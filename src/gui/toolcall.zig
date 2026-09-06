@@ -59,7 +59,62 @@ fn atLineStart(buf: []const u8, idx: usize) bool {
 /// mention of the tag is left as ordinary text, so it neither fires a
 /// generation nor gets hidden from the reply. Callers must strip the reasoning
 /// block first (see `answerText`); this scans only text.
+/// The tool name the GUI declares to models with a native tool format (K2
+/// Horizon), see chat.zig `image_tool_decl`. Its `prompt` argument is the image
+/// prompt; the rest are the same attributes the `<image>` tag takes.
+pub const image_tool_name = "generate_image";
+
+/// Find the next image tool call in `buf`: a line-anchored `<image ...>...</image>`
+/// tag, or a native tool-call block naming `image_tool_name`, whichever comes
+/// first. For the native form `attrs` is the block body (see `parseGenAttrs`).
 pub fn nextImageCall(buf: []const u8) ScanResult {
+    const tag = nextImageTag(buf);
+    const native = nextNativeImageCall(buf);
+    return switch (native) {
+        .none => tag,
+        .partial => |np| switch (tag) {
+            .none => native,
+            .partial => |tp| if (tp.text_before.len <= np.text_before.len) tag else native,
+            .call => |tc| if (tc.text_before.len < np.text_before.len) tag else native,
+        },
+        .call => |nc| switch (tag) {
+            .none => native,
+            .partial => |tp| if (tp.text_before.len <= nc.text_before.len) tag else native,
+            .call => |tc| if (tc.text_before.len < nc.text_before.len) tag else native,
+        },
+    };
+}
+
+/// A native block (`tool_call.nextBlock`) calling the image tool. Blocks naming
+/// another tool are skipped as text, exactly like a casual `<image` mention.
+fn nextNativeImageCall(buf: []const u8) ScanResult {
+    var rest = buf;
+    while (true) {
+        switch (tool_call.nextBlock(rest)) {
+            .none => return .none,
+            .partial => |p| return .{ .partial = .{ .text_before = buf[0 .. buf.len - rest.len + p.text_before.len] } },
+            .block => |b| {
+                const name = tool_call.k2Name(b.body) orelse "";
+                if (std.mem.eql(u8, name, image_tool_name)) {
+                    var prompt: []const u8 = "";
+                    var it = tool_call.k2Args(b.body);
+                    while (it.next()) |arg| if (std.mem.eql(u8, arg.key, "prompt")) {
+                        prompt = std.mem.trim(u8, arg.value, " \n\r\t");
+                    };
+                    return .{ .call = .{
+                        .text_before = buf[0 .. buf.len - rest.len + b.text_before.len],
+                        .attrs = b.body,
+                        .prompt = prompt,
+                        .after = b.after,
+                    } };
+                }
+                rest = b.after;
+            },
+        }
+    }
+}
+
+fn nextImageTag(buf: []const u8) ScanResult {
     const close = "</image>";
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, buf, from, "<image")) |a| {
@@ -321,4 +376,17 @@ test "a run still reports its calls when no image survived" {
     try std.testing.expectEqual(@as(usize, 0), s[1].calls.len);
     try std.testing.expectEqual(@as(usize, 2), s[1].calls.n_calls);
     try std.testing.expectEqualStrings("<image>a</image>\n<image>b</image>", s[1].calls.text);
+}
+
+test "nextImageCall: a native K2 generate_image block is a call, other tools are text" {
+    const r = nextImageCall("Here:\n<ifm|tool_calls>\n<ifm|tool_call>generate_image\n<ifm|arg_key>prompt</ifm|arg_key>\n<ifm|arg_value>a red fox</ifm|arg_value>\n<ifm|arg_key>width</ifm|arg_key>\n<ifm|arg_value>1024</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>\nDone.");
+    try testing.expectEqualStrings("Here:\n", r.call.text_before);
+    try testing.expectEqualStrings("a red fox", r.call.prompt);
+    try testing.expectEqualStrings("\nDone.", r.call.after);
+    try testing.expect(std.mem.indexOf(u8, r.call.attrs, "<ifm|arg_key>width</ifm|arg_key>") != null);
+    try testing.expectEqual(ScanResult.none, nextImageCall("<ifm|tool_calls>\n<ifm|tool_call>get_weather\n</ifm|tool_call>\n</ifm|tool_calls>"));
+    switch (nextImageCall("ok\n<ifm|tool_calls>\n<ifm|tool_call>generate_image\n<ifm|arg_key>pro")) {
+        .partial => |p| try testing.expectEqualStrings("ok\n", p.text_before),
+        else => return error.TestUnexpectedResult,
+    }
 }

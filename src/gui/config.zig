@@ -267,6 +267,16 @@ pub const Backend = enum(u8) {
     }
 };
 
+pub const ReasoningEffort = enum(u8) {
+    low,
+    medium,
+    high,
+
+    fn fromStr(s: []const u8) ?ReasoningEffort {
+        return std.meta.stringToEnum(ReasoningEffort, s);
+    }
+};
+
 /// KV-cache element storage type for the chat LLM. `f32` is the default and
 /// bit-exact; `f16` halves the KV footprint (VRAM) and `q8_0` (ggml 34-byte
 /// blocks) roughly quarters it, each at a small precision cost (output is not
@@ -669,6 +679,8 @@ pub const Config = struct {
     /// live, the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
+    /// K2 Horizon reasoning mode. Other model families ignore it.
+    reasoning_effort: ReasoningEffort = .high,
     /// Tell the model when an image it asked for finishes or fails, as a note
     /// in the transcript before the user's next message. Off means the image
     /// tool stays fire-and-forget: the model asks, and never learns what
@@ -1115,6 +1127,8 @@ pub const Config = struct {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "reasoning_effort")) {
+            if (ReasoningEffort.fromStr(val)) |e| self.reasoning_effort = e;
         } else if (std.mem.eql(u8, key, "gemma4_canonical_template")) {
             self.gemma4_canonical_template = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "qwen35_fixed_template")) {
@@ -1322,6 +1336,11 @@ test "apply parses the reasoning flag (default on)" {
     try std.testing.expect(!cfg.reasoning);
     cfg.apply("reasoning", "true");
     try std.testing.expect(cfg.reasoning);
+    try std.testing.expectEqual(ReasoningEffort.high, cfg.reasoning_effort);
+    cfg.apply("reasoning_effort", "medium");
+    try std.testing.expectEqual(ReasoningEffort.medium, cfg.reasoning_effort);
+    cfg.apply("reasoning_effort", "garbage");
+    try std.testing.expectEqual(ReasoningEffort.medium, cfg.reasoning_effort);
 }
 
 test "apply parses weight_read (default pread) and ignores junk" {
@@ -1613,12 +1632,14 @@ test "save/load round-trips the new backend + decode fields" {
     a.llm_backend = .cuda;
     a.diff_backend = .vulkan;
     a.vae_decode = .gpu_tiled;
+    a.reasoning_effort = .low;
     try a.save(io, gpa, &environ, file);
 
     const b = Config.load(io, gpa, &environ, file);
     try std.testing.expectEqual(Backend.cuda, b.llm_backend);
     try std.testing.expectEqual(Backend.vulkan, b.diff_backend);
     try std.testing.expectEqual(VaeDecode.gpu_tiled, b.vae_decode);
+    try std.testing.expectEqual(ReasoningEffort.low, b.reasoning_effort);
     try std.testing.expectEqualStrings("/m.gguf", b.llm_model.opt().?);
 }
 

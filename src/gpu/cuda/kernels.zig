@@ -338,7 +338,7 @@ const wnoise = @import("wnoise.zig");
 /// sigma and stream index; only the kernels listed in BACKEND.md read them, the
 /// rest declare them so the ABI stays one shape.
 const mmq_params = "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale,\n    .param .f32 p_nsig,\n    .param .u32 p_nseq";
-
+const mmq_expert_params = "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u64 p_groups,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale,\n    .param .f32 p_nsig,\n    .param .u32 p_nseq";
 
 /// v1, shared-memory register-tiled IMMA GEMM. 128x128 block tile, 4 warps
 /// (2x2 grid of 64x64 warp tiles), 128 s32 accumulators/thread, K_STEP=64.
@@ -511,10 +511,10 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
             while (nj < NT) : (nj += 1) {
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
                 try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
-                    a[0],              a[1],              a[2],              a[3],
-                    af[mi * 4 + 0],    af[mi * 4 + 1],    af[mi * 4 + 2],    af[mi * 4 + 3],
-                    bf[nj * 2 + 0],    bf[nj * 2 + 1],    a[0],              a[1],
-                    a[2],              a[3],
+                    a[0],           a[1],           a[2],           a[3],
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], a[0],           a[1],
+                    a[2],           a[3],
                 });
             }
         }
@@ -877,10 +877,20 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
                 try b.linef("{s} {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                     mma_op,
-                    a[0],           a[1],           a[2],           a[3],
-                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
-                    bf[nj * 2 + 0], bf[nj * 2 + 1], a[0],           a[1],
-                    a[2],           a[3],
+                    a[0],
+                    a[1],
+                    a[2],
+                    a[3],
+                    af[mi * 4 + 0],
+                    af[mi * 4 + 1],
+                    af[mi * 4 + 2],
+                    af[mi * 4 + 3],
+                    bf[nj * 2 + 0],
+                    bf[nj * 2 + 1],
+                    a[0],
+                    a[1],
+                    a[2],
+                    a[3],
                 });
             }
         }
@@ -1373,22 +1383,22 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
         }
     } else {
-    try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_t });
-    try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, if (in_f16) @as(usize, 1) else 2 });
-    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
-    {
-        const r_h = if (in_f16) try b.reg(.b16) else "";
-        var i: usize = 0;
-        while (i < load_iters) : (i += 1) {
-            if (in_f16) {
-                try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ r_h, rd_g, i * 256 * 2 });
-                try b.linef("cvt.f32.f16 {s}, {s};", .{ r_ftmp, r_h });
-            } else {
-                try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_t });
+        try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, if (in_f16) @as(usize, 1) else 2 });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
+        {
+            const r_h = if (in_f16) try b.reg(.b16) else "";
+            var i: usize = 0;
+            while (i < load_iters) : (i += 1) {
+                if (in_f16) {
+                    try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ r_h, rd_g, i * 256 * 2 });
+                    try b.linef("cvt.f32.f16 {s}, {s};", .{ r_ftmp, r_h });
+                } else {
+                    try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
+                }
+                try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sh, i * 256 * 4, r_ftmp });
             }
-            try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sh, i * 256 * 4, r_ftmp });
         }
-    }
     }
     try b.line("bar.sync 0;");
 
@@ -1779,7 +1789,28 @@ pub const irescale_h16_ptx: [:0]const u8 =
 ///     in [0,1], so only the LOAD and A's pointer arithmetic change, and the MMA is
 ///     untouched. B keeps its f16 stride, hence the separate A registers below.
 pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool) ![:0]u8 {
+    return buildHgemmMode(alloc, batched, c_f16, attnout, bf16, use_ldmatrix, a_f32, false);
+}
+
+/// Grouped f16 GEMM for routed experts: grid.y indexes a table of 128-row
+/// activation tiles, each `hgemmGroup`-packed as (expert, row count, row
+/// offset). The tile's B operand is expert `e`'s [n][k] slice of one contiguous
+/// f16 weight group, its A rows start at `offset` (rows past `count` are read
+/// but never stored), and C rows are stored only below `count`. Entry
+/// `hgemm_experts`; params are hgemm's plus `p_groups`.
+pub fn buildHgemmExperts(alloc: std.mem.Allocator) ![:0]u8 {
+    return buildHgemmMode(alloc, false, false, false, false, true, false, true);
+}
+
+/// Pack one `hgemm_experts` tile: expert < 256, 1 <= count <= 128, offset < 65536.
+pub fn hgemmGroup(expert: usize, count: usize, offset: usize) u32 {
+    std.debug.assert(expert < 256 and count >= 1 and count <= 128 and offset < (1 << 16));
+    return @as(u32, @intCast(expert)) | (@as(u32, @intCast(count - 1)) << 8) | (@as(u32, @intCast(offset)) << 16);
+}
+
+fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool, experts: bool) ![:0]u8 {
     std.debug.assert(!a_f32 or attnout);
+    std.debug.assert(!experts or (!batched and !attnout and !c_f16));
     const BM = 128;
     const KSTEP = 32;
     const MT = 4;
@@ -1848,6 +1879,8 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     var r_l2e: []const u8 = undefined;
     var f_zero: []const u8 = undefined;
     var r_qbase: []const u8 = undefined;
+    var r_cbase: []const u8 = undefined;
+    var r_lim: []const u8 = undefined;
     if (attnout) {
         rd_md = try b.reg(.b64);
         r_seq = try b.reg(.b32);
@@ -1857,9 +1890,12 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
         r_l2e = try b.reg(.f32);
         f_zero = try b.reg(.f32);
         r_qbase = try b.reg(.b32);
+        r_cbase = try b.reg(.b32);
+        r_lim = try b.reg(.b32);
         try b.linef("ld.param.u64 {s}, [p_md];", .{rd_md});
         try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_md, rd_md });
         try b.linef("ld.param.u32 {s}, [p_seq];", .{r_seq});
+        try b.linef("ld.param.u32 {s}, [p_cbase];", .{r_cbase});
         try b.linef("ld.param.u32 {s}, [p_mds];", .{r_mds});
         try b.linef("sub.u32 {s}, {s}, 1;", .{ r_mds1, r_mds }); // mpad-1 (clamp)
         try b.linef("mov.u32 {s}, %ctaid.z;", .{r_zz}); // head index
@@ -1887,10 +1923,33 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     try b.linef("shr.u32 {s}, {s}, 1;", .{ r_wn, r_warp });
     try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
     try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
-    try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
     try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
-    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
     try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    const r_cnt = if (experts) try b.reg(.b32) else "";
+    if (experts) {
+        const rd_g = try b.reg(.b64);
+        const r_g = try b.reg(.b32);
+        const rd_nk = try b.reg(.b64);
+        try b.linef("ld.param.u64 {s}, [p_groups];", .{rd_g});
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_g, rd_g });
+        try b.linef("mov.u32 {s}, %ctaid.y;", .{r_g});
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_nk, r_g });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_g, rd_nk });
+        try b.linef("ld.global.u32 {s}, [{s}];", .{ r_g, rd_g });
+        try b.linef("shr.u32 {s}, {s}, 16;", .{ r_row0, r_g });
+        try b.linef("shr.u32 {s}, {s}, 8;", .{ r_cnt, r_g });
+        try b.linef("and.b32 {s}, {s}, 0xff;", .{ r_cnt, r_cnt });
+        try b.linef("add.u32 {s}, {s}, 1;", .{ r_cnt, r_cnt });
+        try b.linef("and.b32 {s}, {s}, 0xff;", .{ r_g, r_g }); // expert
+        try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_nk, r_n, r_k });
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_g, r_g });
+        try b.linef("mul.lo.u64 {s}, {s}, {s};", .{ rd_nk, rd_nk, rd_g });
+        try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_nk, rd_nk });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_b, rd_b, rd_nk });
+    } else {
+        try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
+        try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
+    }
     // attnout: q of the first-staged A row (i=0) = row0 + rowq (rowq = t>>4).
     if (attnout) try b.linef("add.u32 {s}, {s}, {s};", .{ r_qbase, r_row0, r_rowq });
 
@@ -2045,11 +2104,10 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bp, rd_bbase, rd_k0 });
     if (attnout) {
         // key columns of this k-slab's A pair: j0 = k0 + kq*2, j1 = j0+1 (constant
-        // across the row-advancing i-loop); pad keys j>=seq contribute P=0.
+        // across the row-advancing i-loop); the per-row key limit below zeroes
+        // pad keys j>=seq and, causally, keys past the row's position.
         try b.linef("add.u32 {s}, {s}, {s};", .{ r_j0, r_k0, r_kq2 });
-        try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_j0, r_j0, r_seq });
         try b.linef("add.u32 {s}, {s}, 1;", .{ r_j1, r_j0 });
-        try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_j1, r_j1, r_seq });
     }
     var i: usize = 0;
     while (i < 16) : (i += 1) {
@@ -2066,6 +2124,11 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
             // for redundant/pad staging rows stays in-bounds); load {max, 1/sum}.
             try b.linef("add.u32 {s}, {s}, {d};", .{ r_qi, r_qbase, i * 8 });
             try b.linef("min.u32 {s}, {s}, {s};", .{ r_qi, r_qi, r_mds1 });
+            // keys this row may see: min(seq, cbase + q); non-causal cbase is huge
+            try b.linef("add.u32 {s}, {s}, {s};", .{ r_lim, r_qi, r_cbase });
+            try b.linef("min.u32 {s}, {s}, {s};", .{ r_lim, r_lim, r_seq });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_j0, r_j0, r_lim });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_j1, r_j1, r_lim });
             try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ r_mdrow, r_zz, r_mds, r_qi });
             try b.linef("mul.wide.u32 {s}, {s}, 8;", .{ rd_mdp, r_mdrow });
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_mdp, rd_md, rd_mdp });
@@ -2134,10 +2197,13 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
                 try b.linef("mma.sync.aligned.m16n8k16.row.col.f32.{s}.{s}.f32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                     if (bf16) "bf16" else "f16", if (bf16) "bf16" else "f16",
-                    a[0],           a[1],           a[2],           a[3],
-                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
-                    bf[nj * 2 + 0], bf[nj * 2 + 1], a[0],           a[1],
-                    a[2],           a[3],
+                    a[0],                        a[1],
+                    a[2],                        a[3],
+                    af[mi * 4 + 0],              af[mi * 4 + 1],
+                    af[mi * 4 + 2],              af[mi * 4 + 3],
+                    bf[nj * 2 + 0],              bf[nj * 2 + 1],
+                    a[0],                        a[1],
+                    a[2],                        a[3],
                 });
             }
         }
@@ -2167,9 +2233,23 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const r_idx = try b.reg(.b32);
     const rd_cp = try b.reg(.b64);
     const rd_cp2 = try b.reg(.b64);
+    const p_lo = if (experts) try b.reg(.pred) else "";
+    const p_hi = if (experts) try b.reg(.pred) else "";
+    const r_loc = if (experts) try b.reg(.b32) else "";
+    const g_lo = if (experts) try std.fmt.allocPrint(alloc, "@{s} ", .{p_lo}) else "";
+    defer if (experts) alloc.free(g_lo);
+    const g_hi = if (experts) try std.fmt.allocPrint(alloc, "@{s} ", .{p_hi}) else "";
+    defer if (experts) alloc.free(g_hi);
     var mi2: usize = 0;
     while (mi2 < MT) : (mi2 += 1) {
         try b.linef("add.u32 {s}, {s}, {d};", .{ r_row_mi, r_crow, mi2 * 16 });
+        if (experts) {
+            // tile-local row of this lane's two C rows vs the expert's count
+            try b.linef("sub.u32 {s}, {s}, {s};", .{ r_loc, r_row_mi, r_row0 });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_lo, r_loc, r_cnt });
+            try b.linef("add.u32 {s}, {s}, 8;", .{ r_loc, r_loc });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_hi, r_loc, r_cnt });
+        }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
             const a = acc[(mi2 * NT + nj) * 4 ..][0..4];
@@ -2193,24 +2273,26 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
                 try b.linef("st.global.b16 [{s}+2], {s};", .{ rd_cp2, rh[3] });
                 continue;
             }
-            try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp, a[0] });
-            try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp, a[1] });
+            try b.linef("{s}st.global.f32 [{s}], {s};", .{ g_lo, rd_cp, a[0] });
+            try b.linef("{s}st.global.f32 [{s}+4], {s};", .{ g_lo, rd_cp, a[1] });
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp2, rd_cp, rd_8n4 });
-            try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp2, a[2] });
-            try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp2, a[3] });
+            try b.linef("{s}st.global.f32 [{s}], {s};", .{ g_hi, rd_cp2, a[2] });
+            try b.linef("{s}st.global.f32 [{s}+4], {s};", .{ g_hi, rd_cp2, a[3] });
         }
     }
 
     const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
-    const name = if (attnout and a_f32) "hgemm_attnout_a32" else if (attnout) "hgemm_attnout" else if (batched and c_f16) "hgemm_batched_c16" else if (batched) "hgemm_batched" else "hgemm";
+    const name = if (experts) "hgemm_experts" else if (attnout and a_f32) "hgemm_attnout_a32" else if (attnout) "hgemm_attnout" else if (batched and c_f16) "hgemm_batched_c16" else if (batched) "hgemm_batched" else "hgemm";
     const batched_params = "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u32 p_sa,\n    .param .u32 p_sb,\n    .param .u32 p_sc,\n    .param .f32 p_scale";
     return b.build(
         name,
         if (attnout)
-            batched_params ++ ",\n    .param .u64 p_md,\n    .param .u32 p_seq,\n    .param .u32 p_mds"
+            batched_params ++ ",\n    .param .u64 p_md,\n    .param .u32 p_seq,\n    .param .u32 p_mds,\n    .param .u32 p_cbase"
         else if (batched)
             batched_params
+        else if (experts)
+            "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_groups"
         else
             "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k",
         shared_decl,
@@ -2518,7 +2600,9 @@ pub const softmax_row_f16_ptx: [:0]const u8 =
 /// (d=0) contribute 0*anything = 0. (In practice attention seq ≥ 256 so every
 /// lane has a valid column, but the sentinel keeps it robust for any seq ≥ 1.)
 /// Entry `softmax_md_f16`. params: p_s(f16 [rows][pn]), p_md(f32 [rows][2]),
-/// p_n(u32 pn=mpad), p_seq(u32 valid cols). grid=(rows,1,1), block=256.
+/// p_n(u32 pn=mpad), p_seq(u32 valid cols), p_qpad(rows per head), p_cbase (causal
+/// base: row r of a head sees min(seq, cbase + r) keys; pass a huge value for
+/// none). grid=(rows,1,1), block=256.
 pub const softmax_md_f16_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -2527,7 +2611,9 @@ pub const softmax_md_f16_ptx: [:0]const u8 =
     \\    .param .u64 p_s,
     \\    .param .u64 p_md,
     \\    .param .u32 p_n,
-    \\    .param .u32 p_seq
+    \\    .param .u32 p_seq,
+    \\    .param .u32 p_qpad,
+    \\    .param .u32 p_cbase
     \\)
     \\{
     \\    .reg .pred %p<5>;
@@ -2544,6 +2630,10 @@ pub const softmax_md_f16_ptx: [:0]const u8 =
     \\    cvta.to.global.u64 %rd2, %rd2;
     \\    mov.u32 %r3, %ctaid.x;                // row
     \\    mov.u32 %r4, %tid.x;                  // 0..255
+    \\    // causal: keys valid for this row = min(seq, cbase + row-in-head); a
+    \\    // non-causal caller passes a cbase past any seq.
+    \\    ld.param.u32 %r12, [p_qpad]; ld.param.u32 %r13, [p_cbase];
+    \\    rem.u32 %r14, %r3, %r12; add.u32 %r14, %r14, %r13; min.u32 %r2, %r2, %r14;
     \\    mov.f32 %f10, 0f3FB8AA3B;             // log2(e)
     \\    mul.wide.u32 %rd3, %r3, %r1;
     \\    shl.b64 %rd3, %rd3, 1;                // *2 (f16) S row byte offset
@@ -2641,7 +2731,6 @@ pub const softmax_md_f32_ptx: [:0]const u8 = blk: {
     // PTX loader, which needs a NUL-terminated string.
     break :blk (d ++ "\x00")[0..d.len :0];
 };
-
 
 const gpa = std.heap.page_allocator;
 
@@ -3659,8 +3748,6 @@ pub const f32gemm_ptx: [:0]const u8 =
     \\}
 ;
 
-
-
 // ---------------------------------------------------------------------------
 // MMQ, q4_k weight x q8_1 activation on the s8 tensor cores, with the
 // dequantized weight NEVER materialized in global memory.
@@ -3980,8 +4067,8 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
             try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                 cfr[0], cfr[1], cfr[2], cfr[3],
                 afr[0], afr[1], afr[2], afr[3],
-                bfr[0], bfr[1],
-                cfr[0], cfr[1], cfr[2], cfr[3],
+                bfr[0], bfr[1], cfr[0], cfr[1],
+                cfr[2], cfr[3],
             });
             _ = lb_st;
             // Activation d/Σq for this lane's two C columns, from shared.
@@ -5113,8 +5200,8 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
                 try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                     ct[0],          ct[1],          ct[2],          ct[3],
                     af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
-                    bf[nj * 2 + 0], bf[nj * 2 + 1],
-                    zq[0],          zq[1],          zq[2],          zq[3],
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], zq[0],          zq[1],
+                    zq[2],          zq[3],
                 });
                 // c0=(row gid,col tf*2) c1=(gid,tf*2+1) c2=(gid+8,tf*2) c3=(gid+8,+1)
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
@@ -5198,12 +5285,20 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
 /// Requires cols % 256 == 0 and rows % 128 == 0; `n` padded to 128 by the caller.
 /// Entry `mmq_pipe_q6_k`.
 pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
+    return buildMmqPipeQ6KMode(alloc, false);
+}
+
+pub fn buildMmqPipeQ6KExperts(alloc: std.mem.Allocator) ![:0]u8 {
+    return buildMmqPipeQ6KMode(alloc, true);
+}
+
+fn buildMmqPipeQ6KMode(alloc: std.mem.Allocator, comptime experts: bool) ![:0]u8 {
     const BM = 128;
-    const BN = 128;
+    const BN = if (experts) 32 else 128;
     const kstep = 64;
     const KS = kstep / 16; // 16-k substeps == q6_k sub-blocks per slab
     const MT = 4;
-    const NT = 8;
+    const NT = if (experts) 2 else 8;
     const ATILE = BM * kstep;
     const BTILE = BN * kstep;
     const ASC = BM * KS * 4; // d*sc f32 per row per substep
@@ -5227,6 +5322,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     const rd_w = try b.reg(.b64);
     const rd_x = try b.reg(.b64);
     const rd_y = try b.reg(.b64);
+    const rd_groups = try b.reg(.b64);
     const r_rows = try b.reg(.b32);
     const r_cols = try b.reg(.b32);
     const r_n = try b.reg(.b32);
@@ -5234,6 +5330,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("ld.param.u64 {s}, [p_w];", .{rd_w});
     try b.linef("ld.param.u64 {s}, [p_x];", .{rd_x});
     try b.linef("ld.param.u64 {s}, [p_y];", .{rd_y});
+    if (experts) try b.linef("ld.param.u64 {s}, [p_groups];", .{rd_groups});
     try b.linef("ld.param.u32 {s}, [p_rows];", .{r_rows});
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
@@ -5241,6 +5338,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
+    if (experts) try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_groups, rd_groups });
 
     const r_t = try b.reg(.b32);
     const r_lane = try b.reg(.b32);
@@ -5268,10 +5366,23 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
     try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
     try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
-    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
-    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    if (!experts) {
+        try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
+        try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    }
     try b.linef("shr.u32 {s}, {s}, 8;", .{ r_nsb, r_cols });
     try b.linef("mul.lo.u32 {s}, {s}, 210;", .{ r_rb, r_nsb });
+    if (experts) {
+        try b.linef("mov.u32 {s}, %ctaid.x;", .{tm[0]});
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[0] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_groups, rdt[0] });
+        try b.linef("ld.global.u32 {s}, [{s}];", .{ tm[0], rdt[0] });
+        try b.linef("shr.u32 {s}, {s}, 12;", .{ r_col0, tm[0] });
+        try b.linef("and.b32 {s}, {s}, 0xff;", .{ tm[0], tm[0] });
+        try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[1], r_rows, r_rb });
+        try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rdt[0], tm[0], tm[1] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_w, rd_w, rdt[0] });
+    }
     try b.linef("shr.u32 {s}, {s}, 5;", .{ r_bpt, r_cols });
 
     const rd_qs = try b.reg(.b64);
@@ -5313,7 +5424,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("shl.b32 {s}, {s}, {d};", .{ tm[0], r_wn, if (experts) 4 else 6 });
     try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], kstep });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
@@ -5327,7 +5438,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascr, tm[0], KS * 4 });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascr, r_ascr, r_smem });
     try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascr, r_ascr, ASC_OFF });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("shl.b32 {s}, {s}, {d};", .{ tm[0], r_wn, if (experts) 4 else 6 });
     try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[1], r_tf });
     try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], tm[1] });
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscr, tm[0], KS * 4 });
@@ -5341,6 +5452,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     const r_nslab = try b.reg(.b32);
     const pr = try b.regs(.pred, 2);
     const lp = try b.newLabel("slab6");
+    const lp_bdone = try b.newLabel("b6done");
     try b.linef("shr.u32 {s}, {s}, 6;", .{ r_nslab, r_cols });
     try b.linef("mov.u32 {s}, 0;", .{r_i});
     try b.label(lp);
@@ -5439,6 +5551,10 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, fsv[0], fsv[1], fsv[2], fsv[3] });
 
     // -- stage B: activations (16-byte aligned) + their per-32-block scale ----
+    if (experts) {
+        try b.linef("setp.ge.u32 {s}, {s}, 32;", .{ pr[1], r_t });
+        try b.linef("@{s} bra {s};", .{ pr[1], lp_bdone });
+    }
     try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_i });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
@@ -5457,6 +5573,8 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("mov.f32 {s}, {s};", .{ fsv[1], fsv[0] });
     try b.linef("mov.f32 {s}, {s};", .{ fsv[3], fsv[2] });
     try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_bscd, fsv[0], fsv[1], fsv[2], fsv[3] });
+
+    if (experts) try b.label(lp_bdone);
 
     try b.line("bar.sync 0;");
 
@@ -5484,10 +5602,9 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
             mi = 0;
             while (mi < MT) : (mi += 1) {
                 try b.linef("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s}}}, {{{s},{s},{s},{s}}};", .{
-                    ct[0],          ct[1],          ct[2], ct[3],
-                    af[mi * 2 + 0], af[mi * 2 + 1],
-                    bfr[nj],
-                    zq[0],          zq[1],          zq[2], zq[3],
+                    ct[0],          ct[1],          ct[2],   ct[3],
+                    af[mi * 2 + 0], af[mi * 2 + 1], bfr[nj], zq[0],
+                    zq[1],          zq[2],          zq[3],
                 });
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
                 const rows2 = [_]usize{ 0, 0, 1, 1 };
@@ -5511,7 +5628,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("shl.b32 {s}, {s}, 6;", .{ r_crow, r_wm });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_row0 });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_gid });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_ccol, r_wn });
+    try b.linef("shl.b32 {s}, {s}, {d};", .{ r_ccol, r_wn, if (experts) 4 else 6 });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_col0 });
     try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_tf });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, tm[0] });
@@ -5537,8 +5654,8 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
-        "mmq_pipe_q6_k",
-        mmq_params,
+        if (experts) "mmq_pipe_q6_k_experts" else "mmq_pipe_q6_k",
+        if (experts) mmq_expert_params else mmq_params,
         shared_decl,
     );
 }
@@ -6362,8 +6479,8 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
                         try bb.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                             args.ct[0],          args.ct[1],          args.ct[2],          args.ct[3],
                             args.af[mi * 4 + 0], args.af[mi * 4 + 1], args.af[mi * 4 + 2], args.af[mi * 4 + 3],
-                            args.bf[nj * 2 + 0], args.bf[nj * 2 + 1],
-                            args.zq[0],          args.zq[1],          args.zq[2],          args.zq[3],
+                            args.bf[nj * 2 + 0], args.bf[nj * 2 + 1], args.zq[0],          args.zq[1],
+                            args.zq[2],          args.zq[3],
                         });
                         const a = args.acc[(mi * args.nt + nj) * 4 ..][0..4];
                         const rows2 = [_]usize{ 0, 0, 1, 1 };
@@ -6380,14 +6497,46 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
     }.emit;
 
     const A = .{
-        .sh_half = SH_HALF, .ks = KS,   .kstep = kstep, .stride = stride, .mt = MT, .nt = NT,
-        .tm = tm,           .rdt = rdt, .r_pf = r_pf,   .rd_wrow = rd_wrow, .rd_bcol = rd_bcol,
-        .h16 = h16,         .ar = ar,   .f_ad = f_ad,   .f_bd = f_bd,   .r_bdst = r_bdst,
-        .r_adst = r_adst,   .r_ascd = r_ascd, .r_bscd = r_bscd, .r_gcol = r_gcol, .r_bpt = r_bpt,
-        .rd_x = rd_x,       .r_l1 = r_l1, .r_l2 = r_l2, .spb = SPB,     .bb = BB,   .us = us,
-        .uv = uv,           .r_ascr = r_ascr, .r_asl = r_asl, .r_bsl = r_bsl, .r_bscr = r_bscr,
-        .rsc = rsc,         .csc = csc, .af = af,       .bf = bf,       .ct = ct,
-        .zq = zq,           .acc = acc, .fs = fs,
+        .sh_half = SH_HALF,
+        .ks = KS,
+        .kstep = kstep,
+        .stride = stride,
+        .mt = MT,
+        .nt = NT,
+        .tm = tm,
+        .rdt = rdt,
+        .r_pf = r_pf,
+        .rd_wrow = rd_wrow,
+        .rd_bcol = rd_bcol,
+        .h16 = h16,
+        .ar = ar,
+        .f_ad = f_ad,
+        .f_bd = f_bd,
+        .r_bdst = r_bdst,
+        .r_adst = r_adst,
+        .r_ascd = r_ascd,
+        .r_bscd = r_bscd,
+        .r_gcol = r_gcol,
+        .r_bpt = r_bpt,
+        .rd_x = rd_x,
+        .r_l1 = r_l1,
+        .r_l2 = r_l2,
+        .spb = SPB,
+        .bb = BB,
+        .us = us,
+        .uv = uv,
+        .r_ascr = r_ascr,
+        .r_asl = r_asl,
+        .r_bsl = r_bsl,
+        .r_bscr = r_bscr,
+        .rsc = rsc,
+        .csc = csc,
+        .af = af,
+        .bf = bf,
+        .ct = ct,
+        .zq = zq,
+        .acc = acc,
+        .fs = fs,
     };
 
     // prologue: slab 0 -> buffer 0, then start slab 1 into buffer 1.
@@ -6766,8 +6915,8 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
                         try bb.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                             args.ct[0],          args.ct[1],          args.ct[2],          args.ct[3],
                             args.af[mi * 4 + 0], args.af[mi * 4 + 1], args.af[mi * 4 + 2], args.af[mi * 4 + 3],
-                            args.bf[nj * 2 + 0], args.bf[nj * 2 + 1],
-                            args.zq[0],          args.zq[1],          args.zq[2],          args.zq[3],
+                            args.bf[nj * 2 + 0], args.bf[nj * 2 + 1], args.zq[0],          args.zq[1],
+                            args.zq[2],          args.zq[3],
                         });
                         const a = args.acc[(mi * args.nt + nj) * 4 ..][0..4];
                         const rows2 = [_]usize{ 0, 0, 1, 1 };
@@ -6784,14 +6933,45 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
     }.emit;
 
     const A = .{
-        .sh_half = SH_HALF, .ks = KS,   .kstep = kstep, .stride = stride, .mt = MT, .nt = NT,
-        .tm = tm,           .rdt = rdt, .r_pf = r_pf,   .rd_wrow = rd_wrow, .rd_bcol = rd_bcol,
-        .h16 = h16,         .ar = ar,   .f_ad = f_ad,   .f_bd = f_bd,   .r_bdst = r_bdst,
-        .r_adst = r_adst,   .r_ascd = r_ascd, .r_bscd = r_bscd, .r_gcol = r_gcol, .r_bpt = r_bpt,
-        .rd_x = rd_x,       .r_l1 = r_l1, .r_l2 = r_l2, .un = un,       .us = us,
-        .uv = uv,           .r_ascr = r_ascr, .r_asl = r_asl, .r_bsl = r_bsl, .r_bscr = r_bscr,
-        .rsc = rsc,         .csc = csc, .af = af,       .bf = bf,       .ct = ct,
-        .zq = zq,           .acc = acc, .fs = fs,
+        .sh_half = SH_HALF,
+        .ks = KS,
+        .kstep = kstep,
+        .stride = stride,
+        .mt = MT,
+        .nt = NT,
+        .tm = tm,
+        .rdt = rdt,
+        .r_pf = r_pf,
+        .rd_wrow = rd_wrow,
+        .rd_bcol = rd_bcol,
+        .h16 = h16,
+        .ar = ar,
+        .f_ad = f_ad,
+        .f_bd = f_bd,
+        .r_bdst = r_bdst,
+        .r_adst = r_adst,
+        .r_ascd = r_ascd,
+        .r_bscd = r_bscd,
+        .r_gcol = r_gcol,
+        .r_bpt = r_bpt,
+        .rd_x = rd_x,
+        .r_l1 = r_l1,
+        .r_l2 = r_l2,
+        .un = un,
+        .us = us,
+        .uv = uv,
+        .r_ascr = r_ascr,
+        .r_asl = r_asl,
+        .r_bsl = r_bsl,
+        .r_bscr = r_bscr,
+        .rsc = rsc,
+        .csc = csc,
+        .af = af,
+        .bf = bf,
+        .ct = ct,
+        .zq = zq,
+        .acc = acc,
+        .fs = fs,
     };
 
     // prologue: slab 0 -> buffer 0, then start slab 1 into buffer 1.
@@ -7015,7 +7195,6 @@ test "the activation prep's rotation covers every group" {
     try std.testing.expectEqual(@as(usize, 6), prepButterflyIters(5376));
     try std.testing.expectEqual(@as(usize, 24 * 64 / 256), prepButterflyIters(6144));
 }
-
 
 test "the prep's global row staging is a drop-in for the shared one" {
     // Structural, because the two must differ in exactly one way: where the row

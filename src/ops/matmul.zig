@@ -418,6 +418,19 @@ fn matmulPacked(
     if (cancel.canceled(tok)) return error.Canceled;
 }
 
+/// One decode GEMV of a batch: y[rows] = W[rows][cols] (block-quant) @ x[cols].
+pub const Gemv1 = struct { y: []f32, x: []const f32, w: []const u8 };
+
+/// Many small block-quant GEMVs of one dtype and shape (a MoE layer's selected
+/// experts) as ONE threaded pass: every input is quantized once, then the rows
+/// of all jobs are split across the cores together, so a layer costs one
+/// fork/join instead of one per matrix.
+pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const Gemv1, rows: usize, cols: usize) Error!void {
+    if (jobs.len == 0) return;
+    if (!quants.usesGgml(dt) or !have_ggml) return error.QuantBackendUnavailable;
+    return ggml_gemv.quantGemvBatch(io, dt, jobs, rows, cols);
+}
+
 // Small-m GEMV for block-quant dtypes ggml cannot serve, today only q2_0_g128,
 // whose 128-element blocks ggml's 64-element type 42 cannot address (see
 // quants.dequantQ2_0G128). Same shape as `ggml_gemv` below (thread over row
@@ -555,6 +568,71 @@ const ggml_gemv = if (have_ggml) struct {
             group.async(io, gemvRows, .{ job, r, @min(r + chunk, rows) });
         }
         try group.await(io);
+        if (cancel.canceled(tok)) return error.Canceled;
+    }
+
+    const BatchJob = struct {
+        vd: ggml.c.ggml_vec_dot_t,
+        jobs: []const Gemv1,
+        vy: []const u8,
+        vy_bytes: usize,
+        rows: usize,
+        cols: usize,
+        row_bytes: usize,
+        tok: cancel.Token,
+    };
+
+    /// Rows [r0, r1) of the flattened (job, row) space.
+    fn batchRows(j: BatchJob, r0: usize, r1: usize) void {
+        var r = r0;
+        while (r < r1) {
+            if (cancel.canceled(j.tok)) return;
+            const ji = r / j.rows;
+            const row0 = r % j.rows;
+            const row1 = @min(j.rows, row0 + (r1 - r));
+            const job = j.jobs[ji];
+            const vy = j.vy.ptr + ji * j.vy_bytes;
+            for (row0..row1) |row| {
+                var acc: f32 = 0;
+                j.vd.?(@intCast(j.cols), &acc, 0, job.w.ptr + row * j.row_bytes, 0, vy, 0, 1);
+                job.y[row] = acc;
+            }
+            r += row1 - row0;
+        }
+    }
+
+    pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const Gemv1, rows: usize, cols: usize) Error!void {
+        quants.ensureGgmlInit();
+        const gtype = quants.ggmlType(dt) orelse unreachable;
+        const wt = ggml.c.ggml_get_type_traits_cpu(gtype);
+        const vdt = wt.*.vec_dot_type;
+        const from_float = ggml.c.ggml_get_type_traits_cpu(vdt).*.from_float.?;
+        const row_bytes: usize = @intCast(ggml.c.ggml_row_size(gtype, @intCast(cols)));
+        const vy_bytes: usize = @intCast(ggml.c.ggml_row_size(vdt, @intCast(cols)));
+        const alloc = std.heap.c_allocator;
+        const vy = alloc.alloc(u8, jobs.len * vy_bytes) catch @panic("quantGemvBatch: OOM");
+        defer alloc.free(vy);
+        for (jobs, 0..) |job, i| {
+            std.debug.assert(job.w.len >= rows * row_bytes and job.x.len == cols and job.y.len == rows);
+            from_float(job.x.ptr, vy.ptr + i * vy_bytes, @intCast(cols));
+        }
+        const tok = cancel.token;
+        const bj = BatchJob{ .vd = wt.*.vec_dot, .jobs = jobs, .vy = vy, .vy_bytes = vy_bytes, .rows = rows, .cols = cols, .row_bytes = row_bytes, .tok = tok };
+        const total = jobs.len * rows;
+        const n_threads = std.Thread.getCpuCount() catch 1;
+        const want: usize = if (n_threads == 1 or total < 128) 1 else n_threads;
+        if (want == 1) {
+            batchRows(bj, 0, total);
+        } else {
+            const chunk = std.math.divCeil(usize, total, want) catch unreachable;
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            var r: usize = 0;
+            while (r < total) : (r += chunk) {
+                group.async(io, batchRows, .{ bj, r, @min(r + chunk, total) });
+            }
+            try group.await(io);
+        }
         if (cancel.canceled(tok)) return error.Canceled;
     }
 } else struct {};

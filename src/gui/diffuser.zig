@@ -19,6 +19,7 @@
 //! worker, starts the next pending image). The worker thread writes the
 //! `GenImage` atomics (`onStep`, and the final `rgba`/`status`).
 const std = @import("std");
+const tool_call = @import("TensorPencil").llm.tool_call;
 const tp = @import("TensorPencil");
 const config = @import("config.zig");
 
@@ -455,21 +456,30 @@ pub fn clampDim(n: usize) usize {
 }
 
 /// Parse `key=value` tokens from an `<image ...>` tag into the GenImage.
+/// `attrs` is either the `<image ...>` tag's `key=value` list or a native K2
+/// tool-call body (see gui/toolcall.zig), whose arg pairs carry the same keys.
 pub fn parseGenAttrs(attrs: []const u8, gi: *GenImage) void {
+    if (std.mem.indexOf(u8, attrs, "<ifm|arg_key>") != null) {
+        var it = tool_call.k2Args(attrs);
+        while (it.next()) |arg| applyGenAttr(arg.key, std.mem.trim(u8, arg.value, " \t\r\n\"'"), gi);
+        return;
+    }
     var it = std.mem.tokenizeAny(u8, attrs, " \t");
     while (it.next()) |tok| {
         const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
-        const key = tok[0..eq];
-        const val = std.mem.trim(u8, tok[eq + 1 ..], "\"'");
-        if (std.mem.eql(u8, key, "width")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_width = clampDim(n) else |_| {}
-        } else if (std.mem.eql(u8, key, "height")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_height = clampDim(n) else |_| {}
-        } else if (std.mem.eql(u8, key, "steps")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_steps = std.math.clamp(n, 1, 100) else |_| {}
-        } else if (std.mem.eql(u8, key, "seed")) {
-            if (std.fmt.parseInt(u64, val, 10)) |n| gi.req_seed = n else |_| {}
-        }
+        applyGenAttr(tok[0..eq], std.mem.trim(u8, tok[eq + 1 ..], "\"'"), gi);
+    }
+}
+
+fn applyGenAttr(key: []const u8, val: []const u8, gi: *GenImage) void {
+    if (std.mem.eql(u8, key, "width")) {
+        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_width = clampDim(n) else |_| {}
+    } else if (std.mem.eql(u8, key, "height")) {
+        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_height = clampDim(n) else |_| {}
+    } else if (std.mem.eql(u8, key, "steps")) {
+        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_steps = std.math.clamp(n, 1, 100) else |_| {}
+    } else if (std.mem.eql(u8, key, "seed")) {
+        if (std.fmt.parseInt(u64, val, 10)) |n| gi.req_seed = n else |_| {}
     }
 }
 

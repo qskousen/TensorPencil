@@ -36,7 +36,7 @@ pub var eos: ?u32 = null;
 /// `gemma` is Gemma 3's `<start_of_turn>role\n...<end_of_turn>\n`; `gemma4` is
 /// Gemma 4's `<|turn>role\n...<turn|>\n` (roles system / user / model, each its
 /// own turn; the system turn also carries the `<|think|>` reasoning cue).
-pub const Family = enum { chatml, gemma, gemma4 };
+pub const Family = enum { chatml, k2_horizon, gemma, gemma4 };
 pub var family: Family = .chatml;
 /// Gemma: a user turn was opened by appendSystem (the system prefix) and the
 /// next appendUser continues it rather than starting a fresh turn.
@@ -50,11 +50,18 @@ var gemma_user_open: bool = false;
 /// block (gemma4 is additionally cued by `<|think|>` in the system turn).
 pub var enable_thinking: bool = true;
 
+pub const ReasoningEffort = enum { low, medium, high };
+pub var reasoning_effort: ReasoningEffort = .high;
+
 /// Turn reasoning on/off (process-global). Forward-looking: a new reasoning
 /// family just adds its markers to `reasoning` and its priming to
 /// `openAssistant`/`appendSystem`; this stays untouched.
 pub fn setThinking(on: bool) void {
     enable_thinking = on;
+}
+
+pub fn setReasoningEffort(effort: ReasoningEffort) void {
+    reasoning_effort = effort;
 }
 
 /// Delimiters of a family's reasoning block as they appear in the *generated
@@ -70,8 +77,17 @@ pub const Reasoning = @import("tool_call.zig").Reasoning;
 /// single source of truth; `reasoning`/`supportsThinking` read the active
 /// family, callers probing a not-yet-active family pass it explicitly.
 pub fn reasoningFor(f: Family) ?Reasoning {
+    return reasoningForEffort(f, .high);
+}
+
+pub fn reasoningForEffort(f: Family, effort: ReasoningEffort) ?Reasoning {
     return switch (f) {
         .chatml => .{ .open = "<think>", .close = "</think>" },
+        .k2_horizon => switch (effort) {
+            .high => .{ .open = "<ifm|think>", .close = "</ifm|think>" },
+            .medium => .{ .open = "<ifm|think_fast>", .close = "</ifm|think_fast>" },
+            .low => .{ .open = "<ifm|think_faster>", .close = "</ifm|think_faster>" },
+        },
         .gemma4 => .{ .open = "<|channel>thought", .close = "<channel|>" },
         .gemma => null,
     };
@@ -79,7 +95,20 @@ pub fn reasoningFor(f: Family) ?Reasoning {
 
 /// The active family's reasoning-block markers, or null if it can't reason.
 pub fn reasoning() ?Reasoning {
-    return reasoningFor(family);
+    return reasoningForEffort(family, reasoning_effort);
+}
+
+pub fn familySupportsReasoningEffort(f: Family) bool {
+    return f == .k2_horizon;
+}
+
+pub fn supportsReasoningEffort() bool {
+    return familySupportsReasoningEffort(family);
+}
+
+pub fn templateReasoningEffort() ?[]const u8 {
+    if (!supportsReasoningEffort()) return null;
+    return @tagName(reasoning_effort);
 }
 
 /// Whether a given family supports a reasoning block (pure, lets the GUI probe
@@ -101,6 +130,7 @@ pub fn supportsThinking() bool {
 pub fn familyForArch(arch: []const u8) ?Family {
     if (std.mem.eql(u8, arch, "qwen3")) return .chatml;
     if (std.mem.eql(u8, arch, "qwen35")) return .chatml;
+    if (std.mem.eql(u8, arch, "k2-horizon")) return .k2_horizon;
     // Mistral-Nemo & the plain llama family ship a ChatML chat_template
     // (<|im_start|>...<|im_end|>) and reuse the qwen3 stack (see qwen3.zig).
     if (std.mem.eql(u8, arch, "llama")) return .chatml;
@@ -150,6 +180,7 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text_opt: ?[]
     try appendBosIfStart(gpa, out);
     switch (family) {
         .chatml => try appendTurn(tok, gpa, "system", text, out),
+        .k2_horizon => try appendK2Turn(tok, gpa, "system", text, out),
         .gemma => {
             // Gemma has no system role: the content prefixes the first user
             // turn (first_user_prefix + "\n\n"), which appendUser completes.
@@ -176,6 +207,7 @@ pub fn appendUser(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u
     try appendBosIfStart(gpa, out);
     switch (family) {
         .chatml => try appendTurn(tok, gpa, "user", text, out),
+        .k2_horizon => try appendK2Turn(tok, gpa, "user", text, out),
         .gemma => {
             if (!gemma_user_open) try tok.encode(gpa, "<start_of_turn>user\n", out);
             gemma_user_open = false;
@@ -245,6 +277,7 @@ pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segment
             try out.append(gpa, turn_end);
             try out.append(gpa, newline);
         },
+        .k2_horizon => return error.ImagesUnsupported,
     }
 }
 
@@ -284,6 +317,16 @@ pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.Ar
             // <think>\n\n</think> convention) so the model answers directly.
             // Thinking: unprimed, the model emits its own <think>...</think>.
             if (!enable_thinking) try tok.encode(gpa, "<think>\n\n</think>\n\n", out);
+        },
+        .k2_horizon => {
+            try tok.encode(gpa, "<|ifm|im_start|>assistant\n", out);
+            if (!enable_thinking) {
+                try tok.encode(gpa, "<ifm|think>\n</ifm|think>\n", out);
+            } else switch (reasoning_effort) {
+                .high => try tok.encode(gpa, "<ifm|think>\n", out),
+                .medium => try tok.encode(gpa, "<ifm|think_fast>\n", out),
+                .low => try tok.encode(gpa, "<ifm|think_faster>\n", out),
+            }
         },
         .gemma => try tok.encode(gpa, "<start_of_turn>model\n", out),
         .gemma4 => {
@@ -368,6 +411,14 @@ fn appendTurn(tok: *const Tokenizer, gpa: std.mem.Allocator, role: []const u8, t
     try out.append(gpa, newline);
 }
 
+fn appendK2Turn(tok: *const Tokenizer, gpa: std.mem.Allocator, role: []const u8, text: []const u8, out: *std.ArrayList(u32)) !void {
+    try tok.encode(gpa, "<|ifm|im_start|>", out);
+    try tok.encode(gpa, role, out);
+    try out.append(gpa, newline);
+    try tok.encode(gpa, text, out);
+    try out.append(gpa, turn_end);
+}
+
 // --- tests -----------------------------------------------------------------
 
 test "turn building matches whole-template tokenization" {
@@ -400,6 +451,14 @@ test "reasoning descriptor is family-scoped" {
     try std.testing.expectEqualStrings("<think>", reasoning().?.open);
     try std.testing.expectEqualStrings("</think>", reasoning().?.close);
 
+    setFamily(.k2_horizon);
+    try std.testing.expect(supportsThinking());
+    try std.testing.expectEqualStrings("<ifm|think>", reasoning().?.open);
+    try std.testing.expectEqualStrings("</ifm|think>", reasoning().?.close);
+    try std.testing.expect(supportsReasoningEffort());
+    try std.testing.expectEqualStrings("<ifm|think_fast>", reasoningForEffort(.k2_horizon, .medium).?.open);
+    try std.testing.expectEqualStrings("<ifm|think_faster>", reasoningForEffort(.k2_horizon, .low).?.open);
+
     setFamily(.gemma4);
     try std.testing.expect(supportsThinking());
     try std.testing.expectEqualStrings("<|channel>thought", reasoning().?.open);
@@ -418,12 +477,14 @@ test "arch→family mapping and family-scoped thinking probe (no global mutation
     setFamily(.gemma); // a distinctive sentinel to prove the probe leaves it be
 
     try std.testing.expectEqual(@as(?Family, .chatml), familyForArch("qwen35"));
+    try std.testing.expectEqual(@as(?Family, .k2_horizon), familyForArch("k2-horizon"));
     try std.testing.expectEqual(@as(?Family, .gemma), familyForArch("gemma3"));
     try std.testing.expectEqual(@as(?Family, .gemma4), familyForArch("gemma4"));
     try std.testing.expectEqual(@as(?Family, .chatml), familyForArch("llama"));
     try std.testing.expectEqual(@as(?Family, null), familyForArch(""));
 
     try std.testing.expect(familySupportsThinking(.chatml));
+    try std.testing.expect(familySupportsThinking(.k2_horizon));
     try std.testing.expect(familySupportsThinking(.gemma4));
     try std.testing.expect(!familySupportsThinking(.gemma));
 

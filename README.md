@@ -5,7 +5,7 @@
 TensorPencil is about running inference backed by Zig so we have better control over memory.
 
 It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested for diffusion.
-For LLM side, it works with Qwen 3/3.5/3.6 of various sizes, and Gemma 3 12b. LLM's are only tested in GGUF currently
+For LLM side, it works with Qwen 3/3.5/3.6 of various sizes, K2 Horizon, and Gemma 3 12b. LLM's are only tested in GGUF currently
 (with the exception of the krea 2 text encoder, which is safetensors),
 while diffusion models are only supported in safetensors.
 
@@ -126,7 +126,7 @@ Added another executable that processes LLM models, for fun: `tp-llm`. Only test
 text encoder model (embedded tables) and now supports gguf models and qwen 3.6 27b, with vision.
 
 Can run in single-response mode if you specify `--prompt <prompt>`, or runs in REPL (conversation) mode if you skip
-the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends. Qwen 3 VL 4b:
+the prompt. In REPL mode, type `/exit` to exit. Most models run on all four backends; K2 Horizon runs on CPU and CUDA. Qwen 3 VL 4b:
 
 | Backend  | tok/s |
 |:---------|:------|
@@ -138,5 +138,9 @@ the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends. Qwen 
 Run the command without arguments to see the usage. Example usage:
 
 `tp-llm --model qwen-3-vl-4b.safetensors --prompt "why is the sky blue" --backend zig-cuda`
+
+K2 Horizon supports `--reasoning-effort high|medium|low`. Its CUDA path keeps fixed weights resident and streams the routed MoE/MoVA experts:
+
+`tp-llm --model K2-Horizon-MoVA-36B-A4B-Q6_K.gguf --prompt "why is the sky blue" --backend zig-cuda --reasoning-effort medium`
 
 LLM mode also has some types of speculative decoding and VRAM offloading.

@@ -21,6 +21,19 @@
 //! Plain qwen3 and most llama finetunes emit the Hermes/qwen2 JSON body instead:
 //! `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`.
 //!
+//! K2 Horizon has its own tags (its template's default `xml` tool_call_format), all
+//! calls of a turn inside one wrapper:
+//!
+//!     <ifm|tool_calls>
+//!     <ifm|tool_call>get_weather
+//!     <ifm|arg_key>city</ifm|arg_key>
+//!     <ifm|arg_value>Paris</ifm|arg_value>
+//!     </ifm|tool_call>
+//!     </ifm|tool_calls>
+//!
+//! `nextBlock` yields one `<ifm|tool_call>` body at a time and folds the wrapper tags
+//! into the block's span, so a display that hides blocks hides the wrapper too.
+//!
 //! `splitThought` / `answerText` / `endsInsideThought` live here rather than in the GUI
 //! because both the CLI and the GUI scanners need "where does the answer start", and two
 //! definitions of that is the drift that lets one caller fire a tool the other hides. A
@@ -50,6 +63,18 @@ pub const Split = struct {
     answer: []const u8,
     open: bool,
 };
+
+const Close = struct { at: usize, len: usize };
+
+fn findClose(body: []const u8, expected: []const u8) ?Close {
+    var best: ?Close = if (std.mem.indexOf(u8, body, expected)) |at| .{ .at = at, .len = expected.len } else null;
+    if (!std.mem.startsWith(u8, expected, "</ifm|think")) return best;
+    for ([_][]const u8{ "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>" }) |close| {
+        const at = std.mem.indexOf(u8, body, close) orelse continue;
+        if (best == null or at < best.?.at) best = .{ .at = at, .len = close.len };
+    }
+    return best;
+}
 
 /// Split a generated assistant turn around its reasoning block. ONE definition
 /// shared by the display (the GUI's thought expander) and every tool-call
@@ -85,9 +110,9 @@ pub fn splitThought(text: []const u8, r: ?Reasoning, primed: bool) Split {
         t
     else
         return .{ .think = null, .answer = text, .open = false };
-    if (std.mem.indexOf(u8, body, rr.close)) |end| return .{
-        .think = std.mem.trim(u8, body[0..end], ws),
-        .answer = std.mem.trimStart(u8, body[end + rr.close.len ..], ws),
+    if (findClose(body, rr.close)) |close| return .{
+        .think = std.mem.trim(u8, body[0..close.at], ws),
+        .answer = std.mem.trimStart(u8, body[close.at + close.len ..], ws),
         .open = false,
     };
     return .{ .think = std.mem.trimStart(u8, body, ws), .answer = "", .open = true };
@@ -143,11 +168,17 @@ pub const Call = struct {
 pub const Found = union(enum) {
     none,
     partial: struct { text_before: []const u8 },
-    block: struct { text_before: []const u8, body: []const u8, after: []const u8 },
+    /// `k2` marks the K2 tag form, whose body carries no format marker of its
+    /// own (a bare name line), so the scanner's knowledge picks the parser.
+    block: struct { text_before: []const u8, body: []const u8, after: []const u8, k2: bool = false },
 };
 
 const open_tag = "<tool_call>";
 const close_tag = "</tool_call>";
+const k2_open = "<ifm|tool_call>";
+const k2_close = "</ifm|tool_call>";
+const k2_wrap_open = "<ifm|tool_calls>";
+const k2_wrap_close = "</ifm|tool_calls>";
 
 /// Find the next complete (or still-streaming) call block in `buf`. Pure.
 ///
@@ -157,7 +188,15 @@ const close_tag = "</tool_call>";
 /// mid-line (`...\n\n<tool_call>\n<function=...`). The reasoning-block guard is what
 /// keeps a merely-contemplated call from firing here.
 pub fn nextBlock(buf: []const u8) Found {
-    const a = std.mem.indexOf(u8, buf, open_tag) orelse return .none;
+    const qa = std.mem.indexOf(u8, buf, open_tag);
+    const ka = std.mem.indexOf(u8, buf, k2_open);
+    const kw = std.mem.indexOf(u8, buf, k2_wrap_open);
+    // K2's wrapper may have arrived before its first call: everything from it on
+    // is pending.
+    const k_first = if (ka) |k| (if (kw) |w| @min(w, k) else k) else kw;
+    if (qa == null and k_first == null) return .none;
+    if (k_first != null and (qa == null or k_first.? < qa.?)) return nextK2Block(buf, k_first.?);
+    const a = qa.?;
     const body_start = a + open_tag.len;
     const b = std.mem.indexOfPos(u8, buf, body_start, close_tag) orelse
         return .{ .partial = .{ .text_before = buf[0..a] } };
@@ -168,13 +207,117 @@ pub fn nextBlock(buf: []const u8) Found {
     } };
 }
 
+/// The K2 form from `first` (the wrapper or a call tag, whichever came first):
+/// the block spans a leading wrapper open and a trailing wrapper close when they
+/// are adjacent to the call, so neither leaks into the surrounding text.
+fn nextK2Block(buf: []const u8, first: usize) Found {
+    const a = std.mem.indexOfPos(u8, buf, first, k2_open) orelse
+        return .{ .partial = .{ .text_before = buf[0..first] } };
+    const body_start = a + k2_open.len;
+    const b = std.mem.indexOfPos(u8, buf, body_start, k2_close) orelse
+        return .{ .partial = .{ .text_before = buf[0..first] } };
+    var before_end = a;
+    const lead = std.mem.trimEnd(u8, buf[0..a], " \t\r\n");
+    if (std.mem.endsWith(u8, lead, k2_wrap_open)) before_end = lead.len - k2_wrap_open.len;
+    var after_start = b + k2_close.len;
+    const tail = std.mem.trimStart(u8, buf[after_start..], " \t\r\n");
+    if (std.mem.startsWith(u8, tail, k2_wrap_close)) after_start = buf.len - tail.len + k2_wrap_close.len;
+    return .{ .block = .{
+        .text_before = buf[0..before_end],
+        .body = buf[body_start..b],
+        .after = buf[after_start..],
+        .k2 = true,
+    } };
+}
+
+/// One `<ifm|arg_key>`/`<ifm|arg_value>` pair of a K2 body, values as the raw text
+/// between the tags. Pure, for callers that cannot allocate (the GUI's per-frame
+/// display scan); `parse` re-types them.
+pub const K2Arg = struct { key: []const u8, type_name: ?[]const u8, value: []const u8 };
+
+pub const K2Args = struct {
+    rest: []const u8,
+
+    pub fn next(self: *K2Args) ?K2Arg {
+        const ks = std.mem.indexOf(u8, self.rest, "<ifm|arg_key>") orelse return null;
+        const key_start = ks + "<ifm|arg_key>".len;
+        const key_end = std.mem.indexOfPos(u8, self.rest, key_start, "</ifm|arg_key>") orelse return null;
+        var pos = key_end + "</ifm|arg_key>".len;
+        var type_name: ?[]const u8 = null;
+        const t = std.mem.trimStart(u8, self.rest[pos..], " \t\r\n");
+        if (std.mem.startsWith(u8, t, "<ifm|arg_type>")) {
+            const ts = self.rest.len - t.len + "<ifm|arg_type>".len;
+            const te = std.mem.indexOfPos(u8, self.rest, ts, "</ifm|arg_type>") orelse return null;
+            type_name = std.mem.trim(u8, self.rest[ts..te], " \t\r\n");
+            pos = te + "</ifm|arg_type>".len;
+        }
+        const vs0 = std.mem.indexOfPos(u8, self.rest, pos, "<ifm|arg_value>") orelse return null;
+        const vs = vs0 + "<ifm|arg_value>".len;
+        const ve = std.mem.indexOfPos(u8, self.rest, vs, "</ifm|arg_value>") orelse self.rest.len;
+        const arg: K2Arg = .{ .key = std.mem.trim(u8, self.rest[key_start..key_end], " \t\r\n"), .type_name = type_name, .value = self.rest[vs..ve] };
+        self.rest = self.rest[@min(self.rest.len, ve + "</ifm|arg_value>".len)..];
+        return arg;
+    }
+};
+
+/// The function name a K2 body opens with (its first line), or null.
+pub fn k2Name(body: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, body, " \t\r\n");
+    const end = std.mem.indexOfAny(u8, t, "\r\n<") orelse t.len;
+    const name = std.mem.trim(u8, t[0..end], " \t");
+    return if (name.len == 0) null else name;
+}
+
+/// Iterate a K2 body's arguments (the text after the name line).
+pub fn k2Args(body: []const u8) K2Args {
+    return .{ .rest = body };
+}
+
+/// Whether `buf` holds any tool-call block, complete or streaming, in any form.
+pub fn hasBlock(buf: []const u8) bool {
+    return nextBlock(buf) != .none;
+}
+
 /// Parse one block body (what `Found.block.body` gives) into a `Call`.
 /// Auto-detects the two formats: a body whose first non-space byte is `{` is the
 /// JSON form, anything else the XML form.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Call {
     const t = std.mem.trim(u8, body, " \t\r\n");
     if (t.len == 0) return error.EmptyToolCall;
-    return if (t[0] == '{') parseJson(gpa, t) else parseXml(gpa, body);
+    if (t[0] == '{') return parseJson(gpa, t);
+    if (std.mem.indexOf(u8, t, "<ifm|arg_key>") != null) return parseK2(gpa, body);
+    return parseXml(gpa, body);
+}
+
+/// The K2 form: `NAME` on the first line, then arg pairs. A declared
+/// `<ifm|arg_type>` of string keeps the value verbatim; otherwise the value is
+/// re-typed the way the qwen form is (JSON literal if it parses, else a string).
+/// `parse` only reaches this on an arg tag; a no-argument call is a bare name
+/// line, which only the scanner (`Found.block.k2`) can vouch for.
+pub fn parseK2(gpa: std.mem.Allocator, body: []const u8) !Call {
+    const name = k2Name(body) orelse return error.NoFunctionTag;
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 128);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{");
+    var it = k2Args(body);
+    var n: usize = 0;
+    while (it.next()) |arg| {
+        if (arg.key.len == 0) continue;
+        if (n > 0) try w.writeAll(", ");
+        try std.json.Stringify.encodeJsonString(arg.key, .{}, w);
+        try w.writeAll(": ");
+        const val = stripDelimiterNewlines(arg.value);
+        if (arg.type_name != null and std.mem.eql(u8, arg.type_name.?, "string"))
+            try std.json.Stringify.encodeJsonString(val, .{}, w)
+        else
+            try writeArgValue(gpa, w, val);
+        n += 1;
+    }
+    try w.writeAll("}");
+    const args = try aw.toOwnedSlice();
+    errdefer gpa.free(args);
+    return .{ .name = try gpa.dupe(u8, name), .arguments_json = args };
 }
 
 /// Every call in `buf`, appended to `out` (caller `deinit`s each). A block that
@@ -189,7 +332,7 @@ pub fn parseAll(gpa: std.mem.Allocator, buf: []const u8, out: *std.ArrayList(Cal
             .block => |b| b,
         };
         rest = blk.after;
-        const c = parse(gpa, blk.body) catch {
+        const c = (if (blk.k2) parseK2(gpa, blk.body) else parse(gpa, blk.body)) catch {
             if (bad) |p| p.* += 1;
             continue;
         };
@@ -363,6 +506,14 @@ test "splitThought: primed turn with no opening marker folds the thought" {
     const s = splitThought(txt, think_markers, true);
     try testing.expectEqualStrings("Here's a thinking process:\n1. multiply.", s.think.?);
     try testing.expectEqualStrings("17 x 4 = 68.", s.answer);
+    try testing.expect(!s.open);
+}
+
+test "splitThought: K2 accepts any effort close marker" {
+    const low: Reasoning = .{ .open = "<ifm|think_faster>", .close = "</ifm|think_faster>" };
+    const s = splitThought("brief\n</ifm|think>\nanswer", low, true);
+    try testing.expectEqualStrings("brief", s.think.?);
+    try testing.expectEqualStrings("answer", s.answer);
     try testing.expect(!s.open);
 }
 
@@ -559,4 +710,52 @@ test "parseAll: several calls in one reply; a broken one is counted, not fatal" 
     try testing.expectEqualStrings("a", out.items[0].name);
     try testing.expectEqualStrings("b", out.items[1].name);
     try testing.expectEqualStrings("{\"x\": 1}", out.items[1].arguments_json);
+}
+
+test "K2 form: wrapper folded into the block, name line + arg pairs parsed" {
+    const gpa = testing.allocator;
+    const txt = "Sure.\n<ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Paris</ifm|arg_value>\n<ifm|arg_key>days</ifm|arg_key>\n<ifm|arg_type>integer</ifm|arg_type>\n<ifm|arg_value>3</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>\nDone.";
+    switch (nextBlock(txt)) {
+        .block => |b| {
+            try testing.expectEqualStrings("Sure.\n", b.text_before);
+            try testing.expectEqualStrings("\nDone.", b.after);
+            var c = try parse(gpa, b.body);
+            defer c.deinit(gpa);
+            try testing.expectEqualStrings("get_weather", c.name);
+            try testing.expectEqualStrings("{\"city\": \"Paris\", \"days\": 3}", c.arguments_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "K2 form: a typed string that looks like a number stays a string" {
+    const gpa = testing.allocator;
+    var c = try parse(gpa, "f\n<ifm|arg_key>id</ifm|arg_key><ifm|arg_type>string</ifm|arg_type><ifm|arg_value>42</ifm|arg_value>");
+    defer c.deinit(gpa);
+    try testing.expectEqualStrings("{\"id\": \"42\"}", c.arguments_json);
+}
+
+test "K2 form: a wrapper without a finished call is partial" {
+    switch (nextBlock("Let me draw that.\n<ifm|tool_calls>\n<ifm|tool_call>generate_image\n<ifm|arg_key>prom")) {
+        .partial => |p| try testing.expectEqualStrings("Let me draw that.\n", p.text_before),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (nextBlock("text\n<ifm|tool_calls>")) {
+        .partial => |p| try testing.expectEqualStrings("text\n", p.text_before),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "K2 form: two calls in one wrapper scan in sequence" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(Call) = .empty;
+    defer {
+        for (out.items) |*c| c.deinit(gpa);
+        out.deinit(gpa);
+    }
+    try parseAll(gpa, "<ifm|tool_calls>\n<ifm|tool_call>a\n</ifm|tool_call>\n<ifm|tool_call>b\n<ifm|arg_key>x</ifm|arg_key>\n<ifm|arg_value>[1, 2]</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>", &out, null);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqualStrings("a", out.items[0].name);
+    try testing.expectEqualStrings("{}", out.items[0].arguments_json);
+    try testing.expectEqualStrings("{\"x\": [1, 2]}", out.items[1].arguments_json);
 }

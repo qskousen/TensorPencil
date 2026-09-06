@@ -649,6 +649,7 @@ storage form, and a narrow conv falling to it writes f32 into an f16 buffer.
 |---|---|---|---|---|---|
 | **qwen3** (Qwen3 / Qwen3-VL / llama-arch Mistral-Nemo) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` |
 | **qwen35** (hybrid DeltaNet: GDN + attn) | ✅ | ✅ | ✅ | ✅ | `qwen35{,_gpu,_cuda}.zig` |
+| **k2-horizon** (MoE + MoVA) | ✅ | ❌ | ✅ | ✅ | `k2_horizon{,_cuda}.zig` |
 | **gemma3** (sandwich norms, dual RoPE) | ✅ | ✅ | ✅ | ✅ | `gemma3{,_gpu,_cuda}.zig` |
 | **gemma4** (per-layer geometry, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` |
 
@@ -656,6 +657,25 @@ storage form, and a narrow conv falling to it writes f32 into an f16 buffer.
   generalized `llama`/Mistral arch (un-permuted q/k at load, optional QK-norm, untied head,
   runtime vocab/eps). GGUF metadata config-detect up to 64 layers.
 - **qwen35** has no spec decode (recurrent state).
+- **k2-horizon** supports grouped RMSNorm, sigmoid routing, shared experts, attention
+  gates, MoVA value experts, and reasoning effort. CUDA pins the fixed path and as many
+  routed-expert groups as fit; the rest live on the host, a layer at a time, and that
+  placement is the residency unit the runtime drives (`migrateLayer`/`promoteLayer`,
+  `autoOffload`, `offloadToBudget`, KV growth migrates layers first, never LRU-streams).
+  Host layers: decode and batches of up to 8 tokens run their experts on the CPU (one
+  threaded pass per gate+up / down / values, `ops.matmul.quantGemvBatch`), larger batches
+  stage the layer's groups to the GPU once per prefill (`Stage`, `uploadInto`). Routed
+  GEMMs on the device: up to 256 packed rows the grouped q8 GEMV (`gemv_q6_k_q8_expert`,
+  q6_k only), above that one f16 dequant of the whole group + one grouped tensor-core GEMM
+  (`hgemm_experts`, any block quant); the q6_k MMQ expert kernel stays selectable
+  (`TP_K2_EXPERT_GEMM=mmq|gemv`). Expert outputs combine through `moe_combine` (a gather
+  in slot order: deterministic, no scatter race). Routers are upcast to f32 at load.
+  Prefill attention on f32 KV runs the causal tensor-core path (`opAttnTCCausal`) for
+  batches of 64+ tokens; f16/q8_0 KV and short batches use the flash-split kernel.
+  Prompts render through the model's own chat template (it needs the `generation`
+  block and `replace` filter our Jinja now has); tools are declared through it and the
+  native `<ifm|tool_call>` wire format is parsed by `llm/tool_call.zig`. The GUI declares
+  its image tool that way for this family (`generate_image`) instead of the `<image>` prose.
 - **gemma3** is entirely GGUF block-quant.
 - **gemma4** config is fully metadata-driven: 12B (Q4_0, 48L) and 31B (mixed Q4_K/Q6_K, tied
   Q6_K head, 60L, hidden 5376, kv 16↔4) load with no code change. Vision via `gemma4uv` /

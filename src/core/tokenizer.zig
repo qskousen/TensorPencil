@@ -140,7 +140,7 @@ fn isTekLo(cp: u21) bool {
 /// Pretokenizer regex variant (tokenizer.ggml.pre). qwen35 differs from
 /// qwen2 in two places: letter runs are [\p{L}\p{M}]+ (combining marks join
 /// the run) and the punctuation class also excludes \p{M}.
-pub const Pretok = enum { qwen2, qwen35, tekken };
+pub const Pretok = enum { qwen2, qwen35, k2_horizon, tekken };
 
 /// Tokenizer algorithm. `bpe` is GPT-2 byte-level BPE (Qwen family);
 /// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma 3, Llama);
@@ -274,6 +274,8 @@ pub const Tokenizer = struct {
         if (g.getStr("tokenizer.ggml.pre")) |pre| {
             if (std.mem.eql(u8, pre, "qwen35")) {
                 pretok = .qwen35;
+            } else if (std.mem.eql(u8, pre, "k2-horizon")) {
+                pretok = .k2_horizon;
             } else if (std.mem.eql(u8, pre, "tekken")) {
                 pretok = .tekken; // Mistral (Nemo etc.): case-split letter runs, single-digit
             } else if (!std.mem.eql(u8, pre, "qwen2")) {
@@ -334,7 +336,8 @@ pub const Tokenizer = struct {
             .pretok = pretok,
         };
         const eos: ?u32 = if (g.getUint("tokenizer.ggml.eos_token_id")) |e| @intCast(e) else null;
-        t.turn_end = findSpecial(t.specials, "<|im_end|>") orelse eos orelse return error.MissingTokenizer;
+        t.turn_end = findSpecial(t.specials, "<|im_end|>") orelse
+            findSpecial(t.specials, "<|ifm|im_end|>") orelse eos orelse return error.MissingTokenizer;
         t.eos = eos;
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
         // Prepend BOS only when the model asks for it (Mistral/llama: true;
@@ -886,7 +889,7 @@ pub const Tokenizer = struct {
     }
 
     /// Register one merge rule ("left right", byte-level-unicode form).
-    /// Longest key in these vocabs is 128 UTF-8 bytes; decoded never longer.
+    /// K2 Horizon includes 224-byte whitespace merge operands.
     fn addMerge(
         alloc: std.mem.Allocator,
         merges: *std.AutoHashMapUnmanaged(u64, Merge),
@@ -894,10 +897,10 @@ pub const Tokenizer = struct {
         line: []const u8,
         rank: u32,
     ) !void {
-        var pair_buf: [256]u8 = undefined; // left ++ right, concatenated
-        var right_buf: [128]u8 = undefined;
+        var pair_buf: [2048]u8 = undefined; // left ++ right, concatenated
+        var right_buf: [1024]u8 = undefined;
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidMerges;
-        const left_n = try decodeTokenKey(line[0..space], pair_buf[0..128]);
+        const left_n = try decodeTokenKey(line[0..space], pair_buf[0..1024]);
         const right_n = try decodeTokenKey(line[space + 1 ..], &right_buf);
         const left = raw_to_id.get(pair_buf[0..left_n]) orelse return error.InvalidMerges;
         const right = raw_to_id.get(right_buf[0..right_n]) orelse return error.InvalidMerges;
@@ -1046,7 +1049,9 @@ pub const Tokenizer = struct {
 
         const wordish = struct {
             fn f(p: Pretok, cp: u21) bool {
-                return isLetter(cp) or (p == .qwen35 and isMark(cp));
+                return isLetter(cp) or
+                    ((p == .qwen35 or p == .k2_horizon) and isMark(cp)) or
+                    (p == .k2_horizon and (cp == 0x200c or cp == 0x200d));
             }
         }.f;
 
@@ -1062,8 +1067,13 @@ pub const Tokenizer = struct {
             return j;
         }
 
-        // 3: single number char.
-        if (isNumber(c0)) return i + 1;
+        // K2 groups one to three digits; Qwen emits one digit at a time.
+        if (isNumber(c0)) {
+            if (pretok != .k2_horizon) return i + 1;
+            var j = i + 1;
+            while (j < n and j - i < 3 and isNumber(cps[j])) j += 1;
+            return j;
+        }
 
         // 4: optional space + punctuation run + trailing newlines.
         {

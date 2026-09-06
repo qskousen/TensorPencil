@@ -16,6 +16,8 @@ pub const vae_gpu = @import("models/vae_gpu.zig");
 pub const vae_cuda = @import("models/vae_cuda.zig");
 pub const vae_tiled = @import("models/vae_tiled.zig");
 pub const qwen3 = @import("models/qwen3.zig");
+pub const k2_horizon = @import("models/k2_horizon.zig");
+pub const k2_horizon_cuda = @import("models/k2_horizon_cuda.zig");
 pub const qwen35 = @import("models/qwen35.zig");
 pub const gemma3 = @import("models/gemma3.zig");
 pub const gemma4 = @import("models/gemma4.zig");
@@ -150,6 +152,7 @@ test {
     _ = qwen3_gpu;
     _ = qwen35_gpu;
     _ = qwen3_cuda;
+    _ = k2_horizon_cuda;
     _ = eagle3;
     _ = krea2_text;
     _ = lpips;

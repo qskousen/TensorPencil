@@ -442,6 +442,64 @@ pub const qk_rmsnorm_par_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Grouped RMSNorm. Flattened groups are contiguous rows; u0 is their count,
+/// u1 the group width, and u2 the number of groups per original row.
+pub const group_rmsnorm_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry group_rmsnorm(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<5>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<12>;
+    \\  .reg .b64 %rd<16>;
+    \\  .shared .align 4 .b8 red[1024];
+    \\  mov.u32 %r1,%ctaid.x;
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r1,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];
+    \\  ld.param.u32 %r5,[u2];
+    \\  ld.param.f32 %f1,[f0];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  mul.lo.u32 %r7,%r1,%r4; mul.wide.u32 %rd4,%r7,4;
+    \\  add.s64 %rd5,%rd1,%rd4; add.s64 %rd6,%rd2,%rd4;
+    \\  rem.u32 %r6,%r1,%r5; mul.lo.u32 %r6,%r6,%r4;
+    \\  mov.f32 %f2,0f00000000; mov.u32 %r8,%r3;
+    \\SS:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra SSD;
+    \\  mul.wide.u32 %rd7,%r8,4; add.s64 %rd8,%rd5,%rd7;
+    \\  ld.global.f32 %f3,[%rd8]; fma.rn.f32 %f2,%f3,%f3,%f2;
+    \\  add.u32 %r8,%r8,256; bra SS;
+    \\SSD:
+    \\  mov.u32 %r9,red; shl.b32 %r10,%r3,2; add.u32 %r10,%r10,%r9;
+    \\  st.shared.f32 [%r10],%f2; bar.sync 0;
+    \\  mov.u32 %r11,128;
+    \\RED:
+    \\  setp.eq.u32 %p2,%r11,0; @%p2 bra REDD;
+    \\  setp.ge.u32 %p3,%r3,%r11; @%p3 bra REDS;
+    \\  ld.shared.f32 %f4,[%r10]; shl.b32 %r12,%r11,2; add.u32 %r12,%r10,%r12;
+    \\  ld.shared.f32 %f5,[%r12]; add.f32 %f4,%f4,%f5; st.shared.f32 [%r10],%f4;
+    \\REDS:
+    \\  bar.sync 0; shr.u32 %r11,%r11,1; bra RED;
+    \\REDD:
+    \\  ld.shared.f32 %f6,[%r9]; cvt.rn.f32.u32 %f7,%r4;
+    \\  div.rn.f32 %f6,%f6,%f7; add.f32 %f6,%f6,%f1; rsqrt.approx.f32 %f8,%f6;
+    \\  mov.u32 %r8,%r3;
+    \\AP:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra END;
+    \\  mul.wide.u32 %rd7,%r8,4; add.s64 %rd8,%rd5,%rd7; ld.global.f32 %f3,[%rd8];
+    \\  add.u32 %r13,%r6,%r8; mul.wide.u32 %rd9,%r13,4; add.s64 %rd9,%rd3,%rd9; ld.global.f32 %f9,[%rd9];
+    \\  mul.f32 %f3,%f3,%f8; mul.f32 %f3,%f3,%f9;
+    \\  add.s64 %rd10,%rd6,%rd7; st.global.f32 [%rd10],%f3;
+    \\  add.u32 %r8,%r8,256; bra AP;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Classic LayerNorm with weight and bias (qwen3vl ViT ln1/ln2/post_ln):
 /// out = (x - mean) / sqrt(var + eps) * w + b, one 256-thread block per row.
 /// Two-pass variance (sum -> mean -> sum (x-mean)^2), matching
@@ -2788,6 +2846,86 @@ fn q6nInput(comptime i: u32) []const u8 {
         \\
     , .{ i, 40 + i, 40 + i });
 }
+
+/// Each contiguous grid range selects an expert and up to eight activation rows.
+/// `p3[group]` packs expert:8, row count:4, and row offset:20.
+pub const gemv_q6_k_q8_expert_ptx: [:0]const u8 = q6_expert_head ++ q8nInputs(q6nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
+
+const q6_expert_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_q6_k_q8_expert(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<64>;
+    \\  .reg .f32 %f<48>;
+    \\  .reg .b64 %rd<30>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x; ld.param.u32 %r59,[u3];
+    \\  div.u32 %r62,%r1,%r59; rem.u32 %r1,%r1,%r59;
+    \\  shr.u32 %r5,%r3,5;
+    \\  and.b32 %r6,%r3,31;
+    \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];
+    \\  ld.param.u32 %r63,[u4];
+    \\  ld.param.f32 %f1,[f0];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd28,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd28,%rd28;
+    \\  mul.wide.u32 %rd29,%r62,4; add.s64 %rd29,%rd28,%rd29; ld.global.u32 %r60,[%rd29];
+    \\  shr.u32 %r62,%r60,12; shr.u32 %r61,%r60,8; and.b32 %r61,%r61,0xf; and.b32 %r60,%r60,0xff;
+    \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,210;
+    \\  mul.lo.u32 %r11,%r2,%r10; mul.lo.u32 %r11,%r60,%r11; cvt.u64.u32 %rd29,%r11; add.s64 %rd1,%rd1,%rd29;
+    \\  mul.lo.u32 %r11,%r62,%r2; shl.b32 %r11,%r11,2; cvt.u64.u32 %rd29,%r11; add.s64 %rd3,%rd3,%rd29;
+    \\  mul.wide.u32 %rd7,%r7,%r10; add.s64 %rd8,%rd1,%rd7;
+    \\  shl.b32 %r10,%r63,2; cvt.u64.u32 %rd4,%r10; add.s64 %rd4,%rd2,%rd4;
+    \\  shr.u32 %r10,%r4,3; cvt.u64.u32 %rd25,%r10;
+    \\  mul.lo.u32 %r11,%r62,%r10; cvt.u64.u32 %rd5,%r11; add.s64 %rd5,%rd2,%rd5;
+    \\  mul.lo.u32 %r11,%r62,%r4; cvt.u64.u32 %rd6,%r11; add.s64 %rd6,%rd4,%rd6;
+    \\  cvt.u64.u32 %rd26,%r4;
+    \\  mov.u32 %r48,0; mov.u32 %r49,0x01010101;
+    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
+    \\  mov.f32 %f44,0f00000000; mov.f32 %f45,0f00000000; mov.f32 %f46,0f00000000; mov.f32 %f47,0f00000000;
+    \\  shr.u32 %r30,%r4,4;
+    \\  mov.u32 %r8,%r6;
+    \\LOOP:
+    \\  setp.ge.u32 %p4,%r8,%r30; @%p4 bra LD;
+    \\  shr.u32 %r9,%r8,4;
+    \\  and.b32 %r11,%r8,15;
+    \\  mul.lo.u32 %r10,%r9,210;
+    \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;
+    \\  shr.u32 %r12,%r11,3;
+    \\  and.b32 %r13,%r11,7; shl.b32 %r13,%r13,2;
+    \\  shl.b32 %r15,%r12,6; add.u32 %r15,%r15,%r13;
+    \\  cvt.u64.u32 %rd11,%r15; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.u16 %r16,[%rd12]; ld.global.u16 %r17,[%rd12+2];
+    \\  shl.b32 %r17,%r17,16; or.b32 %r16,%r16,%r17;
+    \\  ld.global.u16 %r18,[%rd12+32]; ld.global.u16 %r19,[%rd12+34];
+    \\  shl.b32 %r19,%r19,16; or.b32 %r18,%r18,%r19;
+    \\  shl.b32 %r20,%r12,5; add.u32 %r20,%r20,%r13;
+    \\  cvt.u64.u32 %rd13,%r20; add.s64 %rd17,%rd10,%rd13;
+    \\  ld.global.u16 %r21,[%rd17+128]; ld.global.u16 %r22,[%rd17+130];
+    \\  shl.b32 %r22,%r22,16; or.b32 %r21,%r21,%r22;
+    \\  ld.global.b16 %h0,[%rd10+208]; cvt.f32.f16 %f24,%h0;
+    \\  shl.b32 %r23,%r12,3; shr.u32 %r25,%r13,4; add.u32 %r23,%r23,%r25;
+    \\  cvt.u64.u32 %rd14,%r23; add.s64 %rd15,%rd10,%rd14;
+    \\  ld.global.s8 %r26,[%rd15+192];
+    \\  ld.global.s8 %r29,[%rd15+194];
+    \\  ld.global.s8 %r31,[%rd15+196];
+    \\  ld.global.s8 %r32,[%rd15+198];
+    \\  and.b32 %r40,%r16,0x0f0f0f0f; and.b32 %r41,%r21,0x03030303; shl.b32 %r41,%r41,4; or.b32 %r40,%r40,%r41;
+    \\  and.b32 %r42,%r18,0x0f0f0f0f; shr.u32 %r43,%r21,2; and.b32 %r43,%r43,0x03030303; shl.b32 %r43,%r43,4; or.b32 %r42,%r42,%r43;
+    \\  shr.u32 %r44,%r16,4; and.b32 %r44,%r44,0x0f0f0f0f; shr.u32 %r45,%r21,4; and.b32 %r45,%r45,0x03030303; shl.b32 %r45,%r45,4; or.b32 %r44,%r44,%r45;
+    \\  shr.u32 %r46,%r18,4; and.b32 %r46,%r46,0x0f0f0f0f; shr.u32 %r47,%r21,6; and.b32 %r47,%r47,0x03030303; shl.b32 %r47,%r47,4; or.b32 %r46,%r46,%r47;
+    \\  shl.b32 %r33,%r9,3; shl.b32 %r34,%r12,2; add.u32 %r33,%r33,%r34;
+    \\  shl.b32 %r34,%r33,2;
+    \\  cvt.u64.u32 %rd18,%r34; add.s64 %rd22,%rd5,%rd18;
+    \\  shl.b32 %r34,%r9,8; shl.b32 %r35,%r12,7; add.u32 %r34,%r34,%r35; add.u32 %r34,%r34,%r13;
+    \\  cvt.u64.u32 %rd20,%r34; add.s64 %rd23,%rd6,%rd20;
+    \\
+;
 
 /// gemv_q5_k_q8n's q4_k sibling: identical scale decode, dp4a dot (dot*sc -
 /// su*m min term), and epilogue, the only difference is the weight value is
@@ -5687,6 +5825,126 @@ pub const add_scaled_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Gather selected f32 rows. b0=src, b1=dst, b2=u32 row ids; u0=total,
+/// u1=row width.
+pub const gather_rows_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gather_rows(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>; .reg .b32 %r<10>; .reg .b64 %rd<12>; .reg .f32 %f<2>;
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x;
+    \\  mad.lo.s32 %r1,%r2,%r3,%r1; ld.param.u32 %r4,[u0];
+    \\  setp.ge.u32 %p1,%r1,%r4; @%p1 bra END;
+    \\  ld.param.u32 %r5,[u1]; div.u32 %r6,%r1,%r5; rem.u32 %r7,%r1,%r5;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  mul.wide.u32 %rd4,%r6,4; add.s64 %rd4,%rd3,%rd4; ld.global.u32 %r8,[%rd4];
+    \\  mad.lo.u32 %r9,%r8,%r5,%r7; mul.wide.u32 %rd5,%r9,4; add.s64 %rd6,%rd1,%rd5;
+    \\  ld.global.f32 %f1,[%rd6]; mul.wide.u32 %rd7,%r1,4; add.s64 %rd8,%rd2,%rd7; st.global.f32 [%rd8],%f1;
+    \\END: ret;
+    \\}
+;
+
+/// Scatter-add selected f32 rows. b0=dst, b1=src, b2=u32 row ids,
+/// b3=f32 row scales; u0=total, u1=row width. Plain read-modify-write: the ids
+/// of one launch must be distinct (use moe_combine when a row can repeat).
+pub const scatter_add_rows_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry scatter_add_rows(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>; .reg .b32 %r<10>; .reg .b64 %rd<16>; .reg .f32 %f<4>;
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x;
+    \\  mad.lo.s32 %r1,%r2,%r3,%r1; ld.param.u32 %r4,[u0];
+    \\  setp.ge.u32 %p1,%r1,%r4; @%p1 bra END;
+    \\  ld.param.u32 %r5,[u1]; div.u32 %r6,%r1,%r5; rem.u32 %r7,%r1,%r5;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r6,4; add.s64 %rd6,%rd3,%rd5; ld.global.u32 %r8,[%rd6];
+    \\  add.s64 %rd7,%rd4,%rd5; ld.global.f32 %f1,[%rd7];
+    \\  mul.wide.u32 %rd8,%r1,4; add.s64 %rd9,%rd2,%rd8; ld.global.f32 %f2,[%rd9];
+    \\  mad.lo.u32 %r9,%r8,%r5,%r7; mul.wide.u32 %rd10,%r9,4; add.s64 %rd11,%rd1,%rd10;
+    \\  ld.global.f32 %f3,[%rd11]; fma.rn.f32 %f3,%f2,%f1,%f3; st.global.f32 [%rd11],%f3;
+    \\END: ret;
+    \\}
+;
+
+/// MoE combine: dst[t][j] = sum_k scales[r] * src[r][j] over a token's `used`
+/// route rows r = slot_rows[t*used+k], in slot order, so the result is
+/// deterministic and no two threads touch one output. b0=dst, b1=src, b2=u32
+/// slot_rows, b3=f32 route scales; u0=total (tokens*width), u1=width, u2=used.
+pub const moe_combine_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry moe_combine(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>; .reg .b32 %r<16>; .reg .b64 %rd<16>; .reg .f32 %f<4>;
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x;
+    \\  mad.lo.s32 %r1,%r2,%r3,%r1; ld.param.u32 %r4,[u0];
+    \\  setp.ge.u32 %p1,%r1,%r4; @%p1 bra END;
+    \\  ld.param.u32 %r5,[u1]; ld.param.u32 %r6,[u2]; div.u32 %r7,%r1,%r5; rem.u32 %r8,%r1,%r5;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.lo.u32 %r9,%r7,%r6; mul.wide.u32 %rd5,%r9,4; add.s64 %rd5,%rd3,%rd5;
+    \\  mov.f32 %f1,0f00000000; mov.u32 %r10,0;
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r10,%r6; @%p2 bra DONE;
+    \\  ld.global.u32 %r11,[%rd5];
+    \\  mul.wide.u32 %rd6,%r11,4; add.s64 %rd6,%rd4,%rd6; ld.global.f32 %f2,[%rd6];
+    \\  mad.lo.u32 %r12,%r11,%r5,%r8; mul.wide.u32 %rd7,%r12,4; add.s64 %rd7,%rd2,%rd7; ld.global.f32 %f3,[%rd7];
+    \\  fma.rn.f32 %f1,%f3,%f2,%f1;
+    \\  add.s64 %rd5,%rd5,4; add.u32 %r10,%r10,1; bra LOOP;
+    \\DONE:
+    \\  mul.wide.u32 %rd8,%r1,4; add.s64 %rd8,%rd1,%rd8; st.global.f32 [%rd8],%f1;
+    \\END: ret;
+    \\}
+;
+
+pub const silu_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry silu(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>; .reg .b32 %r<5>; .reg .b64 %rd<5>; .reg .f32 %f<5>;
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.s32 %r1,%r2,%r3,%r1;
+    \\  ld.param.u32 %r4,[u0]; setp.ge.u32 %p1,%r1,%r4; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1; mul.wide.u32 %rd2,%r1,4; add.s64 %rd3,%rd1,%rd2;
+    \\  ld.global.f32 %f1,[%rd3]; neg.f32 %f2,%f1; mul.f32 %f2,%f2,0f3FB8AA3B; ex2.approx.f32 %f2,%f2;
+    \\  add.f32 %f2,%f2,0f3F800000; rcp.approx.f32 %f2,%f2; mul.f32 %f1,%f1,%f2; st.global.f32 [%rd3],%f1;
+    \\END: ret;
+    \\}
+;
+
+/// a *= softplus(gate * ln(2)) / ln(2), evaluated as log2(1 + 2^gate).
+pub const softplus_gate_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry softplus_gate(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>; .reg .b32 %r<5>; .reg .b64 %rd<8>; .reg .f32 %f<6>;
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.s32 %r1,%r2,%r3,%r1;
+    \\  ld.param.u32 %r4,[u0]; setp.ge.u32 %p1,%r1,%r4; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r1,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5]; setp.gt.f32 %p2,%f2,0f00000000;
+    \\  @%p2 neg.f32 %f3,%f2; @!%p2 mov.f32 %f3,%f2; ex2.approx.f32 %f3,%f3;
+    \\  add.f32 %f3,%f3,0f3F800000; lg2.approx.f32 %f3,%f3; @%p2 add.f32 %f3,%f3,%f2;
+    \\  mul.f32 %f1,%f1,%f3; st.global.f32 [%rd4],%f1;
+    \\END: ret;
+    \\}
+;
+
 /// ReLU in place: a[idx] = max(0, a[idx]). b0=a. u0=total.
 pub const relu_ptx: [:0]const u8 =
     \\.version 8.0
@@ -6945,6 +7203,60 @@ pub const dequant_q5_k_f16_ptx: [:0]const u8 =
     \\  cvt.rn.f32.u32 %f5,%r19; mul.f32 %f5,%f5,%f3; sub.f32 %f5,%f5,%f4;
     \\  cvt.rn.f16.f32 %h2,%f5;
     \\  mul.wide.u32 %rd10,%r4,2; add.s64 %rd11,%rd2,%rd10; st.global.b16 [%rd11],%h2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `dequant_q6_k_f16` at 16 elements per thread: one (super-block, half, group of
+/// four `l`) per thread, word loads funnel-shifted to the 2-byte block alignment,
+/// four v4 f16 stores. Same operation order as the scalar kernel, so bit-identical.
+/// b0=in(q6_k), b1=out(f16). u0=total/16.
+pub const dequant_q6_k_f16v_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry dequant_q6_k_f16v(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>; .reg .b32 %r<48>; .reg .f32 %f<24>; .reg .b16 %h<20>; .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  shr.u32 %r6,%r4,4; and.b32 %r7,%r4,15; shr.u32 %r8,%r7,3; and.b32 %r9,%r7,7;      // sb, r, half, g
+    \\  mul.wide.u32 %rd3,%r6,210; add.s64 %rd3,%rd1,%rd3;                                  // super-block
+    \\  ld.global.b16 %h0,[%rd3+208]; cvt.f32.f16 %f1,%h0;                                  // d
+    \\  shl.b32 %r10,%r8,3; shr.u32 %r11,%r9,2; add.u32 %r10,%r10,%r11; add.u32 %r10,%r10,192;
+    \\  cvt.u64.u32 %rd4,%r10; add.s64 %rd4,%rd3,%rd4;                                      // &sc[is]
+    \\  ld.global.s8 %r12,[%rd4]; ld.global.s8 %r13,[%rd4+2]; ld.global.s8 %r14,[%rd4+4]; ld.global.s8 %r15,[%rd4+6];
+    \\  cvt.rn.f32.s32 %f2,%r12; mul.f32 %f2,%f1,%f2; cvt.rn.f32.s32 %f3,%r13; mul.f32 %f3,%f1,%f3;
+    \\  cvt.rn.f32.s32 %f4,%r14; mul.f32 %f4,%f1,%f4; cvt.rn.f32.s32 %f5,%r15; mul.f32 %f5,%f1,%f5;
+    \\  shl.b32 %r16,%r8,6; shl.b32 %r17,%r9,2; add.u32 %r16,%r16,%r17; add.u32 %r18,%r16,32;   // ql lo/hi offsets
+    \\  shl.b32 %r19,%r8,5; add.u32 %r19,%r19,%r17; add.u32 %r19,%r19,128;                    // qh offset
+    \\  cvt.u32.u64 %r20,%rd3; and.b32 %r20,%r20,3; shl.b32 %r20,%r20,3; and.b64 %rd5,%rd3,-4;   // funnel shift, aligned base
+    \\  cvt.u64.u32 %rd6,%r16; add.s64 %rd6,%rd5,%rd6; ld.global.u32 %r21,[%rd6]; ld.global.u32 %r22,[%rd6+4]; shf.r.clamp.b32 %r21,%r21,%r22,%r20;
+    \\  cvt.u64.u32 %rd7,%r18; add.s64 %rd7,%rd5,%rd7; ld.global.u32 %r23,[%rd7]; ld.global.u32 %r24,[%rd7+4]; shf.r.clamp.b32 %r23,%r23,%r24,%r20;
+    \\  cvt.u64.u32 %rd8,%r19; add.s64 %rd8,%rd5,%rd8; ld.global.u32 %r25,[%rd8]; ld.global.u32 %r26,[%rd8+4]; shf.r.clamp.b32 %r25,%r25,%r26,%r20;
+    \\  bfe.u32 %r30,%r21,0,4; bfe.u32 %r34,%r25,0,2; shl.b32 %r34,%r34,4; or.b32 %r30,%r30,%r34; sub.s32 %r30,%r30,32; cvt.rn.f32.s32 %f10,%r30; mul.f32 %f10,%f2,%f10; cvt.rn.f16.f32 %h1,%f10;
+    \\  bfe.u32 %r31,%r23,0,4; bfe.u32 %r35,%r25,2,2; shl.b32 %r35,%r35,4; or.b32 %r31,%r31,%r35; sub.s32 %r31,%r31,32; cvt.rn.f32.s32 %f11,%r31; mul.f32 %f11,%f3,%f11; cvt.rn.f16.f32 %h5,%f11;
+    \\  bfe.u32 %r32,%r21,4,4; bfe.u32 %r36,%r25,4,2; shl.b32 %r36,%r36,4; or.b32 %r32,%r32,%r36; sub.s32 %r32,%r32,32; cvt.rn.f32.s32 %f12,%r32; mul.f32 %f12,%f4,%f12; cvt.rn.f16.f32 %h9,%f12;
+    \\  bfe.u32 %r33,%r23,4,4; bfe.u32 %r37,%r25,6,2; shl.b32 %r37,%r37,4; or.b32 %r33,%r33,%r37; sub.s32 %r33,%r33,32; cvt.rn.f32.s32 %f13,%r33; mul.f32 %f13,%f5,%f13; cvt.rn.f16.f32 %h13,%f13;
+    \\  bfe.u32 %r30,%r21,8,4; bfe.u32 %r34,%r25,8,2; shl.b32 %r34,%r34,4; or.b32 %r30,%r30,%r34; sub.s32 %r30,%r30,32; cvt.rn.f32.s32 %f10,%r30; mul.f32 %f10,%f2,%f10; cvt.rn.f16.f32 %h2,%f10;
+    \\  bfe.u32 %r31,%r23,8,4; bfe.u32 %r35,%r25,10,2; shl.b32 %r35,%r35,4; or.b32 %r31,%r31,%r35; sub.s32 %r31,%r31,32; cvt.rn.f32.s32 %f11,%r31; mul.f32 %f11,%f3,%f11; cvt.rn.f16.f32 %h6,%f11;
+    \\  bfe.u32 %r32,%r21,12,4; bfe.u32 %r36,%r25,12,2; shl.b32 %r36,%r36,4; or.b32 %r32,%r32,%r36; sub.s32 %r32,%r32,32; cvt.rn.f32.s32 %f12,%r32; mul.f32 %f12,%f4,%f12; cvt.rn.f16.f32 %h10,%f12;
+    \\  bfe.u32 %r33,%r23,12,4; bfe.u32 %r37,%r25,14,2; shl.b32 %r37,%r37,4; or.b32 %r33,%r33,%r37; sub.s32 %r33,%r33,32; cvt.rn.f32.s32 %f13,%r33; mul.f32 %f13,%f5,%f13; cvt.rn.f16.f32 %h14,%f13;
+    \\  bfe.u32 %r30,%r21,16,4; bfe.u32 %r34,%r25,16,2; shl.b32 %r34,%r34,4; or.b32 %r30,%r30,%r34; sub.s32 %r30,%r30,32; cvt.rn.f32.s32 %f10,%r30; mul.f32 %f10,%f2,%f10; cvt.rn.f16.f32 %h3,%f10;
+    \\  bfe.u32 %r31,%r23,16,4; bfe.u32 %r35,%r25,18,2; shl.b32 %r35,%r35,4; or.b32 %r31,%r31,%r35; sub.s32 %r31,%r31,32; cvt.rn.f32.s32 %f11,%r31; mul.f32 %f11,%f3,%f11; cvt.rn.f16.f32 %h7,%f11;
+    \\  bfe.u32 %r32,%r21,20,4; bfe.u32 %r36,%r25,20,2; shl.b32 %r36,%r36,4; or.b32 %r32,%r32,%r36; sub.s32 %r32,%r32,32; cvt.rn.f32.s32 %f12,%r32; mul.f32 %f12,%f4,%f12; cvt.rn.f16.f32 %h11,%f12;
+    \\  bfe.u32 %r33,%r23,20,4; bfe.u32 %r37,%r25,22,2; shl.b32 %r37,%r37,4; or.b32 %r33,%r33,%r37; sub.s32 %r33,%r33,32; cvt.rn.f32.s32 %f13,%r33; mul.f32 %f13,%f5,%f13; cvt.rn.f16.f32 %h15,%f13;
+    \\  bfe.u32 %r30,%r21,24,4; bfe.u32 %r34,%r25,24,2; shl.b32 %r34,%r34,4; or.b32 %r30,%r30,%r34; sub.s32 %r30,%r30,32; cvt.rn.f32.s32 %f10,%r30; mul.f32 %f10,%f2,%f10; cvt.rn.f16.f32 %h4,%f10;
+    \\  bfe.u32 %r31,%r23,24,4; bfe.u32 %r35,%r25,26,2; shl.b32 %r35,%r35,4; or.b32 %r31,%r31,%r35; sub.s32 %r31,%r31,32; cvt.rn.f32.s32 %f11,%r31; mul.f32 %f11,%f3,%f11; cvt.rn.f16.f32 %h8,%f11;
+    \\  bfe.u32 %r32,%r21,28,4; bfe.u32 %r36,%r25,28,2; shl.b32 %r36,%r36,4; or.b32 %r32,%r32,%r36; sub.s32 %r32,%r32,32; cvt.rn.f32.s32 %f12,%r32; mul.f32 %f12,%f4,%f12; cvt.rn.f16.f32 %h12,%f12;
+    \\  bfe.u32 %r33,%r23,28,4; bfe.u32 %r37,%r25,30,2; shl.b32 %r37,%r37,4; or.b32 %r33,%r33,%r37; sub.s32 %r33,%r33,32; cvt.rn.f32.s32 %f13,%r33; mul.f32 %f13,%f5,%f13; cvt.rn.f16.f32 %h16,%f13;
+    \\  shl.b32 %r40,%r6,8; shl.b32 %r41,%r8,7; add.u32 %r40,%r40,%r41; add.u32 %r40,%r40,%r17;   // out element index
+    \\  mul.wide.u32 %rd9,%r40,2; add.s64 %rd9,%rd2,%rd9;
+    \\  st.global.v4.b16 [%rd9],{%h1,%h2,%h3,%h4}; st.global.v4.b16 [%rd9+64],{%h5,%h6,%h7,%h8};
+    \\  st.global.v4.b16 [%rd9+128],{%h9,%h10,%h11,%h12}; st.global.v4.b16 [%rd9+192],{%h13,%h14,%h15,%h16};
     \\END:
     \\  ret;
     \\}

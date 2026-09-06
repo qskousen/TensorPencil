@@ -228,15 +228,20 @@ const WeightEntry = struct {
     f16_converted: bool = false,
 };
 
+const WeightAlias = struct {
+    db: DeviceBuffer,
+    owner_key: usize,
+    owner_noise_id: u32,
+    noise_id: u32,
+};
+
 /// A queued weight upload for the prefetch thread: memcpy `bytes` (mmap) into a
 /// pinned slot then async-DMA into `db`, recording `ev` (compute waits on it).
-const PrefetchReq = struct { bytes: []const u8, db: DeviceBuffer, ev: cu.CUevent, gen: u64 };
+const PrefetchReq = struct { bytes: []const u8, db: DeviceBuffer, ev: cu.CUevent, gen: u64, after: ?cu.CUevent = null };
 const pf_ring_sz = 512;
 
-/// Weight-cache entries at or below this size are never evicted (see
-/// evictOneWeight): eviction reclaims negligible VRAM and the synchronous
-/// re-upload stalls the host behind the full compute queue, which collapses
-/// the streaming pipeline.
+/// Routine streaming eviction skips entries at or below this size. The OOM
+/// path may still reclaim them when they are the only available weights.
 const evict_min_size: u64 = 4 << 20;
 
 /// A weight buffer evicted but not yet freed: its `ev` (recorded on the compute
@@ -249,7 +254,6 @@ const PendingFree = struct { db: DeviceBuffer, ev: cu.CUevent };
 /// 4-bit decode divides the same absmax by 7 where an 8-bit one divides by 127, so
 /// the two are different numbers for the same weight.
 const BqScaleKey = struct { ptr: usize, bits: u8 };
-
 
 /// Weight noise: the two values every block-quant GEMM/GEMV kernel reads out of
 /// the parameter slots the ABI already carried unused. See `cuda/wnoise.zig` for
@@ -405,6 +409,7 @@ pub const Backend = struct {
     // streaming: under memory pressure the least-recently-used weights are
     // evicted and re-uploaded on next use, see reserveForWeights/evictOneWeight).
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
+    weight_aliases: std.AutoHashMapUnmanaged(usize, WeightAlias) = .empty,
     use_counter: u64 = 0,
     /// A weight scope is open: new cache entries are tagged for group
     /// release (see WeightEntry.scoped).
@@ -651,6 +656,8 @@ pub const Backend = struct {
     mm_fn: cu.CUfunction = null,
     hgemm_mod: ?ctxmod.Module = null,
     hgemm_fn: cu.CUfunction = null,
+    hgemm_x_mod: ?ctxmod.Module = null,
+    hgemm_x_fn: cu.CUfunction = null,
     mmq_q4k_mod: ?ctxmod.Module = null,
     mmq_q4k_fn: cu.CUfunction = null,
     mmq_pipe_mod: ?ctxmod.Module = null,
@@ -661,6 +668,8 @@ pub const Backend = struct {
     mmq_pipe_iq4_fn: cu.CUfunction = null,
     mmq_pipe6_mod: ?ctxmod.Module = null,
     mmq_pipe6_fn: cu.CUfunction = null,
+    mmq_pipe6_expert_mod: ?ctxmod.Module = null,
+    mmq_pipe6_expert_fn: cu.CUfunction = null,
     mmq_pipe1_mod: ?ctxmod.Module = null,
     mmq_pipe1_fn: cu.CUfunction = null,
     mmq_pipe8_mod: ?ctxmod.Module = null,
@@ -842,13 +851,11 @@ pub const Backend = struct {
             std.debug.print(
                 "[warmup] ptx-jit/load {d:.2}s ({d} mods) · cuBLASLt heuristic {d:.2}s ({d} shapes) · cuDNN sdpa {d:.2}s ({d} plans) · HtoD {d:.2}GB (fill {d:.2}s, slot-wait {d:.2}s) · weight-prefetch stall {d:.2}s\n",
                 .{
-                    @as(f64, @floatFromInt(self.ctx.jit_ns)) / 1e9,     self.ctx.jit_count,
-                    @as(f64, @floatFromInt(self.lt_heur_ns)) / 1e9,     self.lt_heur_count,
-                    @as(f64, @floatFromInt(self.sdpa_ns)) / 1e9,        self.sdpa_count,
-                    @as(f64, @floatFromInt(self.ctx.htod_bytes)) / 1e9,
-                    @as(f64, @floatFromInt(self.ctx.stage_read_ns)) / 1e9,
-                    @as(f64, @floatFromInt(self.ctx.stage_wait_ns)) / 1e9,
-                    @as(f64, @floatFromInt(self.wt_stall_ns)) / 1e9,
+                    @as(f64, @floatFromInt(self.ctx.jit_ns)) / 1e9,        self.ctx.jit_count,
+                    @as(f64, @floatFromInt(self.lt_heur_ns)) / 1e9,        self.lt_heur_count,
+                    @as(f64, @floatFromInt(self.sdpa_ns)) / 1e9,           self.sdpa_count,
+                    @as(f64, @floatFromInt(self.ctx.htod_bytes)) / 1e9,    @as(f64, @floatFromInt(self.ctx.stage_read_ns)) / 1e9,
+                    @as(f64, @floatFromInt(self.ctx.stage_wait_ns)) / 1e9, @as(f64, @floatFromInt(self.wt_stall_ns)) / 1e9,
                 },
             );
         }
@@ -896,6 +903,7 @@ pub const Backend = struct {
             self.tensorDestroy(&db);
         }
         self.weights.deinit(self.gpa);
+        self.weight_aliases.deinit(self.gpa);
         self.prep_mods.deinit(self.gpa);
         for (self.prep_owned.items) |m| m.unload(self.ctx);
         self.prep_owned.deinit(self.gpa);
@@ -915,11 +923,13 @@ pub const Backend = struct {
         if (self.fused_mod) |m| m.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
+        if (self.hgemm_x_mod) |m| m.unload(self.ctx);
         if (self.mmq_q4k_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe5_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe_iq4_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe6_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe6_expert_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe1_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe8_mod) |m| m.unload(self.ctx);
         for (self.mmq_pipe2_mod) |mo| if (mo) |m| m.unload(self.ctx);
@@ -1001,6 +1011,11 @@ pub const Backend = struct {
         self.pin_budget = std.math.maxInt(u64);
     }
 
+    /// Keep current pins but make later weight-cache misses evictable.
+    pub fn freezeWeightPins(self: *Backend) void {
+        self.pin_budget = self.pinned_bytes;
+    }
+
     /// Block the prefetch thread until `pf_wake` changes from `expect` (an
     /// enqueue or shutdown bumps it). Uses `std.Io`'s cross-platform futex; the
     /// uncancelable variant is safe from this raw (non-Io-runtime) thread.
@@ -1039,6 +1054,7 @@ pub const Backend = struct {
             }
             const req = self.pf_ring[tail % pf_ring_sz];
             const cb = ctxmod.Buffer{ .ptr = req.db.ptr(), .bytes = @intCast(req.db.size) };
+            if (req.after) |after| _ = self.ctx.api.cuStreamWaitEvent(self.ctx.xfer_stream, after, 0);
             self.ctx.uploadStaged(cb, req.bytes, req.ev) catch {};
             self.pf_tail.store(tail + 1, .release);
             self.pf_completed.store(req.gen, .release); // FIFO: gens complete in order
@@ -1052,6 +1068,7 @@ pub const Backend = struct {
         if (!self.async_uploads) return;
         const key = @intFromPtr(bytes.ptr);
         self.use_counter += 1;
+        if (self.aliasWeight(key)) |_| return;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
             return; // already resident or in flight
@@ -1120,14 +1137,14 @@ pub const Backend = struct {
                 // streaming instead of failing.
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
-                if (self.evictOneWeight()) continue;
+                if (self.evictOneWeight(true)) continue;
                 if (self.drainPoolForOom() > 0) continue; // sacrifice the recycle pool
                 if (self.evictNewestPrefetch()) continue; // last resort: drop the farthest-out prefetch
                 if (self.foreignReclaim(size)) continue; // finally: another context on this card
                 const es = self.evict_skip;
                 std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
                     size >> 20, self.ctx.memGetInfo().free >> 20, self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
-                    es.pin,     es.awaiting,                     es.mru,                    es.pf,                      es.small,
+                    es.pin,     es.awaiting,                      es.mru,                  es.pf,                     es.small,
                 });
                 return error.DeviceOutOfMemory;
             }
@@ -1382,7 +1399,7 @@ pub const Backend = struct {
         self.tensorDestroy(&d);
     }
 
-    fn evictOneWeight(self: *Backend) bool {
+    fn evictOneWeight(self: *Backend, allow_small: bool) bool {
         // In-flight prefetches (pf_gen > pf_completed) must not be freed, the
         // prefetch thread is about to DMA into them.
         const completed = self.pf_completed.load(.acquire);
@@ -1416,7 +1433,7 @@ pub const Backend = struct {
                 sk_pf += 1;
                 continue;
             } // protect in-flight prefetch
-            if (e.value_ptr.db.size <= evict_min_size) {
+            if (!allow_small and e.value_ptr.db.size <= evict_min_size) {
                 sk_small += 1;
                 continue;
             } // norms/scales: not worth a sync stall
@@ -1660,7 +1677,7 @@ pub const Backend = struct {
         // eviction; counting them stops the loop from over-evicting while
         // their events are still in flight.
         while (self.budgetHeadroom() + self.pending_free_bytes < need) {
-            if (!self.evictOneWeight()) return;
+            if (!self.evictOneWeight(false) and !self.evictOneWeight(true)) return;
         }
     }
 
@@ -1725,7 +1742,7 @@ pub const Backend = struct {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
-                if (self.evictOneWeight()) continue;
+                if (self.evictOneWeight(true)) continue;
                 if (self.foreignReclaim(delta)) continue; // another context on this card
                 return error.DeviceOutOfMemory;
             };
@@ -1781,6 +1798,10 @@ pub const Backend = struct {
         self.ctx.check(self.ctx.api.cuMemcpyDtoD(dst.ptr() + dst_off, src.ptr() + src_off, @intCast(size)), "cuMemcpyDtoD") catch return error.CudaError;
     }
 
+    pub fn tensorZero(self: *Backend, dst: DeviceBuffer, size: usize) Error!void {
+        self.ctx.memsetD8Async(.{ .ptr = dst.ptr(), .bytes = @intCast(size) }, 0, size) catch return error.CudaError;
+    }
+
     /// Cached small upload keyed by host pointer; returns the raw device handle.
     pub fn smallBuffer(self: *Backend, bytes: []const u8) Error!Handle {
         return (try self.cachedWeight(bytes)).buf;
@@ -1803,6 +1824,91 @@ pub const Backend = struct {
     pub fn warmWeight(self: *Backend, bytes: []const u8) void {
         if (bytes.len == 0) return;
         _ = self.cachedWeight(bytes) catch return;
+    }
+
+    /// An in-flight `uploadInto`. `ev` is recorded on the transfer stream once
+    /// the last piece's DMA is queued; `gen` is the ring generation that records it.
+    pub const StagedUpload = struct { ev: ?cu.CUevent, gen: u64 };
+
+    /// Async upload of `bytes` into the caller-owned `db` through the prefetch
+    /// ring, in slot-sized pieces, with no weight-cache entry. The DMA waits for
+    /// `after` (a compute-stream event) when given, so a buffer the GPU is still
+    /// reading can be refilled without a host sync. Call `uploadIntoWait` before
+    /// launching anything that reads `db`. Falls back to a synchronous upload
+    /// when there is no prefetch thread.
+    pub fn uploadInto(self: *Backend, db: DeviceBuffer, bytes: []const u8, after: ?cu.CUevent) Error!StagedUpload {
+        std.debug.assert(bytes.len <= db.size);
+        if (!self.async_uploads or self.ctx.staging_size == 0) {
+            if (after) |a| _ = self.ctx.api.cuStreamWaitEvent(self.ctx.xfer_stream, a, 0);
+            _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
+            const cb = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
+            self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
+            return .{ .ev = null, .gen = 0 };
+        }
+        const ev = self.ctx.eventCreate() catch return error.CudaError;
+        const piece = self.ctx.staging_size;
+        var off: usize = 0;
+        var gen: u64 = 0;
+        while (off < bytes.len) : (off += piece) {
+            const n = @min(piece, bytes.len - off);
+            var head = self.pf_head.load(.monotonic);
+            while (head - self.pf_tail.load(.acquire) >= pf_ring_sz) {
+                std.Thread.yield() catch {};
+                head = self.pf_head.load(.monotonic);
+            }
+            self.pf_gen += 1;
+            gen = self.pf_gen;
+            var dst = db.viewBytes(off);
+            dst.size = n;
+            self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes[off..][0..n], .db = dst, .ev = ev, .gen = gen, .after = if (off == 0) after else null };
+            self.pf_head.store(head + 1, .release);
+            self.pfWakeWorker();
+        }
+        return .{ .ev = ev, .gen = gen };
+    }
+
+    /// Make the compute stream wait for an `uploadInto`, then release its event.
+    pub fn uploadIntoWait(self: *Backend, u: StagedUpload) void {
+        const ev = u.ev orelse return;
+        while (self.pf_completed.load(.acquire) < u.gen) std.Thread.yield() catch {};
+        self.ctx.computeWaitEvent(ev) catch {};
+        self.ctx.eventDestroy(ev);
+    }
+
+    /// Record an event at the current tail of the compute stream.
+    pub fn recordCompute(self: *Backend) Error!cu.CUevent {
+        const ev = self.ctx.eventCreate() catch return error.CudaError;
+        self.ctx.check(self.ctx.api.cuEventRecord(ev, self.ctx.stream), "cuEventRecord(compute)") catch return error.CudaError;
+        return ev;
+    }
+
+    pub fn eventDestroy(self: *Backend, ev: cu.CUevent) void {
+        self.ctx.eventDestroy(ev);
+    }
+
+    /// The device copy of a weight, uploading and caching it on a miss.
+    pub fn residentWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
+        return self.cachedWeight(bytes);
+    }
+
+    /// Cache equal contiguous slices as one CUDA allocation.
+    pub fn warmWeightGroup(self: *Backend, first: []const u8, count: usize) void {
+        if (first.len == 0 or count == 0) return;
+        const full = first.ptr[0 .. first.len * count];
+        const owner = self.cachedWeight(full) catch return;
+        const owner_key = @intFromPtr(first.ptr);
+        const owner_noise_id = self.weights.get(owner_key).?.noise_id;
+        for (1..count) |i| {
+            const key = owner_key + i * first.len;
+            var db = owner.viewBytes(i * first.len);
+            db.size = first.len;
+            self.weight_aliases.put(self.gpa, key, .{
+                .db = db,
+                .owner_key = owner_key,
+                .owner_noise_id = owner_noise_id,
+                .noise_id = self.nextNoiseId(),
+            }) catch return;
+        }
     }
 
     /// Free the tensor-core attention scratch (the ~seq² scores plane dominates).
@@ -1887,6 +1993,38 @@ pub const Backend = struct {
         return freed;
     }
 
+    /// Keep the newest unpinned weights within `limit` bytes.
+    pub fn trimUnpinned(self: *Backend, limit: u64) u64 {
+        if (self.streamed_bytes <= limit) return 0;
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
+        self.drainPending();
+        const Candidate = struct { key: usize, last_use: u64 };
+        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer candidates.deinit(self.gpa);
+        var it = self.weights.iterator();
+        while (it.next()) |e| {
+            if (!e.value_ptr.pinned)
+                candidates.append(self.gpa, .{ .key = e.key_ptr.*, .last_use = e.value_ptr.last_use }) catch return 0;
+        }
+        std.mem.sort(Candidate, candidates.items, {}, struct {
+            fn less(_: void, a: Candidate, b: Candidate) bool {
+                return a.last_use < b.last_use;
+            }
+        }.less);
+        var freed: u64 = 0;
+        for (candidates.items) |candidate| {
+            if (self.streamed_bytes <= limit) break;
+            const e = self.weights.fetchRemove(candidate.key).?.value;
+            if (e.upload_ev) |ev| self.ctx.eventDestroy(ev);
+            self.streamed_bytes -|= e.db.size;
+            freed += e.db.size;
+            var db = e.db;
+            self.tensorDestroy(&db);
+        }
+        return freed;
+    }
+
     pub fn evictWeights(self: *Backend) void {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream); // in-flight prefetch DMAs
@@ -1898,6 +2036,7 @@ pub const Backend = struct {
             self.tensorDestroy(&db);
         }
         self.weights.clearRetainingCapacity();
+        self.weight_aliases.clearRetainingCapacity();
         self.drainPool();
         self.pinned_bytes = 0;
         self.streamed_bytes = 0;
@@ -1942,13 +2081,31 @@ pub const Backend = struct {
     /// weight, where the caller is about to upload it anyway.
     fn noiseKey(self: *Backend, bytes: []const u8) u32 {
         if (!self.weight_noise.on()) return 0;
-        const e = self.weights.getPtr(@intFromPtr(bytes.ptr)) orelse return 0;
+        const key = @intFromPtr(bytes.ptr);
+        if (self.weight_aliases.get(key)) |alias| {
+            if (self.weights.get(alias.owner_key)) |owner|
+                if (owner.noise_id == alias.owner_noise_id) return self.weight_noise.key(alias.noise_id);
+        }
+        const e = self.weights.getPtr(key) orelse return 0;
         return self.weight_noise.key(e.noise_id);
+    }
+
+    fn aliasWeight(self: *Backend, key: usize) ?DeviceBuffer {
+        const alias = self.weight_aliases.get(key) orelse return null;
+        if (self.weights.getPtr(alias.owner_key)) |owner| {
+            if (owner.noise_id == alias.owner_noise_id) {
+                owner.last_use = self.use_counter;
+                return alias.db;
+            }
+        }
+        _ = self.weight_aliases.remove(key);
+        return null;
     }
 
     fn cachedWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
         const key = @intFromPtr(bytes.ptr);
         self.use_counter += 1;
+        if (self.aliasWeight(key)) |db| return db;
         // A cached entry too small for `bytes` means the SAME host pointer was
         // cached earlier as a shorter slice (e.g. a shared zero-bias buffer
         // sliced to different GEMM widths). Returning it would read the tail out
@@ -2097,6 +2254,35 @@ pub const Backend = struct {
         self.hgemm_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
         self.hgemm_mod = mod;
         return self.hgemm_fn;
+    }
+
+    fn hgemmExpertsFn(self: *Backend) Error!cu.CUfunction {
+        if (self.hgemm_x_mod != null) return self.hgemm_x_fn;
+        const ptx = kernels.buildHgemmExperts(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.hgemm_x_fn = mod.getFunction(self.ctx, "hgemm_experts") catch return error.CudaError;
+        self.hgemm_x_mod = mod;
+        return self.hgemm_x_fn;
+    }
+
+    /// Grouped f16 GEMM over routed experts in one launch: for each of `tiles`
+    /// `kernels.hgemmGroup` entries in `groups`, y[offset..][count][rows] =
+    /// W16[expert][rows][cols] @ A16[offset..][count][cols]. A16 needs 128 readable
+    /// rows from every offset; y is written only within each tile's count.
+    pub fn opGemmF16Experts(self: *Backend, y: DeviceBuffer, w16: DeviceBuffer, a16: DeviceBuffer, groups: DeviceBuffer, tiles: usize, rows: usize, cols: usize) Error!void {
+        std.debug.assert(rows % 128 == 0 and cols % 32 == 0 and tiles >= 1);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const f = try self.hgemmExpertsFn();
+        var pa = a16.ptr();
+        var pb = w16.ptr();
+        var pc = y.ptr();
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(cols);
+        var pg = groups.ptr();
+        var params = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pg) };
+        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(tiles), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// Native bf16 tensor-core GEMM (dense bf16 DiT): same tiling as hgemmFn but
@@ -2500,6 +2686,10 @@ pub const Backend = struct {
         return dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs;
     }
 
+    pub fn routedExpertGemvEnabled(self: *const Backend) bool {
+        return !self.weight_noise.on();
+    }
+
     /// Whether `opGemvQuantQ8N` has a kernel for this dtype. Wider coverage than
     /// `quantQ8BatchSupported`, at 8 tokens per launch instead of all of them.
     pub fn quantQ8NSupported(dt: dtypes.DType) bool {
@@ -2555,9 +2745,22 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), self.noiseKey(w_bytes) }, .{ scale, self.weight_noise.sigma() }, rows / 8);
     }
 
-    /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape, dequant the
-    /// weight to the shared f16 scratch, convert/pad the activations, run the
-    /// f16 tensor-core GEMM. rows,cols must be multiples of 128,32.
+    pub fn opGemvQ6Experts(self: *Backend, y: DeviceBuffer, first: []const u8, expert_count: usize, expert_ids: DeviceBuffer, scale: f32, rows: usize, cols: usize, packed_rows: usize, groups: usize) Error!void {
+        const all = first.ptr[0 .. first.len * expert_count];
+        const w_db = try self.cachedWeight(all);
+        try self.opGemvQ6ExpertsDev(y, w_db, expert_ids, scale, rows, cols, packed_rows, groups);
+    }
+
+    /// `opGemvQ6Experts` on an already-resident expert group (e.g. a staging buffer).
+    pub fn opGemvQ6ExpertsDev(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, expert_ids: DeviceBuffer, scale: f32, rows: usize, cols: usize, packed_rows: usize, groups: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 256 == 0 and rows % 8 == 0 and groups >= 1 and packed_rows >= groups);
+        std.debug.assert(!self.weight_noise.on());
+        const f = try self.eltFn(elt.gemv_q6_k_q8_expert_ptx, "gemv_q6_k_q8_expert");
+        try self.rowLaunch(f, w_db, self.q8_act, y, expert_ids, .{ @intCast(rows), @intCast(cols), 0, @intCast(rows / 8), @intCast(packed_rows * cols / 32), 0 }, .{ scale, 0 }, rows / 8 * groups);
+    }
+
     /// Column tiles per warp / warps per block for the MMQ kernel. nt*8 = 128
     /// tokens per weight pass: below that MMQ re-reads the weight often enough
     /// to lose its traffic advantage over the dequant+f16-GEMM fallback.
@@ -2633,6 +2836,17 @@ pub const Backend = struct {
         return self.mmq_pipe6_fn;
     }
 
+    fn mmqPipe6ExpertFn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe6_expert_mod != null) return self.mmq_pipe6_expert_fn;
+        const ptx = kernels.buildMmqPipeQ6KExperts(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe6_expert_fn = mod.getFunction(self.ctx, "mmq_pipe_q6_k_experts") catch return error.CudaError;
+        self.mmq_pipe6_expert_mod = mod;
+        self.logOccupancy("mmq_pipe_q6_k_experts", self.mmq_pipe6_expert_fn, mmq_pipe_threads);
+        return self.mmq_pipe6_expert_fn;
+    }
+
     fn mmqPipe2Fn(self: *Backend, dt: dtypes.DType) Error!cu.CUfunction {
         const g: elt.Q2Geom = if (dt == .q2_0_g64) elt.q2_g64 else elt.q2_g128;
         const i: usize = if (dt == .q2_0_g64) 0 else 1;
@@ -2670,7 +2884,7 @@ pub const Backend = struct {
         if (!envSet("TP_KERNEL_INFO")) return;
         const occ = self.ctx.kernelOccupancy(f, threads) catch return;
         std.log.info("[kernel] {s}: {d} regs, {d} B shared, {d} block(s)/SM at {d} threads ({d} warps/scheduler)", .{
-            name, occ.regs, occ.shared, occ.blocks_per_sm, threads,
+            name,                                   occ.regs, occ.shared, occ.blocks_per_sm, threads,
             occ.blocks_per_sm * (threads / 32) / 4,
         });
     }
@@ -2765,11 +2979,42 @@ pub const Backend = struct {
         var pnsig: f32 = self.weight_noise.sigma();
         var pnseq: u32 = self.noiseKey(w_bytes);
         var params = [_]?*anyopaque{
-            @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
-            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn),    @ptrCast(&pscale),
-            @ptrCast(&pnsig), @ptrCast(&pnseq),
+            @ptrCast(&pw),     @ptrCast(&px),    @ptrCast(&py),
+            @ptrCast(&prows),  @ptrCast(&pcols), @ptrCast(&pn),
+            @ptrCast(&pscale), @ptrCast(&pnsig), @ptrCast(&pnseq),
         };
         self.ctx.launch(f, .{ @intCast(npad / mmq_pipe_tile), @intCast(rows / mmq_pipe_tile), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    pub fn opMmqQ6Experts(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, first: []const u8, expert_count: usize, groups_d: DeviceBuffer, rows: usize, cols: usize, packed_rows: usize, groups: usize) Error!void {
+        const all = first.ptr[0 .. first.len * expert_count];
+        const w_db = try self.cachedWeight(all);
+        try self.opMmqQ6ExpertsDev(y, x, w_db, groups_d, rows, cols, packed_rows, groups);
+    }
+
+    /// `opMmqQ6Experts` on an already-resident expert group (e.g. a staging buffer).
+    pub fn opMmqQ6ExpertsDev(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_db: DeviceBuffer, groups_d: DeviceBuffer, rows: usize, cols: usize, packed_rows: usize, groups: usize) Error!void {
+        std.debug.assert(rows % 128 == 0 and cols % 256 == 0 and packed_rows == groups * 32);
+        try self.opGemvQuantizeX(x, packed_rows * cols);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const f = try self.mmqPipe6ExpertFn();
+        var pw = w_db.ptr();
+        var px = self.q8_act.ptr();
+        var py = y.ptr();
+        var pg = groups_d.ptr();
+        var prows: u32 = @intCast(rows);
+        var pcols: u32 = @intCast(cols);
+        var pn: u32 = @intCast(packed_rows);
+        var pscale: f32 = 1.0;
+        var pnsig: f32 = 0;
+        var pnseq: u32 = 0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py), @ptrCast(&pg),
+            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn), @ptrCast(&pscale),
+            @ptrCast(&pnsig), @ptrCast(&pnseq),
+        };
+        self.ctx.launch(f, .{ @intCast(groups), @intCast(rows / 128), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// Whether `opMatmulQuantMmq` has a kernel for this shape/dtype. The caller
@@ -2804,55 +3049,96 @@ pub const Backend = struct {
         var pnsig: f32 = self.weight_noise.sigma();
         var pnseq: u32 = self.noiseKey(w_bytes);
         var params = [_]?*anyopaque{
-            @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
-            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn),    @ptrCast(&pscale),
-            @ptrCast(&pnsig), @ptrCast(&pnseq),
+            @ptrCast(&pw),     @ptrCast(&px),    @ptrCast(&py),
+            @ptrCast(&prows),  @ptrCast(&pcols), @ptrCast(&pn),
+            @ptrCast(&pscale), @ptrCast(&pnsig), @ptrCast(&pnseq),
         };
         const gx: u32 = @intCast((m + mmq_tile_n - 1) / mmq_tile_n);
         const gy: u32 = @intCast(rows / mmq_tile_rows);
         self.ctx.launch(f, .{ gx, gy, 1 }, .{ 32 * mmq_warps, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
+    /// Block-quant GEMM (prefill): dequant the weight to the shared f16 scratch,
+    /// convert/pad the activations, run the f16 tensor-core GEMM. rows,cols must
+    /// be multiples of 128,32.
     pub fn opMatmulQuant(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize) Error!void {
         const w_db = try self.cachedWeight(w_bytes);
+        try self.opMatmulQuantDev(dt, y, x, m, w_db, rows, cols);
+    }
+
+    /// `opMatmulQuant` on an already-resident weight (e.g. one expert of a
+    /// staged group).
+    pub fn opMatmulQuantDev(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_db: DeviceBuffer, rows: usize, cols: usize) Error!void {
         const mpad = std.mem.alignForward(usize, m, 128);
-        try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
-        // Two timed phases (the profiler's single timer can't nest): the weight
-        // dequant, then the activation convert + GEMM. Only `--profile` inserts
-        // the extra sync between them.
+        const w16 = try self.opDequantF16(dt, w_db, rows * cols);
+        const a16 = try self.opActF16(x, m, mpad, cols);
+        try self.opGemmF16Dev(y, w16, a16, rows, mpad, cols);
+    }
+
+    /// Dequantize `elems` block-quant weights (one matrix, or a contiguous group
+    /// of them) into the shared f16 weight scratch and return it. An f16 weight
+    /// is returned as is. The scratch is one buffer: the view is valid until the
+    /// next dequant.
+    pub fn opDequantF16(self: *Backend, dt: dtypes.DType, w_db: DeviceBuffer, elems: usize) Error!DeviceBuffer {
+        if (dt == .f16) return w_db;
         self.ptic();
-        // Weight as f16 [rows][cols]: block-quant weights dequant into scratch;
-        // an f16 weight (some GGUF quants keep small matrices at f16, e.g.
-        // Unsloth ssm_out) is already in that layout and is used directly.
-        const w16 = if (dt == .f16) w_db else blk: {
-            try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
-            const f_deq = switch (dt) {
-                .q4_0 => try self.eltFn(elt.dequant_q4_0_f16_ptx, "dequant_q4_0_f16"),
-                .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
-                .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
-                .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
-                .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
-                .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
-                .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_f16_ptx, "dequant_iq4_xs_f16"),
-                .q1_0 => try self.eltFn(elt.dequant_q1_0_f16_ptx, "dequant_q1_0_f16"),
-                .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16"),
-                .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16"),
-                else => unreachable,
-            };
-            try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
-            break :blk self.fp8_w16;
+        defer self.ptoc(.dequant);
+        try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
+        const f_deq = switch (dt) {
+            .q4_0 => try self.eltFn(elt.dequant_q4_0_f16_ptx, "dequant_q4_0_f16"),
+            .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
+            .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
+            .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
+            .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
+            .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
+            .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_f16_ptx, "dequant_iq4_xs_f16"),
+            .q1_0 => try self.eltFn(elt.dequant_q1_0_f16_ptx, "dequant_q1_0_f16"),
+            .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16"),
+            .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16"),
+            else => unreachable,
         };
-        self.ptoc(.dequant);
+        if (dt == .q6_k) {
+            // 16 elements per thread; q6_k super-blocks are 256 elements.
+            const fv = try self.eltFn(elt.dequant_q6_k_f16v_ptx, "dequant_q6_k_f16v");
+            try self.eltLaunch(fv, w_db, self.fp8_w16, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
+            return self.fp8_w16;
+        }
+        try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
+        return self.fp8_w16;
+    }
+
+    /// Convert `m` rows of f32 activations to f16 in the shared activation
+    /// scratch, zero-filling rows m..mpad, and return it. Same lifetime rule as
+    /// `opDequantF16`.
+    pub fn opActF16(self: *Backend, x: DeviceBuffer, m: usize, mpad: usize, cols: usize) Error!DeviceBuffer {
+        std.debug.assert(mpad >= m);
         self.ptic();
-        defer self.ptoc(.matmul);
+        defer self.ptoc(.elt);
+        try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
         const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
+        return self.fp8_a16;
+    }
+
+    /// y[mpad][rows] f32 = W16[rows][cols] @ A16[mpad][cols]; `mpad` must be a
+    /// multiple of 128 and both operands resident f16.
+    pub fn opGemmF16Dev(self: *Backend, y: DeviceBuffer, w16: DeviceBuffer, a16: DeviceBuffer, rows: usize, mpad: usize, cols: usize) Error!void {
+        std.debug.assert(mpad % 128 == 0);
+        self.ptic();
+        defer self.ptoc(.matmul);
         if (self.kernels == .libs) {
-            try self.ltMatmulF16(y, w16, self.fp8_a16, rows, mpad, cols);
+            try self.ltMatmulF16(y, w16, a16, rows, mpad, cols);
         } else {
             const f_hg = try self.hgemmFn();
-            try self.launchHgemm(f_hg, self.fp8_a16, w16, y, mpad, rows, cols);
+            try self.launchHgemm(f_hg, a16, w16, y, mpad, rows, cols);
         }
+    }
+
+    /// Grow the shared dequant scratches up front so the expert cache is planned
+    /// around them rather than evicted by their first growth.
+    pub fn reserveDequantScratch(self: *Backend, w16_bytes: u64, a16_bytes: u64) Error!void {
+        try self.ensureDeviceBuffer(&self.fp8_w16, w16_bytes);
+        try self.ensureDeviceBuffer(&self.fp8_a16, a16_bytes);
     }
 
     /// bf16 GEMV (tied LM head): y[rows] f32 = scale * (W bf16 [rows][cols] @ x).
@@ -4727,6 +5013,15 @@ pub const Backend = struct {
         try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, (rows + 7) / 8);
     }
 
+    pub fn groupRmsNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, groups: usize, eps: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(groups > 0 and dim % groups == 0);
+        const f = try self.eltFn(elt.group_rmsnorm_ptx, "group_rmsnorm");
+        const group = dim / groups;
+        try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows * groups), @intCast(group), @intCast(groups), 0, 0, 0 }, .{ eps, 0 }, rows * groups);
+    }
+
     /// interleaved RoPE in place. total = rows*n_heads*half.
     pub fn rope(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
         self.ptic();
@@ -4767,9 +5062,9 @@ pub const Backend = struct {
         var uu = [6]u32{ @intCast(total), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), 0, 0 };
         var ff = [2]f32{ scale, 0 };
         var params = [_]?*anyopaque{
-            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),   @ptrCast(&p4),
-            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
-            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
+            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),    @ptrCast(&p4),
+            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]), @ptrCast(&uu[4]),
+            @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
         };
         const grid: u32 = @intCast((total * n_heads + 255) / 256);
         self.ctx.launch(f, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
@@ -4816,6 +5111,46 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.f32_scale_ptx, "f32_scale");
         try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ scalar, 0 }, total);
+    }
+
+    pub fn opGatherRows(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, ids: DeviceBuffer, rows: usize, width: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * width;
+        const f = try self.eltFn(elt.gather_rows_ptx, "gather_rows");
+        try self.eltLaunch(f, src, dst, ids, null, .{ @intCast(total), @intCast(width), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    pub fn opScatterAddRows(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, ids: DeviceBuffer, scales: DeviceBuffer, rows: usize, width: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * width;
+        const f = try self.eltFn(elt.scatter_add_rows_ptx, "scatter_add_rows");
+        try self.eltLaunch(f, dst, src, ids, scales, .{ @intCast(total), @intCast(width), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// dst[t] = sum over the token's `used` route rows of scales[r] * src[r];
+    /// `slot_rows[t*used+k]` names the row. Deterministic (see elt.moe_combine_ptx).
+    pub fn opMoeCombine(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, slot_rows: DeviceBuffer, scales: DeviceBuffer, tokens: usize, used: usize, width: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = tokens * width;
+        const f = try self.eltFn(elt.moe_combine_ptx, "moe_combine");
+        try self.eltLaunch(f, dst, src, slot_rows, scales, .{ @intCast(total), @intCast(width), @intCast(used), 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    pub fn opSilu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.silu_ptx, "silu");
+        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    pub fn opSoftplusGate(self: *Backend, a: DeviceBuffer, gate: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.softplus_gate_ptx, "softplus_gate");
+        try self.eltLaunch(f, a, gate, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// ReLU in place: a[i] = max(0, a[i]).
@@ -5305,11 +5640,11 @@ pub const Backend = struct {
             if (fused) {
                 // MD[gs*mpad][2] f32 = {max, 1/sum} per row (one S read, no P write)
                 self.ptic();
-                try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * mpad, mpad, seq);
+                try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * mpad, mpad, seq, mpad, no_causal);
                 self.ptoc(.attn_softmax);
                 // O[gs][mpad][hd] f32 = (softmax S) @ Vtᵀ, P recomputed in-GEMM
                 self.ptic();
-                try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, mpad, hd, mpad, gs, s_s, s_vt, s_o, seq32, mpad32);
+                try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, mpad, hd, mpad, gs, s_s, s_vt, s_o, seq32, mpad32, no_causal);
                 self.ptoc(.attn_pv);
             } else {
                 // P[gs*mpad][mpad] f16 = softmax(S), flat over all gs heads' rows
@@ -5345,7 +5680,20 @@ pub const Backend = struct {
     /// same kernels on both arms calls it directly (Anima does). `opAttnCross` is the
     /// dispatching entry point, and it sends `--backend cuda` to cuDNN's SDPA at a
     /// rectangular shape instead.
-    pub fn opAttnTCRect(
+    pub fn opAttnTCRect(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        return self.attnTCRect(q, k, v, out, seq_q, seq_kv, n_heads, kv_heads, hd, scale, no_causal);
+    }
+
+    /// Causal `opAttnTCRect` for a KV-cached prefill batch: query row r sits at
+    /// position `pos0 + r` and sees keys `0..pos0 + r`; `seq_kv` is the cache
+    /// length the last row sees (`pos0 + seq_q`), `k`/`v` the f32 caches
+    /// `[seq_kv][kv_heads][hd]`.
+    pub fn opAttnTCCausal(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, pos0: usize) Error!void {
+        std.debug.assert(seq_kv >= pos0 + seq_q);
+        return self.attnTCRect(q, k, v, out, seq_q, seq_kv, n_heads, kv_heads, hd, scale, @intCast(pos0 + 1));
+    }
+
+    fn attnTCRect(
         self: *Backend,
         q: DeviceBuffer,
         k: DeviceBuffer,
@@ -5357,6 +5705,7 @@ pub const Backend = struct {
         kv_heads: usize,
         hd: usize,
         scale: f32,
+        cbase: u32,
     ) Error!void {
         const qpad = std.mem.alignForward(usize, seq_q, 128);
         const kpad = std.mem.alignForward(usize, seq_kv, 128);
@@ -5416,10 +5765,10 @@ pub const Backend = struct {
             try self.launchHgemmB(f_scores, self.attn_qh, self.attn_kh, self.attn_s, qpad, kpad, hd, gs, s_q, s_k, s_s, scale);
             self.ptoc(.attn_scores);
             self.ptic();
-            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * qpad, kpad, seq_kv);
+            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * qpad, kpad, seq_kv, qpad, cbase);
             self.ptoc(.attn_softmax);
             self.ptic();
-            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, qpad, hd, kpad, gs, s_s, s_vt, s_o, ks32, qp32);
+            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, qpad, hd, kpad, gs, s_s, s_vt, s_o, ks32, qp32, cbase);
             self.ptoc(.attn_pv);
             self.ptic();
             try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ qs32, nh32, bh, hd32, qp32, gs32 * qs32 * hd32, 0 }, gs * seq_q * hd);
@@ -5488,9 +5837,9 @@ pub const Backend = struct {
             // S[m][mpad] f16 = scale*(Qblk @ Kᵀ)  (scale prefolded in the C-store)
             try self.launchHgemmB(f_scores, qblk, self.attn_kh, self.attn_s, m, mpad, hd, 1, s_qk, s_qk, s_s, scale);
             // MD[m][2] f32 = {max, 1/sum} per row over valid cols 0..seq
-            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq);
+            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq, mpad, no_causal);
             // O[m][hd] f32 = softmax(S) @ Vt  (k = mpad keys)
-            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32);
+            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32, no_causal);
         }
         // Scatter O rows 0..seq into out (n_heads = head = 0).
         try self.launch7(f_sc, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, 1, 0, hd32, seq32 * hd32, 0, 0 }, seq * hd);
@@ -5584,7 +5933,11 @@ pub const Backend = struct {
     /// where P = exp(S-max)/sum is recomputed per element from S (f16, A operand,
     /// stride sa) + the MD table (per-row {max,1/sum}, per-head row stride mds=mpad)
     /// during A-staging. m=mpad, n=hd, k=mpad. p_scale is 1 (P is already normalized).
-    fn launchAttnOut(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, vt: DeviceBuffer, o: DeviceBuffer, md: DeviceBuffer, m: usize, n: usize, kk: usize, gs: usize, sa: u32, sb: u32, sc: u32, seq: u32, mds: u32) Error!void {
+    /// Causal base for the attention kernels' per-row key limit `min(seq, cbase +
+    /// row)`: past any sequence, so it never binds.
+    const no_causal: u32 = 0x7fff_0000;
+
+    fn launchAttnOut(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, vt: DeviceBuffer, o: DeviceBuffer, md: DeviceBuffer, m: usize, n: usize, kk: usize, gs: usize, sa: u32, sb: u32, sc: u32, seq: u32, mds: u32, cbase: u32) Error!void {
         var pa = s.ptr();
         var pb = vt.ptr();
         var pc = o.ptr();
@@ -5597,22 +5950,26 @@ pub const Backend = struct {
         var pmd = md.ptr();
         var pseq = seq;
         var pmds = mds;
+        var pcb = cbase;
         var params = [_]?*anyopaque{
             @ptrCast(&pa),     @ptrCast(&pb),  @ptrCast(&pc),   @ptrCast(&pn),
             @ptrCast(&pk),     @ptrCast(&psa), @ptrCast(&psb),  @ptrCast(&psc),
             @ptrCast(&pscale), @ptrCast(&pmd), @ptrCast(&pseq), @ptrCast(&pmds),
+            @ptrCast(&pcb),
         };
         self.ctx.launch(f, .{ @intCast(n / 128), @intCast(m / 128), @intCast(gs) }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// softmax_md_f16: MD[rows][2] f32 = {max, 1/sum} per row of S[rows][pn] f16
     /// (valid cols 0..seq). One block (256) per row; static 2 KiB shared.
-    fn launchSoftmaxMd(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, md: DeviceBuffer, rows: usize, pn: usize, seq: usize) Error!void {
+    fn launchSoftmaxMd(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, md: DeviceBuffer, rows: usize, pn: usize, seq: usize, qpad: usize, cbase: u32) Error!void {
         var ps = s.ptr();
         var pmd = md.ptr();
         var pnn: u32 = @intCast(pn);
         var pseq: u32 = @intCast(seq);
-        var params = [_]?*anyopaque{ @ptrCast(&ps), @ptrCast(&pmd), @ptrCast(&pnn), @ptrCast(&pseq) };
+        var pqp: u32 = @intCast(qpad);
+        var pcb = cbase;
+        var params = [_]?*anyopaque{ @ptrCast(&ps), @ptrCast(&pmd), @ptrCast(&pnn), @ptrCast(&pseq), @ptrCast(&pqp), @ptrCast(&pcb) };
         self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
@@ -5789,6 +6146,263 @@ test "growable tensor grows in place" {
 
 // Gated on a CUDA device: the fused block-quant GEMVs against the CPU
 // quants.zig dequant + dot reference, all four formats.
+test "moe_combine matches a host combine" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(0xC0DE);
+    const rand = prng.random();
+    const tokens = 37;
+    const used = 8;
+    const width = 96;
+    const rows = tokens * used + 13; // a few padding rows nobody references
+    const src = try gpa.alloc(f32, rows * width);
+    defer gpa.free(src);
+    const scales = try gpa.alloc(f32, rows);
+    defer gpa.free(scales);
+    const slot_rows = try gpa.alloc(u32, tokens * used);
+    defer gpa.free(slot_rows);
+    for (src) |*v| v.* = rand.floatNorm(f32);
+    for (scales) |*v| v.* = rand.float(f32);
+    // a random permutation of the referenced rows
+    for (slot_rows, 0..) |*r, i| r.* = @intCast(i);
+    rand.shuffle(u32, slot_rows);
+    const ref = try gpa.alloc(f32, tokens * width);
+    defer gpa.free(ref);
+    for (0..tokens) |t| for (0..width) |j| {
+        var acc: f32 = 0;
+        for (0..used) |k| {
+            const r = slot_rows[t * used + k];
+            acc = @mulAdd(f32, src[r * width + j], scales[r], acc);
+        }
+        ref[t * width + j] = acc;
+    };
+    var d_src = try be.tensorCreate(src.len * 4);
+    var d_scales = try be.tensorCreate(scales.len * 4);
+    var d_slots = try be.tensorCreate(slot_rows.len * 4);
+    var d_dst = try be.tensorCreate(ref.len * 4);
+    defer {
+        be.tensorDestroy(&d_src);
+        be.tensorDestroy(&d_scales);
+        be.tensorDestroy(&d_slots);
+        be.tensorDestroy(&d_dst);
+    }
+    try be.tensorUpload(d_src, std.mem.sliceAsBytes(src));
+    try be.tensorUpload(d_scales, std.mem.sliceAsBytes(scales));
+    try be.tensorUpload(d_slots, std.mem.sliceAsBytes(slot_rows));
+    try be.opMoeCombine(d_dst, d_src, d_slots, d_scales, tokens, used, width);
+    const got = try gpa.alloc(f32, ref.len);
+    defer gpa.free(got);
+    try be.tensorDownload(d_dst, std.mem.sliceAsBytes(got));
+    try std.testing.expectEqualSlices(f32, ref, got);
+}
+
+test "vector q6_k dequant is bit-identical to the scalar kernel" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(0x66);
+    const rand = prng.random();
+    const blocks = 3 * 100 + 1; // odd count: half the super-blocks sit at 2-byte alignment
+    const elems = blocks * 256;
+    const raw = try gpa.alloc(u8, blocks * 210);
+    defer gpa.free(raw);
+    rand.bytes(raw);
+    for (0..blocks) |b| {
+        const d: f16 = @floatCast(rand.float(f32) * 0.01);
+        @memcpy(raw[b * 210 + 208 ..][0..2], std.mem.asBytes(&d));
+    }
+    var d_in = try be.tensorCreate(raw.len);
+    var d_ref = try be.tensorCreate(elems * 2);
+    var d_got = try be.tensorCreate(elems * 2);
+    defer {
+        be.tensorDestroy(&d_in);
+        be.tensorDestroy(&d_ref);
+        be.tensorDestroy(&d_got);
+    }
+    try be.tensorUpload(d_in, raw);
+    const f_s = try be.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16");
+    try be.eltLaunch(f_s, d_in, d_ref, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
+    const f_v = try be.eltFn(elt.dequant_q6_k_f16v_ptx, "dequant_q6_k_f16v");
+    try be.eltLaunch(f_v, d_in, d_got, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
+    const ref = try gpa.alloc(u16, elems);
+    defer gpa.free(ref);
+    const got = try gpa.alloc(u16, elems);
+    defer gpa.free(got);
+    try be.tensorDownload(d_ref, std.mem.sliceAsBytes(ref));
+    try be.tensorDownload(d_got, std.mem.sliceAsBytes(got));
+    try std.testing.expectEqualSlices(u16, ref, got);
+}
+
+test "causal tensor-core attention matches the flash-split kernel" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(0xA77);
+    const rand = prng.random();
+    const n_heads = 32;
+    const kv_heads = 8;
+    const hd = 128;
+    const pos0 = 301;
+    const seq_q = 203;
+    const seq_kv = pos0 + seq_q;
+    const q = try gpa.alloc(f32, seq_q * n_heads * hd);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, seq_kv * kv_heads * hd);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, seq_kv * kv_heads * hd);
+    defer gpa.free(v);
+    for (q) |*x| x.* = rand.floatNorm(f32);
+    for (k) |*x| x.* = rand.floatNorm(f32);
+    for (v) |*x| x.* = rand.floatNorm(f32);
+    var d_q = try be.tensorCreate(q.len * 4);
+    var d_k = try be.tensorCreate(k.len * 4);
+    var d_v = try be.tensorCreate(v.len * 4);
+    var d_ref = try be.tensorCreate(seq_q * n_heads * hd * 4);
+    var d_got = try be.tensorCreate(seq_q * n_heads * hd * 4);
+    var d_scr = try be.tensorCreate(seq_q * n_heads * (hd + 4) * 4);
+    defer {
+        be.tensorDestroy(&d_q);
+        be.tensorDestroy(&d_k);
+        be.tensorDestroy(&d_v);
+        be.tensorDestroy(&d_ref);
+        be.tensorDestroy(&d_got);
+        be.tensorDestroy(&d_scr);
+    }
+    try be.tensorUpload(d_q, std.mem.sliceAsBytes(q));
+    try be.tensorUpload(d_k, std.mem.sliceAsBytes(k));
+    try be.tensorUpload(d_v, std.mem.sliceAsBytes(v));
+    const scale: f32 = 1.0 / @sqrt(@as(f32, hd));
+    try be.opAttnDecode(d_q, d_k, d_v, d_ref, d_scr, pos0 + 1, seq_q, n_heads, kv_heads, hd, 1, scale, 0, 0, false, .f32);
+    try be.opAttnTCCausal(d_q, d_k, d_v, d_got, seq_q, seq_kv, n_heads, kv_heads, hd, scale, pos0);
+    const ref = try gpa.alloc(f32, seq_q * n_heads * hd);
+    defer gpa.free(ref);
+    const got = try gpa.alloc(f32, seq_q * n_heads * hd);
+    defer gpa.free(got);
+    try be.tensorDownload(d_ref, std.mem.sliceAsBytes(ref));
+    try be.tensorDownload(d_got, std.mem.sliceAsBytes(got));
+    var max_err: f32 = 0;
+    var max_ref: f32 = 0;
+    for (ref, got) |r, g| {
+        max_err = @max(max_err, @abs(r - g));
+        max_ref = @max(max_ref, @abs(r));
+    }
+    errdefer std.debug.print("causal tc attn: max|err|={e} max|ref|={e}\n", .{ max_err, max_ref });
+    try std.testing.expect(max_err < 2e-2 * @max(1.0, max_ref));
+}
+
+test "hgemm_experts matches a host GEMM per expert" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(0xE7);
+    const rand = prng.random();
+    const n_experts = 5;
+    const rows = 256;
+    const cols = 320;
+    // ragged counts incl. one over 128 (two tiles), one empty
+    const counts = [n_experts]usize{ 130, 0, 7, 128, 1 };
+    var total: usize = 0;
+    for (counts) |c| total += c;
+    const a_rows = std.mem.alignForward(usize, total, 128) + 128;
+    const w = try gpa.alloc(f16, n_experts * rows * cols);
+    defer gpa.free(w);
+    const a = try gpa.alloc(f16, a_rows * cols);
+    defer gpa.free(a);
+    for (w) |*v| v.* = @floatCast(rand.floatNorm(f32) * 0.25);
+    for (a) |*v| v.* = @floatCast(rand.floatNorm(f32) * 0.25);
+    var groups: [8]u32 = undefined;
+    var tiles: usize = 0;
+    var off: usize = 0;
+    for (counts, 0..) |c, e| {
+        var at: usize = 0;
+        while (at < c) : (at += 128) {
+            groups[tiles] = kernels.hgemmGroup(e, @min(128, c - at), off + at);
+            tiles += 1;
+        }
+        off += c;
+    }
+    // reference in f32 over the exact f16 inputs
+    const ref = try gpa.alloc(f32, total * rows);
+    defer gpa.free(ref);
+    off = 0;
+    for (counts, 0..) |c, e| {
+        for (0..c) |i| for (0..rows) |r| {
+            var acc: f32 = 0;
+            for (0..cols) |k| acc += @as(f32, @floatCast(a[(off + i) * cols + k])) * @as(f32, @floatCast(w[(e * rows + r) * cols + k]));
+            ref[(off + i) * rows + r] = acc;
+        };
+        off += c;
+    }
+    var d_w = try be.tensorCreate(w.len * 2);
+    var d_a = try be.tensorCreate(a.len * 2);
+    var d_g = try be.tensorCreate(groups.len * 4);
+    var d_y = try be.tensorCreate((total + 128) * rows * 4);
+    defer {
+        be.tensorDestroy(&d_w);
+        be.tensorDestroy(&d_a);
+        be.tensorDestroy(&d_g);
+        be.tensorDestroy(&d_y);
+    }
+    try be.tensorUpload(d_w, std.mem.sliceAsBytes(w));
+    try be.tensorUpload(d_a, std.mem.sliceAsBytes(a));
+    try be.tensorUpload(d_g, std.mem.sliceAsBytes(groups[0..tiles]));
+    // poison y: rows past a tile's count must stay untouched
+    try be.ctx.memsetD32(.{ .ptr = d_y.ptr(), .bytes = @intCast(d_y.size) }, 0x7fc00000, (total + 128) * rows);
+    try be.opGemmF16Experts(d_y, d_w, d_a, d_g, tiles, rows, cols);
+    const got = try gpa.alloc(f32, (total + 128) * rows);
+    defer gpa.free(got);
+    try be.tensorDownload(d_y, std.mem.sliceAsBytes(got));
+    var max_err: f32 = 0;
+    for (ref, got[0 .. total * rows]) |r, g| max_err = @max(max_err, @abs(r - g));
+    errdefer std.debug.print("hgemm_experts max|err|={e}\n", .{max_err});
+    try std.testing.expect(max_err < 2e-2);
+    for (got[total * rows ..]) |g| try std.testing.expect(std.math.isNan(g));
+}
+
+test "cuBLASLt f32 GEMM matches the naive f32 kernel" {
+    const gpa = std.testing.allocator;
+    const be = Backend.initLibs(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+    // K2 Horizon's MoE router (100 x 2560) at decode and small-batch widths, and
+    // a wider shape.
+    const shapes = [_][3]usize{ .{ 100, 2560, 1 }, .{ 100, 2560, 13 }, .{ 64, 2560, 256 }, .{ 512, 1024, 96 } };
+    for (shapes) |sh| {
+        const n = sh[0];
+        const k = sh[1];
+        const m = sh[2];
+        const w = try gpa.alloc(f32, n * k);
+        defer gpa.free(w);
+        const x = try gpa.alloc(f32, m * k);
+        defer gpa.free(x);
+        for (w) |*v| v.* = rand.floatNorm(f32);
+        for (x) |*v| v.* = rand.floatNorm(f32);
+        var xd = try be.tensorCreate(x.len * 4);
+        var y_lt = try be.tensorCreate(m * n * 4);
+        var y_ref = try be.tensorCreate(m * n * 4);
+        defer {
+            be.tensorDestroy(&xd);
+            be.tensorDestroy(&y_lt);
+            be.tensorDestroy(&y_ref);
+        }
+        try be.tensorUpload(xd, std.mem.sliceAsBytes(x));
+        try be.opMatmulF32Lt(y_lt, xd, m, std.mem.sliceAsBytes(w), n, k, null);
+        try be.opMatmul(y_ref, 0, xd, 0, m, std.mem.sliceAsBytes(w), false, n, k, 1.0, null);
+        const got = try gpa.alloc(f32, m * n);
+        defer gpa.free(got);
+        const ref = try gpa.alloc(f32, m * n);
+        defer gpa.free(ref);
+        try be.tensorDownload(y_lt, std.mem.sliceAsBytes(got));
+        try be.tensorDownload(y_ref, std.mem.sliceAsBytes(ref));
+        var max_err: f32 = 0;
+        for (got, ref) |g, r| max_err = @max(max_err, @abs(g - r));
+        errdefer std.debug.print("n={d} k={d} m={d}: max|lt-ref|={e} got[0]={e} ref[0]={e}\n", .{ n, k, m, max_err, got[0], ref[0] });
+        try std.testing.expect(max_err < 1e-2);
+    }
+}
+
 test "cuda argmax matches cpu argmax (incl. tie -> lowest index)" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;

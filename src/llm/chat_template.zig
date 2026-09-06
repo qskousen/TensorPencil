@@ -165,6 +165,8 @@ pub const RenderOpts = struct {
     add_generation_prompt: bool = true,
     /// Reasoning families honor this (drives `<|think|>` / thought priming).
     enable_thinking: bool = true,
+    /// Optional model-specific effort name, such as K2 Horizon's high/medium/low.
+    reasoning_effort: ?[]const u8 = null,
     /// The model's BOS string (templates emit `{{ bos_token }}`); "" for none.
     bos_token: []const u8 = "",
     /// The model's EOS string (Mistral/llama templates emit `{{ eos_token }}`
@@ -422,6 +424,7 @@ fn buildGlobals(a: std.mem.Allocator, opts: RenderOpts) !jinja.Value {
     try g.put(a, "messages", .{ .list = msgs });
     try g.put(a, "add_generation_prompt", .{ .boolean = opts.add_generation_prompt });
     try g.put(a, "enable_thinking", .{ .boolean = opts.enable_thinking });
+    if (opts.reasoning_effort) |effort| try g.put(a, "reasoning_effort", .{ .str = effort });
     try g.put(a, "bos_token", .{ .str = opts.bos_token });
     try g.put(a, "eos_token", .{ .str = opts.eos_token });
     if (opts.tools) |decls| {
@@ -855,6 +858,55 @@ test "chat_template: prior-turn thoughts are stripped, current turn primed" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Hello!") != null);
     // Ends primed for the model to answer the latest user turn.
     try std.testing.expect(std.mem.endsWith(u8, out.items, "<|turn>model\n"));
+}
+
+test "chat_template: reasoning effort is optional" {
+    const gpa = std.testing.allocator;
+    var ct = try ChatTemplate.fromSource(gpa, "{{ reasoning_effort | default('unset') }}");
+    defer ct.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &.{}, .reasoning_effort = "medium" }, &out);
+    try std.testing.expectEqualStrings("medium", out.items);
+    out.clearRetainingCapacity();
+    try ct.renderString(gpa, .{ .messages = &.{} }, &out);
+    try std.testing.expectEqualStrings("unset", out.items);
+}
+
+// Real GGUF: K2 Horizon's embedded template through our Jinja, tools declared.
+// The template carries the model's tool-call syntax itself; if it fails to
+// render, the GUI silently falls back to hand glue that declares no tools and
+// the model answers a "tool call" in its native tags with invented names.
+test "chat_template: K2 Horizon's template renders a tool declaration" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/K2-Horizon-MoVA-36B-A4B-Q6_K.gguf";
+    var g = @import("tp_core").gguf.Gguf.open(gpa, io, path) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer g.deinit();
+    const src = g.getStr("tokenizer.chat_template") orelse return error.SkipZigTest;
+    var ct = try ChatTemplate.fromSource(gpa, src);
+    defer ct.deinit();
+    const decls = [_]Tool{.{ .name = "generate_image", .description = "Generate an image from a text description.", .parameters_json =
+        \\{"type":"object","properties":{"prompt":{"type":"string","description":"What to draw"},"width":{"type":"integer","description":"Pixels"},"seed":{"type":"integer"}},"required":["prompt"]}
+    }};
+    const msgs = [_]Message{ .{ .role = .system, .content = "You are helpful." }, .{ .role = .user, .content = "Draw a fox." } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .tools = &decls, .bos_token = "<|ifm|begin_of_text|>", .enable_thinking = false, .reasoning_effort = "high" }, &out);
+    errdefer std.debug.print("rendered:\n{s}\n", .{out.items});
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tools>\n## generate_image\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "- `prompt` *(string, required)* - What to draw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tool_call>$FUNCTION_NAME\n<ifm|arg_key>$PARAMETER_NAME</ifm|arg_key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>") != null);
+    // Thinking on at medium effort primes the fast marker, like chat.openAssistant.
+    out.clearRetainingCapacity();
+    try ct.renderString(gpa, .{ .messages = &msgs, .bos_token = "<|ifm|begin_of_text|>", .enable_thinking = true, .reasoning_effort = "medium" }, &out);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tools>") == null);
 }
 
 // Real GGUF: the actual gemma4 embedded template + tokenizer. Proves the fix

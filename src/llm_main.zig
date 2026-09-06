@@ -27,7 +27,8 @@ const usage =
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
-    \\              [--seed <n>] [--greedy] [--no-think] [--canonical-template]
+    \\              [--seed <n>] [--greedy] [--no-think] [--reasoning-effort high|medium|low]
+    \\              [--canonical-template]
     \\              [--weight-noise <curve>] [--weight-noise-amount <a>]
     \\              [--weight-noise-seed <n>]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
@@ -61,10 +62,11 @@ const usage =
     \\so it takes the CPU-sampling path on GPU backends (slower per token).
     \\Seed defaults to the clock; pass --seed to reproduce a session (it is
     \\the base of a per-turn seed sequence, so turns stay independent).
-    \\Reasoning is on by default for models that support it (Qwen3.5, Gemma 4):
+    \\Reasoning is on by default for models that support it (Qwen3.5, K2 Horizon, Gemma 4):
     \\the model emits a thought block before its answer. --no-think disables it
     \\(the turn is primed with an empty thought so the model answers directly);
     \\--think forces it on. No effect on non-reasoning models (e.g. Gemma 3).
+    \\--reasoning-effort selects K2 Horizon's high, medium, or low thought mode.
     \\--weight-noise perturbs the block-quant weights DURING generation: every
     \\256-weight super-block's scale is multiplied by 1 + sigma*u, u uniform in
     \\[-1,1], redrawn on every forward pass. Unlike temperature, which can only
@@ -238,6 +240,13 @@ pub fn main(init: std.process.Init) !void {
             llm.chat.setThinking(true);
         } else if (std.mem.eql(u8, a, "--no-think")) {
             llm.chat.setThinking(false);
+        } else if (std.mem.eql(u8, a, "--reasoning-effort")) {
+            const name = try nextArg(args, &i);
+            llm.chat.setReasoningEffort(std.meta.stringToEnum(llm.chat.ReasoningEffort, name) orelse {
+                try stdout.print("unknown --reasoning-effort: {s} (high | medium | low)\n", .{name});
+                try stdout.flush();
+                return error.InvalidArgument;
+            });
         } else if (std.mem.eql(u8, a, "--mmap")) {
             // How checkpoint bytes are read; see safetensors.ReadMode. Shared with
             // the diffusion CLI and the GUI so one setting governs every loader.
@@ -390,6 +399,32 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         return runQwen35(arena, gpa, io, &st.gguf, backend, vram_budget, cpu_split, dynamic_offload, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
+    }
+
+    if (st == .gguf and st.gguf.getStr("general.architecture") != null and
+        std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "k2-horizon"))
+    {
+        if (backend == .vulkan) {
+            try stdout.writeAll("K2 Horizon currently runs on cpu / zig-cuda / cuda\n");
+            try stdout.flush();
+            return error.UnsupportedBackend;
+        }
+        if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
+            try stdout.writeAll("speculative decoding is not supported for K2 Horizon yet\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (image_path != null or mmproj_path != null) {
+            try stdout.writeAll("K2 Horizon is text-only\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (cpu_split != null or dynamic_offload) {
+            try stdout.writeAll("K2 Horizon streams routed experts; --cpu-layers / --offload-grow is not used\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        return runK2Horizon(arena, gpa, io, &st.gguf, backend, prompt, system, opts, profile, stdout);
     }
 
     // Gemma 3 (sandwich norms, dual local/global RoPE): its own CPU model.
@@ -839,6 +874,7 @@ fn appendOneShotPrompt(
             .bos_token = llm.chat_template.bos,
             .eos_token = llm.chat_template.eos,
             .enable_thinking = llm.chat.enable_thinking,
+            .reasoning_effort = llm.chat.templateReasoningEffort(),
             .add_generation_prompt = true,
             .tools = llm.chat_template.tools,
         }, ids);
@@ -956,6 +992,7 @@ fn encodeMention(ic: ImageChat, gpa: std.mem.Allocator, path: []const u8, stdout
 fn imageExpandFor(tok: *const TensorPencil.tokenizer.Tokenizer) ?llm.chat_template.ImageExpand {
     return switch (llm.chat.family) {
         .chatml => llm.chat_template.ImageExpand.chatml(tok),
+        .k2_horizon => null,
         .gemma => llm.chat_template.ImageExpand.gemma3(tok),
         .gemma4 => llm.chat_template.ImageExpand.gemma4(tok),
     };
@@ -994,7 +1031,7 @@ fn reportToolCalls(
     stdout: *Io.Writer,
 ) !void {
     const answer = llm.tool_call.answerText(reply, llm.chat.reasoning(), primed);
-    if (std.mem.indexOf(u8, answer, "<tool_call>") == null) return;
+    if (!llm.tool_call.hasBlock(answer)) return;
 
     var calls: std.ArrayList(llm.tool_call.Call) = .empty;
     defer {
@@ -1174,6 +1211,7 @@ fn renderDrivenChat(
             .bos_token = bos,
             .eos_token = eos,
             .enable_thinking = llm.chat.enable_thinking,
+            .reasoning_effort = llm.chat.templateReasoningEffort(),
             .add_generation_prompt = true,
             .tools = llm.chat_template.tools,
         };
@@ -1829,6 +1867,78 @@ fn runQwen35(
         } else if (be_cuda) |be| {
             llm.session.printCudaProfile(stdout, be) catch {};
             stdout.flush() catch {};
+        }
+    }
+    const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats, res.timing);
+    try stdout.flush();
+}
+
+fn runK2Horizon(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    g: *const TensorPencil.Gguf,
+    backend: BackendKind,
+    prompt: ?[]const u8,
+    system: ?[]const u8,
+    opts: llm.engine.Options,
+    profile: bool,
+    stdout: *Io.Writer,
+) !void {
+    const k2 = TensorPencil.models.k2_horizon;
+    var lm = try k2.Model.load(arena, g);
+    defer lm.deinit();
+    var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
+    defer tok.deinit();
+    llm.chat.applyTokenizer(&tok);
+    llm.chat.setFamily(.k2_horizon);
+    setupChatTemplate(arena, g, &tok, system);
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    if (prompt) |p| {
+        try appendOneShotPrompt(&tok, gpa, system, p, &ids);
+    } else if (llm.chat_template.active == null) {
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
+    }
+    try stdout.print("[{s} backend, K2 Horizon {d}L, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    });
+    if (prompt == null)
+        try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
+    try stdout.writeAll("\n");
+    try stdout.flush();
+
+    const cap = try capacityPlan(opts, prompt, ids.items.len, false);
+    if (profile and backend == .cpu) {
+        TensorPencil.prof.reset();
+        TensorPencil.prof.enabled = true;
+    }
+
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    const be_cuda = try llm.session.bringUpCuda(arena, backend, profile);
+    defer if (be_cuda) |be| be.deinit();
+    llm.session.useFileReads(be_cuda, g);
+    const Spec = llm.session.UniformSpec(k2.Model, k2.CpuModel, TensorPencil.models.k2_horizon_cuda.CudaLM, void);
+    const driver: SimpleDriver = .{
+        .tok = &tok,
+        .io = io,
+        .gpa = gpa,
+        .ids = &ids,
+        .opts = opts,
+        .stdout = stdout,
+        .prompt = prompt,
+        .img_chat = null,
+    };
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda };
+    const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, llm.session.no_prefill, driver, io, gpa, cap, stdout);
+    if (profile) {
+        if (backend == .cpu) {
+            TensorPencil.prof.report(stdout) catch {};
+        } else if (be_cuda) |be| {
+            llm.session.printCudaProfile(stdout, be) catch {};
         }
     }
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;

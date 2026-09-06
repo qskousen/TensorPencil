@@ -193,6 +193,7 @@ pub const Template = struct {
             // would be freed on error, but we keep the arena for the message.
             var t = Template{ .arena = arena, .nodes = &.{}, .diag = p.diag };
             _ = &t;
+            if (std.c.getenv("TP_JINJA_DEBUG") != null) std.debug.print("jinja parse: {s} (block {d}/{d})\n", .{ p.diag, p.i, p.chunks.len });
             return e;
         };
         if (p.i != p.chunks.len) {
@@ -219,7 +220,10 @@ pub const Template = struct {
         // the caller's list with the caller's allocator (the arena, and every
         // transient value in it, is freed on return).
         var buf: std.ArrayList(u8) = .empty;
-        try interp.execNodes(self.nodes, &buf);
+        interp.execNodes(self.nodes, &buf) catch |e| {
+            if (std.c.getenv("TP_JINJA_DEBUG") != null) std.debug.print("jinja render: {s}\n", .{interp.diag});
+            return e;
+        };
         try out.appendSlice(gpa, buf.items);
     }
 };
@@ -479,7 +483,10 @@ fn lexInner(a: std.mem.Allocator, s: []const u8) Error![]Tok {
             '<' => .lt,
             '>' => .gt,
             '=' => .assign,
-            else => return Error.JinjaParse,
+            else => {
+                if (std.c.getenv("TP_JINJA_DEBUG") != null) std.debug.print("jinja lex: bad char '{c}' near: {s}\n", .{ s[i], s[i -| 30 .. @min(s.len, i + 30)] });
+                return Error.JinjaParse;
+            },
         };
         try toks.append(a, .{ .sym = one });
         i += 1;
@@ -579,6 +586,9 @@ const Parser = struct {
             try self.parseFor(nodes);
         } else if (std.mem.eql(u8, kw, "macro")) {
             try self.parseMacro(nodes);
+        } else if (std.mem.eql(u8, kw, "generation") or std.mem.eql(u8, kw, "endgeneration")) {
+            // HF's training-mask span markers; nothing to render.
+            try self.endTag();
         } else return self.fail("unknown statement keyword");
     }
 
@@ -1614,6 +1624,14 @@ const Interp = struct {
             return v;
         }
         if (std.mem.eql(u8, name, "trim")) return self.strVal(std.mem.trim(u8, try self.toStr(v), " \t\r\n"));
+        if (std.mem.eql(u8, name, "replace")) {
+            if (args.len < 2) return self.rt("replace needs (old, new)");
+            const old = try self.toStr(try self.eval(args[0]));
+            const new = try self.toStr(try self.eval(args[1]));
+            const src = try self.toStr(v);
+            if (old.len == 0) return self.strVal(src);
+            return self.strVal(try std.mem.replaceOwned(u8, self.a, src, old, new));
+        }
         if (std.mem.eql(u8, name, "upper")) return self.strVal(try std.ascii.allocUpperString(self.a, try self.toStr(v)));
         if (std.mem.eql(u8, name, "lower")) return self.strVal(try std.ascii.allocLowerString(self.a, try self.toStr(v)));
         if (std.mem.eql(u8, name, "string")) return self.strVal(try self.toStr(v));
@@ -1744,7 +1762,7 @@ const Interp = struct {
             }
             return .{ .list = l };
         }
-        return self.rt("unknown filter");
+        return self.rt(std.fmt.allocPrint(self.a, "unknown filter '{s}'", .{name}) catch "unknown filter");
     }
 
     /// Apply a Jinja test to an already-evaluated value with unevaluated arg
@@ -1950,6 +1968,9 @@ test "jinja: adjacent string literals concatenate (Python/Jinja2)" {
         .{ .src = "{{ 'a' 'b' 'c' }}", .want = "abc" }, // 3+ join
         .{ .src = "{{ (\"foo \"\n\"bar\") }}", .want = "foo bar" }, // wrapped, like raise_exception msgs
         .{ .src = "{{ 'x' ~ 'y' }}", .want = "xy" }, // explicit ~ still works
+        .{ .src = "{{ 'a-b-c' | replace('-', '+') }}", .want = "a+b+c" },
+        .{ .src = "{{ 'abc' | replace('', 'x') }}", .want = "abc" },
+        .{ .src = "{% generation %}g{% endgeneration %}", .want = "g" },
     };
     for (cases) |c| {
         var t = try Template.parse(gpa, c.src);

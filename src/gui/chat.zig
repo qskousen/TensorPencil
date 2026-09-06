@@ -23,6 +23,8 @@ const qwen3 = tp.models.qwen3;
 const qwen3_cuda = tp.models.qwen3_cuda;
 const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
+const k2 = tp.models.k2_horizon;
+const k2_cuda = tp.models.k2_horizon_cuda;
 const vit35 = tp.models.vit35;
 const vit35_cuda = tp.models.vit35_cuda;
 const gemma3 = tp.models.gemma3;
@@ -43,6 +45,7 @@ const gemma4v_vit_cuda = tp.models.gemma4v_vit_cuda;
 const Arch = union(enum) {
     qwen3: struct { lm: qwen3.CausalLM, model: qwen3_cuda.CudaLM, vit: ?NoVit = null },
     qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
+    k2_horizon: struct { lm: k2.Model, model: k2_cuda.CudaLM, vit: ?NoVit = null },
     gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
     gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?Gemma4Vit = null },
 };
@@ -113,17 +116,39 @@ const image_tool_prompt =
     \\Only a tool call written on its own line generates an image. You may mention the tag inline while explaining, and you may reason about it in your thoughts, without triggering anything — a generation happens ONLY when you commit to it by writing the tag on its own line in your reply.
     \\You may call the tool multiple times in a single response if the user requests multiple images, there is no limit.
     \\Write a rich prompt covering subject, setting, style, lighting, mood, and composition. The image is generated and shown to the user automatically. When the user asks for a change, emit a new, updated tool call.
-    \\You may optionally set size/steps/seed as tag attributes when the user wants a specific aspect ratio, more detail, or a repeatable result:
+    \\Do not set a size unless the user asks for a specific size or aspect ratio: an omitted size uses the user's preset. Likewise leave steps and seed out unless the user wants more detail or a repeatable result:
     \\<image width=1024 height=1536 steps=12 seed=42>a tall portrait…</image>
-    \\Defaults (square, balanced quality) are used when attributes are omitted. width/height are rounded to multiples of 16. Reuse a prior seed when asked to modify a previous generation, or change the seed when asked to generate variations.
+    \\width/height are rounded to multiples of 16. Reuse a prior seed when asked to modify a previous generation, or change the seed when asked to generate variations.
 ;
 
+/// The same tool for models with a native tool-call format (K2 Horizon): the
+/// template renders this declaration and its own call syntax into the system
+/// turn, and `toolcall.nextImageCall` maps the call back to an image request.
+const image_tool_decl = [_]chat_template.Tool{.{
+    .name = toolcall.image_tool_name,
+    .description = "Generate an image and show it to the user. Call it when the user asks you to create, draw, generate, paint, or show an image; call it once per image requested, there is no limit. Write a rich prompt covering subject, setting, style, lighting, mood, and composition. Pass only the prompt unless the user asks for a specific size, aspect ratio, more detail, or a repeatable result: omitted settings use the user's preset. When the user asks for a change, call it again with an updated prompt; reuse a prior seed to modify a previous image, change it for variations.",
+    .parameters_json =
+    \\{"type":"object","properties":{"prompt":{"type":"string","description":"A vivid, detailed description of the image"},"width":{"type":"integer","description":"Pixels, rounded to a multiple of 16. Only when the user asks for a size or aspect ratio; omit to use the preset"},"height":{"type":"integer","description":"Pixels, rounded to a multiple of 16. Only when the user asks for a size or aspect ratio; omit to use the preset"},"steps":{"type":"integer","description":"Sampling steps. Only when the user asks for more detail; omit to use the preset"},"seed":{"type":"integer","description":"Only for a repeatable result or to modify a previous image"}},"required":["prompt"]}
+    ,
+}};
+
+/// Whether the active family calls tools through its own template-rendered
+/// format, so the image tool is declared (`imageTools`) instead of described.
+fn nativeImageTool() bool {
+    return chat.family == .k2_horizon;
+}
+
+fn imageTools(images_enabled: bool) ?[]const chat_template.Tool {
+    return if (images_enabled and nativeImageTool()) &image_tool_decl else null;
+}
+
 /// Compose the effective system prompt: the configured base, with the
-/// image-tool description appended when the image tool is available. Shared by
-/// session init and the live `updateSettings` restage so both build it the same
-/// way. Caller owns the returned slice.
+/// image-tool description appended when the image tool is available and the
+/// family has no native tool format. Shared by session init and the live
+/// `updateSettings` restage so both build it the same way. Caller owns the
+/// returned slice.
 fn composeSystemText(gpa: std.mem.Allocator, images_enabled: bool, base: []const u8) ![]u8 {
-    if (images_enabled)
+    if (images_enabled and !nativeImageTool())
         return std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ base, image_tool_prompt });
     return gpa.dupe(u8, base);
 }
@@ -415,6 +440,7 @@ pub const Options = struct {
     /// families that support it. Flipped live by the toolbar toggle; no-op for
     /// non-reasoning models. See `chat.setThinking`.
     reasoning: bool = true,
+    reasoning_effort: config.ReasoningEffort = .high,
     /// KV-cache element storage type (f32 default; f16 halves the KV footprint).
     kv_dtype: kv_cache.KvDtype = .f32,
     /// gemma4v vision token budget (nMax); 0 = tower default (280). Applied live
@@ -465,6 +491,14 @@ pub fn toKvDtype(d: config.KvDtype) kv_cache.KvDtype {
     };
 }
 
+fn toReasoningEffort(e: config.ReasoningEffort) chat.ReasoningEffort {
+    return switch (e) {
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+    };
+}
+
 /// The full `Options` a config implies. One builder, so the app and any
 /// headless driver cannot drift apart on a field.
 pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed: u64) !Options {
@@ -482,6 +516,7 @@ pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed:
         .vram_split = cfg.vram_split,
         .vram_limit_frac = cfg.vram_limit_frac,
         .reasoning = cfg.reasoning,
+        .reasoning_effort = cfg.reasoning_effort,
         .kv_dtype = toKvDtype(cfg.kv_dtype),
         .regen_cache_mb = cfg.regen_cache_mb,
         .max_new_tokens = cfg.max_new_tokens,
@@ -768,13 +803,8 @@ pub const Session = struct {
         self.be.weight_noise.seed = cfg.weight_noise_seed;
         self.be.weight_noise.amount = cfg.weight_noise_amount;
         self.be.weight_noise.setCurve(cfg.weight_noise_curve);
-        // LLM weights pin resident on first touch and NEVER stream: without
-        // this, weights sit in the backend's evictable LRU cache, and once the
-        // working set is within ~a layer of the card, per-token allocations
-        // evict them in exactly the (cyclic) order decode re-reads them,
-        // ~the whole model re-uploads from the mmap EVERY token (the 31B
-        // 0.1 tok/s cliff). VRAM pressure is handled by the always-armed
-        // dynamic split + the vram Arbiter migrating whole layers instead.
+        // Resident models keep weights pinned. K2 pins its fixed path during
+        // warmup, then streams only the routed experts.
         self.be.pinAllWeights();
         // Before the model allocates anything (see enableLlmMemTags): turns the
         // one derived `scratch` residual into named per-component figures.
@@ -820,6 +850,7 @@ pub const Session = struct {
         // Reasoning toggle (process-global like the family). No-op for models
         // whose family can't reason; the toolbar toggle flips it live.
         chat.setThinking(cfg.reasoning);
+        chat.setReasoningEffort(toReasoningEffort(cfg.reasoning_effort));
 
         // Chat template family (process-global, keyed off the same architecture
         // string as the model dispatch below). `familyForArch` is the single
@@ -848,6 +879,13 @@ pub const Session = struct {
             if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try qwen35_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+        } else if (std.mem.eql(u8, arch_str, "k2-horizon")) {
+            self.arch = .{ .k2_horizon = .{ .lm = try k2.Model.load(arena, &self.gguf), .model = undefined } };
+            const a = &self.arch.k2_horizon;
+            errdefer a.lm.deinit();
+            if (self.mmproj_gguf != null)
+                std.log.warn("mmproj configured, but K2 Horizon is text-only — disabled", .{});
+            a.model = try k2_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma3")) {
             self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma3;
@@ -1055,12 +1093,18 @@ pub const Session = struct {
         // hand glue. The two overrides swap in a known-good template instead of
         // the model's own: Google's upstream one for gemma4 finetunes shipping
         // an older/stripped variant, froggeric's fixed one for qwen35.
+        // K2's template carries its tool-call syntax and effort markers; the hand
+        // glue below cannot declare tools, so a template that fails to load
+        // leaves the model without the image tool.
         self.template = if (cfg.gemma4_canonical_template and self.arch == .gemma4)
             (chat_template.ChatTemplate.gemma4Canonical(arena) catch null)
         else if (cfg.qwen35_fixed_template and self.arch == .qwen35)
             (chat_template.ChatTemplate.qwen35Fixed(arena) catch null)
         else
-            (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null);
+            (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch |err| blk: {
+                std.log.warn("chat template unusable ({t}); hand glue, no tool declarations", .{err});
+                break :blk null;
+            });
         self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";
         self.eos_str = if (self.tok.eos) |e| (self.tok.decodeAlloc(gpa, &.{e}) catch "") else "";
 
@@ -1260,6 +1304,7 @@ pub const Session = struct {
         // *next* prompt built, so flipping it mid-conversation is safe without a
         // reload, the current turn already has its ids.
         chat.setThinking(cfg.reasoning);
+        chat.setReasoningEffort(toReasoningEffort(cfg.reasoning_effort));
         // Sampling is staged, not applied: `submit` copies it into `opts` at the
         // next turn boundary (a turn possibly generating right now keeps the
         // params it started with, no racing the worker's read of `opts`).
@@ -1417,7 +1462,7 @@ pub const Session = struct {
                 if (after.n_cpu != before.n_cpu) {
                     const dir = if (after.n_cpu > before.n_cpu) "offload→CPU" else "promote→GPU";
                     std.log.info("[vram] LLM {s} (target {d} MiB): {d}→{d}/{d} layers on host · device {d}→{d} MiB · {d} MiB free", .{
-                        dir, target >> 20, before.n_cpu, after.n_cpu, after.n_layers,
+                        dir,               target >> 20,     before.n_cpu,   after.n_cpu, after.n_layers,
                         before.device_mib, after.device_mib, after.free_mib,
                     });
                     // An offload wave that STILL ends over target means the
@@ -1676,9 +1721,10 @@ pub const Session = struct {
             // qwen3 is uniform full attention: every layer holds the whole context.
             .qwen3 => |*a| 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
             .qwen35 => |*a| 2 * @as(u64, a.model.cfg.nAttnLayers()) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
+            .k2_horizon => |*a| 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
             // gemma3/gemma4 LOCAL (sliding-window) layers hold only a fixed ring
             // (window + one prefill chunk), so their footprint plateaus instead
-            // of growing with the conversation (TODO lever 1); GLOBAL layers hold
+            // of growing with the conversation; GLOBAL layers hold
             // the full context. gemma4's KV dim also varies per layer.
             .gemma3 => |*a| blk: {
                 const cfg = a.model.cfg;
@@ -2083,7 +2129,7 @@ pub const Session = struct {
                 // message footer shows for the same turn.
                 const tg = timing.tgRate() orelse (if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0);
                 std.log.info("[llm] {d} tok, {d:.1} tok/s, ctx {d}/{d}{s}, {d}/{d} layers on host, {d} MiB free", .{
-                    n, tg, st.tokens, st.window, st.vramSuffix(&vbuf),
+                    n,         tg,           st.tokens,    st.window, st.vramSuffix(&vbuf),
                     res.n_cpu, res.n_layers, res.free_mib,
                 });
             },
@@ -2142,9 +2188,9 @@ pub const Session = struct {
             dropCheckpointsAfter(self.gpa, &self.checkpoints, q);
             const dropped = n_before - self.checkpoints.items.len;
             std.log.info("[ckpt] rollback: ctx {d}→{d} tok ({d} discarded), restored {d:.1} MiB snapshot · {d} in cache{s}", .{
-                before_tok,                   q,
-                before_tok -| q,              mib(snap_bytes),
-                self.checkpoints.items.len,   if (dropped > 0) " (later boundaries dropped)" else "",
+                before_tok,                 q,
+                before_tok -| q,            mib(snap_bytes),
+                self.checkpoints.items.len, if (dropped > 0) " (later boundaries dropped)" else "",
             });
         }
         // A fallback regenerate / variant switch rebuilt `ids` for a
@@ -2250,9 +2296,8 @@ pub const Session = struct {
         // that time look like an unexplained stall behind "Processing...".
         if (prefilled > 0 or t_end - t0 > 2 * std.time.ns_per_ms) {
             std.log.info("[llm] turn prep: build {d:.0} ms · prefill {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok{s}", .{
-                build_ms, prefilled, pre_s,
-                if (pre_s > 0) @as(f64, @floatFromInt(prefilled)) / pre_s else 0,
-                self.ctxTokens(),
+                build_ms,                                                         prefilled,        pre_s,
+                if (pre_s > 0) @as(f64, @floatFromInt(prefilled)) / pre_s else 0, self.ctxTokens(),
                 if (stopped) " · STOPPED" else "",
             });
         }
@@ -2378,6 +2423,7 @@ pub const Session = struct {
     fn imageExpand(self: *Session) ?chat_template.ImageExpand {
         return switch (self.arch) {
             .qwen3 => null,
+            .k2_horizon => null,
             .qwen35 => chat_template.ImageExpand.chatml(&self.tok),
             .gemma3 => chat_template.ImageExpand.gemma3(&self.tok),
             .gemma4 => chat_template.ImageExpand.gemma4(&self.tok),
@@ -2392,7 +2438,7 @@ pub const Session = struct {
     /// can be released immediately.
     fn encodeCurrentImages(self: *Session, out: *std.ArrayList(EncImg)) !void {
         switch (self.arch) {
-            .qwen3 => {},
+            .qwen3, .k2_horizon => {},
             .qwen35 => |*a| for (self.turn_images.items) |im| {
                 var e = try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
                 defer e.deinit(self.gpa);
@@ -2494,7 +2540,9 @@ pub const Session = struct {
             .bos_token = self.bos_str,
             .eos_token = self.eos_str,
             .enable_thinking = chat.enable_thinking,
+            .reasoning_effort = chat.templateReasoningEffort(),
             .add_generation_prompt = true,
+            .tools = imageTools(self.images_enabled),
         };
         const exp = self.imageExpand();
         if (exp != null and grids.items.len > 0)
@@ -2740,7 +2788,7 @@ pub const Session = struct {
                     std.log.warn("promote for image turn failed: {t}", .{err}),
             }
             switch (self.arch) {
-                .qwen3 => unreachable, // text-only: hasVit() is always false here
+                .qwen3, .k2_horizon => unreachable, // text-only: hasVit() is always false here
                 .qwen35 => |*a| try self.imageTurn(a, false),
                 .gemma3 => |*a| try self.imageTurn(a, true),
                 .gemma4 => |*a| try self.imageTurnGemma4(a),
@@ -2748,6 +2796,12 @@ pub const Session = struct {
         } else {
             try chat.appendUser(&self.tok, self.gpa, self.turn_text, &self.ids);
             try chat.openAssistant(&self.tok, self.gpa, &self.ids);
+            if (getenv("TP_DUMP_CTX") != null) {
+                const dbg = self.tok.decodeAlloc(self.gpa, self.ids.items) catch "";
+                defer if (dbg.len > 0) self.gpa.free(dbg);
+                std.log.info("[chat] prompt ({d} tok):\n{s}\n[chat] end", .{ self.ids.items.len, dbg });
+            }
+            self.recordThoughtPrimed(self.ids.items);
         }
     }
 
@@ -2873,10 +2927,9 @@ pub const Session = struct {
                 // the "Processing..." window but is not prefill, so without this
                 // number it is invisible.
                 std.log.info("[ckpt] saved turn boundary @tok {d} ({d:.1} MiB in {d:.0} ms) · {d} in cache, {d:.1}/{d} MiB used", .{
-                    q,                          mib(snap.len),
-                    @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_ck)) / 1e6,
-                    self.checkpoints.items.len, mib(checkpointsBytes(self.checkpoints.items)),
-                    self.checkpoint_budget >> 20,
+                    q,                                                                                mib(snap.len),
+                    @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_ck)) / 1e6, self.checkpoints.items.len,
+                    mib(checkpointsBytes(self.checkpoints.items)),                                    self.checkpoint_budget >> 20,
                 });
             },
         }
@@ -2996,7 +3049,6 @@ pub const Session = struct {
         const s2 = toolcall.splitThought(v.text.items, Variant.markersFor(v), v.thought_primed);
         return if (s2.think) |t| std.mem.trim(u8, t, " \t\r\n").len else 0;
     }
-
 
     /// Record on the in-flight assistant variant whether `prompt` ends inside an
     /// open reasoning block, so the display and the tool-call scanner know the

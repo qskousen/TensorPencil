@@ -67,6 +67,7 @@ var g_staged_images: std.ArrayList(StagedImage) = .empty;
 var g_think_probe_path: [config.max_path]u8 = undefined;
 var g_think_probe_len: usize = 0;
 var g_think_probe_result: bool = false;
+var g_think_probe_effort: bool = false;
 var g_think_probe_valid: bool = false;
 /// Same memo for the weight-noise capability probe. Separate from the thinking
 /// one because the two answers come from different things (a chat template vs.
@@ -500,6 +501,10 @@ var g_load_conv: ?u64 = null;
 /// 60 times a second.
 var g_saved_turns: usize = 0;
 var g_saved_tail: usize = 0;
+/// Renders on disk at the last save. A turn's images finish AFTER its reply, so
+/// without this the newest turn was saved before its files existed and a reload
+/// reported them missing until some later turn re-saved the conversation.
+var g_saved_images: usize = 0;
 
 // Queue rail state. `g_rail_jobs` maps the row indices the rail reports back
 // (from a drag) onto the engine's images; it is rebuilt every frame right
@@ -909,6 +914,11 @@ fn configuredSupportsThinking() bool {
     return g_think_probe_result;
 }
 
+fn configuredSupportsReasoningEffort() bool {
+    _ = configuredSupportsThinking();
+    return g_think_probe_valid and g_think_probe_effort;
+}
+
 /// Whether the weight-noise controls should be offered at all: the loaded model's
 /// answer when there is one, otherwise the CONFIGURED file's.
 ///
@@ -993,10 +1003,12 @@ fn autoMessage() void {
 /// Read the configured GGUF's architecture and map it to reasoning support.
 /// Any failure (missing/unreadable file, unknown arch) -> false.
 fn probeThinking(path: []const u8) bool {
+    g_think_probe_effort = false;
     var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
     defer gg.deinit();
     const arch = gg.getStr("general.architecture") orelse return false;
     const fam = tp.llm.chat.familyForArch(arch) orelse return false;
+    g_think_probe_effort = tp.llm.chat.familySupportsReasoningEffort(fam);
     return tp.llm.chat.familySupportsThinking(fam);
 }
 
@@ -1455,6 +1467,7 @@ fn onNewConversation() void {
     g_history.newConversation();
     g_saved_turns = 0;
     g_saved_tail = 0;
+    g_saved_images = 0;
     newChat();
 }
 
@@ -1469,6 +1482,7 @@ fn onDeleteConversation(id: u64) void {
     if (was_current) {
         g_saved_turns = 0;
         g_saved_tail = 0;
+        g_saved_images = 0;
         newChat();
     }
 }
@@ -1559,6 +1573,8 @@ fn applyPendingConversationLoad() void {
     g_history.touch(id, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms));
     g_saved_turns = loaded.turns.len;
     g_saved_tail = if (loaded.turns.len > 0) loaded.turns[loaded.turns.len - 1].text.len else 0;
+    // Same function the saver compares against, so opening never rewrites.
+    g_saved_images = savedImageCount(msgs.items);
 }
 
 /// Report each image's terminal state to the model, once, as a note it reads
@@ -1698,7 +1714,8 @@ fn saveHistory(force: bool) void {
     // write.
     if (!force) if (g_session) |s| if (s.busy()) return;
     const tail = msgs[msgs.len - 1].activeConst().text.items.len;
-    if (msgs.len == g_saved_turns and tail == g_saved_tail) return;
+    const n_images = savedImageCount(msgs);
+    if (msgs.len == g_saved_turns and tail == g_saved_tail and n_images == g_saved_images) return;
 
     var turns: std.ArrayList(history.Turn) = .empty;
     defer turns.deinit(g_gpa);
@@ -1750,6 +1767,16 @@ fn saveHistory(force: bool) void {
     g_history.save(g_gpa, g_io, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms), turns.items);
     g_saved_turns = msgs.len;
     g_saved_tail = msgs[msgs.len - 1].activeConst().text.items.len;
+    g_saved_images = n_images;
+}
+
+/// Renders that reached disk, the ones `saveHistory` records.
+fn savedImageCount(msgs: []const chat.Message) usize {
+    var n: usize = 0;
+    for (msgs) |*m| for (m.activeConst().images.items) |gi| {
+        if (gi.get() == .done and gi.saved_path != null) n += 1;
+    };
+    return n;
 }
 
 // -------------------------------------------------------------- title bar
@@ -2494,6 +2521,17 @@ fn applyConfig() void {
 fn toggleReasoning() void {
     g_config.reasoning = !g_config.reasoning;
     g_config_baseline.reasoning = g_config.reasoning;
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+    if (g_session) |s| if (!g_loading.load(.acquire)) s.updateSettings(&g_config);
+}
+
+fn cycleReasoningEffort() void {
+    g_config.reasoning_effort = switch (g_config.reasoning_effort) {
+        .high => .medium,
+        .medium => .low,
+        .low => .high,
+    };
+    g_config_baseline.reasoning_effort = g_config.reasoning_effort;
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
     if (g_session) |s| if (!g_loading.load(.acquire)) s.updateSettings(&g_config);
 }
@@ -3643,6 +3681,16 @@ fn renderInput(s: ?*chat.Session) void {
                 .fill = if (on) style.over(style.C.chip, style.C.blue, 0.16) else style.C.chip,
                 .text = if (on) style.C.blue else style.C.text_dim,
             })) toggleReasoning();
+
+            const has_effort = if (s != null) tp.llm.chat.supportsReasoningEffort() else configuredSupportsReasoningEffort();
+            if (on and has_effort) {
+                const label = switch (g_config.reasoning_effort) {
+                    .high => "effort: high",
+                    .medium => "effort: medium",
+                    .low => "effort: low",
+                };
+                if (style.chip(@src(), label, .{ .id_extra = 3, .margin_x = 8 })) cycleReasoningEffort();
+            }
         }
 
         var link: dvui.ButtonWidget = undefined;
