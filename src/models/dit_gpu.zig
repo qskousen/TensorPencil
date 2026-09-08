@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const dit = @import("dit.zig");
+const lin = @import("lin.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -301,6 +302,10 @@ fn scoresCap(budget: u64) usize {
     return @min(s_bytes_cap, @max(64 << 20, budget / 4));
 }
 
+/// What this arm's GEMM surface runs: int8 natively, int4 and W4A8 through their decode
+/// kernels, NVFP4 through its decode, dense bf16 and fp8. No block-quant GEMM exists here.
+const vulkan_caps: lin.Caps = .{ .i8 = true, .i4 = true, .w4a8 = true, .nvfp4 = true, .bf16 = true, .fp8 = true };
+
 pub fn forward(
     model: *const DiT,
     ctx: *gpu.Context,
@@ -320,16 +325,19 @@ pub fn forward(
     // fp8 bytes and render a blank image with no error at all. Measured: that is
     // exactly what happened once `pipeline` learned to open a GGUF, the path
     // became reachable, so it needs the refusal.
-    if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype, .vulkan)) return error.UnsupportedCheckpoint;
+    if (lin.unsupported(model.device_lins, vulkan_caps)) |bad| {
+        std.log.err("dit vulkan: {s} is {t}, which this arm has no GEMM for", .{ bad.tag, bad.dtype });
+        return error.UnsupportedCheckpoint;
+    }
     // A packed W4A8 weight is `[rows][cols/2]` bytes, and the `else` arm below feeds
     // anything it does not recognize to the fp8 GEMM, the same shape as the GGUF blank
     // image this gate already exists for. `is_i8` covers it now, but keep the explicit
     // refusal so a future storage form cannot reach that arm by default.
-    if (!ctx.hasW4A8Decode() and dit.anyW4A8(model)) return error.UnsupportedCheckpoint;
+    if (!ctx.hasW4A8Decode() and lin.any(model.device_lins, .w4a8)) return error.UnsupportedCheckpoint;
     // Whether the int8 activation prep rotates. A property of the checkpoint, not a
     // tuning knob: ComfyUI's `int8_tensorwise` ships rotated (scale per row) and
     // unrotated (one scale per tensor), and the prep has to match the weight it feeds.
-    const i8_rot = dit.i8Convrot(model) orelse {
+    const i8_rot = lin.convrot(model.device_lins) orelse {
         std.log.err("dit vulkan: this checkpoint mixes convrot and plain int8 block linears; " ++
             "one activation prep serves a whole block, so there is no correct one", .{});
         return error.UnsupportedCheckpoint;
@@ -340,15 +348,15 @@ pub fn forward(
         std.log.err("dit vulkan: int4 block linears without convrot are not supported", .{});
         return error.UnsupportedCheckpoint;
     }
-    if (!ctx.hasNvfp4Decode() and dit.anyNvfp4(model)) return error.UnsupportedCheckpoint;
-    if (dit.anyNvfp4(model))
-        try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, dit.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes));
+    if (!ctx.hasNvfp4Decode() and lin.any(model.device_lins, .nvfp4)) return error.UnsupportedCheckpoint;
+    if (lin.any(model.device_lins, .nvfp4))
+        try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, lin.maxScratch(model.device_lins, .nvfp4, gpu.Context.nvfp4ScratchBytes));
     // Pre-size the W4A8 decode scratch to the model's widest weight BEFORE the batch
     // opens. Growing it mid-forward is *safe* (Vulkan's `ensureDeviceBuffer` flushes
     // the recording batch first) but costs a submit-and-wait per growth, and the first
     // block would pay several. The SD VAE decoders allocate up front for the same
     // reason.
-    if (dit.anyW4A8(model)) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, dit.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes));
+    if (lin.any(model.device_lins, .w4a8)) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, lin.maxScratch(model.device_lins, .w4a8, gpu.Context.w4a8ScratchBytes));
 
     const lat_h = sess.lat_h;
     const lat_w = sess.lat_w;

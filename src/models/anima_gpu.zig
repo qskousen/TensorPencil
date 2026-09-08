@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const anima = @import("anima.zig");
+const lin = @import("lin.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -209,7 +210,7 @@ pub const Session = struct {
         // decodes here too and needs its scratch sized to the model-wide maximum first,
         // growing it later would be correct but costs a submit-and-wait per growth.
         {
-            const w4 = anima.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes);
+            const w4 = lin.maxScratch(model.device_lins, .w4a8, gpu.Context.w4a8ScratchBytes);
             if (w4 > 0) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, w4);
         }
 
@@ -234,8 +235,8 @@ pub const Session = struct {
 
             // k and v share the context activation, so one prep serves both.
             try prepGroup(ctx, cond_d, n, cfg.context_dim, &.{ kw, vw });
-            try lin(ctx, ks, cond_d, n, kw);
-            try lin(ctx, vs, cond_d, n, vw);
+            try linear(ctx, ks, cond_d, n, kw);
+            try linear(ctx, vs, cond_d, n, vw);
             // K is normed, V is NOT (`v_norm = nn.Identity()`), the asymmetry
             // `DiT.projectKv` owns on the host path.
             try qkNorm(ctx, ks, model.blocks[bi].cross_attn.knorm, n * heads, hd, cfg.qk_eps);
@@ -382,22 +383,21 @@ pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     // int4 AND W4A8 each need BOTH the int8 pipeline and their own decode kernel that
     // feeds it, each decode's output is an ordinary int8-convrot weight, so neither half
     // alone is a path.
-    const support: anima.LinSupport = .{
+    // A dense bf16/f16 linear needs one of the f16-weight coop pipelines.
+    const has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
+    const caps: lin.Caps = .{
+        .f32 = true,
+        .fp8 = true,
+        .bf16 = has_f16w,
+        .f16 = has_f16w,
         .i8 = has_i8,
         .i4 = has_i8 and ctx.hasI4Decode(),
         .w4a8 = has_i8 and ctx.hasW4A8Decode(),
         .nvfp4 = ctx.hasNvfp4Decode(),
     };
-    if (anima.unsupportedLin(model, support) != null) return false;
-    for (model.blocks) |*b| {
-        // A dense block still needs one of the f16-weight pipelines.
-        const lins = [_]Weight{ b.self_attn.q, b.cross_attn.q, b.mlp1, b.mlp2 };
-        for (lins) |w| {
-            if (anima.linKind(w) != .dense) continue;
-            if (w.dtype == .bf16 or w.dtype == .f16) {
-                if (ctx.pipe_coop_bf16w == .null_handle and ctx.pipe_coop_f16w == .null_handle) return false;
-            }
-        }
+    if (lin.unsupported(model.device_lins, caps)) |bad| {
+        std.log.err("anima_gpu: {s} is {t}, which this device has no GEMM for", .{ bad.tag, bad.dtype });
+        return false;
     }
     return true;
 }
@@ -412,10 +412,10 @@ pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
 /// and 8192 were added to that table for this reason.
 fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
     // Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
-    // (`anima.prepKind` says why), so a block mixing them pays a single `opI8Prep`.
-    var want: anima.PrepKind = .none;
+    // (`lin.prepOf` says why), so a block mixing them pays a single `opI8Prep`.
+    var want: lin.Prep = .none;
     for (group) |w| {
-        const k = anima.prepKind(anima.linKind(w));
+        const k = lin.prepOf(lin.kindOf(w.dtype));
         if (k == .none) continue;
         if (want != .none and want != k) {
             std.log.err("anima_gpu: a linear group mixes {t} and {t} activation preps; one cannot serve both", .{ want, k });
@@ -424,7 +424,7 @@ fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const We
         want = k;
     }
     switch (want) {
-        // `.i4` takes the INT8 prep here, and that is not a bug. `anima.prepKind` maps
+        // `.i4` takes the INT8 prep here, and that is not a bug. `lin.prepOf` maps
         // int4 to an int4 activation prep because the CUDA arms run true W4A4; Vulkan has no
         // `sint4` coopmat, so its int4 weights are decoded to int8 per GEMM (`lin`) and the
         // activation stays 8-bit. The prep is a property of the BACKEND's GEMM, not of the
@@ -440,8 +440,8 @@ fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const We
 /// `opI8Gemm` requires `rows % (16 * coopmat.i8_nt) == 0`, i.e. a multiple of 64. Every
 /// linear the device runs here is 2048 or 8192; the AdaLN pair's 256/6144 and
 /// cross-attention's k/v are evaluated on the HOST.
-fn lin(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    switch (anima.linKind(w)) {
+fn linear(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
+    switch (lin.kindOf(w.dtype)) {
         .i8 => {
             std.debug.assert(w.rows % 64 == 0);
             try ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
@@ -481,7 +481,7 @@ fn lin(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
             std.debug.assert(w.rows <= zeros.len);
             try ctx.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
         },
-        .dense => try gemm(ctx, y, x, m, w),
+        else => try gemm(ctx, y, x, m, w),
     }
 }
 
@@ -526,9 +526,9 @@ pub fn forward(
     // opens: growing it mid-forward is safe (Vulkan's `ensureDeviceBuffer` flushes first)
     // but costs a submit-and-wait per growth, and the first block would pay several.
     {
-        const need = anima.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes);
+        const need = lin.maxScratch(model.device_lins, .nvfp4, gpu.Context.nvfp4ScratchBytes);
         if (need > 0) try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, need);
-        const w4 = anima.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes);
+        const w4 = lin.maxScratch(model.device_lins, .w4a8, gpu.Context.w4a8ScratchBytes);
         if (w4 > 0) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, w4);
     }
 
@@ -583,9 +583,9 @@ fn blockForward(
     try lnMod(ctx, ws, seq, d, mod_base + dim32, mod_base, cfg.norm_eps);
     // q/k/v share one activation, so one prep serves all three.
     try prepGroup(ctx, ws.nrm_d, seq, d, &.{ blk.self_attn.q, blk.self_attn.k, blk.self_attn.v });
-    try lin(ctx, ws.q_d, ws.nrm_d, seq, blk.self_attn.q);
-    try lin(ctx, ws.k_d, ws.nrm_d, seq, blk.self_attn.k);
-    try lin(ctx, ws.v_d, ws.nrm_d, seq, blk.self_attn.v);
+    try linear(ctx, ws.q_d, ws.nrm_d, seq, blk.self_attn.q);
+    try linear(ctx, ws.k_d, ws.nrm_d, seq, blk.self_attn.k);
+    try linear(ctx, ws.v_d, ws.nrm_d, seq, blk.self_attn.v);
 
     // Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps`, unlike
     // Z-Image, whose `RMSNorm(head_dim)` is built with no `eps` at all. Same kernel,
@@ -607,7 +607,7 @@ fn blockForward(
         .prepared = false,
     }, attn_scale);
     try prepGroup(ctx, ws.attn_d, seq, d, &.{blk.self_attn.out});
-    try lin(ctx, ws.dlt_d, ws.attn_d, seq, blk.self_attn.out);
+    try linear(ctx, ws.dlt_d, ws.attn_d, seq, blk.self_attn.out);
     try ctx.opElt(.gated_add, ws.x_d, ws.dlt_d, ws.mod_d, null, .{
         .u0 = total,
         .u1 = dim32,
@@ -619,7 +619,7 @@ fn blockForward(
     // than from two GEMMs, see the module header.
     try lnMod(ctx, ws, seq, d, mod_base + 4 * dim32, mod_base + 3 * dim32, cfg.norm_eps);
     try prepGroup(ctx, ws.nrm_d, seq, d, &.{blk.cross_attn.q});
-    try lin(ctx, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q);
+    try linear(ctx, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q);
     try qkNorm(ctx, ws.q_d, blk.cross_attn.qnorm, seq * heads, hd, cfg.qk_eps);
     try attention(ctx, sess, cfg, ws, .{
         .k = sess.ck_d[bi],
@@ -629,7 +629,7 @@ fn blockForward(
         .prepared = true,
     }, attn_scale);
     try prepGroup(ctx, ws.attn_d, seq, d, &.{blk.cross_attn.out});
-    try lin(ctx, ws.dlt_d, ws.attn_d, seq, blk.cross_attn.out);
+    try linear(ctx, ws.dlt_d, ws.attn_d, seq, blk.cross_attn.out);
     try ctx.opElt(.gated_add, ws.x_d, ws.dlt_d, ws.mod_d, null, .{
         .u0 = total,
         .u1 = dim32,
@@ -639,14 +639,14 @@ fn blockForward(
     // --- MLP -------------------------------------------------------------------
     try lnMod(ctx, ws, seq, d, mod_base + 7 * dim32, mod_base + 6 * dim32, cfg.norm_eps);
     try prepGroup(ctx, ws.nrm_d, seq, d, &.{blk.mlp1});
-    try lin(ctx, ws.mlp_d, ws.nrm_d, seq, blk.mlp1);
+    try linear(ctx, ws.mlp_d, ws.nrm_d, seq, blk.mlp1);
     // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
     try ctx.opElt(.gelu_erf, ws.mlp_d, null, null, null, .{
         .u0 = @intCast(seq * cfg.mlp_dim),
     }, seq * cfg.mlp_dim, 1, 1);
     // Its own prep: the reduction width here is `mlp_dim`, not `dim`.
     try prepGroup(ctx, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2});
-    try lin(ctx, ws.dlt_d, ws.mlp_d, seq, blk.mlp2);
+    try linear(ctx, ws.dlt_d, ws.mlp_d, seq, blk.mlp2);
     try ctx.opElt(.gated_add, ws.x_d, ws.dlt_d, ws.mod_d, null, .{
         .u0 = total,
         .u1 = dim32,

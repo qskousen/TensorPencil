@@ -122,15 +122,39 @@ pub fn main(init: std.process.Init) !void {
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
         var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
         var libs = false;
+        var layers: usize = 0; // 0 = the full trunk
+        var lat_arg: usize = 16;
+        var cap_arg: usize = 20;
+        var sigma_arg: f32 = 0.75;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "libs")) libs = true //
             else if (std.mem.eql(u8, args[i], "--vae") and i + 1 < args.len) {
                 i += 1;
                 vae = args[i];
+            } else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch 0;
+            } else if (std.mem.eql(u8, args[i], "--dequant-at-load") and i + 1 < args.len) {
+                i += 1;
+                TensorPencil.models.lin.dequant_at_load = std.meta.stringToEnum(@TypeOf(TensorPencil.models.lin.dequant_at_load), args[i]) orelse return error.InvalidArgs;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch sigma_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--gguf-gemm") and i + 1 < args.len) {
+                // A GGUF trunk has several decode routes and they are different GEMMs,
+                // so the device check has to be able to name one rather than only `auto`.
+                i += 1;
+                TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, args[i]) orelse return error.InvalidArgs;
             } else ckpt = args[i];
         }
-        try zimageCudaTest(arena, io, stdout, ckpt, vae, libs);
+        try zimageCudaTest(arena, io, stdout, ckpt, vae, libs, layers, lat_arg, cap_arg, sigma_arg);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-cuda-test")) {
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
         var libs = false;
@@ -175,10 +199,10 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "libs")) libs = true;
             // A GGUF DiT has two decode routes and they are different GEMMs, so the
             // device check has to be able to name one rather than only testing `auto`.
-            if (std.mem.eql(u8, a, "int8")) TensorPencil.models.dit_cuda.blockq_gemm = .int8;
-            if (std.mem.eql(u8, a, "int4")) TensorPencil.models.dit_cuda.blockq_gemm = .int4;
-            if (std.mem.eql(u8, a, "f16")) TensorPencil.models.dit_cuda.blockq_gemm = .f16;
-            if (std.mem.eql(u8, a, "mmq")) TensorPencil.models.dit_cuda.blockq_gemm = .mmq;
+            if (std.mem.eql(u8, a, "int8")) TensorPencil.models.lin_cuda.blockq_gemm = .int8;
+            if (std.mem.eql(u8, a, "int4")) TensorPencil.models.lin_cuda.blockq_gemm = .int4;
+            if (std.mem.eql(u8, a, "bf16")) TensorPencil.models.lin_cuda.blockq_gemm = .bf16;
+            if (std.mem.eql(u8, a, "mmq")) TensorPencil.models.lin_cuda.blockq_gemm = .mmq;
         }
         try cudaDitTest(arena, io, stdout, path, lat, loop, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-test")) {
@@ -237,14 +261,20 @@ pub fn main(init: std.process.Init) !void {
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-matmul")) {
         try benchMatmul(arena, io, stdout);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "inspect")) {
-        // Placeholder driver: inspect a safetensors file. Replaced by the real
-        // `generate` command as the pipeline comes together.
-        var st = try TensorPencil.SafeTensors.open(arena, io, args[2]);
-        defer st.deinit();
-        try stdout.print("{s}: {d} tensors\n", .{ args[2], st.count() });
-        for (st.names()) |name| {
-            const view = st.get(name).?;
-            try stdout.print("  {s}  {any}  {t}\n", .{ name, view.info.shape.slice(), view.info.dtype });
+        // Container.open, not SafeTensors.open: the reader is picked by magic, so
+        // `inspect` works on a GGUF too. Handing one to the safetensors reader reports
+        // `InvalidHeader`, which says nothing about what happened.
+        var ct = try TensorPencil.pipeline.Container.open(arena, io, args[2]);
+        defer ct.deinit();
+        const store = ct.store();
+        const names = store.names();
+        try stdout.print("{s}: {d} tensors\n", .{ args[2], names.len });
+        for (names) |name| {
+            const view = store.get(name).?;
+            try stdout.print("  {s}  {any}  {t}{s}\n", .{
+                name,                          view.info.shape.slice(),
+                view.info.dtype,               if (view.info.flat_blocks) "  (flat blocks)" else "",
+            });
         }
     } else {
         try stdout.print(
@@ -318,14 +348,14 @@ pub fn main(init: std.process.Init) !void {
             \\                         exact conditioning (on/off)
             \\      --dit-gguf-gemm auto  which GEMM a GGUF block-quant DiT
             \\                         decodes its weights for:
-            \\                         auto | int8 | int4 | f16.
+            \\                         auto | int8 | int4 | bf16 | mmq.
             \\                         int8 rotates and re-quantizes to convrot
             \\                         int8, which is ~2x faster but caps accuracy
             \\                         at int8's; int4 does the same one width down
-            \\                         for the s4 tensor cores; f16 expands the
+            \\                         for the s4 tensor cores; bf16 expands the
             \\                         weight and keeps the format's own. auto picks
             \\                         int8 for q2_k/q4_k (whose own error already
-            \\                         dominates the regrid) and f16 for the rest.
+            \\                         dominates the regrid) and bf16 for the rest.
             \\                         int4 is opt-in even for q2_k: it is W4A4,
             \\                         and the 4-bit activations cost more than the
             \\                         weight regrid saves. Only q2_k/q4_k/q8_0
@@ -2262,7 +2292,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
 /// Truncated to a few trunk layers so it loads in seconds. The loop bound is not
 /// what a kernel port gets wrong; the block's shape is. Exits non-zero on failure
 /// so it works as a gate.
-fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, vae_path: []const u8, libs: bool) !void {
+fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, vae_path: []const u8, libs: bool, layers: usize, lat_arg: usize, cap_arg: usize, sigma_arg: f32) !void {
     const cuda = TensorPencil.gpu.cuda;
     const zimage = TensorPencil.models.zimage;
     const zimage_cuda = TensorPencil.models.zimage_cuda;
@@ -2272,12 +2302,18 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         try stdout.print("zimage-cuda-test needs a Z-Image checkpoint ({s})\n", .{ckpt});
         return;
     };
-    var ck = try safetensors.open(arena, io, ckpt);
+    // Container.open, not SafeTensors.open: a GGUF Z-Image is a real checkpoint here.
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
     defer ck.deinit();
     var cfg = zimage.z_image;
-    cfg.n_layers = 2;
-    var model = try zimage.DiT.load(arena, .{ .safetensors = &ck }, cfg);
+    // Depth is a real axis here, not a cost knob: a defect that accumulates rather than
+    // being wrong at once reads as a healthy residual at depth 2 and garbage at 30, which
+    // is exactly what a solid white render off a q8_0 GGUF turned out to be. The default
+    // is the full trunk; `--layers N` picks one depth.
+    if (layers != 0) cfg.n_layers = layers;
+    var model = try zimage.DiT.load(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store()), cfg);
     defer model.deinit();
+    try stdout.print("trunk depth {d} (+{d}+{d} refiners)\n", .{ cfg.n_layers, cfg.n_refiner_layers, cfg.n_refiner_layers });
 
     var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
         try stdout.print("cuda unavailable: {t}\n", .{err});
@@ -2290,8 +2326,14 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         return;
     }
 
-    const lat = 16; // 8x8 = 64 image tokens, exactly two pad buckets
-    const seq_txt = 20;
+    // 16 is 8x8 = 64 image tokens, exactly two pad buckets. `--lat` raises it: the token
+    // count is what the padding rules and every GEMM's `m` key on, so a check at one
+    // latent size answers about one `m`.
+    const lat = lat_arg;
+    // The caption length is the other half of the joint sequence, and it is padded on its
+    // own (`cfg.padded`), so it is its own shape axis. `--cap` raises it: a real prompt is
+    // far longer than 20 tokens.
+    const seq_txt = cap_arg;
     var prng = std.Random.DefaultPrng.init(11);
     const rnd = prng.random();
     const ctxv = try arena.alloc(f32, seq_txt * cfg.cap_dim);
@@ -2299,7 +2341,10 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
     const x_lat = try arena.alloc(f32, cfg.channels * lat * lat);
     for (x_lat) |*v| v.* = rnd.floatNorm(f32);
 
-    const sigma: f32 = 0.75;
+    // The sigma is a real axis too, not a fixed detail: the trunk's activations scale
+    // with it, and a device buffer that only overflows at a magnitude is fine at 0.75 and
+    // all-NaN at the 1.0 a render's first step actually uses.
+    const sigma: f32 = sigma_arg;
     const cap = try model.capTokens(io, arena, ctxv, seq_txt);
     const cap_padded = cfg.padded(seq_txt);
 
@@ -2334,9 +2379,19 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
             den += @as(f64, e) * e;
         }
         const rel = if (den == 0) 0 else @sqrt(num / den);
-        // The GEMMs run tensor cores against the CPU's f32 accumulation, the same
-        // regime `sd_unet_cuda` sits in, and `zimage_gpu` measures 2.2e-4 there.
-        const ok = nonfinite == 0 and rel < 1e-3;
+        // The GEMMs run tensor cores against the CPU's f32 accumulation, the same regime
+        // `sd_unet_cuda` sits in. A dense bf16 checkpoint measures 2.2e-4 at the 2 layers
+        // this ran at before it could vary depth; the bound grows with depth because the
+        // residual carries each block's rounding into the next.
+        //
+        // The growth is MEASURED, not chosen to make deep runs pass: a q8_0 GGUF reads
+        // 2.3e-4 flat from depth 2 to 24 and 1.4e-2 at 30, and the same file dequantized
+        // to dense bf16 at load reads 1.1e-2 at 30, i.e. the deep figure is the bf16
+        // operand floor and not the quantization. For scale, krea2's equivalent check
+        // passes at 0.18. It still has teeth: the f16 overflow this test was extended to
+        // catch lands at non-finite, and a mis-wired route lands near 1.0.
+        const tol: f64 = if (model.layers.len <= 8) 1e-3 else 5e-2;
+        const ok = nonfinite == 0 and rel < tol;
         if (!ok) failures += 1;
         try stdout.print("forward vs CPU ({s:<11})  rel L2 {e:.4}  {s}{s}\n", .{
             if (naive) "naive attn" else "opAttnTC", rel,
@@ -3286,7 +3341,6 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     const anima = TensorPencil.models.anima;
     const anima_cuda = TensorPencil.models.anima_cuda;
     const ops = TensorPencil.ops;
-    const safetensors = TensorPencil.SafeTensors;
 
     var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
         try stdout.print("cuda unavailable: {t}\n", .{err});
@@ -3418,7 +3472,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
         try summarize(stdout, failures);
         return;
     };
-    var ck = try safetensors.open(arena, io, ckpt);
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
     defer ck.deinit();
     try stdout.print("\n-- forward (real weights) --\n", .{});
     // Depth 1 AND depth 2, because that is the ATTRIBUTION on a mixed checkpoint.
@@ -3436,19 +3490,20 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     // flat at ~3.9e-2. A single depth cannot distinguish "coarse" from "accumulating",
     // and that distinction is the whole diagnostic. Cheap: the deep CPU reference at a
     // 24x32 latent is seconds.
-    const full = try anima.detectConfig(.{ .safetensors = &ck });
+    const dstore = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    const full = try anima.detectConfig(dstore);
     for ([_]usize{ 1, 2, 8, full.n_layers }) |depth| {
         var cfg = full;
         cfg.n_layers = depth;
-        var model = try anima.DiT.load(arena, .{ .safetensors = &ck }, cfg);
+        var model = try anima.DiT.load(arena, dstore, cfg);
         defer model.deinit();
         if (!anima_cuda.supported(&model)) {
             try stdout.print("  checkpoint dtype unsupported on this backend\n", .{});
             break;
         }
-        // `unsupportedLin` with the no-convrot support set reports the first int8/int4
-        // linear, which is exactly "is this depth quantized, and as what".
-        const qdt: ?TensorPencil.dtype.DType = if (anima.unsupportedLin(&model, .{})) |q| q.dtype else null;
+        // The first non-dense linear says "is this depth quantized, and as what".
+        const dense: TensorPencil.models.lin.Caps = .{ .f32 = true, .f16 = true, .bf16 = true, .fp8 = true };
+        const qdt: ?TensorPencil.dtype.DType = if (TensorPencil.models.lin.unsupported(model.device_lins, dense)) |q| q.dtype else null;
         failures += try animaForwardCheck(arena, io, stdout, be, &model, depth, qdt, rnd);
     }
 
@@ -3524,7 +3579,12 @@ fn animaForwardCheck(
     const base: f64 = switch (qdt orelse .f32) {
         .i4 => 6e-2,
         .i8, .w4a8 => 6e-3,
-        else => if (depth == 1) 2.5e-3 else 1e-3,
+        // A GGUF block quant on the device decodes to convrot int8 per GEMM
+        // (`lin_cuda`), so its residual against the weight-only CPU reference is int8's
+        // plus the format's own regrid, not the dense one. Measured on a q4_k Anima:
+        // 2.28e-3 at depth 2 rising to 1.14e-2 at 28, i.e. within int8's own band. The
+        // dense bound would fail every block-quant checkpoint for being quantized.
+        else => |dt| if (dt.isBlockQuant()) 6e-3 else if (depth == 1) 2.5e-3 else 1e-3,
     };
     const tol: f64 = base * (1.0 + @as(f64, @floatFromInt(depth)) / 8.0);
     var failures: usize = 0;
@@ -4293,12 +4353,15 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     // the safetensors reader reports `InvalidHeader`, which says nothing.
     var container = try TensorPencil.pipeline.Container.open(arena, io, path);
     defer container.deinit();
-    var model = try dit_mod.DiT.load(arena, container.store());
+    var model = try dit_mod.DiT.load(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, container.store()));
     defer model.deinit();
     const wqt = model.blocks[0].attn.wq.dtype;
-    if (!dit_mod.gpuLinKindSupported(wqt, .cuda)) {
-        try stdout.print("cuda-dit-test needs a checkpoint the CUDA DiT has a GEMM for (wq.dtype={t})\n", .{wqt});
-        return;
+    switch (TensorPencil.models.lin_cuda.check(model.device_lins)) {
+        .ok => {},
+        .refused => |r| {
+            try stdout.print("cuda-dit-test needs a checkpoint the CUDA DiT has a GEMM for ({s}: {t} {s})\n", .{ r.tag, r.dtype, @tagName(r.why) });
+            return;
+        },
     }
     const qtag: []const u8 = @tagName(wqt);
 
@@ -4408,7 +4471,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         // So this gate catches a wiring break (which lands near 1.0, not 0.13) and
         // deliberately does not try to bound quantization quality; `--dit` renders and
         // the PSNR tables in BACKEND.md are what measure that.
-        const tol: f32 = if (dit_cuda.activationIs4Bit(wqt))
+        const tol: f32 = if (TensorPencil.models.lin_cuda.activationIs4Bit(wqt))
             0.25
         else if (wqt == .q2_k)
             0.15
@@ -4546,8 +4609,15 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             }
         } else if (std.mem.eql(u8, flag, "--encoder-f16")) {
             opts.encoder_f16 = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--dit-dequant-at-load")) {
+            // Diagnostic: expand every block-quant block linear to f32 at load, so the
+            // same file runs through the dense path (`lin.dequant_at_load`).
+            TensorPencil.models.lin.dequant_at_load = std.meta.stringToEnum(@TypeOf(TensorPencil.models.lin.dequant_at_load), val) orelse {
+                std.log.err("--dit-dequant-at-load: expected off|f32|bf16 (got '{s}')", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--dit-gguf-gemm")) {
-            TensorPencil.models.dit_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.dit_cuda.BlockQGemm, val) orelse {
+            TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, val) orelse {
                 try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, f16, mmq)\n", .{val});
                 return error.InvalidArgs;
             };

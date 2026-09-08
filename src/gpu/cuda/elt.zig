@@ -7310,6 +7310,42 @@ pub const dequant_q6_k_f16_ptx: [:0]const u8 =
     \\}
 ;
 
+/// A dequant kernel's bf16 twin: the same decode with the one output convert changed
+/// (`cvt.rn.f16.f32` -> `cvt.rn.bf16.f32`, sm_80+). The block's own f16 scale loads
+/// (`cvt.f32.f16`) are untouched. Derived, not copied, so the two cannot drift; errors
+/// at compile time if the source has no such convert or its entry is not unique.
+fn bf16Twin(comptime src: []const u8, comptime entry: []const u8, comptime new_entry: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(200000);
+    const a = replaceAll(src, "cvt.rn.f16.f32", "cvt.rn.bf16.f32");
+    const from = ".entry " ++ entry ++ "(";
+    if (std.mem.count(u8, a, from) != 1) @compileError("bf16Twin: entry not unique: " ++ entry);
+    const b = replaceAll(a, from, ".entry " ++ new_entry ++ "(");
+    const z = b ++ [_]u8{0};
+    return z[0..b.len :0];
+}
+
+fn replaceAll(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
+    if (std.mem.count(u8, src, from) == 0) @compileError("replaceAll: pattern absent: " ++ from);
+    var buf: [std.mem.replacementSize(u8, src, from, to)]u8 = undefined;
+    _ = std.mem.replace(u8, src, from, to, &buf);
+    const out = buf;
+    return &out;
+}
+
+/// bf16 twins of the block-quant dequants, for the diffusion trunks: Z-Image's
+/// activations pass f16's 65504 ceiling (an f16 GEMM path rendered it solid white with
+/// no error), so the block-quant weight-only route feeds bf16 tensor cores there.
+pub const dequant_q4_0_bf16_ptx = bf16Twin(dequant_q4_0_f16_ptx, "dequant_q4_0_f16", "dequant_q4_0_bf16");
+pub const dequant_q8_0_bf16_ptx = bf16Twin(dequant_q8_0_f16_ptx, "dequant_q8_0_f16", "dequant_q8_0_bf16");
+pub const dequant_q4_k_bf16_ptx = bf16Twin(dequant_q4_k_f16_ptx, "dequant_q4_k_f16", "dequant_q4_k_bf16");
+pub const dequant_q5_k_bf16_ptx = bf16Twin(dequant_q5_k_f16_ptx, "dequant_q5_k_f16", "dequant_q5_k_bf16");
+pub const dequant_q6_k_bf16v_ptx = bf16Twin(dequant_q6_k_f16v_ptx, "dequant_q6_k_f16v", "dequant_q6_k_bf16v");
+pub const dequant_iq4_nl_bf16_ptx = bf16Twin(dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16", "dequant_iq4_nl_bf16");
+pub const dequant_iq4_xs_bf16_ptx = bf16Twin(dequant_iq4_xs_f16_ptx, "dequant_iq4_xs_f16", "dequant_iq4_xs_bf16");
+pub const dequant_q1_0_bf16_ptx = bf16Twin(dequant_q1_0_f16_ptx, "dequant_q1_0_f16", "dequant_q1_0_bf16");
+pub const dequant_q2_0_g64_bf16_ptx = bf16Twin(dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16", "dequant_q2_0_g64_bf16");
+pub const dequant_q2_0_g128_bf16_ptx = bf16Twin(dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16", "dequant_q2_0_g128_bf16");
+
 /// Convert f32 activations to f16, zero-padding rows past the real count so the
 /// 128-row-padded GEMM sees clean pad rows. out[i] = i<u1 ? f16(in[i]) : 0.
 /// b0=in(f32), b1=out(f16). u0=total(padded elems), u1=real elems. One thread/elem.

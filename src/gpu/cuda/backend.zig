@@ -3107,6 +3107,82 @@ pub const Backend = struct {
         return self.fp8_w16;
     }
 
+    /// `opDequantF16`'s bf16 twin (`elt.bf16Twin`), same scratch and lifetime rule.
+    pub fn opDequantBf16(self: *Backend, dt: dtypes.DType, w_db: DeviceBuffer, elems: usize) Error!DeviceBuffer {
+        if (dt == .bf16) return w_db;
+        self.ptic();
+        defer self.ptoc(.dequant);
+        try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
+        if (dt == .q6_k) {
+            const fv = try self.eltFn(elt.dequant_q6_k_bf16v_ptx, "dequant_q6_k_bf16v");
+            try self.eltLaunch(fv, w_db, self.fp8_w16, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
+            return self.fp8_w16;
+        }
+        const f_deq = switch (dt) {
+            .q4_0 => try self.eltFn(elt.dequant_q4_0_bf16_ptx, "dequant_q4_0_bf16"),
+            .q8_0 => try self.eltFn(elt.dequant_q8_0_bf16_ptx, "dequant_q8_0_bf16"),
+            .q4_k => try self.eltFn(elt.dequant_q4_k_bf16_ptx, "dequant_q4_k_bf16"),
+            .q5_k => try self.eltFn(elt.dequant_q5_k_bf16_ptx, "dequant_q5_k_bf16"),
+            .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_bf16_ptx, "dequant_iq4_nl_bf16"),
+            .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_bf16_ptx, "dequant_iq4_xs_bf16"),
+            .q1_0 => try self.eltFn(elt.dequant_q1_0_bf16_ptx, "dequant_q1_0_bf16"),
+            .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_bf16_ptx, "dequant_q2_0_g64_bf16"),
+            .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_bf16_ptx, "dequant_q2_0_g128_bf16"),
+            else => return error.UnsupportedDtype,
+        };
+        try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
+        return self.fp8_w16;
+    }
+
+    /// `opMatmulQuant` with bf16 operands: the weight dequantizes to bf16, the activation
+    /// converts to bf16, the bf16 tensor cores run. The diffusion trunks take this and
+    /// not the f16 form because Z-Image's activations pass f16's 65504 ceiling, which
+    /// renders solid white with no error; bf16 has f32's range. Same speed on Ampere.
+    ///
+    /// ⚠️ Writes exactly `m` rows of `y`, unlike `opMatmulQuant`, which writes
+    /// `align(m, 128)` and so requires every caller to have padded. This is the route a
+    /// block quant falls back to when nothing faster fits its shape, so it is the one
+    /// that must place no shape requirement on the caller at all: Z-Image pads its
+    /// sequence to 32, and the padded write ran off its workspace into
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS` and a solid white render.
+    ///
+    /// `bias` is a zero vector of at least `rows` entries from a STABLE full-width array
+    /// the caller owns, used only by the hand-PTX arm's compaction. NOT `Backend.zeroBias`,
+    /// which reallocates on growth: `cachedWeight` keys on the host pointer, so a moved
+    /// one leaves a device buffer registered against a freed address (see `opMatmulNvfp4`).
+    pub fn opMatmulQuantBf16(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: []const f32) Error!void {
+        std.debug.assert(bias.len >= rows);
+        const w_db = try self.cachedWeight(w_bytes);
+        const w16 = try self.opDequantBf16(dt, w_db, rows * cols);
+        // cuBLASLt takes an arbitrary `m` and writes exactly `m` rows; the hand-PTX
+        // `hgemm` dispatches `grid.y = mpad/128` and each block stores a whole 128x128 C
+        // tile, so it stages into `conv_c` and compacts, exactly as `opMatmulNvfp4` does.
+        const libs = self.kernels == .libs;
+        const mrun = if (libs) m else std.mem.alignForward(usize, m, 128);
+        {
+            self.ptic();
+            defer self.ptoc(.elt);
+            try self.ensureDeviceBuffer(&self.fp8_a16, mrun * cols * 2);
+            const f_cvt = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+            try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mrun * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, mrun * cols);
+        }
+        if (libs) {
+            self.ptic();
+            defer self.ptoc(.matmul);
+            return self.ltMatmulBf16(y, w16, self.fp8_a16, rows, m, cols);
+        }
+        try self.ensureDeviceBuffer(&self.conv_c, mrun * rows * 4);
+        {
+            self.ptic();
+            defer self.ptoc(.matmul);
+            const f_hg = try self.hgemmBf16Fn();
+            try self.launchHgemm(f_hg, self.fp8_a16, w16, self.conv_c, mrun, rows, cols);
+        }
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, y, null, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
+    }
+
     /// Convert `m` rows of f32 activations to f16 in the shared activation
     /// scratch, zero-filling rows m..mpad, and return it. Same lifetime rule as
     /// `opDequantF16`.

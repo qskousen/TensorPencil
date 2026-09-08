@@ -27,6 +27,7 @@ const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const lin = @import("lin.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -182,6 +183,11 @@ const Attn = struct {
     /// (the packed CPU kernel amortizes activation packing over N); the halves are
     /// split out of the *result*, which is a row copy and negligible beside it.
     qkv: Weight,
+    /// The device forwards run q, k and v as three GEMMs; these are row views of
+    /// `qkv` with every per-row sidecar sliced to match (`lin.rowSlice`).
+    q: Weight,
+    k: Weight,
+    v: Weight,
     out: Weight,
     /// Per-head RMSNorm scales, `[head_dim]`, plain weights (not `1 + scale`).
     qnorm: []const f32,
@@ -220,6 +226,10 @@ pub const DiT = struct {
     context_refiner: []Block,
     noise_refiner: []Block,
     layers: []Block,
+    /// Every block linear the device forwards run: the noise refiner and the trunk, q/k/v
+    /// as the device sees them. The one list every support scan and GEMM plan reads
+    /// (`lin`, `lin_cuda`). The context refiner and the AdaLN linears run on the host.
+    device_lins: []const Weight,
     final_ada: LinearW, // mod_dim -> dim
     final_linear: LinearW, // dim -> patchDim
 
@@ -242,6 +252,9 @@ pub const DiT = struct {
         for (noise_refiner, 0..) |*b, i| b.* = try l.block("noise_refiner.{d}", .{i}, true);
         const layers = try alloc.alloc(Block, cfg.n_layers);
         for (layers, 0..) |*b, i| b.* = try l.block("layers.{d}", .{i}, true);
+        const device_lins = try alloc.alloc(Weight, (noise_refiner.len + layers.len) * 7);
+        for (noise_refiner, 0..) |*b, i| device_lins[i * 7 ..][0..7].* = blockLins(b);
+        for (layers, 0..) |*b, i| device_lins[(noise_refiner.len + i) * 7 ..][0..7].* = blockLins(b);
 
         // `x_embedder` and `final_layer.linear` are the two projections the GPU
         // arms hand to the fused f32-only `opMatmul`; normalize their storage once
@@ -264,6 +277,7 @@ pub const DiT = struct {
             .context_refiner = context_refiner,
             .noise_refiner = noise_refiner,
             .layers = layers,
+            .device_lins = device_lins,
             // Index 1, not 0: the final layer keeps stock Lumina's
             // `Sequential(SiLU, Linear)` while the blocks lose the SiLU and so
             // number their linear 0. See the module header.
@@ -384,7 +398,27 @@ pub const DiT = struct {
         return raw;
     }
 
-    /// Byte offset of the zero block inside a `modulationTable`, i.e. the `shift_off`
+    /// DIAGNOSTIC: print each block's residual magnitude on the CPU path (`TP_ZIMAGE_TRACE`).
+///
+/// The one measurement that separates "the device is imprecise" from "the device saturated":
+/// this trunk's residual grows with depth, and a device buffer or GEMM operand narrower than
+/// the value it holds fails at a DEPTH rather than at a shape, which reads as error that
+/// doubles per block rather than as an error at all.
+var trace_on: ?bool = null;
+
+pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
+    if (trace_on == null) trace_on = std.c.getenv("TP_ZIMAGE_TRACE") != null;
+    if (!trace_on.?) return;
+    var mx: f32 = 0;
+    var sum: f64 = 0;
+    for (x) |v| {
+        mx = @max(mx, @abs(v));
+        sum += @as(f64, v) * @as(f64, v);
+    }
+    std.debug.print("[zimage] {s} {d:>2}  max|x| {d:12.1}  rms {d:10.3}\n", .{ what, i, mx, @sqrt(sum / @as(f64, @floatFromInt(x.len))) });
+}
+
+/// Byte offset of the zero block inside a `modulationTable`, i.e. the `shift_off`
     /// the device `modulate` kernel should read.
     pub fn zeroShiftOffset(self: *const DiT) usize {
         return self.modulatedBlocks() * 4 * self.cfg.dim;
@@ -608,11 +642,12 @@ pub const DiT = struct {
         @memcpy(x[0 .. cap_padded * cfg.dim], cap);
         @memcpy(x[cap_padded * cfg.dim ..], img);
 
-        for (self.layers) |*blk| {
+        for (self.layers, 0..) |*blk, bi| {
             // Poll between blocks so a stop lands mid-step; a full CPU step is tens
             // of seconds.
             if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
             try self.blockForward(io, gpa, blk, x, seq, adaln, freqs);
+            traceActs("layer", bi, x);
         }
 
         // The final layer is row-wise, so running it on the image rows alone is
@@ -876,52 +911,9 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
     try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
 }
 
-/// Whether the GPU forwards have a GEMM path for block linears of this dtype.
-/// Mirrors `dit.gpuLinKindSupported`: an unrecognized dtype on those paths is not a
-/// slow path, it is silently wrong output, so both gate on this before dispatching.
-pub fn gpuLinKindSupported(dt: DType) bool {
-    return switch (dt) {
-        // `.nvfp4` is decoded to f16 inside the GEMM (weight-only, which is what NVFP4 is
-        // below Blackwell), so it runs wherever the f16 GEMM does.
-        .bf16, .f16, .f32, .f8_e4m3, .nvfp4 => true,
-        else => false,
-    };
-}
-
-/// The first block linear the device forward cannot run, or null if it can run all of them.
-///
-/// Scans EVERY layer, not `layers[0].attn.qkv`. A single-tensor probe is correct only
-/// while no mixed Z-Image checkpoint exists, and Anima's mixed checkpoints show what
-/// "mixed" means in practice: mixed PER BLOCK, so a block-0 probe says yes and the
-/// forward then panics on the first thing it does. Returns the tensor's name so the
-/// refusal can say which layer.
-pub fn unsupportedGpuLin(model: *const DiT, extra: fn (DType) bool) ?struct { tag: []const u8, dtype: DType } {
-    for (model.layers) |*b| {
-        const lins = [_]Weight{ b.attn.qkv, b.attn.out, b.ffn.w1, b.ffn.w3, b.ffn.w2 };
-        for (lins) |w| {
-            if (!gpuLinKindSupported(w.dtype) or !extra(w.dtype))
-                return .{ .tag = w.tag orelse "?", .dtype = w.dtype };
-        }
-        if (b.ada) |a| if (!gpuLinKindSupported(a.w.dtype) or !extra(a.w.dtype))
-            return .{ .tag = a.w.tag orelse "?", .dtype = a.w.dtype };
-    }
-    return null;
-}
-
-/// Largest transient buffer any NVFP4 block linear decodes into, per the backend's own
-/// sizing rule, or 0 when the model has none.
-pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
-    var max: usize = 0;
-    for (model.layers) |*b| {
-        const lins = [_]Weight{ b.attn.qkv, b.attn.out, b.ffn.w1, b.ffn.w3, b.ffn.w2 };
-        for (lins) |w| {
-            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
-        }
-        if (b.ada) |a| if (a.w.dtype == .nvfp4) {
-            max = @max(max, bytesFor(a.w.rows, a.w.cols));
-        };
-    }
-    return max;
+/// The seven linears one block's device forward runs.
+pub fn blockLins(b: *const Block) [7]Weight {
+    return .{ b.attn.q, b.attn.k, b.attn.v, b.attn.out, b.ffn.w1, b.ffn.w3, b.ffn.w2 };
 }
 
 // --- weight loading ---------------------------------------------------------
@@ -956,10 +948,7 @@ const Loader = struct {
         // every family that ships them (`quant_weight.zig`).
         //
         // W4A8 is here because being krea2-only made the FIRST Anima W4A8 checkpoint
-        // unloadable, and nothing about Z-Image would have stopped it arriving here
-        // instead. `.w4a8` is absent from `gpuLinKindSupported`, so such a checkpoint runs
-        // on the CPU (where `ops.matmul` decodes per k-slice) and every GPU arm declines
-        // rather than reading the nibbles as something else.
+        // unloadable, and nothing about Z-Image would have stopped it arriving here.
         if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
             var w = nv;
             w.tag = try l.alloc.dupe(u8, nm);
@@ -977,13 +966,10 @@ const Loader = struct {
             std.log.err("zimage: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, view.info.dtype, rows, cols });
             return error.ShapeMismatch;
         }
-        // A shape-fixed block-quantized tensor blocks over the FLAT element
-        // sequence rather than each logical row, which `Weight.init` does not
-        // assume. Refuse loudly rather than read a wrong byte count.
-        if (view.info.flat_blocks) {
-            std.log.err("zimage: {s} is {t} with flat block layout; this loader needs row-aligned blocks", .{ nm, view.info.dtype });
-            return error.UnsupportedCheckpoint;
-        }
+        // A shape-fixed block quant tiles its blocks over the flat element sequence,
+        // not each row, so no GEMM here can read it; it is small by construction
+        // (a GGUF `x_embedder` is [dim, 64]).
+        if (view.info.flat_blocks) return quant_weight.flatBlocksF32(l.alloc, view, nm, rows, cols);
         if (!ops.matmul.supportsDType(view.info.dtype)) {
             std.log.err("zimage: {s} has unsupported dtype {t}", .{ nm, view.info.dtype });
             return error.UnsupportedDType;
@@ -992,7 +978,7 @@ const Loader = struct {
         // Carry the checkpoint name so a GEMM stays attributable to a layer
         // downstream (ops.matmul.probe, profiling, error messages).
         w.tag = try l.alloc.dupe(u8, nm);
-        return w;
+        return lin.maybeDequant(l.alloc, w);
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
@@ -1018,9 +1004,13 @@ const Loader = struct {
 
     fn block(l: Loader, comptime prefix: []const u8, args: anytype, modulated: bool) !Block {
         const cfg = l.cfg;
+        const qkv = try l.mat(prefix ++ ".attention.qkv.weight", args, cfg.qDim() + 2 * cfg.kvDim(), cfg.dim);
         return .{
             .attn = .{
-                .qkv = try l.mat(prefix ++ ".attention.qkv.weight", args, cfg.qDim() + 2 * cfg.kvDim(), cfg.dim),
+                .qkv = qkv,
+                .q = try lin.rowSlice(l.alloc, qkv, 0, cfg.qDim()),
+                .k = try lin.rowSlice(l.alloc, qkv, cfg.qDim(), cfg.kvDim()),
+                .v = try lin.rowSlice(l.alloc, qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim()),
                 .out = try l.mat(prefix ++ ".attention.out.weight", args, cfg.dim, cfg.qDim()),
                 .qnorm = try l.vec(prefix ++ ".attention.q_norm.weight", args, cfg.head_dim),
                 .knorm = try l.vec(prefix ++ ".attention.k_norm.weight", args, cfg.head_dim),

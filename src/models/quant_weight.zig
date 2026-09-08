@@ -24,6 +24,25 @@ const ops = @import("tp_ops");
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 
+/// A shape-fixed block-quant tensor (`TensorInfo.flat_blocks`) as an f32 `Weight`.
+///
+/// A GGUF converter reshapes a tensor whose contiguous dim is not a multiple of 256
+/// before quantizing it, so its blocks tile the flat element sequence rather than each
+/// row, and no GEMM here can read that layout. The values are fine, so materialize once.
+/// Every such tensor is small by construction (a narrow projection like a patch embed),
+/// which is why 4 bytes an element is the right trade and a refusal is not.
+pub fn flatBlocksF32(alloc: std.mem.Allocator, view: weights_mod.TensorView, name: []const u8, rows: usize, cols: usize) !Weight {
+    std.debug.assert(view.info.flat_blocks);
+    if (view.info.elemCount() != rows * cols) {
+        std.log.err("{s} has {d} elements, expected [{d}, {d}]", .{ name, view.info.elemCount(), rows, cols });
+        return error.ShapeMismatch;
+    }
+    const f = try view.toF32Alloc(alloc);
+    var w = Weight.fromF32(f, rows, cols);
+    w.tag = try alloc.dupe(u8, name);
+    return w;
+}
+
 /// Build a `Weight` for a ComfyUI NVFP4 layer, or null when `name` is not one.
 ///
 /// `name` is the weight tensor's full name (e.g. `model.diffusion_model.blocks.0.attn.wq

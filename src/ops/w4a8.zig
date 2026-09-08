@@ -146,6 +146,14 @@ pub const Meta = struct {
     pub fn groups(self: Meta, cols: usize) usize {
         return cols / self.group_size;
     }
+
+    /// The metadata for rows `[row0, row0 + nrows)`, what a fused qkv split needs: the
+    /// per-group scales are per row, so a row view that kept the parent's `s_rel` would
+    /// read q's scales for k and v. `levels` is per tensor and shared unchanged.
+    pub fn rowSlice(self: Meta, cols: usize, row0: usize, nrows: usize) Meta {
+        const g = self.groups(cols);
+        return .{ .s_rel = self.s_rel[row0 * g ..][0 .. nrows * g], .levels = self.levels, .group_size = self.group_size };
+    }
 };
 
 /// Sanity-check a layer's tensor sizes against each other.

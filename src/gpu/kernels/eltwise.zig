@@ -2047,6 +2047,18 @@ export fn copy() callconv(.spirv_kernel) void {
     b.data[pc.u2 + idx] = a.data[pc.u3 + idx];
 }
 
+/// `b[u2 + i] = a[u3 + i] * f0`, in place when the two buffers are the same.
+///
+/// Exists for an exact power-of-two rescale across a narrowing cast: Z-Image's V operand
+/// outgrows f16 in the deep blocks (see `zimage_gpu`'s attention), and attention is
+/// linear in V, so scaling down and back up is the same arithmetic at no precision cost.
+export fn scale_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    b.data[pc.u2 + idx] = a.data[pc.u3 + idx] * pc.f0;
+}
+
 // --- f16 ACTIVATION STORAGE (VAE decode) ------------------------------------
 //
 // Storage-format twins, NOT new maths: each reads and/or writes the big VAE

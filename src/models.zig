@@ -62,6 +62,10 @@ pub const embed_siglip = @import("models/embed_siglip.zig");
 pub const embed_siglip_gpu = @import("models/embed_siglip_gpu.zig");
 pub const embed_siglip_cuda = @import("models/embed_siglip_cuda.zig");
 pub const quant_weight = @import("models/quant_weight.zig");
+/// What a block linear is and what a device arm can run (`lin`), and the one CUDA GEMM
+/// dispatcher every diffusion family's device forward goes through (`lin_cuda`).
+pub const lin = @import("models/lin.zig");
+pub const lin_cuda = @import("models/lin_cuda.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
@@ -114,6 +118,8 @@ test {
     _ = minimax_h3_vit;
     _ = minimax_h3_present;
     _ = quant_weight;
+    _ = lin;
+    _ = lin_cuda;
     _ = loader;
     _ = clip_text;
     _ = clip_text_gpu;

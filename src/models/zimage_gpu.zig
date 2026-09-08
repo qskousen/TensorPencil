@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const zimage = @import("zimage.zig");
+const lin = @import("lin.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -47,6 +48,11 @@ const s_bytes_cap: usize = 2 << 30;
 /// Force the correctness-first `attn_full` path even where the tensor-core scores
 /// pipeline exists. For A/B and for reproducing a mismatch; the device test runs both.
 pub var force_attn_full: bool = false;
+
+/// Exact power-of-two prescale on V across attention's f16 cast. See the call site in
+/// `blockForward`; `zimage_cuda.v_div` is the CUDA twin and must stay the same value, or
+/// the two arms compute different arithmetic on the same checkpoint.
+const v_div: f32 = 1.0 / 64.0;
 
 /// How many heads share one scores plane, given the plane size and a byte budget.
 fn headsPerBatch(cfg: zimage.Config, rows_pad: usize, cap: usize, ws_s_bytes: ?usize) usize {
@@ -305,22 +311,11 @@ pub const Workspace = struct {
 /// CPU rather than silently producing something.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    // Every layer, and every dtype checked against what THIS device has, a bf16 weight
-    // needs one of the f16-weight coop pipelines and an NVFP4 one needs the decode entry.
-    const Cap = struct {
-        var has_f16w: bool = false;
-        var has_nvfp4: bool = false;
-        fn f(dt: @import("tp_core").dtype.DType) bool {
-            return switch (dt) {
-                .bf16, .f16 => has_f16w,
-                .nvfp4 => has_nvfp4,
-                else => true,
-            };
-        }
-    };
-    Cap.has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
-    Cap.has_nvfp4 = ctx.hasNvfp4Decode();
-    if (zimage.unsupportedGpuLin(model, Cap.f)) |bad| {
+    // Every device linear checked against what THIS device has: a bf16 weight needs one
+    // of the f16-weight coop pipelines and an NVFP4 one needs the decode entry.
+    const has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
+    const caps: lin.Caps = .{ .f32 = true, .fp8 = true, .bf16 = has_f16w, .f16 = has_f16w, .nvfp4 = ctx.hasNvfp4Decode() };
+    if (lin.unsupported(model.device_lins, caps)) |bad| {
         std.log.warn("zimage_gpu: {s} is {t}, which this device has no GEMM for — the trunk " ++
             "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
         return false;
@@ -375,7 +370,7 @@ pub fn forward(
     // Pre-size the NVFP4 decode scratch to the model's widest linear BEFORE the batch
     // opens; growing it mid-forward flushes the recording batch.
     {
-        const need = zimage.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes);
+        const need = lin.maxScratch(model.device_lins, .nvfp4, gpu.Context.nvfp4ScratchBytes);
         if (need > 0) try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, need);
     }
 
@@ -471,12 +466,9 @@ fn blockForward(
     }, rows * dim, 1, 1);
 
     // The fused qkv as three zero-copy row views, see the module header.
-    var nvq: ops.nvfp4.Meta = undefined;
-    var nvk: ops.nvfp4.Meta = undefined;
-    var nvv: ops.nvfp4.Meta = undefined;
-    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim(), &nvq);
-    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim(), &nvk);
-    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nvv);
+    const wq = blk.attn.q;
+    const wk = blk.attn.k;
+    const wv = blk.attn.v;
     try gemm(ctx, ws.q_d, ws.nrm_d, rows, wq);
     try gemm(ctx, ws.k_d, ws.nrm_d, rows, wk);
     try gemm(ctx, ws.v_d, ws.nrm_d, rows, wv);
@@ -500,7 +492,15 @@ fn blockForward(
         .u3 = @intCast(kv_heads),
     }, rows * kv_heads * half, 1, 1);
 
+    // Exact power-of-two prescale on V across attention's f16 cast, the CUDA arm's
+    // `zimage_cuda.v_div` and the same reason: Q and K are RMS-normed on the way in, V is
+    // not, and this trunk's V reaches ~98000 by the deep blocks, past f16's 65504. It
+    // becomes inf, `softmax @ V` becomes NaN, and the render is solid white with no error.
+    // Attention is linear in V, so this is the same arithmetic; a power of two shifts the
+    // exponent and costs no mantissa.
+    try ctx.opElt(.scale_f32, ws.v_d, ws.v_d, null, null, .{ .u0 = @intCast(rows * cfg.kvDim()), .f0 = v_div }, rows * cfg.kvDim(), 1, 1);
     try attention(ctx, cfg, ws, rows, attn_scale);
+    try ctx.opElt(.scale_f32, ws.attn_d, ws.attn_d, null, null, .{ .u0 = @intCast(rows * cfg.qDim()), .f0 = 1.0 / v_div }, rows * cfg.qDim(), 1, 1);
     try gemm(ctx, ws.dlt_d, ws.attn_d, rows, blk.attn.out);
     // The sandwich norm: a SECOND RMSNorm, on the sublayer's output, inside the
     // residual. krea2 has no equivalent.
@@ -631,24 +631,6 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
     }
 }
 
-/// A contiguous row range of the fused `[q_dim + 2*kv_dim, dim]` qkv weight, as a
-/// `Weight` in its own right. Zero-copy: `[q|k|v]` are row blocks, so this is a
-/// slice, and the device weight cache keys on the pointer.
-fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
-    const row_bytes = w.dtype.storageBytes(w.cols);
-    var s = w;
-    s.rows = nrows;
-    s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
-    // An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
-    // storage that outlives the returned `Weight`. Without it the k and v views would read
-    // q's block scales, see `ops.nvfp4.Meta.rowSlice`.
-    if (w.nvfp4) |m| {
-        nv.* = m.rowSlice(w.cols, row0, nrows);
-        s.nvfp4 = nv;
-    }
-    return s;
-}
-
 /// A block GEMM, dispatched by weight dtype. Z-Image ships dense bf16, which takes
 /// one of the two f16-weight tensor-core pipelines (native bf16 where the device has
 /// a bf16 coop config, else bf16->f16 at upload, both keep the conversion off the
@@ -740,50 +722,6 @@ fn relL2(want: []const f32, got: []const f32) f64 {
         den += @as(f64, e) * e;
     }
     return if (den > 0) @sqrt(num / den) else @sqrt(num);
-}
-
-test "the fused qkv splits into three row views the CPU forward agrees with" {
-    // The GPU path does three GEMMs on row slices where the CPU path does one wide
-    // GEMM and de-interleaves the result. Those must be the same linear map, and a
-    // swapped or misaligned slice is not an error, q/k/v would simply be each
-    // other's, which renders as structured noise. Checked against the CPU's own
-    // fused GEMM rather than against a re-derivation.
-    const gpa = testing.allocator;
-    const io = testing.io;
-    const dim = 8;
-    const q_dim = 8;
-    const kv_dim = 8;
-    const rows = q_dim + 2 * kv_dim;
-    const m = 3;
-
-    var wbits: [rows * dim]f32 = undefined;
-    for (&wbits, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) * 0.25 - 1.0;
-    const w = Weight.fromF32(&wbits, rows, dim);
-
-    var x: [m * dim]f32 = undefined;
-    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.5 - 1.5;
-
-    // One wide GEMM, as `zimage.attnForward` does.
-    const fused = try gpa.alloc(f32, m * rows);
-    defer gpa.free(fused);
-    try ops.matmul.matmul(io, gpa, fused, &x, m, w, null);
-
-    // Three row-view GEMMs, as `blockForward` does.
-    inline for (.{ .{ 0, q_dim }, .{ q_dim, kv_dim }, .{ q_dim + kv_dim, kv_dim } }, 0..) |part, pi| {
-        var nv: ops.nvfp4.Meta = undefined;
-        const sub = qkvPart(w, part[0], part[1], &nv);
-        try testing.expectEqual(@as(usize, part[1]), sub.rows);
-        try testing.expectEqual(dim, sub.cols);
-        const got = try gpa.alloc(f32, m * part[1]);
-        defer gpa.free(got);
-        try ops.matmul.matmul(io, gpa, got, &x, m, sub, null);
-        for (0..m) |r| {
-            for (0..part[1]) |c| {
-                errdefer std.debug.print("part {d} row {d} col {d}\n", .{ pi, r, c });
-                try testing.expectEqual(fused[r * rows + part[0] + c], got[r * part[1] + c]);
-            }
-        }
-    }
 }
 
 test "the modulation table is laid out the way the device kernels index it" {

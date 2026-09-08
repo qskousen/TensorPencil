@@ -15,13 +15,11 @@
 //!    to pre-convert into. 235 MB against Vulkan's 117 MB, and the per-step
 //!    re-conversion it costs is well under a millisecond.
 //!
-//! int8/int4 convrot runs here with the kind resolved PER BLOCK (`kindOf` per linear,
-//! `prepGroup` per shared activation). A real mixed checkpoint quantizes different
-//! linears in different blocks, so `dit_cuda`'s one-value-per-model `LinKind` would be
-//! wrong for at least one of them. Cross-attention's k/v and the AdaLN pair may be
-//! quantized too but are evaluated on the HOST, where `ops.matmul` handles convrot at
-//! any shape, which is what lets the device path require `rows % 128 == 0` without
-//! special-casing their 256/6144 widths.
+//! Every block GEMM goes through `lin_cuda`, routed per weight, so a mixed checkpoint
+//! that quantizes different linears in different blocks computes correctly. The AdaLN
+//! pair is evaluated on the HOST, where `ops.matmul` handles convrot at any shape, which
+//! is what lets the device path require `rows % 128 == 0` without special-casing its
+//! 256/6144 widths.
 //!
 //! Head width is exactly 128, which both `launchHgemmB`'s P@V tiling and cuDNN handle
 //! directly, so unlike the SD family there is no head padding. Every GEMM width (2048 /
@@ -29,6 +27,7 @@
 
 const std = @import("std");
 const anima = @import("anima.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -41,12 +40,6 @@ const Weight = ops.matmul.Weight;
 /// paths. For A/B and for reproducing a mismatch; `anima-cuda-test` runs both.
 pub var force_naive_attn: bool = false;
 
-/// Widest zero bias any Anima GEMM needs (the MLP's `mlp_dim`). Passed WHOLE,
-/// never sliced: a bias is cached by host pointer and sized from the first call's
-/// length, so a narrow layer seen first would leave every wider one reading past the
-/// end. `opGemmBf16` asserts `bias.len >= co` and the kernels read only `co` entries.
-const zero_bias: [anima.anima_2b.mlp_dim]f32 = @splat(0);
-
 /// Per-image cache: everything constant across sampling steps.
 pub const Session = struct {
     cfg: anima.Config,
@@ -58,6 +51,8 @@ pub const Session = struct {
 
     /// 3-axis RoPE table for the image grid: `cos` then `sin`, `seq * half` each.
     freqs_d: Buf,
+    /// What `lin_cuda.plan` decided for this checkpoint's block linears.
+    plan: lin_cuda.Plan,
     /// Cross-attention K and V for EVERY block, `[n_layers][ctx_seq][dim]` f32,
     /// projections of the adapter's output, which no step changes. See the header.
     ck_d: Buf,
@@ -100,6 +95,7 @@ pub const Session = struct {
             .seq = seq,
             .ctx_seq = ctx_seq,
             .freqs_d = undefined,
+            .plan = try lin_cuda.plan(model.device_lins, "anima cuda"),
             .ck_d = undefined,
             .cv_d = undefined,
             .sigmas = &.{},
@@ -139,13 +135,9 @@ pub const Session = struct {
         // get uploaded (~235 MB) where before only the host read them. They are uploaded
         // once and cached, against 1.2 s of host GEMM per image.
         {
-            // Pre-size the W4A8 decode scratch to the model's widest linear before any
-            // batch opens. Growth is safe (`ensureDeviceBuffer` syncs the stream first)
-            // but the first block would otherwise pay several syncs for nothing. One
-            // sizing serves the cross-K/V batch below and every later forward, since it
-            // is the model-wide maximum.
-            const need = anima.maxW4A8Scratch(model, Backend.w4a8ScratchBytes);
-            if (need > 0) try be.ensureDeviceBuffer(&be.w4a8_i8, need);
+            // Pre-size the decode scratches before any batch opens; one sizing serves the
+            // cross-K/V batch below and every later forward.
+            try lin_cuda.presize(be, model.device_lins);
 
             var cond_d = try be.tensorCreate(cond.len * 4);
             defer be.tensorDestroy(&cond_d);
@@ -162,9 +154,9 @@ pub const Session = struct {
                 const kv_out = self.ck_d.viewF32(off);
                 const vv_out = self.cv_d.viewF32(off);
                 // k and v share the context activation, so one prep serves both.
-                try prepGroup(be, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v });
-                try lin(be, kv_out, cond_d, ctx_seq, blk.cross_attn.k);
-                try lin(be, vv_out, cond_d, ctx_seq, blk.cross_attn.v);
+                try lin_cuda.prep(be, self.plan, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v }, false);
+                try lin_cuda.gemm(be, self.plan, kv_out, cond_d, ctx_seq, blk.cross_attn.k, false);
+                try lin_cuda.gemm(be, self.plan, vv_out, cond_d, ctx_seq, blk.cross_attn.v, false);
                 // K is normed, V is NOT (`v_norm = nn.Identity()`), the asymmetry
                 // `DiT.projectKv` owns on the host path.
                 try be.qkNorm(kv_out, kv_out, try normBuf(be, blk.cross_attn.knorm), ctx_seq * cfg.n_heads, cfg.headDim(), cfg.qk_eps);
@@ -250,102 +242,11 @@ pub const Workspace = struct {
     }
 };
 
-/// Whether this backend can run Anima's block GEMMs. The trunk weights are dense bf16
-/// in every checkpoint seen so far; fp8 and f32 also have paths. Anything else (int8/
-/// int4 convrot, ggml block quants) has no CUDA GEMM here and must stay on the CPU
-/// rather than being read as the wrong dtype.
+/// Whether the CUDA arms can run every block linear this model has. The refusal, if
+/// any, is logged by name.
 pub fn supported(model: *const DiT) bool {
-    if (model.blocks.len == 0) return false;
-    // EVERY block's linears, not block 0's, see `anima.unsupportedLin`. This arm HAS
-    // int8/int4 convrot (`opI8Prep`/`opI8Gemm`), which the Vulkan one does not, so the
-    // support set is passed rather than assumed.
-    // Both CUDA arms have int8 AND int4 convrot, plus the W4A8 and NVFP4 decode kernels.
-    if (anima.unsupportedLin(model, .{ .i8 = true, .i4 = true, .w4a8 = true, .nvfp4 = true }) != null) return false;
-    // The W4A8 decode kernel reads four packed bytes per thread as one `u32`, so a
-    // group must not straddle that word. Checked here rather than asserted in `lin`:
-    // a checkpoint we cannot run belongs on the CPU, not in a panic.
-    if (anima.w4a8SmallGroup(model)) |tag| {
-        std.log.err("anima_cuda: {s} is W4A8 with a group_size that is not a multiple of 8; " ++
-            "the CUDA decode kernel needs one (Vulkan's is general)", .{tag});
-        return false;
-    }
+    _ = lin_cuda.plan(model.device_lins, "anima cuda") catch return false;
     return true;
-}
-
-const LinKind = anima.LinKind;
-const kindOf = anima.linKind;
-
-/// Quantize+rotate the activation `x` once for a group of GEMMs that share it, if any
-/// member of the group needs it.
-///
-/// `opI8Prep` does NOT overwrite `x`, it writes int8 rows and per-row scales into
-/// the backend's own `i8_x`/`i8_scale` and records `i8_cols`. So a dense GEMM in the same
-/// group is free to read the f32 `x` afterwards, and the only real constraint is that the
-/// prep happens before the quant GEMMs and that `cols` matches (which it does: a group
-/// shares one activation, hence one reduction width).
-///
-/// The prep state is global and each call replaces it, so every group that contains a
-/// quantized linear pays exactly one prep.
-fn prepGroup(be: *Backend, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
-    // Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
-    // (`anima.prepKind` says why), so a block mixing them pays a single `opI8Prep`.
-    var want: anima.PrepKind = .none;
-    for (group) |w| {
-        const k = anima.prepKind(kindOf(w));
-        if (k == .none) continue;
-        // int8 and int4 in ONE group would need two preps of the same activation
-        // and two live prep states, which the backend does not have. No checkpoint
-        // does this; refuse loudly rather than silently use the wrong scale set.
-        if (want != .none and want != k) {
-            std.log.err("anima_cuda: a linear group mixes {t} and {t} activation preps; one cannot serve both", .{ want, k });
-            return error.UnsupportedCheckpoint;
-        }
-        want = k;
-    }
-    switch (want) {
-        .i8 => try be.opI8Prep(x, m, cols, false),
-        .i4 => try be.opI4Prep(x, m, cols),
-        .none => {},
-    }
-}
-
-/// One block linear `y[m][w.rows] = x[m][w.cols] @ Wᵀ`. A quantized weight reads the
-/// prep state (so `x` is unused for it) and fuses the per-row rescale; a dense one takes
-/// the tensor-core path in `gemm`.
-///
-/// `opI8Gemm`/`opI4Gemm` launch `grid.x = rows / 128`, so a quantized linear needs
-/// `rows % 128 == 0`. Every one the device runs here is 2048 or 8192; the odd widths
-/// (the AdaLN pair's 256 and 6144, and cross-attention's k/v) are evaluated on the HOST,
-/// where `ops.matmul` handles convrot regardless of shape.
-fn lin(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    switch (kindOf(w)) {
-        .i8 => {
-            std.debug.assert(w.rows % 128 == 0);
-            try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
-        },
-        .i4 => {
-            std.debug.assert(w.rows % 128 == 0);
-            try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows);
-        },
-        // W4A8 reads the SAME prep state and runs the SAME int8 GEMM as `.i8` above; the
-        // only difference is that the packed 4-bit weight is decoded into a device scratch
-        // on the way in, so the 4-bit form stays resident (see `quant_weight.w4a8`).
-        .w4a8 => {
-            std.debug.assert(w.rows % 128 == 0);
-            const meta = w.w4a8.?;
-            try be.opI8GemmW4A8(y, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, false);
-        },
-        // Weight-only NVFP4: the 4-bit weight is decoded to an f16 scratch inside the
-        // GEMM and the packed form stays resident. `rows % 128` / `cols % 32` come from
-        // the f16 GEMM it feeds; every NVFP4 layer in the shipped checkpoints satisfies
-        // both (audited across all three families).
-        .nvfp4 => {
-            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
-            const meta = w.nvfp4.?;
-            try be.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, &zero_bias);
-        },
-        .dense => try gemm(be, y, x, m, w),
-    }
 }
 
 /// One denoiser forward. `out`/`x_lat` are planar `[channels][lat_h][lat_w]`.
@@ -431,10 +332,10 @@ fn blockForward(
     // The pre-norm's scale block carries the `1 +` already (`foldModulationTable`).
     try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + d, mod_base, cfg.norm_eps);
     // q/k/v share one activation, so one prep serves all three.
-    try prepGroup(be, ws.nrm_d, seq, d, &.{ blk.self_attn.q, blk.self_attn.k, blk.self_attn.v });
-    try lin(be, ws.q_d, ws.nrm_d, seq, blk.self_attn.q);
-    try lin(be, ws.k_d, ws.nrm_d, seq, blk.self_attn.k);
-    try lin(be, ws.v_d, ws.nrm_d, seq, blk.self_attn.v);
+    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{ blk.self_attn.q, blk.self_attn.k, blk.self_attn.v }, false);
+    try lin_cuda.gemm(be, sess.plan, ws.q_d, ws.nrm_d, seq, blk.self_attn.q, false);
+    try lin_cuda.gemm(be, sess.plan, ws.k_d, ws.nrm_d, seq, blk.self_attn.k, false);
+    try lin_cuda.gemm(be, sess.plan, ws.v_d, ws.nrm_d, seq, blk.self_attn.v, false);
 
     // Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps`, unlike
     // Z-Image, whose `RMSNorm(head_dim)` is built with no `eps` at all.
@@ -450,16 +351,16 @@ fn blockForward(
     } else {
         try be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, heads, heads, hd, attn_scale);
     }
-    try prepGroup(be, ws.attn_d, seq, d, &.{blk.self_attn.out});
-    try lin(be, ws.dlt_d, ws.attn_d, seq, blk.self_attn.out);
+    try lin_cuda.prep(be, sess.plan, ws.attn_d, seq, d, &.{blk.self_attn.out}, false);
+    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.attn_d, seq, blk.self_attn.out, false);
     try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 2 * d);
 
     // --- cross-attention onto the adapter's output ------------------------------
     // No RoPE here at all, and K/V come from the session's per-image cache rather
     // than from two GEMMs, see the module header.
     try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 4 * d, mod_base + 3 * d, cfg.norm_eps);
-    try prepGroup(be, ws.nrm_d, seq, d, &.{blk.cross_attn.q});
-    try lin(be, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q);
+    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{blk.cross_attn.q}, false);
+    try lin_cuda.gemm(be, sess.plan, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q, false);
     try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.cross_attn.qnorm), seq * heads, hd, cfg.qk_eps);
     {
         const off = bi * sess.ctx_seq * d;
@@ -471,20 +372,20 @@ fn blockForward(
             try be.opAttnTCRect(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, heads, hd, attn_scale);
         }
     }
-    try prepGroup(be, ws.attn_d, seq, d, &.{blk.cross_attn.out});
-    try lin(be, ws.dlt_d, ws.attn_d, seq, blk.cross_attn.out);
+    try lin_cuda.prep(be, sess.plan, ws.attn_d, seq, d, &.{blk.cross_attn.out}, false);
+    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.attn_d, seq, blk.cross_attn.out, false);
     try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 5 * d);
 
     // --- MLP -------------------------------------------------------------------
     try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 7 * d, mod_base + 6 * d, cfg.norm_eps);
-    try prepGroup(be, ws.nrm_d, seq, d, &.{blk.mlp1});
-    try lin(be, ws.mlp_d, ws.nrm_d, seq, blk.mlp1);
+    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{blk.mlp1}, false);
+    try lin_cuda.gemm(be, sess.plan, ws.mlp_d, ws.nrm_d, seq, blk.mlp1, false);
     // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
     try be.geluErf(ws.mlp_d, seq * cfg.mlp_dim);
     // Its own prep: the reduction width here is `mlp_dim`, not `dim`, and the prep
     // state records ONE `cols`.
-    try prepGroup(be, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2});
-    try lin(be, ws.dlt_d, ws.mlp_d, seq, blk.mlp2);
+    try lin_cuda.prep(be, sess.plan, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2}, false);
+    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.mlp_d, seq, blk.mlp2, false);
     try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 8 * d);
 }
 
@@ -504,28 +405,6 @@ fn prefetchBlock(be: *Backend, blk: anytype) void {
     inline for (.{ blk.cross_attn.q, blk.cross_attn.out }) |w| be.prefetchWeight(w.bytes);
     be.prefetchWeight(bytes(blk.cross_attn.qnorm));
     inline for (.{ blk.mlp1, blk.mlp2 }) |w| be.prefetchWeight(w.bytes);
-}
-
-/// A block GEMM, dispatched by weight dtype, the same routing `zimage_cuda.gemm`
-/// uses. Ampere+ feeds raw bf16 straight to the tensor cores; older cards take the
-/// GPU-side bf16->f16 GEMM.
-fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    const zeros: []const f32 = &zero_bias;
-    std.debug.assert(w.rows <= zeros.len);
-    switch (w.dtype) {
-        // `null`, not `zeros`: Anima's block linears are all bias-free, and a null
-        // bias lets the `.libs` arm write the GEMM straight into `y` instead of staging
-        // through `conv_c` and re-reading the whole output to add zero.
-        .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)
-            try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, null)
-        else
-            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros, false, false),
-        .f16 => try be.opMatmulF16(y, x, m, w.bytes, w.rows, w.cols, null, false, false),
-        .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
-        .f32 => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, null),
-        // `supported` gates this before a session is built.
-        else => return error.UnsupportedDType,
-    }
 }
 
 /// Wrap a CPU norm-weight slice as a (pointer-cached) small device buffer.

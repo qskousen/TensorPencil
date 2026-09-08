@@ -60,6 +60,11 @@ from a checkpoint, match what ComfyUI does.
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
 | `TODO.md` | open work |
 
+**A device check pinned to one shape answers about one shape.** The diffusion device
+commands take the axes a defect rides (`--layers`, `--lat`, `--cap`, `--sigma`), and
+`--dequant-at-load` runs a quantized file through the dense path; BACKEND.md 2C says what
+each has caught.
+
 ## Commands
 
 - `zig build` — build the executables (`zig-out/bin/TensorPencil`, `zig-out/bin/tp-llm`)
@@ -212,7 +217,9 @@ wrong — only the image is different. Pin each direction with its own test.
 ## Weight formats
 
 `models/quant_weight.zig` holds the **one** container reader for each quantized format, called
-from every family's `mat`. ⚠️ **Every format ComfyUI's quantizers emit reaches every family
+from every family's `mat`, and `models/lin_cuda.zig` the **one** CUDA GEMM dispatcher, routing
+each block linear by its own dtype and shape, called from every family's device forward. A
+family's loader builds `DiT.device_lins`, the flat list every support scan reads (`models/lin.zig`). ⚠️ **Every format ComfyUI's quantizers emit reaches every family
 they support** — a new reader belongs in that shared module the day it is written.
 
 | format | storage | compute |
@@ -229,10 +236,10 @@ they support** — a new reader belongs in that shared module the day it is writ
   gives back the memory the format saved.
 - Quantization is **per weight, not per model**: a checkpoint may mix formats block by
   block. A support probe must scan every device linear, not one tensor of one block —
-  `anima.deviceLins` is the single list all three Anima scans read.
+  `DiT.device_lins` is the single list every scan reads.
 - The activation prep is a property of the *activation*, the format a property of the
   *weight*; int8 and W4A8 share one prep.
-- ⚠️ **Whether that prep ROTATES is a property of the checkpoint** (`dit.i8Convrot`), and a
+- ⚠️ **Whether that prep ROTATES is a property of the checkpoint** (`lin.convrot`), and a
   scan for it must cover every storage form sharing the prep, W4A8 included: its weights are
   rotated, so leaving it out of the scan pairs them with an unrotated activation and renders
   uncorrelated noise. Both sides rotate or neither.
@@ -243,9 +250,10 @@ they support** — a new reader belongs in that shared module the day it is writ
   architecture-independent. `y = W x + s B (A x)` leaves an int8 base untouched and
   `strength` a runtime dial. Same call-site hazard as above, and `minimax_h3.Lin` is the
   answer to it: the weight is reachable only as `.w`, so the sidecar is in every grep.
-- ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met three times here
+- ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met four times here
   (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk
-  activations). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
+  activations, and Z-Image's unnormed attention V, which only overflows at DEPTH on a
+  checkpoint whose residual is large enough). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
   f16, an f32 scores plane, and `residual_act_div` (an exact power-of-two scale across the
   cast). `sd_vae.Config.act_f16` and `sd_unet.Config.act_f16` pick f16 activation storage per
   architecture, and it is **range** that gates it, not precision. With f16 storage on, every

@@ -1112,20 +1112,9 @@ pub const SdBranch = struct {
     adm: ?[]f32 = null,
 };
 
-/// Say WHY Anima's trunk is on the host, naming the layer when a dtype is the reason.
-/// A bare "unsupported dtype" is not actionable on a MIXED checkpoint that keeps block 0
-/// in bf16 and quantizes blocks 1-27: the answer to "but my checkpoint is bf16" is
-/// "block 1 is not".
-fn warnAnimaCpu(dit: *const anima.DiT, support: anima.LinSupport) void {
-    if (anima.unsupportedLin(dit, support)) |bad| {
-        std.log.warn(
-            "Anima: block {d}'s {s} is {t}, which this backend has no GEMM for — the whole " ++
-                "trunk runs on the CPU. Expect CPU sampling speed. (int8/int4 convrot runs on " ++
-                "the CUDA backends but not yet on vulkan; ggml block quants are CPU-only.)",
-            .{ bad.block, bad.tag, bad.dtype },
-        );
-        return;
-    }
+/// Anima's trunk is on the host. The arm's `supported` already logged which linear and
+/// dtype it could not run, so this only says what that means.
+fn warnAnimaCpu() void {
     std.log.warn("Anima: this device cannot run the trunk's GEMMs; it runs on the " ++
         "CPU. Expect CPU sampling speed.", .{});
 }
@@ -1935,6 +1924,20 @@ fn resolveComponent(
     // treats stderr from a passing test as a failure). `reportResolve` is the reporting
     // wrapper the loading paths use.
     return error.ComponentNotInCheckpoint;
+}
+
+/// The denoiser's tensors at the root of the returned store, whatever prefix the file
+/// nests them under (`componentSpec`'s list for the family).
+///
+/// For the CLI device checks, which load a model straight from a container and so would
+/// otherwise see prefixed names and report `MissingTensor` on any checkpoint whose layout
+/// is not the bare one. They must resolve the way a render does, from the SAME prefix
+/// list: a second copy of it is what made a `net.`-prefixed Anima load in one path and
+/// not the other. Allocations live in `gpa` and must outlive the store.
+pub fn denoiserStoreIn(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !weights_mod.WeightStore {
+    const fam = try detectFamily(store);
+    const r = try resolveComponent(gpa, fam, .denoiser, store, null, false);
+    return r.store;
 }
 
 /// `resolveComponent` plus the diagnostic. The load paths use this; tests of the
@@ -4214,7 +4217,7 @@ pub const Session = struct {
                     }
                     d.an_cu_ws = try anima_cuda.Workspace.init(b, dit, lat_h, lat_w);
                 } else {
-                    warnAnimaCpu(dit, .{ .i8 = true, .i4 = true });
+                    warnAnimaCpu();
                 }
             } else if (self.gpu_ctx) |gc| {
                 if (anima_gpu.supported(gc, dit)) {
@@ -4225,7 +4228,7 @@ pub const Session = struct {
                     }
                     d.an_vk_ws = try anima_gpu.Workspace.init(gc, dit, lat_h, lat_w, d.an_vk.?.tc);
                 } else {
-                    warnAnimaCpu(dit, .{ .i8 = true });
+                    warnAnimaCpu();
                 }
             }
             return d;
@@ -6408,7 +6411,13 @@ pub const Session = struct {
                 try den.predictAt(gpa, v, x, sigmas[i], i, opts.cancel);
                 if (sde) |*s| try s.step(x, v, i) else sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
                 const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
-                try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, nsteps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
+                try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.3}s)\n", .{ i + 1, nsteps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
+                // The magnitudes the step ran on, when asked. A render that comes out
+                // solid white says only that the decode saturated; these say whether the
+                // model's prediction or the latent it was applied to is what grew, and at
+                // which step, which is the difference between a denoiser bug and a
+                // sampler one.
+                traceStep(i, v, x);
                 if (opts.on_step) |p| {
                     // Live-preview decode allocations (taew weights + scratch) are
                     // working memory, not DiT.
@@ -6536,6 +6545,21 @@ fn downsampleLatent(gpa: std.mem.Allocator, x: []const f32, c: usize, h: usize, 
         };
     }
     return out;
+}
+
+/// DIAGNOSTIC: per-step magnitudes of the model's prediction and the latent
+/// (`TP_STEP_TRACE`). See the call site.
+fn traceStep(i: usize, v: []const f32, x: []const f32) void {
+    if (std.c.getenv("TP_STEP_TRACE") == null) return;
+    var vm: f32 = 0;
+    var xm: f32 = 0;
+    var nonfinite: usize = 0;
+    for (v) |t| vm = @max(vm, @abs(t));
+    for (x) |t| {
+        xm = @max(xm, @abs(t));
+        if (!std.math.isFinite(t)) nonfinite += 1;
+    }
+    std.debug.print("[step] {d:>2}  max|v| {d:12.3}  max|x| {d:12.3}  non-finite x {d}\n", .{ i, vm, xm, nonfinite });
 }
 
 fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !void {

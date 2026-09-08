@@ -21,6 +21,7 @@ const safetensors = @import("tp_core").safetensors;
 const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const lin = @import("lin.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -88,6 +89,9 @@ pub const DiT = struct {
     arena: std.heap.ArenaAllocator,
     first: LinearW, // 64 -> 6144
     blocks: []Block,
+    /// Every block linear the device forwards run, the one list every support scan and
+    /// GEMM plan reads (`lin`, `lin_cuda`).
+    device_lins: []const Weight,
     tmlp0: LinearW, // 256 -> 6144
     tmlp2: LinearW, // 6144 -> 6144
     tproj1: LinearW, // 6144 -> 6*6144
@@ -148,6 +152,9 @@ pub const DiT = struct {
             };
         }
 
+        const device_lins = try alloc.alloc(Weight, blocks.len * 8);
+        for (blocks, 0..) |*b, i| device_lins[i * 8 ..][0..8].* = blockLins(b);
+
         var txt_layerwise: [2]TxtBlock = undefined;
         var txt_refiner: [2]TxtBlock = undefined;
         for (0..2) |i| {
@@ -184,6 +191,7 @@ pub const DiT = struct {
             .arena = arena,
             .first = first,
             .blocks = blocks,
+            .device_lins = device_lins,
             .tmlp0 = tmlp0,
             .tmlp2 = tmlp2,
             .tproj1 = tproj1,
@@ -666,131 +674,9 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
     try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
 }
 
-/// Which GPU forward is asking `gpuLinKindSupported`. The two do not accept the same
-/// set, so a single answer would either lock CUDA out of a format it has or hand Vulkan
-/// one it does not.
-pub const GpuArm = enum { vulkan, cuda };
-
-/// Whether that GPU DiT forward (`dit_gpu`, `dit_cuda`) has a GEMM path for block
-/// linears of this dtype. They branch on int8/int4 convrot and dense bf16 and treat
-/// anything else as raw fp8-e4m3, so an unrecognized dtype is not a slow path, it
-/// is silently wrong output. Both gate on this before dispatching.
-pub fn gpuLinKindSupported(dt: DType, arm: GpuArm) bool {
-    return switch (dt) {
-        // `.w4a8` is decoded to int8 inside each backend's GEMM (the packed form stays
-        // resident), so it runs wherever int8 does.
-        // `.nvfp4` decodes to f16 inside each backend's GEMM (weight-only, which is what
-        // NVFP4 is below Blackwell), so it runs wherever the f16 GEMM does, everywhere.
-        .i8, .i4, .w4a8, .nvfp4, .bf16, .f8_e4m3 => true,
-        // The ggml block quants decode per GEMM instead of expanding in VRAM, either to
-        // convrot int8 (`Backend.blockQFormat`, q4_k/q8_0 only) or to f16
-        // (`Backend.quantKernelSupported`, everything with a dequant kernel), which is
-        // what `dit_cuda.blockQKind` picks between. Only the CUDA arm has either; Vulkan
-        // has no block-quant GEMM at all.
-        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl => arm == .cuda,
-        else => false,
-    };
-}
-
-/// Whether any block linear is stored in ComfyUI's packed `asym_w4a8_int8` form.
-///
-/// Scans EVERY block's linears rather than reading one tensor: a real ComfyUI mixed
-/// checkpoint quantizes per block, often leaving block 0 entirely dense, so a probe of
-/// `blocks[0]` answers a different question.
-pub fn anyW4A8(model: *const DiT) bool {
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w|
-            if (w.dtype == .w4a8) return true;
-    }
-    return false;
-}
-
-/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any, the
-/// CUDA decode kernel reads four packed bytes (8 columns) per thread and so assumes one
-/// group scale covers them. Returns the offending tensor's name so the refusal can say
-/// which layer, since "unsupported" is unactionable across 224 weights.
-///
-/// No checkpoint in the wild uses a group size below 16 (ComfyUI's default), but the
-/// format permits 4 and 8, so this is a refusal rather than an assert. Vulkan's decode is
-/// general over the group size and does not need it.
-pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
-            if (w.dtype == .w4a8 and w.w4a8.?.group_size % 8 != 0) return w.tag orelse "<untagged>";
-        }
-    }
-    return null;
-}
-
-/// Whether the block linears that share the int8 activation prep carry the convrot
-/// rotation, or null when they disagree with each other.
-///
-/// ComfyUI's `int8_tensorwise` ships both ways: rotated with a scale per output row, or
-/// unrotated with one scale for the whole tensor. The rotation cancels across the GEMM
-/// only when BOTH sides apply it, and one activation prep serves every GEMM in a block,
-/// so a block that mixes the two has no prep that is right for all of them. Answering
-/// null lets the caller refuse instead of picking one and computing the rest in a basis
-/// their weights were never quantized in.
-///
-/// ⚠️ Every storage form that runs on that prep has to be counted here, not just the
-/// plain int8 one: `.w4a8` decodes to a rotated int8 weight and takes int8's prep, so
-/// leaving it out reports "unrotated" for a W4A8 checkpoint and pairs a rotated weight
-/// with an unrotated activation. That renders noise, not a slightly worse image.
-///
-/// Scans every block for the reason `anyW4A8` does: a ComfyUI checkpoint quantizes per
-/// layer, so one weight is an answer about one weight.
-pub fn i8Convrot(model: *const DiT) ?bool {
-    var seen: ?bool = null;
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
-            if (w.dtype != .i8 and w.dtype != .i4 and w.dtype != .w4a8) continue;
-            const rot = w.convrot != 0;
-            if (seen) |s| {
-                if (s != rot) return null;
-            } else seen = rot;
-        }
-    }
-    return seen orelse false;
-}
-
-/// Whether any block linear is stored in ComfyUI's packed NVFP4 form. Scans every block
-/// for the reason `anyW4A8` does: a real ComfyUI mixed checkpoint quantizes per block.
-pub fn anyNvfp4(model: *const DiT) bool {
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
-            if (w.dtype == .nvfp4) return true;
-        }
-    }
-    return false;
-}
-
-/// Largest transient f16 buffer any packed NVFP4 block linear decodes into, per the
-/// backend's own sizing rule. A caller pre-sizes with this so the scratch never grows
-/// mid-forward (which on Vulkan flushes the recording batch).
-pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
-    var max: usize = 0;
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
-            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
-        }
-    }
-    return max;
-}
-
-/// Largest transient int8 buffer any packed W4A8 block linear decodes into, per the
-/// backend's own sizing rule (the two differ: CUDA's GEMM reads the raw `[rows][cols]`
-/// while Vulkan's reads a row-padded k-major copy).
-///
-/// A caller pre-sizes with this so the scratch never has to grow mid-forward, which on
-/// Vulkan would flush the recording batch and on CUDA sync the stream.
-pub fn maxW4A8Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
-    var max: usize = 0;
-    for (model.blocks) |*b| {
-        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
-            if (w.dtype == .w4a8) max = @max(max, bytesFor(w.rows, w.cols));
-        }
-    }
-    return max;
+/// The eight linears one block's device forward runs.
+pub fn blockLins(b: *const Block) [8]Weight {
+    return .{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down };
 }
 
 // --- weight loading --------------------------------------------------------
@@ -858,15 +744,9 @@ const Loader = struct {
             return error.ShapeMismatch;
         }
 
-        // A shape-fixed block-quantized tensor (`TensorInfo.flat_blocks`) has its
-        // blocks tiling the flat element sequence rather than each logical row, which
-        // is not what `Weight.init` assumes. krea2 never hits this, its only
-        // shape-fixed tensor, `first.weight`, is `keys_hiprec` and so unquantized,
-        // but refusing loudly beats a silently wrong byte count in ReleaseFast.
-        if (view.info.flat_blocks) {
-            std.log.err("dit: {s} is {t} with flat block layout (shape-fixed); the DiT loader needs row-aligned blocks", .{ nm, dt });
-            return error.UnsupportedCheckpoint;
-        }
+        // A shape-fixed block quant tiles its blocks over the flat element sequence,
+        // not each row, so no GEMM here can read it; it is small by construction.
+        if (view.info.flat_blocks) return quant_weight.flatBlocksF32(l.alloc, view, nm, rows, cols);
         var w = Weight.init(view.bytes, wdt, rows, cols);
         // Carry the checkpoint name on the Weight so a GEMM can be attributed to a
         // layer downstream (ops.matmul.probe, profiling, error messages). Duped into
@@ -1015,7 +895,7 @@ test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
     try std.testing.expect(model.first.w.dtype == .f32);
     try std.testing.expect(model.first.w.row_scale == null);
 
-    try std.testing.expectEqual(@as(?bool, true), i8Convrot(&model));
+    try std.testing.expectEqual(@as(?bool, true), lin.convrot(model.device_lins));
 }
 
 test "an unrotated int8_tensorwise checkpoint loads with a broadcast scale" {
@@ -1043,7 +923,7 @@ test "an unrotated int8_tensorwise checkpoint loads with a broadcast scale" {
         try std.testing.expectEqual(w.rows, w.row_scale.?.len);
         for (w.row_scale.?) |s| try std.testing.expectEqual(w.row_scale.?[0], s);
     }
-    try std.testing.expectEqual(@as(?bool, false), i8Convrot(&model));
+    try std.testing.expectEqual(@as(?bool, false), lin.convrot(model.device_lins));
 
     // `first`, `last.linear` and the projector are int8 in this file and are the three
     // the GPU backends hand to an f32-only path.
@@ -1501,43 +1381,3 @@ test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
     try std.testing.expect(quantized > n_blocks * 5);
 }
 
-test "the GPU DiT paths refuse a block-quant checkpoint instead of misreading it" {
-    // Both GPU forwards recognize int8/int4/bf16 and treat everything else as raw
-    // fp8 bytes. A GGUF checkpoint is neither, and before `pipeline` could open a
-    // GGUF the case was unreachable, so the day it became reachable, Vulkan
-    // rendered a blank white image with no error, while CUDA (which already had the
-    // gate) refused. This pins both to refusing.
-    //
-    // Checks the *gate*, not a device: it asserts the dtype classification both
-    // forwards do, so it runs on the fast suite with no GPU and no checkpoint.
-    const supported = [_]DType{ .i8, .i4, .bf16, .f8_e4m3 };
-    // The block quants the CUDA arm decodes per GEMM are checked separately below. These
-    // are the ones with no diffusion dequant kernel at all, still fp8-shaped garbage on
-    // both arms. `.q2_0_g64`/`.q2_0_g128` are LLM-only formats no diffusion quantizer
-    // emits, so they belong here rather than in the CUDA list.
-    const block_quants = [_]DType{ .q2_0_g64, .q2_0_g128, .q1_0 };
-
-    for (supported) |dt| {
-        try std.testing.expect(gpuLinKindSupported(dt, .vulkan));
-        try std.testing.expect(gpuLinKindSupported(dt, .cuda));
-    }
-    for (block_quants) |dt| {
-        for ([_]GpuArm{ .vulkan, .cuda }) |arm| {
-            std.testing.expect(!gpuLinKindSupported(dt, arm)) catch |e| {
-                std.debug.print("block quant {t} would be misread as fp8 by the {t} DiT forward\n", .{ dt, arm });
-                return e;
-            };
-        }
-    }
-    // The decodable block quants are CUDA-only. Vulkan has no block-quant GEMM, so
-    // accepting one there feeds the packed bytes to the fp8 GEMM: a blank white image
-    // with no error, which is what this test exists to catch.
-    for ([_]DType{ .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| {
-        try std.testing.expect(gpuLinKindSupported(dt, .cuda));
-        try std.testing.expect(!gpuLinKindSupported(dt, .vulkan));
-    }
-    // f32 block linears are not a thing a checkpoint ships, and the GPU paths have
-    // no branch for them either.
-    try std.testing.expect(!gpuLinKindSupported(.f32, .vulkan));
-    try std.testing.expect(!gpuLinKindSupported(.f32, .cuda));
-}

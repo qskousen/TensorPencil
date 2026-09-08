@@ -218,12 +218,49 @@ pub fn supportsDType(dt: DType) bool {
 /// - `i8` is dequantized with its per-row scale and, when it carries one, un-rotated.
 ///   ComfyUI's `int8_tensorwise` quantizer reaches these projections on some
 ///   checkpoints even though the convrot ones leave them dense.
-/// - Anything else, int4 and the ggml block quants, refuses loudly. Dequantizing
-///   those needs metadata this function does not have (a nibble order, or a ggml
-///   block layout), so converting them here would emit silent garbage.
+/// - A ggml block quant is dequantized block by block (`convertToF32` has every format's
+///   decode); its rows are whole blocks, so the flat sequence is the row-major matrix.
+/// - Anything else, int4 and W4A8, refuses loudly. Dequantizing those needs the rotation
+///   or the codebook, which this function does not have.
 ///
 /// The `tag` survives the copy: materializing must not make a weight
 /// unattributable to its checkpoint tensor (`Weight.tag`).
+/// `materializeF32` at half the width: the same dequantize, rounded to bf16.
+///
+/// For the diagnostic that runs a quantized checkpoint through the DENSE path, where f32
+/// does not fit in VRAM at real depths and bf16 is what a native dense checkpoint would
+/// have carried anyway, so it is the truer control.
+///
+/// A block quant converts ROW BY ROW through a one-row scratch rather than through a
+/// whole f32 copy: these run inside a model arena, where a free is a no-op, so a
+/// full-width intermediate doubles the peak and runs a real trunk out of memory.
+pub fn materializeBf16(alloc: std.mem.Allocator, w: Weight) !Weight {
+    const out = try alloc.alloc(u16, w.rows * w.cols);
+    if (w.dtype.isBlockQuant()) {
+        const row = try alloc.alloc(f32, w.cols);
+        defer alloc.free(row);
+        const row_bytes = w.dtype.storageBytes(w.cols);
+        for (0..w.rows) |r| {
+            try @import("tp_core").safetensors.convertToF32(w.dtype, w.bytes[r * row_bytes ..][0..row_bytes], row);
+            for (out[r * w.cols ..][0..w.cols], row) |*d, v| d.* = f32ToBf16(v);
+        }
+    } else {
+        const f = try materializeF32(alloc, w);
+        const src: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, f.bytes));
+        for (out, src) |*d, v| d.* = f32ToBf16(v);
+    }
+    var out_w = Weight.init(std.mem.sliceAsBytes(out), .bf16, w.rows, w.cols);
+    out_w.tag = w.tag;
+    return out_w;
+}
+
+/// Round to nearest even, the rounding the device's `f32_to_bf16` does. Truncating
+/// instead biases every weight toward zero, which is a systematic error over a trunk.
+fn f32ToBf16(v: f32) u16 {
+    const bits: u32 = @bitCast(v);
+    return @truncate((bits +% 0x7fff +% ((bits >> 16) & 1)) >> 16);
+}
+
 pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
     switch (w.dtype) {
         .f32 => return w,
@@ -256,7 +293,14 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
             out_w.tag = w.tag;
             return out_w;
         },
-        else => return error.UnsupportedCheckpoint,
+        else => {
+            if (!w.dtype.isBlockQuant()) return error.UnsupportedCheckpoint;
+            const out = try alloc.alloc(f32, w.rows * w.cols);
+            try @import("tp_core").safetensors.convertToF32(w.dtype, w.bytes, out);
+            var out_w = Weight.fromF32(out, w.rows, w.cols);
+            out_w.tag = w.tag;
+            return out_w;
+        },
     }
 }
 

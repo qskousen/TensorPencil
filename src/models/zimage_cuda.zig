@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const zimage = @import("zimage.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -32,13 +33,6 @@ const Weight = ops.matmul.Weight;
 /// A/B and for reproducing a mismatch; the device test runs both.
 pub var force_naive_attn: bool = false;
 
-/// Widest zero bias any Z-Image GEMM needs. Passed WHOLE, never sliced: a bias is
-/// cached by host pointer and sized from the first call's length, so a narrow layer
-/// seen first would leave every wider one reading past the end. `opGemmBf16` asserts
-/// `bias.len >= co` and the kernels read only `co` entries, so one full-width buffer
-/// serves every GEMM.
-const zero_bias: [zimage.z_image.mlp_dim]f32 = @splat(0);
-
 /// Per-image cache: everything constant across sampling steps.
 pub const Session = struct {
     cfg: zimage.Config,
@@ -49,6 +43,8 @@ pub const Session = struct {
     img_padded: usize,
     /// `cap_padded + img_padded`, the joint sequence the trunk runs on.
     seq: usize,
+    /// What `lin_cuda.plan` decided for this checkpoint's block linears.
+    plan: lin_cuda.Plan,
 
     cap_d: Buf,
     x_pad_d: Buf,
@@ -93,6 +89,7 @@ pub const Session = struct {
             .n_img = n_img,
             .img_padded = img_padded,
             .seq = seq,
+            .plan = try lin_cuda.plan(model.device_lins, "zimage cuda"),
             .cap_d = undefined,
             .x_pad_d = undefined,
             .freqs_d = undefined,
@@ -111,6 +108,7 @@ pub const Session = struct {
             if (self.finals.len != 0) gpa.free(self.finals);
         }
 
+        try lin_cuda.presize(be, model.device_lins);
         self.cap_d = try be.tensorCreate(cap.len * 4);
         made += 1;
         try be.tensorUpload(self.cap_d, std.mem.sliceAsBytes(cap));
@@ -198,18 +196,25 @@ pub const Workspace = struct {
         const cfg = model.cfg;
         const n_img = (lat_h / cfg.patch) * (lat_w / cfg.patch);
         const img_padded = cfg.padded(n_img);
+        // Rows, padded to 128 for the buffers a GEMM writes. Z-Image's own
+        // `pad_multiple` is 32, but a quantized route's GEMM launches over
+        // `align(m, 128)` rows and each block stores a whole tile, so a buffer sized to
+        // the model's padding is written off the end (`CUDA_ERROR_ILLEGAL_ADDRESS`, or a
+        // solid white render where the overrun lands in another workspace buffer).
         const seq = cap_padded_cap + img_padded;
+        const seq_pad = std.mem.alignForward(usize, seq, 128);
+        const img_pad128 = std.mem.alignForward(usize, img_padded, 128);
         const sizes = [fields.len]usize{
-            seq * cfg.dim * 4,
-            img_padded * cfg.dim * 4,
-            seq * cfg.dim * 4,
-            seq * cfg.dim * 4,
-            seq * cfg.qDim() * 4,
-            seq * cfg.kvDim() * 4,
-            seq * cfg.kvDim() * 4,
-            seq * cfg.qDim() * 4,
-            seq * cfg.mlp_dim * 4,
-            seq * cfg.mlp_dim * 4,
+            seq_pad * cfg.dim * 4,
+            img_pad128 * cfg.dim * 4,
+            seq_pad * cfg.dim * 4,
+            seq_pad * cfg.dim * 4,
+            seq_pad * cfg.qDim() * 4,
+            seq_pad * cfg.kvDim() * 4,
+            seq_pad * cfg.kvDim() * 4,
+            seq_pad * cfg.qDim() * 4,
+            seq_pad * cfg.mlp_dim * 4,
+            seq_pad * cfg.mlp_dim * 4,
             (model.modulatedBlocks() * 4 * cfg.dim + cfg.dim) * 4,
             n_img * cfg.patchDim() * 4,
         };
@@ -231,23 +236,55 @@ pub const Workspace = struct {
     }
 };
 
-/// Whether this backend can run Z-Image's block GEMMs. The trunk weights are dense
-/// bf16 in every checkpoint seen so far; fp8 and f32 also have paths. Anything else
-/// (int8/int4 convrot, ggml block quants) has no CUDA GEMM here and must stay on the
-/// CPU rather than being read as the wrong dtype.
+/// Whether the CUDA arms can run every block linear this model has. The refusal, if
+/// any, is logged by name; the caller says the trunk then runs on the CPU.
 pub fn supported(model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    const always = struct {
-        fn f(_: @import("tp_core").dtype.DType) bool {
-            return true;
-        }
-    }.f;
-    if (zimage.unsupportedGpuLin(model, always)) |bad| {
-        std.log.warn("zimage_cuda: {s} is {t}, which this backend has no GEMM for — the trunk " ++
-            "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
-        return false;
-    }
+    _ = lin_cuda.plan(model.device_lins, "zimage cuda") catch return false;
     return true;
+}
+
+/// Exact power-of-two prescale on V across the attention's f16 cast.
+///
+/// Q and K are RMS-normed per head on the way in, so they arrive at O(1); V is NOT
+/// normed and carries the trunk's raw residual scale, which grows with depth. On this
+/// trunk it reaches ~98000 by layer 25, past f16's 65504 ceiling, and both attention
+/// implementations narrow their operands to f16: V becomes inf, `softmax @ V` becomes
+/// NaN, and every later layer is NaN. The render is solid white with no error, which is
+/// this codebase's third f16-range incident on this model.
+///
+/// Attention is exactly linear in V, so scaling V down and the output back up is the same
+/// arithmetic. A power of two is exact in binary floating point and costs no relative
+/// precision (it shifts the exponent, not the mantissa), so this is free rather than a
+/// trade. 2^-6 buys 64x of headroom, taking the safe ceiling to ~4.2e6.
+///
+/// A fixed constant rather than a measured maximum because measuring one means a device
+/// reduction per attention call for a quantity that only has to be bounded, not known.
+const v_div_log2: u5 = 6;
+const v_div: f32 = 1.0 / @as(f32, 1 << v_div_log2);
+
+/// DIAGNOSTIC: report a device buffer's magnitude and non-finite count (`TP_ZIMAGE_TRACE`).
+///
+/// A forward that comes back all-NaN says nothing about where it turned, and the stage
+/// boundaries are the only places a host-side check can look without a kernel per op.
+/// Costs a sync and a download per call, so it is env-gated and never on in a render.
+var trace_on: ?bool = null;
+
+fn trace(be: *Backend, what: []const u8, i: usize, buf: Buf, elems: usize) void {
+    if (trace_on == null) trace_on = std.c.getenv("TP_ZIMAGE_TRACE") != null;
+    if (!trace_on.?) return;
+    const host = be.gpa.alloc(f32, elems) catch return;
+    defer be.gpa.free(host);
+    const batching = be.batching();
+    if (batching) be.endBatch() catch return;
+    be.tensorDownload(buf, std.mem.sliceAsBytes(host)) catch return;
+    var mx: f32 = 0;
+    var bad: usize = 0;
+    for (host) |v| {
+        if (!std.math.isFinite(v)) bad += 1 else mx = @max(mx, @abs(v));
+    }
+    std.debug.print("[zimage-cuda] {s} {d:>2}  max|x| {d:12.1}  non-finite {d}/{d}\n", .{ what, i, mx, bad, elems });
+    if (batching) be.beginBatch() catch return;
 }
 
 /// One denoiser forward. `out`/`x_lat` are planar `[channels][lat_h][lat_w]`.
@@ -304,16 +341,18 @@ pub fn forward(
     // Prefetch one block ahead throughout, so each block's upload overlaps the
     // previous block's compute. The two stacks are consecutive, so the last
     // `noise_refiner` iteration primes `layers[0]`.
-    if (be.async_uploads and model.noise_refiner.len > 0) prefetchBlock(be, cfg, model.noise_refiner[0]);
+    trace(be, "x_embed", 0, ws.img_d, sess.n_img * dim);
+    if (be.async_uploads and model.noise_refiner.len > 0) prefetchBlock(be, model.noise_refiner[0]);
     for (model.noise_refiner, 0..) |*blk, i| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         if (be.async_uploads) {
             if (i + 1 < model.noise_refiner.len)
-                prefetchBlock(be, cfg, model.noise_refiner[i + 1])
+                prefetchBlock(be, model.noise_refiner[i + 1])
             else if (model.layers.len > 0)
-                prefetchBlock(be, cfg, model.layers[0]);
+                prefetchBlock(be, model.layers[0]);
         }
-        try blockForward(be, cfg, blk, ws, ws.img_d, sess.img_padded, sess.img_freqs_d, sess.img_padded * half, i * 4 * dim, zero_off, attn_scale);
+        try blockForward(be, sess.plan, cfg, blk, ws, ws.img_d, sess.img_padded, sess.img_freqs_d, sess.img_padded * half, i * 4 * dim, zero_off, attn_scale);
+        trace(be, "refiner", i, ws.img_d, sess.img_padded * dim);
     }
 
     // --- the joint sequence ----------------------------------------------------
@@ -322,9 +361,10 @@ pub fn forward(
 
     for (model.layers, 0..) |*blk, i| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (be.async_uploads and i + 1 < model.layers.len) prefetchBlock(be, cfg, model.layers[i + 1]);
+        if (be.async_uploads and i + 1 < model.layers.len) prefetchBlock(be, model.layers[i + 1]);
         const base = (model.noise_refiner.len + i) * 4 * dim;
-        try blockForward(be, cfg, blk, ws, ws.x_d, seq, sess.freqs_d, seq * half, base, zero_off, attn_scale);
+        try blockForward(be, sess.plan, cfg, blk, ws, ws.x_d, seq, sess.freqs_d, seq * half, base, zero_off, attn_scale);
+        trace(be, "layer", i, ws.x_d, seq * dim);
     }
     try be.endBatch();
 
@@ -347,6 +387,7 @@ pub fn forward(
 
 fn blockForward(
     be: *Backend,
+    plan: lin_cuda.Plan,
     cfg: zimage.Config,
     blk: anytype,
     ws: *Workspace,
@@ -370,15 +411,13 @@ fn blockForward(
     // table's trailing zero block: Z-Image's modulation has no shift.
     try be.rmsMod(x, ws.nrm_d, ws.mv_d, rows, dim, mod_base + 0 * dim, zero_off, cfg.norm_eps);
 
-    var nvq: ops.nvfp4.Meta = undefined;
-    var nvk: ops.nvfp4.Meta = undefined;
-    var nvv: ops.nvfp4.Meta = undefined;
-    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim(), &nvq);
-    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim(), &nvk);
-    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nvv);
-    try gemm(be, ws.q_d, ws.nrm_d, rows, wq);
-    try gemm(be, ws.k_d, ws.nrm_d, rows, wk);
-    try gemm(be, ws.v_d, ws.nrm_d, rows, wv);
+    try lin_cuda.prep(be, plan, ws.nrm_d, rows, dim, &.{ blk.attn.q, blk.attn.k, blk.attn.v }, false);
+    try lin_cuda.gemm(be, plan, ws.q_d, ws.nrm_d, rows, blk.attn.q, false);
+    try lin_cuda.gemm(be, plan, ws.k_d, ws.nrm_d, rows, blk.attn.k, false);
+    try lin_cuda.gemm(be, plan, ws.v_d, ws.nrm_d, rows, blk.attn.v, false);
+    trace(be, "  attn.nrm", 0, ws.nrm_d, rows * dim);
+    trace(be, "  attn.q", 0, ws.q_d, rows * cfg.qDim());
+    trace(be, "  attn.v", 0, ws.v_d, rows * cfg.kvDim());
 
     // The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5.
     try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.attn.qnorm), rows * heads, hd, cfg.qk_eps);
@@ -386,23 +425,35 @@ fn blockForward(
     try be.rope(ws.q_d, freqs, rows, heads, half, sin_off);
     try be.rope(ws.k_d, freqs, rows, kv_heads, half, sin_off);
 
+    // See `v_div`: V is unnormed and outgrows f16 in the deep blocks.
+    try be.opScale(ws.v_d, v_div, rows * cfg.kvDim());
     if (force_naive_attn) {
         try be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, rows, rows, heads, kv_heads, hd, attn_scale, false);
     } else {
         try be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, rows, heads, kv_heads, hd, attn_scale);
     }
-    try gemm(be, ws.dlt_d, ws.attn_d, rows, blk.attn.out);
+    try be.opScale(ws.attn_d, 1.0 / v_div, rows * cfg.qDim());
+    trace(be, "  attn.o", 0, ws.attn_d, rows * cfg.qDim());
+    try lin_cuda.prep(be, plan, ws.attn_d, rows, cfg.qDim(), &.{blk.attn.out}, false);
+    try lin_cuda.gemm(be, plan, ws.dlt_d, ws.attn_d, rows, blk.attn.out, false);
     // The sandwich norm: a SECOND RMSNorm on the sublayer's output, inside the
     // residual. `qkNorm` is a plain weighted RMSNorm over rows of `dim`.
     try be.qkNorm(ws.dlt_d, ws.dlt_d, try normBuf(be, blk.attn_norm2), rows, dim, cfg.norm_eps);
+    trace(be, "  attn.dlt", 0, ws.dlt_d, rows * dim);
     try be.gatedAdd(x, ws.dlt_d, ws.mv_d, rows * dim, dim, mod_base + 1 * dim);
+    trace(be, "  attn.res", 0, x, rows * dim);
 
     // x += tanh(gate_mlp) * norm2(swiglu(rmsMod(x, premul_ffn)))
     try be.rmsMod(x, ws.nrm_d, ws.mv_d, rows, dim, mod_base + 2 * dim, zero_off, cfg.norm_eps);
-    try gemm(be, ws.mg_d, ws.nrm_d, rows, blk.ffn.w1);
-    try gemm(be, ws.mu_d, ws.nrm_d, rows, blk.ffn.w3);
+    try lin_cuda.prep(be, plan, ws.nrm_d, rows, dim, &.{ blk.ffn.w1, blk.ffn.w3 }, false);
+    try lin_cuda.gemm(be, plan, ws.mg_d, ws.nrm_d, rows, blk.ffn.w1, false);
+    try lin_cuda.gemm(be, plan, ws.mu_d, ws.nrm_d, rows, blk.ffn.w3, false);
+    trace(be, "  ffn.nrm", 0, ws.nrm_d, rows * dim);
+    trace(be, "  ffn.w1", 0, ws.mg_d, rows * cfg.mlp_dim);
     try be.siluMul(ws.mg_d, ws.mu_d, rows * cfg.mlp_dim);
-    try gemm(be, ws.dlt_d, ws.mg_d, rows, blk.ffn.w2);
+    try lin_cuda.prep(be, plan, ws.mg_d, rows, cfg.mlp_dim, &.{blk.ffn.w2}, false);
+    try lin_cuda.gemm(be, plan, ws.dlt_d, ws.mg_d, rows, blk.ffn.w2, false);
+    trace(be, "  ffn.w2", 0, ws.dlt_d, rows * dim);
     try be.qkNorm(ws.dlt_d, ws.dlt_d, try normBuf(be, blk.ffn_norm2), rows, dim, cfg.norm_eps);
     try be.gatedAdd(x, ws.dlt_d, ws.mv_d, rows * dim, dim, mod_base + 3 * dim);
 }
@@ -410,25 +461,14 @@ fn blockForward(
 /// Queue a block's streamable weights for async prefetch, called ONE BLOCK AHEAD so
 /// the upload overlaps the previous block's compute. Keys must be the same host
 /// pointers `forward` later fetches, or the prefetch is a cache miss and pure waste,
-/// hence the qkv ROW VIEWS here, matching `qkvPart` exactly.
+/// hence q/k/v as the loader's row views, the same Weights `blockForward` runs.
 ///
 /// Without this the first step pays the whole ~11.6 GB upload serially: measured
 /// 8.0 s for step 1 against a 2.6 s steady state at 1056x1584, which on a 9-step
 /// turbo render is a fifth of the total time.
-fn prefetchBlock(be: *Backend, cfg: zimage.Config, blk: anytype) void {
+fn prefetchBlock(be: *Backend, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
-    const qkv = blk.attn.qkv;
-    inline for (.{ 0, 1, 2 }) |i| {
-        // Prefetch only touches `.bytes`, so the sliced metadata is unused here.
-        var nv: ops.nvfp4.Meta = undefined;
-        const part = switch (i) {
-            0 => qkvPart(qkv, 0, cfg.qDim(), &nv),
-            1 => qkvPart(qkv, cfg.qDim(), cfg.kvDim(), &nv),
-            else => qkvPart(qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nv),
-        };
-        be.prefetchWeight(part.bytes);
-    }
-    be.prefetchWeight(blk.attn.out.bytes);
+    inline for (.{ blk.attn.q, blk.attn.k, blk.attn.v, blk.attn.out }) |w| be.prefetchWeight(w.bytes);
     be.prefetchWeight(bytes(blk.attn.qnorm));
     be.prefetchWeight(bytes(blk.attn.knorm));
     be.prefetchWeight(bytes(blk.attn_norm2));
@@ -439,54 +479,6 @@ fn prefetchBlock(be: *Backend, cfg: zimage.Config, blk: anytype) void {
 /// A non-owning device-pointer view at a byte offset, sized to what will be read.
 fn offsetBuf(b: Buf, off_bytes: usize, size: usize) Buf {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = size };
-}
-
-/// A contiguous row range of the fused `[q_dim + 2*kv_dim, dim]` qkv weight. Zero-copy
-/// `[q|k|v]` are row blocks, and the device weight cache keys on the host pointer,
-/// so the three views cache separately. Part 0 shares the fused tensor's pointer, so
-/// the whole tensor must never be uploaded as well.
-fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
-    const row_bytes = w.dtype.storageBytes(w.cols);
-    var s = w;
-    s.rows = nrows;
-    s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
-    // An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
-    // storage that outlives the returned `Weight`. Without it the k and v views would read
-    // q's block scales, see `ops.nvfp4.Meta.rowSlice`.
-    if (w.nvfp4) |m| {
-        nv.* = m.rowSlice(w.cols, row0, nrows);
-        s.nvfp4 = nv;
-    }
-    return s;
-}
-
-/// A block GEMM, dispatched by weight dtype, the same routing `dit_cuda.lin` uses.
-/// Ampere+ feeds raw bf16 straight to the tensor cores; older cards take the
-/// GPU-side bf16->f16 GEMM.
-fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    const zeros: []const f32 = &zero_bias;
-    std.debug.assert(w.rows <= zeros.len);
-    switch (w.dtype) {
-        // `null`, not `zeros`: Z-Image's block linears are all bias-free, and a
-        // null bias lets the `.libs` arm write the GEMM straight into `y` instead
-        // of staging through `conv_c` and re-reading the whole output to add zero.
-        .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)
-            try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, null)
-        else
-            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros, false, false),
-        .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
-        // Weight-only NVFP4: the 4-bit weight is decoded to an f16 scratch inside the GEMM
-        // and the packed form stays resident. `rows % 128` / `cols % 32` come from the f16
-        // GEMM it feeds; every NVFP4 layer in the shipped checkpoints satisfies both.
-        .nvfp4 => {
-            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
-            const meta = w.nvfp4.?;
-            try be.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
-        },
-        .f32 => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, null),
-        // `supported` gates this before a session is built.
-        else => return error.UnsupportedDType,
-    }
 }
 
 /// Wrap a CPU norm-weight slice as a (pointer-cached) small device buffer.

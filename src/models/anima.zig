@@ -23,6 +23,7 @@ const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const lin = @import("lin.zig");
 
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
@@ -451,6 +452,9 @@ pub const DiT = struct {
     /// `t_embedding_norm`, an RMSNorm with weight over the raw sinusoid.
     t_norm: []const f32,
     blocks: []Block,
+    /// Every block linear the device forwards run (`deviceLins` per block, flattened),
+    /// the one list every support scan and GEMM plan reads (`lin`, `lin_cuda`).
+    device_lins: []const Weight,
     final_ada: [2]Weight,
     final_linear: Weight,
     adapter: Adapter,
@@ -465,6 +469,8 @@ pub const DiT = struct {
 
         const blocks = try alloc.alloc(Block, cfg.n_layers);
         for (blocks, 0..) |*b, i| b.* = try l.block(i);
+        const device_lins = try alloc.alloc(Weight, blocks.len * 10);
+        for (blocks, 0..) |*b, i| device_lins[i * 10 ..][0..10].* = deviceLins(b);
 
         const ac = cfg.adapter;
         const ablocks = try alloc.alloc(AdapterBlock, ac.n_layers);
@@ -486,6 +492,7 @@ pub const DiT = struct {
             .t_linear2 = try l.mat("t_embedder.1.linear_2.weight", .{}, 3 * cfg.dim, cfg.dim),
             .t_norm = try l.vec("t_embedding_norm.weight", .{}, cfg.dim),
             .blocks = blocks,
+            .device_lins = device_lins,
             .final_ada = .{
                 try l.mat("final_layer.adaln_modulation.1.weight", .{}, cfg.adaln_dim, cfg.dim),
                 try l.mat("final_layer.adaln_modulation.2.weight", .{}, 2 * cfg.dim, cfg.adaln_dim),
@@ -1131,106 +1138,7 @@ fn embedRows(embed: Weight, ids: []const u32, out: []f32) !void {
     }
 }
 
-/// Whether the GPU forwards have a GEMM path for linears of this dtype. Mirrors
-/// `dit.gpuLinKindSupported` / `zimage.gpuLinKindSupported`: an unrecognized dtype
-/// on those paths is not a slow path, it is silently wrong output.
-///
-/// int8/int4 convrot is absent on purpose: the CPU `matmul` runs it (rotate +
-/// per-row dequant) but neither `anima_gpu` nor `anima_cuda` has a W8A8 path yet. See
-/// `unsupportedGpuLin`.
-pub fn gpuLinKindSupported(dt: DType) bool {
-    return switch (dt) {
-        .bf16, .f16, .f32, .f8_e4m3 => true,
-        else => false,
-    };
-}
-
-/// The first block linear whose dtype no GPU arm can run, or null if every one can.
-///
-/// Checking ONE tensor of ONE block is wrong on a real checkpoint and produces a panic
-/// rather than a refusal: mixed checkpoints keep block 0 entirely bf16 and quantize
-/// blocks 1-27, so a `supported()` reading `blocks[0].self_attn.q.dtype` says yes, a
-/// device session is built, and the first thing it does trips `matmul`'s int8 assert.
-/// "Mixed" means mixed per block; per-block-uniform is the easy case, not the general
-/// one.
-///
-/// Returns the offending `{block, name, dtype}` so the warning can say which layer, not
-/// just that something is unsupported.
-pub const UnsupportedLin = struct { block: usize, tag: []const u8, dtype: DType };
-
-/// Which GEMM family one linear takes. Resolved PER LINEAR and used per BLOCK, because a
-/// real mixed checkpoint is mixed by block: block 0 entirely dense, block 1 quantizing
-/// only its ten attention/MLP linears, blocks 2-27 quantizing all sixteen. A per-model
-/// kind would be wrong for at least one block of it.
-pub const LinKind = enum { dense, i8, i4, w4a8, nvfp4 };
-
-pub fn linKind(w: Weight) LinKind {
-    return switch (w.dtype) {
-        .i8 => .i8,
-        .i4 => .i4,
-        // W4A8 is its own kind even though its GEMM *is* the int8 one: only the
-        // WEIGHT's storage differs, so it shares int8's activation prep (see `prepKind`)
-        // but needs a decode step the plain int8 entry point does not have.
-        .w4a8 => .w4a8,
-        // NVFP4 is its OWN kind, not `.dense`. It needs no activation prep (weight-only
-        // here, so the GEMM takes f32 `x` like a dense weight does) but it does need its
-        // own GEMM entry point, and `gemm`'s dense arm would read the packed nibbles as
-        // fp8 or f32, which is finite, plausible and wrong.
-        .nvfp4 => .nvfp4,
-        else => .dense,
-    };
-}
-
-/// What a given backend's GEMM surface can run. Not the same on both arms: both CUDA
-/// arms have int8 AND int4 convrot; Vulkan has int8 (native `sint8` coopmat) but no
-/// `sint4` coopmat exists on this device, so int4 needs a different strategy there.
-pub const LinSupport = struct {
-    i8: bool = false,
-    i4: bool = false,
-    /// Needs the backend's W4A8 decode kernel plus the int8 GEMM it feeds, so it implies
-    /// `i8`, and a backend with int8 but no decode kernel must still say false here.
-    w4a8: bool = false,
-    /// Needs the backend's NVFP4 decode kernel plus the f16-weight GEMM it feeds.
-    nvfp4: bool = false,
-};
-
-/// The activation prep a linear's GEMM reads, which is NOT one-to-one with `LinKind`.
-///
-/// W4A8 and int8 share one prep, and that is what makes a mixed checkpoint work.
-/// The "A8" is exactly that the activation stays 8-bit: only the weight's storage differs,
-/// so a group holding both kinds needs one `opI8Prep`, not two. Treating them as distinct
-/// here would refuse a checkpoint whose block 1 has W4A8 attention weights beside block
-/// 0's dense ones as an unserviceable mix.
-pub const PrepKind = enum { none, i8, i4 };
-
-pub fn prepKind(k: LinKind) PrepKind {
-    return switch (k) {
-        .i8, .w4a8 => .i8,
-        .i4 => .i4,
-        // Weight-only: the GEMM reads the f32 activation, like a dense one does.
-        .nvfp4, .dense => .none,
-    };
-}
-
-/// The first block linear this backend cannot run, or null if it can run all of them.
-pub fn unsupportedLin(model: *const DiT, support: LinSupport) ?UnsupportedLin {
-    for (model.blocks, 0..) |*b, bi| {
-        for (deviceLins(b)) |w| {
-            const ok = switch (linKind(w)) {
-                .i8 => support.i8,
-                .i4 => support.i4,
-                .w4a8 => support.w4a8,
-                .nvfp4 => support.nvfp4,
-                .dense => gpuLinKindSupported(w.dtype),
-            };
-            if (!ok) return .{ .block = bi, .tag = w.tag orelse "?", .dtype = w.dtype };
-        }
-    }
-    return null;
-}
-
-/// Every linear one block's DEVICE forward runs, and the one list all three scans below
-/// share.
+/// Every linear one block's DEVICE forward runs; `DiT.device_lins` is these flattened.
 ///
 /// Cross-attention's k/v belong here: they run on the device, so a checkpoint that
 /// quantizes them in a form the backend lacks must fail the support gate rather than
@@ -1246,58 +1154,6 @@ pub fn deviceLins(b: anytype) [10]Weight {
         b.cross_attn.q, b.cross_attn.out, b.cross_attn.k, b.cross_attn.v,
         b.mlp1,         b.mlp2,
     };
-}
-
-/// Largest transient buffer any NVFP4 block linear decodes into, per the backend's own
-/// sizing rule, or 0 when the model has none. A caller pre-sizes with this so the scratch
-/// never grows mid-forward, on Vulkan that would flush the recording batch.
-///
-/// Scans every block's DEVICE linears, the same set `unsupportedLin` uses.
-pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
-    var max: usize = 0;
-    for (model.blocks) |*b| {
-        for (deviceLins(b)) |w| {
-            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
-        }
-    }
-    return max;
-}
-
-/// Largest transient int8 buffer any packed W4A8 block linear decodes into, per the
-/// backend's own sizing rule, or 0 when the model has none. Mirrors `maxNvfp4Scratch` and
-/// `dit.maxW4A8Scratch`; a caller pre-sizes with this so the scratch never grows
-/// mid-forward, which on Vulkan would flush the recording batch.
-pub fn maxW4A8Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
-    var max: usize = 0;
-    for (model.blocks) |*b| {
-        for (deviceLins(b)) |w| {
-            if (w.dtype == .w4a8) max = @max(max, bytesFor(w.rows, w.cols));
-        }
-    }
-    return max;
-}
-
-/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any.
-///
-/// The CUDA decode kernel reads FOUR packed bytes per thread as one `u32`, which is what
-/// puts eight independent dependent-load chains in flight and takes it from 270 to ~100
-/// ms/step, and that requires a `u32` of packed bytes to lie inside one group, so the
-/// group scale is loaded once. Vulkan's kernel is general over the group size. No shipped
-/// checkpoint uses a smaller group (every one seen here is 16), so this refuses by name
-/// rather than asserting. Mirrors `dit.w4a8SmallGroup`.
-pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
-    for (model.blocks) |*b| {
-        for (deviceLins(b)) |w| {
-            if (w.dtype == .w4a8 and w.w4a8.?.group_size % 8 != 0) return w.tag orelse "<untagged>";
-        }
-    }
-    return null;
-}
-
-/// `unsupportedLin` for a backend with no convrot GEMM, the conservative default, and
-/// what `anima_gpu` passes.
-pub fn unsupportedGpuLin(model: *const DiT) ?UnsupportedLin {
-    return unsupportedLin(model, .{});
 }
 
 // --- weight loading ---------------------------------------------------------
@@ -1368,12 +1224,9 @@ const Loader = struct {
             std.log.err("anima: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, dt, rows, stored_cols });
             return error.ShapeMismatch;
         }
-        // A shape-fixed block-quantized tensor blocks over the FLAT element sequence
-        // rather than each logical row, which `Weight.init` does not assume.
-        if (view.info.flat_blocks) {
-            std.log.err("anima: {s} is {t} with flat block layout; this loader needs row-aligned blocks", .{ nm, dt });
-            return error.UnsupportedCheckpoint;
-        }
+        // A shape-fixed block quant tiles its blocks over the flat element sequence,
+        // not each row, so no GEMM here can read it; it is small by construction.
+        if (view.info.flat_blocks) return quant_weight.flatBlocksF32(l.alloc, view, nm, rows, cols);
         if (!ops.matmul.supportsDType(wdt)) {
             std.log.err("anima: {s} has unsupported dtype {t}", .{ nm, dt });
             return error.UnsupportedDType;
@@ -2005,7 +1858,7 @@ test "detectConfig counts trunk blocks under either prefix and refuses another w
     }
 }
 
-test "unsupportedGpuLin scans every block, not just the first" {
+test "the device-linear scan looks past the first block" {
     // The regression this pins is a real crash. A mixed checkpoint keeps block 0
     // entirely bf16 and quantizes blocks 1-27, so a predicate reading
     // `blocks[0].self_attn.q.dtype` reports "GPU ok", a device session is built, and
@@ -2020,7 +1873,7 @@ test "unsupportedGpuLin scans every block, not just the first" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const blocks = try alloc.alloc(Block, cfg.n_layers);
-    // Only the fields the predicate reads (dtype, tag) need to be meaningful, but
+    // Only the fields the scan reads (dtype, tag) need to be meaningful, but
     // `Weight.init` checks the byte count, so the shapes are 1x8 rather than the real
     // 2048x2048, this test is about the SCAN, not about any arithmetic.
     const bytes = try alloc.alloc(u8, 8 * 2);
@@ -2040,15 +1893,14 @@ test "unsupportedGpuLin scans every block, not just the first" {
             .ada_mlp = .{ bf, bf },
         };
     }
-    var model: DiT = undefined;
-    model.cfg = cfg;
-    model.blocks = blocks;
+    const lins = try alloc.alloc(Weight, blocks.len * 10);
+    for (blocks, 0..) |*b, i| lins[i * 10 ..][0..10].* = deviceLins(b);
 
-    const bad = unsupportedGpuLin(&model);
-    try testing.expect(bad != null);
+    const dense: lin.Caps = .{ .f32 = true, .f16 = true, .bf16 = true, .fp8 = true };
+    const bad = lin.unsupported(lins, dense).?;
     // Block ONE, not zero: the point is that it looked past the first block.
-    try testing.expectEqual(@as(usize, 1), bad.?.block);
-    try testing.expectEqual(DType.i8, bad.?.dtype);
+    try testing.expectEqualStrings("blocks.1.self_attn.q_proj.weight", bad.tag);
+    try testing.expectEqual(DType.i8, bad.dtype);
 
     // All-bf16 must still pass, or the gate would refuse every good checkpoint.
     for (blocks) |*b| {
@@ -2062,7 +1914,8 @@ test "unsupportedGpuLin scans every block, not just the first" {
         b.mlp1 = bf;
         b.mlp2 = bf;
     }
-    try testing.expect(unsupportedGpuLin(&model) == null);
+    for (blocks, 0..) |*b, i| lins[i * 10 ..][0..10].* = deviceLins(b);
+    try testing.expect(lin.unsupported(lins, dense) == null);
 }
 
 test "the loader wires int8/int4 convrot scales, and refuses a weight with none" {
