@@ -95,7 +95,7 @@ pub const Session = struct {
             .seq = seq,
             .ctx_seq = ctx_seq,
             .freqs_d = undefined,
-            .plan = try lin_cuda.plan(model.device_lins, "anima cuda"),
+            .plan = try lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "anima cuda"),
             .ck_d = undefined,
             .cv_d = undefined,
             .sigmas = &.{},
@@ -137,7 +137,7 @@ pub const Session = struct {
         {
             // Pre-size the decode scratches before any batch opens; one sizing serves the
             // cross-K/V batch below and every later forward.
-            try lin_cuda.presize(be, model.device_lins);
+            try lin_cuda.presize(be, self.plan, model.device_lins);
 
             var cond_d = try be.tensorCreate(cond.len * 4);
             defer be.tensorDestroy(&cond_d);
@@ -245,7 +245,7 @@ pub const Workspace = struct {
 /// Whether the CUDA arms can run every block linear this model has. The refusal, if
 /// any, is logged by name.
 pub fn supported(model: *const DiT) bool {
-    _ = lin_cuda.plan(model.device_lins, "anima cuda") catch return false;
+    _ = lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "anima cuda") catch return false;
     return true;
 }
 

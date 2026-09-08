@@ -98,11 +98,23 @@ pub fn main(init: std.process.Init) !void {
         var path: []const u8 = "/home/qt/genai/comfyui/models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
         var ref: []const u8 = "";
         var variant: TensorPencil.models.qwen3.Variant = .zimage;
+        var dump: []const u8 = "";
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--ref") and i + 1 < args.len) {
                 i += 1;
                 ref = args[i];
+            } else if (std.mem.eql(u8, args[i], "--gguf-gemm") and i + 1 < args.len) {
+                // The encoder's block-quant route (`qwen3_cuda.encoder_gemm`), so the
+                // activation-quantizing routes can be measured against the CPU encode.
+                i += 1;
+                TensorPencil.models.qwen3_cuda.encoder_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, args[i]) orelse return error.InvalidArgs;
+            } else if (std.mem.eql(u8, args[i], "--dump") and i + 1 < args.len) {
+                // Raw f32 conditioning per arm, `<prefix>.<arm>.f32`, for a byte
+                // compare of two builds: rel L2 to four digits cannot tell "same
+                // kernels" from "same to 1e-5".
+                i += 1;
+                dump = args[i];
             } else if (std.mem.eql(u8, args[i], "--krea2")) {
                 variant = .krea2;
             } else if (std.mem.eql(u8, args[i], "--anima")) {
@@ -117,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
                 variant = .minimax_h3;
             } else path = args[i];
         }
-        try teTest(arena, io, stdout, path, ref, variant);
+        try teTest(arena, io, stdout, path, ref, variant, dump);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "zimage-cuda-test")) {
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
         var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
@@ -346,9 +358,17 @@ pub fn main(init: std.process.Init) !void {
             \\      --encoder-f16 off  run the text encoder GEMMs on tensor
             \\                         cores (f16): ~0.4s faster, slightly less
             \\                         exact conditioning (on/off)
+            \\      --te-gguf-gemm f16  which GEMM a GGUF block-quant TEXT ENCODER
+            \\                         decodes its weights for (same values as
+            \\                         --dit-gguf-gemm). f16 expands the weight and
+            \\                         leaves the activation alone; int8/int4/mmq
+            \\                         quantize the activation too, and a
+            \\                         conditioning is computed once and steers
+            \\                         every step, so that error is baked into the
+            \\                         whole render. Exists to measure that trade
             \\      --dit-gguf-gemm auto  which GEMM a GGUF block-quant DiT
             \\                         decodes its weights for:
-            \\                         auto | int8 | int4 | bf16 | mmq.
+            \\                         auto | int8 | int4 | bf16 | f16 | mmq.
             \\                         int8 rotates and re-quantizes to convrot
             \\                         int8, which is ~2x faster but caps accuracy
             \\                         at int8's; int4 does the same one width down
@@ -2073,7 +2093,7 @@ fn summarize(stdout: *Io.Writer, failures: usize) !void {
 /// computes" (a kernel question, expect ~1e-3) and "does this quantization change
 /// the conditioning" (a format question, expect much more). A render comparison
 /// answers neither on its own.
-fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, ref_path: []const u8, variant: TensorPencil.models.qwen3.Variant) !void {
+fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, ref_path: []const u8, variant: TensorPencil.models.qwen3.Variant, dump: []const u8) !void {
     const qwen3 = TensorPencil.models.qwen3;
     const qwen3_cuda = TensorPencil.models.qwen3_cuda;
     const qwen3_gpu = TensorPencil.models.qwen3_gpu;
@@ -2181,6 +2201,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
     const want = try enc.encodeVision(io, arena, ids.items, vision, null);
     var ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
     try stdout.print("\ncpu       {d:8.0} ms   (reference)\n", .{ms});
+    try dumpF32(io, arena, dump, "cpu", want);
 
     // The payload must not be inert, or the device compare below proves only that
     // the text path runs twice.
@@ -2234,7 +2255,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
         if (be) |b| {
             defer b.deinit();
             const name = if (libs) "cuda" else "zig-cuda";
-            if (!qwen3_cuda.supportsWeightsOn(b, &enc)) {
+            if (!qwen3_cuda.supportsWeights(&enc)) {
                 try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{name});
                 failures += 1;
             } else {
@@ -2242,6 +2263,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
                 t0 = std.Io.Clock.real.now(io);
                 const got = try qwen3_cuda.encodeVision(&enc, b, io, arena, ids.items, vision, null);
                 ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+                try dumpF32(io, arena, dump, name, got);
                 const r = R.rel(want, got);
                 const ok = R.finite(got) and r < tol;
                 if (!ok) failures += 1;
@@ -2263,6 +2285,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
             t0 = std.Io.Clock.real.now(io);
             const got = try qwen3_gpu.encode(&enc, gc, io, arena, ids.items, false, null);
             ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+            try dumpF32(io, arena, dump, "vulkan", got);
             const r = R.rel(want, got);
             const ok = R.finite(got) and r < tol;
             if (!ok) failures += 1;
@@ -2282,6 +2305,18 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
         });
     }
     try summarize(stdout, failures);
+}
+
+/// `<prefix>.<arm>.f32`, raw little-endian f32, or nothing when `prefix` is empty.
+fn dumpF32(io: Io, arena: std.mem.Allocator, prefix: []const u8, arm: []const u8, data: []const f32) !void {
+    if (prefix.len == 0) return;
+    const path = try std.fmt.allocPrint(arena, "{s}.{s}.f32", .{ prefix, arm });
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var w = f.writer(io, &buf);
+    try w.interface.writeAll(std.mem.sliceAsBytes(data));
+    try w.interface.flush();
 }
 
 /// Check `zimage_cuda`'s device forward against `zimage.DiT.predict` on real
@@ -4356,7 +4391,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     var model = try dit_mod.DiT.load(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, container.store()));
     defer model.deinit();
     const wqt = model.blocks[0].attn.wq.dtype;
-    switch (TensorPencil.models.lin_cuda.check(model.device_lins)) {
+    switch (TensorPencil.models.lin_cuda.check(model.device_lins, TensorPencil.models.lin_cuda.blockq_gemm)) {
         .ok => {},
         .refused => |r| {
             try stdout.print("cuda-dit-test needs a checkpoint the CUDA DiT has a GEMM for ({s}: {t} {s})\n", .{ r.tag, r.dtype, @tagName(r.why) });
@@ -4471,7 +4506,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         // So this gate catches a wiring break (which lands near 1.0, not 0.13) and
         // deliberately does not try to bound quantization quality; `--dit` renders and
         // the PSNR tables in BACKEND.md are what measure that.
-        const tol: f32 = if (TensorPencil.models.lin_cuda.activationIs4Bit(wqt))
+        const tol: f32 = if (TensorPencil.models.lin_cuda.activationIs4Bit(TensorPencil.models.lin_cuda.blockq_gemm, wqt))
             0.25
         else if (wqt == .q2_k)
             0.15
@@ -4618,7 +4653,12 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             };
         } else if (std.mem.eql(u8, flag, "--dit-gguf-gemm")) {
             TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, val) orelse {
-                try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, f16, mmq)\n", .{val});
+                try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, bf16, f16, mmq)\n", .{val});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, flag, "--te-gguf-gemm")) {
+            TensorPencil.models.qwen3_cuda.encoder_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, val) orelse {
+                try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, bf16, f16, mmq)\n", .{val});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, flag, "--dit-f32")) {

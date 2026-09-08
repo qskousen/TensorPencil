@@ -48,3 +48,17 @@
 - gui: replaying a conversation into a DIFFERENT model feeds the old model's
   reasoning markup in as literal content; real chat templates vary in whether
   they keep prior reasoning at all (Qwen's drops it)
+- llm decode: iq4_xs has no dp4a GEMV (`quantQ8NSupported` excludes it), so gemma3 12B
+  IQ4_XS decodes at 28 tok/s against Q4_K_M's 58 through the same dispatcher. A
+  `gemv_iq4_xs_q8n` twin of `gemv_q4_k_q8n` closes it for every arch at once
+- llm vulkan: `lin_llm_gpu` refuses q4_0/iq4_xs/q1_0/q2_0 by name; each needs a
+  `gemv_*_t` and a `dequant_*` kernel. Also `check` runs without a device in tests only
+  through `quantKernel`/`wcode`; `routeOf` needs a Context for the knob reads
+- llm: a `--llm-gemm` knob mirroring `--dit-gguf-gemm` (force grouped / MMQ / dequant
+  per run) would make the dispatcher's crossovers measurable from one binary;
+  `grouped_max = 40` is a 3090 number from qgemv-bench
+- h3 text encoder: the 50-layer encode streams all 23 GB every prompt (2.4 s) because the
+  weight cache is LRU and a sequential walk larger than the cache evicts each layer just
+  before its next use. Keeping the first ~25 layers resident across prompts (a pin
+  scoped to the encoder that the DiT's `evictUnpinned` still drops, or MRU-aware
+  eviction for scans) would halve it. Only matters if the DiT leaves that VRAM free

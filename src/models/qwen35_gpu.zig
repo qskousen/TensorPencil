@@ -12,6 +12,7 @@
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
 const qwen35 = @import("qwen35.zig");
+const lin_gpu = @import("lin_llm_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
@@ -67,8 +68,7 @@ pub const VulkanLM = struct {
     mlp_gate: Buf,
     mlp_up: Buf,
     logits: Buf,
-    // k-split GEMV partials scratch [nchunk][max_rows]; reduced by gemv_combine.
-    partials: Buf,
+    lin: lin_gpu.Lin,
 
     // Per-attention-slot KV caches [capacity][kvDim]; recurrent conv/ssm states.
     k_cache: []Buf,
@@ -141,10 +141,10 @@ pub const VulkanLM = struct {
         self.mlp_gate = try ctx.tensorCreate(cfg.intermediate * 4);
         self.mlp_up = try ctx.tensorCreate(cfg.intermediate * 4);
         self.logits = try ctx.tensorCreate(cfg.vocab * 4);
-        // Split-GEMV partials, sized for the largest GEMV output (LM head,
-        // rows = vocab) times nchunk.
         const max_rows = @max(cfg.vocab, @max(cfg.convChannels(), @max(cfg.intermediate, cfg.qDim() * 2)));
-        self.partials = try ctx.tensorCreate(max_rows * gemv_nchunk * 4);
+        self.lin = try lin_gpu.Lin.init(gpa, ctx, max_rows, gemv_nchunk, 1);
+        errdefer self.lin.deinit();
+        try self.lin.plan(try lm.deviceLins(alloc), 1, "qwen35 vulkan");
 
         const n_attn = cfg.nAttnLayers();
         self.k_cache = try alloc.alloc(Buf, n_attn);
@@ -186,13 +186,14 @@ pub const VulkanLM = struct {
 
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.ctx;
-        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "attn_scratch", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "partials", "freqs_d" }) |f| {
+        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "attn_scratch", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "freqs_d" }) |f| {
             ctx.tensorDestroy(&@field(self, f));
         }
         for (self.k_cache) |*b| ctx.tensorDestroy(b);
         for (self.v_cache) |*b| ctx.tensorDestroy(b);
         for (self.conv_state) |*b| ctx.tensorDestroy(b);
         for (self.ssm_state) |*b| ctx.tensorDestroy(b);
+        self.lin.deinit();
         self.arena.deinit();
     }
 
@@ -214,17 +215,6 @@ pub const VulkanLM = struct {
         if (min_rows > self.capacity) return error.ContextFull;
     }
 
-    /// GEMV of a block-quant weight against the (f32) activation `x` into
-    /// `y[y_off..]`; dequant-on-the-fly. Block-quant formats read the
-    /// 32-row-group transposed layout with a k-split reduction (coalesced warp
-    /// loads + enough warps to hide latency); anything else falls back to the
-    /// raw row-major kernel.
-    fn gemvW(self: *VulkanLM, y: Buf, y_off: usize, x: Buf, w: Weight) !void {
-        switch (w.dtype) {
-            .q8_0, .q4_k, .q5_k, .q6_k => try self.ctx.opGemvQuantT(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.partials),
-            else => try self.ctx.opGemvQuant(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
-        }
-    }
 
     fn rms(self: *VulkanLM, in: Buf, out: Buf, weight: []const f32, rows: usize, dim: usize) !void {
         try self.ctx.opElt(.rmsnorm, in, out, try nbuf(self.ctx, weight), null, .{
@@ -272,9 +262,9 @@ pub const VulkanLM = struct {
                 .attn => |*al| {
                     const slot = l / cfg.full_attn_interval;
                     try self.rms(self.x, self.normed, al.input_norm, 1, cfg.hidden);
-                    try self.gemvW(self.qg, 0, self.normed, al.qg);
-                    try self.gemvW(self.k, 0, self.normed, al.k);
-                    try self.gemvW(self.v, 0, self.normed, al.v);
+                    try self.lin.linear(self.qg, 0, self.normed, 1, al.qg);
+                    try self.lin.linear(self.k, 0, self.normed, 1, al.k);
+                    try self.lin.linear(self.v, 0, self.normed, 1, al.v);
                     try ctx.opDeinterleave2(self.qg, self.q, self.gate, cfg.qDim(), hd);
                     try self.rms(self.q, self.q, al.q_norm, cfg.n_heads, hd);
                     try self.rms(self.k, self.k, al.k_norm, cfg.n_kv_heads, hd);
@@ -300,7 +290,7 @@ pub const VulkanLM = struct {
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, 0, kvFmt(self.kv_dtype));
                     try ctx.opElt(.sigmoid_mul, self.attn, self.gate, null, null, .{ .u0 = @intCast(cfg.qDim()) }, cfg.qDim(), 1, 1);
-                    try self.gemvW(self.t, 0, self.attn, al.o);
+                    try self.lin.linear(self.t, 0, self.attn, 1, al.o);
                     try self.add(self.x, self.t, cfg.hidden);
                 },
                 .linear => |*ll| {
@@ -309,17 +299,17 @@ pub const VulkanLM = struct {
                     const d = cfg.lin_head_dim;
                     const heads = cfg.lin_v_heads;
                     try self.rms(self.x, self.normed, ll.input_norm, 1, cfg.hidden);
-                    try self.gemvW(self.lin_qkv, 0, self.normed, ll.qkv);
-                    try self.gemvW(self.lin_z, 0, self.normed, ll.z);
-                    try self.gemvW(self.ab, 0, self.normed, ll.alpha);
-                    try self.gemvW(self.ab, heads, self.normed, ll.beta);
+                    try self.lin.linear(self.lin_qkv, 0, self.normed, 1, ll.qkv);
+                    try self.lin.linear(self.lin_z, 0, self.normed, 1, ll.z);
+                    try self.lin.linear(self.ab, 0, self.normed, 1, ll.alpha);
+                    try self.lin.linear(self.ab, heads, self.normed, 1, ll.beta);
                     try ctx.opGdnGates(self.ab, try nbuf(ctx, self.a_dt[lin_idx]), self.gates, heads);
                     try ctx.opGdnConvStep(self.conv_state[lin_idx], self.lin_qkv, try nbuf(ctx, ll.conv_w), self.lin_conv, channels, cfg.conv_kernel);
                     try ctx.opL2NormRows(self.lin_conv, 2 * cfg.lin_k_heads, d, cfg.rms_eps);
                     try ctx.opGdnDeltaStep(self.ssm_state[lin_idx], self.lin_conv, self.gates, self.lin_o, heads, d, cfg.lin_k_heads, 1.0 / @sqrt(@as(f32, @floatFromInt(d))));
                     try self.rms(self.lin_o, self.lin_o, ll.ssm_norm, heads, d);
                     try self.siluMul(self.lin_z, self.lin_o, cfg.linVDim());
-                    try self.gemvW(self.t, 0, self.lin_z, ll.out);
+                    try self.lin.linear(self.t, 0, self.lin_z, 1, ll.out);
                     try self.add(self.x, self.t, cfg.hidden);
                 },
             }
@@ -328,16 +318,16 @@ pub const VulkanLM = struct {
                 .linear => |*ll| &ll.mlp,
             };
             try self.rms(self.x, self.normed, mlp.post_norm, 1, cfg.hidden);
-            try self.gemvW(self.mlp_gate, 0, self.normed, mlp.gate);
-            try self.gemvW(self.mlp_up, 0, self.normed, mlp.up);
+            try self.lin.linear(self.mlp_gate, 0, self.normed, 1, mlp.gate);
+            try self.lin.linear(self.mlp_up, 0, self.normed, 1, mlp.up);
             try self.siluMul(self.mlp_gate, self.mlp_up, cfg.intermediate);
-            try self.gemvW(self.t, 0, self.mlp_gate, mlp.down);
+            try self.lin.linear(self.t, 0, self.mlp_gate, 1, mlp.down);
             try self.add(self.x, self.t, cfg.hidden);
         }
 
         if (want_logits) {
             try self.rms(self.x, self.t, self.lm.final_norm, 1, cfg.hidden);
-            try self.gemvW(self.logits, 0, self.t, self.lm.head);
+            try self.lin.linear(self.logits, 0, self.t, 1, self.lm.head);
         }
     }
 };

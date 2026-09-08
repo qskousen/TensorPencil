@@ -33,6 +33,7 @@ const weights_mod = @import("tp_core").weights;
 const qwen3 = @import("qwen3.zig");
 const ops = @import("tp_ops");
 const loader = @import("loader.zig");
+const lin = @import("lin.zig");
 const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
@@ -322,6 +323,15 @@ pub const Model = struct {
             .rope_freqs = rope_freqs,
             .suppress_tokens = suppress,
         };
+    }
+
+
+    /// Every linear the device forwards run, tagged by layer and field, for a backend's
+    /// route check at load.
+    pub fn deviceLins(self: *const Model, alloc: std.mem.Allocator) ![]Weight {
+        var head = self.head;
+        head.tag = "lm_head";
+        return lin.collect(alloc, "layers", self.layers, &.{ "q", "k", "v", "o", "gate", "up", "down" }, &.{head});
     }
 
     pub fn deinit(self: *Model) void {

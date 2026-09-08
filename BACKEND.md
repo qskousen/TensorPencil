@@ -253,7 +253,7 @@ ONE packed token sequence, on two sigma schedules. See VIDEO_PLAN.md.
 
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
-| **Text encoder** (Qwen3-VL-32B, 50 layers, UNNORMALIZED last state) | ✅ int8-convrot | — | ✅ | ✅ | `qwen3{,_cuda}.zig`, `Variant.minimax_h3`. The device arms have the int8 GEMM and the vision path, and are **60x** where the weights fit (25 layers: 7421 -> 124 ms). ⚠️ They do not fit a 3090: 23250 MB of weights against 21451 MB free, and past that the per-layer re-upload makes it SLOWER than the CPU (50 layers: 20840 ms vs 18384 ms). `supportsWeightsOn` gates on measured free VRAM, so this encoder runs on the CPU here |
+| **Text encoder** (Qwen3-VL-32B, 50 layers, UNNORMALIZED last state) | ✅ int8-convrot | — | ✅ | ✅ | `qwen3{,_cuda}.zig`, `Variant.minimax_h3`. The device arms have the int8 GEMM and the vision path. The 23 GB of weights do not fit a 3090, so the encode streams them: each layer's weights are prefetched one layer ahead on the transfer stream (`prefetchLayer`, the DiT's pattern), and the whole 50-layer encode is **2.4 s** against 13.3 s on the CPU, bounded by the PCIe pass (23 GB at ~10 GB/s). The 25 layers that fit run in 98 ms. There is no free-VRAM gate and no CPU fallback: the device path is always taken, so the conditioning does not depend on what else was resident |
 | **DiT trunk** (50 blocks, 5376, 56x128) | ✅ int8 | — | ✅ int8 | ✅ int8 | `minimax_h3{,_cuda}.zig` |
 | **Video VAE decode** (ViT3D, 36 blocks, temporal chunking) | ✅ | — | ✅ | ✅ | `minimax_h3_vae{,_cuda}.zig` |
 | **Audio VAE decode** (BigVGAN, 32 kHz stereo) | ✅ | — | ✅ f32 | ✅ f32 | `minimax_h3_audio{,_cuda}.zig` |
@@ -484,6 +484,28 @@ weight and nothing in the GGUF knows it. It falls out for free because the weigh
 decode IS `buildPrep` with a packed input mode — rotating a row, taking its absmax and
 quantizing to int8 is the same operation whether the row is a token's activations or a
 weight's output row.
+
+**The block-quant route is the caller's choice**, passed to `lin_cuda.plan` and carried in
+its `Plan`: the DiT families pass `lin_cuda.blockq_gemm` (`--dit-gguf-gemm`), the text
+encoders pass `qwen3_cuda.encoder_gemm` (`--te-gguf-gemm`, default `f16`). The same GGUF
+file asks for different trades in the two roles. `int8`, `int4` and `mmq` quantize the
+ACTIVATION as well as reading a quantized weight; `bf16` and `f16` expand the weight and
+leave the activation alone. A DiT runs its GEMMs at m in the thousands every step, so the
+activation error is paid for a 2x step; a conditioning tensor is computed once and then
+read by every step, so the same error is baked into the whole render for a few hundred
+milliseconds saved once. `te-test --gguf-gemm <route>` measures each route against the CPU
+encode, rel L2 over the whole conditioning (Qwen3-4B, 36 layers, 72 tokens, `cuda` arm):
+
+| route | q4_k | q8_0 | encode ms (q4_k) |
+|---|---|---|---|
+| `f16` (default) | 1.3e-4 | 1.4e-4 | 159 |
+| `bf16` | 2.4e-3 | 5.5e-3 | 156 |
+| `int8` (`auto` for q4_k) | 3.3e-3 | 6.0e-3 | 156 |
+| `mmq` | 8.5e-3 | 4.7e-3 | 186 |
+| `int4` | 4.8e-2 | 5.2e-2 | 162 |
+
+Every other route puts 20-60x the error into the conditioning and saves nothing at a
+72-token prompt. Whether that shows in an image is a render question, not answered here.
 
 **Two decode routes, `--dit-gguf-gemm auto|int8|bf16`** (`lin_cuda.routeOf`). `int8` is
 the convrot path above. `bf16` expands the weight to bf16 and runs the bf16 tensor cores
@@ -727,13 +749,49 @@ storage form, and a narrow conv falling to it writes f32 into an f16 buffer.
   Q6_K head, 60L, hidden 5376, kv 16↔4) load with no code change. Vision via `gemma4uv` /
   `gemma4v` towers (§5).
 
+### LLM linear dispatch (`models/lin_llm_cuda.zig`, `models/lin_llm_gpu.zig`)
+
+One dispatcher per backend for every LLM stepper. Each `Model` exposes `deviceLins`, the
+flat tagged list of every linear its device forwards run, and the stepper `plan`s it at
+init, so a format with no kernel is refused by tensor name at load instead of hitting
+`unreachable` inside a forward (an IQ4_XS gemma3 used to segfault that way). A stepper
+`prep`s an activation once per group of linears sharing it (q/k/v, gate/up) and `gemm`s
+each; the route is chosen per weight from its storage, its shape and the row count `m`:
+
+| weight | `m = 1` | `1 < m <= 40` | `m > 40` |
+|---|---|---|---|
+| q5_k, q6_k, q1_0, q2_0 | `gemv_q*_q8` dp4a | `gemv_q*_q8n` grouped (q1_0/q2_0: one batched launch) | MMQ pipe where `mmqPipeFaster`, else dequant-f16 GEMM |
+| q4_0, q8_0, q4_k | `gemv_q*_q8n` (ng = 1) dp4a | grouped | same |
+| iq4_nl, iq4_xs | `gemv_*` f32 activation | dequant-f16 GEMM (iq4_xs: MMQ) | same |
+| any block quant, `rows % 128 != 0` or `cols % 256 != 0` | f32 GEMV | grouped if tileable, else per-row f32 GEMV | same (a router, a GDN gate, an odd vocab never sees a GEMM) |
+| bf16 | `gemv_bf16` | `gemv_bf16n`, 4 rows per launch | `opGemmBf16` (Ampere+) / f16 GEMM |
+| fp8 | `gemv_fp8` | `gemv_fp8n` | `opMatmulFp8` |
+| f16 / f32 | f16 GEMV / f32 GEMM | GEMM | GEMM |
+
+The dp4a and MMQ routes read the q8_1 activation the prep staged (one layout serves both:
+the grouped kernel reads the tile-padded layout when a group also runs MMQ); the rest read
+the f32 activation. `lin_llm_cuda.decode_dp4a = false` is the isolation for a wrong decode
+(every block quant through the f32 GEMV). Numerics are unchanged for every route an arch
+already had; what changed is coverage, all of it measured token-identical on the greedy
+corpus: qwen3 gained dp4a decode (4B Q4_K_M 88 → 159 tok/s, 8B Q8_0 49 → 67) and the bf16
+prefill GEMM (4B bf16 137 → 294 tok/s), gemma3 gained MMQ prefill (Q4_K_M 610 → 665
+`cuda`, 435 → 620 `zig-cuda`), gemma4 gained the grouped GEMV for short follow-up turns
+(q4_0, 33-token prompt: 195 → 330 tok/s). k2's dense linears take dp4a too, which its
+expert-bound decode does not notice (34 tok/s either way).
+
+On Vulkan the routes are the transposed dequant GEMV (`opGemvQuantT`, the five formats it
+has), the dp4a repack for q8_0 (iq4_nl behind `TP_VK_DP4A`), the three opt-in decode kernels
+(`TP_VK_SG_GEMV`, `TP_VK_SG_DP4A`, `TP_VK_T_DP4A`, now on every arm), and the coop dequant
+GEMM for a batch where the device has the f16-weight pipeline. A Vulkan buffer is a handle,
+so a batch a GEMV would have to step through row by row is refused, not looped.
+
 ¹ **qwen3 on vulkan** (`qwen3_gpu.zig VulkanLM`, config-driven) runs two regimes. **Dense**
 (fp8/bf16/f32, tied head): batched square-attention prefill + spec decode, with bf16 read
 natively (2-byte `transpose_bf16`/`pipe_tr_bf16` plus a bf16 branch in `gemv_partial{,4}`,
 weight code `context.WCode.bf16`) so weights are never widened; bf16 has no tiled GEMM, so
 prefill streams through grouped GEMV. Generation is coherent but not token-identical to CPU
 (GEMV reduction-order drift). **GGUF block-quant** (q8_0/q4_k/q5_k/q6_k/iq4_nl + untied
-block-quant head): decode is the per-row fused-dequant GEMV (`gemvW` → `opGemvQuantT`);
+block-quant head): decode is the per-row fused-dequant GEMV (`lin_llm_gpu`, `opGemvQuantT`);
 prefill runs the tensor-core GEMM via `opMatmulCoopQuant`, which dequants each weight to f16
 k-major on the GPU and reuses `coopF16WDispatch`, so the whole prompt prefills in one batched
 pass. The f16 form is 4× the block-quant size and is re-dequanted per prefill into one reused
@@ -822,7 +880,7 @@ half-computed state), while cancel unwinds between layers via `engine.publishCan
 | **Growable VMM KV context** (cuMemMap in place) | ⚠️ host arrays | ❌ (reserves window up front) | ✅ | ✅ |
 | RoPE (half/partial/interleaved/dual/factored) | ✅ | ✅ (no vision/M-RoPE) | ✅ (+M-RoPE, vision) | ↤ |
 | RMSNorm / LayerNorm / sandwich | ✅ | `rmsnorm`/`layernorm` | `qk_rmsnorm`/`ln_bias_par` | ↤ |
-| **Decode GEMV (dp4a int8)** | ggml `vec_dot` | ⚠️ opt-in only (`TP_VK_DP4A`) | ✅ `gemv_q*_q8n` grouped-N | ↤ |
+| **Decode GEMV (dp4a int8)** | ggml `vec_dot` | q8_0 default, iq4_nl opt-in (`TP_VK_DP4A`) | ✅ every arch via `lin_llm_cuda` (`gemv_q*_q8`, `_q8n`) | ↤ |
 | Prefill GEMM | `matmul.zig` microkernel | coopmat bf16/f16 + int8 s8→s32 | hand hgemm/igemm/i4gemm, MMQ pipes | **cuBLASLt** |
 | **GDN / gated DeltaNet** (qwen35) | ✅ | `gdn_gates`/`gdn_conv_step`/`gdn_delta_step` | + batched `gdn_conv_batch`, `opGdnDeltaChunk` | ↤ |
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
@@ -1266,6 +1324,8 @@ Delete a row when it closes.
 | No Vulkan ViT except gemma3 | `vit35`, `gemma4_vit`, `gemma4v_vit` are CPU/CUDA only. |
 | No Vulkan gemma4 | `Spec.Vulkan = void`; `--backend vulkan` is rejected for the arch. |
 | Vulkan block-quant embedding | rejected in `llm_main.zig` — no block-quant gather kernel, so an f16/bf16 embed table is required. |
+| No dp4a decode GEMV for iq4_xs | `lin_llm_cuda` sends it through the f32 `gemv_iq4_xs`; gemma3 12B IQ4_XS decodes at 28 tok/s where Q4_K_M does 58. A `gemv_iq4_xs_q8n` twin is the fix, and `quantQ8NSupported` is the one place to declare it. |
+| Vulkan block quants are q8_0/q4_k/q5_k/q6_k/iq4_nl only | q4_0, iq4_xs, q1_0 and q2_0 are refused by name at load (`lin_llm_gpu.plan`); each needs a `gemv_*_t` and a `dequant_*` kernel. |
 | Vulkan dp4a decode is opt-in | `TP_VK_DP4A=1`; the repacked int8 weight roughly doubles VRAM, so it stays opt-in until VRAM-aware auto-sizing lands. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
 | `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |

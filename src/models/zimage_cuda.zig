@@ -89,7 +89,7 @@ pub const Session = struct {
             .n_img = n_img,
             .img_padded = img_padded,
             .seq = seq,
-            .plan = try lin_cuda.plan(model.device_lins, "zimage cuda"),
+            .plan = try lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "zimage cuda"),
             .cap_d = undefined,
             .x_pad_d = undefined,
             .freqs_d = undefined,
@@ -108,7 +108,7 @@ pub const Session = struct {
             if (self.finals.len != 0) gpa.free(self.finals);
         }
 
-        try lin_cuda.presize(be, model.device_lins);
+        try lin_cuda.presize(be, self.plan, model.device_lins);
         self.cap_d = try be.tensorCreate(cap.len * 4);
         made += 1;
         try be.tensorUpload(self.cap_d, std.mem.sliceAsBytes(cap));
@@ -240,7 +240,7 @@ pub const Workspace = struct {
 /// any, is logged by name; the caller says the trunk then runs on the CPU.
 pub fn supported(model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    _ = lin_cuda.plan(model.device_lins, "zimage cuda") catch return false;
+    _ = lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "zimage cuda") catch return false;
     return true;
 }
 

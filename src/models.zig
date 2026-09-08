@@ -66,6 +66,9 @@ pub const quant_weight = @import("models/quant_weight.zig");
 /// dispatcher every diffusion family's device forward goes through (`lin_cuda`).
 pub const lin = @import("models/lin.zig");
 pub const lin_cuda = @import("models/lin_cuda.zig");
+/// The one CUDA linear dispatcher every LLM stepper's device forward goes through.
+pub const lin_llm_cuda = @import("models/lin_llm_cuda.zig");
+pub const lin_llm_gpu = @import("models/lin_llm_gpu.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
@@ -120,6 +123,8 @@ test {
     _ = quant_weight;
     _ = lin;
     _ = lin_cuda;
+    _ = lin_llm_cuda;
+    _ = lin_llm_gpu;
     _ = loader;
     _ = clip_text;
     _ = clip_text_gpu;

@@ -1,6 +1,7 @@
 //! Gemma 3 LM on the CUDA backend (tp-llm --backend zig-cuda / cuda): the
-//! text stack runs device-resident. Prefill is batched chunks
-//! (opMatmulQuant / grouped dp4a GEMVs); decode is per-op fused GEMVs.
+//! text stack runs device-resident. Prefill is batched chunks; every
+//! projection goes through lin_llm_cuda, which picks the kernel per weight
+//! and row count.
 //!
 //! Gemma-specific vs qwen3_cuda: FOUR RMSNorms per layer (input, post-attn,
 //! pre-FFN, post-FFN, the two "post" norms apply to the sublayer output
@@ -19,6 +20,7 @@
 const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 const gemma3 = @import("gemma3.zig");
+const lin_cuda = @import("lin_llm_cuda.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -49,9 +51,6 @@ const nsplit = 32;
 const nsplit_prefill = 8;
 /// Rows per batched-prefill chunk (also the activation-buffer height).
 const prefill_chunk = 128;
-/// Batches up to this take the grouped dp4a GEMV (weight streamed ceil(n/8)x)
-/// instead of opMatmulQuant's dequant-to-f16 GEMM (qwen3_cuda's crossover).
-const grouped_gemv_max = 40;
 
 /// Gemma 3 vision is always a 16x16 = 256-token soft-image block. A
 /// bidirectional image block is prefilled in ONE batch so its tokens see each
@@ -228,6 +227,10 @@ pub const CudaLM = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
+
+        // Every linear the device forwards run, refused by name here rather than as
+        // `unreachable` in a forward (an IQ4_XS GGUF used to segfault that way).
+        try lin_cuda.plan(try lm.deviceLins(alloc), max_batch, "gemma3 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
         // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
@@ -1015,11 +1018,11 @@ pub const CudaLM = struct {
     }
     pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // gemma3: uniform geometry
-        const cfg = self.cfg;
         const b = &self.bufs;
-        try self.linear(b.q, b.normed, layer.q, cfg.qDim(), cfg.hidden, seq);
-        try self.linear(b.k, b.normed, layer.k, cfg.kvDim(), cfg.hidden, seq);
-        try self.linear(b.v, b.normed, layer.v, cfg.kvDim(), cfg.hidden, seq);
+        const g = try lin_cuda.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
+        try lin_cuda.gemm(self.be, g, b.q, layer.q);
+        try lin_cuda.gemm(self.be, g, b.k, layer.k);
+        try lin_cuda.gemm(self.be, g, b.v, layer.v);
     }
     pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -1068,8 +1071,7 @@ pub const CudaLM = struct {
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        const cfg = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.attn, layer.o, cfg.hidden, cfg.qDim(), seq);
+        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.attn, seq, layer.o);
     }
     pub fn postAttnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1083,10 +1085,10 @@ pub const CudaLM = struct {
         try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.pre_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const cfg = self.cfg;
         const b = &self.bufs;
-        try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, seq);
-        try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, seq);
+        const g = try lin_cuda.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try lin_cuda.gemm(self.be, g, b.gate, layer.gate);
+        try lin_cuda.gemm(self.be, g, b.up, layer.up);
     }
     pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -1096,8 +1098,7 @@ pub const CudaLM = struct {
         }
     }
     pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const cfg = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.gate, layer.down, cfg.hidden, cfg.intermediate, seq);
+        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.gate, seq, layer.down);
     }
     pub fn postFfnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1168,46 +1169,9 @@ pub const CudaLM = struct {
         }
     }
 
-    /// LM head over one normed hidden row: y[vocab] = head @ x (tied,
-    /// block-quantized).
+    /// LM head over one normed hidden row: y[vocab] = head @ x.
     fn lmHead(self: *CudaLM, y: Buf, x: Buf) !void {
-        const head = self.lm.head;
-        try self.be.opGemvQuant(head.dtype, y, x, head.bytes, head.scale, self.cfg.vocab, self.cfg.hidden);
-    }
-
-    /// Dense linear over `seq` rows: int8 dp4a GEMV (decode + small batches,
-    /// quantized activation × block-quant weight, faster than the f32
-    /// dequant GEMV and numerically matches llama.cpp's mmvq), or the
-    /// dequant-to-f16 tensor-core GEMM (large prefills). All Gemma weights are
-    /// GGUF block quants; a weight whose shape isn't dp4a-tileable
-    /// (cols%256 / rows%8) falls back to the f32 GEMV.
-    fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
-        const be = self.be;
-        std.debug.assert(w.dtype.isBlockQuant());
-        const dp4a_ok = cols % 256 == 0 and rows_out % 8 == 0;
-        if (seq == 1) {
-            if (!dp4a_ok) {
-                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
-            } else {
-                try be.opGemvQuantizeX(x, cols);
-                // Dedicated single-input kernels for q5_k/q6_k; the grouped
-                // kernel (ng=1) covers q4_k/q8_0 (which have no single twin).
-                if (w.dtype == .q5_k or w.dtype == .q6_k) {
-                    try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, rows_out, cols);
-                } else {
-                    try be.opGemvQuantQ8N(w.dtype, y, w.bytes, w.scale, rows_out, cols, 1, 0, 1);
-                }
-            }
-        } else if (seq <= grouped_gemv_max and cols % 256 == 0 and rows_out % 8 == 0) {
-            try be.opGemvQuantizeX(x, seq * cols);
-            var off: usize = 0;
-            while (off < seq) : (off += 8) {
-                const ng: usize = @min(8, seq - off);
-                try be.opGemvQuantQ8N(w.dtype, offsetBufSized(y, off * rows_out * 4, ng * rows_out * 4), w.bytes, w.scale, rows_out, cols, ng, off, seq);
-            }
-        } else {
-            try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-        }
+        try lin_cuda.linear(self.be, y, x, 1, self.lm.head);
     }
 };
 

@@ -131,6 +131,13 @@ A model architecture is normally three files: `foo.zig` (CPU reference and the l
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path
 and differ only in whether GEMM/attention route to the vendor libraries).
 
+**An LLM stepper names no weight dtype.** `models/lin_llm_cuda.zig` and
+`models/lin_llm_gpu.zig` are the one linear dispatcher per backend, routing each weight by
+storage, shape and row count (decode GEMV, grouped GEMV, MMQ, dequant GEMM). Every `Model`
+exposes `deviceLins`, and the stepper `plan`s that list at init so a format with no kernel
+is refused by tensor name, never met as `unreachable` mid-forward. A kernel wired in the
+dispatcher reaches every architecture; a kernel wired in one stepper is a regression.
+
 ## The diffusion pipeline
 
 `pipeline.Session.generate` is composed from four public stages, and a caller can drive
@@ -218,7 +225,10 @@ wrong — only the image is different. Pin each direction with its own test.
 
 `models/quant_weight.zig` holds the **one** container reader for each quantized format, called
 from every family's `mat`, and `models/lin_cuda.zig` the **one** CUDA GEMM dispatcher, routing
-each block linear by its own dtype and shape, called from every family's device forward. A
+each block linear by its own dtype and shape, called from every family's device forward and
+from the text encoders. The block-quant route is the caller's (`lin_cuda.plan` takes a
+`BlockQGemm`): a DiT passes `--dit-gguf-gemm`, an encoder `--te-gguf-gemm`, because the
+activation-quantizing routes cost a once-computed conditioning what they cost a DiT step. A
 family's loader builds `DiT.device_lins`, the flat list every support scan reads (`models/lin.zig`). ⚠️ **Every format ComfyUI's quantizers emit reaches every family
 they support** — a new reader belongs in that shared module the day it is written.
 

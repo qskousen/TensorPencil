@@ -17,6 +17,9 @@
 const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 const qwen3 = @import("qwen3.zig");
+const lin = @import("lin.zig");
+const lin_cuda = @import("lin_cuda.zig");
+const lin_llm = @import("lin_llm_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
@@ -57,6 +60,15 @@ const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 /// migrates first); kept for interface parity with qwen35_cuda.
 pub const CpuSplitPolicy = enum { tail, attn };
 
+/// The block-quant GEMM the text encoders take, `--te-gguf-gemm`.
+///
+/// `f16` by default, not the DiT's `auto`: the int8 and MMQ routes quantize the
+/// ACTIVATION to 8 bits, and a conditioning tensor is computed once and then steers every
+/// sampling step, so that error is baked into the whole render for a fraction of a second
+/// saved once. The other values exist to measure exactly that trade (`te-test
+/// --gguf-gemm`).
+pub var encoder_gemm: lin_cuda.BlockQGemm = .f16;
+
 /// Encode token ids to the encoder variant's conditioning stack,
 /// `[seq][enc.tapCount()][hidden]` (same token-major layout the CPU `encode`
 /// returns). Caller frees the result.
@@ -65,56 +77,11 @@ pub const CpuSplitPolicy = enum { tail, attn };
 /// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
 /// 1e6, and both would run to completion with the other's values.
 ///
-/// Weight dtype is DISPATCHED per GEMM (`wgemm`), not assumed. Calling `opMatmulFp8`
-/// unconditionally is right for krea2's fp8 encoder and reads a bf16 one as fp8 bytes,
-/// which `supportsWeights` would then have to gate out, sending every Z-Image render's
-/// prompt to the CPU encoder instead. Callers still
-/// gate on `supportsWeights`, but it now answers for the dtypes `wgemm` handles.
-/// One encoder GEMM, dispatched by weight dtype, the same routing `zimage_cuda.gemm`
-/// and `dit_cuda.lin` use. `y[m][co] = x[m][k] @ Wᵀ`, no bias anywhere in Qwen3.
-///
-/// Every Qwen3 encoder width satisfies `opGemmBf16`'s `co%128==0 and k%32==0`
-/// (4B: q 4096, kv 1024, o 2560, mlp 9728, over hidden 2560 / 9728), so the raw
-/// checkpoint bytes ARE the B operand and a bf16 weight is never converted. The
-/// `opMatmulBf16` arm is the general fallback for a checkpoint whose widths differ
-/// or a pre-Ampere card.
-fn wgemm(be: *Backend, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, co: usize, k: usize) !void {
-    if (w.dtype.isBlockQuant()) {
-        // GGUF text encoder (`--text-encoder foo.gguf`). `opMatmulQuant` expands the
-        // weight to f16 once and runs the same tensor-core GEMM the other arms use.
-        //
-        // Deliberately NOT the MMQ path, which `mmqPipeFaster` would select
-        // for every q4_k matrix here and which the LLM prefill does take. MMQ
-        // quantizes the ACTIVATION to q8_1 (~0.5% relative), and this is a
-        // conditioning tensor: it is computed once per render and then steers every
-        // sampling step, so trading accuracy for a fraction of a second, once, is
-        // the wrong side of that trade. The LLM makes it because there the same GEMM
-        // runs per chunk, per token, forever.
-        return be.opMatmulQuant(w.dtype, y, x, m, w.bytes, co, k);
-    }
-    switch (w.dtype) {
-        // int8 convrot. The activation prep is a SEPARATE call (`wprep`) because
-        // one prep serves every GEMM reading the same activation, which is what
-        // lets q/k/v share one; see the note there.
-        //
-        // H3's 25600-wide `down_proj` is past what the prep can stage in shared, so
-        // it takes the prep's global-staging path; `supportsWeightsOn` no longer
-        // refuses on width.
-        .i8 => {
-            std.debug.assert(w.rows % 128 == 0);
-            std.debug.assert(w.rows == co and w.cols == k);
-            try be.opI8Gemm(y, w.bytes, w.row_scale orelse return error.UnsupportedDType, w.rows, false);
-        },
-        .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, co, k),
-        .bf16 => if (be.ctx.cc_major >= 8 and co % 128 == 0 and k % 32 == 0)
-            try be.opGemmBf16(y, x, m, w.bytes, co, k, null)
-        else
-            try be.opMatmulBf16(y, x, m, w.bytes, co, k, null, false, false),
-        .f16 => try be.opMatmulF16(y, x, m, w.bytes, co, k, null, false, false),
-        else => return error.UnsupportedDType,
-    }
-}
-
+/// Every GEMM goes through `lin_cuda` under `encoder_gemm`, so the weight dtype is
+/// dispatched per linear and a format with no kernel is refused by name up front;
+/// `supportsWeights` is the same check for callers that want to fall back to the CPU.
+/// Each layer's weights are prefetched one layer ahead, so an encoder larger than VRAM
+/// streams through at PCIe speed rather than moving to the CPU.
 pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     return encodeVision(enc, be, io, gpa, ids, .{}, cancel);
 }
@@ -150,14 +117,17 @@ pub fn encodeVision(
     std.debug.assert(seq > 0);
     const seq_pad = std.mem.alignForward(usize, seq, 128);
     const tap_count = enc.tapCount();
-    if (!supportsWeights(enc)) return error.UnsupportedDType;
+    const plan = blk: {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        break :blk try lin_cuda.plan(try enc.deviceLins(arena.allocator()), encoder_gemm, "qwen3 cuda encoder");
+    };
 
     const c = enc.cfg;
     const hidden = c.hidden;
     const n_heads = c.n_heads;
     const kv_heads = c.n_kv_heads;
     const q_dim = c.qDim();
-    const kv_dim = c.kvDim();
     const intermediate = c.intermediate;
     const eps = c.rms_eps;
 
@@ -236,6 +206,7 @@ pub fn encodeVision(
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
 
+    if (be.async_uploads and enc.layers.len > 0) prefetchLayer(be, enc.layers[0]);
     var tap_idx: usize = 0;
     // `n_layers + 1`: a tap index may be one PAST the last layer (Anima's is), and
     // the `l >= enc.layers.len` break is what terminates the loop.
@@ -243,6 +214,7 @@ pub fn encodeVision(
         // Poll cancel between layers so a stop lands mid-encode; the errdefer
         // above aborts the in-flight batch.
         if (cancel) |cc| if (cc.load(.acquire)) return error.Canceled;
+        if (be.async_uploads and l + 1 < enc.layers.len) prefetchLayer(be, enc.layers[l + 1]);
         if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major output.
             // A tap past the last layer carries the final norm; it lands in the
@@ -263,27 +235,27 @@ pub fn encodeVision(
 
         // --- Attention ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.input_norm), seq, hidden, eps);
-        try wprep(be, nd, seq, hidden, layer.q);
-        try wgemm(be, q_d, nd, seq, layer.q, q_dim, hidden);
-        try wgemm(be, k_d, nd, seq, layer.k, kv_dim, hidden);
-        try wgemm(be, v_d, nd, seq, layer.v, kv_dim, hidden);
+        try lin_cuda.prep(be, plan, nd, seq, hidden, &.{ layer.q, layer.k, layer.v }, false);
+        try lin_cuda.gemm(be, plan, q_d, nd, seq, layer.q, false);
+        try lin_cuda.gemm(be, plan, k_d, nd, seq, layer.k, false);
+        try lin_cuda.gemm(be, plan, v_d, nd, seq, layer.v, false);
         try be.qkNorm(q_d, q_d, try nbuf(be, layer.q_norm), seq * n_heads, hd, eps);
         try be.qkNorm(k_d, k_d, try nbuf(be, layer.k_norm), seq * kv_heads, hd, eps);
         try be.ropeHalf(q_d, freqs_d, seq, n_heads, half, sin_off, 0);
         try be.ropeHalf(k_d, freqs_d, seq, kv_heads, half, sin_off, 0);
         try be.attn(q_d, k_d, v_d, attn_d, seq, seq, n_heads, kv_heads, hd, attn_scale, true);
-        try wprep(be, attn_d, seq, q_dim, layer.o);
-        try wgemm(be, t_d, attn_d, seq, layer.o, hidden, q_dim);
+        try lin_cuda.prep(be, plan, attn_d, seq, q_dim, &.{layer.o}, false);
+        try lin_cuda.gemm(be, plan, t_d, attn_d, seq, layer.o, false);
         try be.opAdd(x_d, t_d, seq * hidden);
 
         // --- MLP (SwiGLU) ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.post_norm), seq, hidden, eps);
-        try wprep(be, nd, seq, hidden, layer.gate);
-        try wgemm(be, g_d, nd, seq, layer.gate, intermediate, hidden);
-        try wgemm(be, u_d, nd, seq, layer.up, intermediate, hidden);
+        try lin_cuda.prep(be, plan, nd, seq, hidden, &.{ layer.gate, layer.up }, false);
+        try lin_cuda.gemm(be, plan, g_d, nd, seq, layer.gate, false);
+        try lin_cuda.gemm(be, plan, u_d, nd, seq, layer.up, false);
         try be.siluMul(g_d, u_d, seq * intermediate);
-        try wprep(be, g_d, seq, intermediate, layer.down);
-        try wgemm(be, t_d, g_d, seq, layer.down, hidden, intermediate);
+        try lin_cuda.prep(be, plan, g_d, seq, intermediate, &.{layer.down}, false);
+        try lin_cuda.gemm(be, plan, t_d, g_d, seq, layer.down, false);
         try be.opAdd(x_d, t_d, seq * hidden);
 
         // DeepStack, added at the image rows AFTER this layer. Each injection span
@@ -321,99 +293,33 @@ pub fn encodeVision(
     return out;
 }
 
-/// The activation prep an int8 weight needs; a no-op for every other dtype.
-///
-/// ⚠️ **The prep is BACKEND STATE, not a value.** One call serves every following
-/// `opI8Gemm` that reads the same activation, which is what lets q/k/v share one
-/// prep of the normed hidden state. Putting a second prep between a prep and its
-/// GEMM silently feeds the second activation to the first weight, with no error.
-///
-/// Every width here is a multiple of the 256-wide convrot group (H3's are 5120,
-/// 8192 and 25600), which `supportsWeights` is what checks.
-fn wprep(be: *Backend, x: Buf, m: usize, k: usize, w: ops.matmul.Weight) !void {
-    if (w.dtype == .i8) try be.opI8Prep(x, m, k, false);
-}
-
-/// Whether this backend's `encode` has a GEMM path for the encoder's weights.
-/// It calls `opMatmulFp8` unconditionally, so anything else would be read as fp8
-/// bytes and produce noise rather than an error. Exposed so the pipeline can fall
-/// back to the CPU encode instead of finding out from the image.
+/// Whether this backend's `encode` has a GEMM for every one of the encoder's weights
+/// under `encoder_gemm`, so the pipeline can fall back to the CPU encode instead of
+/// finding out from the image. A property of the checkpoint alone: an encoder that
+/// outgrows VRAM streams its layers (`prefetchLayer`), it never moves to the CPU.
 pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
-    return supportsWeightsOn(null, enc);
+    if (enc.layers.len == 0) return false;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lins = enc.deviceLins(arena.allocator()) catch return false;
+    return lin_cuda.check(lins, encoder_gemm) == .ok;
 }
 
-/// `supportsWeights` with the device in hand, which the int8 path needs: the
-/// activation prep's width ceiling is the GPU's shared-memory limit.
-pub fn supportsWeightsOn(be: ?*Backend, enc: *const qwen3.TextEncoder) bool {
-    if (enc.layers.len == 0) return false;
-    return switch (enc.layers[0].q.dtype) {
-        // int8 convrot, which is what MiniMax H3's conditioning encoder ships.
-        // Every projection must carry its per-ROW scale and the 256-wide rotation,
-        // and every reduction width must be a multiple of that group: the prep's
-        // FWHT works in 256-wide groups, and a width that is not a multiple leaves
-        // a row tail in the unrotated basis -- a wrong GEMM with no error.
-        .i8 => blk: {
-            const cols = [_]usize{ enc.cfg.hidden, enc.cfg.qDim(), enc.cfg.intermediate };
-            for (cols) |cc| if (cc % ops.convrot.group_size != 0) break :blk false;
-            // The prep stages the row in shared where it fits and in global memory
-            // where it does not, so width is no longer a support question -- only a
-            // slower prep past `i8PrepMaxSharedCols`, which H3's 25600-wide
-            // `down_proj` is (by exactly one convrot group on sm_86).
-            //
-            // ⚠️ **VRAM is the real gate, and it is MEASURED.** An int8 encoder whose
-            // weights do not fit re-uploads them per layer, and the cliff is brutal:
-            // on a 3090 the 27 GB H3 encoder runs 25 layers in 99 ms and 50 in
-            // 20840 ms, which is SLOWER than the 18384 ms CPU encode. Below the
-            // cliff it is ~90x. So the device path is taken only when the weights
-            // fit, and that is a property of the card, not of the checkpoint.
-            if (be) |b| {
-                var bytes: usize = 0;
-                for (enc.layers) |l| {
-                    inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| bytes += w.bytes.len;
-                }
-                const mem = b.ctx.memGetInfo();
-                // Four fifths of what is free right now: the activations, the prep
-                // scratch and the global row staging all come out of the same pool.
-                const budget = mem.free / 5 * 4;
-                if (mem.free == 0 or bytes > budget) {
-                    std.log.warn(
-                        "qwen3 cuda: this int8 encoder's {d} MB of weights does not fit the {d} MB " ++
-                            "of free VRAM; encoding on the CPU, which is faster than re-uploading " ++
-                            "them per layer",
-                        .{ bytes >> 20, mem.free >> 20 },
-                    );
-                    break :blk false;
-                }
-                const shared_cols = b.i8PrepMaxSharedCols();
-                for (cols) |cc| if (cc > shared_cols) {
-                    std.log.info(
-                        "qwen3 cuda: the {d}-wide reduction stages its int8 prep in global " ++
-                            "memory ({d} columns is this device's shared limit)",
-                        .{ cc, shared_cols },
-                    );
-                    break;
-                };
-            }
-            for (enc.layers) |l| {
-                inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
-                    if (w.dtype != .i8) break :blk false;
-                    if (w.row_scale == null) break :blk false;
-                    if (w.convrot != ops.convrot.group_size) break :blk false;
-                    // `opI8Gemm` launches `grid.y = rows / 128`.
-                    if (w.rows % 128 != 0) break :blk false;
-                }
-            }
-            break :blk true;
-        },
-        .f8_e4m3 => true,
-        // Native bf16 tensor cores are Ampere+; older cards take the f16 route,
-        // which `wgemm` falls back to, so both are supported either way.
-        .bf16, .f16 => true,
-        // Asked of the DTYPE, not of a hardcoded list, because a GGUF encoder's
-        // matrices are not all one dtype: Qwen3-4B-Q4_K_M ships q4_k projections
-        // with q6_k on some, and `wgemm` dispatches per matrix.
-        else => |dt| dt.isBlockQuant(),
-    };
+/// Queue one layer's weights for async upload so they land while the previous layer
+/// computes. Keys are the byte slices the GEMMs fetch, so a prefetched weight is a
+/// cache hit. An encoder that does not fit VRAM thus costs one PCIe pass per encode
+/// instead of a synchronous upload per layer, which measured 20.8 s on the 27 GB H3
+/// encoder against 18.4 s for the CPU; with the uploads overlapped it is the bus time.
+fn prefetchLayer(be: *Backend, layer: anytype) void {
+    const bytes = std.mem.sliceAsBytes;
+    inline for (.{ layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down }) |w| {
+        be.prefetchWeight(w.bytes);
+        if (w.row_scale) |rs| be.prefetchWeight(bytes(rs));
+    }
+    be.prefetchWeight(bytes(layer.input_norm));
+    be.prefetchWeight(bytes(layer.q_norm));
+    be.prefetchWeight(bytes(layer.k_norm));
+    be.prefetchWeight(bytes(layer.post_norm));
 }
 
 /// Wrap a CPU f32 norm-weight slice as a (pointer-cached) small device buffer.
@@ -543,6 +449,11 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = c;
+        {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            try lin_llm.plan(try lm.deviceLins(arena.allocator()), @max(first_seq, spec_limits.max_draft + 1), "qwen3 cuda");
+        }
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
@@ -903,9 +814,10 @@ pub const CudaLM = struct {
                 }
             }
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, c.rms_eps);
-            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, 1);
-            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, 1);
-            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, 1);
+            const qkv = try lin_llm.prep(be, b.normed, 1, c.hidden, &.{ layer.q, layer.k, layer.v });
+            try lin_llm.gemm(be, qkv, b.q, layer.q);
+            try lin_llm.gemm(be, qkv, b.k, layer.k);
+            try lin_llm.gemm(be, qkv, b.v, layer.v);
             if (c.qk_norm) {
                 try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), c.n_heads, hd, c.rms_eps);
                 try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, c.rms_eps);
@@ -916,17 +828,18 @@ pub const CudaLM = struct {
             try be.opKvAppendS(self.k_cache[l].buf, b.k, c.kvDim(), c.kvDim(), 0, fmt);
             try be.opKvAppendS(self.v_cache[l].buf, b.v, c.kvDim(), c.kvDim(), 0, fmt);
             try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, fmt);
-            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), 1);
+            try lin_llm.linear(be, b.t, b.attn, 1, layer.o);
             try be.opAdd(b.x, b.t, c.hidden);
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, c.rms_eps);
-            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, 1);
-            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, 1);
+            const gu = try lin_llm.prep(be, b.normed, 1, c.hidden, &.{ layer.gate, layer.up });
+            try lin_llm.gemm(be, gu, b.gate, layer.gate);
+            try lin_llm.gemm(be, gu, b.up, layer.up);
             try be.siluMul(b.gate, b.up, c.intermediate);
-            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, 1);
+            try lin_llm.linear(be, b.t, b.gate, 1, layer.down);
             try be.opAdd(b.x, b.t, c.hidden);
         }
         try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, c.rms_eps);
-        try self.lmHeadGemv(b.logits, b.t);
+        try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
     }
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
@@ -949,12 +862,11 @@ pub const CudaLM = struct {
         const b = &self.bufs;
         try self.layersForward(ids);
         errdefer if (be.batching()) be.abortBatch();
-        // Final norm on every new position, then the tied bf16 LM head in
-        // 4-input groups (each group reads the vocab x hidden weight once).
-        // b.t is 128-row padded, so gemv_bf16n's 4-row reads stay in bounds.
+        // Final norm on every new position, then the LM head over the batch (b.t is
+        // 128-row padded, so a grouped GEMV's 4-row reads stay in bounds).
         const h = self.cfg.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, self.cfg.rms_eps);
-        try self.lmHeadAll(b.logits, b.t, seq);
+        try lin_llm.linear(be, b.logits, b.t, seq, self.lm.head);
         try be.endBatch();
         self.advance(seq);
     }
@@ -1358,9 +1270,10 @@ pub const CudaLM = struct {
             }
             // --- Attention ---
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, c.hidden, c.rms_eps);
-            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, n);
-            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, n);
-            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, n);
+            const qkv = try lin_llm.prep(be, b.normed, n, c.hidden, &.{ layer.q, layer.k, layer.v });
+            try lin_llm.gemm(be, qkv, b.q, layer.q);
+            try lin_llm.gemm(be, qkv, b.k, layer.k);
+            try lin_llm.gemm(be, qkv, b.v, layer.v);
             if (c.qk_norm) {
                 try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * c.n_heads, hd, c.rms_eps);
                 try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, c.rms_eps);
@@ -1370,15 +1283,16 @@ pub const CudaLM = struct {
             try be.tensorCopy(self.k_cache[l].buf, self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
             try be.tensorCopy(self.v_cache[l].buf, self.capacity * c.kvDim() * 4, b.v, 0, n * c.kvDim() * 4);
             try be.opAttnDecodeTree(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, tb.scratch, self.len, self.capacity, n, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
-            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), n);
+            try lin_llm.linear(be, b.t, b.attn, n, layer.o);
             try be.opAdd(b.x, b.t, n * c.hidden);
 
             // --- MLP (SwiGLU) ---
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), n, c.hidden, c.rms_eps);
-            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, n);
-            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, n);
+            const gu = try lin_llm.prep(be, b.normed, n, c.hidden, &.{ layer.gate, layer.up });
+            try lin_llm.gemm(be, gu, b.gate, layer.gate);
+            try lin_llm.gemm(be, gu, b.up, layer.up);
             try be.siluMul(b.gate, b.up, n * c.intermediate);
-            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, n);
+            try lin_llm.linear(be, b.t, b.gate, n, layer.down);
             try be.opAdd(b.x, b.t, n * c.hidden);
         }
 
@@ -1386,7 +1300,7 @@ pub const CudaLM = struct {
         // groups (b.t is 128-row padded, so the 4-row reads stay in bounds).
         const h = c.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, c.rms_eps);
-        try self.lmHeadAll(tb.logits, b.t, n);
+        try lin_llm.linear(be, tb.logits, b.t, n, self.lm.head);
         try be.endBatch();
         self.tree_n = n;
 
@@ -1432,7 +1346,7 @@ pub const CudaLM = struct {
         // Final norm on the last position + tied bf16 LM head, on device.
         const h = self.cfg.hidden;
         try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, self.cfg.rms_eps);
-        try self.lmHeadGemv(b.logits, b.t);
+        try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
         try be.endBatch();
         self.advance(seq);
 
@@ -1535,11 +1449,11 @@ pub const CudaLM = struct {
     }
     pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // qwen3: uniform geometry
-        const c = self.cfg;
         const b = &self.bufs;
-        try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, seq);
-        try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, seq);
-        try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, seq);
+        const g = try lin_llm.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
+        try lin_llm.gemm(self.be, g, b.q, layer.q);
+        try lin_llm.gemm(self.be, g, b.k, layer.k);
+        try lin_llm.gemm(self.be, g, b.v, layer.v);
     }
     pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -1597,8 +1511,7 @@ pub const CudaLM = struct {
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        const c = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.attn, layer.o, c.hidden, c.qDim(), seq);
+        try lin_llm.linear(self.be, self.bufs.t, self.bufs.attn, seq, layer.o);
     }
     pub fn addResidual(self: *CudaLM, seq: usize) !void {
         try self.be.opAdd(self.bufs.x, self.bufs.t, seq * self.cfg.hidden);
@@ -1608,10 +1521,10 @@ pub const CudaLM = struct {
         try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.post_norm), seq, c.hidden, c.rms_eps);
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const c = self.cfg;
         const b = &self.bufs;
-        try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, seq);
-        try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, seq);
+        const g = try lin_llm.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try lin_llm.gemm(self.be, g, b.gate, layer.gate);
+        try lin_llm.gemm(self.be, g, b.up, layer.up);
     }
     pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -1621,8 +1534,7 @@ pub const CudaLM = struct {
         }
     }
     pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const c = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.gate, layer.down, c.hidden, c.intermediate, seq);
+        try lin_llm.linear(self.be, self.bufs.t, self.bufs.gate, seq, layer.down);
     }
 
     fn layersForward(self: *CudaLM, ids: []const u32) !void {
@@ -1692,168 +1604,9 @@ pub const CudaLM = struct {
         return self.cfg.vocab;
     }
 
-    /// LM head over one normed hidden row: y[vocab] = head @ x.
-    fn lmHeadGemv(self: *CudaLM, y: Buf, x: Buf) !void {
-        const head = self.lm.head;
-        if (head.dtype.isBlockQuant()) {
-            try self.be.opGemvQuant(head.dtype, y, x, head.bytes, 1.0, self.cfg.vocab, self.cfg.hidden);
-        } else {
-            try self.be.opGemvBf16(y, x, head.bytes, 1.0, self.cfg.vocab, self.cfg.hidden);
-        }
-    }
-
-    /// LM head over `seq` normed rows (x is 4-row-group padded) into
-    /// y [seq][vocab]: grouped bf16 GEMVs reading the weight once per 4
-    /// inputs, or per-row fused GEMVs for ggml block-quant heads.
-    fn lmHeadAll(self: *CudaLM, y: Buf, x: Buf, seq: usize) !void {
-        const be = self.be;
-        const h = self.cfg.hidden;
-        const head = self.lm.head;
-        const nvocab = self.cfg.vocab;
-        if (head.dtype.isBlockQuant()) {
-            for (0..seq) |i| {
-                try be.opGemvQuant(
-                    head.dtype,
-                    offsetBufSized(y, i * nvocab * 4, nvocab * 4),
-                    offsetBufSized(x, i * h * 4, h * 4),
-                    head.bytes,
-                    1.0,
-                    nvocab,
-                    h,
-                );
-            }
-            return;
-        }
-        var off: usize = 0;
-        while (off < seq) : (off += 4) {
-            const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
-            try be.opGemvBf16N(
-                offsetBufSized(y, off * nvocab * 4, n * nvocab * 4),
-                offsetBufSized(x, off * h * 4, 4 * h * 4),
-                head.bytes,
-                1.0,
-                nvocab,
-                h,
-                n,
-            );
-        }
-    }
-
-    /// Dense linear over `seq` rows, kernel picked by weight dtype and batch
-    /// size. fp8 (the 4B target): fused GEMV (1 row), grouped multi-input
-    /// GEMV (small batches, speculative verify and short multi-turn
-    /// prefills; each fp8 weight row is read once per 4 inputs), or the f16
-    /// tensor-core GEMM (large prefills, where the dequant-to-f16 scratch
-    /// round trip amortizes). bf16 (the 0.6B draft model): fused GEMV /
-    /// grouped GEMVs for everything, draft prompts are small and the model
-    /// tiny, so a dedicated GEMM path isn't worth it.
-    fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
-        const be = self.be;
-        if (w.dtype == .iq4_nl) {
-            // Decode (seq==1): fused f32 GEMV (full-precision activation). Prefill
-            // (seq>1): dequant the weight to f16 once and run the tensor-core GEMM
-            // (opMatmulQuant; all layer projections are rows%128==0). The untied
-            // vocab-row head never routes here, it goes through lmHead*.
-            //
-            // A dp4a mmvq variant (gemv_iq4_nl_q8n) was tried to close the ~6.4x
-            // decode gap to llama.cpp but measured IDENTICAL (~9.6s matmul/150 tok):
-            // both kernels stall at ~105 GB/s (11% of the 3090's peak) on the
-            // poorly-coalesced 18-byte IQ4_NL blocks, so the bottleneck is memory
-            // access / occupancy, not compute. Closing it needs an ncu-guided GEMV
-            // redesign, not a compute-kernel swap, see the memory note.
-            if (seq == 1) {
-                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
-            } else {
-                try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-            }
-            return;
-        }
-        if (w.dtype.isBlockQuant()) {
-            // GGUF quants: fused GEMV for decode. For small batches (speculative
-            // verify, always <= spec_limits.max_draft+1 = 17, and short prefills), the
-            // grouped dp4a GEMV streams each weight ceil(seq/8)x: measured 5-20x
-            // faster than the dequant-to-f16 GEMM below the crossover (qgemv-bench
-            // on the 3090, ~n=40). Every block-quant (q4_k/q5_k/q6_k/q8_0) now has
-            // a grouped kernel; larger seq amortizes the GEMM's one-shot dequant.
-            if (seq == 1) {
-                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
-            } else if (w.dtype.isBlockQuant() and seq <= grouped_gemv_max and
-                cols % 256 == 0 and rows_out % 8 == 0)
-            {
-                try be.opGemvQuantizeX(x, seq * cols); // one q8 activation for all groups
-                var off: usize = 0;
-                while (off < seq) : (off += 8) {
-                    const ng: usize = @min(8, seq - off); // annotated: @min would narrow to u4
-                    try be.opGemvQuantQ8N(
-                        w.dtype,
-                        offsetBufSized(y, off * rows_out * 4, ng * rows_out * 4),
-                        w.bytes,
-                        w.scale,
-                        rows_out,
-                        cols,
-                        ng,
-                        off,
-                        seq,
-                    );
-                }
-            } else {
-                try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-            }
-            return;
-        }
-        if (w.dtype != .f8_e4m3) {
-            std.debug.assert(w.dtype == .bf16);
-            if (seq == 1) {
-                try be.opGemvBf16(y, x, w.bytes, w.scale, rows_out, cols);
-            } else {
-                var off: usize = 0;
-                while (off < seq) : (off += 4) {
-                    const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
-                    try be.opGemvBf16N(
-                        offsetBufSized(y, off * rows_out * 4, n * rows_out * 4),
-                        offsetBufSized(x, off * cols * 4, 4 * cols * 4),
-                        w.bytes,
-                        w.scale,
-                        rows_out,
-                        cols,
-                        n,
-                    );
-                }
-            }
-            return;
-        }
-        if (seq == 1) {
-            try be.opGemvFp8(y, x, w.bytes, w.scale, rows_out, cols);
-        } else if (seq <= gemv_batch_max) {
-            var off: usize = 0;
-            while (off < seq) : (off += 4) {
-                const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
-                try be.opGemvFp8N(
-                    offsetBufSized(y, off * rows_out * 4, n * rows_out * 4),
-                    offsetBufSized(x, off * cols * 4, 4 * cols * 4),
-                    w.bytes,
-                    w.scale,
-                    rows_out,
-                    cols,
-                    n,
-                );
-            }
-        } else {
-            try be.opMatmulFp8(y, x, seq, w.bytes, w.scale, rows_out, cols);
-        }
-    }
-
-    /// Largest batch that goes through grouped GEMVs + batched flash-decode
-    /// instead of the GEMM + square-attention prefill path: covers every
-    /// speculative verify batch, and ceil(seq/4) fused weight reads stay
-    /// well below the GEMM's ~5x dequant-scratch traffic.
+    /// Largest batch that takes the batched flash-decode attention instead of the
+    /// square prefill attention: every speculative verify batch.
     const gemv_batch_max = spec_limits.max_draft + 1;
-
-    /// q5_k/q6_k batches at or below this take the grouped dp4a GEMV instead of
-    /// opMatmulQuant's dequant-to-f16 GEMM. Measured crossover (qgemv-bench,
-    /// 3090): ~48 rows q5_k, ~35 q6_k; 40 matches qwen35's grouped_prefill_max
-    /// and covers every speculative-verify batch (<= spec_limits.max_draft + 1 = 17).
-    const grouped_gemv_max = 40;
 
     /// KV chunks per head in the decode attention split pass (one warp each:
     /// 32 heads x 32 splits x 32 lanes = 32k threads).

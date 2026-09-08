@@ -27,18 +27,22 @@ pub const Weight = lin.Weight;
 pub const DType = lin.DType;
 
 /// Which GEMM one linear runs.
-pub const Route = enum { f32, f16, bf16, fp8, i8, i4, w4a8, nvfp4, blockq_i8, blockq_i4, blockq_bf16, blockq_mmq };
+pub const Route = enum { f32, f16, bf16, fp8, i8, i4, w4a8, nvfp4, blockq_i8, blockq_i4, blockq_bf16, blockq_f16, blockq_mmq };
 
-/// Which GEMM a GGUF block-quant weight decodes for.
+/// Which GEMM a GGUF block-quant weight decodes for. The caller's choice, passed to
+/// `plan`: a DiT and a text encoder want different trades from the same file.
 ///
 /// `int8` rotates and re-quantizes to convrot int8, capping accuracy at int8's; `int4` is
 /// that decode one width down for the s4 tensor cores; `bf16` expands the weight and keeps
 /// the format's own accuracy at about half int8's throughput (bf16, not f16: Z-Image's
-/// activations pass f16's range); `mmq` multiplies the packed weight in place with its
-/// scale folded per 32-k substep, re-quantizing nothing.
-pub const BlockQGemm = enum { auto, int8, int4, bf16, mmq };
+/// activations pass f16's range); `f16` is the same expansion in f16, three more mantissa
+/// bits for an activation that fits the range; `mmq` multiplies the packed weight in place
+/// with its scale folded per 32-k substep, re-quantizing nothing. `int8`, `int4` and `mmq`
+/// quantize the ACTIVATION to 8 or 4 bits as well; `bf16` and `f16` leave it alone.
+pub const BlockQGemm = enum { auto, int8, int4, bf16, f16, mmq };
 
-/// Default block-quant route, overridden by `--dit-gguf-gemm`.
+/// The DiT's block-quant route, overridden by `--dit-gguf-gemm`. Every diffusion family
+/// passes this to `plan`; the text encoders pass their own.
 ///
 /// What a re-quantizing route costs a format depends on how the format's own error
 /// compares to the regrid's, so `auto` takes int8 for q2_k and q4_k (0.03% and 0.7% more
@@ -59,8 +63,8 @@ pub var blockq_rotate: bool = true;
 /// end. `opMatmulNvfp4` wants a stable full-width array for the same reason.
 const zero_bias: [16384]f32 = @splat(0);
 
-/// The route a dtype takes, shape aside; null when no kernel reads the format.
-pub fn routeOfDtype(dt: DType) ?Route {
+/// The route a dtype takes under `pol`, shape aside; null when no kernel reads the format.
+pub fn routeOfDtype(dt: DType, pol: BlockQGemm) ?Route {
     return switch (lin.kindOf(dt)) {
         .f32 => .f32,
         .f16 => .f16,
@@ -70,15 +74,16 @@ pub fn routeOfDtype(dt: DType) ?Route {
         .i4 => .i4,
         .w4a8 => .w4a8,
         .nvfp4 => .nvfp4,
-        .blockq => blockQRoute(dt),
+        .blockq => blockQRoute(dt, pol),
         .other => null,
     };
 }
 
-fn blockQRoute(dt: DType) ?Route {
-    if (blockq_gemm == .mmq and Backend.mmqPipeDtype(dt)) return .blockq_mmq;
+fn blockQRoute(dt: DType, pol: BlockQGemm) ?Route {
+    if (pol == .f16) return if (Backend.quantKernelSupported(dt)) .blockq_f16 else null;
+    if (pol == .mmq and Backend.mmqPipeDtype(dt)) return .blockq_mmq;
     if (Backend.blockQFormat(dt) == null) return bf16Route(dt);
-    return switch (blockq_gemm) {
+    return switch (pol) {
         .int8 => .blockq_i8,
         .int4 => .blockq_i4,
         .bf16, .mmq => bf16Route(dt),
@@ -86,6 +91,7 @@ fn blockQRoute(dt: DType) ?Route {
             .q2_k, .q4_k => .blockq_i8,
             else => bf16Route(dt),
         },
+        .f16 => unreachable,
     };
 }
 
@@ -93,11 +99,11 @@ fn bf16Route(dt: DType) ?Route {
     return if (Backend.quantKernelSupported(dt)) .blockq_bf16 else null;
 }
 
-/// The route this weight takes. A block quant whose shape misses its decode's floor
-/// (`cols % 1024` for the chunked int8/int4 decode, the MMQ tile for `mmq`) takes the
-/// bf16 route instead, which has no floor beyond a dequant kernel.
-pub fn routeOf(w: Weight) ?Route {
-    const r = routeOfDtype(w.dtype) orelse return null;
+/// The route this weight takes under `pol`. A block quant whose shape misses its decode's
+/// floor (`cols % 1024` for the chunked int8/int4 decode, the MMQ tile for `mmq`) takes
+/// the bf16 route instead, which has no floor beyond a dequant kernel.
+pub fn routeOf(w: Weight, pol: BlockQGemm) ?Route {
+    const r = routeOfDtype(w.dtype, pol) orelse return null;
     return switch (r) {
         .blockq_mmq => if (Backend.mmqPipeSupported(w.dtype, w.rows, w.cols)) r else bf16Route(w.dtype),
         .blockq_i8, .blockq_i4 => if (w.cols % 1024 == 0 and w.rows % 128 == 0) r else bf16Route(w.dtype),
@@ -108,8 +114,8 @@ pub fn routeOf(w: Weight) ?Route {
 /// Whether this dtype ends up in a W4A4 GEMM here, activation included. A GGUF's route
 /// is a runtime choice its dtype does not show, so a check calibrated on how far a route
 /// may drift from the weight-only CPU forward has to ask this, not the storage dtype.
-pub fn activationIs4Bit(dt: DType) bool {
-    return dt == .i4 or routeOfDtype(dt) == .blockq_i4;
+pub fn activationIs4Bit(pol: BlockQGemm, dt: DType) bool {
+    return dt == .i4 or routeOfDtype(dt, pol) == .blockq_i4;
 }
 
 /// The activation prep a route reads.
@@ -120,37 +126,39 @@ pub fn prepOf(r: Route) Prep {
         .i8, .w4a8, .blockq_i8 => .i8,
         .i4, .blockq_i4 => .i4,
         .blockq_mmq => .mmq,
-        .f32, .f16, .bf16, .fp8, .nvfp4, .blockq_bf16 => .none,
+        .f32, .f16, .bf16, .fp8, .nvfp4, .blockq_bf16, .blockq_f16 => .none,
     };
 }
 
 /// Whether every weight here runs on the int8 prep, which is what lets a caller chain
 /// them through f16 activations (`prep` with `in_f16`, `gemm` with `out_f16`).
-pub fn allI8(ws: []const Weight) bool {
-    for (ws) |w| if (prepOf(routeOf(w) orelse return false) != .i8) return false;
+pub fn allI8(p: Plan, ws: []const Weight) bool {
+    for (ws) |w| if (prepOf(routeOf(w, p.blockq) orelse return false) != .i8) return false;
     return true;
 }
 
-/// What `plan` decided for a model: one value per checkpoint, read by every prep.
+/// What `plan` decided for a model: one value per checkpoint, read by every prep and GEMM.
 pub const Plan = struct {
     /// Whether the int8 activation prep rotates. A property of the checkpoint
     /// (`lin.convrot`), not a knob.
     rot: bool,
+    /// The caller's block-quant route.
+    blockq: BlockQGemm,
 };
 
 /// Why `check` refused a checkpoint.
-pub const Why = enum { mixed_convrot, no_gemm, int_shape, int4_unrotated, blockq_basis, nvfp4_shape, w4a8_group };
+pub const Why = enum { mixed_convrot, no_gemm, int_shape, int4_unrotated, blockq_basis, nvfp4_shape, w4a8_group, gemm_shape };
 
 pub const Refusal = struct { why: Why, tag: []const u8 = "", dtype: DType = .f32, rows: usize = 0, cols: usize = 0 };
 
 pub const Verdict = union(enum) { ok: Plan, refused: Refusal };
 
-/// Accept or refuse a model's device linears, naming the first problem.
-pub fn check(lins: []const Weight) Verdict {
+/// Accept or refuse a model's device linears under `pol`, naming the first problem.
+pub fn check(lins: []const Weight, pol: BlockQGemm) Verdict {
     const rot = lin.convrot(lins) orelse return .{ .refused = .{ .why = .mixed_convrot } };
     for (lins) |w| {
         const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows, .cols = w.cols };
-        const r = routeOf(w) orelse return .{ .refused = with(bad, .no_gemm) };
+        const r = routeOf(w, pol) orelse return .{ .refused = with(bad, .no_gemm) };
         switch (prepOf(r)) {
             // The int8 GEMMs launch `rows / 128` blocks and the prep rotates in groups of 256.
             .i8, .i4 => if (w.rows % 128 != 0 or w.cols % 256 != 0) return .{ .refused = with(bad, .int_shape) },
@@ -164,11 +172,13 @@ pub fn check(lins: []const Weight) Verdict {
             .blockq_i8, .blockq_i4 => if (rot != blockq_rotate and (lin.any(lins, .i8) or lin.any(lins, .i4) or lin.any(lins, .w4a8)))
                 return .{ .refused = with(bad, .blockq_basis) },
             .nvfp4 => if (w.rows % 128 != 0 or w.cols % 32 != 0) return .{ .refused = with(bad, .nvfp4_shape) },
+            // `opMatmulQuant` tiles 128 rows and 32-wide k slabs with no fallback.
+            .blockq_f16 => if (w.rows % 128 != 0 or w.cols % 32 != 0) return .{ .refused = with(bad, .gemm_shape) },
             else => {},
         }
     }
     if (lin.w4a8SmallGroup(lins)) |tag| return .{ .refused = .{ .why = .w4a8_group, .tag = tag, .dtype = .w4a8 } };
-    return .{ .ok = .{ .rot = rot } };
+    return .{ .ok = .{ .rot = rot, .blockq = pol } };
 }
 
 fn with(r: Refusal, why: Why) Refusal {
@@ -178,8 +188,8 @@ fn with(r: Refusal, why: Why) Refusal {
 }
 
 /// `check`, logging the refusal under `who` and returning it as an error.
-pub fn plan(lins: []const Weight, who: []const u8) error{UnsupportedCheckpoint}!Plan {
-    switch (check(lins)) {
+pub fn plan(lins: []const Weight, pol: BlockQGemm, who: []const u8) error{UnsupportedCheckpoint}!Plan {
+    switch (check(lins, pol)) {
         .ok => |p| return p,
         .refused => |r| {
             switch (r.why) {
@@ -190,6 +200,7 @@ pub fn plan(lins: []const Weight, who: []const u8) error{UnsupportedCheckpoint}!
                 .blockq_basis => std.log.err("{s}: {s} decodes to int8 in a different rotation basis than the checkpoint's own int8 linears", .{ who, r.tag }),
                 .nvfp4_shape => std.log.err("{s}: {s} is [{d}, {d}] nvfp4; the f16 GEMM it feeds needs rows % 128 == 0 and cols % 32 == 0", .{ who, r.tag, r.rows, r.cols }),
                 .w4a8_group => std.log.err("{s}: {s} is W4A8 with a group_size that is not a multiple of 8; this backend's decode kernel needs one scale per 8 columns", .{ who, r.tag }),
+                .gemm_shape => std.log.err("{s}: {s} is [{d}, {d}] {t}; the f16 dequant GEMM needs rows % 128 == 0 and cols % 32 == 0", .{ who, r.tag, r.rows, r.cols, r.dtype }),
             }
             return error.UnsupportedCheckpoint;
         },
@@ -199,10 +210,10 @@ pub fn plan(lins: []const Weight, who: []const u8) error{UnsupportedCheckpoint}!
 /// Pre-size the decode scratches to the widest linear, so nothing grows mid-forward.
 /// Growth is safe (`ensureDeviceBuffer` syncs the stream first) but the first block
 /// would pay a sync per linear for nothing.
-pub fn presize(be: *Backend, lins: []const Weight) !void {
+pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
     var bq: usize = 0;
     var w4: usize = 0;
-    for (lins) |w| switch (routeOf(w) orelse continue) {
+    for (lins) |w| switch (routeOf(w, p.blockq) orelse continue) {
         .blockq_i8 => bq = @max(bq, Backend.blockQScratchBytes(w.rows, w.cols)),
         .blockq_i4 => bq = @max(bq, Backend.blockQScratchBytesI4(w.rows, w.cols)),
         .w4a8 => w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols)),
@@ -221,7 +232,7 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
     var want: Prep = .none;
     var bq = false;
     for (group) |w| {
-        const r = routeOf(w) orelse return error.UnsupportedDType;
+        const r = routeOf(w, p.blockq) orelse return error.UnsupportedDType;
         const k = prepOf(r);
         if (k == .none) continue;
         // Two preps of one activation would need two live prep states, which the
@@ -258,8 +269,7 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
 /// never sees a buffer, so a family whose sequence padding is coarser than 128 either
 /// pads its GEMM outputs or takes only weight-only routes.
 pub fn gemm(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, out_f16: bool) !void {
-    _ = p;
-    const r = routeOf(w) orelse return error.UnsupportedDType;
+    const r = routeOf(w, p.blockq) orelse return error.UnsupportedDType;
     std.debug.assert(!out_f16 or prepOf(r) == .i8);
     try probe(be, r, x, m, w);
     switch (r) {
@@ -278,6 +288,8 @@ pub fn gemm(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, out_f16:
             std.debug.assert(w.rows <= zero_bias.len);
             try be.opMatmulQuantBf16(w.dtype, y, x, m, w.bytes, w.rows, w.cols, &zero_bias);
         },
+        // The same expansion in f16, and the f16 GEMM the LLM prefill runs.
+        .blockq_f16 => try be.opMatmulQuant(w.dtype, y, x, m, w.bytes, w.rows, w.cols),
         // The packed s8 goes straight to the int8 tensor cores, scale folded per 32-k
         // substep, against the q8_1 activation `prep` staged.
         .blockq_mmq => try be.opMatmulQuantMmqPipePrepped(w.dtype, y, m, w.bytes, w.rows, w.cols),
@@ -339,62 +351,64 @@ pub fn probeInput(be: *Backend, x: Buf, m: usize, w: anytype) !void {
 // Pure dispatch, so it runs on the fast suite: it decides which GEMM a GGUF DiT uses, and
 // getting it wrong is a silent 2x slowdown or a silent accuracy cap rather than a failure.
 test "the block-quant route policy sends each format to the GEMM that suits it" {
-    const saved = blockq_gemm;
-    defer blockq_gemm = saved;
-
     // `auto`: q4_k to int8, because int8-convrot's ~0.009 error floor is 0.7% on top of
     // q4_k's own and buys 1.85x the speed. Everything else to bf16, where q8_0 keeps the
     // accuracy the int8 route would spend (84% more weight error, measured).
-    blockq_gemm = .auto;
-    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(.q4_k));
+    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(.q4_k, .auto));
     // q2_k too, even though its WEIGHT could take the s4 regrid: that route is W4A4 and
     // the 4-bit activations, not the weight, are what it costs. int4 stays opt-in.
-    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(.q2_k));
+    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(.q2_k, .auto));
     for ([_]DType{ .q8_0, .q5_k, .q6_k, .q4_0, .iq4_nl }) |dt|
-        try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt));
+        try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt, .auto));
 
     // An explicit choice is honoured for every format that has a convrot decode.
     for ([_]DType{ .q2_k, .q4_k, .q8_0 }) |dt| {
-        blockq_gemm = .int8;
-        try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(dt));
-        blockq_gemm = .int4;
-        try std.testing.expectEqual(@as(?Route, .blockq_i4), routeOfDtype(dt));
+        try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOfDtype(dt, .int8));
+        try std.testing.expectEqual(@as(?Route, .blockq_i4), routeOfDtype(dt, .int4));
     }
-    blockq_gemm = .bf16;
     for ([_]DType{ .q4_k, .q8_0 }) |dt|
-        try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt));
+        try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt, .bf16));
     // q2_k has the convrot decode and no dequant kernel, so the bf16 route is a
-    // refusal by name, not a silent fall-through to the int8 one.
-    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.q2_k));
+    // refusal by name, not a silent fall-through to the int8 one. Same for f16.
+    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.q2_k, .bf16));
+    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.q2_k, .f16));
 
     // Asking for int8 or int4 on a format with no convrot decode must NOT reach
     // `opI8GemmBlockQ`, which would refuse mid-forward; it falls back to bf16.
     for ([_]BlockQGemm{ .int8, .int4 }) |g| {
-        blockq_gemm = g;
         for ([_]DType{ .q5_k, .q6_k, .q4_0, .iq4_nl }) |dt|
-            try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt));
+            try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt, g));
     }
 
-    // Dense formats route by storage alone.
-    try std.testing.expectEqual(@as(?Route, .bf16), routeOfDtype(.bf16));
-    try std.testing.expectEqual(@as(?Route, .fp8), routeOfDtype(.f8_e4m3));
-    try std.testing.expectEqual(@as(?Route, .w4a8), routeOfDtype(.w4a8));
-    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.u8));
+    // `f16` is the text encoders' route: weight expanded, activation untouched, for
+    // every format with a dequant kernel, shape permitting.
+    for ([_]DType{ .q4_k, .q5_k, .q6_k, .q8_0, .iq4_xs }) |dt|
+        try std.testing.expectEqual(@as(?Route, .blockq_f16), routeOfDtype(dt, .f16));
+    try std.testing.expectEqual(Prep.none, prepOf(.blockq_f16));
+
+    // Dense formats route by storage alone, whatever the policy.
+    try std.testing.expectEqual(@as(?Route, .bf16), routeOfDtype(.bf16, .f16));
+    try std.testing.expectEqual(@as(?Route, .fp8), routeOfDtype(.f8_e4m3, .auto));
+    try std.testing.expectEqual(@as(?Route, .w4a8), routeOfDtype(.w4a8, .auto));
+    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.u8, .auto));
 }
 
 test "a block quant whose shape misses the int8 decode floor takes the bf16 route" {
-    const saved = blockq_gemm;
-    defer blockq_gemm = saved;
-    blockq_gemm = .auto;
     // q4_k: 144 bytes per 256 elements. Z-Image's 3840-wide reduction is 15 groups of
     // 256, so the chunked decode (1024-wide chunks) cannot cover it; krea2's 6144 can.
     const wide = [_]u8{0} ** (128 * 6144 / 256 * 144);
-    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOf(Weight.init(&wide, .q4_k, 128, 6144)));
+    try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOf(Weight.init(&wide, .q4_k, 128, 6144), .auto));
     const narrow = [_]u8{0} ** (128 * 3840 / 256 * 144);
-    try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOf(Weight.init(&narrow, .q4_k, 128, 3840)));
+    try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOf(Weight.init(&narrow, .q4_k, 128, 3840), .auto));
     // The same shape under `mmq` is fine: the MMQ tile is 256 columns.
-    blockq_gemm = .mmq;
-    try std.testing.expectEqual(@as(?Route, .blockq_mmq), routeOf(Weight.init(&narrow, .q4_k, 128, 3840)));
+    try std.testing.expectEqual(@as(?Route, .blockq_mmq), routeOf(Weight.init(&narrow, .q4_k, 128, 3840), .mmq));
+    // The f16 GEMM has no fallback, so `check` names an odd shape instead.
+    var odd = Weight.init(narrow[0 .. 120 * 3840 / 256 * 144], .q4_k, 120, 3840);
+    odd.tag = "layers.2.q";
+    const r = check(&.{odd}, .f16).refused;
+    try std.testing.expectEqual(Why.gemm_shape, r.why);
+    try std.testing.expectEqualStrings("layers.2.q", r.tag);
+    try std.testing.expect(check(&.{Weight.init(&narrow, .q4_k, 128, 3840)}, .f16) == .ok);
 }
 
 test "check refuses what the kernels cannot pair and accepts the rest" {
@@ -402,26 +416,26 @@ test "check refuses what the kernels cannot pair and accepts the rest" {
     var lins = [_]Weight{ Weight.init(&bf, .bf16, 128, 256), Weight.init(bf[0 .. 128 * 256], .i8, 128, 256) };
     lins[1].row_scale = &([_]f32{1} ** 128);
     // Plain int8 beside dense: fine, prep unrotated.
-    try std.testing.expectEqual(false, check(&lins).ok.rot);
+    try std.testing.expectEqual(false, check(&lins, .auto).ok.rot);
     lins[1].convrot = 256;
-    try std.testing.expectEqual(true, check(&lins).ok.rot);
+    try std.testing.expectEqual(true, check(&lins, .auto).ok.rot);
     // int4 without the rotation has no prep.
     var w4 = Weight.init(bf[0 .. 128 * 256 / 2], .i4, 128, 256);
     w4.row_scale = &([_]f32{1} ** 128);
-    try std.testing.expectEqual(Why.int4_unrotated, check(&.{w4}).refused.why);
+    try std.testing.expectEqual(Why.int4_unrotated, check(&.{w4}, .auto).refused.why);
     w4.convrot = 256;
-    try std.testing.expect(check(&.{w4}) == .ok);
+    try std.testing.expect(check(&.{w4}, .auto) == .ok);
     // A width the int8 GEMM's launch geometry cannot take.
     var odd = Weight.init(bf[0 .. 120 * 256], .i8, 120, 256);
     odd.row_scale = &([_]f32{1} ** 120);
     odd.tag = "blk.3.wq";
-    const r = check(&.{odd}).refused;
+    const r = check(&.{odd}, .auto).refused;
     try std.testing.expectEqual(Why.int_shape, r.why);
     try std.testing.expectEqualStrings("blk.3.wq", r.tag);
     // A format nothing here reads.
-    try std.testing.expectEqual(Why.no_gemm, check(&.{Weight.init(bf[0 .. 128 * 256], .u8, 128, 256)}).refused.why);
+    try std.testing.expectEqual(Why.no_gemm, check(&.{Weight.init(bf[0 .. 128 * 256], .u8, 128, 256)}, .auto).refused.why);
     // A rotated and an unrotated int8 linear in one model have no shared prep.
     var flat = Weight.init(bf[0 .. 128 * 256], .i8, 128, 256);
     flat.row_scale = &([_]f32{1} ** 128);
-    try std.testing.expectEqual(Why.mixed_convrot, check(&.{ lins[1], flat }).refused.why);
+    try std.testing.expectEqual(Why.mixed_convrot, check(&.{ lins[1], flat }, .auto).refused.why);
 }

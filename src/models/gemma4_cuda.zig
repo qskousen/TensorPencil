@@ -27,6 +27,7 @@
 const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 const gemma4 = @import("gemma4.zig");
+const lin_cuda = @import("lin_llm_cuda.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -61,7 +62,6 @@ const nsplit_prefill = 8;
 // 128 -> 208 tok/s, 256 -> 265, 512 -> 267. 256 captures nearly all of it
 // without the larger activation buffers and KV ring 512 would pin.
 const prefill_chunk = 256;
-const grouped_gemv_max = 40;
 
 // The largest single forward batch (a text chunk or a whole bidirectional
 // image block) is `cfg.maxBatch()`, runtime, sized from the vision token
@@ -269,6 +269,8 @@ pub const CudaLM = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
+
+        try lin_cuda.plan(try lm.deviceLins(alloc), bufRows(cfg), "gemma4 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
         // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
@@ -1265,12 +1267,13 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const b = &self.bufs;
         const kv_dim = cfg.kvDim(l);
-        try self.linear(b.q, b.normed, layer.q, cfg.qDim(l), cfg.hidden, seq);
-        try self.linear(b.k, b.normed, layer.k, kv_dim, cfg.hidden, seq);
+        const g = try lin_cuda.prep(self.be, b.normed, seq, cfg.hidden, &.{ layer.q, layer.k, layer.v orelse layer.k });
+        try lin_cuda.gemm(self.be, g, b.q, layer.q);
+        try lin_cuda.gemm(self.be, g, b.k, layer.k);
         // V: its own projection, or (global layers) the RAW K projection copied
         // BEFORE k_norm/rope mutate k.
         if (layer.v) |vw| {
-            try self.linear(b.v, b.normed, vw, kv_dim, cfg.hidden, seq);
+            try lin_cuda.gemm(self.be, g, b.v, vw);
         } else {
             try self.be.tensorCopy(b.v, 0, b.k, 0, seq * kv_dim * 4);
         }
@@ -1348,8 +1351,8 @@ pub const CudaLM = struct {
         try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window, ring, self.bidir_prefill, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
-        const cfg = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.attn, layer.o, cfg.hidden, cfg.qDim(l), seq);
+        _ = l;
+        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.attn, seq, layer.o);
     }
     pub fn postAttnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1363,10 +1366,10 @@ pub const CudaLM = struct {
         try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.pre_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const cfg = self.cfg;
         const b = &self.bufs;
-        try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, seq);
-        try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, seq);
+        const g = try lin_cuda.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try lin_cuda.gemm(self.be, g, b.gate, layer.gate);
+        try lin_cuda.gemm(self.be, g, b.up, layer.up);
     }
     pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -1376,8 +1379,7 @@ pub const CudaLM = struct {
         }
     }
     pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
-        const cfg = self.cfg;
-        try self.linear(self.bufs.t, self.bufs.gate, layer.down, cfg.hidden, cfg.intermediate, seq);
+        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.gate, seq, layer.down);
     }
     pub fn postFfnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1495,65 +1497,11 @@ pub const CudaLM = struct {
     }
 
     fn lmHead(self: *CudaLM, y: Buf, x: Buf) !void {
-        const head = self.lm.head;
         // The head is the far end of the curve (t = 1), so a curve that decays in
         // depth leaves token selection alone, which is what keeps a heavily
         // perturbed model fluent instead of gibbering.
         self.be.weight_noise.atHead();
-        try self.be.opGemvQuant(head.dtype, y, x, head.bytes, head.scale, self.cfg.vocab, self.cfg.hidden);
-    }
-
-    /// Dense linear over `seq` rows (int8 dp4a GEMV / grouped GEMV / dequant
-    /// tensor-core GEMM), mirroring gemma3_cuda.linear. All Gemma weights are
-    /// GGUF block quants.
-    fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
-        const be = self.be;
-        std.debug.assert(w.dtype.isBlockQuant());
-        const dp4a_ok = cols % 256 == 0 and rows_out % 8 == 0;
-        // q4_0 (the 12B QAT format): decode uses the dp4a int8-activation GEMV
-        // (gemv_q4_0_q8n, quantized activation × nibble weight) when tileable,
-        // else the fused f32 weight-read-once GEMV; prefill batches use the
-        // dequant-to-f16 tensor-core GEMM.
-        if (w.dtype == .q4_0) {
-            if (seq == 1 and dp4a_ok) {
-                try be.opGemvQuantizeX(x, cols);
-                try be.opGemvQuantQ8N(w.dtype, y, w.bytes, w.scale, rows_out, cols, 1, 0, 1);
-                return;
-            }
-            if (seq == 1) return be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
-            return be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-        }
-        if (seq == 1) {
-            if (!dp4a_ok) {
-                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
-            } else {
-                try be.opGemvQuantizeX(x, cols);
-                if (w.dtype == .q5_k or w.dtype == .q6_k) {
-                    try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, rows_out, cols);
-                } else {
-                    try be.opGemvQuantQ8N(w.dtype, y, w.bytes, w.scale, rows_out, cols, 1, 0, 1);
-                }
-            }
-        } else if (cuda.backend.Backend.mmqPipeFaster(w.dtype, rows_out, cols)) {
-            // Batched prefill: MMQ on the s8 tensor cores straight from the
-            // packed nibbles. Beats dequant-to-f16 + cuBLASLt ~1.6-2.2x on these
-            // shapes because the f16 expansion never happens and the GEMM reads
-            // 4.5 bits/weight instead of 16. Costs q8_1 activation error (~0.5%
-            // relative), the same tradeoff the decode GEMVs already make.
-            // q4_k only: a q6_k MMQ kernel exists and is correct, but measures
-            // 0.87-0.98x there (6.56 bits/weight and a 2-byte-aligned 210-byte
-            // block that defeats vector loads), so q6_k keeps the f16 path.
-            try be.opMatmulQuantMmqPipe(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-        } else if (seq <= grouped_gemv_max and dp4a_ok) {
-            try be.opGemvQuantizeX(x, seq * cols);
-            var off: usize = 0;
-            while (off < seq) : (off += 8) {
-                const ng: usize = @min(8, seq - off);
-                try be.opGemvQuantQ8N(w.dtype, offsetBufSized(y, off * rows_out * 4, ng * rows_out * 4), w.bytes, w.scale, rows_out, cols, ng, off, seq);
-            }
-        } else {
-            try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
-        }
+        try lin_cuda.linear(self.be, y, x, 1, self.lm.head);
     }
 };
 

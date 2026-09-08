@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
+const lin_gpu = @import("lin_llm_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
@@ -369,9 +370,9 @@ const Bufs = struct {
 ///     to f32 once and split into 4 vocab chunks (each under the kernels' 1 GiB
 ///     type-level buffer bound). Speculative decode (stepAll) is supported.
 ///   * Block-quant (GGUF q8_0/q4_k/q5_k/q6_k/iq4_nl layers, F16 embed, untied
-///     block-quant head, the llama/Mistral arch): every weight matmul routes
-///     through `gemvW` (per-row fused-dequant GEMV; no GEMM path on Vulkan), so
-///     the whole forward, prefill included, runs one token at a time. The
+///     block-quant head, the llama/Mistral arch): decode is the per-row dequant
+///     GEMV and a fresh prompt takes the dequant->f16 coop GEMM where the device
+///     has it, else one token at a time (`lin_llm_gpu` picks per weight). The
 ///     head is a separate block-quant tensor; the F16 embedding is host-gathered
 ///     via the same f32 copy the dense path uses.
 ///
@@ -385,42 +386,21 @@ pub const VulkanLM = struct {
     gpa: std.mem.Allocator,
     /// Model shape (mirrors lm.cfg): dims, vocab, eps, rope θ, qk_norm.
     cfg: qwen3.Config,
-    /// Block-quant layer weights (GGUF llama/Mistral): decode is a fused
-    /// per-row dequant GEMV. Dense (bf16/fp8) models keep the grouped-GEMV / GEMM
-    /// paths.
+    /// Block-quant layer weights (GGUF llama/Mistral): an untied block-quant head,
+    /// and prefill one token at a time unless `can_gemm_prefill`. A dense (bf16/fp8)
+    /// model has the tied head and the square-attention prefill.
     quant: bool,
     /// Block-quant prefill runs the tensor-core GEMM (dequant->f16->coopmat) in
     /// one batched pass over the whole prompt instead of a forward per token,
-    /// but only when the device has the f16-weight coopmat pipeline. Without it,
-    /// prefill falls back to the one-token-at-a-time GEMV.
+    /// when the device has the f16-weight coopmat pipeline (`lin.gemm_prefill`).
     can_gemm_prefill: bool,
-    /// Route q8_0/iq4_nl through the int8 dp4a GEMV + repacked int8-interleaved
-    /// weight layout (TP_VK_DP4A set + device support). ~2.2× faster decode,
-    /// opt-in because the repacked weight ~doubles the iq4_nl VRAM footprint.
-    use_dp4a: bool,
+    /// Every projection and the untied head go through here.
+    lin: lin_gpu.Lin,
     /// Route the wide hidden-dim RMSNorm through the one-pass subgroup-reduce
     /// kernel (rmsnorm_sg) instead of the 3-pass rms_partial/combine/apply_w
     /// global round-trip. Requires device subgroup support; opt-in via
     /// TP_VK_SG_RMS while it's being verified against the multi-pass path.
     use_sg_rms: bool,
-    /// Route block-quant decode GEMV through the cooperative subgroup kernel
-    /// (opGemvQuantSg): raw row-major weight, one subgroup per row, subgroup
-    /// reduce, drops the 32-row-group `_t` transpose AND the dp4a repack. Opt-in
-    /// via TP_VK_SG_GEMV while it's A/B'd against opGemvQuantT / dp4a.
-    use_sg_gemv: bool,
-    /// Cooperative dp4a decode GEMV for q8_0/iq4_nl (opGemvQuantSgDp4a): dp4a
-    /// speed WITHOUT the repack's ~2× VRAM. Opt-in via TP_VK_SG_DP4A. Takes
-    /// precedence over use_dp4a / use_sg_gemv for those two dtypes.
-    use_sg_dp4a: bool,
-    /// dp4a decode GEMV over the _t layout + k-split (opGemvQuantTDp4a): the
-    /// fast repack-dp4a shape with NO int8 repack, reuses the resident _t
-    /// buffer (shared with prefill; no cache collision, no VRAM increase). Opt-in
-    /// via TP_VK_T_DP4A for q8_0/iq4_nl. Takes precedence over the others.
-    use_t_dp4a: bool,
-    /// Zero bias for the prefill GEMM projections (the LLM carries no bias);
-    /// sized to the largest output dim, passed whole so the cached device
-    /// buffer covers every projection's row count.
-    zero_bias: []f32,
     /// LM-head vocab-chunk size (dense tied head only); cfg.vocab / vocab_chunks.
     chunk_rows: usize,
     capacity: usize,
@@ -491,19 +471,11 @@ pub const VulkanLM = struct {
         self.gpa = gpa;
         self.cfg = c;
         self.quant = quant;
-        self.use_dp4a = quant and ctx.hasIntDot() and getenv("TP_VK_DP4A") != null;
         self.use_sg_rms = ctx.hasSubgroupNorm() and getenv("TP_VK_SG_RMS") != null;
-        self.use_sg_gemv = quant and ctx.hasSubgroupGemv() and getenv("TP_VK_SG_GEMV") != null;
-        self.use_sg_dp4a = quant and ctx.hasSubgroupDp4a() and getenv("TP_VK_SG_DP4A") != null;
-        self.use_t_dp4a = quant and ctx.hasTransposedDp4a() and getenv("TP_VK_T_DP4A") != null;
-        // The raw-reading coop GEMV (use_sg_gemv/use_sg_dp4a) reads the RAW
-        // weight while the prefill GEMM reads _t/repacked, and the weight cache
-        // keys by host pointer, so mixing layouts for one weight returns the
-        // wrong bytes. Force token-by-token prefill for those so every weight
-        // stays raw-only. use_t_dp4a is exempt: it reads the SAME _t buffer as
-        // the prefill, so no collision.
-        self.can_gemm_prefill = quant and ctx.hasQuantPrefillGemm() and
-            !(self.use_sg_gemv or self.use_sg_dp4a);
+        const max_out = @max(@max(c.vocab, c.qDim()), @max(c.intermediate, c.hidden));
+        self.lin = try lin_gpu.Lin.init(gpa, ctx, max_out, gemv_nchunk, 3);
+        errdefer self.lin.deinit();
+        self.can_gemm_prefill = quant and self.lin.gemm_prefill;
         self.chunk_rows = c.vocab / vocab_chunks;
         self.capacity = capacity;
         self.len = 0;
@@ -513,17 +485,15 @@ pub const VulkanLM = struct {
         // tensor-core prefill) sizes for the whole first prefill chunk.
         self.max_rows = if (quant and !self.can_gemm_prefill) gemv_batch_max else @max(@max(first_seq, 1), gemv_batch_max);
         self.sin_off = @intCast(capacity * half);
+        {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            try self.lin.plan(try lm.deviceLins(arena.allocator()), if (quant and !self.can_gemm_prefill) 1 else self.max_rows, "qwen3 vulkan");
+        }
 
         self.embed_f32 = try gpa.alloc(f32, c.vocab * c.hidden);
         errdefer gpa.free(self.embed_f32);
         try safetensors.convertToF32(lm.embed.dtype, lm.embed.bytes, self.embed_f32);
-
-        // Zero bias for the prefill GEMM projections; sized to the largest
-        // output dim so one cached device buffer serves every projection.
-        const max_out = @max(@max(c.qDim(), c.kvDim()), @max(c.intermediate, c.hidden));
-        self.zero_bias = try gpa.alloc(f32, max_out);
-        errdefer gpa.free(self.zero_bias);
-        @memset(self.zero_bias, 0);
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, c.rope_theta);
         defer freqs.deinit(gpa);
@@ -559,7 +529,7 @@ pub const VulkanLM = struct {
         self.ctx.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.ctx);
         self.gpa.free(self.embed_f32);
-        self.gpa.free(self.zero_bias);
+        self.lin.deinit();
         self.* = undefined;
     }
 
@@ -590,73 +560,6 @@ pub const VulkanLM = struct {
             return @min(@as(usize, 1), avail);
         }
         return if (self.len == 0) @min(self.max_rows, avail) else @min(gemv_batch_max, avail);
-    }
-
-    /// Whether a block-quant weight of this dtype routes through the int8 dp4a
-    /// path (repacked int8-interleaved layout, ~2.4× decode), used for BOTH
-    /// decode (opGemvDp4a) and prefill (opMatmulCoopQuant repacked=true) so the
-    /// weight's cached device layout is consistent (the cache keys by host ptr).
-    /// q8_0 is ON by default: its repack is only ~6% larger than raw, so the win
-    /// is nearly free. iq4_nl stays opt-in (TP_VK_DP4A): its int8 repack ~doubles
-    /// the 4-bit footprint.
-    fn dp4aRepack(self: *const VulkanLM, dt: @import("tp_core").dtype.DType) bool {
-        return switch (dt) {
-            .q8_0 => self.ctx.hasIntDot(),
-            .iq4_nl => self.use_dp4a,
-            else => false,
-        };
-    }
-
-    /// A block-quant weight routes through the fused per-row dequant GEMV
-    /// (opGemvQuantT, coalesced 32-row-group transpose + k-split); a dense
-    /// weight through the bf16/fp8/f32 k-split GEMV. Both write `w.rows`
-    /// outputs at element offset `y_off` from a single input vector `x`.
-    fn gemvW(self: *VulkanLM, y: Buf, y_off: usize, x: Buf, w: ops.matmul.Weight) !void {
-        // dp4a over _t + k-split (q8_0/iq4_nl): repack-dp4a speed, no repack VRAM.
-        if (self.use_t_dp4a) switch (w.dtype) {
-            .q8_0, .iq4_nl => return self.ctx.opGemvQuantTDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.bufs.quant_partials),
-            else => {},
-        };
-        // Cooperative dp4a GEMV (q8_0/iq4_nl): dp4a speed, raw weight, no repack.
-        if (self.use_sg_dp4a) switch (w.dtype) {
-            .q8_0, .iq4_nl => return self.ctx.opGemvQuantSgDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
-            else => {},
-        };
-        // Cooperative scalar subgroup GEMV: raw layout, no _t transpose / no dp4a
-        // repack. Covers all 5 block-quant dtypes; dense still uses the k-split.
-        if (self.use_sg_gemv) switch (w.dtype) {
-            .q8_0, .iq4_nl, .q4_k, .q5_k, .q6_k => return self.ctx.opGemvQuantSg(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
-            else => {},
-        };
-        switch (w.dtype) {
-            // q8_0 / iq4_nl: int8 dp4a decode GEMV over the repacked
-            // int8-interleaved layout, MEASURED ~2.4× faster than scalar on the
-            // 3090. Default ON for q8_0 (repack ~6% larger than raw); opt-in for
-            // iq4_nl (TP_VK_DP4A, its int8 repack ~doubles the 4-bit footprint).
-            .q8_0, .iq4_nl => if (self.dp4aRepack(w.dtype))
-                try self.ctx.opGemvDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.bufs.quant_partials)
-            else
-                try self.ctx.opGemvQuantT(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.bufs.quant_partials),
-            .q4_k, .q5_k, .q6_k => try self.ctx.opGemvQuantT(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.bufs.quant_partials),
-            else => try self.ctx.opGemv(y, y_off, x, self.bufs.gemv_partials[0], w.bytes, wcode(w.dtype), w.rows, w.cols, w.scale, gemv_nchunk),
-        }
-    }
-
-    /// A block-quant-model projection over `m` rows: the exact per-row dequant
-    /// GEMV at m == 1 (decode / short follow-up prefill), else the tensor-core
-    /// dequant->f16 GEMM over the whole batch (fresh-prompt prefill, the ~N×
-    /// weight-read reuse that turns an O(prompt) stack of forwards into one).
-    /// A stray dense weight inside a quant model routes through the dense GEMM.
-    fn linearQuant(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
-        if (m == 1) return self.gemvW(y, 0, x, w);
-        switch (w.dtype) {
-            // q8_0 / iq4_nl: dequant from the int8-interleaved layout when the
-            // dp4a repack is used for this dtype (shared with decode, one
-            // resident copy, consistent cache layout), else from _t.
-            .q8_0, .iq4_nl => try self.ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, rows, cols, w.scale, self.zero_bias, self.dp4aRepack(w.dtype)),
-            .q4_k, .q5_k, .q6_k => try self.ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, rows, cols, w.scale, self.zero_bias, false),
-            else => try self.gemm(y, x, m, w, rows, cols),
-        }
     }
 
     /// Single-pass per-head RMSNorm (QK-norm): rows is large (seq * heads), so
@@ -762,7 +665,7 @@ pub const VulkanLM = struct {
         try self.normWide(b.t, b.normed, try nbuf(ctx, self.lm.final_norm), 1);
         if (self.quant) {
             // Untied block-quant head: one fused per-row dequant GEMV.
-            try self.gemvW(b.logits, 0, b.normed, self.lm.head);
+            try self.lin.linear(b.logits, 0, b.normed, 1, self.lm.head);
         } else {
             // Dense tied head: 4 vocab chunks (each weight chunk read once).
             ctx.independent(vocab_chunks);
@@ -884,30 +787,11 @@ pub const VulkanLM = struct {
 
     pub fn projectQKV(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // qwen3: uniform geometry
-        const ctx = self.ctx;
         const b = &self.bufs;
-        const c = self.cfg;
-        if (self.quant) {
-            // Block-quant: per-row dequant GEMV (decode) or tensor-core GEMM (prefill).
-            try self.linearQuant(b.q, b.normed, seq, layer.q, c.qDim(), c.hidden);
-            try self.linearQuant(b.k, b.normed, seq, layer.k, c.kvDim(), c.hidden);
-            try self.linearQuant(b.v, b.normed, seq, layer.v, c.kvDim(), c.hidden);
-        } else if (seq == 1) {
-            // Group the q/k/v GEMV halves so no barrier drains the GPU between
-            // independent dispatches.
-            ctx.independent(3);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, wcode(layer.q.dtype), c.qDim(), c.hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, wcode(layer.k.dtype), c.kvDim(), c.hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, wcode(layer.v.dtype), c.kvDim(), c.hidden, gemv_nchunk);
-            ctx.independent(3);
-            try ctx.opGemvCombine(b.q, 0, b.gemv_partials[0], c.qDim(), layer.q.scale, gemv_nchunk);
-            try ctx.opGemvCombine(b.k, 0, b.gemv_partials[1], c.kvDim(), layer.k.scale, gemv_nchunk);
-            try ctx.opGemvCombine(b.v, 0, b.gemv_partials[2], c.kvDim(), layer.v.scale, gemv_nchunk);
-        } else {
-            try self.gemm(b.q, b.normed, seq, layer.q, c.qDim(), c.hidden);
-            try self.gemm(b.k, b.normed, seq, layer.k, c.kvDim(), c.hidden);
-            try self.gemm(b.v, b.normed, seq, layer.v, c.kvDim(), c.hidden);
-        }
+        if (seq == 1) return self.lin.linearGroup(&.{ b.q, b.k, b.v }, b.normed, &.{ layer.q, layer.k, layer.v });
+        try self.lin.linear(b.q, 0, b.normed, seq, layer.q);
+        try self.lin.linear(b.k, 0, b.normed, seq, layer.k);
+        try self.lin.linear(b.v, 0, b.normed, seq, layer.v);
     }
 
     pub fn normQK(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
@@ -1020,12 +904,7 @@ pub const VulkanLM = struct {
 
     pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        const c = self.cfg;
-        if (self.quant) {
-            try self.linearQuant(self.bufs.t, self.bufs.attn, seq, layer.o, c.hidden, c.qDim());
-        } else {
-            try self.gemm(self.bufs.t, self.bufs.attn, seq, layer.o, c.hidden, c.qDim());
-        }
+        try self.lin.linear(self.bufs.t, 0, self.bufs.attn, seq, layer.o);
     }
 
     pub fn addResidual(self: *VulkanLM, seq: usize) !void {
@@ -1038,23 +917,10 @@ pub const VulkanLM = struct {
     }
 
     pub fn projectGateUp(self: *VulkanLM, layer: anytype, seq: usize) !void {
-        const ctx = self.ctx;
         const b = &self.bufs;
-        const c = self.cfg;
-        if (self.quant) {
-            try self.linearQuant(b.gate, b.normed, seq, layer.gate, c.intermediate, c.hidden);
-            try self.linearQuant(b.up, b.normed, seq, layer.up, c.intermediate, c.hidden);
-        } else if (seq == 1) {
-            ctx.independent(2);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, wcode(layer.gate.dtype), c.intermediate, c.hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, wcode(layer.up.dtype), c.intermediate, c.hidden, gemv_nchunk);
-            ctx.independent(2);
-            try ctx.opGemvCombine(b.gate, 0, b.gemv_partials[0], c.intermediate, layer.gate.scale, gemv_nchunk);
-            try ctx.opGemvCombine(b.up, 0, b.gemv_partials[1], c.intermediate, layer.up.scale, gemv_nchunk);
-        } else {
-            try self.gemm(b.gate, b.normed, seq, layer.gate, c.intermediate, c.hidden);
-            try self.gemm(b.up, b.normed, seq, layer.up, c.intermediate, c.hidden);
-        }
+        if (seq == 1) return self.lin.linearGroup(&.{ b.gate, b.up }, b.normed, &.{ layer.gate, layer.up });
+        try self.lin.linear(b.gate, 0, b.normed, seq, layer.gate);
+        try self.lin.linear(b.up, 0, b.normed, seq, layer.up);
     }
 
     pub fn activate(self: *VulkanLM, comptime act: transformer.Activation, seq: usize) !void {
@@ -1067,35 +933,7 @@ pub const VulkanLM = struct {
     }
 
     pub fn projectDown(self: *VulkanLM, layer: anytype, seq: usize) !void {
-        const c = self.cfg;
-        if (self.quant) {
-            try self.linearQuant(self.bufs.t, self.bufs.gate, seq, layer.down, c.hidden, c.intermediate);
-        } else {
-            try self.gemm(self.bufs.t, self.bufs.gate, seq, layer.down, c.hidden, c.intermediate);
-        }
-    }
-
-    /// Dense linear over `m` rows, kernel picked by batch size: k-split GEMV
-    /// (m = 1), grouped 4-input GEMVs (small batches, speculative verify
-    /// and follow-up prefill chunks; bitwise equal to the m = 1 path), or
-    /// the tiled GEMM (large fresh prefills). bf16 weights have no tiled GEMM
-    /// (only fp8/f32), so bf16 always streams through the grouped GEMV, the
-    /// weight is read ceil(m/4)x, matching CUDA's bf16 opGemvBf16N.
-    fn gemm(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
-        const ctx = self.ctx;
-        const wc = wcode(w.dtype);
-        if (m == 1) {
-            try ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, wc, rows, cols, w.scale, gemv_nchunk);
-        } else if (wc == .bf16 or m <= gemv_batch_max) {
-            var g: usize = 0;
-            while (g * 4 < m) : (g += 1) {
-                const n: usize = @min(4, m - g * 4);
-                try ctx.opGemvPartial4(x, g * 4 * cols, self.bufs.gemv_partials[0], w.bytes, wc, rows, cols, gemv_nchunk);
-                try ctx.opGemvCombine4(y, g * 4 * rows, rows, self.bufs.gemv_partials[0], rows, w.scale, gemv_nchunk, n);
-            }
-        } else {
-            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, wc == .f8, rows, cols, w.scale, null);
-        }
+        try self.lin.linear(self.bufs.t, 0, self.bufs.gate, seq, layer.down);
     }
 
     /// 3-pass parallel rmsnorm over [rows][hidden] (one thread per row would
@@ -1142,9 +980,6 @@ const LmBufs = struct {
     rms_partials: Buf,
     rms_inv: Buf,
     gemv_partials: [4]Buf,
-    /// Per-row dequant GEMV partials (gemvW / opGemvQuantT); block-quant only,
-    /// sized for the largest output (the untied head's vocab rows).
-    quant_partials: Buf,
     logits: Buf,
     // GPU-argmax scratch (opArgmax): per-lane max value + index, and the 1-id out.
     argmax_v: Buf,
@@ -1194,10 +1029,6 @@ const LmBufs = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             created += 1;
         }
-        // Dequant GEMV partials: largest output row count is the untied vocab
-        // head; projections (qDim / intermediate) are smaller.
-        self.quant_partials = try ctx.tensorCreate(@max(nvocab, @max(inter, q_dim_)) * VulkanLM.gemv_nchunk * 4);
-        errdefer ctx.tensorDestroy(&self.quant_partials);
         // GEMV k-split partials: one per member of an `independent` group
         // (q/k/v, gate/up, the 4 LM-head chunks). Sized for the largest
         // user, times 4 for the 4-input verify variant.
@@ -1212,7 +1043,6 @@ const LmBufs = struct {
 
     fn deinit(self: *LmBufs, ctx: *gpu.Context) void {
         inline for (fields) |name| ctx.tensorDestroy(&@field(self, name));
-        ctx.tensorDestroy(&self.quant_partials);
         for (&self.gemv_partials) |*pb| ctx.tensorDestroy(pb);
         self.* = undefined;
     }

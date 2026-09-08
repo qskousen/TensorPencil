@@ -19,6 +19,7 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Growable = Backend.GrowableTensor;
 const Weight = ops.matmul.Weight;
+const lin_cuda = @import("lin_llm_cuda.zig");
 
 pub const CpuSplitPolicy = enum { tail, attn };
 
@@ -32,7 +33,6 @@ const ExpertGemm = enum { f16, mmq, gemv };
 /// Batches up to this size run a host-resident layer's experts on the CPU; larger
 /// ones upload the layer's experts to the staging buffers and run on the GPU.
 const cpu_small_max = 8;
-const grouped_gemv_max = 40;
 
 const HybridProfile = struct {
     enabled: bool,
@@ -376,6 +376,11 @@ pub const CudaLM = struct {
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const k2.Model, cap: kvmod.Capacity) !CudaLM {
         const c = lm.cfg;
         const rows = prefillRows(cap.max);
+        {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            try lin_cuda.plan(try lm.deviceLins(arena.allocator()), rows, "k2-horizon cuda");
+        }
         var self: CudaLM = undefined;
         self.lm = lm;
         self.be = be;
@@ -636,7 +641,7 @@ pub const CudaLM = struct {
             c.norm_groups,
             c.rms_eps,
         );
-        try self.linear(b.logits, b.tmp, self.lm.head, c.vocab, c.hidden, 1);
+        try lin_cuda.linear(self.be, b.logits, b.tmp, 1, self.lm.head);
         if (logits) |out| try self.be.tensorDownload(offsetBuf(b.logits, 0, c.vocab * 4), std.mem.sliceAsBytes(out[0..c.vocab]));
         self.len += seq;
     }
@@ -666,8 +671,8 @@ pub const CudaLM = struct {
         const b = &self.bufs;
         const pos0 = self.len;
         try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.attn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
-        try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, seq);
-        try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, seq);
+        try lin_cuda.linear(self.be, b.q, b.normed, seq, layer.q);
+        try lin_cuda.linear(self.be, b.k, b.normed, seq, layer.k);
         const staged = seq > cpu_small_max and self.stagedLayer(l);
         if (staged) self.stageWait(l);
         if (layer.values) |values| {
@@ -677,17 +682,17 @@ pub const CudaLM = struct {
                 try self.cpuRoutedValues(values, seq, b.v)
             else
                 try self.routedValues(values, b.normed, seq, b.v, null);
-        } else try self.linear(b.v, b.normed, layer.v.?, c.kvDim(), c.hidden, seq);
+        } else try lin_cuda.linear(self.be, b.v, b.normed, seq, layer.v.?);
         try self.be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, c.head_dim / 2, self.sin_off, pos0);
         try self.be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, c.head_dim / 2, self.sin_off, pos0);
         try self.storeKv(self.k_cache[l].buf, pos0 * c.kvDim(), b.k, seq * c.kvDim());
         try self.storeKv(self.v_cache[l].buf, pos0 * c.kvDim(), b.v, seq * c.kvDim());
         try self.attention(l, seq, pos0);
         if (layer.attn_gate) |gate| {
-            try self.linear(b.gate, b.normed, gate, c.qDim(), c.hidden, seq);
+            try lin_cuda.linear(self.be, b.gate, b.normed, seq, gate);
             try self.be.opSoftplusGate(b.attn, b.gate, seq * c.qDim());
         }
-        try self.linear(b.tmp, b.attn, layer.o, c.hidden, c.qDim(), seq);
+        try lin_cuda.linear(self.be, b.tmp, b.attn, seq, layer.o);
         try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
 
         try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.ffn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
@@ -701,10 +706,10 @@ pub const CudaLM = struct {
             else
                 try self.routedFfn(experts, b.normed, seq, b.tmp, null);
         } else {
-            try self.linear(b.expert_a, b.normed, layer.dense_gate.?, c.intermediate, c.hidden, seq);
-            try self.linear(b.expert_b, b.normed, layer.dense_up.?, c.intermediate, c.hidden, seq);
+            try lin_cuda.linear(self.be, b.expert_a, b.normed, seq, layer.dense_gate.?);
+            try lin_cuda.linear(self.be, b.expert_b, b.normed, seq, layer.dense_up.?);
             try self.be.siluMul(b.expert_a, b.expert_b, seq * c.intermediate);
-            try self.linear(b.tmp, b.expert_a, layer.dense_down.?, c.hidden, c.intermediate, seq);
+            try lin_cuda.linear(self.be, b.tmp, b.expert_a, seq, layer.dense_down.?);
         }
         try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
     }
@@ -755,7 +760,7 @@ pub const CudaLM = struct {
         const x = self.cpu_scratch.normed[0 .. seq * c.hidden];
         const y = self.cpu_scratch.v[0 .. seq * c.kvDim()];
         var started = self.hybrid_profile.tic();
-        try self.linear(self.bufs.route_logits, self.bufs.normed, values.router, c.n_value_experts, c.hidden, seq);
+        try lin_cuda.linear(self.be, self.bufs.route_logits, self.bufs.normed, seq, values.router);
         try self.selectRoutes(self.bufs.route_logits, values.bias, seq, c.n_value_experts, c.n_value_experts_used);
         self.hybrid_profile.toc(started, &self.hybrid_profile.route_ns);
         started = self.hybrid_profile.tic();
@@ -787,7 +792,7 @@ pub const CudaLM = struct {
         const x = self.cpu_scratch.normed[0 .. seq * c.hidden];
         const y = self.cpu_scratch.tmp[0 .. seq * c.hidden];
         var started = self.hybrid_profile.tic();
-        try self.linear(self.bufs.route_logits, self.bufs.normed, experts.router, c.n_experts, c.hidden, seq);
+        try lin_cuda.linear(self.be, self.bufs.route_logits, self.bufs.normed, seq, experts.router);
         try self.selectRoutes(self.bufs.route_logits, experts.bias, seq, c.n_experts, c.n_experts_used);
         self.hybrid_profile.toc(started, &self.hybrid_profile.route_ns);
         started = self.hybrid_profile.tic();
@@ -811,10 +816,10 @@ pub const CudaLM = struct {
         try self.be.tensorUpload(offsetBuf(out, 0, y.len * 4), std.mem.sliceAsBytes(y));
         self.hybrid_profile.toc(started, &self.hybrid_profile.transfer_ns);
         if (experts.shared_gate) |gate| {
-            try self.linear(self.bufs.expert_a, self.bufs.normed, gate, c.shared_intermediate, c.hidden, seq);
-            try self.linear(self.bufs.expert_b, self.bufs.normed, experts.shared_up.?, c.shared_intermediate, c.hidden, seq);
+            try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.normed, seq, gate);
+            try lin_cuda.linear(self.be, self.bufs.expert_b, self.bufs.normed, seq, experts.shared_up.?);
             try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, seq * c.shared_intermediate);
-            try self.linear(self.bufs.expert_out, self.bufs.expert_a, experts.shared_down.?, c.hidden, c.shared_intermediate, seq);
+            try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?);
             try self.be.opAdd(out, self.bufs.expert_out, seq * c.hidden);
         }
     }
@@ -1003,7 +1008,7 @@ pub const CudaLM = struct {
 
     fn routedValues(self: *CudaLM, values: k2.Values, x: Buf, seq: usize, out: Buf, dev: ?Buf) !void {
         const c = self.cfg;
-        try self.linear(self.bufs.route_logits, x, values.router, c.n_value_experts, c.hidden, seq);
+        try lin_cuda.linear(self.be, self.bufs.route_logits, x, seq, values.router);
         const selected = self.selected[0 .. seq * c.n_value_experts_used];
         const weights = self.selected_weights[0 .. seq * c.n_value_experts_used];
         try self.selectRoutes(self.bufs.route_logits, values.bias, seq, c.n_value_experts, c.n_value_experts_used);
@@ -1027,7 +1032,7 @@ pub const CudaLM = struct {
             const routes = try self.gatherForExpert(x, seq, selected, weights, used, expert);
             if (routes.rows == 0) continue;
             self.prefetchValueExpert(values, selected, expert + 1);
-            try self.linear(self.bufs.expert_a, self.bufs.expert_in, weight, c.kvDim(), c.hidden, routes.rows);
+            try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.expert_in, routes.rows, weight);
             try self.be.opSilu(self.bufs.expert_a, routes.rows * c.kvDim());
             try self.be.opScatterAddRows(out, self.bufs.expert_a, routes.ids, routes.scales, routes.rows, c.kvDim());
         }
@@ -1035,7 +1040,7 @@ pub const CudaLM = struct {
 
     fn routedFfn(self: *CudaLM, experts: k2.Experts, x: Buf, seq: usize, out: Buf, dev: ?[3]Buf) !void {
         const c = self.cfg;
-        try self.linear(self.bufs.route_logits, x, experts.router, c.n_experts, c.hidden, seq);
+        try lin_cuda.linear(self.be, self.bufs.route_logits, x, seq, experts.router);
         const selected = self.selected[0 .. seq * c.n_experts_used];
         const weights = self.selected_weights[0 .. seq * c.n_experts_used];
         try self.selectRoutes(self.bufs.route_logits, experts.bias, seq, c.n_experts, c.n_experts_used);
@@ -1064,70 +1069,19 @@ pub const CudaLM = struct {
                 const routes = try self.gatherForExpert(x, seq, selected, weights, used, expert);
                 if (routes.rows == 0) continue;
                 self.prefetchFfnExpert(experts, selected, expert + 1);
-                try self.linear(self.bufs.expert_a, self.bufs.expert_in, gate, c.expert_intermediate, c.hidden, routes.rows);
-                try self.linear(self.bufs.expert_b, self.bufs.expert_in, up, c.expert_intermediate, c.hidden, routes.rows);
+                try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.expert_in, routes.rows, gate);
+                try lin_cuda.linear(self.be, self.bufs.expert_b, self.bufs.expert_in, routes.rows, up);
                 try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, routes.rows * c.expert_intermediate);
-                try self.linear(self.bufs.expert_out, self.bufs.expert_a, down, c.hidden, c.expert_intermediate, routes.rows);
+                try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, routes.rows, down);
                 try self.be.opScatterAddRows(out, self.bufs.expert_out, routes.ids, routes.scales, routes.rows, c.hidden);
             }
         }
         if (experts.shared_gate) |gate| {
-            try self.linear(self.bufs.expert_a, x, gate, c.shared_intermediate, c.hidden, seq);
-            try self.linear(self.bufs.expert_b, x, experts.shared_up.?, c.shared_intermediate, c.hidden, seq);
+            try lin_cuda.linear(self.be, self.bufs.expert_a, x, seq, gate);
+            try lin_cuda.linear(self.be, self.bufs.expert_b, x, seq, experts.shared_up.?);
             try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, seq * c.shared_intermediate);
-            try self.linear(self.bufs.expert_out, self.bufs.expert_a, experts.shared_down.?, c.hidden, c.shared_intermediate, seq);
+            try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?);
             try self.be.opAdd(out, self.bufs.expert_out, seq * c.hidden);
-        }
-    }
-
-    fn linear(self: *CudaLM, y: Buf, x: Buf, weight: Weight, rows_out: usize, cols: usize, seq: usize) !void {
-        if (weight.dtype.isBlockQuant()) {
-            if (seq == 1) {
-                try self.be.opGemvQuant(weight.dtype, y, x, weight.bytes, weight.scale, rows_out, cols);
-            } else if (Backend.quantQ8NSupported(weight.dtype) and
-                (seq <= grouped_gemv_max or rows_out % 128 != 0) and
-                cols % 256 == 0 and rows_out % 8 == 0)
-            {
-                try self.be.opGemvQuantizeX(x, seq * cols);
-                var off: usize = 0;
-                while (off < seq) : (off += 8) {
-                    const n: usize = @min(8, seq - off);
-                    try self.be.opGemvQuantQ8N(
-                        weight.dtype,
-                        offsetBuf(y, off * rows_out * 4, n * rows_out * 4),
-                        weight.bytes,
-                        weight.scale,
-                        rows_out,
-                        cols,
-                        n,
-                        off,
-                        seq,
-                    );
-                }
-            } else if (weight.dtype == .q6_k and seq >= Backend.mmq_pipe_tile and
-                Backend.mmqPipeSupported(weight.dtype, rows_out, cols) and
-                std.c.getenv("TP_K2_MMQ6") != null)
-            {
-                try self.be.opMatmulQuantMmqPipe(weight.dtype, y, x, seq, weight.bytes, rows_out, cols);
-            } else {
-                try self.be.opMatmulQuant(weight.dtype, y, x, seq, weight.bytes, rows_out, cols);
-            }
-            return;
-        }
-        switch (weight.dtype) {
-            .f32 => if (weight.scale == 1)
-                self.be.opMatmulF32Lt(y, x, seq, weight.bytes, rows_out, cols, null) catch |err| switch (err) {
-                    error.UnsupportedKernelArm => try self.be.opMatmul(y, 0, x, 0, seq, weight.bytes, false, rows_out, cols, weight.scale, null),
-                    else => return err,
-                }
-            else
-                try self.be.opMatmul(y, 0, x, 0, seq, weight.bytes, false, rows_out, cols, weight.scale, null),
-            .bf16 => if (seq == 1)
-                try self.be.opGemvBf16(y, x, weight.bytes, weight.scale, rows_out, cols)
-            else
-                try self.be.opMatmulBf16(y, x, seq, weight.bytes, rows_out, cols, null, false, false),
-            .f16 => try self.be.opMatmulF16(y, x, seq, weight.bytes, rows_out, cols, null, false, false),
-            else => return error.UnsupportedDType,
         }
     }
 

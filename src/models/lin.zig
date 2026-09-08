@@ -1,5 +1,5 @@
 //! What one block linear IS and what a device arm can run, shared by every diffusion
-//! family's GPU forwards.
+//! family's GPU forwards, the text encoders and the LLM steppers.
 //!
 //! A family's loader builds `device_lins`, the flat list of every linear its device
 //! forwards run, and every scan here reads that list. A probe of one tensor answers
@@ -186,6 +186,30 @@ pub fn rowSlice(alloc: std.mem.Allocator, w: Weight, row0: usize, nrows: usize) 
     return s;
 }
 
+/// The flat list of every device linear in `layers` plus `extra`, each tagged
+/// `"<who>.<index>.<field>"` so a refusal can name it. `fields` are the `Weight` or
+/// `?Weight` members of one layer; an absent optional is skipped.
+///
+/// For steppers whose layers are one struct type. A family with several layer kinds
+/// builds its list by hand.
+pub fn collect(alloc: std.mem.Allocator, who: []const u8, layers: anytype, comptime fields: []const []const u8, extra: []const Weight) ![]Weight {
+    var out: std.ArrayList(Weight) = .empty;
+    errdefer out.deinit(alloc);
+    for (layers, 0..) |layer, i| {
+        inline for (fields) |f| {
+            const v = @field(layer, f);
+            const w: ?Weight = if (@typeInfo(@TypeOf(v)) == .optional) v else v;
+            if (w) |ww| {
+                var t = ww;
+                t.tag = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ who, i, f });
+                try out.append(alloc, t);
+            }
+        }
+    }
+    try out.appendSlice(alloc, extra);
+    return out.toOwnedSlice(alloc);
+}
+
 // --- tests -----------------------------------------------------------------
 
 test "kindOf sorts every dtype into a class" {
@@ -286,4 +310,23 @@ test "three row-view GEMMs agree with the fused one the CPU forward runs" {
             }
         }
     }
+}
+
+test "collect flattens a layer list, skips absent optionals and tags by field" {
+    const L = struct { q: Weight, v: ?Weight, norm: []const f32 = &.{} };
+    const a = [_]u8{0} ** 64;
+    const w = Weight.init(a[0..32], .i8, 4, 8);
+    const layers = [_]L{ .{ .q = w, .v = w }, .{ .q = w, .v = null } };
+    var head = w;
+    head.tag = "head";
+    const lins = try collect(std.testing.allocator, "blk", &layers, &.{ "q", "v" }, &.{head});
+    defer {
+        for (lins[0..3]) |l| std.testing.allocator.free(l.tag.?);
+        std.testing.allocator.free(lins);
+    }
+    try std.testing.expectEqual(@as(usize, 4), lins.len);
+    try std.testing.expectEqualStrings("blk.0.q", lins[0].tag.?);
+    try std.testing.expectEqualStrings("blk.0.v", lins[1].tag.?);
+    try std.testing.expectEqualStrings("blk.1.q", lins[2].tag.?);
+    try std.testing.expectEqualStrings("head", lins[3].tag.?);
 }

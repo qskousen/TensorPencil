@@ -3758,10 +3758,9 @@ pub const Session = struct {
             return self.runQwen3(gpa, enc, ids, o);
         }
         if (self.cu_be) |b| {
-            // Same weight gate as the text-only path: the CUDA encode's GEMM is
-            // `opMatmulFp8` unconditionally, so anything else would be read as fp8
-            // bytes and turn into noise rather than fail.
-            if (qwen3_cuda.supportsWeightsOn(b, enc)) {
+            // Only when the CUDA arm has a GEMM for every weight; otherwise the CPU
+            // encode, never noise from a format read as another.
+            if (qwen3_cuda.supportsWeights(enc)) {
                 return qwen3_cuda.encodeVision(enc, b, self.io, gpa, ids, vision, o.cancel) catch |err| {
                     if (err == error.Canceled) return err;
                     std.log.warn("cuda vision-conditioned encode failed ({t}); falling back to CPU (slow)", .{err});
@@ -3781,10 +3780,9 @@ pub const Session = struct {
 
     fn runQwen3(self: *Session, gpa: std.mem.Allocator, enc: *const qwen3.TextEncoder, ids: []const u32, o: EncodeOptions) ![]f32 {
         if (self.cu_be) |b| {
-            // Only when the CUDA arm can actually run these weights: its encode
-            // GEMM is `opMatmulFp8` unconditionally, and Z-Image's Qwen3-4B ships
-            // bf16, which it would read as fp8 bytes and turn into noise.
-            if (qwen3_cuda.supportsWeightsOn(b, enc)) {
+            // Only when the CUDA arm has a GEMM for every weight; otherwise the CPU
+            // encode, never noise from a format read as another.
+            if (qwen3_cuda.supportsWeights(enc)) {
                 return qwen3_cuda.encode(enc, b, self.io, gpa, ids, o.cancel) catch |err| {
                     if (err == error.Canceled) return err;
                     std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});

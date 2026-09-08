@@ -253,8 +253,8 @@ pub const Session = struct {
         _ = io; // text fusion runs on the backend (textTokensCuda), not the CPU
         // Refuse a checkpoint the GEMM dispatch cannot run here, by name, rather than
         // inside the first forward. krea2's widths (6144, 1536, 16384) clear every floor.
-        const plan = try lin_cuda.plan(model.device_lins, "dit cuda");
-        try lin_cuda.presize(be, model.device_lins);
+        const plan = try lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "dit cuda");
+        try lin_cuda.presize(be, plan, model.device_lins);
         const h = lat_h / patch;
         const w = lat_w / patch;
         const seq = seq_txt + h * w;
@@ -460,7 +460,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         // path: gate/up emit f16, silu_mul reads and writes f16, the down prep reads
         // f16, halving the 16384-wide traffic (the biggest eltwise category). Per block,
         // since a mixed checkpoint may keep some blocks dense.
-        const mlp_f16 = be.kernels == .libs and lin_cuda.allI8(&.{ blk.mlp.gate, blk.mlp.up, blk.mlp.down });
+        const mlp_f16 = be.kernels == .libs and lin_cuda.allI8(plan, &.{ blk.mlp.gate, blk.mlp.up, blk.mlp.down });
         // --- mlp (sequence-tiled: mg/mu are [tile][mlp_dim]; each row-chunk is
         // independent, so we walk seq in mlp_tile-row bands over offset x views) ---
         var c0: usize = 0;

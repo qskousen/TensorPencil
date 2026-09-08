@@ -294,6 +294,46 @@ pub const Model = struct {
         };
     }
 
+
+    /// Every linear the device forwards run, tagged by layer and field, for a backend's
+    /// route check at load.
+    pub fn deviceLins(self: *const Model, alloc: std.mem.Allocator) ![]Weight {
+        var lins: std.ArrayList(Weight) = .empty;
+        const T = struct {
+            fn add(list: *std.ArrayList(Weight), a: std.mem.Allocator, w: Weight, l: usize, name: []const u8) !void {
+                var t = w;
+                t.tag = try std.fmt.allocPrint(a, "layers.{d}.{s}", .{ l, name });
+                try list.append(a, t);
+            }
+        };
+        for (self.layers, 0..) |layer, l| {
+            const mlp = switch (layer) {
+                .attn => |al| blk: {
+                    try T.add(&lins, alloc, al.qg, l, "qg");
+                    try T.add(&lins, alloc, al.k, l, "k");
+                    try T.add(&lins, alloc, al.v, l, "v");
+                    try T.add(&lins, alloc, al.o, l, "o");
+                    break :blk al.mlp;
+                },
+                .linear => |ll| blk: {
+                    try T.add(&lins, alloc, ll.qkv, l, "qkv");
+                    try T.add(&lins, alloc, ll.z, l, "z");
+                    try T.add(&lins, alloc, ll.alpha, l, "alpha");
+                    try T.add(&lins, alloc, ll.beta, l, "beta");
+                    try T.add(&lins, alloc, ll.out, l, "out");
+                    break :blk ll.mlp;
+                },
+            };
+            try T.add(&lins, alloc, mlp.gate, l, "mlp.gate");
+            try T.add(&lins, alloc, mlp.up, l, "mlp.up");
+            try T.add(&lins, alloc, mlp.down, l, "mlp.down");
+        }
+        var head = self.head;
+        head.tag = "lm_head";
+        try lins.append(alloc, head);
+        return lins.toOwnedSlice(alloc);
+    }
+
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
         self.* = undefined;

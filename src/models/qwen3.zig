@@ -26,6 +26,7 @@ const dtypes = @import("tp_core").dtype;
 const ops = @import("tp_ops");
 const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("tp_core").kv_cache;
+const lin = @import("lin.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -387,6 +388,12 @@ pub const TextEncoder = struct {
     /// `Variant.appliesFinalNorm`.
     final_norm: ?[]const f32,
 
+    /// Every linear the device encoders run, tagged by layer and field, for a backend's
+    /// route check.
+    pub fn deviceLins(self: *const TextEncoder, alloc: std.mem.Allocator) ![]Weight {
+        return lin.collect(alloc, "layers", self.layers, &.{ "q", "k", "v", "o", "gate", "up", "down" }, &.{});
+    }
+
     pub fn tapCount(self: *const TextEncoder) usize {
         return self.taps.len;
     }
@@ -685,6 +692,15 @@ pub const CausalLM = struct {
         const final_norm = try loadNormNamed(alloc, store, try std.fmt.bufPrint(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
 
         return .{ .arena = arena, .cfg = cfg, .embed = embed, .head = head, .layers = layers, .final_norm = final_norm };
+    }
+
+
+    /// Every linear the device forwards run, tagged by layer and field, for a backend's
+    /// route check at load.
+    pub fn deviceLins(self: *const CausalLM, alloc: std.mem.Allocator) ![]Weight {
+        var head = self.head;
+        head.tag = "lm_head";
+        return lin.collect(alloc, "layers", self.layers, &.{ "q", "k", "v", "o", "gate", "up", "down" }, &.{head});
     }
 
     pub fn deinit(self: *CausalLM) void {

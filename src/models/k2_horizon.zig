@@ -144,6 +144,47 @@ pub const Model = struct {
         return .{ .arena = arena, .cfg = cfg, .embed = embed, .head = head, .layers = layers, .final_norm = final_norm };
     }
 
+
+    /// Every linear the device forwards run, experts included, tagged for a backend's
+    /// route check at load.
+    pub fn deviceLins(self: *const Model, alloc: std.mem.Allocator) ![]Weight {
+        var lins: std.ArrayList(Weight) = .empty;
+        const T = struct {
+            fn add(list: *std.ArrayList(Weight), a: std.mem.Allocator, w: ?Weight, comptime fmt: []const u8, args: anytype) !void {
+                var t = w orelse return;
+                t.tag = try std.fmt.allocPrint(a, fmt, args);
+                try list.append(a, t);
+            }
+        };
+        for (self.layers, 0..) |layer, l| {
+            try T.add(&lins, alloc, layer.q, "layers.{d}.q", .{l});
+            try T.add(&lins, alloc, layer.k, "layers.{d}.k", .{l});
+            try T.add(&lins, alloc, layer.v, "layers.{d}.v", .{l});
+            try T.add(&lins, alloc, layer.attn_gate, "layers.{d}.attn_gate", .{l});
+            try T.add(&lins, alloc, layer.o, "layers.{d}.o", .{l});
+            try T.add(&lins, alloc, layer.dense_gate, "layers.{d}.dense_gate", .{l});
+            try T.add(&lins, alloc, layer.dense_up, "layers.{d}.dense_up", .{l});
+            try T.add(&lins, alloc, layer.dense_down, "layers.{d}.dense_down", .{l});
+            if (layer.values) |vals| {
+                try T.add(&lins, alloc, vals.router, "layers.{d}.values.router", .{l});
+                for (vals.weights, 0..) |w, e| try T.add(&lins, alloc, w, "layers.{d}.values.{d}", .{ l, e });
+            }
+            if (layer.experts) |ex| {
+                try T.add(&lins, alloc, ex.router, "layers.{d}.experts.router", .{l});
+                try T.add(&lins, alloc, ex.shared_gate, "layers.{d}.experts.shared_gate", .{l});
+                try T.add(&lins, alloc, ex.shared_up, "layers.{d}.experts.shared_up", .{l});
+                try T.add(&lins, alloc, ex.shared_down, "layers.{d}.experts.shared_down", .{l});
+                for (ex.gate, ex.up, ex.down, 0..) |g, u, d, e| {
+                    try T.add(&lins, alloc, g, "layers.{d}.experts.{d}.gate", .{ l, e });
+                    try T.add(&lins, alloc, u, "layers.{d}.experts.{d}.up", .{ l, e });
+                    try T.add(&lins, alloc, d, "layers.{d}.experts.{d}.down", .{ l, e });
+                }
+            }
+        }
+        try T.add(&lins, alloc, self.head, "lm_head", .{});
+        return lins.toOwnedSlice(alloc);
+    }
+
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
         self.* = undefined;

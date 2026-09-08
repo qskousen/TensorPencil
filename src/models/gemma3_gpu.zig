@@ -21,6 +21,7 @@ const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 const qwen3 = @import("qwen3.zig");
 const gemma3 = @import("gemma3.zig");
+const lin_gpu = @import("lin_llm_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
@@ -98,7 +99,7 @@ pub const VulkanLM = struct {
     up: Buf,
     t: Buf,
     logits: Buf,
-    partials: Buf,
+    lin: lin_gpu.Lin,
     /// Block-resident hidden [max_image_tokens * hidden] and rope'd Q
     /// [max_image_tokens * qDim] for the two-phase bidirectional image prefill
     /// (Vulkan is single-query, so the block is driven token-by-token but with
@@ -149,7 +150,9 @@ pub const VulkanLM = struct {
         self.t = try ctx.tensorCreate(cfg.hidden * 4);
         self.logits = try ctx.tensorCreate(cfg.vocab * 4);
         const max_rows = @max(cfg.vocab, @max(cfg.intermediate, cfg.qDim()));
-        self.partials = try ctx.tensorCreate(max_rows * gemv_nchunk * 4);
+        self.lin = try lin_gpu.Lin.init(gpa, ctx, max_rows, gemv_nchunk, 1);
+        errdefer self.lin.deinit();
+        try self.lin.plan(try lm.deviceLins(alloc), 1, "gemma3 vulkan");
         self.block_x = try ctx.tensorCreate(max_image_tokens * cfg.hidden * 4);
         self.block_q = try ctx.tensorCreate(max_image_tokens * cfg.qDim() * 4);
 
@@ -181,11 +184,12 @@ pub const VulkanLM = struct {
 
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.ctx;
-        inline for (.{ "x", "normed", "q", "k", "v", "attn", "attn_scratch", "gate", "up", "t", "logits", "partials", "block_x", "block_q", "freqs_global", "freqs_local" }) |f| {
+        inline for (.{ "x", "normed", "q", "k", "v", "attn", "attn_scratch", "gate", "up", "t", "logits", "block_x", "block_q", "freqs_global", "freqs_local" }) |f| {
             ctx.tensorDestroy(&@field(self, f));
         }
         for (self.k_cache) |*b| ctx.tensorDestroy(b);
         for (self.v_cache) |*b| ctx.tensorDestroy(b);
+        self.lin.deinit();
         self.arena.deinit();
     }
 
@@ -207,12 +211,6 @@ pub const VulkanLM = struct {
         if (min_rows > self.capacity) return error.ContextFull;
     }
 
-    fn gemvW(self: *VulkanLM, y: Buf, y_off: usize, x: Buf, w: Weight) !void {
-        switch (w.dtype) {
-            .q8_0, .q4_k, .q5_k, .q6_k => try self.ctx.opGemvQuantT(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.partials),
-            else => try self.ctx.opGemvQuant(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
-        }
-    }
     fn rms(self: *VulkanLM, in: Buf, out: Buf, weight: []const f32, rows: usize, dim: usize) !void {
         try self.ctx.opElt(.rmsnorm, in, out, try nbuf(self.ctx, weight), null, .{
             .u0 = @intCast(rows),
@@ -328,9 +326,9 @@ pub const VulkanLM = struct {
     pub fn projectQKV(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // gemma3: uniform geometry
         _ = seq;
-        try self.gemvW(self.q, 0, self.normed, layer.q);
-        try self.gemvW(self.k, 0, self.normed, layer.k);
-        try self.gemvW(self.v, 0, self.normed, layer.v);
+        try self.lin.linear(self.q, 0, self.normed, 1, layer.q);
+        try self.lin.linear(self.k, 0, self.normed, 1, layer.k);
+        try self.lin.linear(self.v, 0, self.normed, 1, layer.v);
     }
     pub fn normQK(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -383,7 +381,7 @@ pub const VulkanLM = struct {
     pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
         _ = seq;
-        try self.gemvW(self.t, 0, self.attn, layer.o);
+        try self.lin.linear(self.t, 0, self.attn, 1, layer.o);
     }
     pub fn postAttnNorm(self: *VulkanLM, layer: anytype, seq: usize) !void {
         try self.rms(self.t, self.t, layer.post_attn_norm, seq, self.cfg.hidden);
@@ -396,8 +394,8 @@ pub const VulkanLM = struct {
     }
     pub fn projectGateUp(self: *VulkanLM, layer: anytype, seq: usize) !void {
         _ = seq;
-        try self.gemvW(self.gate, 0, self.normed, layer.gate);
-        try self.gemvW(self.up, 0, self.normed, layer.up);
+        try self.lin.linear(self.gate, 0, self.normed, 1, layer.gate);
+        try self.lin.linear(self.up, 0, self.normed, 1, layer.up);
     }
     pub fn activate(self: *VulkanLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -409,7 +407,7 @@ pub const VulkanLM = struct {
     }
     pub fn projectDown(self: *VulkanLM, layer: anytype, seq: usize) !void {
         _ = seq;
-        try self.gemvW(self.t, 0, self.gate, layer.down);
+        try self.lin.linear(self.t, 0, self.gate, 1, layer.down);
     }
     pub fn postFfnNorm(self: *VulkanLM, layer: anytype, seq: usize) !void {
         try self.rms(self.t, self.t, layer.post_ffn_norm, seq, self.cfg.hidden);
@@ -425,7 +423,7 @@ pub const VulkanLM = struct {
 
         if (want_logits) {
             try self.rms(self.x, self.t, self.lm.final_norm, 1, cfg.hidden);
-            try self.gemvW(self.logits, 0, self.t, self.lm.head);
+            try self.lin.linear(self.logits, 0, self.t, 1, self.lm.head);
         }
     }
 };
