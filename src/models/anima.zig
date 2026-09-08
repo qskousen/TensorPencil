@@ -11,7 +11,7 @@
 //! adapter is where the two streams meet. Output is [max(512, n_t)][1024],
 //! zero-padded.
 //!
-//! DiT (28 blocks, 2048 wide, 16 heads of 128) is the denoiser: AdaLN-LoRA
+//! DiT (28 blocks in the base release, 2048 wide, 16 heads of 128) is the denoiser: AdaLN-LoRA
 //! modulated self-attention, then cross-attention, then a GELU MLP, over 2x2
 //! patches of a 16-channel latent, flow-matching parameterized.
 //!
@@ -156,6 +156,33 @@ pub const anima_2b: Config = .{
         .min_rows = 512,
     },
 };
+
+/// A full single-file checkpoint keeps the LDM container prefix; a denoiser-only
+/// export strips it. The same two spellings `detectFamily` reads.
+fn trunkPrefix(store: WeightStore) []const u8 {
+    return if (store.get("model.diffusion_model.x_embedder.proj.1.weight") != null)
+        "model.diffusion_model."
+    else
+        "";
+}
+
+/// `anima_2b` with the trunk depth read from the checkpoint, counting `blocks.N.`
+/// from zero the way `model_detection.count_blocks` does. Fine-tunes splice in extra
+/// blocks (40 is in the wild) and load through the same code; a different width is a
+/// different model and is refused here rather than mis-loaded.
+pub fn detectConfig(store: WeightStore) !Config {
+    const pfx = trunkPrefix(store);
+    var buf: [128]u8 = undefined;
+    var cfg = anima_2b;
+    const xe = store.get(try std.fmt.bufPrint(&buf, "{s}x_embedder.proj.1.weight", .{pfx})) orelse return error.MissingTensor;
+    const shape = xe.info.shape.slice();
+    if (shape.len != 2 or shape[0] != cfg.dim or shape[1] != cfg.patchDim()) return error.UnsupportedCheckpoint;
+    var n: usize = 0;
+    while (store.get(try std.fmt.bufPrint(&buf, "{s}blocks.{d}.mlp.layer1.weight", .{ pfx, n })) != null) n += 1;
+    if (n == 0) return error.MissingTensor;
+    cfg.n_layers = n;
+    return cfg;
+}
 
 /// Latent geometry, for callers that need it without a loaded model. Anima uses the
 /// Wan 2.1 VAE, so these are `wan_vae`'s, including its `latents_mean`/`latents_std`
@@ -433,12 +460,7 @@ pub const DiT = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        // A full single-file checkpoint keeps the LDM container prefix; a
-        // denoiser-only export strips it. The same two spellings `detectFamily` reads.
-        const pfx: []const u8 = if (store.get("model.diffusion_model.x_embedder.proj.1.weight") != null)
-            "model.diffusion_model."
-        else
-            "";
+        const pfx = trunkPrefix(store);
         const l = Loader{ .store = store, .alloc = alloc, .pfx = pfx, .cfg = cfg };
 
         const blocks = try alloc.alloc(Block, cfg.n_layers);
@@ -493,7 +515,7 @@ pub const DiT = struct {
     // per-image constants once and the per-step part per step. Anima's modulation
     // is one vector per sublayer per block for the WHOLE image (`emb` is `[B, T, D]`
     // with T = 1, broadcast over h and w), so the entire AdaLN evaluation is a
-    // per-step constant, 28 blocks x 3 x a rank-256 factorization, which is
+    // per-step constant, n_layers blocks x 3 x a rank-256 factorization, which is
     // ~0.2 GFLOP against the trunk's hundreds.
 
     /// Every block's modulation vectors for one sigma, plus the final layer's, laid
@@ -1922,6 +1944,64 @@ test "the Anima text encoder matches ComfyUI's Qwen3-0.6B tap" {
         const rel = relL2(want_c, got_c);
         errdefer std.debug.print("prompt {d}: conditioning rel L2 {e:.4}\n", .{ pi, rel });
         try testing.expect(rel < 5e-5); // measured 2.5e-6 / 3.0e-6 / 7.8e-6
+    }
+}
+
+/// A safetensors blob holding `x_embedder` at the given shape and `n` consecutive
+/// `blocks.N.mlp.layer1.weight` stubs, under `pfx`. Only names and shapes matter.
+fn synthTrunk(gpa: std.mem.Allocator, pfx: []const u8, n: usize, xe_shape: [2]usize) ![]u8 {
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(gpa);
+    const xe_bytes = xe_shape[0] * xe_shape[1] * 2;
+    try hdr.print(gpa, "{{\"{s}x_embedder.proj.1.weight\":{{\"dtype\":\"BF16\",\"shape\":[{d},{d}],\"data_offsets\":[0,{d}]}}", .{ pfx, xe_shape[0], xe_shape[1], xe_bytes });
+    for (0..n) |i| {
+        const off = xe_bytes + i * 8;
+        try hdr.print(gpa, ",\"{s}blocks.{d}.mlp.layer1.weight\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[{d},{d}]}}", .{ pfx, i, off, off + 8 });
+    }
+    try hdr.append(gpa, '}');
+    const payload = xe_bytes + n * 8;
+    const file = try gpa.alloc(u8, 8 + hdr.items.len + payload);
+    std.mem.writeInt(u64, file[0..8], hdr.items.len, .little);
+    @memcpy(file[8..][0..hdr.items.len], hdr.items);
+    @memset(file[8 + hdr.items.len ..], 0);
+    return file;
+}
+
+test "detectConfig counts trunk blocks under either prefix and refuses another width" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { pfx: []const u8, n: usize }{
+        .{ .pfx = "", .n = 28 },
+        .{ .pfx = "model.diffusion_model.", .n = 40 },
+        .{ .pfx = "", .n = 3 },
+    };
+    for (cases) |c| {
+        const file = try synthTrunk(gpa, c.pfx, c.n, .{ anima_2b.dim, anima_2b.patchDim() });
+        defer gpa.free(file);
+        var st = try SafeTensors.initFromSlice(gpa, file);
+        defer st.deinit();
+        const cfg = try detectConfig(.{ .safetensors = &st });
+        errdefer std.debug.print("pfx '{s}' n {d}: got {d}\n", .{ c.pfx, c.n, cfg.n_layers });
+        try testing.expectEqual(c.n, cfg.n_layers);
+        // Everything but the depth is the base config, the adapter included.
+        var want = anima_2b;
+        want.n_layers = c.n;
+        try testing.expectEqualDeep(want, cfg);
+    }
+    // The 14B Cosmos trunk is 5120 wide; nothing here has kernels sized for it.
+    {
+        const file = try synthTrunk(gpa, "", 4, .{ 5120, anima_2b.patchDim() });
+        defer gpa.free(file);
+        var st = try SafeTensors.initFromSlice(gpa, file);
+        defer st.deinit();
+        try testing.expectError(error.UnsupportedCheckpoint, detectConfig(.{ .safetensors = &st }));
+    }
+    // A trunk with no blocks at all is a broken file, not a zero-depth model.
+    {
+        const file = try synthTrunk(gpa, "", 0, .{ anima_2b.dim, anima_2b.patchDim() });
+        defer gpa.free(file);
+        var st = try SafeTensors.initFromSlice(gpa, file);
+        defer st.deinit();
+        try testing.expectError(error.MissingTensor, detectConfig(.{ .safetensors = &st }));
     }
 }
 

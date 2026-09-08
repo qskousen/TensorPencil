@@ -176,7 +176,7 @@ hold in the joint sequence, so the rope table is *sliced*, not rebuilt.
 | **T5 tokenizer** (SentencePiece Unigram) | ✅ | — | — | — | `core/t5_tokenizer.zig` |
 | **Text encoder** (Qwen3-0.6B, final state + `model.norm`) | ✅ | ✅ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig`, `Variant.anima` |
 | **`llm_adapter`** (6 blocks, 1024, T5-indexed) | ✅ | host | host | host | `anima.zig` (`Adapter`) |
-| **DiT** (28 blocks, 2048) | ✅ bf16/f16/f32/fp8/int8/int4/w4a8/nvfp4 | ✅ int8/int4/w4a8/nvfp4/bf16 | ✅ | ✅ | `anima{,_gpu,_cuda}.zig` |
+| **DiT** (2048 wide; depth counted from the checkpoint, 28 base, 40 seen) | ✅ bf16/f16/f32/fp8/int8/int4/w4a8/nvfp4 | ✅ int8/int4/w4a8/nvfp4/bf16 | ✅ | ✅ | `anima{,_gpu,_cuda}.zig` |
 | **VAE decode** (Wan 2.1, 16-ch) | ✅ | ✅ | ✅ | ✅ | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
 | **TAEHV / latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | krea2's Wan matrix, **not** Z-Image's Flux one |
 

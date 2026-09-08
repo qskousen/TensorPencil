@@ -2595,7 +2595,7 @@ pub const Session = struct {
                     .vae_view = null,
                 };
                 const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
-                m.dit = try anima.DiT.load(gpa, den.store, anima.anima_2b);
+                m.dit = try anima.DiT.load(gpa, den.store, try anima.detectConfig(den.store));
                 errdefer m.dit.deinit();
                 // The DiT loader detects its own prefix, so the resolver's view is
                 // not needed past this point.
@@ -2896,7 +2896,7 @@ pub const Session = struct {
             return;
         }
         if (self.family() == .anima) {
-            const fresh = try anima.DiT.load(self.gpa, store, anima.anima_2b);
+            const fresh = try anima.DiT.load(self.gpa, store, try anima.detectConfig(store));
             const m = &self.models.anima;
             m.dit.deinit();
             m.dit = fresh;

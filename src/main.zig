@@ -3436,8 +3436,9 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     // flat at ~3.9e-2. A single depth cannot distinguish "coarse" from "accumulating",
     // and that distinction is the whole diagnostic. Cheap: the deep CPU reference at a
     // 24x32 latent is seconds.
-    for ([_]usize{ 1, 2, 8, 28 }) |depth| {
-        var cfg = anima.anima_2b;
+    const full = try anima.detectConfig(.{ .safetensors = &ck });
+    for ([_]usize{ 1, 2, 8, full.n_layers }) |depth| {
+        var cfg = full;
         cfg.n_layers = depth;
         var model = try anima.DiT.load(arena, .{ .safetensors = &ck }, cfg);
         defer model.deinit();

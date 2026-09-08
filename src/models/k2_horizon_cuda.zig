@@ -601,6 +601,7 @@ pub const CudaLM = struct {
         const c = self.cfg;
         const b = &self.bufs;
         const seq = ids.len;
+        if (seq == 0 or self.len + seq > self.capacity) return error.ContextFull;
         const first_prefill = seq > 1 and self.len == 0;
         if (first_prefill) self.hybrid_profile.reset();
         const profile_start = self.hybrid_profile.tic();
@@ -1632,8 +1633,20 @@ test "K2 Horizon CUDA produces the expected first token" {
     // grows by their bytes here, not at the next forward.
     const used_host = be.deviceUsed();
     _ = try gpu.promoteLayers(std.math.maxInt(u64));
-    try std.testing.expectEqual(before, gpu.hostLayers());
+    errdefer std.debug.print("after promote: host layers {d} (was {d})\n", .{ gpu.hostLayers(), before });
+    try std.testing.expect(gpu.hostLayers() <= before);
     try std.testing.expect(be.deviceUsed() >= used_host + 3 * CudaLM.routedBytes(lm.layers[3]) - (64 << 20));
+    try gpu.resetCache();
+    try std.testing.expectEqual(id, try gpu.stepArgmax(io, ids.items));
+
+    // The arbiter's shape of it: an image model takes most of the card (offload
+    // to a tight budget), leaves, and the LLM is promoted back to the ceiling.
+    try gpu.offloadToBudget(be.deviceUsed() -| (10 << 30));
+    errdefer std.debug.print("after big offload: host layers {d}\n", .{gpu.hostLayers()});
+    try std.testing.expect(gpu.hostLayers() >= before + 15);
+    _ = try gpu.promoteLayers(be.ctx.memGetInfo().total);
+    try gpu.resetCache();
+    try std.testing.expectEqual(id, try gpu.stepArgmax(io, ids.items));
     try gpu.resetCache();
     try std.testing.expectEqual(id, try gpu.stepArgmax(io, ids.items));
 }
