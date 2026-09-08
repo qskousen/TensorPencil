@@ -35,6 +35,28 @@ their names). Needs `k % 8 == 0`; the padded path stays for everything else and 
 (`cachedWeightF16`) rather than re-converted per call — both are 16 bits, so a second copy
 would cost the weight's size again in VRAM for nothing.
 
+**Dual-target kernels** (`src/gpu/kernels/dual.zig`, bodies in `dual/*.zig`, entry table in
+`dual_table.zig`): one Zig source compiled to SPIR-V for the Vulkan `Context` and to PTX for
+the CUDA `Backend` (both arms), over one launch ABI (four f32 buffers, seven u32, two f32).
+A kernel written there reaches every GPU arm the day it is written, and every entry has a
+Vulkan `Elt` tag and a CUDA `dualElems` / `dualPairs` / `dualRows` launch. It holds the
+whole elementwise set (activations, copies, modulation, residual gates, every RoPE variant
+including M-RoPE and the two vision ropes, the head gathers of the tensor-core attention,
+f16/bf16 conversions and padded copies, im2col, the MoE row routing, the sampling passes,
+the GDN gates and conv, the H3 audio kernels), every block-quant dequantizer (f16, bf16 and
+f32 output, raw row-major input) and the row reductions (rmsnorm, grouped rmsnorm, layernorm,
+the two fused norm+AdaLN kernels, l2norm, GroupNorm statistics, int8 row max) as one subgroup
+per row with `sgSum`/`sgMax`. Layouts are the Vulkan push layouts; the CUDA wrappers remap.
+
+What stays per backend: the tensor-core GEMMs and MMQ pipes (`cuda/kernels.zig`,
+`coopmat.zig`), the dp4a GEMVs, the attention decompositions, the graph-capture kernels
+that read `g_state`, and anything needing workgroup memory (Zig-emitted workgroup storage
+still hangs NVIDIA under Vulkan, ZIG.md). The weighted rmsnorm keeps one hand CUDA twin,
+`qk_rmsnorm_par` (a whole block per row), for fewer than 64 rows at 1024 wide or more, the
+LLM decode hidden norm: one subgroup per row with no workgroup memory is latency-bound there
+and measures ~1.6x slower even with its loads pipelined; at every other shape the shared
+kernel is at parity or up to 1.4x faster. `dual-cuda-test` reports both.
+
 Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — not applicable
 
 ---
@@ -48,8 +70,10 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 | **LLM vision (ViT/mmproj)** | ✅ | ⚠️ gemma3 only | ✅ | ✅ |
 | **GPU init failure** | — | → CPU fallback | → CPU fallback | → CPU fallback |
 
-¹ vulkan LLM excludes **gemma4** entirely; a block-quant token *embedding* is also rejected
-(no Vulkan block-quant gather kernel). See §4–§5.
+¹ vulkan LLM excludes **gemma4** entirely. A block-quant token embedding is host-gathered
+like any other. q4_0 / iq4_xs / q1_0 / q2_0 weights run through the dequant GEMM at every row
+count (`Context.dequantOnly`): the checkpoint loads and decodes correctly, at a fraction of a
+token per second, until they get a decode GEMV. See §4–§5.
 
 ---
 
@@ -241,8 +265,7 @@ falls back to a 3-pass prep that round-trips a full f32 activation copy through 
 
 | new | where | why |
 |---|---|---|
-| `ln_mod_sg` | `kernels/subgroup.zig` | fused weightless LayerNorm + AdaLN modulation, one subgroup per row. Two-pass deviation variance, matching `ops.norm.layerNormUnit` (not the shifted form, which cancels catastrophically at large row means) |
-| `ln_mod_par` | `cuda/elt.zig` | the CUDA twin, derived from `ln_bias_par` by asserted substitution (`replaceOnce`) so the reduction and variance stay literally shared |
+| `ln_mod` | `kernels/dual/rows.zig` | fused weightless LayerNorm + AdaLN modulation, one subgroup per row on both arms. Two-pass deviation variance, matching `ops.norm.layerNormUnit` (not the shifted form, which cancels once the mean is large) |
 | `pmdplane` (push word 7) | `coopmat.buildFlashAttn` | lets the flash kernel run **rectangular** q × kv. `s_stride` was K's row stride, the j loop bound *and* the MD plane stride at once, and the MD table is indexed by QUERY row. **0 means "= s_stride"**, so pre-existing callers are unchanged by construction |
 | `opAttnTCRect` | `cuda/backend.zig` | `opAttnTCBatched` with the two sequence lengths pulled apart |
 
@@ -663,13 +686,13 @@ linear (dequant), 336 is prep, 28 is attn, 281 is elt. The names now come off th
 | **Conv2d** (im2col + GEMM, fused 2× upsample) | ✅ f32 | ✅ f16-TC (co≥96) / f32 | ✅ | ✅ (cuDNN NHWC conv for stride-1 3×3; im2col for stride-2 and upsample) | f32 weights; f16 TC wide-co; f16 activation storage either side |
 | **Attention** (DiT GQA 48/12, hd128) | f32 | f16 two-pass TC (+flash) | `opAttnTC` | f16 TC | f16 scores |
 | **VAE mid-block attn** | f32 | f32 scores plane, query-banded | TC flash, f32 scores band | cuDNN SDPA | see below |
-| RMSNorm + AdaLN modulate | ✅ | `rms_apply_mod`/`modulate` | `rms_mod_par` | ↤ | f32 (+h16) |
-| Weighted RMSNorm (Q/K, sandwich) | ✅ | `rmsnorm_sg` (subgroup) | `qk_rmsnorm_warp` | ↤ | f32/f16 |
-| Weightless LayerNorm + modulate | ✅ | `ln_mod_sg` | `ln_mod_par` | ↤ | f32 |
-| RoPE (3-axis interleaved) | ✅ | `rope_inter` | `rope` | ↤ | f32 |
-| SwiGLU / silu-mul | ✅ | `silu_mul{,16,_h16}` | `silu_mul{,_h16}` | ↤ | f32/f16 |
-| sigmoid-gated add | ✅ | `sigmoid_mul` | `mul_sigmoid` | ↤ | f32 |
-| gated residual add | ✅ | `gated_add{,16}` | `gated_add` | ↤ | f32/f16 |
+| RMSNorm + AdaLN modulate | ✅ | `rms_apply_mod`/`modulate` or `rms_mod` (dual) | `rms_mod` (dual) | ↤ | f32 (+h16) |
+| Weighted RMSNorm (Q/K, sandwich) | ✅ | `rmsnorm` (dual, subgroup per row) | `rmsnorm` (dual); hand `qk_rmsnorm_par` for <64 rows at ≥1024 wide | ↤ | f32/f16 |
+| Weightless LayerNorm + modulate | ✅ | `ln_mod` (dual) | ↤ | ↤ | f32 |
+| RoPE (3-axis interleaved) | ✅ | `rope_inter` (dual) | ↤ | ↤ | f32 |
+| SwiGLU / silu-mul | ✅ | `silu_mul{,16,_h16}` (dual) | ↤ | ↤ | f32/f16 |
+| sigmoid-gated add | ✅ | `sigmoid_mul` (dual) | ↤ | ↤ | f32 |
+| gated residual add | ✅ | `gated_add{,16}` (dual) | ↤ | ↤ | f32/f16 |
 | relu / add_relu | ✅ | `relu` / `add_relu` | `relu` / `add`+`relu` | ↤ | f32 |
 | GroupNorm (Welford) | ✅ | `gn_stats`/`gn_combine`/`gn_apply` | ↤ same names | ↤ | f32/h16 |
 | im2col | ✅ | `im2col`, `im2col_sd` | ↤ | ↤ | f32/h16 |
@@ -1134,22 +1157,34 @@ path; GGUF `q*` are the **LLM** path.
 
 ## 8. Kernel inventory (appendix)
 
-### Vulkan — `Elt` compute kernels (`src/gpu/context.zig`, bodies in `src/gpu/kernels/eltwise.zig`)
+### Both GPU arms — dual-target kernels (`src/gpu/kernels/dual.zig`, table `dual_table.zig`)
 
-`rmsnorm` · `rmsnorm_sg` · `rms_partial` · `rms_combine` · `rms_apply_mod{,_h16}` · `rms_apply_w` ·
-`modulate` · `ln_mod_sg` · `gated_add{,16}` · `add{,_h16}` · `relu` · `add_relu` ·
-`silu_mul{,_h16,16}` · `sigmoid_mul{,_h16,_g16}` · `gelu` · `gelu_mul` · `gelu_quick` · `gelu_erf` ·
-`layernorm` · `vae_norm` · `l2norm_rows` · `qknorm_rope16` · `qknorm_rope_f32` · `rope_inter` ·
-`rope_half` · `rope_qwen35` · `attention` · `attn_scores` · `softmax_partial` · `softmax_combine` ·
-`softmax_rows` · `attn_out` · `attn_dsplit` · `attn_dmerge` · `attn_full` · `attn_decode_q35` ·
-`attn_causal_batched` · `attn_cross` · `gather_kmajor{,_h16,16}` · `f32_to_h16{,_pad}` ·
-`h16_to_h16_pad` · `f32_to_bf16_pad` · `copy` · `deinterleave2` · `scale_concat` · `scale_i32` ·
-`bias_compact{,_h16}` · `im2col` · `im2col_sd{,_h16}` · `rotate` · `rotate_fwht` · `rowmax_i8` ·
-`rowscale_i8` · `quantize_i8` · `gemv_partial{,4}` · `gemv_combine{,4}` · `gn_stats{,_h16}` ·
-`gn_combine` · `gn_apply{,_h16}` · `silu` · `geglu` · `concat_ch` · `head_pad_h16` · `head_unpad` ·
-`i4_decode_t` · `w4a8_decode_t` · `nvfp4_decode_t` · `gemv_q8_0{,_t}` · `gemv_q4_k{,_t}` ·
-`gemv_q5_k{,_t}` · `gemv_q6_k{,_t}` · `gemv_iq4_nl{,_t}` · `gdn_gates` · `gdn_conv_step` ·
-`gdn_delta_step`
+One source, SPIR-V and PTX; the full list is `dual_table.entries`. By area:
+activations `add{,_relu,_scaled,_h16}` · `relu` · `silu{,_mul,_mul16,_mul_h16}` · `sigmoid_mul{,_h16,_g16}` ·
+`gelu{,_mul,_quick,_quick_mul,_erf}` · `geglu{,_h16}` · `softplus_gate`; moves `copy` · `scale_f32` ·
+`concat_ch` · `scale_concat` · `scale_i32` · `quantize_i8` · `kv_store_f16` · `pack_h16_kmajor` ·
+`gather_kmajor{,_h16,16}` · `gather_head{,_b}` · `gather_vt{,_b}` · `scatter_head{,_b}` · `head_pad{,_h16}` ·
+`head_unpad` · `deinterleave{2,3}` · `gather_rows` · `scatter_add_rows` · `moe_combine`; converts
+`f32_to_h16{,_pad}` · `f32_to_bf16_pad` · `h16_to_h16_pad` · `bf16_to_h16_pad` · `f16_to_f32`; modulation
+`modulate` · `gated_add{,16}` · `rms_apply_mod{,_h16}` · `rms_apply_w` · `rms_partial` · `rms_combine`;
+rope `rope_inter` · `rope_half{,_pos,_part}` · `rope_imrope{,_pos}` · `rope_vision{,_gemma4}`; row
+reductions (one subgroup per row) `rmsnorm` · `group_rmsnorm` · `rms_mod` · `layernorm{,_h16}` · `ln_mod` ·
+`l2norm_rows{,_g}` · `gn_stats{,_h16}` · `rowmax_i8`; GroupNorm/VAE `gn_combine` · `gn_apply{,_h16}` ·
+`vae_norm` · `bias_compact{,_h16}` · `bias_add_{f16,h16}` · `add_bias_rows{,_h16}` · `im2col` ·
+`im2col_sd{,_h16}` · `im2col1d`; softmax partials `softmax_partial` · `softmax_combine`; fused
+`qknorm_rope16` · `qknorm_rope_f32`; sampling `argmax_reduce` · `argmax_final` · `topk_reduce` ·
+`penalize`; GDN `gdn_gates{,_batch}` · `gdn_conv_{step,batch,state}`; k-split `gemv_combine{,4}`; H3
+audio `aa_up_snake` · `aa_down` · `convt1d_ca` · `snake1d_ca` · `mean_heads_pool`; dequantizers
+`dequant_<fmt>_{f16,bf16,f32}` for fp8, q8_0, q4_0, q1_0, q2_0_g64, q2_0_g128, iq4_nl, iq4_xs, q4_k,
+q5_k, q6_k (raw row-major input).
+
+### Vulkan-only — `Elt` compute kernels (`src/gpu/kernels/eltwise.zig`, `subgroup.zig`, `dp4a.zig`)
+
+`attn_full` · `attn_causal_batched` · `attn_cross` · `attn_scores` · `attn_out` · `attn_dsplit` ·
+`attn_dmerge` · `attn_dsplit_gemma{,_f16,_q8}` · `kv_store_q8_0` · `gemv_partial{,4}` ·
+`gemv_{q8_0,q4_k,q5_k,q6_k,iq4_nl}{,_t}` · `dequant_{q8_0,q4_k,q5_k,q6_k,iq4_nl}_f32` (transposed
+layout) · `gdn_delta_step` · `rotate_fwht` · `w4a8_decode_t` · `i4_decode_t` · `nvfp4_decode_t`;
+subgroup module `subgroup_sum` · `gemv_*_sg` · `attn_decode_sg`; dp4a module (`OpSDot`).
 
 **Vulkan GEMM entry points** (`context.zig`): `opMatmul` (f32/fp8) · `opGemv{,Partial,Quant,QuantT}` ·
 `opMatmulCoop{,H16}` (fp8→f16) · `opMatmulCoopF16W{,b,h,Dev}` (f32/bf16/f16→f16; `Dev` takes a
@@ -1283,15 +1318,15 @@ Attention: `attn` · `attn_split`/`_merge`/`_h256`/`_h512`/`_tree` · `attn_spli
 fragment, entry for hd ∈ {128, 256}, full causal, `heads > kv_heads`; bit-identical per head to
 `attn_split`, with `_f16`/`_q8` KV variants) · `softmax_md_{f16,f32}`.
 
-GDN: `gdn_{conv_step,gates,delta_step}` · `gdn_conv_batch` · `opGdnDeltaChunk` (state in registers
+GDN: `gdn_delta_step` (block per head, shared memory) · `opGdnDeltaChunk` (state in registers
 across the chunk, so bit-identical to the per-token form — ⚠️ decode can only run the per-token
 form, so a re-prefill must match it exactly).
 
-SD family: `gn_stats`/`gn_combine`/`gn_apply` (Welford) · `geglu` · `concat_ch` · `attn_cross` ·
-`im2col_sd` · `head_pad_h16`/`head_unpad` · `add_bias_rows` · `gelu_quick`/`gelu_erf` ·
-`f16_pad2d`. Diffusion decode: `i4`/`w4a8_decode`/`nvfp4_decode`. Vision: `rope_vision` ·
-`rope_vision_gemma4` · `gelu_quick_mul`. Plus `im2col`, dtype-pad converts, `dequant_*_f16`, and
-the rope/norm/act kernels.
+Still hand PTX in `elt.zig`: `qk_rmsnorm_par` (the one-row decode norm) · `attn_cross` ·
+`attn_batched` · `quantize_q8_1` · `w4a8_decode` · `nvfp4_decode` · `f32_to_q8_0` · `im2col3d` ·
+`gdn_delta_step` · the graph-capture `decode_state` set (embed gathers, rope/attention/KV-append
+variants reading `g_state`). Every other elementwise, conversion, dequant and row kernel is the
+dual-target module above.
 
 ### cuda — vendor libs (`.libs` mode)
 
@@ -1323,9 +1358,8 @@ Delete a row when it closes.
 | `warmWeights` is qwen35-only | qwen3, gemma3 and gemma4 charge the lazy weight upload to their prefill timer. ~30 lines each, mirroring their own `layerDeviceBytes`. |
 | No Vulkan ViT except gemma3 | `vit35`, `gemma4_vit`, `gemma4v_vit` are CPU/CUDA only. |
 | No Vulkan gemma4 | `Spec.Vulkan = void`; `--backend vulkan` is rejected for the arch. |
-| Vulkan block-quant embedding | rejected in `llm_main.zig` — no block-quant gather kernel, so an f16/bf16 embed table is required. |
 | No dp4a decode GEMV for iq4_xs | `lin_llm_cuda` sends it through the f32 `gemv_iq4_xs`; gemma3 12B IQ4_XS decodes at 28 tok/s where Q4_K_M does 58. A `gemv_iq4_xs_q8n` twin is the fix, and `quantQ8NSupported` is the one place to declare it. |
-| Vulkan block quants are q8_0/q4_k/q5_k/q6_k/iq4_nl only | q4_0, iq4_xs, q1_0 and q2_0 are refused by name at load (`lin_llm_gpu.plan`); each needs a `gemv_*_t` and a `dequant_*` kernel. |
+| Vulkan q4_0 / iq4_xs / q1_0 / q2_0 decode is the dequant GEMM | `Context.dequantOnly`: the whole weight is dequantized per token (gemma3 12B IQ4_XS 0.8 tok/s). A shared subgroup-per-row GEMV over the raw ggml layout in `dual/` gives them a real decode kernel on both arms. |
 | Vulkan dp4a decode is opt-in | `TP_VK_DP4A=1`; the repacked int8 weight roughly doubles VRAM, so it stays opt-in until VRAM-aware auto-sizing lands. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
 | `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |

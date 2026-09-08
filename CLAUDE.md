@@ -131,6 +131,10 @@ A model architecture is normally three files: `foo.zig` (CPU reference and the l
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path
 and differ only in whether GEMM/attention route to the vendor libraries).
 
+**A plain elementwise kernel is written once, in `src/gpu/kernels/dual.zig`**, which compiles
+to SPIR-V and to PTX and so reaches every GPU arm; only kernels needing shared memory or a
+subgroup reduce still live per backend (`gpu/kernels/eltwise.zig`, `gpu/cuda/elt.zig`).
+
 **An LLM stepper names no weight dtype.** `models/lin_llm_cuda.zig` and
 `models/lin_llm_gpu.zig` are the one linear dispatcher per backend, routing each weight by
 storage, shape and row count (decode GEMV, grouped GEMV, MMQ, dequant GEMM). Every `Model`

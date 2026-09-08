@@ -134,6 +134,8 @@ pub const Lin = struct {
         std.debug.assert(m >= 1);
         switch (lin.kindOf(w.dtype)) {
             .blockq => {
+                // No decode GEMV for these: the dequant GEMM at every row count, or nothing.
+                if (gpu.Context.dequantOnly(w.dtype)) return if (self.gemm_prefill) .gemm_quant else null;
                 if (!quantKernel(w.dtype)) return null;
                 // A Vulkan buffer is an opaque handle, so a GEMV cannot step through the
                 // rows of `x`: a batch needs the GEMM or nothing.
@@ -160,8 +162,8 @@ pub const Lin = struct {
         std.debug.assert(m == 1 or r == .gemm_quant or r == .gemv_dense4 or r == .gemm_dense);
         switch (r) {
             .gemm_quant => {
-                std.debug.assert(y_off == 0 and w.rows <= self.zero_bias.len);
-                try ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, self.zero_bias, self.dp4aRepack(w.dtype));
+                std.debug.assert(w.rows <= self.zero_bias.len);
+                try ctx.opMatmulCoopQuant(w.dtype, y, y_off, x, m, w.bytes, w.rows, w.cols, w.scale, self.zero_bias, self.dp4aRepack(w.dtype));
             },
             .gemv_dense4 => {
                 std.debug.assert(y_off == 0);
@@ -231,7 +233,12 @@ pub const Lin = struct {
     /// `check`, logging the refusal under `who` and returning it as an error.
     pub fn plan(self: *const Lin, lins: []const Weight, prefill_rows: usize, who: []const u8) error{UnsupportedCheckpoint}!void {
         switch (self.check(lins, prefill_rows)) {
-            .ok => {},
+            .ok => {
+                for (lins) |w| if (gpu.Context.dequantOnly(w.dtype)) {
+                    std.log.info("{s}: {t} has no Vulkan decode GEMV; every GEMM dequantizes the weight (slow, but it runs)", .{ who, w.dtype });
+                    break;
+                };
+            },
             .refused => |r| {
                 switch (r.why) {
                     .no_kernel => std.log.err("{s}: {s} is {t}, which the Vulkan backend has no kernel for", .{ who, r.tag, r.dtype }),
@@ -245,9 +252,10 @@ pub const Lin = struct {
 
 // --- tests -----------------------------------------------------------------
 
-test "quantKernel names the five formats the Vulkan dequant kernels have" {
-    for ([_]DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| try std.testing.expect(quantKernel(dt));
-    for ([_]DType{ .q4_0, .iq4_xs, .q2_k, .q1_0, .q2_0_g128, .bf16 }) |dt| try std.testing.expect(!quantKernel(dt));
+test "quantKernel names the five formats the Vulkan decode GEMV has; the rest of the dequantizers are dequant-only" {
+    for ([_]DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| try std.testing.expect(quantKernel(dt) and !gpu.Context.dequantOnly(dt));
+    for ([_]DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 }) |dt| try std.testing.expect(!quantKernel(dt) and gpu.Context.dequantOnly(dt));
+    for ([_]DType{ .q2_k, .bf16 }) |dt| try std.testing.expect(!quantKernel(dt) and !gpu.Context.dequantOnly(dt));
 }
 
 test "wcode reads bf16 and fp8 natively and everything else as f32" {

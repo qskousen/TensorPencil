@@ -290,6 +290,49 @@ asm volatile (
 - Note: the Zig SPIR-V backend **segfaults compiling a single-kernel module**
   that uses a subgroup/dp4a inline-asm op; the same kernel compiles fine in a
   multi-kernel module. Park such probes alongside other kernels (e.g. `dp4a.zig`).
+- The backend also **segfaults on a real function call from a kernel into a
+  function that reads or writes a storage buffer** (a helper taking a zero-sized
+  struct, or no argument at all, both crash). Mark every such helper `inline`;
+  then the same code compiles. `kernels/dual.zig` relies on this.
+- A `[*]addrspace(.storage_buffer) f32` many-pointer cannot be indexed ("cannot
+  access element of logical pointer"); index the extern struct's array directly.
+- **The NVIDIA driver's SPIR-V compiler (580) segfaults at `CreateComputePipelines`**
+  on a kernel whose loop body issues eight strided storage-buffer loads and then
+  eight stores (an unrolled load-then-store apply), whether the temporaries are a
+  local array, flat arrays or plain SSA values. The same unroll with loads only
+  (`dual/rows.zig` `stridedSum`) compiles and runs. `te-test` on the vulkan arm is
+  the quickest bring-up probe: the crash is a SEGV inside `libnvidia-glvkspirv`
+  before any kernel runs.
+
+## NVPTX kernels: `export` + `callconv(.nvptx_kernel)` dies in LLVM (0.16.0)
+
+- `zig build-obj -target nvptx64-cuda -mcpu=sm_86 -femit-asm=k.ptx -fno-emit-bin`
+  aborts with `LLVM ERROR: NVPTX aliasee must be a non-kernel function definition`
+  for ANY exported kernel, every optimize mode, `@export` included. The LLVM
+  backend emits the function as `define private ptx_kernel @mod.name` plus
+  `@name = alias ... @mod.name`, and NVPTX refuses an alias to a kernel. Open
+  upstream issue; no in-language workaround.
+- Working route with no extra tools: `-femit-llvm-ir=k.ll -fno-emit-bin
+  -fno-emit-asm` succeeds; drop the alias line and rename the private function
+  to the exported name (make it non-private); then Zig's bundled clang lowers
+  it: `zig cc -target nvptx64-cuda -O3 k.ll -S -o k.ptx` (`.ll` is picked by
+  extension; `-x ir` is rejected by the wrapper). `ptxas -arch=sm_86` accepts
+  the result. The box's `llc-18` does not: 0.16 emits LLVM 21 syntax
+  (`captures(none)`).
+- `@exp` has no libcall on nvptx ("no libcall available for fexp"); use
+  `@exp2(x * log2e)`, which lowers to `ex2.approx` like the hand PTX does.
+- A kernel `[*]addrspace(.global) f32` parameter comes out as
+  `.param .u64 .ptr .global`, and scalar params in order, so a Zig kernel taking
+  `(a, b, c, d, u0..u5, f0, f1)` matches `cuda/elt.zig`'s launcher ABI as is.
+- Thread index: `@workGroupId(0) * @workGroupSize(0) + @workItemId(0)`
+  (`std.gpu.global_invocation_id` is SPIR-V only).
+- In build.zig this is `b.addObject` for `nvptx64-cuda` (only `getEmittedLlvmIr()`
+  requested, so the step passes `-fno-emit-bin` itself), a run of
+  `tools/ptx_unalias.zig`, then `b.addSystemCommand` with `zig cc`. Under `zig cc`
+  the PTX ISA version follows Zig's CPU model (7.1 for sm_86); add
+  `-Xclang -target-feature -Xclang +ptx80` to get the 8.0 the hand kernels use.
+  The box's `ptxas` (12.x) rejects the 8.7 that `zig clang -march=sm_86` emits;
+  the driver JIT would take it.
 
 ## `@min`/`@max` with a comptime bound narrows the result type
 

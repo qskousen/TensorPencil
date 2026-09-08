@@ -140,6 +140,7 @@ fn norm(ctx: *Context, src: *const DeviceBuffer, dst: *DeviceBuffer, n: usize, g
         .u0 = @intCast(n),
         .u1 = @intCast(c),
         .u2 = @intFromBool(silu),
+        .f0 = 1e-12,
     }, n, 1, 1);
 }
 

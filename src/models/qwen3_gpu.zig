@@ -450,11 +450,8 @@ pub const VulkanLM = struct {
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
         const c = lm.cfg;
         if (c.n_layers > qwen3.Config.max_layers) return error.UnsupportedModelConfig;
-        // The embedding table is host-gathered into an f32 copy, bf16 / f16
-        // only (no Vulkan block-quant gather kernel; those checkpoints run on
-        // cpu / zig-cuda / cuda).
-        if (lm.embed.dtype != .bf16 and lm.embed.dtype != .f16)
-            return error.UnsupportedModelConfig;
+        // The embedding table is host-gathered into an f32 copy, so any dtype
+        // `qwen3.embedTokens` converts works here, block quants included.
         // Block-quant head (llama/Mistral) => per-row GEMV everything. A dense
         // model must use the tied bf16 embedding as its LM head (the 4-chunk
         // head path reads `embed_f32`, which assumes head == embed).

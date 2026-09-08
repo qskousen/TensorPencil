@@ -27,6 +27,8 @@ const eltwise_spv = @embedFile("eltwise_spv");
 const attn_batched_spv = @embedFile("attn_batched_spv");
 const dp4a_spv = @embedFile("dp4a_spv");
 const subgroup_spv = @embedFile("subgroup_spv");
+const dual_spv = @embedFile("dual_spv");
+const dual_table = @import("kernels/dual_table.zig");
 
 /// Push constants for the standalone `attn_batched` kernel (matches the Push
 /// struct in kernels/attn_batched.zig: u0=total, u1=n_heads, u2=n_kv, u3=hd,
@@ -380,88 +382,83 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, layernorm_h16, ln_mod, l2norm_rows_g };
 const elt_entry_sizes = [_]EntrySize{
-    .{ .name = "rmsnorm", .x = 64, .y = 1 },
-    .{ .name = "rms_partial", .x = 256, .y = 1 },
-    .{ .name = "rms_combine", .x = 256, .y = 1 },
-    .{ .name = "rms_apply_mod", .x = 256, .y = 1 },
-    .{ .name = "rms_apply_mod_h16", .x = 256, .y = 1 },
-    .{ .name = "modulate", .x = 256, .y = 1 },
-    .{ .name = "gated_add", .x = 256, .y = 1 },
-    .{ .name = "add", .x = 256, .y = 1 },
-    .{ .name = "silu_mul", .x = 256, .y = 1 },
-    .{ .name = "sigmoid_mul", .x = 256, .y = 1 },
-    .{ .name = "silu_mul_h16", .x = 256, .y = 1 },
-    .{ .name = "sigmoid_mul_h16", .x = 256, .y = 1 },
-    .{ .name = "rope_inter", .x = 256, .y = 1 },
-    .{ .name = "attention", .x = 4, .y = 64 },
-    .{ .name = "gather_kmajor", .x = 256, .y = 1 },
-    .{ .name = "gather_kmajor_h16", .x = 256, .y = 1 },
+    dualEntry("rmsnorm"),
+    dualEntry("rms_partial"),
+    dualEntry("rms_combine"),
+    dualEntry("rms_apply_mod"),
+    dualEntry("rms_apply_mod_h16"),
+    dualEntry("modulate"),
+    dualEntry("gated_add"),
+    dualEntry("add"),
+    dualEntry("silu_mul"),
+    dualEntry("sigmoid_mul"),
+    dualEntry("silu_mul_h16"),
+    dualEntry("sigmoid_mul_h16"),
+    dualEntry("rope_inter"),
+    dualEntry("gather_kmajor"),
+    dualEntry("gather_kmajor_h16"),
     .{ .name = "attn_scores", .x = 16, .y = 16 },
-    .{ .name = "softmax_partial", .x = 256, .y = 1 },
-    .{ .name = "softmax_combine", .x = 256, .y = 1 },
-    .{ .name = "softmax_rows", .x = 64, .y = 1 },
+    dualEntry("softmax_partial"),
+    dualEntry("softmax_combine"),
     .{ .name = "attn_out", .x = 16, .y = 16 },
-    .{ .name = "f32_to_h16", .x = 256, .y = 1 },
-    .{ .name = "f32_to_h16_pad", .x = 256, .y = 1 },
-    .{ .name = "vae_norm", .x = 64, .y = 1 },
-    .{ .name = "im2col", .x = 256, .y = 1 },
-    .{ .name = "bias_compact", .x = 256, .y = 1 },
-    .{ .name = "qknorm_rope16", .x = 64, .y = 1 },
-    .{ .name = "gather_kmajor16", .x = 256, .y = 1 },
-    .{ .name = "silu_mul16", .x = 256, .y = 1 },
-    .{ .name = "sigmoid_mul_g16", .x = 256, .y = 1 },
-    .{ .name = "gated_add16", .x = 256, .y = 1 },
-    .{ .name = "rope_half", .x = 256, .y = 1 },
-    .{ .name = "copy", .x = 256, .y = 1 },
-    .{ .name = "rotate", .x = 256, .y = 1 },
+    dualEntry("f32_to_h16"),
+    dualEntry("f32_to_h16_pad"),
+    dualEntry("vae_norm"),
+    dualEntry("im2col"),
+    dualEntry("bias_compact"),
+    dualEntry("qknorm_rope16"),
+    dualEntry("gather_kmajor16"),
+    dualEntry("silu_mul16"),
+    dualEntry("sigmoid_mul_g16"),
+    dualEntry("gated_add16"),
+    dualEntry("rope_half"),
+    dualEntry("copy"),
     .{ .name = "rotate_fwht", .x = 64, .y = 1 },
-    .{ .name = "rowmax_i8", .x = 64, .y = 1 },
-    .{ .name = "rowscale_i8", .x = 64, .y = 1 },
-    .{ .name = "quantize_i8", .x = 256, .y = 1 },
+    dualEntry("rowmax_i8"),
+    dualEntry("rowscale_i8"),
+    dualEntry("quantize_i8"),
     .{ .name = "w4a8_decode_t", .x = 256, .y = 1 },
     .{ .name = "i4_decode_t", .x = 256, .y = 1 },
     .{ .name = "nvfp4_decode_t", .x = 256, .y = 1 },
-    .{ .name = "scale_i32", .x = 256, .y = 1 },
-    .{ .name = "scale_concat", .x = 256, .y = 1 },
-    .{ .name = "qknorm_rope_f32", .x = 64, .y = 1 },
-    .{ .name = "rms_apply_w", .x = 256, .y = 1 },
+    dualEntry("scale_i32"),
+    dualEntry("scale_concat"),
+    dualEntry("qknorm_rope_f32"),
+    dualEntry("rms_apply_w"),
     .{ .name = "attn_dsplit", .x = 256, .y = 1 },
     .{ .name = "attn_dmerge", .x = 256, .y = 1 },
     .{ .name = "gemv_partial", .x = 256, .y = 1 },
-    .{ .name = "gemv_combine", .x = 256, .y = 1 },
+    dualEntry("gemv_combine"),
     .{ .name = "gemv_partial4", .x = 256, .y = 1 },
-    .{ .name = "gemv_combine4", .x = 256, .y = 1 },
+    dualEntry("gemv_combine4"),
     .{ .name = "gemv_q8_0", .x = 256, .y = 1 },
     .{ .name = "gemv_q4_k", .x = 256, .y = 1 },
     .{ .name = "gemv_q5_k", .x = 256, .y = 1 },
     .{ .name = "gemv_q6_k", .x = 256, .y = 1 },
-    .{ .name = "l2norm_rows", .x = 64, .y = 1 },
-    .{ .name = "deinterleave2", .x = 256, .y = 1 },
-    .{ .name = "gdn_gates", .x = 32, .y = 1 },
-    .{ .name = "gdn_conv_step", .x = 256, .y = 1 },
+    dualEntry("l2norm_rows"),
+    dualEntry("deinterleave2"),
+    dualEntry("gdn_gates"),
+    dualEntry("gdn_conv_step"),
     .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
-    .{ .name = "rope_qwen35", .x = 256, .y = 1 },
-    .{ .name = "attn_decode_q35", .x = 16, .y = 1 },
     .{ .name = "attn_dsplit_gemma", .x = 256, .y = 1 },
     .{ .name = "gemv_q6_k_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q8_0_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q4_k_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q5_k_t", .x = 256, .y = 1 },
-    .{ .name = "gelu_mul", .x = 256, .y = 1 },
-    .{ .name = "gelu", .x = 256, .y = 1 },
-    .{ .name = "layernorm", .x = 64, .y = 1 },
+    dualEntry("gelu_mul"),
+    dualEntry("gelu"),
+    dualEntry("layernorm"),
     .{ .name = "attn_full", .x = 64, .y = 1 },
-    .{ .name = "f32_to_bf16_pad", .x = 256, .y = 1 },
-    .{ .name = "relu", .x = 256, .y = 1 },
-    .{ .name = "add_relu", .x = 256, .y = 1 },
-    .{ .name = "argmax_reduce", .x = 256, .y = 1 },
-    .{ .name = "argmax_final", .x = 64, .y = 1 },
-    .{ .name = "topk_reduce", .x = 256, .y = 1 },
+    dualEntry("f32_to_bf16_pad"),
+    dualEntry("relu"),
+    dualEntry("add_relu"),
+    dualEntry("argmax_reduce"),
+    dualEntry("argmax_final"),
+    dualEntry("topk_reduce"),
     .{ .name = "attn_dsplit_gemma_f16", .x = 256, .y = 1 },
-    .{ .name = "kv_store_f16", .x = 256, .y = 1 },
-    .{ .name = "penalize", .x = 256, .y = 1 },
+    dualEntry("kv_store_f16"),
+    dualEntry("penalize"),
     .{ .name = "attn_dsplit_gemma_q8", .x = 256, .y = 1 },
     .{ .name = "kv_store_q8_0", .x = 256, .y = 1 },
     .{ .name = "gemv_iq4_nl", .x = 256, .y = 1 },
@@ -471,32 +468,96 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "dequant_q5_k_f32", .x = 256, .y = 1 },
     .{ .name = "dequant_q6_k_f32", .x = 256, .y = 1 },
     .{ .name = "dequant_iq4_nl_f32", .x = 256, .y = 1 },
-    .{ .name = "pack_h16_kmajor", .x = 256, .y = 1 },
-    .{ .name = "gn_stats", .x = 256, .y = 1 },
-    .{ .name = "gn_combine", .x = 32, .y = 1 },
-    .{ .name = "gn_apply", .x = 256, .y = 1 },
-    .{ .name = "silu", .x = 256, .y = 1 },
-    .{ .name = "geglu", .x = 256, .y = 1 },
-    .{ .name = "concat_ch", .x = 256, .y = 1 },
+    dualEntry("pack_h16_kmajor"),
+    dualEntry("gn_stats"),
+    dualEntry("gn_combine"),
+    dualEntry("gn_apply"),
+    dualEntry("silu"),
+    dualEntry("geglu"),
+    dualEntry("concat_ch"),
     .{ .name = "attn_cross", .x = 64, .y = 1 },
-    .{ .name = "head_pad_h16", .x = 256, .y = 1 },
-    .{ .name = "head_unpad", .x = 256, .y = 1 },
-    .{ .name = "im2col_sd", .x = 256, .y = 1 },
-    // CLIP's text tower (`clip_text_gpu`): causal self-attention batched over prompt
-    // chunks, and the two GELU forms its two towers use. Appended rather than grouped
-    // with their non-causal siblings above because `Elt` is indexed by
-    // `@intFromEnum` into this table, inserting mid-list silently renames kernels.
+    dualEntry("head_pad_h16"),
+    dualEntry("head_unpad"),
+    dualEntry("im2col_sd"),
     .{ .name = "attn_causal_batched", .x = 64, .y = 1 },
-    .{ .name = "gelu_quick", .x = 256, .y = 1 },
-    .{ .name = "gelu_erf", .x = 256, .y = 1 },
-    // f16 activation-storage twins for the VAE decode (see eltwise.zig).
-    .{ .name = "gn_stats_h16", .x = 256, .y = 1 },
-    .{ .name = "gn_apply_h16", .x = 256, .y = 1 },
-    .{ .name = "add_h16", .x = 256, .y = 1 },
-    .{ .name = "bias_compact_h16", .x = 256, .y = 1 },
-    .{ .name = "im2col_sd_h16", .x = 256, .y = 1 },
-    .{ .name = "h16_to_h16_pad", .x = 256, .y = 1 },
-    .{ .name = "scale_f32", .x = 256, .y = 1 },
+    dualEntry("gelu_quick"),
+    dualEntry("gelu_erf"),
+    dualEntry("gn_stats_h16"),
+    dualEntry("gn_apply_h16"),
+    dualEntry("add_h16"),
+    dualEntry("bias_compact_h16"),
+    dualEntry("im2col_sd_h16"),
+    dualEntry("h16_to_h16_pad"),
+    dualEntry("scale_f32"),
+    dualEntry("add_scaled"),
+    dualEntry("gelu_quick_mul"),
+    dualEntry("geglu_h16"),
+    dualEntry("softplus_gate"),
+    dualEntry("rope_half_pos"),
+    dualEntry("rope_half_part"),
+    dualEntry("deinterleave3"),
+    dualEntry("gdn_gates_batch"),
+    dualEntry("gdn_conv_batch"),
+    dualEntry("gdn_conv_state"),
+    dualEntry("head_pad"),
+    dualEntry("gather_head"),
+    dualEntry("gather_vt"),
+    dualEntry("scatter_head"),
+    dualEntry("gather_head_b"),
+    dualEntry("gather_vt_b"),
+    dualEntry("scatter_head_b"),
+    dualEntry("bf16_to_h16_pad"),
+    dualEntry("f16_to_f32"),
+    dualEntry("bias_add_f16"),
+    dualEntry("bias_add_h16"),
+    dualEntry("add_bias_rows"),
+    dualEntry("add_bias_rows_h16"),
+    dualEntry("gather_rows"),
+    dualEntry("scatter_add_rows"),
+    dualEntry("moe_combine"),
+    dualEntry("rope_imrope"),
+    dualEntry("rope_imrope_pos"),
+    dualEntry("rope_vision"),
+    dualEntry("rope_vision_gemma4"),
+    dualEntry("im2col1d"),
+    dualEntry("aa_up_snake"),
+    dualEntry("aa_down"),
+    dualEntry("convt1d_ca"),
+    dualEntry("snake1d_ca"),
+    dualEntry("mean_heads_pool"),
+    dualEntry("dequant_fp8_f16"),
+    dualEntry("dequant_fp8_bf16"),
+    dualEntry("dequant_fp8_f32"),
+    dualEntry("dequant_q8_0_f16"),
+    dualEntry("dequant_q8_0_bf16"),
+    dualEntry("dequant_q4_0_f16"),
+    dualEntry("dequant_q4_0_bf16"),
+    dualEntry("dequant_q4_0_f32"),
+    dualEntry("dequant_q1_0_f16"),
+    dualEntry("dequant_q1_0_bf16"),
+    dualEntry("dequant_q1_0_f32"),
+    dualEntry("dequant_q2_0_g64_f16"),
+    dualEntry("dequant_q2_0_g64_bf16"),
+    dualEntry("dequant_q2_0_g64_f32"),
+    dualEntry("dequant_q2_0_g128_f16"),
+    dualEntry("dequant_q2_0_g128_bf16"),
+    dualEntry("dequant_q2_0_g128_f32"),
+    dualEntry("dequant_iq4_nl_f16"),
+    dualEntry("dequant_iq4_nl_bf16"),
+    dualEntry("dequant_iq4_xs_f16"),
+    dualEntry("dequant_iq4_xs_bf16"),
+    dualEntry("dequant_iq4_xs_f32"),
+    dualEntry("dequant_q4_k_f16"),
+    dualEntry("dequant_q4_k_bf16"),
+    dualEntry("dequant_q5_k_f16"),
+    dualEntry("dequant_q5_k_bf16"),
+    dualEntry("dequant_q6_k_f16"),
+    dualEntry("dequant_q6_k_bf16"),
+    dualEntry("group_rmsnorm"),
+    dualEntry("rms_mod"),
+    dualEntry("layernorm_h16"),
+    dualEntry("ln_mod"),
+    dualEntry("l2norm_rows_g"),
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -535,7 +596,33 @@ pub const Error = error{
 /// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
 /// logical addressing, no workgroup ArrayStrides, see spv.zig) and create
 /// the module. All listed entry points get the same workgroup size.
-const EntrySize = struct { name: []const u8, x: u32, y: u32 };
+/// Which compiled module holds an `Elt` entry: eltwise.zig, or the dual-target
+/// dual.zig that the CUDA backend launches from the same source.
+const EltSrc = enum { eltwise, dual };
+const EntrySize = struct { name: []const u8, x: u32, y: u32, src: EltSrc = .eltwise, rows: bool = false };
+
+fn eltEntriesOf(comptime src: EltSrc) [eltEntryCount(src)]EntrySize {
+    var out: [eltEntryCount(src)]EntrySize = undefined;
+    var n: usize = 0;
+    for (elt_entry_sizes) |es| {
+        if (es.src == src) {
+            out[n] = es;
+            n += 1;
+        }
+    }
+    return out;
+}
+fn eltEntryCount(comptime src: EltSrc) usize {
+    var n: usize = 0;
+    for (elt_entry_sizes) |es| n += @intFromBool(es.src == src);
+    return n;
+}
+fn dualEntry(comptime name: [:0]const u8) EntrySize {
+    const t = dual_table.get(name);
+    return .{ .name = name, .x = t.wg, .y = 1, .src = .dual, .rows = t.kind == .rows };
+}
+const eltwise_entries = eltEntriesOf(.eltwise);
+const dual_entries = eltEntriesOf(.dual);
 
 fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, code: []const u8, entries: []const EntrySize, caps: []const u32, ext: ?[]const u8, out: *vk.ShaderModule) Error!void {
     var current = try gpa.alignedAlloc(u8, .of(u32), code.len);
@@ -817,6 +904,7 @@ pub const Context = struct {
     pipe_repack_iq4_nl: vk.Pipeline, // raw iq4_nl -> int8-interleaved dp4a layout (LUT pre-applied)
     pipeline_layout_e: vk.PipelineLayout,
     shader_e: vk.ShaderModule,
+    shader_dual: vk.ShaderModule,
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
     /// int8 dp4a block-quant decode GEMV, present iff the device supports
     /// VK_KHR_shader_integer_dot_product. Pipelines: [0] quant_act_i8,
@@ -833,12 +921,12 @@ pub const Context = struct {
     /// within a subgroup, no workgroup storage (the NVIDIA-safe escape hatch).
     /// Built whenever subgroup arithmetic is available (core Vulkan 1.1); null
     /// on the rare device that rejects the module.
-    /// [0] subgroup_sum (capability probe), [1] rmsnorm_sg, [2] gemv_q8_0_sg,
-    /// [3] gemv_q4_k_sg, [4] gemv_q5_k_sg, [5] gemv_q6_k_sg, [6] gemv_iq4_nl_sg,
-    /// [7] attn_decode_sg (folded flash-decode attention),
-    /// [8] ln_mod_sg (fused weightless LayerNorm + AdaLN modulation).
+    /// [0] subgroup_sum (capability probe), [1] gemv_q8_0_sg, [2] gemv_q4_k_sg,
+    /// [3] gemv_q5_k_sg, [4] gemv_q6_k_sg, [5] gemv_iq4_nl_sg,
+    /// [6] attn_decode_sg (folded flash-decode attention). The norms live in the
+    /// dual-target module now.
     shader_sg: vk.ShaderModule = .null_handle,
-    pipe_sg: [9]vk.Pipeline = @splat(.null_handle),
+    pipe_sg: [7]vk.Pipeline = @splat(.null_handle),
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
     // module, which is at the SPIR-V backend's per-module entry-point limit.
@@ -1353,8 +1441,13 @@ pub const Context = struct {
             .{ .name = "repack_iq4_nl", .x = 256, .y = 1 },
         }, &.{}, null, &shader_tr);
         var shader_e: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, eltwise_spv, &elt_entry_sizes, &.{}, null, &shader_e);
+        try createKernelModule(gpa, &d, device, eltwise_spv, &eltwise_entries, &.{}, null, &shader_e);
         errdefer d.DestroyShaderModule(device, shader_e, null);
+        var shader_dual: vk.ShaderModule = .null_handle;
+        // Subgroup reductions (`sgSum`/`sgMax`) are inline asm; the caps are core 1.1.
+        const dual_caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
+        try createKernelModule(gpa, &d, device, dual_spv, &dual_entries, &dual_caps, null, &shader_dual);
+        errdefer d.DestroyShaderModule(device, shader_dual, null);
         errdefer d.DestroyShaderModule(device, shader_tr, null);
 
         var dsl: vk.DescriptorSetLayout = .null_handle;
@@ -1476,7 +1569,11 @@ pub const Context = struct {
             for (&infos, elt_entry_sizes, 0..) |*info, es, i| {
                 @memset(&names[i], 0);
                 @memcpy(names[i][0..es.name.len], es.name);
-                info.* = .{ .stage = .{ .module = shader_e, .p_name = @ptrCast(&names[i]) }, .layout = pipeline_layout_e };
+                const module = switch (es.src) {
+                    .eltwise => shader_e,
+                    .dual => shader_dual,
+                };
+                info.* = .{ .stage = .{ .module = module, .p_name = @ptrCast(&names[i]) }, .layout = pipeline_layout_e };
             }
             try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes_e));
         }
@@ -1545,14 +1642,13 @@ pub const Context = struct {
         // workgroup memory. Subgroup arithmetic is core
         // Vulkan 1.1: only the module capabilities are injected, no extension
         // and no device feature. Independent of has_int_dot. A failure here just
-        // leaves the subgroup pipelines null (callers fall back to the multi-pass
-        // eltwise path), never failing device bring-up.
+        // leaves the subgroup pipelines null (the opt-in subgroup GEMVs stay off),
+        // never failing device bring-up.
         var shader_sg: vk.ShaderModule = .null_handle;
-        var pipe_sg: [9]vk.Pipeline = @splat(vk.Pipeline.null_handle);
+        var pipe_sg: [7]vk.Pipeline = @splat(vk.Pipeline.null_handle);
         sg: {
             const sg_entries = [_]EntrySize{
                 .{ .name = "subgroup_sum", .x = 32, .y = 1 },
-                .{ .name = "rmsnorm_sg", .x = 32, .y = 1 },
                 // gemv_*_sg: 256-thread workgroups = 8 subgroups each (one row
                 // per subgroup, row = gid/32) so the SM stays occupied, a
                 // 32-thread (1-warp) workgroup runs at ~1/8 occupancy.
@@ -1564,28 +1660,23 @@ pub const Context = struct {
                 // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
                 // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
                 .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
-                // ln_mod_sg: one row per subgroup, 8 subgroups per workgroup,
-                // same reasoning as the gemv_*_sg entries above.
-                .{ .name = "ln_mod_sg", .x = 256, .y = 1 },
             };
             const caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
             createKernelModule(gpa, &d, device, subgroup_spv, &sg_entries, &caps, null, &shader_sg) catch |e| {
-                std.log.warn("subgroup module unavailable ({t}); norms use the multi-pass path", .{e});
+                std.log.warn("subgroup module unavailable ({t}); the opt-in subgroup GEMVs are off", .{e});
                 break :sg;
             };
-            const infos = [9]vk.ComputePipelineCreateInfo{
+            const infos = [7]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_sg, .p_name = "subgroup_sum" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "rmsnorm_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q8_0_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q4_k_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q5_k_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q6_k_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_nl_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "attn_decode_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "ln_mod_sg" }, .layout = pipeline_layout_e },
             };
             if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_sg) != .success) {
-                std.log.warn("subgroup pipelines unavailable; norms use the multi-pass path", .{});
+                std.log.warn("subgroup pipelines unavailable; the opt-in subgroup GEMVs are off", .{});
                 for (pipe_sg) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
                 pipe_sg = @splat(vk.Pipeline.null_handle);
                 d.DestroyShaderModule(device, shader_sg, null);
@@ -2028,6 +2119,7 @@ pub const Context = struct {
             .pipe_repack_iq4_nl = pipes_tr[7],
             .pipeline_layout_e = pipeline_layout_e,
             .shader_e = shader_e,
+            .shader_dual = shader_dual,
             .pipes_e = pipes_e,
             .has_int_dot = has_int_dot,
             .shader_dp4a = shader_dp4a,
@@ -2181,6 +2273,7 @@ pub const Context = struct {
             self.d.DestroyShaderModule(self.device, self.shader_sg, null);
         }
         self.d.DestroyShaderModule(self.device, self.shader_e, null);
+        self.d.DestroyShaderModule(self.device, self.shader_dual, null);
         self.d.DestroyPipeline(self.device, self.pipe_ab, null);
         self.d.DestroyPipelineLayout(self.device, self.pipeline_layout_ab, null);
         self.d.DestroyShaderModule(self.device, self.shader_ab, null);
@@ -3037,7 +3130,7 @@ pub const Context = struct {
     /// Partial rotate-half RoPE over the first rope_dim head dims (text-only
     /// decode). qk in place; freqs = cos then sin at sin_off. half = rope_dim/2.
     pub fn opRopeQwen35(self: *Context, qk: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize, head_dim: usize, pos: usize) Error!void {
-        try self.opElt(.rope_qwen35, qk, null, freqs, null, .{ .u0 = @intCast(n_heads * half), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(head_dim), .u4 = @intCast(pos) }, n_heads * half, 1, 1);
+        try self.opElt(.rope_half_part, qk, null, freqs, null, .{ .u0 = @intCast(n_heads * half), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(n_heads), .u4 = @intCast(pos), .u5 = @intCast(head_dim) }, n_heads * half, 1, 1);
     }
     /// Causal GQA attention for one decode query (online softmax, one thread
     /// per query head). k/v caches: position j at j*(n_kv*hd) + kvh*hd.
@@ -3080,7 +3173,7 @@ pub const Context = struct {
 
     /// Whether the folded flash-decode attention (attn_decode_sg) built.
     pub fn hasAttnDecodeSg(self: *const Context) bool {
-        return self.pipe_sg[7] != .null_handle;
+        return self.pipe_sg[6] != .null_handle;
     }
 
     /// Folded flash-decode GQA attention (f32 KV): one subgroup per head, the
@@ -3088,7 +3181,7 @@ pub const Context = struct {
     /// separate merge dispatch (vs opAttnDecodeQ35's dsplit+dmerge). Same
     /// semantics: window/ring/kv_end as there. Requires hasAttnDecodeSg().
     pub fn opAttnDecodeSg(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize) Error!void {
-        std.debug.assert(self.pipe_sg[7] != .null_handle);
+        std.debug.assert(self.pipe_sg[6] != .null_handle);
         try self.opBegin();
         var set = self.bind4(.{ q.buf, k_cache.buf, v_cache.buf, out.buf });
         const push: EltPush = .{
@@ -3101,7 +3194,7 @@ pub const Context = struct {
             .f1 = @bitCast(@as(u32, @intCast(ring))),
             .u6 = @intCast(kv_end),
         };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[7]);
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[6]);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
         // LocalSize 32 = one subgroup per workgroup, one head per subgroup.
@@ -4422,6 +4515,16 @@ pub const Context = struct {
 
     /// Bytes per weight row for a block-quant dtype at `cols` elements (the
     /// row stride the 32-row-group transpose / dequant kernels assume).
+    /// Block-quant formats with no Vulkan decode GEMV: they run through
+    /// `opMatmulCoopQuant` at every row count, dequantized per call. Slow, but the
+    /// checkpoint loads.
+    pub fn dequantOnly(dt: @import("tp_core").dtype.DType) bool {
+        return switch (dt) {
+            .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            else => false,
+        };
+    }
+
     fn quantRowBytes(dt: @import("tp_core").dtype.DType, cols: usize) usize {
         return switch (dt) {
             .q8_0 => (cols / 32) * 34,
@@ -4454,6 +4557,23 @@ pub const Context = struct {
                 .u1 = @intCast(cols),
                 .u2 = @intCast(rows),
             }, units);
+        } else if (dequantOnly(dt)) {
+            // No transposed decode GEMV for this format: the weight stays RAW row-major
+            // and the shared per-element dequantizer (dual.zig) reads it. GGUF weights
+            // carry no per-tensor scale.
+            std.debug.assert(scale == 1.0);
+            const w_raw = try self.weightBufferRaw(w_bytes);
+            const w_db: DeviceBuffer = .{ .buf = w_raw, .mem = .null_handle, .size = 0 };
+            const entry: Elt = switch (dt) {
+                .q4_0 => .dequant_q4_0_f32,
+                .iq4_xs => .dequant_iq4_xs_f32,
+                .q1_0 => .dequant_q1_0_f32,
+                .q2_0_g64 => .dequant_q2_0_g64_f32,
+                .q2_0_g128 => .dequant_q2_0_g128_f32,
+                else => unreachable,
+            };
+            const elems = rows * cols;
+            try self.opElt(entry, w_db, self.deq_f32, null, null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
         } else {
             const row_bytes = quantRowBytes(dt, cols);
             const w_t = try self.weightBufferRawT(w_bytes, row_bytes);
@@ -4536,9 +4656,10 @@ pub const Context = struct {
         return out[0];
     }
 
-    /// Whether the one-pass subgroup RMSNorm (rmsnorm_sg) built on this device.
+    /// The weighted rmsnorm is a dual-target row kernel, present on every device.
     pub fn hasSubgroupNorm(self: *const Context) bool {
-        return self.pipe_sg[1] != .null_handle;
+        _ = self;
+        return true;
     }
 
     /// One-pass RMSNorm over [rows][dim] with a plain norm weight, via a single
@@ -4548,16 +4669,7 @@ pub const Context = struct {
     /// through global memory. Requires hasSubgroupNorm(). a = x, b = out,
     /// c = weight; each workgroup is 32 lanes (baked LocalSize) = one subgroup.
     pub fn opRmsNormSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
-        std.debug.assert(self.pipe_sg[1] != .null_handle);
-        const dummy = try self.dummyBuf();
-        try self.opBegin();
-        var set = self.bind4(.{ x.buf, out.buf, weight.buf, dummy });
-        const push: EltPush = .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[1]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows), 1, 1); // one 32-lane subgroup per row
-        try self.opEnd();
+        try self.opElt(.rmsnorm, x, out, weight, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
     }
 
     /// Whether this reduction width has a FUSED int8 prep kernel, rather than falling back to
@@ -4569,9 +4681,11 @@ pub const Context = struct {
         return self.pipe_i8_prep[i] != .null_handle;
     }
 
-    /// Whether the fused LayerNorm + AdaLN modulation (ln_mod_sg) built.
+    /// The fused LayerNorm + AdaLN modulation is a dual-target row kernel, present
+    /// on every device.
     pub fn hasLnModSg(self: *const Context) bool {
-        return self.pipe_sg[8] != .null_handle;
+        _ = self;
+        return true;
     }
 
     /// Fused weightless LayerNorm + AdaLN modulation over `[rows][dim]`:
@@ -4581,39 +4695,13 @@ pub const Context = struct {
     /// `premul` must already carry the `(1 + scale)` fold, the same convention
     /// `Backend.rmsMod` takes on the CUDA side, so one host-built table serves both
     /// backends. Requires `hasLnModSg()`.
-    pub fn opLnModSg(
-        self: *Context,
-        x: DeviceBuffer,
-        out: DeviceBuffer,
-        mod: DeviceBuffer,
-        rows: usize,
-        dim: usize,
-        premul_off: usize,
-        shift_off: usize,
-        eps: f32,
-    ) Error!void {
-        std.debug.assert(self.pipe_sg[8] != .null_handle);
-        const dummy = try self.dummyBuf();
-        try self.opBegin();
-        var set = self.bind4(.{ x.buf, out.buf, mod.buf, dummy });
-        const push: EltPush = .{
-            .u0 = @intCast(rows),
-            .u1 = @intCast(dim),
-            .u2 = @intCast(premul_off),
-            .u3 = @intCast(shift_off),
-            .f0 = eps,
-        };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[8]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        // 256-lane workgroups = 8 subgroups = 8 rows each.
-        self.d.CmdDispatch(self.cmd, @intCast((rows + 7) / 8), 1, 1);
-        try self.opEnd();
+    pub fn opLnModSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
+        try self.opElt(.ln_mod, x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
     }
 
     /// Whether the cooperative block-quant decode GEMV (gemv_q*_sg) is available.
     pub fn hasSubgroupGemv(self: *const Context) bool {
-        return self.pipe_sg[2] != .null_handle;
+        return self.pipe_sg[1] != .null_handle;
     }
 
     /// Cooperative block-quant decode GEMV: `y[rows] = scale * (dequant(W) @ x)`,
@@ -4635,11 +4723,11 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(cols % 32 == 0);
         const pipe_idx: usize = switch (dt) {
-            .q8_0 => 2,
-            .q4_k => 3,
-            .q5_k => 4,
-            .q6_k => 5,
-            .iq4_nl => 6,
+            .q8_0 => 1,
+            .q4_k => 2,
+            .q5_k => 3,
+            .q6_k => 4,
+            .iq4_nl => 5,
             else => return error.UnsupportedDType,
         };
         if (dt != .q8_0 and dt != .iq4_nl) std.debug.assert(cols % 256 == 0);
@@ -4933,9 +5021,11 @@ pub const Context = struct {
         self.d.CmdBindPipeline(self.cmd, .compute, self.pipes_e[@intFromEnum(which)]);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
+        // A row kernel takes its ROW count in total_x, one subgroup per row.
+        const gx = if (es.rows) dual_table.rowGroups(total_x) else std.math.divCeil(usize, total_x, es.x) catch unreachable;
         self.d.CmdDispatch(
             self.cmd,
-            @intCast(std.math.divCeil(usize, total_x, es.x) catch unreachable),
+            @intCast(gx),
             @intCast(std.math.divCeil(usize, @max(total_y, 1), es.y) catch unreachable),
             @intCast(@max(total_z, 1)),
         );
@@ -6734,6 +6824,75 @@ test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches refe
     var worst: f32 = 0;
     for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
     try std.testing.expect(worst <= 5e-3);
+}
+
+test "gpu dual-target eltwise kernels match an f64 reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xd0a1);
+    const rand = prng.random();
+    // Not a multiple of the 256-wide workgroup, so the tail guard is exercised.
+    const n: usize = 1000 * 257 + 13;
+    const a = try gpa.alloc(f32, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    const got = try gpa.alloc(f32, n);
+    defer gpa.free(got);
+    for (a) |*v| v.* = rand.floatNorm(f32) * 3.0;
+    for (b) |*v| v.* = rand.floatNorm(f32) * 3.0;
+
+    var da = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&da);
+    var db = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&db);
+    try ctx.tensorUpload(db, std.mem.sliceAsBytes(b));
+
+    const elts = [_]Elt{ .add, .silu_mul, .sigmoid_mul, .gelu };
+    for (elts) |op| {
+        try ctx.tensorUpload(da, std.mem.sliceAsBytes(a));
+        try ctx.opElt(op, da, db, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+        try ctx.tensorDownload(da, std.mem.sliceAsBytes(got));
+        var worst: f64 = 0;
+        for (a, b, got) |ai, bi, gi| {
+            const x: f64 = ai;
+            const y: f64 = bi;
+            const ref: f64 = switch (op) {
+                .add => ai + bi,
+                .silu_mul => x / (1.0 + @exp(-x)) * y,
+                .sigmoid_mul => x / (1.0 + @exp(-y)),
+                .gelu => x / (1.0 + @exp(-(1.5957691216057308 * (x + 0.044715 * x * x * x)))),
+                else => unreachable,
+            };
+            worst = @max(worst, @abs(@as(f64, gi) - ref) / (1.0 + @abs(ref)));
+        }
+        errdefer std.debug.print("{t}: max scaled err {e}\n", .{ op, worst });
+        const tol: f64 = if (op == .add) 0 else 4e-6;
+        try std.testing.expect(worst <= tol);
+    }
+
+    // Subgroup-per-row kernel, at a row count that is not a multiple of the
+    // subgroups per launch and a dim that is not a multiple of the subgroup width.
+    const dim: usize = 100;
+    const rows: usize = n / dim;
+    try ctx.tensorUpload(da, std.mem.sliceAsBytes(a));
+    try ctx.opL2NormRows(da, rows, dim, 1e-6);
+    try ctx.tensorDownload(da, std.mem.sliceAsBytes(got));
+    var worst: f64 = 0;
+    for (0..rows) |r| {
+        var ss: f64 = 0;
+        for (a[r * dim ..][0..dim]) |v| ss += @as(f64, v) * v;
+        const scale = 1.0 / @max(@sqrt(ss), 1e-6);
+        for (a[r * dim ..][0..dim], got[r * dim ..][0..dim]) |v, g| {
+            const ref = v * scale;
+            worst = @max(worst, @abs(@as(f64, g) - ref) / (1.0 + @abs(ref)));
+        }
+    }
+    errdefer std.debug.print("l2norm_rows: max scaled err {e}\n", .{worst});
+    try std.testing.expect(worst <= 4e-6);
 }
 
 test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {

@@ -13,6 +13,8 @@ const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const kernels = @import("kernels.zig");
 const elt = @import("elt.zig");
+const dual_ptx = @embedFile("dual_ptx");
+const dual_table = @import("../kernels/dual_table.zig");
 const cublaslt = @import("cublaslt.zig");
 const cudnn = @import("cudnn.zig");
 const dtypes = @import("tp_core").dtype;
@@ -51,8 +53,7 @@ fn q2X2() bool {
 pub const KvFmt = elt.KvFmt;
 
 /// GPU top-k selection (opTopK): `topk_lanes` lanes each keep their `topk_m`
-/// highest candidates. `topk_m` MUST match elt.topk_reduce_ptx (and the Vulkan
-/// side). See context.opTopK for the rationale.
+/// highest candidates. `topk_m` MUST match `dual/elt.zig`'s `topk_m` (both arms launch that kernel). See context.opTopK for the rationale.
 pub const topk_m = 8;
 pub const topk_lanes = 1024;
 
@@ -381,6 +382,11 @@ pub const WeightNoise = struct {
         return h;
     }
 };
+
+/// A/B knob for the weighted rmsnorm: false sends every shape to the hand
+/// block-per-row kernel that `qkNorm` otherwise keeps for a few wide rows.
+/// `dual-cuda-test` measures the two.
+pub var rms_dual: bool = true;
 
 pub const Backend = struct {
     ctx: *Context,
@@ -714,6 +720,10 @@ pub const Backend = struct {
     // eltwise module cache: PTX string pointer -> function.
     elt_fns: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
     elt_mods: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    // The dual-target kernel module (gpu/kernels/dual.zig, one PTX text with
+    // many entries) and its functions by entry name.
+    dual_mod: ?ctxmod.Module = null,
+    dual_fns: std.StringHashMapUnmanaged(cu.CUfunction) = .empty,
 
     /// Q/K/V/O handed to `opAttnTC` / `opAttnCross` are f16, not f32. Set around a
     /// forward by a model carrying an f16 activation stream (`sd_unet_cuda`), rather
@@ -943,6 +953,8 @@ pub const Backend = struct {
         for (self.elt_mods.items) |m| m.unload(self.ctx);
         self.elt_mods.deinit(self.gpa);
         self.elt_fns.deinit(self.gpa);
+        if (self.dual_mod) |m| m.unload(self.ctx);
+        self.dual_fns.deinit(self.gpa);
         self.tensorDestroy(&self.fp8_lut);
         self.tensorDestroy(&self.fp8_w16);
         self.tensorDestroy(&self.fp8_a16);
@@ -2061,10 +2073,9 @@ pub const Backend = struct {
         const db = try self.cachedWeight(bytes);
         const e = self.weights.getPtr(@intFromPtr(bytes.ptr)) orelse return db;
         if (e.f16_converted) return db;
-        const f = try self.eltFn(elt.bf16_to_f16_pad2d_ptx, "bf16_to_f16_pad2d");
         // Pad width == real width, so the index map is the identity and reading
         // and writing the same buffer is one load and one store per element.
-        try self.eltLaunch(f, db, db, null, null, .{ @intCast(co * k), @intCast(k), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co * k);
+        try self.pad2d("bf16_to_h16_pad", db, db, co * k, k, co, k, 1.0);
         e.f16_converted = true;
         return db;
     }
@@ -2392,10 +2403,8 @@ pub const Backend = struct {
         const mpad = std.mem.alignForward(usize, m, 128);
         try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
         try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
-        const f_deq = try self.eltFn(elt.dequant_fp8_f16_ptx, "dequant_fp8_f16");
-        try self.eltLaunch(f_deq, w_db, self.fp8_lut, self.fp8_w16, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
-        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
-        try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
+        try self.dualPairs("dequant_fp8_f16", w_db, self.fp8_w16, self.fp8_lut, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
+        try self.cvtF32ToH16(x, self.fp8_a16, mpad * cols, m * cols);
         // C[mpad][rows] = A[mpad][cols] @ B[rows][cols]ᵀ  (m=mpad, n=rows, k=cols)
         if (self.kernels == .libs) {
             try self.ltMatmulF16(y, self.fp8_w16, self.fp8_a16, rows, mpad, cols);
@@ -2462,8 +2471,7 @@ pub const Backend = struct {
         // of the expected ordering.
         if (self.kernels == .libs) {
             try self.ensureDeviceBuffer(&self.fp8_a16, m * cols * 2);
-            const f_c = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-            try self.eltLaunch(f_c, x, self.fp8_a16, null, null, .{ @intCast(m * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, m * cols);
+            try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, m * cols, cols, m, cols, 1.0);
             try self.ltMatmulBf16(y, self.fp8_w16, self.fp8_a16, rows, m, cols);
             return;
         }
@@ -2471,8 +2479,7 @@ pub const Backend = struct {
         // converts the ACTIVATION to the same format, and Z-Image's trunk activations pass
         // f16's 65504 ceiling: an f16 path rendered it solid white on all three backends
         // identically. `f32_to_bf16_pad2d` zeroes the m-padding the GEMM's C tiles read.
-        const f_cvt = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-        try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, mpad * cols);
+        try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, mpad * cols, cols, m, cols, 1.0);
         // The GEMM writes `mpad` rows, not `m`, `launchHgemm` dispatches
         // `grid.y = mpad/128` and each block stores a whole 128x128 C tile, and the
         // cuBLASLt arm is handed `mpad` too. So it CANNOT write straight into a caller
@@ -2491,8 +2498,7 @@ pub const Backend = struct {
         // Strip the row padding into the tight `y`. These linears have no bias, but
         // `bias_compact` needs a buffer regardless, the caller's full-width zero array.
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, y, null, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, y, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
     }
 
     /// Decode a packed NVFP4 weight to bf16 in `fp8_w16` and return it, the decode half of
@@ -3084,26 +3090,11 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.dequant);
         try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
-        const f_deq = switch (dt) {
-            .q4_0 => try self.eltFn(elt.dequant_q4_0_f16_ptx, "dequant_q4_0_f16"),
-            .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
-            .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
-            .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
-            .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
-            .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
-            .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_f16_ptx, "dequant_iq4_xs_f16"),
-            .q1_0 => try self.eltFn(elt.dequant_q1_0_f16_ptx, "dequant_q1_0_f16"),
-            .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16"),
-            .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16"),
-            else => unreachable,
-        };
-        if (dt == .q6_k) {
-            // 16 elements per thread; q6_k super-blocks are 256 elements.
-            const fv = try self.eltFn(elt.dequant_q6_k_f16v_ptx, "dequant_q6_k_f16v");
-            try self.eltLaunch(fv, w_db, self.fp8_w16, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
-            return self.fp8_w16;
+        const u = [7]u32{ @intCast(elems), 0, 0, 0, 0, 0, 0 };
+        switch (dt) {
+            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_f16", w_db, self.fp8_w16, null, null, u, .{ 0, 0 }, elems),
+            else => return error.UnsupportedDtype,
         }
-        try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
         return self.fp8_w16;
     }
 
@@ -3113,24 +3104,11 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.dequant);
         try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
-        if (dt == .q6_k) {
-            const fv = try self.eltFn(elt.dequant_q6_k_bf16v_ptx, "dequant_q6_k_bf16v");
-            try self.eltLaunch(fv, w_db, self.fp8_w16, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
-            return self.fp8_w16;
-        }
-        const f_deq = switch (dt) {
-            .q4_0 => try self.eltFn(elt.dequant_q4_0_bf16_ptx, "dequant_q4_0_bf16"),
-            .q8_0 => try self.eltFn(elt.dequant_q8_0_bf16_ptx, "dequant_q8_0_bf16"),
-            .q4_k => try self.eltFn(elt.dequant_q4_k_bf16_ptx, "dequant_q4_k_bf16"),
-            .q5_k => try self.eltFn(elt.dequant_q5_k_bf16_ptx, "dequant_q5_k_bf16"),
-            .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_bf16_ptx, "dequant_iq4_nl_bf16"),
-            .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_bf16_ptx, "dequant_iq4_xs_bf16"),
-            .q1_0 => try self.eltFn(elt.dequant_q1_0_bf16_ptx, "dequant_q1_0_bf16"),
-            .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_bf16_ptx, "dequant_q2_0_g64_bf16"),
-            .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_bf16_ptx, "dequant_q2_0_g128_bf16"),
+        const u = [7]u32{ @intCast(elems), 0, 0, 0, 0, 0, 0 };
+        switch (dt) {
+            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_bf16", w_db, self.fp8_w16, null, null, u, .{ 0, 0 }, elems),
             else => return error.UnsupportedDtype,
-        };
-        try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
+        }
         return self.fp8_w16;
     }
 
@@ -3163,8 +3141,7 @@ pub const Backend = struct {
             self.ptic();
             defer self.ptoc(.elt);
             try self.ensureDeviceBuffer(&self.fp8_a16, mrun * cols * 2);
-            const f_cvt = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-            try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mrun * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, mrun * cols);
+            try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, mrun * cols, cols, m, cols, 1.0);
         }
         if (libs) {
             self.ptic();
@@ -3179,8 +3156,7 @@ pub const Backend = struct {
             try self.launchHgemm(f_hg, self.fp8_a16, w16, self.conv_c, mrun, rows, cols);
         }
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, y, null, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, y, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
     }
 
     /// Convert `m` rows of f32 activations to f16 in the shared activation
@@ -3191,8 +3167,7 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
-        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
-        try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
+        try self.cvtF32ToH16(x, self.fp8_a16, mpad * cols, m * cols);
         return self.fp8_a16;
     }
 
@@ -3354,10 +3329,9 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         // The shared f32_to_f16 kernel converts idx < u1 and zero-fills the
         // rest; u0 is the thread-guard count. All n elements are valid here.
-        const f = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         const srcb = dbOffset(src, src_off * 4);
         const dstb = dbOffset(dst, dst_off * 2);
-        try self.eltLaunch(f, srcb, dstb, null, null, .{ @intCast(n), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        try self.cvtF32ToH16(srcb, dstb, n, n);
     }
 
     /// Quantize-copy `n` f32 elements (a whole number of 32-element blocks)
@@ -3381,9 +3355,8 @@ pub const Backend = struct {
     pub fn opRopeHalfPart(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, seq: usize, n_heads: usize, half: usize, sin_off: usize, pos0: usize, head_dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_half_part_ptx, "rope_half_part");
         const total = seq * n_heads * half;
-        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(pos0), @intCast(head_dim) }, .{ 0, 0 }, total);
+        try self.dualElems("rope_half_part", qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(pos0), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
     }
 
     /// Interleaved M-RoPE for one row (qwen35 decode with images): the
@@ -3392,10 +3365,9 @@ pub const Backend = struct {
     pub fn opRopeImrope(self: *Backend, qk: DeviceBuffer, pos3: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize, sections: [3]u32, head_dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_imrope_ptx, "rope_imrope");
         const packed_sections = sections[0] | (sections[1] << 8) | (sections[2] << 16);
         const total = n_heads * half;
-        try self.eltLaunch(f, qk, pos3, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), packed_sections, @intCast(head_dim) }, .{ 0, 0 }, total);
+        try self.dualElems("rope_imrope", qk, pos3, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), packed_sections, @intCast(head_dim), 0 }, .{ 0, 0 }, total);
     }
 
     /// rope_imrope over a batch of rows with per-row position triples
@@ -3403,10 +3375,9 @@ pub const Backend = struct {
     pub fn opRopeImropePos(self: *Backend, qk: DeviceBuffer, pos3s: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, sections: [3]u32, head_dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_imrope_pos_ptx, "rope_imrope_pos");
         const packed_sections = sections[0] | (sections[1] << 8) | (sections[2] << 16);
         const total = rows * n_heads * half;
-        try self.eltLaunch(f, qk, pos3s, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), packed_sections, @intCast(head_dim) }, .{ 0, 0 }, total);
+        try self.dualElems("rope_imrope_pos", qk, pos3s, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), packed_sections, @intCast(head_dim), 0 }, .{ 0, 0 }, total);
     }
 
     /// Classic LayerNorm with weight and bias (ViT ln1/ln2/post_ln):
@@ -3419,11 +3390,12 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const w_db = try self.cachedWeight(std.mem.sliceAsBytes(w));
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(b));
-        const f = if (h16)
-            try self.eltFn(elt.ln_bias_par_h16_ptx, "ln_bias_par_h16")
-        else
-            try self.eltFn(elt.ln_bias_par_ptx, "ln_bias_par");
-        try self.rowLaunch(f, x, out, w_db, b_db, .{ @intCast(rows), @intCast(dim), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+        const u = [7]u32{ @intCast(rows), @intCast(dim), 0, 0, 0, 0, 0 };
+        if (h16) {
+            try self.dualRows("layernorm_h16", x, out, w_db, b_db, u, .{ eps, 0 }, rows);
+        } else {
+            try self.dualRows("layernorm", x, out, w_db, b_db, u, .{ eps, 0 }, rows);
+        }
     }
 
     /// 2-D vision rope over [rows][n_heads][head_dim] q/k: rotation pairs
@@ -3434,9 +3406,8 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(4 * half <= head_dim);
-        const f = try self.eltFn(elt.rope_vision_ptx, "rope_vision");
         const total = rows * n_heads * 2 * half;
-        try self.eltLaunch(f, qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
+        try self.dualElems("rope_vision", qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// gemma4v vision 2-D RoPE (neox, per-head-half x/y split). `half` is the
@@ -3447,9 +3418,8 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(4 * half <= head_dim);
-        const f = try self.eltFn(elt.rope_vision_gemma4_ptx, "rope_vision_gemma4");
         const total = rows * n_heads * 2 * half;
-        try self.eltLaunch(f, qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
+        try self.dualElems("rope_vision_gemma4", qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Restride per-head slices between packed layouts (ViT: pad 72-dim
@@ -3458,9 +3428,8 @@ pub const Backend = struct {
     pub fn opHeadPad(self: *Backend, out: DeviceBuffer, in: DeviceBuffer, rows: usize, heads: usize, out_hd: usize, in_hd: usize, in_stride: usize, in_off: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.head_pad_ptx, "head_pad");
         const total = rows * heads * out_hd;
-        try self.eltLaunch(f, in, out, null, null, .{ @intCast(total), @intCast(out_hd), @intCast(in_hd), @intCast(in_stride), @intCast(in_off), @intCast(heads) }, .{ 0, 0 }, total);
+        try self.dualElems("head_pad", in, out, null, null, .{ @intCast(total), @intCast(out_hd), @intCast(in_hd), @intCast(in_stride), @intCast(in_off), @intCast(heads), 0 }, .{ 0, 0 }, total);
     }
 
     /// Deinterleave the qwen35 attention q projection into query and gate
@@ -3470,23 +3439,20 @@ pub const Backend = struct {
     pub fn opDeinterleave3(self: *Backend, src: DeviceBuffer, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, total: usize, hd: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.deinterleave3_ptx, "deinterleave3");
-        try self.eltLaunch(f, src, q, k, v, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("deinterleave3", src, q, k, v, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opDeinterleave2(self: *Backend, qg: DeviceBuffer, q: DeviceBuffer, gate: DeviceBuffer, total: usize, hd: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.deinterleave2_ptx, "deinterleave2");
-        try self.eltLaunch(f, qg, q, gate, null, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("deinterleave2", qg, null, q, gate, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a[i] *= sigmoid(b[i]), the qwen35 attention output gate.
     pub fn opMulSigmoid(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.mul_sigmoid_ptx, "mul_sigmoid");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("sigmoid_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Row-wise L2 normalization in place, x_row /= max(|x_row|, eps)
@@ -3494,9 +3460,7 @@ pub const Backend = struct {
     pub fn opL2NormRows(self: *Backend, x: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        std.debug.assert(dim <= 256);
-        const f = try self.eltFn(elt.l2norm_rows_ptx, "l2norm_rows");
-        try self.rowLaunch(f, x, null, null, null, .{ @intCast(rows), @intCast(dim), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+        try self.dualRows("l2norm_rows", x, null, null, null, .{ @intCast(rows), @intCast(dim), 0, 0, 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     /// `opL2NormRows` over rows that come in GROUPS strided by `group_stride`
@@ -3508,8 +3472,7 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(dim <= 256 and rows_per_group > 0 and rows % rows_per_group == 0);
-        const f = try self.eltFn(elt.l2norm_rows_g_ptx, "l2norm_rows_g");
-        try self.rowLaunch(f, x, null, null, null, .{ @intCast(rows), @intCast(dim), @intCast(rows_per_group), @intCast(group_stride), 0, 0 }, .{ eps, 0 }, rows);
+        try self.dualRows("l2norm_rows_g", x, null, null, null, .{ @intCast(rows), @intCast(dim), @intCast(rows_per_group), @intCast(group_stride), 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     /// One qwen35 causal-conv step (kernel 4, SiLU) over all channels; the
@@ -3517,22 +3480,19 @@ pub const Backend = struct {
     pub fn opGdnConvStep(self: *Backend, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gdn_conv_step_ptx, "gdn_conv_step");
-        try self.eltLaunch(f, conv_state, x, conv_w, out, .{ @intCast(channels), 0, 0, 0, 0, 0 }, .{ 0, 0 }, channels);
+        try self.dualElems("gdn_conv_step", conv_state, x, conv_w, out, .{ @intCast(channels), 4, 0, 0, 0, 0, 0 }, .{ 0, 0 }, channels);
     }
 
     /// Batched causal conv + SiLU over a whole prefill chunk: `n` tokens in two
-    /// launches instead of `n` (see `elt.gdn_conv_batch_ptx` for why this is
+    /// launches instead of `n` (see `dual/elt.zig` gdnConvBatch for why this is
     /// legal, it is a convolution, so tokens are independent given the carried
     /// state). The state roll is a separate launch because every token's threads
     /// read the same incoming state.
     pub fn opGdnConvBatch(self: *Backend, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize, n: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gdn_conv_batch_ptx, "gdn_conv_batch");
-        try self.eltLaunch(f, conv_state, x, conv_w, out, .{ @intCast(n * channels), @intCast(channels), @intCast(n), 0, 0, 0 }, .{ 0, 0 }, n * channels);
-        const fs = try self.eltFn(elt.gdn_conv_state_ptx, "gdn_conv_state");
-        try self.eltLaunch(fs, conv_state, x, null, null, .{ @intCast(channels), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, channels);
+        try self.dualElems("gdn_conv_batch", conv_state, x, conv_w, out, .{ @intCast(n * channels), @intCast(channels), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, n * channels);
+        try self.dualElems("gdn_conv_state", conv_state, x, null, null, .{ @intCast(channels), @intCast(n), 0, 0, 0, 0, 0 }, .{ 0, 0 }, channels);
     }
 
     /// Batched delta-net gates: `n` tokens in one launch. `out` is per token
@@ -3545,8 +3505,7 @@ pub const Backend = struct {
     pub fn opGdnGatesBatch(self: *Backend, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize, stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gdn_gates_batch_ptx, "gdn_gates_batch");
-        try self.eltLaunch(f, alpha, beta, a_dt, out, .{ @intCast(n * heads), @intCast(heads), @intCast(stride), 0, 0, 0 }, .{ 0, 0 }, n * heads);
+        try self.dualElems("gdn_gates_batch", alpha, beta, a_dt, out, .{ @intCast(n * heads), @intCast(heads), @intCast(stride), 0, 0, 0, 0 }, .{ 0, 0 }, n * heads);
     }
 
     fn gdnChunkFn(self: *Backend, d: usize) Error!cu.CUfunction {
@@ -3627,8 +3586,7 @@ pub const Backend = struct {
     pub fn opGdnGates(self: *Backend, alpha_beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gdn_gates_ptx, "gdn_gates");
-        try self.eltLaunch(f, alpha_beta, a_dt, out, null, .{ @intCast(heads), 0, 0, 0, 0, 0 }, .{ 0, 0 }, heads);
+        try self.dualElems("gdn_gates", alpha_beta, a_dt, null, out, .{ @intCast(heads), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, heads);
     }
 
     /// One decode step of the gated-delta-net recurrence: one 256-thread
@@ -3666,9 +3624,8 @@ pub const Backend = struct {
     pub fn opRopeHalfPos(self: *Backend, qk: DeviceBuffer, positions: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_half_pos_ptx, "rope_half_pos");
         const total = rows * n_heads * half;
-        try self.eltLaunch(f, qk, positions, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("rope_half_pos", qk, positions, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// eltLaunch variant with one 256-thread block per row (`grid_rows` blocks).
@@ -3752,35 +3709,31 @@ pub const Backend = struct {
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         // Unpadded, bias in the GEMM epilogue, and D in the destination's own width.
         if (self.kernels == .libs and k % 8 == 0) {
-            const f_p = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
             try self.ensureDeviceBuffer(&self.conv_w16, co * k * 2);
             try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-            try self.eltLaunch(f_p, w_db, self.conv_w16, null, null, .{ @intCast(co * k), @intCast(k), @intCast(co), @intCast(k), 0, 0 }, .{ 1.0, 0 }, co * k);
+            try self.pad2d("f32_to_h16_pad", w_db, self.conv_w16, co * k, k, co, k, 1.0);
             if (src_f16) {
                 std.debug.assert(act_div == 1.0);
-                const f_h = try self.eltFn(elt.f16_pad2d_ptx, "f16_pad2d");
-                try self.eltLaunch(f_h, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m * k);
+                try self.pad2d("h16_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
             } else {
-                try self.eltLaunch(f_p, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0 / act_div, 0 }, m * k);
+                try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0 / act_div);
             }
             return self.ltGemmHalfBias(dst, dst_off_elems, self.conv_a16, self.conv_w16, bias, m, co, k, act_div, dst_f16);
         }
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        const f_pad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
         // The WEIGHT is never scaled, conv weights are O(1) and it is the
         // activation that overflows.
-        try self.eltLaunch(f_pad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 1.0, 0 }, co_pad * k_pad);
+        try self.pad2d("f32_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
         // An f16 source is already in the GEMM's format: `f16_pad2d` only pads.
         // It takes no scale, so an f16 source cannot carry `act_div`, asserted
         // rather than silently ignored, since that is a wrong image, not an error.
         if (src_f16) {
             std.debug.assert(act_div == 1.0);
-            const f_h = try self.eltFn(elt.f16_pad2d_ptx, "f16_pad2d");
-            try self.eltLaunch(f_h, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
+            try self.pad2d("h16_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
         } else {
-            try self.eltLaunch(f_pad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0 / act_div, 0 }, m_pad * k_pad);
+            try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0 / act_div);
         }
         if (self.kernels == .libs) {
             try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
@@ -3788,11 +3741,13 @@ pub const Backend = struct {
             const f_hg = try self.hgemmFn();
             try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
         }
-        const f_bc = if (dst_f16)
-            try self.eltFn(elt.bias_compact_h16_ptx, "bias_compact_h16")
-        else
-            try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ act_div, 0 }, m * co);
+        const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0, 0 };
+        if (dst_f16) {
+            std.debug.assert(dst_off_elems % 2 == 0);
+            try self.dualPairs("bias_compact_h16", self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+        } else {
+            try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+        }
     }
 
     /// Native bf16 GEMM: dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16
@@ -3820,8 +3775,7 @@ pub const Backend = struct {
             const w_direct = try self.cachedWeight(w_bytes);
             try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
             if (!bench_gemm_only) {
-                const f_a = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-                try self.eltLaunch(f_a, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m * k);
+                try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
             }
             try self.ltMatmulBf16(dst, w_direct, self.conv_a16, co, m, k);
             return;
@@ -3842,8 +3796,7 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co * 4);
         if (!bench_gemm_only) {
-            const f_apad = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-            try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k);
+            try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m_pad * k, k, m, k, 1.0);
         }
         if (self.kernels == .libs) {
             try self.ltMatmulBf16(self.conv_c, w_db, self.conv_a16, co, m_pad, k);
@@ -3852,8 +3805,7 @@ pub const Backend = struct {
             try self.launchHgemm(f_hg, self.conv_a16, w_db, self.conv_c, m_pad, co, k);
         }
         if (bench_gemm_only) return;
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
 
     /// `dst[m][co] += scale * (src[m][k] @ Wᵀ)`, W bf16 `[co][k]` straight from
@@ -3879,8 +3831,7 @@ pub const Backend = struct {
         std.debug.assert(co % 128 == 0 and k % 32 == 0);
         const w_direct = try self.cachedWeight(w_bytes);
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-        const f_a = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-        try self.eltLaunch(f_a, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m * k);
+        try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
         try self.ltMatmulBf16Scaled(dst, w_direct, self.conv_a16, co, m, k, scale, 1.0);
     }
 
@@ -3917,18 +3868,15 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        const f_wpad = try self.eltFn(elt.bf16_to_f16_pad2d_ptx, "bf16_to_f16_pad2d");
-        try self.eltLaunch(f_wpad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
-        const f_apad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
-        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0, 0 }, m_pad * k_pad);
+        try self.pad2d("bf16_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
+        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
         if (self.kernels == .libs) {
             try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
         } else {
             const f_hg = try self.hgemmFn();
             try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
         }
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
 
     /// Like `opMatmulBf16` but for an f16 weight (some GGUF mmproj towers ship
@@ -3961,18 +3909,15 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        const f_wpad = try self.eltFn(elt.f16_pad2d_ptx, "f16_pad2d");
-        try self.eltLaunch(f_wpad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
-        const f_apad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
-        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0, 0 }, m_pad * k_pad);
+        try self.pad2d("h16_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
+        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
         if (self.kernels == .libs) {
             try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
         } else {
             const f_hg = try self.hgemmFn();
             try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
         }
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
-        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
 
     /// Free the shared GEMM conversion scratch (conv_w16/a16/c, the padded
@@ -4000,14 +3945,13 @@ pub const Backend = struct {
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         try self.ensureDeviceBuffer(&self.conv_w16, co * 9 * ci * 2);
         try self.ensureDeviceBuffer(&self.conv_c, n * co * 2);
-        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         // An f16 source is already cuDNN's X tensor.
         const x16 = if (src_f16) src else blk: {
             try self.ensureDeviceBuffer(&self.conv_a16, n * ci * 2);
-            try self.eltLaunch(f_cvt, src, self.conv_a16, null, null, .{ @intCast(n * ci), @intCast(n * ci), 0, 0, 0, 0 }, .{ 0, 0 }, n * ci);
+            try self.cvtF32ToH16(src, self.conv_a16, n * ci, n * ci);
             break :blk self.conv_a16;
         };
-        try self.eltLaunch(f_cvt, w_db, self.conv_w16, null, null, .{ @intCast(co * 9 * ci), @intCast(co * 9 * ci), 0, 0, 0, 0 }, .{ 0, 0 }, co * 9 * ci);
+        try self.cvtF32ToH16(w_db, self.conv_w16, co * 9 * ci, co * 9 * ci);
         const L = &self.libs.?;
         const ckey: ConvKey = .{ .h = h, .w = w, .ci = ci, .co = co };
         const plan = self.conv_plans.get(ckey) orelse blk: {
@@ -4017,11 +3961,13 @@ pub const Backend = struct {
         };
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
         plan.execute(&L.dnn, try self.dnnHandle(), x16.ptr(), self.conv_w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
-        const f_bias = if (dst_f16)
-            try self.eltFn(elt.bias_add_h16_ptx, "bias_add_h16")
-        else
-            try self.eltFn(elt.bias_add_f16_ptx, "bias_add_f16");
-        try self.eltLaunch(f_bias, self.conv_c, b_db, dst, null, .{ @intCast(n * co), @intCast(co), @intCast(dst_off_elems), 0, 0, 0 }, .{ 0, 0 }, n * co);
+        const u_b = [7]u32{ @intCast(n * co), @intCast(co), @intCast(dst_off_elems), 0, 0, 0, 0 };
+        if (dst_f16) {
+            std.debug.assert(co % 2 == 0 and dst_off_elems % 2 == 0);
+            try self.dualPairs("bias_add_h16", self.conv_c, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+        } else {
+            try self.dualElems("bias_add_f16", self.conv_c, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+        }
     }
 
     // ---- cuBLASLt int8 GEMM (.libs mode) ------------------------------------
@@ -4159,8 +4105,7 @@ pub const Backend = struct {
         var db: DeviceBuffer = .{};
         errdefer self.tensorDestroy(&db);
         try self.ensureDeviceBuffer(&db, bias.len * 2);
-        const f = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
-        try self.eltLaunch(f, src, db, null, null, .{ @intCast(bias.len), @intCast(bias.len), 0, 0, 0, 0 }, .{ 0, 0 }, bias.len);
+        try self.cvtF32ToH16(src, db, bias.len, bias.len);
         self.bias16.put(self.gpa, key, db) catch return error.OutOfMemory;
         return db;
     }
@@ -4171,8 +4116,7 @@ pub const Backend = struct {
     fn halfActivation(self: *Backend, src: DeviceBuffer, m: usize, k: usize, src_f16: bool) Error!DeviceBuffer {
         if (src_f16) return src;
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-        const f = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
-        try self.eltLaunch(f, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0, 0 }, m * k);
+        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
         return self.conv_a16;
     }
 
@@ -4876,7 +4820,7 @@ pub const Backend = struct {
     }
 
     /// im2col for a stride-1 dilated 1-D conv over channel-last `[in_len][ci]`:
-    /// `patch[out_len][k*ci]`, column order `(tap, in_ch)`. See `elt.im2col1d_ptx`
+    /// `patch[out_len][k*ci]`, column order `(tap, in_ch)`. See `dual/elt.zig` im2col1d
     /// for why that order and not the weight's own.
     ///
     /// Stride 1 only. Every ungrouped conv in the BigVGAN decoder is stride 1; the
@@ -4895,10 +4839,9 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(stride >= 1);
-        const f = try self.eltFn(elt.im2col1d_ptx, "im2col1d");
         const plen = k * ci;
         const total = out_len * plen;
-        try self.eltLaunch(f, src, patch, null, null, .{ @intCast(total), @intCast(plen), @intCast(ci), @intCast(in_len), @intCast(dilation), @intCast(padding) }, .{ @floatFromInt(stride), @floatFromInt(t0) }, total);
+        try self.dualElems("im2col1d", src, patch, null, null, .{ @intCast(total), @intCast(plen), @intCast(ci), @intCast(in_len), @intCast(dilation), @intCast(padding), 0 }, .{ @floatFromInt(stride), @floatFromInt(t0) }, total);
     }
 
     /// Channel-last 3-D im2col with reflect spatial and causal temporal padding.
@@ -4918,9 +4861,8 @@ pub const Backend = struct {
     pub fn opSnake1dCa(self: *Backend, x: DeviceBuffer, alpha: DeviceBuffer, len: usize, ch: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.snake1d_ca_ptx, "snake1d_ca");
         const total = len * ch;
-        try self.eltLaunch(f, x, alpha, null, null, .{ @intCast(total), @intCast(ch), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("snake1d_ca", x, alpha, null, null, .{ @intCast(total), @intCast(ch), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Mean over attention heads, then `adaptive_avg_pool1d` along the FEATURE axis
@@ -4929,9 +4871,8 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(out_dim > 0 and hd >= out_dim);
-        const f = try self.eltFn(elt.mean_heads_pool_ptx, "mean_heads_pool");
         const total = rows * out_dim;
-        try self.eltLaunch(f, src, out, null, null, .{ @intCast(total), @intCast(out_dim), @intCast(heads), @intCast(hd), 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("mean_heads_pool", src, out, null, null, .{ @intCast(total), @intCast(out_dim), @intCast(heads), @intCast(hd), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// BigVGAN's anti-aliased activation, first half: replicate-pad + kaiser-sinc
@@ -4941,9 +4882,8 @@ pub const Backend = struct {
     pub fn opAaUpSnake(self: *Backend, src: DeviceBuffer, out: DeviceBuffer, filter: DeviceBuffer, snake: DeviceBuffer, len: usize, ch: usize, k: usize, pad: usize, pad_left: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.aa_up_snake_ptx, "aa_up_snake");
         const total = 2 * len * ch;
-        try self.eltLaunch(f, src, out, filter, snake, .{ @intCast(total), @intCast(ch), @intCast(len), @intCast(k), @intCast(pad), @intCast(pad_left) }, .{ 0, 0 }, total);
+        try self.dualElems("aa_up_snake", src, out, filter, snake, .{ @intCast(total), @intCast(ch), @intCast(len), @intCast(k), @intCast(pad), @intCast(pad_left), 0 }, .{ 0, 0 }, total);
     }
 
     /// Second half: replicate-pad + kaiser-sinc downsample x2, channel-last.
@@ -4951,9 +4891,8 @@ pub const Backend = struct {
     pub fn opAaDown(self: *Backend, up: DeviceBuffer, out: DeviceBuffer, filter: DeviceBuffer, out_len: usize, up_len: usize, ch: usize, k: usize, pad_left: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.aa_down_ptx, "aa_down");
         const total = out_len * ch;
-        try self.eltLaunch(f, up, out, filter, null, .{ @intCast(total), @intCast(ch), @intCast(up_len), @intCast(k), @intCast(pad_left), 0 }, .{ 0, 0 }, total);
+        try self.dualElems("aa_down", up, out, filter, null, .{ @intCast(total), @intCast(ch), @intCast(up_len), @intCast(k), @intCast(pad_left), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Ungrouped 1-D transposed convolution, channel-last. `w` is permuted to
@@ -4961,19 +4900,17 @@ pub const Backend = struct {
     pub fn opConvT1dCa(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: DeviceBuffer, bias: DeviceBuffer, out_len: usize, out_ch: usize, in_ch: usize, in_len: usize, k: usize, stride: usize, padding: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.convt1d_ca_ptx, "convt1d_ca");
         const total = out_len * out_ch;
-        try self.eltLaunch(f, x, out, w, bias, .{ @intCast(total), @intCast(out_ch), @intCast(in_ch), @intCast(in_len), @intCast(k), @intCast(stride) }, .{ @floatFromInt(padding), 0 }, total);
+        try self.dualElems("convt1d_ca", x, out, w, bias, .{ @intCast(total), @intCast(out_ch), @intCast(in_ch), @intCast(in_len), @intCast(k), @intCast(stride), 0 }, .{ @floatFromInt(padding), 0 }, total);
     }
 
     /// dst[dst_off + i] = src[src_off + i] as a kernel, usable inside
     /// recorded batches and graph captures (unlike the null-stream memcpy).
     pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize, h16: bool) Error!void {
-        const f = if (h16)
-            try self.eltFn(elt.copy_off_h16_ptx, "copy_off_h16")
-        else
-            try self.eltFn(elt.copy_off_ptx, "copy_off");
-        try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(dst_off_elems), @intCast(src_off_elems), 0, 0, 0 }, .{ 0, 0 }, count);
+        // An f16 copy moves whole words: offsets and count must be even.
+        if (h16) std.debug.assert(count % 2 == 0 and dst_off_elems % 2 == 0 and src_off_elems % 2 == 0);
+        const sh: u1 = @intFromBool(h16);
+        try self.dualElems("copy", src, dst, null, null, .{ @intCast(count >> sh), 0, @intCast(dst_off_elems >> sh), @intCast(src_off_elems >> sh), 0, 0, 0 }, .{ 0, 0 }, count >> sh);
     }
 
     pub fn opRopeHalfS(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize) Error!void {
@@ -5005,6 +4942,66 @@ pub const Backend = struct {
         self.elt_mods.append(self.gpa, mod) catch return error.OutOfMemory;
         self.elt_fns.put(self.gpa, key, f) catch return error.OutOfMemory;
         return f;
+    }
+
+    /// One entry of the dual-target module, JIT'd once per process on first use.
+    fn dualFn(self: *Backend, entry: [:0]const u8) Error!cu.CUfunction {
+        if (self.dual_fns.get(entry)) |f| return f;
+        if (self.dual_mod == null) self.dual_mod = self.ctx.loadModule(dual_ptx) catch return error.CudaError;
+        const f = self.dual_mod.?.getFunction(self.ctx, entry) catch return error.CudaError;
+        self.dual_fns.put(self.gpa, entry, f) catch return error.OutOfMemory;
+        return f;
+    }
+
+    /// Launch one dual-target entry over `groups` workgroups of its table width.
+    fn dualLaunch(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, groups: usize) Error!void {
+        const f = try self.dualFn(entry);
+        var p0: cu.CUdeviceptr = if (b0) |bb| bb.ptr() else 0;
+        var p1: cu.CUdeviceptr = if (b1) |bb| bb.ptr() else 0;
+        var p2: cu.CUdeviceptr = if (b2) |bb| bb.ptr() else 0;
+        var p3: cu.CUdeviceptr = if (b3) |bb| bb.ptr() else 0;
+        var uu = u;
+        var ff = fp;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
+            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&uu[6]), @ptrCast(&ff[0]),
+            @ptrCast(&ff[1]),
+        };
+        const wg = comptime dual_table.wgOf(entry);
+        self.ctx.launch(f, .{ @intCast(groups), 1, 1 }, .{ wg, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    /// `dualLaunch` for an element kernel: one thread per element.
+    fn dualElems(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, total: usize) Error!void {
+        const wg = comptime dual_table.wgOf(entry);
+        try self.dualLaunch(entry, b0, b1, b2, b3, u, fp, (total + wg - 1) / wg);
+    }
+
+    /// `dualLaunch` for a kernel writing f16 pairs: one thread per two elements.
+    fn dualPairs(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, elems: usize) Error!void {
+        try self.dualElems(entry, b0, b1, b2, b3, u, fp, (elems + 1) / 2);
+    }
+
+    /// f32 -> f16 over `guard` elements, the first `real` converted and the rest
+    /// zero; `guard` must be even (f16 pairs).
+    fn cvtF32ToH16(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, guard: usize, real: usize) Error!void {
+        std.debug.assert(guard % 2 == 0);
+        try self.dualElems("f32_to_h16", src, null, null, dst, .{ @intCast(guard / 2), @intCast(real), 0, 0, 0, 0, 0 }, .{ 1.0, 0 }, guard / 2);
+    }
+
+    /// Tight [rows][cols] -> [*][cols_pad] 16-bit rows over `total` elements, zero in
+    /// the pads, scaled by `scale`. `entry` picks the source and destination widths
+    /// (f32_to_h16_pad, f32_to_bf16_pad, h16_to_h16_pad, bf16_to_h16_pad); `cols_pad`
+    /// must be even.
+    fn pad2d(self: *Backend, comptime entry: [:0]const u8, src: DeviceBuffer, dst: DeviceBuffer, total: usize, cols_pad: usize, rows: usize, cols: usize, scale: f32) Error!void {
+        std.debug.assert(cols_pad % 2 == 0 and total % 2 == 0);
+        try self.dualElems(entry, src, null, null, dst, .{ @intCast(total / 2), @intCast(cols), @intCast(cols_pad), @intCast(rows), 0, 0, 0 }, .{ scale, 0 }, total / 2);
+    }
+
+    /// `dualLaunch` for a row kernel: one subgroup per row, striding.
+    fn dualRows(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, rows: usize) Error!void {
+        try self.dualLaunch(entry, b0, b1, b2, b3, u, fp, dual_table.rowGroups(rows));
     }
 
     fn eltLaunch(self: *Backend, f: cu.CUfunction, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [6]u32, fp: [2]f32, total: usize) Error!void {
@@ -5040,20 +5037,7 @@ pub const Backend = struct {
     pub fn rmsModRows(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        // one block (256 threads) per row, parallel shared reduction.
-        const f = try self.eltFn(elt.rms_mod_par_ptx, "rms_mod_par");
-        var p0 = x.ptr();
-        var p1 = out.ptr();
-        var p2 = mod.ptr();
-        var p3: cu.CUdeviceptr = if (idx) |b| b.ptr() else 0;
-        var uu = [_]u32{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), @intCast(idx_stride), 0 };
-        var ff = [_]f32{ eps, 0 };
-        var params = [_]?*anyopaque{
-            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
-            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
-            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
-        };
-        self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
+        try self.dualRows("rms_mod", x, out, mod, idx, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), @intCast(idx_stride), 0, 0 }, .{ eps, 0 }, rows);
     }
 
     /// out = (x - mean)*inv*mod[premul+c] + mod[shift+c], inv = 1/sqrt(var+eps).
@@ -5065,46 +5049,37 @@ pub const Backend = struct {
     pub fn lnMod(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.ln_mod_par_ptx, "ln_mod_par");
-        try self.rowLaunch(f, x, out, mod, null, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0 }, .{ eps, 0 }, rows);
+        try self.dualRows("ln_mod", x, out, mod, null, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     /// per-head RMS norm * weight, one thread per row (rows = seq*n_heads).
     pub fn qkNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, hd: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        // Few wide rows (LLM decode: 1 x 2560) serialize badly at one thread
-        // per row; hand them a block per row instead.
-        if (rows < 512) {
+        // A few wide rows (an LLM decode hidden norm, 1 x 2560..5376) are latency-bound
+        // for one subgroup per row; the hand kernel puts a whole block on each row and
+        // measures ~1.6x faster there. Everywhere else the shared kernel wins.
+        if (rows < 64 and hd >= 1024 or !rms_dual) {
             const f = try self.eltFn(elt.qk_rmsnorm_par_ptx, "qk_rmsnorm_par");
-            try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
-            return;
+            return self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
         }
-        // Many rows: a WARP each, so the 32 lanes of a load cover one contiguous
-        // line. The one-thread-per-row kernel this replaced was reading a whole
-        // row per lane, see `qk_rmsnorm_warp_ptx` for the measurement, but the
-        // short version is 37-47 GB/s on a 936 GB/s card, and a quarter of a
-        // Z-Image step. 256 threads = 8 rows per block.
-        const f = try self.eltFn(elt.qk_rmsnorm_warp_ptx, "qk_rmsnorm_warp");
-        try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, (rows + 7) / 8);
+        try self.dualRows("rmsnorm", x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     pub fn groupRmsNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, groups: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         std.debug.assert(groups > 0 and dim % groups == 0);
-        const f = try self.eltFn(elt.group_rmsnorm_ptx, "group_rmsnorm");
         const group = dim / groups;
-        try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows * groups), @intCast(group), @intCast(groups), 0, 0, 0 }, .{ eps, 0 }, rows * groups);
+        try self.dualRows("group_rmsnorm", x, out, weight, null, .{ @intCast(rows * groups), @intCast(group), @intCast(groups), 0, 0, 0, 0 }, .{ eps, 0 }, rows * groups);
     }
 
     /// interleaved RoPE in place. total = rows*n_heads*half.
     pub fn rope(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_ptx, "rope");
         const total = rows * n_heads * half;
-        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("rope_inter", qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal`
@@ -5151,25 +5126,22 @@ pub const Backend = struct {
     pub fn ropeHalf(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, pos0: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.rope_half_ptx, "rope_half");
         const total = rows * n_heads * half;
-        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(pos0), 0 }, .{ 0, 0 }, total);
+        try self.dualElems("rope_half", qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(pos0), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a += b, in place (plain residual add). total = element count.
-    /// `a += b` over two f16 activations, summed in f32. See `elt.add_h16_ptx`.
+    /// `a += b` over two f16 activations, summed in f32.
     pub fn opAddH16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.add_h16_ptx, "add_h16");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualPairs("add_h16", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.add_ptx, "add");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("add", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a += scale * b, in place. The LoRA sidecar's accumulate, where `scale`
@@ -5177,64 +5149,56 @@ pub const Backend = struct {
     pub fn opAddScaled(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.add_scaled_ptx, "add_scaled");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ scale, 0 }, total);
+        try self.dualElems("add_scaled", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, total);
     }
 
     /// In-place scalar multiply: a[i] *= scalar (Gemma 4 per-layer out_scale).
     pub fn opScale(self: *Backend, a: DeviceBuffer, scalar: f32, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.f32_scale_ptx, "f32_scale");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ scalar, 0 }, total);
+        try self.dualElems("scale_f32", a, a, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ scalar, 0 }, total);
     }
 
     pub fn opGatherRows(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, ids: DeviceBuffer, rows: usize, width: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const total = rows * width;
-        const f = try self.eltFn(elt.gather_rows_ptx, "gather_rows");
-        try self.eltLaunch(f, src, dst, ids, null, .{ @intCast(total), @intCast(width), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gather_rows", src, dst, ids, null, .{ @intCast(total), @intCast(width), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opScatterAddRows(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, ids: DeviceBuffer, scales: DeviceBuffer, rows: usize, width: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const total = rows * width;
-        const f = try self.eltFn(elt.scatter_add_rows_ptx, "scatter_add_rows");
-        try self.eltLaunch(f, dst, src, ids, scales, .{ @intCast(total), @intCast(width), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("scatter_add_rows", dst, src, ids, scales, .{ @intCast(total), @intCast(width), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// dst[t] = sum over the token's `used` route rows of scales[r] * src[r];
-    /// `slot_rows[t*used+k]` names the row. Deterministic (see elt.moe_combine_ptx).
+    /// `slot_rows[t*used+k]` names the row. Deterministic (see `dual/elt.zig` moeCombine).
     pub fn opMoeCombine(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, slot_rows: DeviceBuffer, scales: DeviceBuffer, tokens: usize, used: usize, width: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const total = tokens * width;
-        const f = try self.eltFn(elt.moe_combine_ptx, "moe_combine");
-        try self.eltLaunch(f, dst, src, slot_rows, scales, .{ @intCast(total), @intCast(width), @intCast(used), 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("moe_combine", dst, src, slot_rows, scales, .{ @intCast(total), @intCast(width), @intCast(used), 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opSilu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.silu_ptx, "silu");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("silu", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opSoftplusGate(self: *Backend, a: DeviceBuffer, gate: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.softplus_gate_ptx, "softplus_gate");
-        try self.eltLaunch(f, a, gate, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("softplus_gate", a, gate, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// ReLU in place: a[i] = max(0, a[i]).
     pub fn opRelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.relu_ptx, "relu");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("relu", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Top-k candidate selection over `logits` (device [vocab] f32): `topk_lanes`
@@ -5250,12 +5214,11 @@ pub const Backend = struct {
         if (entries.len == 0) return;
         self.ptic();
         defer self.ptoc(.elt);
-        var wire: sample.PenaltyWire = undefined;
-        const w = sample.packPenaltyWireU32(entries, sp, &wire);
+        var wire: [2 * sample.max_penalty_window]f32 = undefined;
+        const w = sample.packPenaltyWireF32(entries, sp, &wire);
         try self.ensureDeviceBuffer(&self.pen_wire, w.len * 4);
         try self.tensorUpload(self.pen_wire, std.mem.sliceAsBytes(w));
-        const f = try self.eltFn(elt.penalize_ptx, "penalize");
-        try self.eltLaunch(f, logits, self.pen_wire, null, null, .{ @intCast(entries.len), 0, 0, 0, 0, 0 }, .{ sp.repeat_penalty, 0 }, entries.len);
+        try self.dualElems("penalize", logits, self.pen_wire, null, null, .{ @intCast(entries.len), 0, 0, 0, 0, 0, 0 }, .{ sp.repeat_penalty, 0 }, entries.len);
     }
 
     pub fn opTopK(self: *Backend, logits: DeviceBuffer, vocab: usize, out_val: *DeviceBuffer, out_idx: *DeviceBuffer) Error!usize {
@@ -5265,8 +5228,7 @@ pub const Backend = struct {
         const count = lanes * topk_m;
         try self.ensureDeviceBuffer(out_val, count * 4);
         try self.ensureDeviceBuffer(out_idx, count * 4);
-        const f = try self.eltFn(elt.topk_reduce_ptx, "topk_reduce");
-        try self.eltLaunch(f, logits, out_val.*, out_idx.*, null, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
+        try self.dualElems("topk_reduce", logits, null, out_val.*, out_idx.*, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
         return count;
     }
 
@@ -5290,10 +5252,8 @@ pub const Backend = struct {
         const lanes: usize = @min(@as(usize, 4096), vocab);
         try self.ensureDeviceBuffer(scratch_v, lanes * 4);
         try self.ensureDeviceBuffer(scratch_i, lanes * 4);
-        const fr = try self.eltFn(elt.argmax_reduce_ptx, "argmax_reduce");
-        try self.eltLaunch(fr, logits, scratch_v.*, scratch_i.*, null, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
-        const ff = try self.eltFn(elt.argmax_final_ptx, "argmax_final");
-        try self.eltLaunch(ff, scratch_v.*, scratch_i.*, out_id, null, .{ @intCast(lanes), 0, 0, 0, 0, 0 }, .{ 0, 0 }, 1);
+        try self.dualElems("argmax_reduce", logits, null, scratch_v.*, scratch_i.*, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
+        try self.dualElems("argmax_final", scratch_v.*, scratch_i.*, null, out_id, .{ @intCast(lanes), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, 1);
     }
 
     /// VAE per-position channel L2 norm (+ optional fused silu). x/out [n][c]
@@ -5301,8 +5261,7 @@ pub const Backend = struct {
     pub fn opVaeNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, gamma: DeviceBuffer, n: usize, c: usize, silu: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.vae_norm_ptx, "vae_norm");
-        try self.eltLaunch(f, x, out, gamma, null, .{ @intCast(n), @intCast(c), @intFromBool(silu), 0, 0, 0 }, .{ 1e-12, 0 }, n);
+        try self.dualElems("vae_norm", x, out, gamma, null, .{ @intCast(n), @intCast(c), @intFromBool(silu), 0, 0, 0, 0 }, .{ 1e-12, 0 }, n);
     }
 
     // --- SD family (UNet / AutoencoderKL) --------------------------------
@@ -5333,63 +5292,57 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         const per_group = ch / groups;
-        const f_st = if (act_f16)
-            try self.eltFn(elt.gn_stats_h16_ptx, "gn_stats_h16")
-        else
-            try self.eltFn(elt.gn_stats_ptx, "gn_stats");
-        // `total` here only sets the grid: both kernels want ONE 256-thread block per
-        // unit of work (a partial, then a group), and `eltLaunch` blocks by 256.
-        try self.eltLaunch(f_st, x, null, null, gstat, .{
-            @intCast(groups * chunks), @intCast(ch), @intCast(chunks), @intCast(per_group), @intCast(n), 0,
-        }, .{ 0, 0 }, groups * chunks * 256);
-        const f_cb = try self.eltFn(elt.gn_combine_ptx, "gn_combine");
-        try self.eltLaunch(f_cb, gstat, null, null, gmi, .{
-            @intCast(groups), 0, @intCast(chunks), 0, 0, 0,
-        }, .{ eps, 0 }, groups * 256);
-        const f_ap = if (act_f16)
-            try self.eltFn(elt.gn_apply_h16_ptx, "gn_apply_h16")
-        else
-            try self.eltFn(elt.gn_apply_ptx, "gn_apply");
-        try self.eltLaunch(f_ap, x, out, cat, gmi, .{
-            @intCast(n * ch), @intCast(ch), @intCast(per_group), @intCast(groups), @intCast(ch), @intFromBool(silu),
-        }, .{ 0, 0 }, n * ch);
+        const u_st = [7]u32{ @intCast(groups * chunks), @intCast(ch), @intCast(chunks), @intCast(per_group), @intCast(n), 0, 0 };
+        if (act_f16) {
+            try self.dualRows("gn_stats_h16", x, null, null, gstat, u_st, .{ 0, 0 }, groups * chunks);
+        } else {
+            try self.dualRows("gn_stats", x, null, null, gstat, u_st, .{ 0, 0 }, groups * chunks);
+        }
+        try self.dualElems("gn_combine", gstat, null, null, gmi, .{ @intCast(groups), 0, @intCast(chunks), 0, 0, 0, 0 }, .{ eps, 0 }, groups);
+        const u_ap = [7]u32{ @intCast(n * ch), @intCast(ch), @intCast(per_group), @intCast(groups), @intCast(ch), @intFromBool(silu), 0 };
+        if (act_f16) {
+            try self.dualPairs("gn_apply_h16", x, out, cat, gmi, u_ap, .{ 0, 0 }, n * ch);
+        } else {
+            try self.dualElems("gn_apply", x, out, cat, gmi, u_ap, .{ 0, 0 }, n * ch);
+        }
     }
 
     /// dst[p][c] += bias[off + c], broadcast over positions.
     pub fn opAddBiasRows(self: *Backend, dst: DeviceBuffer, bias: DeviceBuffer, n: usize, ch: usize, off: usize, h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = if (h16)
-            try self.eltFn(elt.add_bias_rows_h16_ptx, "add_bias_rows_h16")
-        else
-            try self.eltFn(elt.add_bias_rows_ptx, "add_bias_rows");
-        try self.eltLaunch(f, dst, bias, null, null, .{
-            @intCast(n * ch), @intCast(ch), 0, @intCast(off), 0, 0,
-        }, .{ 0, 0 }, n * ch);
+        const u = [7]u32{ @intCast(n * ch), @intCast(ch), 0, @intCast(off), 0, 0, 0 };
+        if (h16) {
+            std.debug.assert(ch % 2 == 0);
+            try self.dualPairs("add_bias_rows_h16", dst, bias, null, null, u, .{ 0, 0 }, n * ch);
+        } else {
+            try self.dualElems("add_bias_rows", dst, bias, null, null, u, .{ 0, 0 }, n * ch);
+        }
     }
 
     /// GEGLU: dst[p][j] = src[p][j] * geluErf(src[p][inner+j]).
     pub fn opGeglu(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, inner: usize, h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = if (h16)
-            try self.eltFn(elt.geglu_h16_ptx, "geglu_h16")
-        else
-            try self.eltFn(elt.geglu_ptx, "geglu");
-        try self.eltLaunch(f, src, dst, null, null, .{ @intCast(n * inner), @intCast(inner), 0, 0, 0, 0 }, .{ 0, 0 }, n * inner);
+        const u = [7]u32{ @intCast(n * inner), @intCast(inner), 0, 0, 0, 0, 0 };
+        if (h16) {
+            std.debug.assert(inner % 2 == 0);
+            try self.dualPairs("geglu_h16", src, dst, null, null, u, .{ 0, 0 }, n * inner);
+        } else {
+            try self.dualElems("geglu", src, dst, null, null, u, .{ 0, 0 }, n * inner);
+        }
     }
 
     /// Channel-axis concatenation: dst[p][off + j] = src[p][j].
     pub fn opConcatCh(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, src_ch: usize, dst_ch: usize, off: usize, h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = if (h16)
-            try self.eltFn(elt.concat_ch_h16_ptx, "concat_ch_h16")
-        else
-            try self.eltFn(elt.concat_ch_ptx, "concat_ch");
-        try self.eltLaunch(f, src, dst, null, null, .{
-            @intCast(n * src_ch), @intCast(src_ch), @intCast(dst_ch), @intCast(off), 0, 0,
-        }, .{ 0, 0 }, n * src_ch);
+        // An f16 concatenation moves whole words: every channel count is even.
+        if (h16) std.debug.assert(src_ch % 2 == 0 and dst_ch % 2 == 0 and off % 2 == 0);
+        const sh: u1 = @intFromBool(h16);
+        try self.dualElems("concat_ch", src, dst, null, null, .{
+            @intCast((n * src_ch) >> sh), @intCast(src_ch >> sh), @intCast(dst_ch >> sh), @intCast(off >> sh), 0, 0, 0,
+        }, .{ 0, 0 }, (n * src_ch) >> sh);
     }
 
     /// Cross-attention: non-causal, with `seq_kv` independent of `seq_q` (the
@@ -5485,16 +5438,13 @@ pub const Backend = struct {
     ) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = if (src_f16)
-            try self.eltFn(elt.im2col_sd_h16_ptx, "im2col_sd_h16")
-        else
-            try self.eltFn(elt.im2col_sd_ptx, "im2col_sd");
         const total = bn * patch_len;
-        // The output width rides in f1's raw bits: this kernel signature has six
-        // u32 slots and the band already needs all of them.
-        try self.eltLaunch(f, src, patch, null, null, .{
-            @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0),
-        }, .{ @floatFromInt(mode), @bitCast(@as(u32, @intCast(out_w))) }, total);
+        const u = [7]u32{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0), @intCast(out_w) };
+        if (src_f16) {
+            try self.dualElems("im2col_sd_h16", src, null, null, patch, u, .{ @floatFromInt(mode), 0 }, total);
+        } else {
+            try self.dualElems("im2col_sd", src, null, null, patch, u, .{ @floatFromInt(mode), 0 }, total);
+        }
     }
 
     /// f32 [seq][heads*hd_src] -> f16 [seq_pad][heads*hd_out], each head
@@ -5514,10 +5464,7 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         std.debug.assert(hd_out % 2 == 0);
         const words = seq_pad * heads * hd_out / 2;
-        const f = try self.eltFn(elt.head_pad_h16_ptx, "head_pad_h16");
-        try self.eltLaunch(f, src, dst, null, null, .{
-            @intCast(words), @intCast(hd_src), @intCast(hd_out), @intCast(seq), @intCast(heads), 0,
-        }, .{ scale, 0 }, words);
+        try self.dualElems("head_pad_h16", src, null, null, dst, .{ @intCast(words), @intCast(hd_src), @intCast(hd_out), @intCast(seq), @intCast(heads), 0, 0 }, .{ scale, 0 }, words);
     }
 
     /// The f32 inverse: [seq_pad][heads*hd_out] -> tight [seq][heads*hd_src].
@@ -5533,10 +5480,7 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         const total = seq * heads * hd_src;
-        const f = try self.eltFn(elt.head_unpad_ptx, "head_unpad");
-        try self.eltLaunch(f, src, dst, null, null, .{
-            @intCast(total), @intCast(hd_src), @intCast(hd_out), 0, @intCast(heads), 0,
-        }, .{ 0, 0 }, total);
+        try self.dualElems("head_unpad", src, dst, null, null, .{ @intCast(total), @intCast(hd_src), @intCast(hd_out), 0, @intCast(heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// im2col for a 3x3 conv band: patch[bn][9*ci] from src[h*w][ci], zero-padded;
@@ -5545,9 +5489,8 @@ pub const Backend = struct {
     pub fn opIm2col(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, bn: usize, patch_len: usize, ci: usize, w: usize, h: usize, p0: usize, up: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.im2col_ptx, "im2col");
         const total = bn * patch_len;
-        try self.eltLaunch(f, src, patch, null, null, .{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0) }, .{ if (up) 1.0 else 0.0, 0 }, total);
+        try self.dualElems("im2col", src, null, null, patch, .{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0), 0 }, .{ if (up) 1.0 else 0.0, 0 }, total);
     }
 
     /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale*Q*Kᵀ)*V. Q/K/V are
@@ -5613,7 +5556,6 @@ pub const Backend = struct {
     fn opAttnCudnn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, io_f16: bool) Error!void {
         const qn = seq_q * n_heads * hd;
         const kn = seq_kv * kv_heads * hd;
-        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         // f16 Q/K/V/O are already the op's own tensors: with an f16 activation stream
         // the four conversions around every attention disappear rather than shrink.
         var q16 = q;
@@ -5629,9 +5571,9 @@ pub const Backend = struct {
             k16 = self.cudnn_k16;
             v16 = self.cudnn_v16;
             o16 = self.cudnn_o16;
-            try self.eltLaunch(f_cvt, q, q16, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0 }, .{ 0, 0 }, qn);
-            try self.eltLaunch(f_cvt, k, k16, null, null, .{ @intCast(kn), @intCast(kn), 0, 0, 0, 0 }, .{ 0, 0 }, kn);
-            try self.eltLaunch(f_cvt, v, v16, null, null, .{ @intCast(kn), @intCast(kn), 0, 0, 0, 0 }, .{ 0, 0 }, kn);
+            try self.cvtF32ToH16(q, q16, qn, qn);
+            try self.cvtF32ToH16(k, k16, kn, kn);
+            try self.cvtF32ToH16(v, v16, kn, kn);
         }
         const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd);
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
@@ -5639,8 +5581,7 @@ pub const Backend = struct {
         const L = &self.libs.?;
         plan.execute(&L.dnn, try self.dnnHandle(), q16.ptr(), k16.ptr(), v16.ptr(), o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
         if (io_f16) return;
-        const f_back = try self.eltFn(elt.f16_to_f32_ptx, "f16_to_f32");
-        try self.eltLaunch(f_back, o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0 }, .{ 0, 0 }, qn);
+        try self.dualElems("f16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn);
     }
 
     /// Head-batched attention: process `G` heads per launch (grid.z=G) so the PV
@@ -5680,9 +5621,6 @@ pub const Backend = struct {
             try self.eltFn(kernels.softmax_md_f16_ptx, "softmax_md_f16")
         else
             try self.eltFn(kernels.softmax_row_f16_ptx, "softmax_row_f16");
-        const f_ghb = try self.eltFn(elt.gather_head_b_ptx, "gather_head_b");
-        const f_gvtb = try self.eltFn(elt.gather_vt_b_ptx, "gather_vt_b");
-        const f_scb = try self.eltFn(elt.scatter_head_b_ptx, "scatter_head_b");
 
         // per-head strides (elements): scores A=Q,B=K stride s_qk, C=S stride s_s;
         // PV A=P/S stride s_s, B=Vt stride s_vt, C=O stride s_o.
@@ -5704,9 +5642,9 @@ pub const Backend = struct {
             const bh: u32 = @intCast(base);
             // gather Q (group_div=1), K (group_div=group), Vt for gs heads
             self.ptic();
-            try self.launch7(f_ghb, .{ q.ptr(), self.attn_qh.ptr() }, .{ seq32, nh32, bh, 1, hd32, mpad32, gs32 * mpad32 * hd32 }, gs * mpad * hd);
-            try self.launch7(f_ghb, .{ k.ptr(), self.attn_kh.ptr() }, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * mpad32 * hd32 }, gs * mpad * hd);
-            try self.launch7(f_gvtb, .{ v.ptr(), self.attn_vth.ptr() }, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * hd32 * mpad32 }, gs * hd * mpad);
+            try self.dualPairs("gather_head_b", q, self.attn_qh, null, null, .{ seq32, nh32, bh, 1, hd32, mpad32, gs32 * mpad32 * hd32 }, .{ 0, 0 }, gs * mpad * hd);
+            try self.dualPairs("gather_head_b", k, self.attn_kh, null, null, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * mpad32 * hd32 }, .{ 0, 0 }, gs * mpad * hd);
+            try self.dualPairs("gather_vt_b", v, self.attn_vth, null, null, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * hd32 * mpad32 }, .{ 0, 0 }, gs * hd * mpad);
             self.ptoc(.attn);
             // scores S[gs][mpad][mpad] f16 = scale*(Q @ Kᵀ)  (scale prefolded in
             // the C-store so f16 S can't overflow; softmax then uses scale=1)
@@ -5734,7 +5672,7 @@ pub const Backend = struct {
             }
             // scatter O rows 0..seq into out[q][base+z][hd]
             self.ptic();
-            try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, nh32, bh, hd32, mpad32, gs32 * seq32 * hd32, 0 }, gs * seq * hd);
+            try self.dualElems("scatter_head_b", self.attn_oh, out, null, null, .{ seq32, nh32, bh, hd32, mpad32, gs32 * seq32 * hd32, 0 }, .{ 0, 0 }, gs * seq * hd);
             self.ptoc(.attn);
         }
     }
@@ -5808,9 +5746,6 @@ pub const Backend = struct {
         const f_scores = try self.hgemmBatchedC16Fn();
         const f_pv = try self.hgemmAttnOutFn();
         const f_sm = try self.eltFn(kernels.softmax_md_f16_ptx, "softmax_md_f16");
-        const f_ghb = try self.eltFn(elt.gather_head_b_ptx, "gather_head_b");
-        const f_gvtb = try self.eltFn(elt.gather_vt_b_ptx, "gather_vt_b");
-        const f_scb = try self.eltFn(elt.scatter_head_b_ptx, "scatter_head_b");
 
         const s_q: u32 = @intCast(qpad * hd);
         const s_k: u32 = @intCast(kpad * hd);
@@ -5833,9 +5768,9 @@ pub const Backend = struct {
             const bh: u32 = @intCast(base);
             // Q/scatter carry the QUERY length and pad; K/Vᵀ the KEY length and pad.
             self.ptic();
-            try self.launch7(f_ghb, .{ q.ptr(), self.attn_qh.ptr() }, .{ qs32, nh32, bh, 1, hd32, qp32, gs32 * qp32 * hd32 }, gs * qpad * hd);
-            try self.launch7(f_ghb, .{ k.ptr(), self.attn_kh.ptr() }, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * kp32 * hd32 }, gs * kpad * hd);
-            try self.launch7(f_gvtb, .{ v.ptr(), self.attn_vth.ptr() }, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * hd32 * kp32 }, gs * hd * kpad);
+            try self.dualPairs("gather_head_b", q, self.attn_qh, null, null, .{ qs32, nh32, bh, 1, hd32, qp32, gs32 * qp32 * hd32 }, .{ 0, 0 }, gs * qpad * hd);
+            try self.dualPairs("gather_head_b", k, self.attn_kh, null, null, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * kp32 * hd32 }, .{ 0, 0 }, gs * kpad * hd);
+            try self.dualPairs("gather_vt_b", v, self.attn_vth, null, null, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * hd32 * kp32 }, .{ 0, 0 }, gs * hd * kpad);
             self.ptoc(.attn);
             self.ptic();
             try self.launchHgemmB(f_scores, self.attn_qh, self.attn_kh, self.attn_s, qpad, kpad, hd, gs, s_q, s_k, s_s, scale);
@@ -5847,7 +5782,7 @@ pub const Backend = struct {
             try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, qpad, hd, kpad, gs, s_s, s_vt, s_o, ks32, qp32, cbase);
             self.ptoc(.attn_pv);
             self.ptic();
-            try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ qs32, nh32, bh, hd32, qp32, gs32 * qs32 * hd32, 0 }, gs * seq_q * hd);
+            try self.dualElems("scatter_head_b", self.attn_oh, out, null, null, .{ qs32, nh32, bh, hd32, qp32, gs32 * qs32 * hd32, 0 }, .{ 0, 0 }, gs * seq_q * hd);
             self.ptoc(.attn);
         }
     }
@@ -5887,9 +5822,6 @@ pub const Backend = struct {
         const f_scores = try self.hgemmBatchedFn(); // f32-C scores GEMM
         const f_pv = try self.hgemmAttnOutA32Fn();
         const f_sm = try self.eltFn(kernels.softmax_md_f32_ptx, "softmax_md_f32");
-        const f_gh = try self.eltFn(elt.gather_head_ptx, "gather_head");
-        const f_gvt = try self.eltFn(elt.gather_vt_ptx, "gather_vt");
-        const f_sc = try self.eltFn(elt.scatter_head_ptx, "scatter_head");
 
         const mpad32: u32 = @intCast(mpad);
         const seq32: u32 = @intCast(seq);
@@ -5900,9 +5832,9 @@ pub const Backend = struct {
         const s_s: u32 = @intCast(mpad * mpad); // per-head stride; unused at gs=1
 
         // Gather the single head (n_heads = head = 0), padding rows seq..mpad.
-        try self.launch7(f_gh, .{ q.ptr(), self.attn_qh.ptr() }, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
-        try self.launch7(f_gh, .{ k.ptr(), self.attn_kh.ptr() }, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
-        try self.launch7(f_gvt, .{ v.ptr(), self.attn_vth.ptr() }, .{ seq32, 1, 0, hd32, mpad32, hd32 * mpad32, 0 }, hd * mpad);
+        try self.dualPairs("gather_head", q, self.attn_qh, null, null, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+        try self.dualPairs("gather_head", k, self.attn_kh, null, null, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+        try self.dualPairs("gather_vt", v, self.attn_vth, null, null, .{ seq32, 1, 0, hd32, mpad32, hd32 * mpad32, 0 }, .{ 0, 0 }, hd * mpad);
 
         var q0: usize = 0;
         while (q0 < mpad) : (q0 += qb) {
@@ -5918,7 +5850,7 @@ pub const Backend = struct {
             try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32, no_causal);
         }
         // Scatter O rows 0..seq into out (n_heads = head = 0).
-        try self.launch7(f_sc, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, 1, 0, hd32, seq32 * hd32, 0, 0 }, seq * hd);
+        try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, 1, 0, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
     }
 
     /// Per-head attention reference (A/B against the batched path). Scratch reused
@@ -5935,9 +5867,6 @@ pub const Backend = struct {
 
         const f_hg = try self.hgemmFn();
         const f_sm = try self.eltFn(kernels.softmax_row_ptx, "softmax_row");
-        const f_gh = try self.eltFn(elt.gather_head_ptx, "gather_head");
-        const f_gvt = try self.eltFn(elt.gather_vt_ptx, "gather_vt");
-        const f_sc = try self.eltFn(elt.scatter_head_ptx, "scatter_head");
 
         const mpad32: u32 = @intCast(mpad);
         const seq32: u32 = @intCast(seq);
@@ -5948,30 +5877,14 @@ pub const Backend = struct {
         for (0..n_heads) |h| {
             const kvh: u32 = @intCast(h / group);
             const head32: u32 = @intCast(h);
-            try self.launch7(f_gh, .{ q.ptr(), self.attn_qh.ptr() }, .{ seq32, nh32, head32, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
-            try self.launch7(f_gh, .{ k.ptr(), self.attn_kh.ptr() }, .{ seq32, kvh32, kvh, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
-            try self.launch7(f_gvt, .{ v.ptr(), self.attn_vth.ptr() }, .{ seq32, kvh32, kvh, hd32, mpad32, hd32 * mpad32, 0 }, hd * mpad);
+            try self.dualPairs("gather_head", q, self.attn_qh, null, null, .{ seq32, nh32, head32, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+            try self.dualPairs("gather_head", k, self.attn_kh, null, null, .{ seq32, kvh32, kvh, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+            try self.dualPairs("gather_vt", v, self.attn_vth, null, null, .{ seq32, kvh32, kvh, hd32, mpad32, hd32 * mpad32, 0 }, .{ 0, 0 }, hd * mpad);
             try self.launchHgemm(f_hg, self.attn_qh, self.attn_kh, self.attn_s, mpad, mpad, hd);
             try self.launchSoftmax(f_sm, self.attn_s, self.attn_p, mpad, mpad, seq, scale);
             try self.launchHgemm(f_hg, self.attn_p, self.attn_vth, self.attn_oh, mpad, hd, mpad);
-            try self.launch7(f_sc, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, nh32, head32, hd32, seq32 * hd32, 0, 0 }, seq * hd);
+            try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, nh32, head32, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
         }
-    }
-
-    /// Launch a 2-buffer / up-to-7-u32 kernel (the gather/scatter signature).
-    fn launch7(self: *Backend, f: cu.CUfunction, bufs: [2]cu.CUdeviceptr, u: [7]u32, total: usize) Error!void {
-        var p0 = bufs[0];
-        var p1 = bufs[1];
-        var uu = u;
-        var params = [_]?*anyopaque{
-            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&uu[0]), @ptrCast(&uu[1]),
-            @ptrCast(&uu[2]), @ptrCast(&uu[3]), @ptrCast(&uu[4]), @ptrCast(&uu[5]),
-            @ptrCast(&uu[6]),
-        };
-        // param count is fixed by the entry (gather_vt uses 8, others 7); passing
-        // extra pointers is harmless, the driver reads only what the entry declares.
-        const grid: u32 = @intCast((total + 255) / 256);
-        self.ctx.launch(f, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// hgemm: C[m][n] f32 = A[m][k] f16 @ B[n][k] f16ᵀ. m,n multiples of 128.
@@ -6066,8 +5979,7 @@ pub const Backend = struct {
     pub fn sigmoidMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.sigmoid_mul_ptx, "sigmoid_mul");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("sigmoid_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = silu(a)*b, in place (a=gate, b=up).
@@ -6075,47 +5987,42 @@ pub const Backend = struct {
     pub fn siluMul16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.silu_mul_h16_ptx, "silu_mul_h16");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(total % 2 == 0);
+        try self.dualElems("silu_mul16", a, b, null, a, .{ @intCast(total / 2), 0, 0, 0, 0, 0, 0 }, .{ 1.0, 0 }, total / 2);
     }
 
     pub fn siluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.silu_mul_ptx, "silu_mul");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("silu_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// GeGLU gate: a = geluTanh(a) * b, in place (Gemma FFN). total = elements.
     pub fn geluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gelu_mul_ptx, "gelu_mul");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gelu_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = gelu_quick(a) * b, in place (gemma4v vision FFN: gelu_quick(gate)*up).
     pub fn geluQuickMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gelu_quick_mul_ptx, "gelu_quick_mul");
-        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gelu_quick_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = geluTanh(a), in place. total = element count.
     pub fn gelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gelu_ptx, "gelu");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gelu", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = x*sigmoid(1.702x), in place, CLIP-L's FFN activation. total = element count.
     pub fn geluQuick(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gelu_quick_ptx, "gelu_quick");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gelu_quick", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = 0.5x(1 + erf(x/sqrt2)), in place, CLIP-G's FFN activation. NOT
@@ -6123,8 +6030,7 @@ pub const Backend = struct {
     pub fn geluErf(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gelu_erf_ptx, "gelu_erf");
-        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gelu_erf", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a += mod[gate_off + col] * b, in place (residual with gate). total=rows*dim.
@@ -6137,8 +6043,7 @@ pub const Backend = struct {
     pub fn gatedAddRows(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.gated_add_ptx, "gated_add");
-        try self.eltLaunch(f, a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), @intCast(idx_stride), 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("gated_add", a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), @intCast(idx_stride), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 };
 
@@ -6273,7 +6178,7 @@ test "moe_combine matches a host combine" {
     try std.testing.expectEqualSlices(f32, ref, got);
 }
 
-test "vector q6_k dequant is bit-identical to the scalar kernel" {
+test "device q6_k dequant matches the CPU decode" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -6288,26 +6193,23 @@ test "vector q6_k dequant is bit-identical to the scalar kernel" {
         const d: f16 = @floatCast(rand.float(f32) * 0.01);
         @memcpy(raw[b * 210 + 208 ..][0..2], std.mem.asBytes(&d));
     }
-    var d_in = try be.tensorCreate(raw.len);
-    var d_ref = try be.tensorCreate(elems * 2);
-    var d_got = try be.tensorCreate(elems * 2);
-    defer {
-        be.tensorDestroy(&d_in);
-        be.tensorDestroy(&d_ref);
-        be.tensorDestroy(&d_got);
-    }
-    try be.tensorUpload(d_in, raw);
-    const f_s = try be.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16");
-    try be.eltLaunch(f_s, d_in, d_ref, null, null, .{ @intCast(elems), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems);
-    const f_v = try be.eltFn(elt.dequant_q6_k_f16v_ptx, "dequant_q6_k_f16v");
-    try be.eltLaunch(f_v, d_in, d_got, null, null, .{ @intCast(elems / 16), 0, 0, 0, 0, 0 }, .{ 0, 0 }, elems / 16);
-    const ref = try gpa.alloc(u16, elems);
+    const ref = try gpa.alloc(f32, elems);
     defer gpa.free(ref);
+    const quants = @import("tp_core").quants;
+    quants.raw.dequantRow(14, raw, elems, ref) catch return error.SkipZigTest; // GGML_TYPE_Q6_K
+    var d_in = try be.tensorCreate(raw.len);
+    defer be.tensorDestroy(&d_in);
+    try be.tensorUpload(d_in, raw);
+    const out = try be.opDequantF16(.q6_k, d_in, elems);
     const got = try gpa.alloc(u16, elems);
     defer gpa.free(got);
-    try be.tensorDownload(d_ref, std.mem.sliceAsBytes(ref));
-    try be.tensorDownload(d_got, std.mem.sliceAsBytes(got));
-    try std.testing.expectEqualSlices(u16, ref, got);
+    try be.tensorDownload(out, std.mem.sliceAsBytes(got));
+    // The CPU decode is f32; the device rounds once to f16, so compare at f16.
+    for (ref, got, 0..) |r, g, idx| {
+        const want: u16 = @bitCast(@as(f16, @floatCast(r)));
+        errdefer std.debug.print("q6_k dequant mismatch at {d}: cpu {x} device {x}\n", .{ idx, want, g });
+        try std.testing.expectEqual(want, g);
+    }
 }
 
 test "causal tensor-core attention matches the flash-split kernel" {

@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
             ctx.coop_wg_m / 2, ctx.coop_wg_n / 2, ctx.coop_wg_m, ctx.coop_wg_n, ctx.coop_i8_wg_m, ctx.coop_i8_wg_n,
         });
         try stdout.print("coop matrix i8->i32:   {d}x{d}x{d}  ({s})\n", .{
-            ctx.coop_i8_m, ctx.coop_i8_n, ctx.coop_i8_k,
+            ctx.coop_i8_m,                                                                    ctx.coop_i8_n, ctx.coop_i8_k,
             if (ctx.coop_i8_m != 0) "int8 tensor cores available" else "no int8 coop config",
         });
         // Tiny correctness check: y = x @ W^T with W = 2*I.
@@ -262,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
         try minimaxH3AudioCudaTest(arena, io, stdout, ck, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "lora-cuda-test")) {
         try loraCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "dual-cuda-test")) {
+        try dualCudaTest(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-cuda-test")) {
         try minimaxH3VaeCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-cuda-test")) {
@@ -284,8 +286,8 @@ pub fn main(init: std.process.Init) !void {
         for (names) |name| {
             const view = store.get(name).?;
             try stdout.print("  {s}  {any}  {t}{s}\n", .{
-                name,                          view.info.shape.slice(),
-                view.info.dtype,               if (view.info.flat_blocks) "  (flat blocks)" else "",
+                name,            view.info.shape.slice(),
+                view.info.dtype, if (view.info.flat_blocks) "  (flat blocks)" else "",
             });
         }
     } else {
@@ -432,6 +434,10 @@ pub fn main(init: std.process.Init) !void {
             \\      attention) against the CPU ops they reproduce, then its whole
             \\      device forward against anima.DiT.predict on real weights, on
             \\      both attention paths; non-zero if any fails
+            \\  TensorPencil dual-cuda-test
+            \\      the dual-target kernels (gpu/kernels/dual.zig, compiled to PTX)
+            \\      against their hand-PTX twins and an f64 host reference, then
+            \\      bandwidth of both; non-zero if any result is off
             \\  TensorPencil vk-norm-bench
             \\      thread-per-row vs subgroup weighted RMSNorm at every shape the
             \\      three Vulkan DiTs use, at the sizes they render at
@@ -699,9 +705,9 @@ fn cudaTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     };
     defer ctx.deinit();
     try stdout.print("cuda device: {s} (sm_{d}{d}), {d} SMs, opt-in shared {d} KB/block, {d} KB/SM, {d} MHz\n", .{
-        ctx.deviceName(),   ctx.cc_major,                    ctx.cc_minor,
-        ctx.sm_count,       @divTrunc(ctx.shared_optin_max, 1024),
-        @divTrunc(ctx.shared_per_sm, 1024), @divTrunc(ctx.clock_khz, 1000),
+        ctx.deviceName(),               ctx.cc_major,                          ctx.cc_minor,
+        ctx.sm_count,                   @divTrunc(ctx.shared_optin_max, 1024), @divTrunc(ctx.shared_per_sm, 1024),
+        @divTrunc(ctx.clock_khz, 1000),
     });
     try cuda.kernels.smokeTest(&ctx);
     try stdout.print("cuda vadd smoke test OK\n", .{});
@@ -2477,9 +2483,8 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
                 const ok = bad == 0 and rel < 5e-3;
                 if (!ok) failures += 1;
                 try stdout.print("  {d}x{d} {s:<12} {d:7.0} ms  rel L2 {e:.4}  {s}{s}\n", .{
-                    zh, zw, if (naive) "be.attn" else "opAttnTC", dt, rel,
-                    if (ok) "ok" else "FAILED",
-                    if (bad != 0) " (non-finite)" else "",
+                    zh,                         zw,                                    if (naive) "be.attn" else "opAttnTC", dt, rel,
+                    if (ok) "ok" else "FAILED", if (bad != 0) " (non-finite)" else "",
                 });
             }
         }
@@ -3072,10 +3077,9 @@ fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         }, c.rows, @as(usize, 1), @as(usize, 1) });
         const sub = try T.run(gpu.Context.opRmsNormSg, .{ ctx, x_d, y_d, w_d, c.rows, c.dim, @as(f32, 1e-6) });
         try stdout.print("{s} {d:6}x{d:<4} {d:7.2} ms {d:4.0} GB/s {d:7.2} ms {d:4.0} GB/s {d:6.1}x  {d:6.0} -> {d:4.0} ms\n", .{
-            c.who,      c.rows,                    c.dim,
-            thr,        bytes / thr / 1e6,
-            sub,        bytes / sub / 1e6,
-            thr / sub,  thr * @as(f64, @floatFromInt(c.per_step)),
+            c.who,                                     c.rows,            c.dim,
+            thr,                                       bytes / thr / 1e6, sub,
+            bytes / sub / 1e6,                         thr / sub,         thr * @as(f64, @floatFromInt(c.per_step)),
             sub * @as(f64, @floatFromInt(c.per_step)),
         });
     }
@@ -3258,10 +3262,10 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
         // TFLOP/s is computed on the time NET of the submit floor, so a small GEMM is not
         // credited with the harness's own overhead.
         try stdout.print("  {s} x{d}  bf16 {d:7.2} ms ({d:5.1} TF/s net)  int8 {d:7.2} ms ({d:5.1} TF/s net)  {d:4.2}x   prep {d:6.2} ms\n", .{
-            sh.name,      sh.per_block,
-            bf,           flop / @max(bf - floor, 1e-6) / 1e9,
-            q8,           flop / @max(q8 - floor, 1e-6) / 1e9,
-            bf / q8,      pr,
+            sh.name, sh.per_block,
+            bf,      flop / @max(bf - floor, 1e-6) / 1e9,
+            q8,      flop / @max(q8 - floor, 1e-6) / 1e9,
+            bf / q8, pr,
         });
     }
 
@@ -3777,7 +3781,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     try stdout.print("GEMM only       : {d:.1} ms   ({d:.1} TFLOP/s)\n", .{ t_gemm, flop / (t_gemm / 1e3) / 1e12 });
     try stdout.print("conversion pass : {d:.1} ms   ({d:.1}% of the op)\n", .{ conv, 100.0 * conv / t_full });
     try stdout.print("\narithmetic: {d:.1} TFLOP/step at m_pad={d} (m={d}, {d:.1}% pad waste)\n", .{
-        flop / 1e12, m_pad, seq,
+        flop / 1e12,                                                                   m_pad, seq,
         100.0 * @as(f64, @floatFromInt(m_pad - seq)) / @as(f64, @floatFromInt(m_pad)),
     });
 
@@ -5216,9 +5220,8 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         const ap = try std.fmt.bufPrint(&ab, "{s}/audio.wav", .{dir_path});
         cont_wave = loadWav(gpa, io, ap) catch null;
         try stdout.print("continue from: {s} ({d} frames, {d}x{d}{s}), preserving {d}\n", .{
-            dir_path,           cont_frames.items.len, cont_frames.items[0].width,
-            cont_frames.items[0].height, if (cont_wave != null) ", with audio" else ", no audio.wav",
-            preserve_frames,
+            dir_path,                    cont_frames.items.len,                                       cont_frames.items[0].width,
+            cont_frames.items[0].height, if (cont_wave != null) ", with audio" else ", no audio.wav", preserve_frames,
         });
         clip_opts.continue_from = .{
             .frames = cont_frames.items,
@@ -5711,6 +5714,160 @@ fn minimaxH3AudioCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, 
     try stdout.print("OK\n", .{});
 }
 
+/// `dual-cuda-test`: a sample of the dual-target kernels (gpu/kernels/dual.zig,
+/// compiled to PTX) against an f64 host evaluation of the same formula, then their
+/// achieved bandwidth. The hand-PTX twins are gone; correctness of the rest of the
+/// set is the whole-forward device parity commands.
+fn dualCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    _ = io;
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== dual-cuda-test ==\ncuda device: {s}\n", .{be.deviceName()});
+
+    const Op = enum { add, silu_mul, sigmoid_mul, gelu, gelu_erf, relu, l2norm_rows };
+    const ops = [_]Op{ .add, .silu_mul, .sigmoid_mul, .gelu, .gelu_erf, .relu, .l2norm_rows };
+    // A DiT MLP activation's size: 4096 tokens x 8192 wide. Row kernels run over
+    // it as rows x l2_dim.
+    const n: usize = 4096 * 8192;
+    const l2_dim: usize = 128;
+    const a0 = try arena.alloc(f32, n);
+    const b0 = try arena.alloc(f32, n);
+    var prng = std.Random.DefaultPrng.init(0xd0a1);
+    const rnd = prng.random();
+    for (a0) |*v| v.* = rnd.floatNorm(f32) * 3.0;
+    for (b0) |*v| v.* = rnd.floatNorm(f32) * 3.0;
+    const got = try arena.alloc(f32, n);
+
+    var da = try be.tensorCreate(n * 4);
+    defer be.tensorDestroy(&da);
+    var db = try be.tensorCreate(n * 4);
+    defer be.tensorDestroy(&db);
+    try be.tensorUpload(db, std.mem.sliceAsBytes(b0));
+
+    const timer = try be.ctx.timerCreate();
+    defer be.ctx.timerDestroy(timer);
+
+    var failed = false;
+    try stdout.print("{s:<12} {s:>10} {s:>10}\n", .{ "op", "max err", "GB/s" });
+    for (ops) |op| {
+        var err: f64 = 0;
+        var ms: f64 = 0;
+        const reps = 20;
+        var rep: usize = 0;
+        // Rep 0 is the untimed warm-up: it carries the module's JIT.
+        while (rep <= reps) : (rep += 1) {
+            try be.tensorUpload(da, std.mem.sliceAsBytes(a0));
+            try be.ctx.synchronize();
+            try be.ctx.timerBegin(timer);
+            switch (op) {
+                .add => try be.opAdd(da, db, n),
+                .silu_mul => try be.siluMul(da, db, n),
+                .sigmoid_mul => try be.sigmoidMul(da, db, n),
+                .gelu => try be.gelu(da, n),
+                .gelu_erf => try be.geluErf(da, n),
+                .relu => try be.opRelu(da, n),
+                .l2norm_rows => try be.opL2NormRows(da, n / l2_dim, l2_dim, 1e-6),
+            }
+            const t = try be.ctx.timerEndMs(timer);
+            if (rep > 0) ms += t;
+            if (rep == 0) {
+                try be.tensorDownload(da, std.mem.sliceAsBytes(got));
+                err = if (op == .l2norm_rows) l2normMaxErr(a0, got, l2_dim) else dualMaxErr(op, a0, b0, got);
+            }
+        }
+        // Two-input ops read a and b and write a; one-input ops read and write a.
+        const two = op == .add or op == .silu_mul or op == .sigmoid_mul;
+        const bytes: f64 = @floatFromInt(n * 4 * @as(usize, if (two) 3 else 2) + if (op == .l2norm_rows) n * 4 else 0);
+        const gbs = bytes / (ms / reps * 1e-3) / 1e9;
+        // f32 transcendental paths through ex2.approx: a few ulp. add and relu are exact.
+        const tol: f64 = if (op == .add or op == .relu) 0 else 4e-6;
+        const ok = err <= tol;
+        if (!ok) failed = true;
+        try stdout.print("{t:<12} {e:>10.2} {d:>10.1}{s}\n", .{ op, err, gbs, if (ok) "" else "  FAIL" });
+    }
+
+    // The weighted rmsnorm at the shapes that matter: an LLM decode hidden norm
+    // (one wide row), a decode qk norm (many short rows) and a DiT trunk norm.
+    // Hand PTX (block per row under 512 rows, else warp per row) against the shared
+    // subgroup-per-row kernel, interleaved.
+    try stdout.print("\n{s:<22} {s:>10} {s:>10} {s:>8}\n", .{ "rmsnorm rows x dim", "hand us", "dual us", "ratio" });
+    const shapes = [_][2]usize{ .{ 1, 4096 }, .{ 1, 5376 }, .{ 32, 128 }, .{ 256, 128 }, .{ 4096, 3072 }, .{ 32768, 128 } };
+    for (shapes) |sh| {
+        const rows = sh[0];
+        const dim = sh[1];
+        var w = try be.tensorCreate(dim * 4);
+        defer be.tensorDestroy(&w);
+        try be.tensorUpload(w, std.mem.sliceAsBytes(b0[0..dim]));
+        var us: [2]f64 = .{ 0, 0 };
+        const reps = 50;
+        var rep: usize = 0;
+        while (rep <= reps) : (rep += 1) {
+            for ([_]bool{ false, true }, 0..) |dual, kk| {
+                cuda.backend.rms_dual = dual;
+                try be.ctx.synchronize();
+                try be.ctx.timerBegin(timer);
+                try be.qkNorm(da, db, w, rows, dim, 1e-6);
+                const t = try be.ctx.timerEndMs(timer);
+                if (rep > 0) us[kk] += t * 1000.0;
+            }
+        }
+        cuda.backend.rms_dual = true;
+        try stdout.print("{d:>8} x {d:<11} {d:>10.1} {d:>10.1} {d:>8.2}\n", .{ rows, dim, us[0] / reps, us[1] / reps, us[0] / us[1] });
+    }
+    if (failed) return error.DualKernelMismatch;
+}
+
+fn l2normMaxErr(a: []const f32, got: []const f32, dim: usize) f64 {
+    var worst: f64 = 0;
+    var r: usize = 0;
+    while (r < a.len / dim) : (r += 1) {
+        var ss: f64 = 0;
+        for (a[r * dim ..][0..dim]) |v| ss += @as(f64, v) * v;
+        const scale = 1.0 / @max(@sqrt(ss), 1e-6);
+        for (a[r * dim ..][0..dim], got[r * dim ..][0..dim]) |v, g| {
+            const ref = v * scale;
+            worst = @max(worst, @abs(@as(f64, g) - ref) / (1.0 + @abs(ref)));
+        }
+    }
+    return worst;
+}
+
+/// max |got - ref| / (1 + |ref|) over all elements, the reference evaluated in f64.
+fn dualMaxErr(op: anytype, a: []const f32, b: []const f32, got: []const f32) f64 {
+    var worst: f64 = 0;
+    for (a, b, got) |ai, bi, gi| {
+        const x: f64 = ai;
+        const y: f64 = bi;
+        const ref: f64 = switch (op) {
+            // The f32 sum itself: an add has one correctly rounded answer.
+            .add => ai + bi,
+            .silu_mul => x / (1.0 + @exp(-x)) * y,
+            .sigmoid_mul => x / (1.0 + @exp(-y)),
+            .gelu => x / (1.0 + @exp(-(1.5957691216057308 * (x + 0.044715 * x * x * x)))),
+            .gelu_erf => 0.5 * x * (1.0 + erf64(x * 0.7071067811865476)),
+            .relu => @max(0.0, x),
+            .l2norm_rows => unreachable,
+        };
+        const e = @abs(@as(f64, gi) - ref) / (1.0 + @abs(ref));
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
+/// A&S 7.1.26 erf, the same approximation the kernels use, so the check measures
+/// the f32 evaluation and not the approximation itself.
+fn erf64(x: f64) f64 {
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    const er = 1.0 - poly * @exp(-ax * ax);
+    return if (x < 0) -er else er;
+}
+
 /// `lora-cuda-test`: the device LoRA sidecar against its host twin, at the real
 /// H3 factor shapes. Non-zero exit if they disagree.
 ///
@@ -6093,7 +6250,6 @@ fn minimaxH3CudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt:
         if (worst != 0) return error.GpuMismatch;
         return;
     }
-
 
     const in: h3.Inputs = .{
         .video = video,

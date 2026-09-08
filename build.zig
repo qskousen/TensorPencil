@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     // into the library as raw module bytes.
     // One object per kernel: the 0.16 SPIR-V backend only supports workgroup
     // storage in a single entry point per module.
-    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "dp4a", "subgroup" };
+    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "dp4a", "subgroup", "dual" };
     var kernel_objs: [kernel_names.len]*std.Build.Step.Compile = undefined;
     for (kernel_names, 0..) |kname, i| {
         kernel_objs[i] = b.addObject(.{
@@ -78,6 +78,43 @@ pub fn build(b: *std.Build) void {
             .use_llvm = false,
         });
     }
+
+    // `dual` also compiles to PTX for the CUDA backend. Zig's LLVM backend cannot
+    // emit nvptx assembly for an exported kernel (it aliases the export name to
+    // a private kernel, which NVPTX rejects), so: LLVM IR out of the object,
+    // tools/ptx_unalias.zig renames the kernels, and Zig's bundled clang lowers
+    // the IR. `+ptx80` pins the ISA version the hand-written kernels use.
+    const dual_ir = b.addObject(.{
+        .name = "dual_ir",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/kernels/dual.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .nvptx64,
+                .os_tag = .cuda,
+                .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_86 },
+            }),
+            .optimize = .ReleaseFast,
+        }),
+        .use_llvm = true,
+    });
+    const ptx_unalias = b.addExecutable(.{
+        .name = "ptx_unalias",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ptx_unalias.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const unalias_run = b.addRunArtifact(ptx_unalias);
+    unalias_run.addFileArg(dual_ir.getEmittedLlvmIr());
+    const dual_ll = unalias_run.addOutputFileArg("dual.ll");
+    const dual_lower = b.addSystemCommand(&.{
+        b.graph.zig_exe, "cc",              "-target", "nvptx64-cuda", "-march=sm_86",
+        "-Xclang",       "-target-feature", "-Xclang", "+ptx80",       "-Wno-unused-command-line-argument",
+        "-O3",           "-S",              "-o",
+    });
+    const dual_ptx = dual_lower.addOutputFileArg("dual.ptx");
+    dual_lower.addFileArg(dual_ll);
 
     // The engine itself is pure Zig; libc is linked solely so std.DynLib can
     // dlopen the system Vulkan loader (Zig's own ELF loader cannot initialize
@@ -136,6 +173,7 @@ pub fn build(b: *std.Build) void {
     for (kernel_names, kernel_objs) |kname, obj| {
         gpu_mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = obj.getEmittedBin() });
     }
+    gpu_mod.addAnonymousImport("dual_ptx", .{ .root_source_file = dual_ptx });
     mod.addImport("tp_gpu", gpu_mod);
 
     // tp_runtime: the offload/scheduling tier (VRAM arbiter + residency planner;
@@ -856,8 +894,16 @@ pub fn build(b: *std.Build) void {
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
+    const unalias_tests = b.addTest(.{
+        .root_module = ptx_unalias.root_module,
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    const run_unalias_tests = b.addRunArtifact(unalias_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_unalias_tests.step);
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_ops_tests.step);
     test_step.dependOn(&run_gpu_tests.step);

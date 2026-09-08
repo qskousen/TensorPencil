@@ -1,3 +1,16 @@
+- gpu: `kernels/dual.zig` holds every elementwise kernel, every dequantizer and the row
+  reductions for both GPU arms. Still per backend: the block-quant GEMVs (CUDA warp-per-row
+  dp4a/f16 kernels, Vulkan `_t`/`_sg` kernels), attention, GEMMs. A shared subgroup-per-row
+  GEMV over the RAW ggml layout would give Vulkan decode kernels for q4_0/iq4_xs/q1_0/q2_0
+  (today they run through the dequant GEMM at <1 tok/s) and replace both arms' scalar
+  fallbacks; the dp4a/MMQ fast paths stay hand-tuned. Shared memory stays out until
+  Zig-emitted workgroup memory stops hanging NVIDIA on Vulkan; that is also what keeps
+  `qk_rmsnorm_par` alive for the one-row decode norm
+- gpu: the Vulkan 3-pass rmsnorm (`rms_partial`/`rms_combine`/`rms_apply_w`, qwen3_gpu
+  `normWide`, dit_gpu) can now call the shared `.rmsnorm` / `.rms_mod` row kernels directly;
+  one launch instead of three, same result
+- gpu: `dual_ptx` hardcodes sm_86 / ptx80 in build.zig, like the hand kernels' headers;
+  a second GPU generation needs both parameterized together
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - gui: studio (image_view) still uses its own form layout; bring the parameter form onto the shared chip/section primitives
@@ -51,9 +64,8 @@
 - llm decode: iq4_xs has no dp4a GEMV (`quantQ8NSupported` excludes it), so gemma3 12B
   IQ4_XS decodes at 28 tok/s against Q4_K_M's 58 through the same dispatcher. A
   `gemv_iq4_xs_q8n` twin of `gemv_q4_k_q8n` closes it for every arch at once
-- llm vulkan: `lin_llm_gpu` refuses q4_0/iq4_xs/q1_0/q2_0 by name; each needs a
-  `gemv_*_t` and a `dequant_*` kernel. Also `check` runs without a device in tests only
-  through `quantKernel`/`wcode`; `routeOf` needs a Context for the knob reads
+- llm vulkan: `check` runs without a device in tests only through `quantKernel`/`wcode`;
+  `routeOf` needs a Context for the knob reads
 - llm: a `--llm-gemm` knob mirroring `--dit-gguf-gemm` (force grouped / MMQ / dequant
   per run) would make the dispatcher's crossovers measurable from one binary;
   `grouped_max = 40` is a 3090 number from qgemv-bench
