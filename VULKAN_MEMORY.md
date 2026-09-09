@@ -177,24 +177,21 @@ Build once, reuse everywhere below:
       cooperative version would need a separate raw row-major buffer (extra VRAM)
       or a non-coalesced k-major read. Lower priority than the DP4A item.
       *LLM only* (diffusion linears are m=seq → coop GEMM, not GEMV).
-- [~] **One-pass RMSNorm.** DONE for the LLM (`rmsnorm_sg` in subgroup.zig +
-      `Context.opRmsNormSg`): one subgroup per row, lanes stride the row summing
-      squares → single subgroup reduce → each lane writes normed*w. Replaces the
-      3-pass `rms_partial`/`rms_combine`/`rms_apply_w` (`VulkanLM.normWide`, fires
-      ~2×/layer/token). **Correctness: VERIFIED** — device test `"gpu subgroup
-      rmsnorm matches cpu reference"` (rows∈{1,4,3}, dim∈{6144,6157}) passes on
-      580 (no DEVICE_LOST — the escape hatch works for a real reduction kernel).
-      **tok/s: MEASURED NEUTRAL** on a 12B (llama-arch) Vulkan decode: baseline
-      ~10.7 vs subgroup ~10.6 tok/s (2-run 16-vs-128 subtraction, within
-      run-to-run noise) — as predicted, a 12B's per-token cost is GEMV-dominated,
-      not norm-dominated. Currently **opt-in via `TP_VK_SG_RMS`** (not yet
-      default): neutral+correct on the one model testable here, but the regime
-      where the dispatch-count drop would show (small model / high tok/s) has no
-      Vulkan-runnable checkpoint on this box (all local qwen3 GGUFs have
-      block-quant embed tables Vulkan rejects; only F16-embed GGUF is this 12B).
-      Flip to default once the GEMV work lands a fast small-model path to measure.
-      STILL TODO: diffusion side (`rms_apply_mod` variant; dit_gpu.zig:443/809/905)
-      — needs a modulation-aware `rmsnorm_mod_sg`. CUDA twin: `rms_mod`/`qk_rmsnorm`.
+- [x] **One-pass RMSNorm.** SHIPPED on the DIFFUSION side and REJECTED on the LLM side,
+      which is the opposite of what this entry predicted. The DiT's norms are now one
+      fused row kernel each (`rms_mod` / `rms_mod_h16` in `dual/rows.zig`), so the
+      norm and the AdaLN modulation are a single launch where they were three plus a
+      per-chunk round trip through global memory, and two workspace buffers are gone.
+      Time is a wash there (the elementwise bucket is ~60 ms against ~3.4 s of matmul
+      at 512 px), so it is a simplification, not a win.
+      The LLM's `normWide` stays on the 3-pass chain: at the decode's ONE row a
+      subgroup-per-row kernel is 32 lanes on one multiprocessor, where the chunked
+      partials spread the row over 64 and the apply pass over `hidden` threads. That
+      cost 6% of decode (30.9 → 29.0 tok/s, 8B q8_0, interleaved same-binary A/B; the
+      3-pass restore brought it back to 30.9), so the dispatch-count argument loses to
+      the parallelism one at rows = 1. A row kernel that splits a wide row across
+      subgroups needs a cross-subgroup reduce, i.e. the workgroup memory this file
+      exists to avoid. `TP_VK_SG_RMS` is gone with it.
 
 ## Tier 2 — per-token / per-block; medium
 

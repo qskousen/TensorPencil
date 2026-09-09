@@ -96,6 +96,14 @@ each has caught.
 The gate lives in `src/test_gate.zig` (`build_options.integration`): GPU `init` fails in
 test builds when it is off, and heavy tests call `test_gate.requireModelFile` /
 `requireIntegration`. Gate new slow tests the same way; keep fast CPU unit tests ungated.
+A SECOND gate is the `testdata/gpu-tests` marker file (git-ignored): the device tests skip
+without it, so `-Dintegration` on a box that lacks it reports green having run almost none
+of them. Two hazards that only bite once they do run, both of which pass a test in isolation
+and fail it in the full binary: a weight buffer freed before the next allocation can be
+served the PREVIOUS upload (both device weight caches key on the HOST POINTER, so every
+weight in a test must live to the end), and `chat.applyTokenizer` publishes special ids
+process-wide (restore them with `chat.tokenizerIds` or the next model gets ids its vocab has
+no rows for).
 
 **Device validation is CLI commands, not unit tests**, because the test binary brings up no
 CUDA context. Each checks kernels against their CPU ops and then a whole forward against the

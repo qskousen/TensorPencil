@@ -73,11 +73,50 @@ pub fn setReasoningEffort(effort: ReasoningEffort) void {
 /// conversion step that could quietly disagree.
 pub const Reasoning = @import("tool_call.zig").Reasoning;
 
-/// A given family's reasoning-block markers, or null if it can't reason. The
-/// single source of truth; `reasoning`/`supportsThinking` read the active
-/// family, callers probing a not-yet-active family pass it explicitly.
+/// A given family's reasoning-block markers, or null if it can't reason. What a
+/// family's ARCHITECTURE implies; the model's own template can say otherwise, which
+/// is what `reasoning()` prefers. Callers probing a not-yet-active family pass it
+/// explicitly.
 pub fn reasoningFor(f: Family) ?Reasoning {
     return reasoningForEffort(f, .high);
+}
+
+/// Markers read out of the loaded model's own chat template, when it names a pair
+/// this build knows. Set by `observeReasoning` at load, and what `reasoning()`
+/// prefers over the family guess: a fine-tune that emits another family's markers
+/// is otherwise mis-split LIVE, not merely on reload.
+pub var reasoning_observed: ?Reasoning = null;
+
+/// An explicit answer from the user (`tp-llm --reasoning-markers`), which wins over
+/// both. The escape hatch for a model whose markers are in neither list: the CLOSE
+/// marker cannot be observed from a generation prompt, and a template that builds
+/// its markers by concatenation names neither.
+pub var reasoning_override: ?Reasoning = null;
+
+/// Every marker pair this build can split, longest open marker first so a template
+/// naming two of them resolves to the more specific.
+const known_reasoning = [_]Reasoning{
+    .{ .open = "<|channel>thought", .close = "<channel|>" },
+    .{ .open = "<ifm|think_faster>", .close = "</ifm|think_faster>" },
+    .{ .open = "<ifm|think_fast>", .close = "</ifm|think_fast>" },
+    .{ .open = "<ifm|think>", .close = "</ifm|think>" },
+    .{ .open = "<think>", .close = "</think>" },
+};
+
+/// The markers `src` (a chat template's text) writes, or null when it names none.
+/// BOTH halves must appear: a template that only mentions an open marker is priming
+/// a block it does not close, and guessing the close is how a thought leaks into
+/// the answer.
+pub fn reasoningFromTemplate(src: []const u8) ?Reasoning {
+    for (known_reasoning) |r| {
+        if (std.mem.indexOf(u8, src, r.open) != null and std.mem.indexOf(u8, src, r.close) != null) return r;
+    }
+    return null;
+}
+
+/// Record what the loaded model's template says. Pass null (no template) to clear.
+pub fn observeReasoning(src: ?[]const u8) void {
+    reasoning_observed = if (src) |t| reasoningFromTemplate(t) else null;
 }
 
 pub fn reasoningForEffort(f: Family, effort: ReasoningEffort) ?Reasoning {
@@ -93,8 +132,14 @@ pub fn reasoningForEffort(f: Family, effort: ReasoningEffort) ?Reasoning {
     };
 }
 
-/// The active family's reasoning-block markers, or null if it can't reason.
+/// The active model's reasoning-block markers, or null if it can't reason: what the
+/// user said, else what its own template writes, else what its architecture implies.
+///
+/// A family with selectable effort keeps the family answer, since its template names
+/// every variant's markers and only the request says which one this turn asked for.
 pub fn reasoning() ?Reasoning {
+    if (reasoning_override) |r| return r;
+    if (!familySupportsReasoningEffort(family)) if (reasoning_observed) |r| return r;
     return reasoningForEffort(family, reasoning_effort);
 }
 
@@ -118,9 +163,11 @@ pub fn familySupportsThinking(f: Family) bool {
     return reasoningFor(f) != null;
 }
 
-/// Whether the active family supports a reasoning block (drives the GUI toggle).
+/// Whether the active model supports a reasoning block (drives the GUI toggle).
+/// Reads `reasoning()`, so a model whose template names markers its architecture
+/// does not have still gets the toggle.
 pub fn supportsThinking() bool {
-    return familySupportsThinking(family);
+    return reasoning() != null;
 }
 
 /// Map a GGUF `general.architecture` string to its chat template family, or
@@ -176,6 +223,25 @@ pub fn archForProjector(projector: []const u8) ?[]const u8 {
 pub fn setFamily(f: Family) void {
     family = f;
     gemma_user_open = false;
+}
+
+/// The special ids `applyTokenizer` publishes, as one value. A caller that has to
+/// put them back (a test that loads a SECOND model in the same process) restores
+/// this rather than five globals; leaving another vocab's ids here emits token ids
+/// that do not exist in the next model, which surfaces far away as
+/// `error.TokenIdOutOfRange` inside a forward.
+pub const TokenizerIds = struct { turn_end: u32, pad: u32, newline: u32, bos: ?u32, eos: ?u32 };
+
+pub fn tokenizerIds() TokenizerIds {
+    return .{ .turn_end = turn_end, .pad = pad, .newline = newline, .bos = bos_token, .eos = eos };
+}
+
+pub fn restoreTokenizerIds(s: TokenizerIds) void {
+    turn_end = s.turn_end;
+    pad = s.pad;
+    newline = s.newline;
+    bos_token = s.bos;
+    eos = s.eos;
 }
 
 /// Point the template glue and stop check at `tok`'s vocab.
@@ -500,6 +566,51 @@ test "reasoning descriptor is family-scoped" {
     setFamily(.gemma);
     try std.testing.expect(!supportsThinking());
     try std.testing.expectEqual(@as(?Reasoning, null), reasoning());
+}
+
+test "the model's own template outranks its family, and an override outranks both" {
+    const saved_f = family;
+    const saved_o = reasoning_observed;
+    const saved_ov = reasoning_override;
+    defer {
+        setFamily(saved_f);
+        reasoning_observed = saved_o;
+        reasoning_override = saved_ov;
+    }
+    reasoning_override = null;
+
+    // A gemma3 fine-tune that emits ChatML thoughts: the family says it cannot
+    // reason at all, the template says otherwise, and the template is right.
+    setFamily(.gemma);
+    observeReasoning("{% if enable_thinking %}<think>\n{% endif %}...</think>");
+    try std.testing.expect(supportsThinking());
+    try std.testing.expectEqualStrings("<think>", reasoning().?.open);
+    // No template, or one that names no markers: back to the family's answer.
+    observeReasoning(null);
+    try std.testing.expect(!supportsThinking());
+    observeReasoning("{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}");
+    try std.testing.expect(!supportsThinking());
+
+    // An open marker with no close is not a pair: guessing the close is how a
+    // thought block leaks into the answer.
+    try std.testing.expectEqual(@as(?Reasoning, null), reasoningFromTemplate("<think>"));
+    // The more specific pair wins over one whose open marker is a substring.
+    const both = reasoningFromTemplate("<|channel>thought ... <channel|> ... <think></think>").?;
+    try std.testing.expectEqualStrings("<|channel>thought", both.open);
+
+    // Effort-selectable families keep the family answer: their template names all
+    // three variants, and only the request says which one this turn asked for.
+    setFamily(.k2_horizon);
+    observeReasoning("<think>x</think>");
+    setReasoningEffort(.medium);
+    try std.testing.expectEqualStrings("<ifm|think_fast>", reasoning().?.open);
+    setReasoningEffort(.high);
+
+    // The user's answer wins over both.
+    setFamily(.chatml);
+    observeReasoning(null);
+    reasoning_override = .{ .open = "<reason>", .close = "</reason>" };
+    try std.testing.expectEqualStrings("<reason>", reasoning().?.open);
 }
 
 test "arch→family mapping and family-scoped thinking probe (no global mutation)" {

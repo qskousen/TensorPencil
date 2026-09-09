@@ -13,6 +13,7 @@
 /// b2=mod. u0=rows, u1=dim, u2=premul_off, u3=shift_off, f0=eps. grid=(rows,1,1).
 const std = @import("std");
 const wnoise = @import("wnoise.zig");
+const ptx = @import("ptx.zig");
 
 /// naive attention, one thread per (query,head), online softmax, GQA.
 /// b0=q[seq_q][heads][hd], b1=k[seq_kv][kv][hd], b2=v[seq_kv][kv][hd],
@@ -21,10 +22,7 @@ const wnoise = @import("wnoise.zig");
 /// Causal treats the queries as the LAST seq_q positions of the kv sequence
 /// (query i attends to keys [0, seq_kv - seq_q + i]), seq_q == seq_kv is the
 /// classic square case, seq_q == 1 with longer seq_kv is KV-cached decode.
-pub const attn_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -119,10 +117,7 @@ pub const attn_ptx: [:0]const u8 =
 /// total*heads (query,head) threads -> B× the parallelism of the per-item loop,
 /// which is what fills the GPU for short-sequence encoders. u0=total, u1=heads,
 /// u2=kv_heads, u3=hd, f0=scale. Same online-softmax math as `attn`.
-pub const attn_batched_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_batched_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_batched(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,.param .u64 p4,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -205,10 +200,7 @@ pub const attn_batched_ptx: [:0]const u8 =
 /// kernel serializes the whole row on a single lane. Same math/params:
 /// out = x * rsqrt(mean(x^2)+eps) * w. b0=x, b1=out, b2=w. u0=rows, u1=dim,
 /// f0=eps.
-pub const qk_rmsnorm_par_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const qk_rmsnorm_par_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry qk_rmsnorm_par(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -276,10 +268,7 @@ fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to:
 /// loading 8 weights as one v2.u32 (coalesced 2 KiB per block iteration) and x as
 /// v4.f32, then a shared-memory tree reduction. cols must be a multiple of 8.
 /// b0=W, b1=x, b2=y, b3=lut(f32[256] global). u0=rows, u1=cols, f0=scale.
-pub const gemv_fp8_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_fp8_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_fp8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -344,10 +333,7 @@ pub const gemv_fp8_ptx: [:0]const u8 =
 /// (two bf16, elems c and c+1 at c = 2t stride 512) and x as v2.f32; bf16 ->
 /// f32 is a 16-bit shift. cols must be a multiple of 2.
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_bf16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_bf16_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_bf16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -400,10 +386,7 @@ pub const gemv_bf16_ptx: [:0]const u8 =
 /// Used for the small f16 weights some GGUF quants keep at higher precision
 /// (e.g. Unsloth's ssm_alpha/ssm_beta). cols must be a multiple of 2.
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_f16_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -457,17 +440,19 @@ pub const gemv_f16_ptx: [:0]const u8 =
 /// thread t owns elems c = 2t stride 512. Blocks are only 2-byte aligned
 /// (34 B stride), so quants load as u16 pairs and d as b16. cols % 32 == 0.
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_q8_0_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_q8_0_ptx: [:0]const u8 = q8_0d_a ++ q8_0d_noise.prologue() ++ q8_0d_b ++
+    wnoise.jitterAt("%f6", "%rd10", "%rd1", .d, q8_0d_noise.h, q8_0d_noise.t, q8_0d_noise.u, q8_0d_noise.sig, q8_0d_noise.key) ++ q8_0d_c;
+
+const q8_0d_noise: NoiseRegs = .{ .sig = "%f14", .key = "%r24", .h = "%r25", .t = "%r26", .u = "%f15" };
+
+const q8_0d_a = ptx.preamble ++
     \\.visible .entry gemv_q8_0(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<6>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<24>;
-    \\  .reg .f32 %f<14>;
+    \\  .reg .b32 %r<27>;
+    \\  .reg .f32 %f<16>;
     \\  .reg .b64 %rd<20>;
     \\  .shared .align 4 .b8 red[1024];
     \\  mov.u32 %r1,%ctaid.x;                  // row
@@ -475,6 +460,10 @@ pub const gemv_q8_0_ptx: [:0]const u8 =
     \\  mov.u32 %r3,%tid.x;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q8_0d_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r5,%r4,5; mul.lo.u32 %r6,%r5,34;          // row bytes = cols/32*34
@@ -486,6 +475,10 @@ pub const gemv_q8_0_ptx: [:0]const u8 =
     \\  shr.u32 %r9,%r8,5; mul.lo.u32 %r10,%r9,34;
     \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // &block
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f6,%h0;    // d
+    \\
+;
+
+const q8_0d_c =
     \\  and.b32 %r11,%r8,31; cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11;
     \\  ld.global.u16 %r13,[%rd12+2];                      // 2 quants
     \\  mul.wide.u32 %rd13,%r8,4; add.s64 %rd14,%rd2,%rd13;
@@ -521,17 +514,19 @@ pub const gemv_q8_0_ptx: [:0]const u8 =
 /// per block: byte g holds element (b*32 + jj) in its LOW nibble and element
 /// (b*32 + jj + 16) in its HIGH nibble, so each weight byte is read ONCE and
 /// contributes two FMAs, v = (nibble - 8) * d. cols % 32 == 0.
-pub const gemv_q4_0_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_q4_0_ptx: [:0]const u8 = q4_0_a ++ q4_0_noise.prologue() ++ q4_0_b ++
+    wnoise.jitterAt("%f6", "%rd10", "%rd1", .d, q4_0_noise.h, q4_0_noise.t, q4_0_noise.u, q4_0_noise.sig, q4_0_noise.key) ++ q4_0_c;
+
+const q4_0_noise: NoiseRegs = .{ .sig = "%f16", .key = "%r20", .h = "%r21", .t = "%r22", .u = "%f17" };
+
+const q4_0_a = ptx.preamble ++
     \\.visible .entry gemv_q4_0(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<6>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<20>;
-    \\  .reg .f32 %f<16>;
+    \\  .reg .b32 %r<23>;
+    \\  .reg .f32 %f<18>;
     \\  .reg .b64 %rd<20>;
     \\  .shared .align 4 .b8 red[1024];
     \\  mov.u32 %r1,%ctaid.x;                  // row
@@ -539,6 +534,10 @@ pub const gemv_q4_0_ptx: [:0]const u8 =
     \\  mov.u32 %r3,%tid.x;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q4_0_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r5,%r4,5; mul.lo.u32 %r6,%r5,18;          // row bytes = cols/32*18
@@ -551,6 +550,10 @@ pub const gemv_q4_0_ptx: [:0]const u8 =
     \\  shr.u32 %r9,%r8,4;                     // block b = g/16
     \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f6,%h0;    // d
+    \\
+;
+
+const q4_0_c =
     \\  and.b32 %r11,%r8,15;                   // jj
     \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];  // qs byte
     \\  and.b32 %r14,%r13,15; sub.s32 %r14,%r14,8; cvt.rn.f32.s32 %f7,%r14; mul.f32 %f7,%f7,%f6;  // lo*d
@@ -634,17 +637,19 @@ fn q1BitSteps() []const u8 {
 /// cols % 128 == 0. b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
 pub const gemv_q1_0_ptx: [:0]const u8 = q1_0_head ++ q1BitSteps() ++ q1_0_tail;
 
-const q1_0_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q1_0_head = q1_0h_a ++ q1_0h_noise.prologue() ++ q1_0h_b ++
+    wnoise.jitterAt("%f2", "%rd10", "%rd1", .d, q1_0h_noise.h, q1_0h_noise.t, q1_0h_noise.u, q1_0h_noise.sig, q1_0h_noise.key) ++ q1_0h_c;
+
+const q1_0h_noise: NoiseRegs = .{ .sig = "%f16", .key = "%r24", .h = "%r25", .t = "%r26", .u = "%f17" };
+
+const q1_0h_a = ptx.preamble ++
     \\.visible .entry gemv_q1_0(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<4>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<24>;
-    \\  .reg .f32 %f<16>;
+    \\  .reg .b32 %r<27>;
+    \\  .reg .f32 %f<18>;
     \\  .reg .b64 %rd<20>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -653,6 +658,10 @@ const q1_0_head =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r19,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q1_0h_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r21,%r4,7; mul.lo.u32 %r22,%r21,18;       // row bytes = cols/128*18
@@ -665,6 +674,10 @@ const q1_0_head =
     \\  shr.u32 %r9,%r8,4;                     // block b = g/16
     \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d
+    \\
+;
+
+const q1_0h_c =
     \\  and.b32 %r11,%r8,15;                   // jj (qs byte within block)
     \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];
     \\  shl.b32 %r12,%r8,3;                    // e0 = g*8
@@ -771,17 +784,14 @@ pub const gemv_q2_0_g64_ptx = gemvQ2_0Ptx(q2_g64);
 pub const gemv_q2_0_g128_ptx = gemvQ2_0Ptx(q2_g128);
 
 fn q2_0_head(comptime g: Q2Geom) []const u8 {
-    return std.fmt.comptimePrint(
-        \\.version 8.0
-        \\.target sm_86
-        \\.address_size 64
+    return std.fmt.comptimePrint(ptx.preamble ++
         \\.visible .entry gemv_q2_0_{[tag]s}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
         \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
         \\{{
         \\  .reg .pred %p<4>;
         \\  .reg .b16 %h<2>;
-        \\  .reg .b32 %r<24>;
-        \\  .reg .f32 %f<16>;
+        \\  .reg .b32 %r<27>;
+        \\  .reg .f32 %f<18>;
         \\  .reg .b64 %rd<20>;
         \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
         \\  shr.u32 %r5,%r3,5;                     // warp
@@ -790,6 +800,7 @@ fn q2_0_head(comptime g: Q2Geom) []const u8 {
         \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r19,%r2; @%p1 bra END;
         \\  ld.param.u32 %r4,[u1];                 // cols
         \\  ld.param.f32 %f1,[f0];                 // scale
+    ++ "\n" ++ wnoise.prologueAt("%f16", "%r24", "f1", "u5") ++
         \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
         \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
         \\  shr.u32 %r21,%r4,{[qk_log]d}; mul.lo.u32 %r22,%r21,{[bb]d};   // row bytes = cols/qk*bb
@@ -802,6 +813,7 @@ fn q2_0_head(comptime g: Q2Geom) []const u8 {
         \\  shr.u32 %r9,%r8,{[bpb_log]d};          // block b = g/(qk/4)
         \\  mul.lo.u32 %r10,%r9,{[bb]d}; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
         \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d
+    ++ "\n" ++ wnoise.jitterAt("%f2", "%rd10", "%rd1", .d, "%r25", "%r26", "%f17", "%f16", "%r24") ++
         \\  and.b32 %r11,%r8,{[bpb_mask]d};        // jj (qs byte within block)
         \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];
         \\  shl.b32 %r12,%r8,2;                    // e0 = g*4
@@ -944,17 +956,14 @@ pub const gemv_q2_0_g64_q8_ptx = gemvQ2_0Q8Ptx(q2_g64);
 pub const gemv_q2_0_g128_q8_ptx = gemvQ2_0Q8Ptx(q2_g128);
 
 fn q2_0_q8_head(comptime g: Q2Geom) []const u8 {
-    return std.fmt.comptimePrint(
-        \\.version 8.0
-        \\.target sm_86
-        \\.address_size 64
+    return std.fmt.comptimePrint(ptx.preamble ++
         \\.visible .entry gemv_q2_0_{[tag]s}_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
         \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
         \\{{
         \\  .reg .pred %p<4>;
         \\  .reg .b16 %h<2>;
-        \\  .reg .b32 %r<60>;
-        \\  .reg .f32 %f<12>;
+        \\  .reg .b32 %r<63>;
+        \\  .reg .f32 %f<14>;
         \\  .reg .b64 %rd<26>;
         \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
         \\  shr.u32 %r5,%r3,5;                     // warp
@@ -963,6 +972,7 @@ fn q2_0_q8_head(comptime g: Q2Geom) []const u8 {
         \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
         \\  ld.param.u32 %r4,[u1];                 // cols
         \\  ld.param.f32 %f1,[f0];                 // scale
+    ++ "\n" ++ wnoise.prologueAt("%f12", "%r60", "f1", "u5") ++
         \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
         \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
         \\  shr.u32 %r15,%r4,{[qk_log]d}; mul.lo.u32 %r16,%r15,{[bb]d};   // row bytes = cols/qk*bb
@@ -991,6 +1001,7 @@ fn q2_0_q8_head(comptime g: Q2Geom) []const u8 {
         \\  and.b32 %r11,%r8,{[cpb_mask]d};        // chunk within block
         \\  mul.lo.u32 %r10,%r9,{[bb]d}; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
         \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d1
+    ++ "\n" ++ wnoise.jitterAt("%f2", "%rd10", "%rd1", .d, "%r61", "%r62", "%f13", "%f12", "%r60") ++
         \\  shl.b32 %r12,%r11,3; cvt.u64.u32 %rd11,%r12; add.s64 %rd12,%rd10,%rd11;
         \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];
         \\  ld.global.u16 %r17,[%rd12+6]; ld.global.u16 %r18,[%rd12+8];   // 32 codes
@@ -1051,17 +1062,14 @@ pub const gemv_q2_0_g64_q8x2_ptx = gemvQ2_0Q8X2Ptx(q2_g64);
 pub const gemv_q2_0_g128_q8x2_ptx = gemvQ2_0Q8X2Ptx(q2_g128);
 
 fn q2_0_q8x2_head(comptime g: Q2Geom) []const u8 {
-    return std.fmt.comptimePrint(
-        \\.version 8.0
-        \\.target sm_86
-        \\.address_size 64
+    return std.fmt.comptimePrint(ptx.preamble ++
         \\.visible .entry gemv_q2_0_{[tag]s}_q8x2(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
         \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
         \\{{
         \\  .reg .pred %p<4>;
         \\  .reg .b16 %h<4>;
-        \\  .reg .b32 %r<80>;
-        \\  .reg .f32 %f<16>;
+        \\  .reg .b32 %r<83>;
+        \\  .reg .f32 %f<18>;
         \\  .reg .b64 %rd<30>;
         \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
         \\  shr.u32 %r5,%r3,5;                     // warp
@@ -1070,6 +1078,7 @@ fn q2_0_q8x2_head(comptime g: Q2Geom) []const u8 {
         \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
         \\  ld.param.u32 %r4,[u1];                 // cols
         \\  ld.param.f32 %f1,[f0];                 // scale
+    ++ "\n" ++ wnoise.prologueAt("%f16", "%r80", "f1", "u5") ++
         \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
         \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
         \\  shr.u32 %r15,%r4,{[qk_log]d}; mul.lo.u32 %r16,%r15,{[bb]d};   // row bytes = cols/qk*bb
@@ -1099,6 +1108,8 @@ fn q2_0_q8x2_head(comptime g: Q2Geom) []const u8 {
         \\  add.s64 %rd10,%rd8,%rd9; add.s64 %rd24,%rd23,%rd9;   // &block row0 / row1
         \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;      // d1 row0
         \\  ld.global.b16 %h2,[%rd24]; cvt.f32.f16 %f10,%h2;     // d1 row1
+    ++ "\n" ++ wnoise.jitterAt("%f2", "%rd10", "%rd1", .d, "%r81", "%r82", "%f17", "%f16", "%r80") ++
+    wnoise.jitterAt("%f10", "%rd24", "%rd1", .d, "%r81", "%r82", "%f17", "%f16", "%r80") ++
         \\  shl.b32 %r12,%r11,3; cvt.u64.u32 %rd11,%r12;
         \\  add.s64 %rd12,%rd10,%rd11; add.s64 %rd25,%rd24,%rd11;
         \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];
@@ -1213,17 +1224,19 @@ fn q1Dp4aHalf(comptime q: u32, comptime act: u32) []const u8 {
 pub const gemv_q1_0_q8_ptx: [:0]const u8 =
     q1_0_q8_head ++ q1Dp4aHalf(13, 20) ++ q1Dp4aHalf(14, 24) ++ q1_0_q8_tail;
 
-const q1_0_q8_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q1_0_q8_head = q1_0q8_a ++ q1_0q8_noise.prologue() ++ q1_0q8_b ++
+    wnoise.jitterAt("%f2", "%rd10", "%rd1", .d, q1_0q8_noise.h, q1_0q8_noise.t, q1_0q8_noise.u, q1_0q8_noise.sig, q1_0q8_noise.key) ++ q1_0q8_c;
+
+const q1_0q8_noise: NoiseRegs = .{ .sig = "%f10", .key = "%r56", .h = "%r57", .t = "%r58", .u = "%f11" };
+
+const q1_0q8_a = ptx.preamble ++
     \\.visible .entry gemv_q1_0_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<4>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<56>;
-    \\  .reg .f32 %f<10>;
+    \\  .reg .b32 %r<59>;
+    \\  .reg .f32 %f<12>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -1232,6 +1245,10 @@ const q1_0_q8_head =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q1_0q8_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r15,%r4,7; mul.lo.u32 %r16,%r15,18;       // row bytes = cols/128*18
@@ -1259,6 +1276,10 @@ const q1_0_q8_head =
     \\  and.b32 %r11,%r8,3;                    // chunk within block
     \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d1
+    \\
+;
+
+const q1_0q8_c =
     \\  shl.b32 %r12,%r11,2; cvt.u64.u32 %rd11,%r12; add.s64 %rd12,%rd10,%rd11;
     \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];  // 32 sign bits
     \\  mul.wide.u32 %rd13,%r8,4; add.s64 %rd14,%rd19,%rd13; ld.global.f32 %f4,[%rd14];  // d8
@@ -1294,17 +1315,19 @@ const q1_0_q8_tail =
 /// maps through the non-linear codebook kvalues_iq4nl (a 16-entry .const LUT)
 /// instead of the affine (nibble - 8). Launch grid = ceil(rows/8).
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_iq4_nl_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_iq4_nl_ptx: [:0]const u8 = iq4nld_a ++ iq4nld_noise.prologue() ++ iq4nld_b ++
+    wnoise.jitterAt("%f6", "%rd10", "%rd1", .d, iq4nld_noise.h, iq4nld_noise.t, iq4nld_noise.u, iq4nld_noise.sig, iq4nld_noise.key) ++ iq4nld_c;
+
+const iq4nld_noise: NoiseRegs = .{ .sig = "%f16", .key = "%r24", .h = "%r25", .t = "%r26", .u = "%f17" };
+
+const iq4nld_a = ptx.preamble ++
     \\.visible .entry gemv_iq4_nl(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<4>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<24>;
-    \\  .reg .f32 %f<16>;
+    \\  .reg .b32 %r<27>;
+    \\  .reg .f32 %f<18>;
     \\  .reg .b64 %rd<22>;
     \\  .shared .align 4 .b8 kvsh[16];         // kvalues_iq4nl LUT (shared: divergent
     \\                                         // lookups parallelize, unlike const mem)
@@ -1323,6 +1346,10 @@ pub const gemv_iq4_nl_ptx: [:0]const u8 =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const iq4nld_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r18,%r4,5; mul.lo.u32 %r19,%r18,18;       // row bytes = cols/32*18
@@ -1336,6 +1363,10 @@ pub const gemv_iq4_nl_ptx: [:0]const u8 =
     \\  shr.u32 %r9,%r8,4;                     // block b = g/16
     \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f6,%h0;    // d
+    \\
+;
+
+const iq4nld_c =
     \\  and.b32 %r11,%r8,15;                   // jj
     \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];  // qs byte
     \\  and.b32 %r14,%r13,15; add.u32 %r22,%r14,%r12; ld.shared.s8 %r14,[%r22]; cvt.rn.f32.s32 %f7,%r14; mul.f32 %f7,%f7,%f6;  // kv[lo]*d
@@ -1367,10 +1398,7 @@ pub const gemv_iq4_nl_ptx: [:0]const u8 =
 /// byte bb of super-block sb covers elements sb*256 + (bb>>4)*32 + (bb&15)
 /// (low nibble) and +16 (high nibble). Launch grid = ceil(rows/8).
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_iq4_xs_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_iq4_xs_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_iq4_xs(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -1448,10 +1476,7 @@ pub const gemv_iq4_xs_ptx: [:0]const u8 =
 /// (q >> 4*((j>>5)&1)) & 15 from byte (j>>6)*32 + (j&31), v = dsc*q - dm.
 /// cols % 256 == 0 and cols <= 32768 (shared scale table).
 /// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_q4_k_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_q4_k_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_q4_k(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -1548,10 +1573,7 @@ pub const gemv_q4_k_ptx: [:0]const u8 =
 /// memory or barriers. Every qs/qh byte is read exactly once.
 /// cols % 256 == 0, rows % 8 == 0. b0=W, b1=x, b2=y. u0=rows, u1=cols,
 /// f0=scale.
-pub const gemv_q5_k_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_q5_k_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_q5_k(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -1711,10 +1733,7 @@ pub const gemv_q6_k_ptx: [:0]const u8 = q6k_a ++ q6k_noise.prologue() ++ q6k_b +
 
 const q6k_noise: NoiseRegs = .{ .sig = "%f40", .key = "%r48", .h = "%r49", .t = "%r50", .u = "%f41" };
 
-const q6k_a =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q6k_a = ptx.preamble ++
     \\.visible .entry gemv_q6_k(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -1850,10 +1869,7 @@ const q6k_c =
 ///
 /// Warp per block: lane loads one elem, butterfly-max for amax, butterfly-add
 /// for Σq. b0=x f32[cols], b1=xq out. u0=nblk (cols/32).
-pub const quantize_q8_1_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const quantize_q8_1_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry quantize_q8_1(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -1922,10 +1938,7 @@ pub const gemv_q5_k_q8_ptx: [:0]const u8 = q5kq8_a ++ q5kq8_noise.prologue() ++ 
 
 const q5kq8_noise: NoiseRegs = .{ .sig = "%f32", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f33" };
 
-const q5kq8_a =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q5kq8_a = ptx.preamble ++
     \\.visible .entry gemv_q5_k_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -2059,17 +2072,18 @@ const q5kq8_c =
 /// cvt+fma per group; the SoA activation loads as one v4.f32 of d8 + 4 u32.
 /// cols % 256 == 0, rows % 8 == 0. b0=W, b1=xq (SoA: f32 d[cols/32] then
 /// i8 qs[cols]), b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_q6_k_q8_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_q6_k_q8_ptx: [:0]const u8 = q6kq8_a ++ q6kq8_noise.prologue() ++ q6kq8_b ++ q6kq8_noise.jitter(false) ++ q6kq8_c;
+
+const q6kq8_noise: NoiseRegs = .{ .sig = "%f32", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f33" };
+
+const q6kq8_a = ptx.preamble ++
     \\.visible .entry gemv_q6_k_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<32>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<34>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2078,6 +2092,10 @@ pub const gemv_q6_k_q8_ptx: [:0]const u8 =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q6kq8_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,210;        // row bytes
@@ -2106,6 +2124,10 @@ pub const gemv_q6_k_q8_ptx: [:0]const u8 =
     \\  ld.global.u16 %r21,[%rd17+128]; ld.global.u16 %r22,[%rd17+130];
     \\  shl.b32 %r22,%r22,16; or.b32 %r21,%r21,%r22;       // w_h
     \\  ld.global.b16 %h0,[%rd10+208]; cvt.f32.f16 %f24,%h0; // d
+    \\
+;
+
+const q6kq8_c =
     \\  // i8 scales at +192 + half*8 + lb/16 (+2 per group), kept integer
     \\  shl.b32 %r23,%r12,3; shr.u32 %r25,%r13,4; add.u32 %r23,%r23,%r25;
     \\  cvt.u64.u32 %rd14,%r23; add.s64 %rd15,%rd10,%rd14;
@@ -2181,10 +2203,7 @@ const q5n_head = q5n_a ++ q5n_noise.prologue() ++ q5n_b ++ q5n_noise.jitter(true
 
 const q5n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
 
-const q5n_a =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q5n_a = ptx.preamble ++
     \\.visible .entry gemv_q5_k_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -2389,17 +2408,18 @@ const q8n_tail =
 /// loads, 8 dp4a, dot - 32*sum, acc fma). Same xq layout and params.
 pub const gemv_q6_k_q8n_ptx: [:0]const u8 = q6n_head ++ q8nInputs(q6nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q6n_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q6n_head = q6n_a ++ q6n_noise.prologue() ++ q6n_b ++ q6n_noise.jitter(false) ++ q6n_c;
+
+const q6n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const q6n_a = ptx.preamble ++
     \\.visible .entry gemv_q6_k_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<48>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
     \\  .reg .b64 %rd<28>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2411,6 +2431,10 @@ const q6n_head =
     \\  ld.param.u32 %r62,[u3];                // row_off
     \\  ld.param.u32 %r63,[u4];                // nblk_total
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q6n_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,210;        // row bytes
@@ -2444,6 +2468,10 @@ const q6n_head =
     \\  ld.global.u16 %r21,[%rd17+128]; ld.global.u16 %r22,[%rd17+130];
     \\  shl.b32 %r22,%r22,16; or.b32 %r21,%r21,%r22;       // w_h
     \\  ld.global.b16 %h0,[%rd10+208]; cvt.f32.f16 %f24,%h0; // d
+    \\
+;
+
+const q6n_c =
     \\  shl.b32 %r23,%r12,3; shr.u32 %r25,%r13,4; add.u32 %r23,%r23,%r25;
     \\  cvt.u64.u32 %rd14,%r23; add.s64 %rd15,%rd10,%rd14;
     \\  ld.global.s8 %r26,[%rd15+192];         // sc0
@@ -2503,10 +2531,7 @@ fn q6nInput(comptime i: u32) []const u8 {
 /// `p3[group]` packs expert:8, row count:4, and row offset:20.
 pub const gemv_q6_k_q8_expert_ptx: [:0]const u8 = q6_expert_head ++ q8nInputs(q6nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q6_expert_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q6_expert_head = ptx.preamble ++
     \\.visible .entry gemv_q6_k_q8_expert(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -2590,10 +2615,7 @@ const q4n_head = q4n_a ++ q4n_noise.prologue() ++ q4n_b ++ q4n_noise.jitter(true
 
 const q4n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
 
-const q4n_a =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q4n_a = ptx.preamble ++
     \\.visible .entry gemv_q4_k_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -2693,17 +2715,18 @@ const q4n_c =
 /// Shares q8n_step/epi with the k-quant grouped kernels. Same xq layout/params.
 pub const gemv_q8_0_q8n_ptx: [:0]const u8 = q8_0n_head ++ q8nInputs(q8_0nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q8_0n_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q8_0n_head = q8_0n_a ++ q8_0n_noise.prologue() ++ q8_0n_b ++ q8_0n_noise.jitter(false) ++ q8_0n_c;
+
+const q8_0n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const q8_0n_a = ptx.preamble ++
     \\.visible .entry gemv_q8_0_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<48>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
     \\  .reg .b64 %rd<28>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2715,6 +2738,10 @@ const q8_0n_head =
     \\  ld.param.u32 %r62,[u3];                // row_off
     \\  ld.param.u32 %r63,[u4];                // nblk_total
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q8_0n_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,5; mul.lo.u32 %r10,%r9,34;        // row bytes = nblk*34
@@ -2733,6 +2760,10 @@ const q8_0n_head =
     \\  mul.lo.u32 %r10,%r8,34;
     \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // weight block base
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f24,%h0;   // weight d
+    \\
+;
+
+const q8_0n_c =
     \\  ld.global.u16 %r40,[%rd10+2];  ld.global.u16 %r12,[%rd10+4];  shl.b32 %r12,%r12,16; or.b32 %r40,%r40,%r12;
     \\  ld.global.u16 %r41,[%rd10+6];  ld.global.u16 %r12,[%rd10+8];  shl.b32 %r12,%r12,16; or.b32 %r41,%r41,%r12;
     \\  ld.global.u16 %r42,[%rd10+10]; ld.global.u16 %r12,[%rd10+12]; shl.b32 %r12,%r12,16; or.b32 %r42,%r42,%r12;
@@ -2778,20 +2809,23 @@ fn q8_0nInput(comptime i: u32) []const u8 {
 /// the 18-byte q4_0 block (f16 d + 16 nibble bytes) and the -8 weight offset,
 /// applied as dot(w-8,a) = dp4a(nibble, a) - 8*sum(a) (sum via dp4a with
 /// 0x01010101 in r58). Nibbles decode to 0..15 (positive int8, so dp4a.s32 is
-/// exact). Reuses q8nInputs(q4_0nInput) ++ q8n_step ++ epilogue ++ tail.
+/// exact). Reuses q8nInputs(q4_0nInput) ++ q8n_step ++ epilogue ++ tail. The
+/// block scale takes the weight-noise jitter like the k-quants (f1 = sigma, u5 =
+/// stream), so a QAT q4_0 checkpoint is perturbed too.
 pub const gemv_q4_0_q8n_ptx: [:0]const u8 = q4_0n_head ++ q8nInputs(q4_0nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q4_0n_head =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+const q4_0n_head = q4_0n_a ++ q4_0n_noise.prologue() ++ q4_0n_b ++ q4_0n_noise.jitter(false) ++ q4_0n_c;
+
+const q4_0n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const q4_0n_a = ptx.preamble ++
     \\.visible .entry gemv_q4_0_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<48>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
     \\  .reg .b64 %rd<28>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2803,6 +2837,10 @@ const q4_0n_head =
     \\  ld.param.u32 %r62,[u3];                // row_off
     \\  ld.param.u32 %r63,[u4];                // nblk_total
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q4_0n_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,5; mul.lo.u32 %r10,%r9,18;        // row bytes = nblk*18
@@ -2822,6 +2860,10 @@ const q4_0n_head =
     \\  mul.lo.u32 %r10,%r8,18;
     \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // weight block base
     \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f24,%h0;   // weight d
+    \\
+;
+
+const q4_0n_c =
     \\  ld.global.u16 %r40,[%rd10+2];  ld.global.u16 %r12,[%rd10+4];  shl.b32 %r12,%r12,16; or.b32 %r40,%r40,%r12; // W0=qs[0..3]
     \\  ld.global.u16 %r41,[%rd10+6];  ld.global.u16 %r12,[%rd10+8];  shl.b32 %r12,%r12,16; or.b32 %r41,%r41,%r12; // W1=qs[4..7]
     \\  ld.global.u16 %r42,[%rd10+10]; ld.global.u16 %r12,[%rd10+12]; shl.b32 %r12,%r12,16; or.b32 %r42,%r42,%r12; // W2=qs[8..11]
@@ -2873,6 +2915,135 @@ fn q4_0nInput(comptime i: u32) []const u8 {
     , .{ i, 40 + i, 40 + i });
 }
 
+/// dp4a IQ4_XS GEMV, grouped-N q8_1 activation: the iq4_xs twin of gemv_q5_k_q8n.
+/// A unit is 8 qs bytes of one 32-element sub-block: low nibbles are its elements
+/// half*8+[0,8), high nibbles the same run 16 later, so both share the sub-block's
+/// 6-bit scale (dl = d*(ls-32)) and the activation's block scale. A nibble is an
+/// INDEX into kvalues_iq4nl, decoded four at a time with `prmt` over the table held
+/// in four registers (`iq4Lut`), so the dp4a operand is the signed table value and
+/// there is no min term. Same xq layout, params and shared step/epilogue as the
+/// other grouped kernels; the 136-byte super-block is 8-aligned, so v2 loads only.
+pub const gemv_iq4_xs_q8n_ptx: [:0]const u8 = iq4xsn_head ++ q8nInputs(iq4xsnInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
+
+const iq4xsn_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const iq4xsn_head = iq4xsn_a ++ iq4xsn_noise.prologue() ++ iq4xsn_b ++ iq4xsn_noise.jitter(false) ++ iq4xsn_c ++
+    iq4Lut("%r17", "%r47") ++ iq4Lut("%r18", "%r51") ++ iq4Lut("%r25", "%r49") ++ iq4Lut("%r26", "%r53") ++ iq4xsn_d;
+
+/// Four kvalues_iq4nl lookups: `src` holds four 4-bit indices, one per byte (upper
+/// nibbles clear); `dst` gets the four signed table bytes. Table words in
+/// %r40..%r43, scratch %r21/%r22/%r33/%r34. The indices are packed into prmt's
+/// four selector nibbles, both table halves are read, and bit 3 of each index
+/// (which prmt would take as "replicate the sign") picks the half instead.
+fn iq4Lut(comptime src: []const u8, comptime dst: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  shr.u32 %r21,{[s]s},4; or.b32 %r21,{[s]s},%r21; prmt.b32 %r21,%r21,%r21,0x0020; and.b32 %r21,%r21,0x7777;
+        \\  prmt.b32 %r22,%r40,%r41,%r21;
+        \\  prmt.b32 %r33,%r42,%r43,%r21;
+        \\  and.b32 %r34,{[s]s},0x08080808; shr.u32 %r34,%r34,3; mul.lo.u32 %r34,%r34,0xFF;
+        \\  xor.b32 %r33,%r33,%r22; and.b32 %r33,%r33,%r34; xor.b32 {[d]s},%r22,%r33;
+        \\
+    , .{ .s = src, .d = dst });
+}
+
+const iq4xsn_a = ptx.preamble ++
+    \\.visible .entry gemv_iq4_xs_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b16 %h<4>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
+    \\  .reg .b64 %rd<28>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;            // row
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.u32 %r61,[u2];                // ng
+    \\  ld.param.u32 %r62,[u3];                // row_off
+    \\  ld.param.u32 %r63,[u4];                // nblk_total
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const iq4xsn_b =
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,136;        // row bytes
+    \\  mul.wide.u32 %rd7,%r7,%r10; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  shl.b32 %r10,%r63,2; cvt.u64.u32 %rd4,%r10; add.s64 %rd4,%rd2,%rd4; // qs region base
+    \\  shr.u32 %r10,%r4,3; cvt.u64.u32 %rd25,%r10;        // d row step (cols/8 bytes)
+    \\  mul.lo.u32 %r11,%r62,%r10; cvt.u64.u32 %rd5,%r11; add.s64 %rd5,%rd2,%rd5; // d base at row_off
+    \\  mul.lo.u32 %r11,%r62,%r4; cvt.u64.u32 %rd6,%r11; add.s64 %rd6,%rd4,%rd6;  // qs base at row_off
+    \\  cvt.u64.u32 %rd26,%r4;                 // qs row step
+    \\  mov.u32 %r40,0xBFAD9881; mov.u32 %r41,0xF6EADDCF; mov.u32 %r42,0x26190D01; mov.u32 %r43,0x71594535; // kvalues_iq4nl
+    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
+    \\  mov.f32 %f44,0f00000000; mov.f32 %f45,0f00000000; mov.f32 %f46,0f00000000; mov.f32 %f47,0f00000000;
+    \\  shr.u32 %r30,%r4,4;                    // nu = cols/16
+    \\  mov.u32 %r8,%r6;                       // unit = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p4,%r8,%r30; @%p4 bra LD;
+    \\  shr.u32 %r9,%r8,4;                     // sb
+    \\  and.b32 %r11,%r8,15;                   // within
+    \\  shr.u32 %r12,%r11,1;                   // ib (sub-block 0..7)
+    \\  and.b32 %r13,%r11,1; shl.b32 %r13,%r13,3;          // half*8
+    \\  mul.lo.u32 %r10,%r9,136;
+    \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // super-block base
+    \\  ld.global.v2.u32 {%r35,%r36},[%rd10];              // d | scales_h, scales_l[0..3]
+    \\  mov.b32 {%h0,%h1},%r35;
+    \\  cvt.f32.f16 %f24,%h0;                  // d
+    \\
+;
+
+const iq4xsn_c =
+    \\  shl.b32 %r14,%r12,2; shr.u32 %r31,%r36,%r14; and.b32 %r31,%r31,15;             // ls_l
+    \\  shl.b32 %r14,%r12,1; add.u32 %r14,%r14,16; shr.u32 %r32,%r35,%r14; and.b32 %r32,%r32,3; shl.b32 %r32,%r32,4; // ls_h << 4
+    \\  or.b32 %r31,%r31,%r32; sub.s32 %r31,%r31,32;
+    \\  cvt.rn.f32.s32 %f10,%r31; mul.f32 %f25,%f24,%f10;  // dl = d * (ls - 32)
+    \\  shl.b32 %r14,%r12,4; add.u32 %r14,%r14,%r13; add.u32 %r14,%r14,8;
+    \\  cvt.u64.u32 %rd11,%r14; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.v2.u32 {%r15,%r16},[%rd12];              // qs0, qs1
+    \\  and.b32 %r17,%r15,0x0f0f0f0f;                      // low-nibble indices
+    \\  shr.u32 %r18,%r15,4; and.b32 %r18,%r18,0x0f0f0f0f; // high-nibble indices
+    \\  and.b32 %r25,%r16,0x0f0f0f0f;
+    \\  shr.u32 %r26,%r16,4; and.b32 %r26,%r26,0x0f0f0f0f;
+    \\
+;
+
+const iq4xsn_d =
+    \\  // moving input pointers for this unit (d, quants)
+    \\  shl.b32 %r45,%r9,3; add.u32 %r45,%r45,%r12; shl.b32 %r46,%r45,2;
+    \\  cvt.u64.u32 %rd15,%r46; add.s64 %rd16,%rd5,%rd15;
+    \\  shl.b32 %r46,%r9,8; shl.b32 %r20,%r12,5; add.u32 %r46,%r46,%r20; add.u32 %r46,%r46,%r13;
+    \\  cvt.u64.u32 %rd17,%r46; add.s64 %rd18,%rd6,%rd17;
+    \\
+;
+
+/// One grouped-GEMV input block (iq4_xs): dot the unit's four signed table words
+/// with input i's quants (low run, then the run 16 elements later), scale by
+/// dl * d8, accumulate into %f4{0+i}.
+fn iq4xsnInput(comptime i: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  setp.le.u32 %p6,%r61,{d}; @%p6 bra UDONE;
+        \\  ld.global.f32 %f26,[%rd16];
+        \\  ld.global.v2.u32 {{%r19,%r20}},[%rd18];
+        \\  ld.global.v2.u32 {{%r23,%r24}},[%rd18+16];
+        \\  mov.u32 %r56,0;
+        \\  dp4a.s32.s32 %r56,%r47,%r19,%r56;
+        \\  dp4a.s32.s32 %r56,%r49,%r20,%r56;
+        \\  dp4a.s32.s32 %r56,%r51,%r23,%r56;
+        \\  dp4a.s32.s32 %r56,%r53,%r24,%r56;
+        \\  cvt.rn.f32.s32 %f6,%r56;
+        \\  mul.f32 %f10,%f25,%f26;
+        \\  fma.rn.f32 %f{d},%f6,%f10,%f{d};
+        \\  add.s64 %rd16,%rd16,%rd25;
+        \\  add.s64 %rd18,%rd18,%rd26;
+        \\
+    , .{ i, 40 + i, 40 + i });
+}
+
 /// KV storage format of the flash-decode attention kernels (and the KV store/
 /// append ops): mirrors llm.kv_cache.KvDtype without importing the LLM layer.
 /// q8_0 is the ggml 34-byte block (f16 scale + 32 x i8).
@@ -2915,7 +3086,7 @@ fn genAttnSplit(comptime hd: u32, comptime kvf: KvFmt) [:0]const u8 {
     };
     const name = cp("attn_split_h{d}{s}", .{ hd, suffix });
 
-    comptime var s: []const u8 = ".version 8.0\n.target sm_86\n.address_size 64\n";
+    comptime var s: []const u8 = ptx.preamble;
     s = s ++ cp(".visible .entry {s}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,\n", .{name});
     s = s ++ "  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)\n{\n";
     s = s ++ "  .reg .pred %p<8>;\n  .reg .b32 %r<64>;\n  .reg .f32 %f<128>;\n";
@@ -3109,10 +3280,7 @@ pub const attn_split_h512_q8_ptx = genAttnSplit(512, .q8_0);
 /// W streams with .cs (evict-first). 32 accumulators (8 rows x 4 inputs)
 /// reduce through 32 shared arrays.
 /// b0=W, b1=x [4][cols], b2=y [n][rows], b3=lut. u0=rows, u1=cols, u2=n, f0=scale.
-pub const gemv_fp8n_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_fp8n_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_fp8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -3472,10 +3640,7 @@ pub const gemv_fp8n_ptx: [:0]const u8 =
 /// backing store; W streams with .cs. 32 accumulators (8 rows x 4 inputs)
 /// reduce through 32 shared arrays.
 /// b0=W, b1=x [4][cols], b2=y [n][rows]. u0=rows, u1=cols, u2=n, f0=scale.
-pub const gemv_bf16n_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gemv_bf16n_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gemv_bf16n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -3719,10 +3884,7 @@ pub const gemv_bf16n_ptx: [:0]const u8 =
 /// stores stay 16B-aligned (attn_merge then runs with heads' = seq_q*heads).
 /// b0=q[seq_q][heads][hd], b1=k[seq_kv][kv][hd], b2=v, b3=scratch.
 /// u0=kv_len0, u1=heads, u2=kv_heads, u3=hd(=128), u4=nsplit, u5=seq_q, f0=scale.
-pub const attn_split_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_split_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_split(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -3815,10 +3977,7 @@ pub const attn_split_ptx: [:0]const u8 =
 /// f16-KV variant of `attn_split` (hd128, qwen3 prefill): each 4-dim K/V
 /// fragment loaded as v2.u32 (8 B = 4 halfs) and widened to f32; *2 stride.
 /// q/scratch/out stay f32. Otherwise identical to attn_split. Lossy vs f32.
-pub const attn_split_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_split_f16_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_split_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -3914,10 +4073,7 @@ pub const attn_split_f16_ptx: [:0]const u8 =
 /// lives inside one 34-byte ggml block (f16 scale d + 32 x i8). The lane loads
 /// its block's scale, then its 4 quants as two u16s (2-byte aligned), sign-
 /// extends and multiplies by d. q/scratch/out stay f32. Lossy vs f32.
-pub const attn_split_q8_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_split_q8_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_split_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4026,10 +4182,7 @@ pub const attn_split_q8_ptx: [:0]const u8 =
 /// out[h][c] = sum_i acc_i[c]*exp(m_i-M) / D.
 /// b0=scratch[heads*nsplit][hd+4] (see attn_split), b1=out[heads][hd].
 /// u0=heads, u1=hd, u2=nsplit.
-pub const attn_merge_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_merge_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_merge(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4090,10 +4243,7 @@ pub const attn_merge_ptx: [:0]const u8 =
 /// 128 (as attn_split requires); its param slot carries tree_base.
 /// b0=q[seq_q][heads][128], b1=k, b2=v, b3=scratch(+meta).
 /// u0=L, u1=heads, u2=kv_heads, u3=tree_base, u4=nsplit, u5=seq_q, f0=scale.
-pub const attn_split_tree_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_split_tree_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_split_tree(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4210,10 +4360,7 @@ pub const attn_split_tree_ptx: [:0]const u8 =
 /// b0=S (all heads, [heads][d][d]), b1=conv_out ([q(k_heads*d) |
 /// k(k_heads*d) | v(heads*d)]), b2=gates ([decay(heads) | beta(heads)]),
 /// b3=o out [heads*d]. u0=heads, u1=d, u2=k_heads. f0=readout scale.
-pub const gdn_delta_step_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const gdn_delta_step_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gdn_delta_step(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4341,10 +4488,7 @@ pub const gdn_delta_step_ptx: [:0]const u8 =
 ///
 /// b0=packed(u8 [rows][cols/2]), b1=scales(u8 fp8 [rows][cols/16], unswizzled),
 /// b2=levels(f16[256*16]), b3=out(f16 [rows][cols]). u0=rows*cols/8 (threads).
-pub const nvfp4_decode_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const nvfp4_decode_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry nvfp4_decode(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4411,10 +4555,7 @@ pub const nvfp4_decode_ptx: [:0]const u8 =
 /// b0=packed(u8 [rows][cols/2]), b1=s_rel(u8 fp8 [rows][cols/group_size]),
 /// b2=levels(s8[256*16]), b3=out(s8 [rows][cols]). u0=rows*cols/8 (threads),
 /// u1=group_size/8 (u32 words of packed per group).
-pub const w4a8_decode_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const w4a8_decode_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry w4a8_decode(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4485,10 +4626,7 @@ fn replaceAll(comptime src: []const u8, comptime from: []const u8, comptime to: 
 /// d = absmax/127 stored as f16, q[i] = rni(x[i]/d) as i8, div.rn + cvt.rni
 /// (round-to-nearest-EVEN) are bit-identical to the host packQ80, so a row
 /// quantized on either side of a CPU-offload split produces the same bytes.
-pub const f32_to_q8_0_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const f32_to_q8_0_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry f32_to_q8_0(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -4546,10 +4684,7 @@ pub const f32_to_q8_0_ptx: [:0]const u8 =
 /// embedding gather + upload, rope_half_s takes pos0 from g_state[1],
 /// kv_append_s replaces the KV-append memcpy, attn_split_s is the seq_q=1
 /// flash-decode split with kv_len = g_state[1] + 1. g_state = [token, pos0].
-pub const decode_state_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const decode_state_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .global .align 8 .b32 g_state[2];
     \\
     \\// x[i] = f32(embed_bf16[g_state[0]*hidden + i]); b0=embed, b1=x, u0=hidden
@@ -5524,10 +5659,7 @@ pub const decode_state_ptx: [:0]const u8 =
 /// n x n scores plane where an n x 77 one is wanted.
 /// b0=q [u0][u1*u2], b1=k, b2=v (both [u3][u1*u2]), b3=out.
 /// u0=seq_q, u1=heads, u2=head_dim, u3=seq_kv, f0=scale.
-pub const attn_cross_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const attn_cross_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry attn_cross(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -5712,10 +5844,7 @@ fn checkRegisterBounds(name: []const u8, src: []const u8) !void {
 /// b0 = src, b1 = patch, b2 = params. u0 = rows * cols.
 /// params: cols, in_ch, kt, kh, kw, out_h, out_w, x_t, x_h, x_w, stride_t,
 ///         stride_s, front, pad_h_lo, pad_w_lo, t0.
-pub const im2col3d_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const im2col3d_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry im2col3d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
@@ -5801,3 +5930,28 @@ pub const im2col3d_ptx: [:0]const u8 =
     \\  ret;
     \\}
 ;
+
+// The weight-noise snippets are CONCATENATED into these kernels, and a Zig
+// multiline string's last line carries no newline: appending after a line that
+// ends in a `//` comment puts the injected statement inside that comment. It
+// assembles, it runs, and the swallowed `ld.param` of sigma leaves the register
+// uninitialized, which reads as noise-off with no error anywhere. So every
+// injected statement must start its own line.
+test "every injected weight-noise statement starts its own line" {
+    const marks = [_][]const u8{ "[f1];", "[u5];", "0x9E3779B1", "0x85EBCA6B", "0xC2B2AE35" };
+    inline for (@typeInfo(@This()).@"struct".decls) |d| {
+        if (comptime std.mem.endsWith(u8, d.name, "_ptx")) {
+            const text: []const u8 = @field(@This(), d.name);
+            for (marks) |mark| {
+                var at: usize = 0;
+                while (std.mem.indexOfPos(u8, text, at, mark)) |i| {
+                    at = i + mark.len;
+                    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..i], '\n')) |nl| nl + 1 else 0;
+                    const before = text[line_start..i];
+                    errdefer std.debug.print("{s}: `{s}` sits behind a comment: {s}\n", .{ d.name, mark, before });
+                    try std.testing.expect(std.mem.indexOf(u8, before, "//") == null);
+                }
+            }
+        }
+    }
+}

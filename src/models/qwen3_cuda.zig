@@ -449,6 +449,7 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = c;
+        be.weight_noise.setDepth(c.n_layers);
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
@@ -736,7 +737,15 @@ pub const CudaLM = struct {
     /// for every layer (migrateLayer also drops any captured graph).
     fn graphEligible(self: *const CudaLM) bool {
         if (self.split) |*sp| if (sp.n_cpu > 0) return false;
-        return self.graph_ok and !self.be.profile;
+        // A captured graph freezes the noise key and sigma in its kernel parameters,
+        // so every replay would draw the same perturbation.
+        return self.graph_ok and !self.be.profile and !self.be.weight_noise.on();
+    }
+
+    /// Which layer the coming launches belong to, for the weight-noise curve.
+    /// Called by `transformer_gpu.decoderLayer*`.
+    pub fn noiseAtLayer(self: *CudaLM, l: usize) void {
+        self.be.weight_noise.atLayer(l);
     }
 
     fn stepDecodeGraph(self: *CudaLM, id: u32, logits: ?[]f32) !void {
@@ -839,6 +848,7 @@ pub const CudaLM = struct {
             try be.opAdd(b.x, b.t, c.hidden);
         }
         try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, c.rms_eps);
+        be.weight_noise.atHead();
         try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
     }
 
@@ -866,6 +876,7 @@ pub const CudaLM = struct {
         // 128-row padded, so a grouped GEMV's 4-row reads stay in bounds).
         const h = self.cfg.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, self.cfg.rms_eps);
+        be.weight_noise.atHead();
         try lin_llm.linear(be, b.logits, b.t, seq, self.lm.head);
         try be.endBatch();
         self.advance(seq);
@@ -1260,9 +1271,11 @@ pub const CudaLM = struct {
         try qwen3.embedTokens(self.lm.embed, tokens, x);
         try be.tensorUpload(offsetBufSized(b.x, 0, n * c.hidden * 4), std.mem.sliceAsBytes(x));
 
+        be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
         for (self.lm.layers, 0..) |layer, l| {
+            be.weight_noise.atLayer(l);
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
                     if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden, false);
@@ -1300,6 +1313,7 @@ pub const CudaLM = struct {
         // groups (b.t is 128-row padded, so the 4-row reads stay in bounds).
         const h = c.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, c.rms_eps);
+        be.weight_noise.atHead();
         try lin_llm.linear(be, tb.logits, b.t, n, self.lm.head);
         try be.endBatch();
         self.tree_n = n;
@@ -1346,6 +1360,7 @@ pub const CudaLM = struct {
         // Final norm on the last position + tied bf16 LM head, on device.
         const h = self.cfg.hidden;
         try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, self.cfg.rms_eps);
+        be.weight_noise.atHead();
         try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
         try be.endBatch();
         self.advance(seq);
@@ -1552,6 +1567,8 @@ pub const CudaLM = struct {
         try be.tensorUpload(offsetBufSized(self.bufs.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         const b = &self.bufs;
+        // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
+        be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
 

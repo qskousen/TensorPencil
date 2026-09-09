@@ -466,7 +466,7 @@ const FillPool = struct {
             @ptrFromInt(info_buf.len),
             @ptrCast(&self.jit_log),
             @ptrFromInt(self.jit_log.len),
-            @ptrFromInt(86), // sm_86
+            @ptrFromInt(@as(usize, @intCast(self.cc_major * 10 + self.cc_minor))),
         };
         var mod: cu.CUmodule = null;
         const t0 = monoNs();

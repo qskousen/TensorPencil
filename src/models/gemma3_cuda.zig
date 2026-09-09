@@ -238,6 +238,7 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
+        be.weight_noise.setDepth(cfg.n_layers);
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
@@ -1116,6 +1117,8 @@ pub const CudaLM = struct {
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
+        // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
+        be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
 
@@ -1171,7 +1174,14 @@ pub const CudaLM = struct {
 
     /// LM head over one normed hidden row: y[vocab] = head @ x.
     fn lmHead(self: *CudaLM, y: Buf, x: Buf) !void {
+        self.be.weight_noise.atHead();
         try lin_cuda.linear(self.be, y, x, 1, self.lm.head);
+    }
+
+    /// Which layer the coming launches belong to, for the weight-noise curve.
+    /// Called by `transformer_gpu.decoderLayer*`.
+    pub fn noiseAtLayer(self: *CudaLM, l: usize) void {
+        self.be.weight_noise.atLayer(l);
     }
 };
 

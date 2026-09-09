@@ -1105,6 +1105,9 @@ pub const Session = struct {
                 std.log.warn("chat template unusable ({t}); hand glue, no tool declarations", .{err});
                 break :blk null;
             });
+        // What the model's own template says its thought markers are, which outranks
+        // the per-family guess (see `chat.reasoning`). Whichever template won above.
+        chat.observeReasoning(if (self.template) |t| t.src else null);
         self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";
         self.eos_str = if (self.tok.eos) |e| (self.tok.decodeAlloc(gpa, &.{e}) catch "") else "";
 

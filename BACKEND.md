@@ -71,9 +71,9 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 | **GPU init failure** | — | → CPU fallback | → CPU fallback | → CPU fallback |
 
 ¹ vulkan LLM excludes **gemma4** entirely. A block-quant token embedding is host-gathered
-like any other. q4_0 / iq4_xs / q1_0 / q2_0 weights run through the dequant GEMM at every row
-count (`Context.dequantOnly`): the checkpoint loads and decodes correctly, at a fraction of a
-token per second, until they get a decode GEMV. See §4–§5.
+like any other. q4_0 / iq4_xs / q1_0 / q2_0 have no transposed GEMV (`Context.dequantOnly`),
+so they decode through the cooperative subgroup GEMV and still prefill through the dequant
+GEMM. See §4–§5.
 
 ---
 
@@ -785,7 +785,8 @@ each; the route is chosen per weight from its storage, its shape and the row cou
 |---|---|---|---|
 | q5_k, q6_k, q1_0, q2_0 | `gemv_q*_q8` dp4a | `gemv_q*_q8n` grouped (q1_0/q2_0: one batched launch) | MMQ pipe where `mmqPipeFaster`, else dequant-f16 GEMM |
 | q4_0, q8_0, q4_k | `gemv_q*_q8n` (ng = 1) dp4a | grouped | same |
-| iq4_nl, iq4_xs | `gemv_*` f32 activation | dequant-f16 GEMM (iq4_xs: MMQ) | same |
+| iq4_xs | `gemv_iq4_xs_q8n` (ng = 1) dp4a | grouped | MMQ pipe |
+| iq4_nl | `gemv_iq4_nl` f32 activation | dequant-f16 GEMM | same |
 | any block quant, `rows % 128 != 0` or `cols % 256 != 0` | f32 GEMV | grouped if tileable, else per-row f32 GEMV | same (a router, a GDN gate, an odd vocab never sees a GEMM) |
 | bf16 | `gemv_bf16` | `gemv_bf16n`, 4 rows per launch | `opGemmBf16` (Ampere+) / f16 GEMM |
 | fp8 | `gemv_fp8` | `gemv_fp8n` | `opMatmulFp8` |
@@ -794,7 +795,15 @@ each; the route is chosen per weight from its storage, its shape and the row cou
 The dp4a and MMQ routes read the q8_1 activation the prep staged (one layout serves both:
 the grouped kernel reads the tile-padded layout when a group also runs MMQ); the rest read
 the f32 activation. `lin_llm_cuda.decode_dp4a = false` is the isolation for a wrong decode
-(every block quant through the f32 GEMV). Numerics are unchanged for every route an arch
+(every block quant through the f32 GEMV), and `tp-llm --llm-gemm grouped|mmq|dequant` forces
+the batched route so the table's two crossovers are measurable from one binary (a weight
+whose dtype or shape cannot take the forced kernel keeps its automatic route). Measured on a
+917-token gemma3 12B Q4_K_M prefill: auto 763 tok/s, mmq 649, dequant 652, grouped 220 — the
+per-weight choice beats every fixed one, which is the point of the table.
+
+`gemv_iq4_xs_q8n` closed the one dtype with no dp4a decode: Qwen3.8 27B IQ4_XS went 13.5 ->
+34.2 tok/s decode and 48 -> 96 prefill (interleaved same-binary A/B, 3090), because every
+GEMV had been running the f32-activation kernel. Numerics are unchanged for every route an arch
 already had; what changed is coverage, all of it measured token-identical on the greedy
 corpus: qwen3 gained dp4a decode (4B Q4_K_M 88 → 159 tok/s, 8B Q8_0 49 → 67) and the bf16
 prefill GEMM (4B bf16 137 → 294 tok/s), gemma3 gained MMQ prefill (Q4_K_M 610 → 665
@@ -807,6 +816,23 @@ has), the dp4a repack for q8_0 (iq4_nl behind `TP_VK_DP4A`), the three opt-in de
 (`TP_VK_SG_GEMV`, `TP_VK_SG_DP4A`, `TP_VK_T_DP4A`, now on every arm), and the coop dequant
 GEMM for a batch where the device has the f16-weight pipeline. A Vulkan buffer is a handle,
 so a batch a GEMV would have to step through row by row is refused, not looped.
+
+The formats with NO transposed GEMV (`Context.dequantOnly`: q4_0, iq4_xs, q1_0, q2_0) decode
+through the cooperative subgroup GEMV over the raw ggml layout — `gemv_{q4_0,iq4_xs,q1_0,
+q2_0_g64,q2_0_g128}_sg`, one subgroup per output row, no transpose and no repack. That is not
+an opt-in A/B like the other `_sg` kernels: for these it is the only alternative to
+dequantizing the whole weight per token, so it is on wherever the pipelines built. It reads
+the same RAW resident buffer the prefill GEMM dequantizes from, so decode and prefill still
+share one copy. Measured on a 3090, same greedy text before and after:
+
+| model / format | decode before | decode after |
+|---|---|---|
+| gemma3 12B IQ4_XS | 0.9 tok/s | **9.5** (prefill 0.8 -> 7.9, 365 MB less VRAM) |
+| Bonsai-27B Q1_0 | 0.3 tok/s | **3.4** |
+| Ternary-Bonsai-27B Q2_0 g128 | 0.3 tok/s | **3.2** |
+
+⚠️ q4_0's kernel is covered by `gpu cooperative gemv covers the formats with no transposed
+kernel` only: every q4_0 file here is a Gemma 4 QAT one, and gemma4 has no Vulkan stepper.
 
 ¹ **qwen3 on vulkan** (`qwen3_gpu.zig VulkanLM`, config-driven) runs two regimes. **Dense**
 (fp8/bf16/f32, tied head): batched square-attention prefill + spec decode, with bf16 read
@@ -909,7 +935,7 @@ half-computed state), while cancel unwinds between layers via `engine.publishCan
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
 | **Sampling** (argmax/temp/top-k/top-p/min-p + penalties) | ✅ `llm/sample.zig` | ✅ argmax/top-k select (qwen3) | ✅ (qwen3/qwen35/gemma3/gemma4) | ↤ |
 | **Turn-boundary checkpoint / rollback** | ❌ | ❌ | ✅ qwen3/qwen35/gemma3/gemma4 | ↤ |
-| **Weight noise** (`--weight-noise`, per-layer curve) | ❌ | ❌ | ✅ gemma4, q4_k/q5_k/q6_k/iq4_xs | ↤ |
+| **Weight noise** (`--weight-noise`, per-layer curve) | ❌ | ❌ | ✅ gemma3/gemma4/qwen3/qwen35, every block-quant GEMV + MMQ pipe | ↤ |
 
 **GPU sampling is a candidate select, not a full sampler.** The device runs argmax or a top-k
 reduce (`stepArgmax`/`stepSelect`) and downloads only the candidates; the CPU tail (temperature
@@ -1008,20 +1034,44 @@ Honoring it today:
 
 | kernel | path | dtypes |
 |---|---|---|
-| `gemv_q4_k_q8n`, `gemv_q5_k_q8n` | decode + grouped prefill | q4_k, q5_k |
-| `gemv_q5_k_q8` | decode | q5_k |
-| `gemv_q6_k` | LM head (tied `token_embd`) | q6_k |
-| `buildMmqPipeQ4K` | batched prefill MMQ | q4_k, q5_k, iq4_xs |
+| `gemv_{q4_0,q8_0,q4_k,q5_k,q6_k,iq4_xs}_q8n` | decode + grouped prefill | those six |
+| `gemv_{q5_k,q6_k,q1_0,q2_0_g64,q2_0_g128}_q8`, `_q8x2` | dp4a decode | those five |
+| `gemv_{q4_0,q8_0,q1_0,q2_0_g64,q2_0_g128,iq4_nl,q6_k}` | f32-activation decode, LM head (tied `token_embd`) | those seven |
+| `buildMmqPipeQ{4K,6K,8_0,1_0,2_0}` | batched prefill MMQ | q4_k, q5_k, iq4_xs, q6_k, q8_0, q1_0, q2_0 |
 
-Every MMQ entry declares the two parameters (`mmq_params`, so one launcher fits all), but only
-`buildMmqPipeQ4K` reads them: the q6_k / q8_0 / q1_0 / q2_0 pipes and the older
-`buildMmqQ4K` ignore sigma, as do the dequant-to-f16 fallback, the fp8/bf16/int8-convrot GEMMs,
-and every non-gemma4 stepper (only `gemma4_cuda.forwardRows` ticks the stream, and only
-`gemma4_cuda` declares `noiseAtLayer`). The embedding GATHER is a separate kernel from
+⚠️ **A dtype's sigma tolerance is not the same as another's.** A front-loaded `0.4*(1-t)^2`
+visibly rewords a q4_k, q6_k, iq4_xs or q1_0 model and leaves a ternary q2_0 one's greedy
+answer unchanged; the same q2_0 model reworded at 0.9 and broke down at 2.0. Read a flat
+sweep as "wrong amplitude for this format", not as "the kernel is unwired".
+
+Steppers: gemma3, gemma4, qwen3 (and llama, which runs on it) and qwen35 all declare
+`noiseAtLayer` and tick the stream; k2-horizon does not. ⚠️ A stepper that captures a
+decode graph must refuse the capture while noise is on, since a graph freezes the key
+and sigma in its recorded kernel parameters and every replay would draw the SAME
+perturbation.
+
+Every MMQ entry declares the two parameters (`mmq_params`, so one launcher fits all) and every
+pipe now reads them; the older `buildMmqQ4K`, the dequant-to-f16 fallback and the
+fp8/bf16/int8-convrot GEMMs still ignore sigma. The fallback is the batched route for q4_0 and
+iq4_nl (neither has an MMQ pipe), so those two are perturbed at decode and NOT through a long
+prefill. `opGemvQuantQ8Batch` passes sigma 0 as well, so a q1_0/q2_0 prefill chunk that takes
+the batched GEMV instead of MMQ is unperturbed. The embedding GATHER is a separate kernel from
 `gemv_q6_k` — gemma4 embeds host-side entirely — so a tied `token_embd` is perturbed as the LM
 head and left alone as the embedding table. ⚠️ Noise on `attn_k`/`attn_v` enters the KV cache
 and persists for the rest of the sequence, so those two drift cumulatively while everything
 else is resampled per forward.
+
+### Reasoning markers
+
+Which delimiters split a thought from an answer is read from the loaded model's OWN chat
+template (`chat.observeReasoning` scans it for a known pair; BOTH halves must appear, since
+a guessed close marker leaks the thought into the answer), and only otherwise guessed from
+the architecture (`chat.reasoningFor`). `tp-llm --reasoning-markers "<open>,<close>"`
+overrides both. A family with selectable effort (K2 Horizon) keeps the family answer: its
+template names all three variants and only the request says which one this turn asked for.
+Observed on the checkpoints here: qwen35 `<think>`, gemma4 `<|channel>thought`, gemma3 none —
+i.e. agreeing with the guess, which is the point; it diverges only for a fine-tune that
+changed them.
 
 ### Speculative decoding (qwen3 only)
 
@@ -1093,15 +1143,15 @@ path; GGUF `q*` are the **LLM** path.
 | **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) | ✅ hand-PTX (no cuBLASLt s4) | nibble-packed 2/byte |
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; stays packed, decodes to int8 **per GEMM** then runs the ordinary int8 convrot GEMM. `ops/w4a8.zig` |
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | 4-bit E2M1 + fp8 per-16-block scale + per-tensor scale; stays packed, decodes to **bf16** per GEMM then the existing bf16 tensor-core GEMM. Weight-only; the native W4A4-fp4 GEMM is sm_100+. `ops/nvfp4.zig` |
-| **GGUF q4_0** | ✅ ggml | ❌ | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
+| **GGUF q4_0** | ✅ ggml | ✅ `gemv_q4_0_sg` (subgroup, raw) | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_q8_0{,_t}` (scalar) | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | q6_k's MMQ is correct but loses to dequant+f16, so `mmqPipeFaster` routes only q4_k/q5_k on. `TP_NO_MMQ5` / `TP_NO_MMQ_IQ4` A/B the routing, `TP_MMQ_NOSTAGE` isolates A-staging cost (garbage output, valid timing) |
 | **GGUF q2_k** | ✅ ggml | ❌ | ✅ decode→int8/int4 convrot (`buildPrep`) | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL. Diffusion only so far: no GEMV, so no LLM decode path |
 | **GGUF iq4_nl** | ✅ ggml | ✅ scalar (module-const LUT) | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
-| **GGUF iq4_xs** | ✅ ggml | ❌ | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs`, `mmq_pipe_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. No dp4a GEMV. Its 136-byte block leaves odd super-blocks only 8-byte aligned, so staging loads are `v2` |
-| **GGUF q1_0** | ✅ ggml | ❌ | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
-| **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ❌ | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
-| **GGUF q2_0 g64** | ✅ ggml | ❌ | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |
+| **GGUF iq4_xs** | ✅ ggml | ✅ `gemv_iq4_xs_sg` (subgroup, raw) | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs`, `mmq_pipe_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. The dp4a GEMV (`gemv_iq4_xs_q8n`) reads the codebook through `prmt` pairs rather than a shared table, since the index's bit 3 means sign-replicate to `prmt` and has to pick the table half instead. Its 136-byte block leaves odd super-blocks only 8-byte aligned, so staging loads are `v2` |
+| **GGUF q1_0** | ✅ ggml | ✅ `gemv_q1_0_sg` (subgroup, raw) | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
+| **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ✅ `gemv_q2_0_g128_sg` (subgroup, raw) | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
+| **GGUF q2_0 g64** | ✅ ggml | ✅ `gemv_q2_0_g64_sg`, ⚠️ device test only | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |
 
 **Notes:**
 
@@ -1179,6 +1229,12 @@ audio `aa_up_snake` · `aa_down` · `convt1d_ca` · `snake1d_ca` · `mean_heads_
 q5_k, q6_k (raw row-major input).
 
 ### Vulkan-only — `Elt` compute kernels (`src/gpu/kernels/eltwise.zig`, `subgroup.zig`, `dp4a.zig`)
+
+`subgroup.zig` holds the cooperative (one subgroup per output row) decode GEMVs:
+`gemv_{q8_0,q4_k,q5_k,q6_k,iq4_nl}_sg` are an opt-in A/B against the transposed kernels
+(`TP_VK_SG_GEMV`), while `gemv_{q4_0,iq4_xs,q1_0,q2_0_g64,q2_0_g128}_sg` are the only decode
+kernel those formats have and are always on. Plus `attn_decode_sg` and the `subgroup_sum`
+capability probe.
 
 `attn_full` · `attn_causal_batched` · `attn_cross` · `attn_scores` · `attn_out` · `attn_dsplit` ·
 `attn_dmerge` · `attn_dsplit_gemma{,_f16,_q8}` · `kv_store_q8_0` · `gemv_partial{,4}` ·
@@ -1312,7 +1368,7 @@ GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16, optional f32 A/C) · `buildI
 (`use_ldmatrix`; a pure permutation, so bit-exact).
 
 GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k,iq4_nl,iq4_xs,q1_0,q2_0_g64,q2_0_g128}` plus `_q8`
-and grouped-N `_q8n` dp4a variants (iq4_xs has neither: it decodes f32 straight from the block).
+and grouped-N `_q8n` dp4a variants (iq4_nl has neither: it decodes f32 straight from the block).
 
 Attention: `attn` · `attn_split`/`_merge`/`_h256`/`_h512`/`_tree` · `attn_split_g` (group-shared KV
 fragment, entry for hd ∈ {128, 256}, full causal, `heads > kv_heads`; bit-identical per head to
@@ -1359,7 +1415,6 @@ Delete a row when it closes.
 | No Vulkan ViT except gemma3 | `vit35`, `gemma4_vit`, `gemma4v_vit` are CPU/CUDA only. |
 | No Vulkan gemma4 | `Spec.Vulkan = void`; `--backend vulkan` is rejected for the arch. |
 | No dp4a decode GEMV for iq4_xs | `lin_llm_cuda` sends it through the f32 `gemv_iq4_xs`; gemma3 12B IQ4_XS decodes at 28 tok/s where Q4_K_M does 58. A `gemv_iq4_xs_q8n` twin is the fix, and `quantQ8NSupported` is the one place to declare it. |
-| Vulkan q4_0 / iq4_xs / q1_0 / q2_0 decode is the dequant GEMM | `Context.dequantOnly`: the whole weight is dequantized per token (gemma3 12B IQ4_XS 0.8 tok/s). A shared subgroup-per-row GEMV over the raw ggml layout in `dual/` gives them a real decode kernel on both arms. |
 | Vulkan dp4a decode is opt-in | `TP_VK_DP4A=1`; the repacked int8 weight roughly doubles VRAM, so it stays opt-in until VRAM-aware auto-sizing lands. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
 | `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |

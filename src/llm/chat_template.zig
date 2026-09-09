@@ -180,6 +180,11 @@ pub const RenderOpts = struct {
 
 pub const ChatTemplate = struct {
     tmpl: jinja.Template,
+    /// The template TEXT this was parsed from, borrowed. Kept because the text
+    /// answers questions the parsed form cannot: `chat.observeReasoning` reads the
+    /// thought markers a model actually writes out of it, whichever of the sources
+    /// below won.
+    src: []const u8,
 
     /// Load the embedded `tokenizer.chat_template`; null if the GGUF has none
     /// and no stand-in covers its architecture (caller falls back to the hand
@@ -193,11 +198,11 @@ pub const ChatTemplate = struct {
             if (!std.mem.eql(u8, arch, "qwen35")) return null;
             return try qwen35Fixed(gpa);
         };
-        return .{ .tmpl = try jinja.Template.parse(gpa, src) };
+        return try fromSource(gpa, src);
     }
 
     pub fn fromSource(gpa: std.mem.Allocator, src: []const u8) !ChatTemplate {
-        return .{ .tmpl = try jinja.Template.parse(gpa, src) };
+        return .{ .tmpl = try jinja.Template.parse(gpa, src), .src = src };
     }
 
     /// Google's current upstream "canonical" Gemma 4 chat template (identical

@@ -150,16 +150,17 @@ pub var weight_noise_amount: f32 = 1;
 pub var weight_noise_seed: u32 = 0;
 
 /// Whether an architecture publishes a per-layer sigma, which is what makes weight
-/// noise reach its GEMMs at all. Today exactly one does.
+/// noise reach its GEMMs at all.
 ///
 /// The coupling is concrete: a stepper honors noise iff it declares `noiseAtLayer`
 /// (so `transformer_gpu.decoderLayer*` can tell it which layer is launching) AND
 /// ticks the stream in its forward. Extend this list in the same commit that adds
-/// the second one, or the GUI will offer the knob for a model that ignores it.
+/// a stepper, or the GUI will offer the knob for a model that ignores it.
 /// `weight noise arch list matches the steppers` in `gui/chat.zig` fails if the two
-/// drift.
+/// drift. `llama` runs on the qwen3 stepper.
 pub fn archSupportsWeightNoise(arch: []const u8) bool {
-    return std.mem.eql(u8, arch, "gemma4");
+    for ([_][]const u8{ "gemma4", "gemma3", "qwen3", "qwen35", "llama" }) |a| if (std.mem.eql(u8, arch, a)) return true;
+    return false;
 }
 
 /// Whether weight noise would actually do anything to this checkpoint. Both halves
@@ -202,17 +203,23 @@ pub fn bringUpCuda(arena: std.mem.Allocator, backend: BackendKind, profile: bool
         .@"zig-cuda" => try cuda.Backend.init(arena),
         .cpu, .vulkan => null,
     };
-    if (be) |b| {
-        b.profile = profile;
-        b.pinAllWeights();
-        b.enableLlmMemTags(); // before any allocation; see enableLlmMemTags
-        b.weight_noise.seed = weight_noise_seed;
-        // The curve needs the layer count to evaluate; the model supplies that in
-        // its own init (`setDepth`), which re-evaluates whatever is set here.
-        b.weight_noise.amount = weight_noise_amount;
-        b.weight_noise.setCurve(weight_noise_curve);
-    }
+    if (be) |b| configureCuda(b, profile);
     return be;
+}
+
+/// The policy every CUDA LLM backend runs under, whoever created it: profiling,
+/// weight residency, memory tagging and the weight-noise stream. A caller that
+/// brings up its own backend (the qwen35 CLI path does, to encode an image before
+/// the LLM claims VRAM) must call this, or its knobs are silently inert.
+pub fn configureCuda(b: *cuda.Backend, profile: bool) void {
+    b.profile = profile;
+    b.pinAllWeights();
+    b.enableLlmMemTags(); // before any allocation; see enableLlmMemTags
+    b.weight_noise.seed = weight_noise_seed;
+    // The curve needs the layer count to evaluate; the model supplies that in
+    // its own init (`setDepth`), which re-evaluates whatever is set here.
+    b.weight_noise.amount = weight_noise_amount;
+    b.weight_noise.setCurve(weight_noise_curve);
 }
 
 /// Point the CUDA weight cache at the checkpoint FILE, so a weight upload reads
@@ -532,17 +539,25 @@ test "weightNoiseSupported gates on both the arch and the weight dtype" {
         // `layers.N.…`, and scanning for the raw spelling found nothing at all.
         try std.testing.expect(weightNoiseSupported(&gg));
     }
-    // gemma4 + q4_0 (the 12B QAT format): right arch, unwired kernels.
+    // gemma4 + q4_0 (the 12B QAT format): its GEMVs carry the jitter now.
     {
         const bytes = try testGguf(gpa, "gemma4", 2, 4); // 2 = q4_0
         defer gpa.free(bytes);
         var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
         defer gg.deinit();
+        try std.testing.expect(weightNoiseSupported(&gg));
+    }
+    // Right arch, a dtype with no noised kernel (q2_k).
+    {
+        const bytes = try testGguf(gpa, "qwen35", 10, 4); // 10 = q2_k
+        defer gpa.free(bytes);
+        var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
+        defer gg.deinit();
         try std.testing.expect(!weightNoiseSupported(&gg));
     }
-    // Right dtype, wrong arch: no stepper publishes a layer index.
+    // Right dtype, an arch whose stepper publishes no layer index.
     {
-        const bytes = try testGguf(gpa, "qwen35", 12, 4);
+        const bytes = try testGguf(gpa, "k2-horizon", 12, 4);
         defer gpa.free(bytes);
         var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
         defer gg.deinit();

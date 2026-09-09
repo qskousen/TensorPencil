@@ -170,10 +170,6 @@ pub const EltPush = extern struct {
 /// The eltwise kernel selector. Names match the Vulkan `Elt` enum so dit_gpu's
 /// enum literals coerce. Only the DiT-path subset is implemented (see opElt).
 pub const Elt = enum {
-    rms_partial,
-    rms_combine,
-    rms_apply_mod,
-    rms_apply_mod_h16,
     rmsnorm,
     rope_inter,
     qknorm_rope16,
@@ -2686,10 +2682,15 @@ pub const Backend = struct {
     /// Whether this dtype's GEMM/GEMV kernels honor `weight_noise`. The authority
     /// for it, because it is a property of which kernels were actually wired (see
     /// BACKEND.md 6): a weight in any other dtype passes through untouched, so a UI
-    /// offering the knob for such a checkpoint would be lying. Notably NOT here:
-    /// q4_0, the Gemma 4 12B QAT format, and the fp8/bf16/int8-convrot paths.
+    /// offering the knob for such a checkpoint would be lying. Notably NOT here: the
+    /// fp8/bf16/int8-convrot GEMMs, and the dequant-to-f16 fallback, which is the
+    /// batched route for q4_0 and iq4_nl (they have no MMQ pipe), so those two are
+    /// perturbed at decode and not through a long prefill.
     pub fn weightNoiseSupported(dt: dtypes.DType) bool {
-        return dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs;
+        return switch (dt) {
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            else => false,
+        };
     }
 
     pub fn routedExpertGemvEnabled(self: *const Backend) bool {
@@ -2699,7 +2700,7 @@ pub const Backend = struct {
     /// Whether `opGemvQuantQ8N` has a kernel for this dtype. Wider coverage than
     /// `quantQ8BatchSupported`, at 8 tokens per launch instead of all of them.
     pub fn quantQ8NSupported(dt: dtypes.DType) bool {
-        return dt == .q4_0 or dt == .q8_0 or dt == .q4_k or dt == .q5_k or dt == .q6_k;
+        return dt == .q4_0 or dt == .q8_0 or dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs;
     }
 
     /// Batched dp4a GEMV: `y[n][rows] = scale * (W @ x_t)` for all `n` tokens in
@@ -2746,6 +2747,7 @@ pub const Backend = struct {
             .q4_k => try self.eltFn(elt.gemv_q4_k_q8n_ptx, "gemv_q4_k_q8n"),
             .q5_k => try self.eltFn(elt.gemv_q5_k_q8n_ptx, "gemv_q5_k_q8n"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_q8n_ptx, "gemv_q6_k_q8n"),
+            .iq4_xs => try self.eltFn(elt.gemv_iq4_xs_q8n_ptx, "gemv_iq4_xs_q8n"),
             else => unreachable,
         };
         try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), self.noiseKey(w_bytes) }, .{ scale, self.weight_noise.sigma() }, rows / 8);
@@ -6064,7 +6066,7 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
     var off: usize = 0;
     while (off < wbytes.len) : (off += bb) {
         switch (dt) {
-            .q8_0 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
+            .q8_0, .q4_0 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
             .q4_k, .q5_k => {
                 std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little);
                 std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], min16, .little);
@@ -6125,8 +6127,14 @@ test "growable tensor grows in place" {
     try std.testing.expectError(error.DeviceOutOfMemory, be.growableEnsure(&gt, max + (32 << 20)));
 }
 
-// Gated on a CUDA device: the fused block-quant GEMVs against the CPU
-// quants.zig dequant + dot reference, all four formats.
+// Gated on a CUDA device: the MoE combine gather (`moe_combine`) against a host
+// reference. What it is really pinning is the SLOT MAPPING — every token reads its
+// own `used` rows, through a permutation, and scales each by that ROW's weight —
+// because a wrong row or a wrong scale is an O(1) error, while the arithmetic
+// itself is an 8-term f32 dot whose last bit depends on whether the multiply-add
+// contracts. So the reference is f64 and the bound is a rounding bound; demanding
+// bit-equality against a host `@mulAdd` chain fails on the last ulp for reasons
+// that say nothing about the kernel.
 test "moe_combine matches a host combine" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -6148,13 +6156,13 @@ test "moe_combine matches a host combine" {
     // a random permutation of the referenced rows
     for (slot_rows, 0..) |*r, i| r.* = @intCast(i);
     rand.shuffle(u32, slot_rows);
-    const ref = try gpa.alloc(f32, tokens * width);
+    const ref = try gpa.alloc(f64, tokens * width);
     defer gpa.free(ref);
     for (0..tokens) |t| for (0..width) |j| {
-        var acc: f32 = 0;
+        var acc: f64 = 0;
         for (0..used) |k| {
             const r = slot_rows[t * used + k];
-            acc = @mulAdd(f32, src[r * width + j], scales[r], acc);
+            acc += @as(f64, src[r * width + j]) * scales[r];
         }
         ref[t * width + j] = acc;
     };
@@ -6175,7 +6183,11 @@ test "moe_combine matches a host combine" {
     const got = try gpa.alloc(f32, ref.len);
     defer gpa.free(got);
     try be.tensorDownload(d_dst, std.mem.sliceAsBytes(got));
-    try std.testing.expectEqualSlices(f32, ref, got);
+    for (ref, got, 0..) |want, have, i| {
+        const tol = 1e-6 * @max(1.0, @abs(want));
+        errdefer std.debug.print("moe_combine [{d}] (token {d}, col {d}): gpu {d} vs f64 {d}\n", .{ i, i / width, i % width, have, want });
+        try std.testing.expect(@abs(@as(f64, have) - want) <= tol);
+    }
 }
 
 test "device q6_k dequant matches the CPU decode" {
@@ -6347,12 +6359,19 @@ test "cuBLASLt f32 GEMM matches the naive f32 kernel" {
     // K2 Horizon's MoE router (100 x 2560) at decode and small-batch widths, and
     // a wider shape.
     const shapes = [_][3]usize{ .{ 100, 2560, 1 }, .{ 100, 2560, 13 }, .{ 64, 2560, 256 }, .{ 512, 1024, 96 } };
+    // Each shape's weight is freed only after the LAST shape has run: the device
+    // weight cache keys on the host pointer, so a freed buffer whose address the
+    // next allocation reuses would be served the previous shape's upload.
+    var kept: [shapes.len][]f32 = undefined;
+    var n_kept: usize = 0;
+    defer for (kept[0..n_kept]) |b| gpa.free(b);
     for (shapes) |sh| {
         const n = sh[0];
         const k = sh[1];
         const m = sh[2];
         const w = try gpa.alloc(f32, n * k);
-        defer gpa.free(w);
+        kept[n_kept] = w;
+        n_kept += 1;
         const x = try gpa.alloc(f32, m * k);
         defer gpa.free(x);
         for (w) |*v| v.* = rand.floatNorm(f32);
@@ -6679,12 +6698,13 @@ test "dp4a gemv quant kernels match CPU reference" {
     }
 }
 
-// Gated on a CUDA device: the q4_k and q8_0 grouped dp4a GEMVs (opGemvQuantQ8N)
-// vs a CPU dequant-dot reference. Neither has an m=1 dp4a kernel, so both are
-// covered only via the grouped path (here ng=5, one partial group); the CPU
-// side emulates the same q8_1 activation quantization, so it differs only by
-// rounding order. q8_0 also exercises the signed-weight dp4a.s32.s32 path.
-test "q4_k/q8_0 grouped dp4a gemv matches CPU reference" {
+// Gated on a CUDA device: the q4_k, q8_0, iq4_xs and q4_0 grouped dp4a GEMVs
+// (opGemvQuantQ8N) vs a CPU dequant-dot reference. None has an m=1 dp4a kernel, so
+// all are covered only via the grouped path (here ng=5, one partial group); the
+// CPU side emulates the same q8_1 activation quantization, so it differs only by
+// rounding order. q8_0 and iq4_xs exercise the signed-weight dp4a.s32.s32 path,
+// iq4_xs the prmt codebook lookup.
+test "q4_k/q8_0/iq4_xs/q4_0 grouped dp4a gemv matches CPU reference" {
     const quants = @import("tp_core").quants;
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -6727,9 +6747,18 @@ test "q4_k/q8_0 grouped dp4a gemv matches CPU reference" {
     const row_f32 = try gpa.alloc(f32, cols);
     defer gpa.free(row_f32);
 
-    inline for (.{ dtypes.DType.q4_k, dtypes.DType.q8_0 }, .{ 314, 271 }) |dt, seed| {
-        const w = try testQuantWeightBytes(gpa, dt, rows, cols, seed);
-        defer gpa.free(w);
+    // ⚠️ Every weight stays alive to the end of the test. The device weight cache
+    // keys on the HOST POINTER, so freeing one and allocating the next can land at
+    // the same address and serve the previous dtype's upload — which is a wrong
+    // answer that depends on allocator luck, so it passes alone and fails in the
+    // full binary.
+    const dts = [_]dtypes.DType{ .q4_k, .q8_0, .iq4_xs, .q4_0 };
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, .{ 314, 271, 555, 777 }, 0..) |dt, seed, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, seed);
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        const w = ws[i];
         try be.opGemvQuantQ8N(dt, yn_d, w, 1.0, rows, cols, n, 0, n);
         try be.tensorDownload(yn_d, std.mem.sliceAsBytes(yn));
         const row_bytes = dt.storageBytes(cols);
@@ -6738,6 +6767,7 @@ test "q4_k/q8_0 grouped dp4a gemv matches CPU reference" {
                 quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
                 var acc: f64 = 0;
                 for (row_f32, xq[t * cols ..][0..cols]) |wv, xv| acc += @as(f64, wv) * xv;
+                errdefer std.debug.print("{t} token {d} row {d}\n", .{ dt, t, r });
                 try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yn[t * rows + r], 2e-2);
             }
         }

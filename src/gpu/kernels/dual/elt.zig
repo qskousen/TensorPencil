@@ -217,32 +217,6 @@ pub inline fn gatedAdd16(e: Env) void {
     }
 }
 
-/// y = x * inv[row] * premul[col] + shift[col]. a = x, b = out, c = vectors,
-/// d = inv. u0 = n, u1 = dim, u2 = premul offset, u3 = shift offset.
-pub inline fn rmsApplyMod(e: Env) void {
-    const i = k.elem(e) orelse return;
-    const col = i % e.u(1);
-    e.st(.b, i, e.ld(.a, i) * e.ld(.d, i / e.u(1)) * e.ld(.c, e.u(2) + col) + e.ld(.c, e.u(3) + col));
-}
-
-/// `rmsApplyMod` emitting f16 pairs scaled by f0, zero past u4 real elements.
-/// b = out words. u0 = words, u1 = dim, u2, u3 as above, u4 = real elems.
-pub inline fn rmsApplyModH16(e: Env) void {
-    const w = k.elem(e) orelse return;
-    const e0 = w * 2;
-    var out: u32 = 0;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const idx = e0 + j;
-        if (idx < e.u(4)) {
-            const col = idx % e.u(1);
-            const v = (e.ld(.a, idx) * e.ld(.d, idx / e.u(1)) * e.ld(.c, e.u(2) + col) + e.ld(.c, e.u(3) + col)) * e.f(0);
-            out |= @as(u32, k.f16Bits(v)) << (16 * j);
-        }
-    }
-    e.stW(.b, w, out);
-}
-
 /// y = x * inv[row] * w[col]. a = x, b = out, c = weight, d = inv. u0 = n, u1 = dim.
 pub inline fn rmsApplyW(e: Env) void {
     const i = k.elem(e) orelse return;

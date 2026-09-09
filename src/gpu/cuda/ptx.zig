@@ -20,6 +20,7 @@
 //! the final module declares exactly `.reg .b32 %r<8>;`.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const RegClass = enum { b32, b64, f32, b16, pred };
 
@@ -164,12 +165,7 @@ pub const Builder = struct {
         const w = &out;
         const g = self.gpa;
 
-        try w.print(g,
-            \\.version 8.0
-            \\.target sm_86
-            \\.address_size 64
-            \\
-        , .{});
+        try w.appendSlice(g, preamble);
         if (shared_decls.len != 0) {
             try w.appendSlice(g, shared_decls);
             try w.append(g, '\n');
@@ -199,10 +195,13 @@ pub const Builder = struct {
 // PTX preamble constants shared by hand-authored kernels.
 // -------------------------------------------------------------------------
 
-/// The `.version` string nvcc 13.0 emits for sm_86; 8.0 covers everything we use
-/// (mma.m16n8k32, cp.async, ldmatrix). The driver JIT accepts >= its ISA support.
-pub const version = "8.0";
-pub const target = "sm_86";
+/// Both come from build.zig (`-Dptx-isa`, `-Dcuda-sm`), the same pair the `dual`
+/// lowering is built with. 8.0 covers everything the hand kernels use
+/// (mma.m16n8k32, cp.async, ldmatrix); the driver JIT accepts <= its ISA support.
+pub const version: []const u8 = build_options.ptx_isa;
+pub const target = std.fmt.comptimePrint("sm_{d}", .{build_options.cuda_sm});
+/// The three header lines every hand-authored module starts with.
+pub const preamble = std.fmt.comptimePrint(".version {s}\n.target {s}\n.address_size 64\n", .{ version, target });
 
 test "ptx builder emits a valid vector-add module" {
     const gpa = std.testing.allocator;

@@ -44,6 +44,108 @@ pub const Route = enum {
 /// Rows at or below which a dense fp8/f32 weight takes the grouped GEMV.
 pub const dense_grouped_max = spec_limits.max_draft + 1;
 
+/// What routing reads about the device and the opt-in knobs, as a plain value so a
+/// route is decided, and tested, without a Context.
+pub const Knobs = struct {
+    /// The device has the integer dot (`OpSDot`) the dp4a kernels need.
+    int_dot: bool,
+    /// Route iq4_nl through the int8 repack too. Opt-in (`TP_VK_DP4A`): the repack
+    /// doubles a 4-bit weight's footprint, where q8_0's grows only ~6%.
+    dp4a_iq4: bool,
+    sg_gemv: bool,
+    sg_dp4a: bool,
+    t_dp4a: bool,
+    /// The cooperative GEMV covers the formats with no other decode kernel. Not a
+    /// knob: for those it is the only alternative to dequantizing the whole weight
+    /// per token, so it is on wherever the pipelines built.
+    sg_raw: bool,
+    /// Block-quant prefill takes the coop GEMM. Off without the f16-weight pipeline,
+    /// and off under the raw-reading coop GEMVs: the weight cache keys by host
+    /// pointer, so one weight cannot be resident raw for decode and transposed for
+    /// prefill. `t_dp4a` reads the same transposed buffer and is exempt.
+    gemm_prefill: bool,
+
+    /// Every knob off and no dp4a: the pure dequant routes, for tests.
+    pub const plain: Knobs = .{ .int_dot = false, .dp4a_iq4 = false, .sg_gemv = false, .sg_dp4a = false, .t_dp4a = false, .sg_raw = false, .gemm_prefill = false };
+
+    pub fn fromContext(ctx: *const gpu.Context) Knobs {
+        const sg_gemv = ctx.hasSubgroupGemv() and getenv("TP_VK_SG_GEMV") != null;
+        const sg_dp4a = ctx.hasSubgroupDp4a() and getenv("TP_VK_SG_DP4A") != null;
+        return .{
+            .int_dot = ctx.hasIntDot(),
+            .dp4a_iq4 = ctx.hasIntDot() and getenv("TP_VK_DP4A") != null,
+            .sg_gemv = sg_gemv,
+            .sg_dp4a = sg_dp4a,
+            .t_dp4a = ctx.hasTransposedDp4a() and getenv("TP_VK_T_DP4A") != null,
+            .sg_raw = ctx.hasRawSubgroupGemv(),
+            .gemm_prefill = ctx.hasQuantPrefillGemm() and !(sg_gemv or sg_dp4a),
+        };
+    }
+
+    /// Whether this format's resident copy is the int8 repack, which decode and the
+    /// prefill GEMM must agree on.
+    pub fn dp4aRepack(k: Knobs, dt: DType) bool {
+        return switch (dt) {
+            .q8_0 => k.int_dot,
+            .iq4_nl => k.dp4a_iq4,
+            else => false,
+        };
+    }
+
+    /// The route this weight takes at `m` rows, or null when no kernel here reads it.
+    pub fn routeOf(k: Knobs, w: Weight, m: usize) ?Route {
+        std.debug.assert(m >= 1);
+        switch (lin.kindOf(w.dtype)) {
+            .blockq => {
+                // These have no TRANSPOSED GEMV; decode is the cooperative one over the
+                // raw layout, which is the same buffer the prefill GEMM dequantizes
+                // from, so both run off one resident copy.
+                if (gpu.Context.dequantOnly(w.dtype)) {
+                    if (m == 1 and k.sg_raw and w.cols % w.dtype.blockElems() == 0) return .gemv_sg;
+                    return if (k.gemm_prefill) .gemm_quant else null;
+                }
+                if (!quantKernel(w.dtype)) return null;
+                // A Vulkan buffer is an opaque handle, so a GEMV cannot step through the
+                // rows of `x`: a batch needs the GEMM or nothing.
+                if (m > 1) return if (k.gemm_prefill) .gemm_quant else null;
+                const dp4a_fmt = w.dtype == .q8_0 or w.dtype == .iq4_nl;
+                if (k.t_dp4a and dp4a_fmt) return .gemv_t_dp4a;
+                if (k.sg_dp4a and dp4a_fmt) return .gemv_sg_dp4a;
+                if (k.sg_gemv) return .gemv_sg;
+                if (dp4a_fmt and k.dp4aRepack(w.dtype)) return .gemv_dp4a;
+                return .gemv_quant_t;
+            },
+            .bf16 => return if (m == 1) .gemv_dense else .gemv_dense4,
+            .fp8, .f32 => return if (m == 1) .gemv_dense else if (m <= dense_grouped_max) .gemv_dense4 else .gemm_dense,
+            else => return null,
+        }
+    }
+
+    /// Accept or refuse a model's device linears, naming the first problem. A linear
+    /// wider than `max_out` (the GEMV scratch) would write past it.
+    pub fn check(k: Knobs, max_out: usize, lins: []const Weight, prefill_rows: usize) Verdict {
+        for (lins) |w| {
+            const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows };
+            if (k.routeOf(w, 1) == null or k.routeOf(w, @max(prefill_rows, 1)) == null) return .{ .refused = with(bad, .no_kernel) };
+            if (w.rows > max_out) return .{ .refused = with(bad, .too_wide) };
+        }
+        return .ok;
+    }
+};
+
+/// Why `check` refused a checkpoint.
+pub const Why = enum { no_kernel, too_wide };
+
+pub const Refusal = struct { why: Why, tag: []const u8, dtype: DType, rows: usize };
+
+pub const Verdict = union(enum) { ok, refused: Refusal };
+
+fn with(r: Refusal, why: Why) Refusal {
+    var out = r;
+    out.why = why;
+    return out;
+}
+
 /// Whether the transposed dequant GEMV and the coop dequant GEMM have this format.
 pub fn quantKernel(dt: DType) bool {
     return switch (dt) {
@@ -71,17 +173,7 @@ pub const Lin = struct {
     zero_bias: []f32,
     /// Interleaved k chunks per output row in the k-split GEMVs.
     nchunk: usize,
-    /// Route iq4_nl through the int8 repack too. Opt-in (`TP_VK_DP4A`): the repack
-    /// doubles a 4-bit weight's footprint, where q8_0's grows only ~6%.
-    dp4a_iq4: bool,
-    sg_gemv: bool,
-    sg_dp4a: bool,
-    t_dp4a: bool,
-    /// Block-quant prefill takes the coop GEMM. Off without the f16-weight pipeline,
-    /// and off under the raw-reading coop GEMVs: the weight cache keys by host
-    /// pointer, so one weight cannot be resident raw for decode and transposed for
-    /// prefill. `t_dp4a` reads the same transposed buffer and is exempt.
-    gemm_prefill: bool,
+    knobs: Knobs,
 
     /// `max_out` is the widest output any linear here writes (the head's vocab);
     /// `groups` the widest `linearGroup` (1 for a stepper that never groups).
@@ -97,19 +189,13 @@ pub const Lin = struct {
             b.* = try ctx.tensorCreate(max_out * nchunk * 4);
             made += 1;
         }
-        const sg_gemv = ctx.hasSubgroupGemv() and getenv("TP_VK_SG_GEMV") != null;
-        const sg_dp4a = ctx.hasSubgroupDp4a() and getenv("TP_VK_SG_DP4A") != null;
         return .{
             .ctx = ctx,
             .gpa = gpa,
             .partials = partials,
             .zero_bias = zero_bias,
             .nchunk = nchunk,
-            .dp4a_iq4 = ctx.hasIntDot() and getenv("TP_VK_DP4A") != null,
-            .sg_gemv = sg_gemv,
-            .sg_dp4a = sg_dp4a,
-            .t_dp4a = ctx.hasTransposedDp4a() and getenv("TP_VK_T_DP4A") != null,
-            .gemm_prefill = ctx.hasQuantPrefillGemm() and !(sg_gemv or sg_dp4a),
+            .knobs = Knobs.fromContext(ctx),
         };
     }
 
@@ -119,38 +205,13 @@ pub const Lin = struct {
         self.gpa.free(self.zero_bias);
     }
 
-    /// Whether this format's resident copy is the int8 repack, which decode and the
-    /// prefill GEMM must agree on.
     pub fn dp4aRepack(self: *const Lin, dt: DType) bool {
-        return switch (dt) {
-            .q8_0 => self.ctx.hasIntDot(),
-            .iq4_nl => self.dp4a_iq4,
-            else => false,
-        };
+        return self.knobs.dp4aRepack(dt);
     }
 
     /// The route this weight takes at `m` rows, or null when no kernel here reads it.
     pub fn routeOf(self: *const Lin, w: Weight, m: usize) ?Route {
-        std.debug.assert(m >= 1);
-        switch (lin.kindOf(w.dtype)) {
-            .blockq => {
-                // No decode GEMV for these: the dequant GEMM at every row count, or nothing.
-                if (gpu.Context.dequantOnly(w.dtype)) return if (self.gemm_prefill) .gemm_quant else null;
-                if (!quantKernel(w.dtype)) return null;
-                // A Vulkan buffer is an opaque handle, so a GEMV cannot step through the
-                // rows of `x`: a batch needs the GEMM or nothing.
-                if (m > 1) return if (self.gemm_prefill) .gemm_quant else null;
-                const dp4a_fmt = w.dtype == .q8_0 or w.dtype == .iq4_nl;
-                if (self.t_dp4a and dp4a_fmt) return .gemv_t_dp4a;
-                if (self.sg_dp4a and dp4a_fmt) return .gemv_sg_dp4a;
-                if (self.sg_gemv) return .gemv_sg;
-                if (dp4a_fmt and self.dp4aRepack(w.dtype)) return .gemv_dp4a;
-                return .gemv_quant_t;
-            },
-            .bf16 => return if (m == 1) .gemv_dense else .gemv_dense4,
-            .fp8, .f32 => return if (m == 1) .gemv_dense else if (m <= dense_grouped_max) .gemv_dense4 else .gemm_dense,
-            else => return null,
-        }
+        return self.knobs.routeOf(w, m);
     }
 
     /// One linear `y[m][w.rows] f32 = x[m][w.cols] @ Wᵀ`, `y` written at element offset
@@ -205,29 +266,8 @@ pub const Lin = struct {
         for (ys, ws, 0..) |y, w, i| try ctx.opGemvCombine(y, 0, self.partials[i], w.rows, w.scale, self.nchunk);
     }
 
-    /// Why `check` refused a checkpoint.
-    pub const Why = enum { no_kernel, too_wide };
-
-    pub const Refusal = struct { why: Why, tag: []const u8, dtype: DType, rows: usize };
-
-    pub const Verdict = union(enum) { ok, refused: Refusal };
-
-    /// Accept or refuse a model's device linears, naming the first problem. A linear
-    /// wider than `partials` was sized for would write past it.
     pub fn check(self: *const Lin, lins: []const Weight, prefill_rows: usize) Verdict {
-        const max_out = self.zero_bias.len;
-        for (lins) |w| {
-            const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows };
-            if (self.routeOf(w, 1) == null or self.routeOf(w, @max(prefill_rows, 1)) == null) return .{ .refused = with(bad, .no_kernel) };
-            if (w.rows > max_out) return .{ .refused = with(bad, .too_wide) };
-        }
-        return .ok;
-    }
-
-    fn with(r: Refusal, why: Why) Refusal {
-        var out = r;
-        out.why = why;
-        return out;
+        return self.knobs.check(self.zero_bias.len, lins, prefill_rows);
     }
 
     /// `check`, logging the refusal under `who` and returning it as an error.
@@ -256,6 +296,81 @@ test "quantKernel names the five formats the Vulkan decode GEMV has; the rest of
     for ([_]DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| try std.testing.expect(quantKernel(dt) and !gpu.Context.dequantOnly(dt));
     for ([_]DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 }) |dt| try std.testing.expect(!quantKernel(dt) and gpu.Context.dequantOnly(dt));
     for ([_]DType{ .q2_k, .bf16 }) |dt| try std.testing.expect(!quantKernel(dt) and !gpu.Context.dequantOnly(dt));
+}
+
+fn fake(dt: DType, rows: usize, cols: usize) Weight {
+    return .{ .bytes = &.{}, .dtype = dt, .rows = rows, .cols = cols };
+}
+
+test "block quants route by knob: dequant GEMV by default, dp4a with the integer dot, the coop GEMM only for prefill" {
+    const q8 = fake(.q8_0, 4096, 4096);
+    const q4 = fake(.q4_k, 4096, 4096);
+    try std.testing.expectEqual(@as(?Route, .gemv_quant_t), Knobs.plain.routeOf(q8, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_quant_t), Knobs.plain.routeOf(q4, 1));
+    // A batch is the GEMM or nothing.
+    try std.testing.expectEqual(@as(?Route, null), Knobs.plain.routeOf(q4, 8));
+    var k = Knobs.plain;
+    k.gemm_prefill = true;
+    try std.testing.expectEqual(@as(?Route, .gemm_quant), k.routeOf(q4, 8));
+    try std.testing.expectEqual(@as(?Route, .gemv_quant_t), k.routeOf(q4, 1));
+    // The integer dot takes q8_0 to the repack, iq4_nl only when opted in.
+    k.int_dot = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_dp4a), k.routeOf(q8, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_quant_t), k.routeOf(fake(.iq4_nl, 4096, 4096), 1));
+    k.dp4a_iq4 = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_dp4a), k.routeOf(fake(.iq4_nl, 4096, 4096), 1));
+    // The cooperative kernels win over the repack; the transposed dp4a over both.
+    k.sg_gemv = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_sg), k.routeOf(q4, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_sg), k.routeOf(q8, 1));
+    k.sg_dp4a = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_sg_dp4a), k.routeOf(q8, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_sg), k.routeOf(q4, 1));
+    k.t_dp4a = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_t_dp4a), k.routeOf(q8, 1));
+}
+
+test "a format with no transposed GEMV decodes cooperatively and prefills through the GEMM" {
+    const w = fake(.iq4_xs, 4096, 4096);
+    try std.testing.expectEqual(@as(?Route, null), Knobs.plain.routeOf(w, 1));
+    var k = Knobs.plain;
+    k.gemm_prefill = true;
+    // Without the cooperative kernels the whole weight dequantizes even to decode.
+    try std.testing.expectEqual(@as(?Route, .gemm_quant), k.routeOf(w, 1));
+    k.sg_raw = true;
+    try std.testing.expectEqual(@as(?Route, .gemv_sg), k.routeOf(w, 1));
+    try std.testing.expectEqual(@as(?Route, .gemm_quant), k.routeOf(w, 512));
+    for ([_]DType{ .q4_0, .q1_0, .q2_0_g64, .q2_0_g128 }) |dt|
+        try std.testing.expectEqual(@as(?Route, .gemv_sg), k.routeOf(fake(dt, 4096, 4096), 1));
+    // A row that is not whole blocks has no lane mapping, so it stays on the GEMM.
+    try std.testing.expectEqual(@as(?Route, .gemm_quant), k.routeOf(fake(.q1_0, 4096, 4032), 1));
+}
+
+test "dense formats route by row count" {
+    const b16 = fake(.bf16, 4096, 4096);
+    try std.testing.expectEqual(@as(?Route, .gemv_dense), Knobs.plain.routeOf(b16, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_dense4), Knobs.plain.routeOf(b16, 512));
+    const f8 = fake(.f8_e4m3, 4096, 4096);
+    try std.testing.expectEqual(@as(?Route, .gemv_dense4), Knobs.plain.routeOf(f8, dense_grouped_max));
+    try std.testing.expectEqual(@as(?Route, .gemm_dense), Knobs.plain.routeOf(f8, dense_grouped_max + 1));
+    try std.testing.expectEqual(@as(?Route, null), Knobs.plain.routeOf(fake(.u8, 8, 8), 1));
+}
+
+test "check names the first linear with no kernel and one wider than the scratch" {
+    var ok = fake(.q4_k, 4096, 4096);
+    ok.tag = "blk.0.attn_q";
+    var k = Knobs.plain;
+    k.gemm_prefill = true;
+    try std.testing.expect(k.check(4096, &.{ok}, 512) == .ok);
+    // Without the prefill GEMM a batch has no route, so the same weight is refused.
+    const r = Knobs.plain.check(4096, &.{ok}, 512).refused;
+    try std.testing.expectEqual(Why.no_kernel, r.why);
+    try std.testing.expectEqualStrings("blk.0.attn_q", r.tag);
+    var wide = fake(.q4_k, 8192, 4096);
+    wide.tag = "output";
+    const r2 = k.check(4096, &.{ ok, wide }, 1).refused;
+    try std.testing.expectEqual(Why.too_wide, r2.why);
+    try std.testing.expectEqualStrings("output", r2.tag);
 }
 
 test "wcode reads bf16 and fp8 natively and everything else as f32" {

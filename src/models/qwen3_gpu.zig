@@ -376,8 +376,8 @@ const Bufs = struct {
 ///     head is a separate block-quant tensor; the F16 embedding is host-gathered
 ///     via the same f32 copy the dense path uses.
 ///
-/// Hidden-dim norms take the 3-pass parallel rmsnorm (rms_partial/rms_combine/
-/// rms_apply_w, one thread per row would serialize rows = 1). Optional per-head
+/// Hidden-dim norms take the 3-pass parallel rmsnorm (see `normWide`, which
+/// records why the one-launch subgroup form loses here). Optional per-head
 /// QK-norm (`cfg.qk_norm`; llama/Mistral omit it). eps / rope θ / vocab all come
 /// from `cfg`.
 pub const VulkanLM = struct {
@@ -392,15 +392,10 @@ pub const VulkanLM = struct {
     quant: bool,
     /// Block-quant prefill runs the tensor-core GEMM (dequant->f16->coopmat) in
     /// one batched pass over the whole prompt instead of a forward per token,
-    /// when the device has the f16-weight coopmat pipeline (`lin.gemm_prefill`).
+    /// when the device has the f16-weight coopmat pipeline (`lin.knobs.gemm_prefill`).
     can_gemm_prefill: bool,
     /// Every projection and the untied head go through here.
     lin: lin_gpu.Lin,
-    /// Route the wide hidden-dim RMSNorm through the one-pass subgroup-reduce
-    /// kernel (rmsnorm_sg) instead of the 3-pass rms_partial/combine/apply_w
-    /// global round-trip. Requires device subgroup support; opt-in via
-    /// TP_VK_SG_RMS while it's being verified against the multi-pass path.
-    use_sg_rms: bool,
     /// LM-head vocab-chunk size (dense tied head only); cfg.vocab / vocab_chunks.
     chunk_rows: usize,
     capacity: usize,
@@ -468,11 +463,10 @@ pub const VulkanLM = struct {
         self.gpa = gpa;
         self.cfg = c;
         self.quant = quant;
-        self.use_sg_rms = ctx.hasSubgroupNorm() and getenv("TP_VK_SG_RMS") != null;
         const max_out = @max(@max(c.vocab, c.qDim()), @max(c.intermediate, c.hidden));
         self.lin = try lin_gpu.Lin.init(gpa, ctx, max_out, gemv_nchunk, 3);
         errdefer self.lin.deinit();
-        self.can_gemm_prefill = quant and self.lin.gemm_prefill;
+        self.can_gemm_prefill = quant and self.lin.knobs.gemm_prefill;
         self.chunk_rows = c.vocab / vocab_chunks;
         self.capacity = capacity;
         self.len = 0;
@@ -933,15 +927,18 @@ pub const VulkanLM = struct {
         try self.lin.linear(self.bufs.t, 0, self.bufs.gate, seq, layer.down);
     }
 
-    /// 3-pass parallel rmsnorm over [rows][hidden] (one thread per row would
-    /// serialize the decode path's rows = 1).
+    /// 3-pass parallel rmsnorm over [rows][hidden].
+    ///
+    /// MEASURED slower on the one-subgroup-per-row kernel the DiT uses, and for a
+    /// structural reason: at the decode's rows = 1 that kernel is 32 lanes over a
+    /// 4096-wide row on ONE multiprocessor, where the chunked partials spread the
+    /// same row over 64 and the apply pass over `hidden` threads. Interleaved
+    /// same-binary A/B, 8B q8_0 on a 3090: 30.9 vs 29.0 tok/s decode, prefill a
+    /// wash. Row count is what decides it, so a batched caller would flip the
+    /// answer; nothing here is batched enough to.
     fn normWide(self: *VulkanLM, in: Buf, out: Buf, weight: Buf, rows: usize) !void {
         const ctx = self.ctx;
         const h: u32 = @intCast(self.cfg.hidden);
-        if (self.use_sg_rms) {
-            try ctx.opRmsNormSg(in, out, weight, rows, self.cfg.hidden, self.cfg.rms_eps);
-            return;
-        }
         try ctx.opElt(.rms_partial, in, null, null, self.bufs.rms_partials, .{
             .u0 = @intCast(rows * rms_chunks),
             .u1 = h,

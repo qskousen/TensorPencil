@@ -3013,9 +3013,9 @@ fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         // dense checkpoints only.
         .{ .who = "krea2  Q/K bf16 @1120x1680", .rows = 7350 * 48, .dim = 128, .per_step = 2 * 28 },
         // Reference only, `per_step = 0`. A 6144-wide row is krea2's block-norm
-        // shape, but `dit_gpu` routes those through the already-parallel
-        // `rms_partial`/`rms_combine`/`rms_apply_mod` chain, NOT `Elt.rmsnorm`. Timed here
-        // so nobody reads the wide-row numbers as an available krea2 win; there is none.
+        // shape, but `dit_gpu` fuses those with the AdaLN modulation (`rms_mod`),
+        // NOT `Elt.rmsnorm`. Timed here so nobody reads the wide-row numbers as an
+        // available krea2 win; there is none.
         .{ .who = "  (ref) wide row, no such site", .rows = 8400, .dim = 6144, .per_step = 0 },
     };
 

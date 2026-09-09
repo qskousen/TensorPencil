@@ -129,6 +129,10 @@ inline fn wf16(bo: u32) f32 { // bo is 2-byte aligned
 inline fn wi8(bo: u32) i32 {
     return @as(i32, @bitCast(wbyte(bo) << 24)) >> 24; // sign-extend low byte
 }
+inline fn wu16(bo: u32) u32 { // bo is 2-byte aligned
+    const word: u32 = @bitCast(a.data[bo / 4]);
+    return if (bo % 4 == 0) word & 0xFFFF else word >> 16;
+}
 const ScaleMin = struct { sc: u32, m: u32 };
 inline fn scaleMinK4(sbase: u32, j: u32) ScaleMin { // ggml get_scale_min_k4
     if (j < 4) {
@@ -318,6 +322,139 @@ export fn gemv_iq4_nl_sg() callconv(.spirv_kernel) void {
     }
     const sum = subgroupReduceAdd(p);
     if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
+}
+
+// The five formats below have NO other Vulkan decode kernel: without these a
+// token dequantizes the whole weight through `opMatmulCoopQuant` (measured under
+// 1 tok/s). They read the same RAW resident buffer that prefill's dequant reads,
+// so decode and prefill still share one copy of the weight.
+
+// q4_0: block 18 B = f16 d + 16 nibble bytes, v = (nibble - 8) * d. Lane l reads
+// byte l%16; lanes 0..15 take the low nibbles (elements 0..15), 16..31 the high
+// (elements 16..31), so x index is blk*32 + lane for every lane.
+export fn gemv_q4_0_sg() callconv(.spirv_kernel) void {
+    decorate();
+    const gid = gpu.global_invocation_id[0];
+    const lane = gid % 32;
+    const row = gid / 32;
+    if (row >= pc.u0) return;
+    const nblk = pc.u1 / 32;
+    const row_base = row * nblk * 18;
+    const i = lane % 16;
+    var p: f32 = 0;
+    var blk: u32 = 0;
+    while (blk < nblk) : (blk += 1) {
+        const bb = row_base + blk * 18;
+        const sc = wf16(bb);
+        const q = wbyte(bb + 2 + i);
+        const nib: u32 = if (lane < 16) q & 0xF else q >> 4;
+        p += sc * @as(f32, @floatFromInt(@as(i32, @intCast(nib)) - 8)) * b.data[blk * 32 + lane];
+    }
+    const sum = subgroupReduceAdd(p);
+    if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
+}
+
+// iq4_xs: super-block 136 B = f16 d, u16 scales_h, 4 B scales_l, 128 qs bytes
+// over 256 elements. Each 32-element sub-block ib has its own 6-bit scale, the
+// low 4 bits in scales_l[ib>>1] and the top 2 in scales_h, biased by -32; the
+// value is the iq4_nl codebook entry the nibble indexes. Lane l reads qs byte
+// ib*16 + l%16, low nibble for lanes 0..15 (elements 0..15 of the sub-block),
+// high for 16..31 (elements 16..31).
+export fn gemv_iq4_xs_sg() callconv(.spirv_kernel) void {
+    decorate();
+    const gid = gpu.global_invocation_id[0];
+    const lane = gid % 32;
+    const row = gid / 32;
+    if (row >= pc.u0) return;
+    const nsb = pc.u1 / 256;
+    const row_base = row * nsb * 136;
+    const i = lane % 16;
+    var p: f32 = 0;
+    var sb: u32 = 0;
+    while (sb < nsb) : (sb += 1) {
+        const bb = row_base + sb * 136;
+        const sd = wf16(bb);
+        const sh = wu16(bb + 2);
+        var ib: u32 = 0;
+        while (ib < 8) : (ib += 1) {
+            const ls_l = (wbyte(bb + 4 + (ib >> 1)) >> @intCast((ib & 1) * 4)) & 0xF;
+            const ls_h = (sh >> @intCast(2 * ib)) & 3;
+            const dl = sd * @as(f32, @floatFromInt(@as(i32, @intCast(ls_l | (ls_h << 4))) - 32));
+            const q = wbyte(bb + 8 + ib * 16 + i);
+            const nib: u32 = if (lane < 16) q & 0xF else q >> 4;
+            const v: f32 = @floatFromInt(kvalues_iq4nl[@intCast(nib)]);
+            p += dl * v * b.data[sb * 256 + ib * 32 + lane];
+        }
+    }
+    const sum = subgroupReduceAdd(p);
+    if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
+}
+
+// q1_0: block 18 B = f16 d + 16 bytes of sign bits over 128 elements, v = +-d.
+// A lane takes elements lane, lane+32, lane+64, lane+96.
+export fn gemv_q1_0_sg() callconv(.spirv_kernel) void {
+    decorate();
+    const gid = gpu.global_invocation_id[0];
+    const lane = gid % 32;
+    const row = gid / 32;
+    if (row >= pc.u0) return;
+    const nblk = pc.u1 / 128;
+    const row_base = row * nblk * 18;
+    var p: f32 = 0;
+    var blk: u32 = 0;
+    while (blk < nblk) : (blk += 1) {
+        const bb = row_base + blk * 18;
+        const sd = wf16(bb);
+        var q: u32 = 0;
+        while (q < 4) : (q += 1) {
+            const e = q * 32 + lane;
+            const bit = (wbyte(bb + 2 + (e >> 3)) >> @intCast(e & 7)) & 1;
+            const v: f32 = if (bit != 0) sd else -sd;
+            p += v * b.data[blk * 128 + e];
+        }
+    }
+    const sum = subgroupReduceAdd(p);
+    if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
+}
+
+// q2_0: f16 d + 2 bits per weight, v = (code - 1) * d. Two block geometries
+// share one ggml type id and differ only in elements per block (see BACKEND.md);
+// `wide` is the 128-element one, so the block is 34 B rather than 18 B and a
+// lane takes four elements instead of two.
+inline fn q2_0Body(comptime wide: bool) void {
+    const qk: u32 = if (wide) 128 else 64;
+    const bytes: u32 = 2 + qk / 4;
+    const per_lane: u32 = qk / 32;
+    const gid = gpu.global_invocation_id[0];
+    const lane = gid % 32;
+    const row = gid / 32;
+    if (row >= pc.u0) return;
+    const nblk = pc.u1 / qk;
+    const row_base = row * nblk * bytes;
+    var p: f32 = 0;
+    var blk: u32 = 0;
+    while (blk < nblk) : (blk += 1) {
+        const bb = row_base + blk * bytes;
+        const sd = wf16(bb);
+        var q: u32 = 0;
+        while (q < per_lane) : (q += 1) {
+            const e = q * 32 + lane;
+            const code = (wbyte(bb + 2 + (e >> 2)) >> @intCast(2 * (e & 3))) & 3;
+            p += sd * @as(f32, @floatFromInt(@as(i32, @intCast(code)) - 1)) * b.data[blk * qk + e];
+        }
+    }
+    const sum = subgroupReduceAdd(p);
+    if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
+}
+
+export fn gemv_q2_0_g64_sg() callconv(.spirv_kernel) void {
+    decorate();
+    q2_0Body(false);
+}
+
+export fn gemv_q2_0_g128_sg() callconv(.spirv_kernel) void {
+    decorate();
+    q2_0Body(true);
 }
 
 // attn_decode_sg: flash-decoding attention for ONE decode query, folded, one

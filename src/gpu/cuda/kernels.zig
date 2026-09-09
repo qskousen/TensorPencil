@@ -1,7 +1,7 @@
 //! Hand-written / hand-emitted PTX kernels for the CUDA backend, plus the
 //! bring-up smoke test. GEMM/prep/attention kernels are added here as Phase 1
 //! progresses; each is authored as PTX (validated offline with
-//! `ptxas -arch=sm_86`) and JIT-compiled by the driver at load time.
+//! `ptxas -arch=<-Dcuda-sm>`) and JIT-compiled by the driver at load time.
 
 const std = @import("std");
 const cu = @import("cu.zig");
@@ -23,11 +23,8 @@ fn envInt(name: [*:0]const u8) ?usize {
 
 /// Trivial element-wise `c = a + b` over `n` f32. The toolchain smoke test:
 /// validates bindings -> PTX JIT -> launch -> readback end to end. Assembles
-/// cleanly under `ptxas -arch=sm_86`.
-pub const vadd_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+/// cleanly under `ptxas`.
+pub const vadd_ptx: [:0]const u8 = ptx.preamble ++
     \\
     \\.visible .entry vadd(
     \\    .param .u64 p_a,
@@ -130,10 +127,7 @@ pub fn smokeTest(ctx: *Context) !void {
 /// v0, correctness reference: one warp per 16x8 output tile, fragments loaded
 /// straight from global, s32 accumulate over the full k. Obviously-correct,
 /// slow (no reuse). Requires m%16==0, n%8==0, k%32==0. Grid (n/8, m/16), 32 thr.
-pub const igemm_v0_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const igemm_v0_ptx: [:0]const u8 = ptx.preamble ++
     \\
     \\.visible .entry igemm_v0(
     \\    .param .u64 p_a,
@@ -238,10 +232,7 @@ pub const igemm_v0_ptx: [:0]const u8 =
 /// output tile, fragments loaded straight from global, s32 accumulate over the
 /// full k. Slow (no reuse) but obviously correct. Requires m%16==0, n%8==0,
 /// k%64==0. Grid (n/8, m/16), 32 threads.
-pub const i4gemm_v0_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const i4gemm_v0_ptx: [:0]const u8 = ptx.preamble ++
     \\
     \\.visible .entry i4gemm_v0(
     \\    .param .u64 p_a,
@@ -1650,10 +1641,7 @@ pub fn prepNeedsGlobalStage(cols: usize, shared_limit: usize) bool {
 
 /// int8 rescale: y[i][j] = f32(acc_s32[i][j]) * act_scale[i] * weight_scale[j].
 /// acc is [m][rows] s32; grid ceil(total/256), block 256. Entry `irescale`.
-pub const irescale_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const irescale_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry irescale(
     \\    .param .u64 p_acc,
     \\    .param .u64 p_y,
@@ -1707,10 +1695,7 @@ pub const irescale_ptx: [:0]const u8 =
 /// f16-output int8 rescale (the c16 chain): y[i][j] (f16) = f32(acc_s32[i][j]) *
 /// act_scale[i] * weight_scale[j]. acc is [m][rows] s32 (×4), y is f16 (×2).
 /// grid ceil(total/256), block 256. Entry `irescale_h16`.
-pub const irescale_h16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const irescale_h16_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry irescale_h16(
     \\    .param .u64 p_acc,
     \\    .param .u64 p_y,
@@ -2304,10 +2289,7 @@ fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
 /// max) / sum, written f16. One block (256 threads) per row; dynamic shared for
 /// the per-thread partials. Entry `softmax_row`. params: p_s(f32 in [m][n]),
 /// p_p(f16 out [m][n]), p_n(u32 padded width), p_seq(u32 valid), p_scale(f32).
-pub const softmax_row_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const softmax_row_ptx: [:0]const u8 = ptx.preamble ++
     \\.extern .shared .align 8 .b8 smem[];
     \\.visible .entry softmax_row(
     \\    .param .u64 p_s,
@@ -2450,10 +2432,7 @@ pub const softmax_row_ptx: [:0]const u8 =
 /// identical to `softmax_row` but S is read as b16 + converted, and the S row
 /// stride is *2. Halves the S write + all three S reads (the memory-bound cost
 /// at large seq). Entry `softmax_row_f16`.
-pub const softmax_row_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const softmax_row_f16_ptx: [:0]const u8 = ptx.preamble ++
     \\.extern .shared .align 8 .b8 smem[];
     \\.visible .entry softmax_row_f16(
     \\    .param .u64 p_s,
@@ -2603,10 +2582,7 @@ pub const softmax_row_f16_ptx: [:0]const u8 =
 /// p_n(u32 pn=mpad), p_seq(u32 valid cols), p_qpad(rows per head), p_cbase (causal
 /// base: row r of a head sees min(seq, cbase + r) keys; pass a huge value for
 /// none). grid=(rows,1,1), block=256.
-pub const softmax_md_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const softmax_md_f16_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry softmax_md_f16(
     \\    .param .u64 p_s,
     \\    .param .u64 p_md,
@@ -3673,10 +3649,7 @@ pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 /// (+bias[rows]); y_off/x_off are ELEMENT offsets to the first row. One thread
 /// per output element. For the non-int8 first/last DiT linears (small). Entry
 /// `f32gemm`. grid ceil(m*rows/256), block 256.
-pub const f32gemm_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
+pub const f32gemm_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry f32gemm(
     \\    .param .u64 p_y, .param .u64 p_x, .param .u64 p_w, .param .u64 p_bias,
     \\    .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_total,
@@ -5004,6 +4977,7 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    const nz = try wnoise.Scratch.init(&b, "p_nsig", "p_nseq");
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
@@ -5151,6 +5125,10 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
     if (!nostage) for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, 32 + v * 16, aqo[v * 4], aqo[v * 4 + 1], aqo[v * 4 + 2], aqo[v * 4 + 3] });
     try b.linef("cvt.f32.f16 {s}, {s};", .{ fs[0], h16[0] });
     try b.linef("cvt.f32.f16 {s}, {s};", .{ fs[1], h16[1] });
+    // A slab is TWO blocks, so the odd one's draw keys on its own base.
+    try wnoise.emitJitter(&b, nz, fs[0], rdt[1], rd_w, .d);
+    try b.linef("add.s64 {s}, {s}, {d};", .{ rdt[2], rdt[1], BLK });
+    try wnoise.emitJitter(&b, nz, fs[1], rdt[2], rd_w, .d);
     try b.linef("st.shared.v2.f32 [{s}], {{{s}, {s}}};", .{ r_ascd, fs[0], fs[1] });
 
     // -- stage B: activation int8 (already in the right layout) + its scales --
@@ -5335,6 +5313,7 @@ fn buildMmqPipeQ6KMode(alloc: std.mem.Allocator, comptime experts: bool) ![:0]u8
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    const nz = try wnoise.Scratch.init(&b, "p_nsig", "p_nseq");
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
@@ -5531,6 +5510,7 @@ fn buildMmqPipeQ6KMode(alloc: std.mem.Allocator, comptime experts: bool) ![:0]u8
     const fsv = try b.regs(.f32, 4);
     try b.linef("ld.global.u16 {s}, [{s}+208];", .{ rs[0], rdt[1] });
     try b.linef("cvt.f32.f16 {s}, {s};", .{ fd6, rs[0] });
+    try wnoise.emitJitter(&b, nz, fd6, rdt[1], rd_w, .d);
     try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[5], tm[1] }); // i_local*4
     try b.linef("add.u32 {s}, {s}, 192;", .{ tm[5], tm[5] });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[5] });
@@ -6233,6 +6213,7 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    const nz = try wnoise.Scratch.init(&b, "p_nsig", "p_nseq");
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
@@ -6413,6 +6394,8 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
             for (0..4) |j| try bb.linef("ld.global.u16 {s}, [{s}+{d}];", .{ args.tm[4 + j], args.rdt[2], j * 4 + 2 });
             for (0..4) |j| try bb.linef("shl.b32 {s}, {s}, 16; or.b32 {s}, {s}, {s};", .{ args.tm[4 + j], args.tm[4 + j], args.ar[j], args.ar[j], args.tm[4 + j] });
             try bb.linef("cvt.f32.f16 {s}, {s};", .{ args.f_ad, args.h16[0] });
+            // `rdt[1]` is still this block's base; B reuses it below.
+            try wnoise.emitJitter(bb, args.nz, args.f_ad, args.rdt[1], args.rd_w, .d);
             // B: 64 bytes per column, global -> shared, no registers.
             try bb.linef("shl.b32 {s}, {s}, 6;", .{ args.tm[0], args.r_pf }); // slab*kstep
             try bb.linef("cvt.u64.u32 {s}, {s};", .{ args.rdt[0], args.tm[0] });
@@ -6506,6 +6489,8 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
         .tm = tm,
         .rdt = rdt,
         .r_pf = r_pf,
+        .nz = nz,
+        .rd_w = rd_w,
         .rd_wrow = rd_wrow,
         .rd_bcol = rd_bcol,
         .h16 = h16,
@@ -6684,6 +6669,7 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    const nz = try wnoise.Scratch.init(&b, "p_nsig", "p_nseq");
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
@@ -6849,6 +6835,8 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
             try bb.linef("add.s64 {s}, {s}, {s};", .{ args.rdt[2], args.rdt[1], args.rdt[0] });
             for (0..4) |j| try bb.linef("ld.global.u16 {s}, [{s}+{d}];", .{ args.ar[j], args.rdt[2], j * 2 });
             try bb.linef("cvt.f32.f16 {s}, {s};", .{ args.f_ad, args.h16[0] });
+            // `rdt[1]` is still this block's base; B reuses it below.
+            try wnoise.emitJitter(bb, args.nz, args.f_ad, args.rdt[1], args.rd_w, .d);
             // B: 64 bytes per column, global -> shared, no registers.
             try bb.linef("shl.b32 {s}, {s}, 6;", .{ args.tm[0], args.r_pf }); // slab*kstep
             try bb.linef("cvt.u64.u32 {s}, {s};", .{ args.rdt[0], args.tm[0] });
@@ -6942,6 +6930,8 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
         .tm = tm,
         .rdt = rdt,
         .r_pf = r_pf,
+        .nz = nz,
+        .rd_w = rd_w,
         .rd_wrow = rd_wrow,
         .rd_bcol = rd_bcol,
         .h16 = h16,

@@ -382,13 +382,12 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, layernorm_h16, ln_mod, l2norm_rows_g };
+pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("rmsnorm"),
+    dualEntry("rms_apply_w"),
     dualEntry("rms_partial"),
     dualEntry("rms_combine"),
-    dualEntry("rms_apply_mod"),
-    dualEntry("rms_apply_mod_h16"),
     dualEntry("modulate"),
     dualEntry("gated_add"),
     dualEntry("add"),
@@ -425,7 +424,6 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("scale_i32"),
     dualEntry("scale_concat"),
     dualEntry("qknorm_rope_f32"),
-    dualEntry("rms_apply_w"),
     .{ .name = "attn_dsplit", .x = 256, .y = 1 },
     .{ .name = "attn_dmerge", .x = 256, .y = 1 },
     .{ .name = "gemv_partial", .x = 256, .y = 1 },
@@ -555,6 +553,7 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("dequant_q6_k_bf16"),
     dualEntry("group_rmsnorm"),
     dualEntry("rms_mod"),
+    dualEntry("rms_mod_h16"),
     dualEntry("layernorm_h16"),
     dualEntry("ln_mod"),
     dualEntry("l2norm_rows_g"),
@@ -926,7 +925,7 @@ pub const Context = struct {
     /// [6] attn_decode_sg (folded flash-decode attention). The norms live in the
     /// dual-target module now.
     shader_sg: vk.ShaderModule = .null_handle,
-    pipe_sg: [7]vk.Pipeline = @splat(.null_handle),
+    pipe_sg: [12]vk.Pipeline = @splat(.null_handle),
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
     // module, which is at the SPIR-V backend's per-module entry-point limit.
@@ -1645,7 +1644,7 @@ pub const Context = struct {
         // leaves the subgroup pipelines null (the opt-in subgroup GEMVs stay off),
         // never failing device bring-up.
         var shader_sg: vk.ShaderModule = .null_handle;
-        var pipe_sg: [7]vk.Pipeline = @splat(vk.Pipeline.null_handle);
+        var pipe_sg: [12]vk.Pipeline = @splat(vk.Pipeline.null_handle);
         sg: {
             const sg_entries = [_]EntrySize{
                 .{ .name = "subgroup_sum", .x = 32, .y = 1 },
@@ -1660,13 +1659,20 @@ pub const Context = struct {
                 // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
                 // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
                 .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
+                // The formats with no other decode kernel; appended so the
+                // indices above keep their meaning.
+                .{ .name = "gemv_q4_0_sg", .x = 256, .y = 1 },
+                .{ .name = "gemv_iq4_xs_sg", .x = 256, .y = 1 },
+                .{ .name = "gemv_q1_0_sg", .x = 256, .y = 1 },
+                .{ .name = "gemv_q2_0_g64_sg", .x = 256, .y = 1 },
+                .{ .name = "gemv_q2_0_g128_sg", .x = 256, .y = 1 },
             };
             const caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
             createKernelModule(gpa, &d, device, subgroup_spv, &sg_entries, &caps, null, &shader_sg) catch |e| {
                 std.log.warn("subgroup module unavailable ({t}); the opt-in subgroup GEMVs are off", .{e});
                 break :sg;
             };
-            const infos = [7]vk.ComputePipelineCreateInfo{
+            const infos = [12]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_sg, .p_name = "subgroup_sum" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q8_0_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q4_k_sg" }, .layout = pipeline_layout_e },
@@ -1674,6 +1680,11 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q6_k_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_nl_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "attn_decode_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q4_0_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_xs_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q1_0_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q2_0_g64_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q2_0_g128_sg" }, .layout = pipeline_layout_e },
             };
             if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_sg) != .success) {
                 std.log.warn("subgroup pipelines unavailable; the opt-in subgroup GEMVs are off", .{});
@@ -4664,8 +4675,7 @@ pub const Context = struct {
 
     /// One-pass RMSNorm over [rows][dim] with a plain norm weight, via a single
     /// subgroup reduce per row (one subgroup per workgroup): y = x*inv*w,
-    /// inv = 1/sqrt(mean(x^2)+eps). Replaces the 3-pass rms_partial ->
-    /// rms_combine -> rms_apply_w chain that round-trips per-chunk partials
+    /// inv = 1/sqrt(mean(x^2)+eps), in ONE launch with no per-chunk partials
     /// through global memory. Requires hasSubgroupNorm(). a = x, b = out,
     /// c = weight; each workgroup is 32 lanes (baked LocalSize) = one subgroup.
     pub fn opRmsNormSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
@@ -4699,9 +4709,42 @@ pub const Context = struct {
         try self.opElt(.ln_mod, x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
     }
 
+    /// Fused rmsnorm + AdaLN modulation over `[rows][dim]`, one subgroup per row:
+    /// `out = x * rsqrt(mean(x^2) + eps) * mod[premul_off + c] + mod[shift_off + c]`.
+    /// One launch where the partial/combine/apply chain was three, and no per-chunk
+    /// partials in global memory. `premul` carries the pre-norm weight folded in,
+    /// the same convention `Backend.rmsMod` takes.
+    pub fn opRmsModSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
+        try self.opElt(.rms_mod, x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
+    }
+
+    /// `opRmsModSg` writing f16 pairs scaled by `scale`, for the half-precision
+    /// GEMMs. `rows` covers the GEMM's padded batch and the first `real_rows` are
+    /// normalized; the rest are zeroed, since their input is uninitialized.
+    pub fn opRmsModSgH16(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, real_rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, scale: f32) Error!void {
+        std.debug.assert(dim % 2 == 0);
+        try self.opElt(.rms_mod_h16, x, out, mod, null, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(dim),
+            .u2 = @intCast(premul_off),
+            .u3 = @intCast(shift_off),
+            .u5 = @intCast(real_rows),
+            .f0 = eps,
+            .f1 = scale,
+        }, rows, 1, 1);
+    }
+
     /// Whether the cooperative block-quant decode GEMV (gemv_q*_sg) is available.
     pub fn hasSubgroupGemv(self: *const Context) bool {
         return self.pipe_sg[1] != .null_handle;
+    }
+
+    /// Whether the cooperative GEMV covers the formats with no other decode
+    /// kernel (q4_0 / iq4_xs / q1_0 / q2_0). The same pipelines, asked separately
+    /// because for those it is not an opt-in A/B but the only kernel: without it
+    /// a token dequantizes the whole weight.
+    pub fn hasRawSubgroupGemv(self: *const Context) bool {
+        return self.pipe_sg[7] != .null_handle;
     }
 
     /// Cooperative block-quant decode GEMV: `y[rows] = scale * (dequant(W) @ x)`,
@@ -4721,16 +4764,21 @@ pub const Context = struct {
         rows: usize,
         cols: usize,
     ) Error!void {
-        std.debug.assert(cols % 32 == 0);
         const pipe_idx: usize = switch (dt) {
             .q8_0 => 1,
             .q4_k => 2,
             .q5_k => 3,
             .q6_k => 4,
             .iq4_nl => 5,
+            .q4_0 => 7,
+            .iq4_xs => 8,
+            .q1_0 => 9,
+            .q2_0_g64 => 10,
+            .q2_0_g128 => 11,
             else => return error.UnsupportedDType,
         };
-        if (dt != .q8_0 and dt != .iq4_nl) std.debug.assert(cols % 256 == 0);
+        // A lane owns one element of a block, so a row must be whole blocks.
+        std.debug.assert(cols % dt.blockElems() == 0);
         std.debug.assert(self.pipe_sg[pipe_idx] != .null_handle);
         const w_buf = try self.weightBufferRaw(w_bytes);
         const dummy = try self.dummyBuf();
@@ -5803,6 +5851,72 @@ test "gpu block-quant gemv matches cpu reference" {
     }
 }
 
+// The cooperative GEMV over the formats that have no OTHER Vulkan decode kernel
+// (`Context.dequantOnly`): without these a decode dequantizes the whole weight
+// through the prefill GEMM. Each is scored against the shared CPU dequant, and
+// the two q2_0 geometries are checked separately because they share one ggml type
+// id and reading a row at the wrong stride passes every bounds check.
+test "gpu cooperative gemv covers the formats with no transposed kernel" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasRawSubgroupGemv()) return error.SkipZigTest;
+    const dtypes = @import("tp_core").dtype;
+    const quants = @import("tp_core").quants;
+
+    const rows = 64;
+    const cols = 512;
+    var prng = std.Random.DefaultPrng.init(0x4d2);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    var x_d = try ctx.tensorCreate(cols * 4);
+    var y_d = try ctx.tensorCreate(rows * 4);
+    defer {
+        ctx.tensorDestroy(&x_d);
+        ctx.tensorDestroy(&y_d);
+    }
+    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    const y = try gpa.alloc(f32, rows);
+    defer gpa.free(y);
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+
+    const dts = [_]dtypes.DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 };
+    const d16: u16 = 0x2A66; // ~0.05
+    // Every buffer stays alive to the end: the device weight cache keys on the
+    // host pointer, so a free and a realloc at the same address would alias.
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| {
+        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
+        rand.bytes(ws[i]);
+        const bb = dt.blockBytes();
+        var off: usize = 0;
+        // Every format here carries its f16 scale first; the quant bytes below it
+        // are legal whatever the random bytes say.
+        while (off < ws[i].len) : (off += bb) std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
+    }
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        try ctx.opGemvQuantSg(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            var acc: f64 = 0;
+            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
+            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
+                std.debug.print("dtype {s} (subgroup) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
+                return e;
+            };
+        }
+    }
+}
+
 // The block-quant prefill tensor-core GEMM (opMatmulCoopQuant): dequant each
 // weight to f16 k-major on-device, then the coop GEMM over a batch. Validates
 // all five dequant kernels + the pack kernel + the coop path against a CPU
@@ -5985,6 +6099,90 @@ test "gpu subgroup rmsnorm matches cpu reference" {
     }
 }
 
+test "gpu fused rmsnorm+modulate matches an f64 reference, f32 and f16 output" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasSubgroupNorm()) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x2f11);
+    const rand = prng.random();
+    const eps: f32 = 1e-5;
+    const scale: f32 = 0.75;
+    // krea2's own width, a strided tail, and a padded batch: the f16 form is
+    // launched over the GEMM's padded row count and must ZERO the rows past the
+    // real ones rather than normalize their uninitialized input.
+    const cases = [_]struct { rows: usize, real: usize, dim: usize }{
+        .{ .rows = 5, .real = 5, .dim = 6144 },
+        .{ .rows = 3, .real = 3, .dim = 6176 },
+        .{ .rows = 8, .real = 5, .dim = 6144 },
+    };
+    for (cases) |cs| {
+        const rows = cs.rows;
+        const dim = cs.dim;
+        const x = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(x);
+        // `mod` holds [premul][shift] back to back, at the offsets pushed below.
+        const mod = try gpa.alloc(f32, 2 * dim);
+        defer gpa.free(mod);
+        for (x) |*v| v.* = rand.floatNorm(f32) * 1.5;
+        for (mod[0..dim]) |*v| v.* = 1.0 + rand.floatNorm(f32) * 0.3;
+        for (mod[dim..]) |*v| v.* = rand.floatNorm(f32) * 0.2;
+
+        var x_d = try ctx.tensorCreate(rows * dim * 4);
+        defer ctx.tensorDestroy(&x_d);
+        var m_d = try ctx.tensorCreate(mod.len * 4);
+        defer ctx.tensorDestroy(&m_d);
+        var y_d = try ctx.tensorCreate(rows * dim * 4);
+        defer ctx.tensorDestroy(&y_d);
+        var h_d = try ctx.tensorCreate(rows * dim * 2);
+        defer ctx.tensorDestroy(&h_d);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try ctx.tensorUpload(m_d, std.mem.sliceAsBytes(mod));
+        try ctx.opRmsModSg(x_d, y_d, m_d, cs.real, dim, 0, dim, eps);
+        try ctx.opRmsModSgH16(x_d, h_d, m_d, rows, cs.real, dim, 0, dim, eps, scale);
+        const y = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(y);
+        const h = try gpa.alloc(u16, rows * dim);
+        defer gpa.free(h);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        try ctx.tensorDownload(h_d, std.mem.sliceAsBytes(h));
+
+        var f32_err: f64 = 0;
+        var f16_err: f64 = 0;
+        var ref_sq: f64 = 0;
+        for (0..rows) |r| {
+            const xr = x[r * dim ..][0..dim];
+            if (r >= cs.real) {
+                // The padded rows exist only so the GEMM reads whole tiles.
+                for (0..dim) |i| try std.testing.expectEqual(@as(u16, 0), h[r * dim + i]);
+                continue;
+            }
+            var sum: f64 = 0;
+            for (xr) |v| sum += @as(f64, v) * v;
+            const inv = 1.0 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + eps);
+            for (0..dim) |i| {
+                const want = @as(f64, xr[i]) * inv * mod[i] + mod[dim + i];
+                ref_sq += want * want;
+                const d32 = @as(f64, y[r * dim + i]) - want;
+                f32_err += d32 * d32;
+                const d16 = @as(f64, @as(f16, @bitCast(h[r * dim + i]))) - want * scale;
+                f16_err += d16 * d16 / (scale * scale);
+            }
+        }
+        const rel32 = @sqrt(f32_err / ref_sq);
+        const rel16 = @sqrt(f16_err / ref_sq);
+        errdefer std.debug.print(
+            "rows {d}/{d} dim {d}: f32 rel L2 {e:.3}, f16 rel L2 {e:.3}\n",
+            .{ cs.real, rows, dim, rel32, rel16 },
+        );
+        try std.testing.expect(rel32 < 1e-5);
+        // f16 carries 11 mantissa bits, so its floor is ~1e-3 whatever the norm does.
+        try std.testing.expect(rel16 < 3e-3);
+    }
+}
+
 test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -6154,10 +6352,24 @@ test "gpu dp4a decode GEMV matches cpu reference" {
     // repack. Same int8-quantized-activation reference (xq). Uses SEPARATE
     // weight buffers: opGemvDp4a above cached `ws[i]` as a REPACKED layout under
     // its host ptr, and weightBufferRaw would return that stale repacked buffer.
+    // ⚠️ Both copies below live to the END of the test, not to the end of their
+    // `if`. The cache keys on the HOST POINTER, so a copy freed at the end of one
+    // block whose address the next block's allocation reuses is served the FIRST
+    // block's layout — raw where the reader wants the 32-row transpose, which
+    // reads as NaN. It depends on allocator luck, so it passes alone and fails in
+    // the full binary.
+    var wsg: [dts.len][]u8 = undefined;
+    var wsg_n: usize = 0;
+    defer for (wsg[0..wsg_n]) |w| gpa.free(w);
+    var wst: [dts.len][]u8 = undefined;
+    var wst_n: usize = 0;
+    defer for (wst[0..wst_n]) |w| gpa.free(w);
+
     if (ctx.hasSubgroupDp4a()) {
-        var wsg: [dts.len][]u8 = undefined;
-        inline for (dts, 0..) |_, i| wsg[i] = try gpa.dupe(u8, ws[i]);
-        defer for (wsg) |w| gpa.free(w);
+        inline for (dts, 0..) |_, i| {
+            wsg[i] = try gpa.dupe(u8, ws[i]);
+            wsg_n += 1;
+        }
         inline for (dts, 0..) |dt, i| {
             try ctx.opGemvQuantSgDp4a(dt, y_d, 0, x_d, wsg[i], 1.0, rows, cols);
             try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
@@ -6179,9 +6391,10 @@ test "gpu dp4a decode GEMV matches cpu reference" {
     // reference (xq). SEPARATE weight buffers (weightBufferRawT vs the repacked
     // uploads above collide on the host-ptr cache key).
     if (ctx.hasTransposedDp4a()) {
-        var wst: [dts.len][]u8 = undefined;
-        inline for (dts, 0..) |_, i| wst[i] = try gpa.dupe(u8, ws[i]);
-        defer for (wst) |w| gpa.free(w);
+        inline for (dts, 0..) |_, i| {
+            wst[i] = try gpa.dupe(u8, ws[i]);
+            wst_n += 1;
+        }
         inline for (dts, 0..) |dt, i| {
             try ctx.opGemvQuantTDp4a(dt, y_d, 0, x_d, wst[i], 1.0, rows, cols, nchunk, part_d);
             try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));

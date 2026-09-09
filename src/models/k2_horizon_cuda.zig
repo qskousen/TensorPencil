@@ -1555,9 +1555,13 @@ test "K2 Horizon CUDA produces the expected first token" {
     defer tok.deinit();
     const old_family = chat.family;
     const old_thinking = chat.enable_thinking;
+    // The special ids too: K2's vocab is ~250k and the next model's may be 151k, so
+    // leaving them published emits ids that model has no rows for.
+    const old_ids = chat.tokenizerIds();
     defer {
         chat.setFamily(old_family);
         chat.setThinking(old_thinking);
+        chat.restoreTokenizerIds(old_ids);
     }
     chat.applyTokenizer(&tok);
     chat.setFamily(.k2_horizon);

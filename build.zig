@@ -79,11 +79,19 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // The CUDA generation every PTX module is built for: the hand kernels' headers
+    // (`cuda/ptx.zig` reads both from build_options), `dual`'s lowering below, and
+    // the JIT all follow these two, so a second generation is one flag.
+    const cuda_sm = b.option(u32, "cuda-sm", "CUDA compute capability the PTX targets, e.g. 86 or 89 (default 86)") orelse 86;
+    const ptx_isa = b.option([]const u8, "ptx-isa", "PTX ISA version in every kernel header (default 8.0)") orelse "8.0";
+    const cuda_march = b.fmt("sm_{d}", .{cuda_sm});
+    const cuda_model = nvptxModel(cuda_march) orelse std.debug.panic("-Dcuda-sm={d}: Zig has no nvptx cpu model {s}", .{ cuda_sm, cuda_march });
+
     // `dual` also compiles to PTX for the CUDA backend. Zig's LLVM backend cannot
     // emit nvptx assembly for an exported kernel (it aliases the export name to
     // a private kernel, which NVPTX rejects), so: LLVM IR out of the object,
     // tools/ptx_unalias.zig renames the kernels, and Zig's bundled clang lowers
-    // the IR. `+ptx80` pins the ISA version the hand-written kernels use.
+    // the IR. `+ptx<isa>` pins the ISA version the hand-written kernels use.
     const dual_ir = b.addObject(.{
         .name = "dual_ir",
         .root_module = b.createModule(.{
@@ -91,9 +99,12 @@ pub fn build(b: *std.Build) void {
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = .nvptx64,
                 .os_tag = .cuda,
-                .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_86 },
+                .cpu_model = .{ .explicit = cuda_model },
             }),
             .optimize = .ReleaseFast,
+            // Some cpu models keep debug metadata in the IR, which the PTX lowering
+            // then warns about on every build.
+            .strip = true,
         }),
         .use_llvm = true,
     });
@@ -109,9 +120,9 @@ pub fn build(b: *std.Build) void {
     unalias_run.addFileArg(dual_ir.getEmittedLlvmIr());
     const dual_ll = unalias_run.addOutputFileArg("dual.ll");
     const dual_lower = b.addSystemCommand(&.{
-        b.graph.zig_exe, "cc",              "-target", "nvptx64-cuda", "-march=sm_86",
-        "-Xclang",       "-target-feature", "-Xclang", "+ptx80",       "-Wno-unused-command-line-argument",
-        "-O3",           "-S",              "-o",
+        b.graph.zig_exe, "cc",              "-target", "nvptx64-cuda", b.fmt("-march={s}", .{cuda_march}),
+        "-Xclang",       "-target-feature", "-Xclang", ptxFeature(b, ptx_isa), "-Wno-unused-command-line-argument",
+        "-g0",           "-O3",             "-S",      "-o",
     });
     const dual_ptx = dual_lower.addOutputFileArg("dual.ptx");
     dual_lower.addFileArg(dual_ll);
@@ -258,6 +269,8 @@ pub fn build(b: *std.Build) void {
     // block-quant paths to a clean runtime error instead of a missing-module
     // compile error.
     build_opts.addOption(bool, "have_ggml", ggml_mod != null);
+    build_opts.addOption(u32, "cuda_sm", cuda_sm);
+    build_opts.addOption([]const u8, "ptx_isa", ptx_isa);
     const opts_mod = build_opts.createModule();
     mod.addImport("build_options", opts_mod);
     core_mod.addImport("build_options", opts_mod);
@@ -973,4 +986,24 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// The `std.Target.nvptx.cpu` model named `name` (`sm_86`), if Zig has one.
+fn nvptxModel(name: []const u8) ?*const std.Target.Cpu.Model {
+    inline for (@typeInfo(std.Target.nvptx.cpu).@"struct".decls) |d| {
+        if (std.mem.eql(u8, d.name, name)) return &@field(std.Target.nvptx.cpu, d.name);
+    }
+    return null;
+}
+
+/// clang's target feature for a PTX ISA version: "8.0" -> "+ptx80".
+fn ptxFeature(b: *std.Build, isa: []const u8) []const u8 {
+    var digits: [8]u8 = undefined;
+    var n: usize = 0;
+    for (isa) |ch| if (ch != '.') {
+        if (n == digits.len) std.debug.panic("-Dptx-isa={s}: expected major.minor", .{isa});
+        digits[n] = ch;
+        n += 1;
+    };
+    return b.fmt("+ptx{s}", .{digits[0..n]});
 }

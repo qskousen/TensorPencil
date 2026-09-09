@@ -671,6 +671,9 @@ pub const Eagle3Drafter = struct {
 // must equal vanilla greedy (the lossless-verification contract holds no
 // matter what the head proposes). Kept tiny, Debug forwards are slow.
 test "eagle drafter matches vanilla greedy on the real models" {
+    // The failure this has actually shown is an ERROR out of the drafter, not a
+    // mismatch, and an error with no message says nothing about which stage.
+    errdefer |e| std.debug.print("eagle chain: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
@@ -691,6 +694,17 @@ test "eagle drafter matches vanilla greedy on the real models" {
     defer est.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
     defer tok.deinit();
+    // Publish THIS tokenizer's special ids and family before building a prompt, the
+    // way every real caller does: they are process-global, and a test that ran a
+    // different model first leaves its own vocab's ids behind.
+    const saved_chat = chat.tokenizerIds();
+    const saved_family = chat.family;
+    defer {
+        chat.restoreTokenizerIds(saved_chat);
+        chat.setFamily(saved_family);
+    }
+    chat.applyTokenizer(&tok);
+    chat.setFamily(.chatml);
 
     var opts: engine.Options = .{ .max_new_tokens = 3, .sampling = .{ .temperature = 0 } };
     var ids_vanilla: std.ArrayList(u32) = .empty;
@@ -725,6 +739,9 @@ test "eagle drafter matches vanilla greedy on the real models" {
 // the target's tree-verify forward) stays byte-identical to vanilla greedy,
 // the lossless contract holds no matter what tree the head proposes.
 test "eagle tree drafter matches vanilla greedy on the real models" {
+    // The failure this has actually shown is an ERROR out of the drafter, not a
+    // mismatch, and an error with no message says nothing about which stage.
+    errdefer |e| std.debug.print("eagle tree: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
@@ -745,6 +762,17 @@ test "eagle tree drafter matches vanilla greedy on the real models" {
     defer est.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
     defer tok.deinit();
+    // Publish THIS tokenizer's special ids and family before building a prompt, the
+    // way every real caller does: they are process-global, and a test that ran a
+    // different model first leaves its own vocab's ids behind.
+    const saved_chat = chat.tokenizerIds();
+    const saved_family = chat.family;
+    defer {
+        chat.restoreTokenizerIds(saved_chat);
+        chat.setFamily(saved_family);
+    }
+    chat.applyTokenizer(&tok);
+    chat.setFamily(.chatml);
 
     var opts: engine.Options = .{ .max_new_tokens = 4, .sampling = .{ .temperature = 0 } };
     var ids_vanilla: std.ArrayList(u32) = .empty;

@@ -60,10 +60,9 @@ const use_flash = false;
 /// f16-weight coop GEMM always folds a bias in). One stable file-scope pointer so
 /// every GEMM width shares a single cached buffer.
 const zero_bias: [dit.mlp_dim]f32 = @splat(0);
-/// Two-pass softmax / parallel rmsnorm chunk counts: 32 interleaved chunks
-/// per row so a warp covers a row with coalesced reads.
+/// Two-pass softmax chunk count: 32 interleaved chunks per row so a warp covers a
+/// row with coalesced reads.
 const nchunks = 32;
-const rms_ch = 32;
 /// Cap on the materialized attention-scores buffer; heads batch to fit it.
 const s_bytes_cap: usize = 2 << 30;
 
@@ -221,8 +220,6 @@ pub const Workspace = struct {
     v16_d: gpu.DeviceBuffer,
     part_d: gpu.DeviceBuffer,
     md_d: gpu.DeviceBuffer,
-    rmsp_d: gpu.DeviceBuffer,
-    rmsi_d: gpu.DeviceBuffer,
     h16_d: gpu.DeviceBuffer,
 
     pub fn init(ctx: *gpu.Context, lat_h: usize, lat_w: usize, seq_txt_cap: usize) !Workspace {
@@ -261,8 +258,6 @@ pub const Workspace = struct {
             if (tc_attn) seq_pad * kv_heads * hd * 2 else 16, // v16_d
             if (tc_attn and !flash) hpb * seq * nchunks * 2 * 4 else 16, // part_d
             if (tc_attn and !flash) hpb * seq_pad * 2 * 4 else 16, // md_d
-            seq * rms_ch * 4, // rmsp_d
-            seq * 4, // rmsi_d
             if (coop) seq_pad * dit.mlp_dim * 2 else 16, // h16_d
         };
         inline for (buf_fields, sizes) |name, size| {
@@ -280,7 +275,7 @@ pub const Workspace = struct {
     const buf_fields = [_][]const u8{
         "x_d",  "t1_d",  "q_d",    "k_d",  "v_d",     "g_d",  "attn_d",
         "mg_d", "mu_d",  "mv_d",   "fin_d", "imgin_d", "qt_d", "kt_d",
-        "s_d",  "v16_d", "part_d", "md_d", "rmsp_d",  "rmsi_d", "h16_d",
+        "s_d",  "v16_d", "part_d", "md_d", "h16_d",
     };
 };
 
@@ -407,7 +402,7 @@ pub fn forward(
     for (model.blocks, 0..) |*blk, b| {
         for (mv[b * 6 * F ..][0 .. 6 * F], tv_vec, blk.mod) |*m, tvv, bm| m.* = tvv + bm;
         // Slots 0/3 (pre/post modulation scale) carry the rmsnorm weight
-        // prefolded: rms_apply_mod computes x*inv_rms*premul + shift.
+        // prefolded: rms_mod computes x*inv_rms*premul + shift.
         const base = b * 6 * F;
         for (0..F) |c| {
             mv[base + c] = (1.0 + mv[base + c]) * blk.prenorm[c];
@@ -469,8 +464,6 @@ pub fn forward(
     const v16_d = ws.v16_d;
     const part_d = ws.part_d;
     const md_d = ws.md_d;
-    const rmsp_d = ws.rmsp_d;
-    const rmsi_d = ws.rmsi_d;
     const h16_d = ws.h16_d;
 
     try ctx.tensorUpload(mv_d, std.mem.sliceAsBytes(mv));
@@ -547,20 +540,9 @@ pub fn forward(
         const mv_base: u32 = @intCast(b * 6 * F);
 
         // t1 = (1+pre_scale) * prenorm(x) + pre_shift, the norm weight is
-        // prefolded into mv slot 0; inv-rms comes from the parallel
-        // partial/combine pair (a one-thread-per-row loop over dim 6144 is
-        // latency-bound).
-        try ctx.opElt(.rms_partial, x_d, null, null, rmsp_d, .{
-            .u0 = @intCast(seq * rms_ch),
-            .u1 = F,
-            .u2 = rms_ch,
-        }, seq * rms_ch, 1, 1);
-        try ctx.opElt(.rms_combine, rmsp_d, null, null, rmsi_d, .{
-            .u0 = @intCast(seq),
-            .u1 = F,
-            .u2 = rms_ch,
-            .f0 = 1e-5,
-        }, seq, 1, 1);
+        // prefolded into mv slot 0. One subgroup per row, so the norm and the
+        // modulation are a single launch (`opRmsModSg`), issued below with the
+        // output width the branch wants.
         // Attention. When every consumer shares one dequant scale (the Krea
         // 2 DiT stores raw e4m3: all scales are 1), the modulated norm
         // converts straight to f16 once and feeds all four GEMMs, the f32
@@ -603,14 +585,7 @@ pub fn forward(
         const i8_f16 = is_i8 and tc_attn and ctx.pipe_coop_i8_fs16 != .null_handle;
         const attn_f16 = att16 or i8_f16;
         if (qkv_shared) {
-            try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
-                .u0 = @intCast(seq_pad * F / 2),
-                .u1 = F,
-                .u2 = mv_base + 0 * F,
-                .u3 = mv_base + 1 * F,
-                .u4 = @intCast(seq * F),
-                .f0 = blk.attn.wq.scale,
-            }, seq_pad * F / 2, 1, 1);
+            try ctx.opRmsModSgH16(x_d, h16_d, mv_d, seq_pad, seq, F, mv_base + 0 * F, mv_base + 1 * F, 1e-5, blk.attn.wq.scale);
             mark(io, &t_mark, &prof.elt_ns);
             // All four GEMMs read h16_d and write disjoint outputs: no
             // barriers between them, so the small wk/wv grids (6 columns of
@@ -628,12 +603,7 @@ pub fn forward(
                 mark(io, &t_mark, &prof.matmul_ns);
             }
         } else {
-            try ctx.opElt(.rms_apply_mod, x_d, t1_d, mv_d, rmsi_d, .{
-                .u0 = @intCast(seq * F),
-                .u1 = F,
-                .u2 = mv_base + 0 * F,
-                .u3 = mv_base + 1 * F,
-            }, seq * F, 1, 1);
+            try ctx.opRmsModSg(x_d, t1_d, mv_d, seq, F, mv_base + 0 * F, mv_base + 1 * F, 1e-5);
             mark(io, &t_mark, &prof.elt_ns);
             if (is_i8) {
                 // Prep the modulated norm once, then four int8 GEMMs share it.
@@ -934,28 +904,10 @@ pub fn forward(
         mark(io, &t_mark, &prof.elt_ns);
 
         // MLP.
-        try ctx.opElt(.rms_partial, x_d, null, null, rmsp_d, .{
-            .u0 = @intCast(seq * rms_ch),
-            .u1 = F,
-            .u2 = rms_ch,
-        }, seq * rms_ch, 1, 1);
-        try ctx.opElt(.rms_combine, rmsp_d, null, null, rmsi_d, .{
-            .u0 = @intCast(seq),
-            .u1 = F,
-            .u2 = rms_ch,
-            .f0 = 1e-5,
-        }, seq, 1, 1);
         const mlp_shared = coop and !is_i8 and !is_bf16 and !is_nvfp4 and blk.mlp.gate.scale == blk.mlp.up.scale;
         const mlp16 = mlp_shared and ctx.pipe_coop_c16 != .null_handle;
         if (mlp_shared) {
-            try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
-                .u0 = @intCast(seq_pad * F / 2),
-                .u1 = F,
-                .u2 = mv_base + 3 * F,
-                .u3 = mv_base + 4 * F,
-                .u4 = @intCast(seq * F),
-                .f0 = blk.mlp.gate.scale,
-            }, seq_pad * F / 2, 1, 1);
+            try ctx.opRmsModSgH16(x_d, h16_d, mv_d, seq_pad, seq, F, mv_base + 3 * F, mv_base + 4 * F, 1e-5, blk.mlp.gate.scale);
             mark(io, &t_mark, &prof.elt_ns);
             ctx.independent(2);
             try ctx.opMatmulCoopH16(mg_d, h16_d, seq_pad, blk.mlp.gate.bytes, blk.mlp.gate.rows, blk.mlp.gate.cols, mlp16);
@@ -963,12 +915,7 @@ pub fn forward(
             try ctx.opMatmulCoopH16(mu_d, h16_d, seq_pad, blk.mlp.up.bytes, blk.mlp.up.rows, blk.mlp.up.cols, mlp16);
             mark(io, &t_mark, &prof.matmul_ns);
         } else {
-            try ctx.opElt(.rms_apply_mod, x_d, t1_d, mv_d, rmsi_d, .{
-                .u0 = @intCast(seq * F),
-                .u1 = F,
-                .u2 = mv_base + 3 * F,
-                .u3 = mv_base + 4 * F,
-            }, seq * F, 1, 1);
+            try ctx.opRmsModSg(x_d, t1_d, mv_d, seq, F, mv_base + 3 * F, mv_base + 4 * F, 1e-5);
             mark(io, &t_mark, &prof.elt_ns);
             if (is_i8) {
                 try ctx.opI8PrepR(t1_d, seq, F, i8_rot);
@@ -1030,23 +977,7 @@ pub fn forward(
     // Final layer on device: modulated rmsnorm then the 6144 -> 64 linear
     // (norm runs over all rows, the text-row waste is negligible next to
     // downloading 100 MB of hidden image rows for a CPU finalize).
-    try ctx.opElt(.rms_partial, x_d, null, null, rmsp_d, .{
-        .u0 = @intCast(seq * rms_ch),
-        .u1 = F,
-        .u2 = rms_ch,
-    }, seq * rms_ch, 1, 1);
-    try ctx.opElt(.rms_combine, rmsp_d, null, null, rmsi_d, .{
-        .u0 = @intCast(seq),
-        .u1 = F,
-        .u2 = rms_ch,
-        .f0 = 1e-5,
-    }, seq, 1, 1);
-    try ctx.opElt(.rms_apply_mod, x_d, t1_d, fin_d, rmsi_d, .{
-        .u0 = @intCast(seq * F),
-        .u1 = F,
-        .u2 = 0,
-        .u3 = F,
-    }, seq * F, 1, 1);
+    try ctx.opRmsModSg(x_d, t1_d, fin_d, seq, F, 0, F, 1e-5);
     mark(io, &t_mark, &prof.elt_ns);
     // imgin_d's input role is long done; it is exactly n_img x 64.
     // The offset is part of the measurement: this GEMM reads the image rows only.

@@ -7,3 +7,8 @@
 
 # Host-specific sframe-stripped CRT (see tools/patch-crt.sh)
 .zig-crt/
+
+# Opt-in marker: GPU device tests run only when this exists (see test_gate.zig).
+/testdata/gpu-tests
+# Comparison builds for an interleaved A/B (`zig build -p zig-out-<tag>`).
+/zig-out-*/

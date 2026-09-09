@@ -28,12 +28,14 @@ const usage =
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
     \\              [--seed <n>] [--greedy] [--no-think] [--reasoning-effort high|medium|low]
+    \\              [--reasoning-markers "<open>,<close>"]
     \\              [--canonical-template]
     \\              [--weight-noise <curve>] [--weight-noise-amount <a>]
     \\              [--weight-noise-seed <n>]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>] [--cpu-layers tail|attn] [--offload-grow]
+    \\              [--llm-gemm auto|grouped|mmq|dequant]
     \\              [--image <image> --mmproj <mmproj.gguf>]
     \\              [--vision-budget low|medium|high|ultra|max | <tokens>]  (gemma4v)
     \\
@@ -67,6 +69,10 @@ const usage =
     \\(the turn is primed with an empty thought so the model answers directly);
     \\--think forces it on. No effect on non-reasoning models (e.g. Gemma 3).
     \\--reasoning-effort selects K2 Horizon's high, medium, or low thought mode.
+    \\Which markers delimit a thought block is read from the model's OWN chat
+    \\template when it names a pair this build knows, and only otherwise guessed
+    \\from the architecture. --reasoning-markers overrides both, for a fine-tune
+    \\that invented its own (e.g. --reasoning-markers "<reason>,</reason>").
     \\--weight-noise perturbs the block-quant weights DURING generation: every
     \\256-weight super-block's scale is multiplied by 1 + sigma*u, u uniform in
     \\[-1,1], redrawn on every forward pass. Unlike temperature, which can only
@@ -94,6 +100,12 @@ const usage =
     \\is bit-identical. CUDA backends only, on the kernels BACKEND.md lists.
     \\--weight-noise-seed bases the stream: the same seed, curve and prompt
     \\reproduce a generation exactly, which is what makes a sweep readable.
+    \\--llm-gemm forces the kernel every batched (prefill / verify) block-quant
+    \\linear takes on the CUDA backends: grouped dp4a GEMVs, the packed-weight
+    \\MMQ tensor-core GEMM, or dequant-to-f16 GEMM. The default picks per weight
+    \\by shape and row count; this makes those crossovers measurable from one
+    \\binary. Decode (one row) is unaffected, and a weight that cannot take the
+    \\forced kernel keeps its automatic route.
     \\--canonical-template ignores the model's own embedded chat template and
     \\renders a known-good one instead: Google's upstream template for Gemma 4,
     \\froggeric's fixed template for Qwen 3.5/3.6/3.8. For finetunes and
@@ -240,6 +252,19 @@ pub fn main(init: std.process.Init) !void {
             llm.chat.setThinking(true);
         } else if (std.mem.eql(u8, a, "--no-think")) {
             llm.chat.setThinking(false);
+        } else if (std.mem.eql(u8, a, "--reasoning-markers")) {
+            const v = try nextArg(args, &i);
+            const comma = std.mem.indexOfScalar(u8, v, ',') orelse {
+                try stdout.print("--reasoning-markers: expected \"<open>,<close>\", got {s}\n", .{v});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
+            if (comma == 0 or comma + 1 == v.len) {
+                try stdout.print("--reasoning-markers: both markers must be non-empty\n", .{});
+                try stdout.flush();
+                return error.InvalidArgument;
+            }
+            llm.chat.reasoning_override = .{ .open = v[0..comma], .close = v[comma + 1 ..] };
         } else if (std.mem.eql(u8, a, "--reasoning-effort")) {
             const name = try nextArg(args, &i);
             llm.chat.setReasoningEffort(std.meta.stringToEnum(llm.chat.ReasoningEffort, name) orelse {
@@ -292,6 +317,13 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, a, "--offload-grow")) {
             dynamic_offload = true;
+        } else if (std.mem.eql(u8, a, "--llm-gemm")) {
+            const name = try nextArg(args, &i);
+            TensorPencil.models.lin_llm_cuda.force = std.meta.stringToEnum(TensorPencil.models.lin_llm_cuda.Force, name) orelse {
+                try stdout.print("unknown --llm-gemm: {s} (auto | grouped | mmq | dequant)\n", .{name});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
         } else if (std.mem.eql(u8, a, "--profile")) {
             profile = true;
         } else if (std.mem.eql(u8, a, "--backend")) {
@@ -364,9 +396,9 @@ pub fn main(init: std.process.Init) !void {
     {
         const arch = st.gguf.getStr("general.architecture") orelse "?";
         if (!llm.session.archSupportsWeightNoise(arch))
-            try stdout.print("[warn] --weight-noise is ignored: no {s} stepper publishes a per-layer sigma (only gemma4 does today)\n", .{arch})
+            try stdout.print("[warn] --weight-noise is ignored: no {s} stepper publishes a per-layer sigma (k2-horizon does not)\n", .{arch})
         else
-            try stdout.print("[warn] --weight-noise is ignored: this {s} checkpoint's linears are in a dtype with no noised kernels (q4_k/q5_k/q6_k/iq4_xs are wired; a QAT q4_0 file is not)\n", .{arch});
+            try stdout.print("[warn] --weight-noise is ignored: this {s} checkpoint's linears are in a dtype with no noised kernels (q4_0/q4_k/q5_k/q6_k/iq4_xs are wired; q8_0/q1_0/q2_0 are not)\n", .{arch});
         try stdout.flush();
     }
 
@@ -837,6 +869,9 @@ fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, to
         (llm.chat_template.ChatTemplate.fromSource(arena, src) catch null)
     else
         (llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null);
+    // What the model's own template says its thought markers are, which outranks the
+    // per-family guess (see `chat.reasoning`).
+    llm.chat.observeReasoning(if (llm.chat_template.active) |t| t.src else null);
     llm.chat_template.system_prompt = system;
     llm.chat_template.bos = if (tok.bos) |b| (tok.decodeAlloc(arena, &.{b}) catch "") else "";
     llm.chat_template.eos = if (tok.eos) |e| (tok.decodeAlloc(arena, &.{e}) catch "") else "";
@@ -1665,10 +1700,7 @@ fn runQwen35(
         else => null,
     };
     defer if (be_cuda) |be| be.deinit();
-    if (be_cuda) |be| {
-        be.profile = profile;
-        be.pinAllWeights();
-    }
+    if (be_cuda) |be| llm.session.configureCuda(be, profile);
     // Read weight bytes from the checkpoint FILE rather than faulting the
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
     llm.session.useFileReads(be_cuda, g);

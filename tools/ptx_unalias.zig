@@ -44,14 +44,21 @@ pub fn rewrite(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     var cur = try gpa.dupe(u8, out.items);
     errdefer gpa.free(cur);
     for (aliases.items) |al| {
-        const defn = try std.fmt.allocPrint(gpa, "define private ptx_kernel void {s}(", .{al.internal});
-        defer gpa.free(defn);
+        // The aliased kernel is `private` on sm_86 and `internal` on sm_89; either
+        // way it must become an ordinary external definition under the export name.
         const defn_new = try std.fmt.allocPrint(gpa, "define ptx_kernel void {s}(", .{al.exported});
         defer gpa.free(defn_new);
-        if (std.mem.indexOf(u8, cur, defn) == null) return error.KernelNotFound;
-        const a = try std.mem.replaceOwned(u8, gpa, cur, defn, defn_new);
-        gpa.free(cur);
-        cur = a;
+        var found = false;
+        for ([_][]const u8{ "private", "internal" }) |linkage| {
+            const defn = try std.fmt.allocPrint(gpa, "define {s} ptx_kernel void {s}(", .{ linkage, al.internal });
+            defer gpa.free(defn);
+            if (std.mem.indexOf(u8, cur, defn) == null) continue;
+            found = true;
+            const a = try std.mem.replaceOwned(u8, gpa, cur, defn, defn_new);
+            gpa.free(cur);
+            cur = a;
+        }
+        if (!found) return error.KernelNotFound;
         // Any remaining reference (a call, a metadata node) follows the rename.
         const b = try std.mem.replaceOwned(u8, gpa, cur, al.internal, al.exported);
         gpa.free(cur);
@@ -103,6 +110,13 @@ test "alias to a kernel becomes a renamed definition" {
         \\
     ;
     try std.testing.expectEqualStrings(want, got);
+}
+
+test "an internal kernel (sm_89 IR) is renamed like a private one" {
+    const src = "@x = alias void (), ptr @m.k\ndefine internal ptx_kernel void @m.k() {\n  ret void\n}\n";
+    const got = try rewrite(std.testing.allocator, src);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("define ptx_kernel void @x() {\n  ret void\n}\n", got);
 }
 
 test "two exports of one kernel is an error" {

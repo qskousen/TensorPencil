@@ -1,16 +1,22 @@
 - gpu: `kernels/dual.zig` holds every elementwise kernel, every dequantizer and the row
   reductions for both GPU arms. Still per backend: the block-quant GEMVs (CUDA warp-per-row
   dp4a/f16 kernels, Vulkan `_t`/`_sg` kernels), attention, GEMMs. A shared subgroup-per-row
-  GEMV over the RAW ggml layout would give Vulkan decode kernels for q4_0/iq4_xs/q1_0/q2_0
-  (today they run through the dequant GEMM at <1 tok/s) and replace both arms' scalar
-  fallbacks; the dp4a/MMQ fast paths stay hand-tuned. Shared memory stays out until
+  GEMV over the RAW ggml layout would replace both arms' scalar fallbacks; the dp4a/MMQ fast
+  paths stay hand-tuned. The Vulkan half of that is done as five hand kernels in
+  `kernels/subgroup.zig` (q4_0/iq4_xs/q1_0/q2_0 now decode there instead of dequantizing the
+  whole weight per token); putting them in `dual/` instead would cost the CUDA arm PTX-JIT
+  time for kernels it never calls, which is why they are not there. Shared memory stays out until
   Zig-emitted workgroup memory stops hanging NVIDIA on Vulkan; that is also what keeps
   `qk_rmsnorm_par` alive for the one-row decode norm
-- gpu: the Vulkan 3-pass rmsnorm (`rms_partial`/`rms_combine`/`rms_apply_w`, qwen3_gpu
-  `normWide`, dit_gpu) can now call the shared `.rmsnorm` / `.rms_mod` row kernels directly;
-  one launch instead of three, same result
-- gpu: `dual_ptx` hardcodes sm_86 / ptx80 in build.zig, like the hand kernels' headers;
-  a second GPU generation needs both parameterized together
+- gpu: the DiT's norms are one fused row kernel each (`rms_mod` / `rms_mod_h16`), but the
+  LLM's `normWide` stays on the 3-pass chain, MEASURED: at the decode's one row a
+  subgroup-per-row kernel is 32 lanes on one multiprocessor and costs 6% of decode
+  (30.9 -> 29.0 tok/s, 8B q8_0). A row kernel that splits a wide row across subgroups
+  needs a cross-subgroup reduce, which is the workgroup memory Vulkan cannot have here
+- gpu: `dual_ptx` builds for one CUDA generation at a time; `-Dcuda-sm` / `-Dptx-isa`
+  now set it for every PTX module at once. Untested past sm_86: only the ISA header and
+  the lowering flags are parameterized, and a kernel using an instruction the older
+  target lacks would still be written by hand
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - gui: studio (image_view) still uses its own form layout; bring the parameter form onto the shared chip/section primitives
@@ -29,14 +35,17 @@
 - even a tiny bit of offloading of gemma4 31b is extremely slow
 - diffusion model weights are "bouncing" during steps, vram-wise
 - there's no good visiblity of "how much of the model is in vram" for either side
-- llm weight noise (`--weight-noise`, BACKEND.md 6) covers gemma4's q4_k/q5_k/q6_k
-  GEMVs and the q4_k-family MMQ pipe. Unwired: every other arch's stepper (only
-  `gemma4_cuda` declares `noiseAtLayer`), q4_0 (so the Gemma 4 12B QAT files get
-  nothing), the q6_k/q8_0/q1_0/q2_0 MMQ pipes, the dequant-to-f16 fallback, and the
-  fp8/bf16/int8-convrot GEMMs. No longer SILENT — the GUI hides the controls and
-  the CLI warns, both off `llm.session.weightNoiseSupported` — but the coverage gap
-  is the real fix. q4_0 is the cheapest next one: `gemv_q4_0_q8n` / `gemv_q4_0`
-  take the same `%rd10`/`%rd1` snippet as the k-quants
+- llm weight noise (`--weight-noise`, BACKEND.md 6) now reaches every block-quant GEMV and
+  every MMQ pipe, on the gemma3, gemma4, qwen3 (and llama) and qwen35 steppers. Still
+  unwired: k2-horizon's stepper, the dequant-to-f16 fallback (the batched route for q4_0
+  and iq4_nl), `opGemvQuantQ8Batch`, and the fp8/bf16/int8-convrot GEMMs
+- llm weight noise: ⚠️ injecting the jitter into a hand-PTX kernel by CONCATENATION lands
+  it on whatever line the string ended on, and a Zig multiline literal's last line carries
+  no newline — so a kernel whose last line ended in a `//` comment silently swallowed the
+  `ld.param` of sigma, leaving it uninitialized (read as 0 = noise off) with no error
+  anywhere. `every injected weight-noise statement starts its own line` now fails on it.
+  That test also found that `cuda/elt.zig`'s tests had NEVER run: nothing in the module
+  tree referenced the file, so its two PTX guard tests were dead
 - llm weight noise: the interesting use is not diversity but UNCERTAINTY. Sample
   one token k times under independent perturbations: a lead that survives is
   redundantly encoded (the model knows it), one that flips is riding a few fragile
@@ -58,26 +67,17 @@
 - llm prefill: q6_k's MMQ pipe is correct but measures ~1.0x against dequant+f16, so
   `mmqPipeFaster` leaves it off. It is the only k-quant still on the f16 route. Worth
   retrying with PLAIN s8 staging, the lever that took q5_k/iq4_xs from ~32 to ~68 TOPS
-- llm: reasoning markers come from `chat.reasoningFor(family)`, a static guess per
-  family. A fine-tune that emits different markers than its base is mis-split
-  LIVE, not just on reload. The real source is the model's own chat template;
-  the open marker could be observed from the rendered generation prompt (where
-  `recordThoughtPrimed` already looks), the close marker cannot, so this likely
-  needs an explicit per-model override to be correct
+- llm: reasoning markers are now read from the model's own chat template
+  (`chat.observeReasoning`, both halves of a pair or nothing) and `tp-llm
+  --reasoning-markers` overrides them. Two gaps left: a fine-tune whose markers are
+  in NEITHER `known_reasoning` nor the flag still falls back to the family guess,
+  and tp-gui has no override field, so a GUI user cannot answer for such a model
 - gui: a transcript does not record the system prompt it was generated under, so
   reloading replays an old conversation under current settings (e.g. with or
   without the image-tool description). Same class as the markers were
 - gui: replaying a conversation into a DIFFERENT model feeds the old model's
   reasoning markup in as literal content; real chat templates vary in whether
   they keep prior reasoning at all (Qwen's drops it)
-- llm decode: iq4_xs has no dp4a GEMV (`quantQ8NSupported` excludes it), so gemma3 12B
-  IQ4_XS decodes at 28 tok/s against Q4_K_M's 58 through the same dispatcher. A
-  `gemv_iq4_xs_q8n` twin of `gemv_q4_k_q8n` closes it for every arch at once
-- llm vulkan: `check` runs without a device in tests only through `quantKernel`/`wcode`;
-  `routeOf` needs a Context for the knob reads
-- llm: a `--llm-gemm` knob mirroring `--dit-gguf-gemm` (force grouped / MMQ / dequant
-  per run) would make the dispatcher's crossovers measurable from one binary;
-  `grouped_max = 40` is a 3090 number from qgemv-bench
 - h3 text encoder: the 50-layer encode streams all 23 GB every prompt (2.4 s) because the
   weight cache is LRU and a sequential walk larger than the cache evicts each layer just
   before its next use. Keeping the first ~25 layers resident across prompts (a pin

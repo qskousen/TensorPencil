@@ -17,6 +17,7 @@ pub const cu = @import("cuda/cu.zig");
 pub const ptx = @import("cuda/ptx.zig");
 pub const kernels = @import("cuda/kernels.zig");
 pub const elt = @import("cuda/elt.zig");
+pub const wnoise = @import("cuda/wnoise.zig");
 pub const context = @import("cuda/context.zig");
 pub const Context = context.Context;
 pub const Buffer = context.Buffer;
@@ -32,6 +33,10 @@ test {
     _ = cu;
     _ = ptx;
     _ = kernels;
+    // `elt` and `wnoise` hold PURE tests (the PTX kernel strings and the noise
+    // hash), and a file whose tests nothing references does not run at all.
+    _ = elt;
+    _ = wnoise;
     _ = context;
     _ = backend;
     _ = cublaslt;

@@ -128,6 +128,32 @@ pub inline fn rmsMod(e: Env) void {
     }
 }
 
+/// `rmsMod` writing f16 pairs scaled by f0, for a GEMM that reads half precision.
+/// Rows at or past u5 are real padding (a tile-aligned batch), so they are zeroed
+/// rather than normalized: their input is uninitialized and an rms over it would
+/// be an inf. b = out words, dim even. u0 = rows, u1 = dim, u2 = premul offset,
+/// u3 = shift offset, u5 = real rows, f0 = eps, f1 = scale.
+pub inline fn rmsModH16(e: Env) void {
+    const r = Rows(e);
+    const dim = e.u(1);
+    var row = r.row;
+    while (row < e.u(0)) : (row += r.step) {
+        const base = row * dim;
+        if (row >= e.u(5)) {
+            var z = r.lane * 2;
+            while (z < dim) : (z += r.lanes * 2) e.stW(.b, (base + z) >> 1, 0);
+            continue;
+        }
+        const inv = rmsInv(e, r, base, dim);
+        var i = r.lane * 2;
+        while (i < dim) : (i += r.lanes * 2) {
+            const lo = (e.ld(.a, base + i) * inv * e.ld(.c, e.u(2) + i) + e.ld(.c, e.u(3) + i)) * e.f(1);
+            const hi = (e.ld(.a, base + i + 1) * inv * e.ld(.c, e.u(2) + i + 1) + e.ld(.c, e.u(3) + i + 1)) * e.f(1);
+            e.stW(.b, (base + i) >> 1, k.packH16(lo, hi));
+        }
+    }
+}
+
 /// Two-pass mean and inverse deviation of a row (deviation-based variance, since
 /// the shifted E[x^2]-E[x]^2 form cancels once the mean is large).
 inline fn lnStats(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: bool) [2]f32 {

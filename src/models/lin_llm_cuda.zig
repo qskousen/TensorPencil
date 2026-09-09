@@ -83,6 +83,13 @@ pub const dense_grouped_max = spec_limits.max_draft + 1;
 /// decode: the two differ only by the q8_1 activation quantization.
 pub var decode_dp4a: bool = true;
 
+/// DIAGNOSTIC: force the batched (`m > 1`) block-quant route, so the dispatcher's
+/// crossovers (`grouped_max`, `mmqPipeFaster`) are measurable from one binary
+/// (`tp-llm --llm-gemm`). A forced route a weight cannot take, by dtype or by
+/// shape, falls back to the automatic choice; `check` still answers for `auto`.
+pub const Force = enum { auto, grouped, mmq, dequant };
+pub var force: Force = .auto;
+
 /// Whether the dp4a kernels can tile this weight: 256-column groups, rows in warps of 8.
 fn dp4aShape(w: Weight) bool {
     return w.cols % 256 == 0 and w.rows % 8 == 0;
@@ -143,6 +150,15 @@ fn blockQRoute(w: Weight, m: usize) ?Route {
     // A weight the GEMM tiles cannot take (a router's expert count, a GDN gate's head
     // count, an odd vocab) is a GEMV question at any m.
     const skinny = !gemmShape(w);
+    switch (force) {
+        .auto => {},
+        .grouped => {
+            if (dp4a and Backend.quantQ8BatchSupported(dt)) return .gemv_q8batch;
+            if (dp4a and Backend.quantQ8NSupported(dt)) return .gemv_q8n;
+        },
+        .mmq => if (!skinny and Backend.mmqPipeSupported(dt, w.rows, w.cols)) return .gemm_mmq,
+        .dequant => if (!skinny) return .gemm_q16,
+    }
     if (dp4a and Backend.quantQ8BatchSupported(dt) and (skinny or m <= grouped_max)) return .gemv_q8batch;
     if (dp4a and Backend.quantQ8NSupported(dt) and (skinny or m <= grouped_max)) return .gemv_q8n;
     if (skinny) return if (w.cols <= 32768) .gemv_q else null;
@@ -343,6 +359,7 @@ test "block quants route by row count: dp4a decode, grouped small batches, MMQ o
     const q6 = fake(.q6_k, 4096, 4096);
     try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(q4, 1));
     try std.testing.expectEqual(@as(?Route, .gemv_q8), routeOf(q6, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(fake(.iq4_xs, 4096, 4096), 1));
     try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(q4, 8));
     try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(q6, grouped_max));
     try std.testing.expectEqual(@as(?Route, .gemm_mmq), routeOf(q4, grouped_max + 1));
@@ -352,6 +369,27 @@ test "block quants route by row count: dp4a decode, grouped small batches, MMQ o
     decode_dp4a = false;
     try std.testing.expectEqual(@as(?Route, .gemv_q), routeOf(q4, 1));
     try std.testing.expectEqual(@as(?Route, .gemv_q), routeOf(q6, 1));
+}
+
+test "--llm-gemm forces the batched route where the weight can take it" {
+    const saved = force;
+    defer force = saved;
+    const q4 = fake(.q4_k, 4096, 4096);
+    const q6 = fake(.q6_k, 4096, 4096);
+    force = .grouped;
+    try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(q4, 512));
+    try std.testing.expectEqual(@as(?Route, .gemv_q8batch), routeOf(fake(.q1_0, 4096, 4096), 512));
+    force = .mmq;
+    try std.testing.expectEqual(@as(?Route, .gemm_mmq), routeOf(q4, 8));
+    // q6_k has a pipe kernel that `mmqPipeFaster` leaves off; forcing reaches it.
+    try std.testing.expectEqual(@as(?Route, .gemm_mmq), routeOf(q6, 256));
+    force = .dequant;
+    try std.testing.expectEqual(@as(?Route, .gemm_q16), routeOf(q4, 8));
+    // Decode and a skinny weight are untouched by the knob.
+    try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(q4, 1));
+    try std.testing.expectEqual(@as(?Route, .gemv_q8n), routeOf(fake(.q8_0, 320, 4096), 512));
+    force = .auto;
+    try std.testing.expectEqual(@as(?Route, .gemm_mmq), routeOf(q4, 512));
 }
 
 test "a weight the GEMM tiles cannot take is a GEMV at every row count" {

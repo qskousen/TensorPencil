@@ -221,6 +221,7 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
+        be.weight_noise.setDepth(cfg.n_layers);
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
@@ -978,7 +979,9 @@ pub const CudaLM = struct {
         // pressure) means device weight pointers are not stable, and a
         // captured graph would replay against freed buffers.
         if (be.evictions != 0) self.graph_ok = false;
-        if (ids_new.len == 1 and self.graph_ok and !be.profile and self.decode_warm) {
+        // A captured graph freezes the noise key and sigma in its kernel parameters,
+        // so every replay would draw the same perturbation.
+        if (ids_new.len == 1 and self.graph_ok and !be.profile and !be.weight_noise.on() and self.decode_warm) {
             try self.stepDecodeGraph(ids_new[0]);
         } else {
             if (ids_new.len > 1) try self.prefill(ids_new[0 .. ids_new.len - 1]);
@@ -1120,6 +1123,8 @@ pub const CudaLM = struct {
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
         try be.tensorUpload(offsetBufSized(self.pos3s_d, 0, n * 3 * 4), std.mem.sliceAsBytes(pos3s));
 
+        // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
+        be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
 
@@ -1134,6 +1139,7 @@ pub const CudaLM = struct {
         const ctok = ops.cancel.token;
         for (self.lm.layers, 0..) |*layer, l| {
             if (ops.cancel.canceled(ctok)) return error.Canceled;
+            self.noiseAtLayer(l);
             if (self.split) |*sp| {
                 if (!sp.on_gpu[l]) {
                     if (!sp.on_host) {
@@ -1396,6 +1402,7 @@ pub const CudaLM = struct {
         try be.tensorUpload(offsetBufSized(self.bufs.x, 0, self.cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
         try be.tensorUpload(self.pos3_d, std.mem.sliceAsBytes(&pos3));
 
+        be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
         try self.decodeBody(false, want_logits);
@@ -1422,6 +1429,7 @@ pub const CudaLM = struct {
         if (self.split) |*sp| sp.on_host = false;
 
         for (self.lm.layers, 0..) |*layer, l| {
+            self.noiseAtLayer(l);
             if (self.split) |*sp| {
                 if (!sp.on_gpu[l]) {
                     if (!sp.on_host) {
@@ -1545,8 +1553,16 @@ pub const CudaLM = struct {
 
         if (want_logits) {
             try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), 1, cfg.hidden, eps);
+            be.weight_noise.atHead();
             try lin_cuda.linear(be, b.logits, b.t, 1, self.lm.head);
         }
+    }
+
+    /// Which layer the coming launches belong to, for the weight-noise curve. This
+    /// stepper walks its own layer loops (the GDN layers are not a
+    /// `transformer_gpu.decoderLayer`), so it calls this itself.
+    pub fn noiseAtLayer(self: *CudaLM, l: usize) void {
+        self.be.weight_noise.atLayer(l);
     }
 
     /// Single-token decode as one captured-graph replay: {token, len} land
