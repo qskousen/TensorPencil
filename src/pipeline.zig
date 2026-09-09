@@ -1618,17 +1618,17 @@ pub const Container = union(enum) {
     }
 
     pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Container {
-        var magic: [4]u8 = undefined;
-        {
-            const f = try dir.openFile(io, path, .{ .mode = .read_only });
-            defer f.close(io);
-            const n = try f.readPositionalAll(io, &magic, 0);
-            if (n < magic.len) return error.CheckpointTooSmall;
-        }
-        if (std.mem.eql(u8, &magic, "GGUF")) {
-            return .{ .gguf = try gguf_mod.Gguf.openIn(gpa, io, dir, path) };
-        }
+        if (try isGgufIn(io, dir, path)) return .{ .gguf = try gguf_mod.Gguf.openIn(gpa, io, dir, path) };
         return .{ .safetensors = try safetensors.SafeTensors.openIn(gpa, io, dir, path) };
+    }
+
+    fn isGgufIn(io: std.Io, dir: std.Io.Dir, path: []const u8) !bool {
+        var magic: [4]u8 = undefined;
+        const f = try dir.openFile(io, path, .{ .mode = .read_only });
+        defer f.close(io);
+        const n = try f.readPositionalAll(io, &magic, 0);
+        if (n < magic.len) return error.CheckpointTooSmall;
+        return std.mem.eql(u8, &magic, "GGUF");
     }
 
     pub fn deinit(self: *Container) void {
@@ -1649,11 +1649,23 @@ pub const Container = union(enum) {
     }
 
     /// Tensor-data bytes, what the VRAM pinning policy sizes itself against.
+    /// Declared, not mapped, so it is right on a header-only open too.
     pub fn payloadLen(self: *const Container) usize {
         return switch (self.*) {
-            .safetensors => |*st| st.payload.len,
-            .gguf => |*g| g.payload.len,
+            .safetensors => |*st| st.payload_len,
+            .gguf => |*g| g.payload_len,
         };
+    }
+
+    /// `open`, but reading only the header: what a folder scan uses (see
+    /// `SafeTensors.openHeader`). Tensors have shapes and dtypes and no bytes.
+    pub fn openHeader(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
+        return openHeaderIn(gpa, io, std.Io.Dir.cwd(), path);
+    }
+
+    pub fn openHeaderIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Container {
+        if (try isGgufIn(io, dir, path)) return .{ .gguf = try gguf_mod.Gguf.openHeaderIn(gpa, io, dir, path) };
+        return .{ .safetensors = try safetensors.SafeTensors.openHeaderIn(gpa, io, dir, path) };
     }
 };
 

@@ -99,17 +99,110 @@ const Spec = struct {
 /// one spelling, reported the file as carrying no conditioner, the GUI refusing a
 /// file the engine could open. One table, one answer.
 pub fn storeHas(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
-    const s = pipeline.componentSpec(fam, comp) catch return false;
+    return probeView(store, fam, comp) != null;
+}
+
+/// The probe tensor that says `store` carries `comp` for `fam`, so a caller can
+/// read its shape. Same table and order as `storeHas`.
+pub fn probeView(store: tp.weights.WeightStore, fam: Family, comp: Component) ?tp.weights.TensorView {
+    const s = pipeline.componentSpec(fam, comp) catch return null;
     for (s.prefixes) |pfx| {
         for (s.probes) |probe| {
             var buf: [256]u8 = undefined;
             if (pfx.len + probe.len > buf.len) continue;
             @memcpy(buf[0..pfx.len], pfx);
             @memcpy(buf[pfx.len..][0..probe.len], probe);
-            if (store.get(buf[0 .. pfx.len + probe.len]) != null) return true;
+            if (store.get(buf[0 .. pfx.len + probe.len])) |v| return v;
         }
     }
-    return false;
+    return null;
+}
+
+/// Whether a file that answers `probeView` for (`fam`, `comp`) is the RIGHT one
+/// for it, which the probe alone cannot say: Z-Image's Qwen3-4B encoder and
+/// Anima's Qwen3-0.6B share `model.embed_tokens.weight`, and the SD family's
+/// 4-channel KL VAE shares `decoder.conv_in.weight` with Z-Image's 16-channel
+/// Flux VAE. Each width is read off the engine's own config for that family, so
+/// this cannot disagree with what the loader will then demand.
+///
+/// True for a probe with no width to check (the Wan VAE serves Krea2 and Anima
+/// alike; H3's audio VAE has one shape).
+pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) bool {
+    const dims = view.info.shape.slice();
+    const models = tp.models;
+    return switch (comp) {
+        // Embedding tables are [vocab][hidden]; CLIP's probe is a norm, [hidden].
+        .conditioner => switch (fam) {
+            .krea2 => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
+            .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
+            .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
+            .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
+            .sd15, .sdxl => dims.len == 1 and dims[0] == models.clip_text.clip_l.hidden,
+        },
+        .conditioner2 => switch (fam) {
+            .sdxl => dims.len == 1 and dims[0] == models.clip_text.clip_g.hidden,
+            else => true,
+        },
+        // `decoder.conv_in.weight` is [inner][z][3][3]; the Wan probe has one shape.
+        .decoder => switch (fam) {
+            .sd15 => dims.len == 4 and dims[1] == models.sd_vae.sd15.z_channels,
+            .sdxl => dims.len == 4 and dims[1] == models.sd_vae.sdxl.z_channels,
+            .zimage => dims.len == 4 and dims[1] == models.sd_vae.flux.z_channels,
+            .krea2, .anima, .minimax_h3 => true,
+        },
+        .decoder2, .denoiser => true,
+    };
+}
+
+/// The file carries the component, it is the right width for `fam`, and for a
+/// Qwen3-based encoder it has EXACTLY the depth the family's loader will demand.
+/// Width alone is not enough there: every 5120-wide chat model would pass as
+/// H3's encoder, and the loader then fails on the 50th layer of a 64-layer file.
+/// Depth is read off the last layer's norm, which exists at every width and
+/// container, and the one past it, which must not.
+pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
+    const v = probeView(store, fam, comp) orelse return false;
+    if (!componentFits(v, fam, comp)) return false;
+    if (comp != .conditioner) return true;
+    const cfg = encoderConfig(fam) orelse return true;
+    // The probe is `<root>embed_tokens.weight`; layers sit beside it.
+    const suffix = "embed_tokens.weight";
+    const name = v.info.name;
+    if (!std.mem.endsWith(u8, name, suffix)) return false;
+    const root = name[0 .. name.len - suffix.len];
+    return layerNormExists(store, root, cfg.n_layers - 1) and !layerNormExists(store, root, cfg.n_layers);
+}
+
+fn layerNormExists(store: tp.weights.WeightStore, root: []const u8, layer: usize) bool {
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}layers.{d}.input_layernorm.weight", .{ root, layer }) catch return false;
+    return store.get(name) != null;
+}
+
+/// The Qwen3 configuration a family's text encoder is loaded with, null for the
+/// CLIP families. Read from the engine so a retrained encoder moves both.
+fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
+    const C = tp.models.qwen3.Config;
+    return switch (fam) {
+        .krea2 => C.vl_4b,
+        .zimage => C.qwen3_4b,
+        .anima => C.qwen3_0_6b,
+        .minimax_h3 => C.qwen3vl_32b_h3,
+        .sd15, .sdxl => null,
+    };
+}
+
+/// The tensor that says a file is the TAEHV (`taew2_1`) approx-VAE the preview
+/// ladder can load, and the families whose latent it decodes. Mirrors the
+/// `taehv_ok` test in the pipeline: a 16-channel Wan latent, which Krea2 and
+/// Anima share and Z-Image, a Flux latent of the same width, does not.
+pub const taehv_probe = "decoder.1.weight";
+
+pub fn previewFits(store: tp.weights.WeightStore, fam: Family) bool {
+    const v = store.get(taehv_probe) orelse return false;
+    const dims = v.info.shape.slice();
+    if (!(dims.len == 4 and dims[1] == tp.models.taehv.latent_channels)) return false;
+    return fam == .krea2 or fam == .anima;
 }
 
 /// Everything `fam` could contribute, from one open store.
@@ -130,6 +223,9 @@ pub fn scan(store: tp.weights.WeightStore, fam: Family) Contents {
 pub const Traits = struct {
     /// Name for the settings/status UI.
     label: []const u8,
+    /// The name a menu or chip uses ("Krea 2"): the architecture alone, no
+    /// explanation, because it sits next to a file name that is already long.
+    short: []const u8,
     /// Backends the engine has kernels for.
     ///
     /// Every family now runs on all four. The field exists because each new
@@ -171,6 +267,7 @@ pub fn traits(fam: Family) Traits {
     return switch (fam) {
         .krea2 => .{
             .label = "krea2 (flow-matching DiT)",
+            .short = "Krea 2",
             .backends = &all_backends,
             .width = 1024,
             .height = 1024,
@@ -182,6 +279,7 @@ pub fn traits(fam: Family) Traits {
         //
         .zimage => .{
             .label = "Z-Image (NextDiT)",
+            .short = "Z-Image",
             .backends = &all_backends,
             .width = 1024,
             .height = 1024,
@@ -192,6 +290,7 @@ pub fn traits(fam: Family) Traits {
         // euler + `simple`.
         .anima => .{
             .label = "Anima (Cosmos MiniTrainDIT + LLM adapter)",
+            .short = "Anima",
             .backends = &all_backends,
             .width = 1024,
             .height = 1024,
@@ -208,6 +307,7 @@ pub fn traits(fam: Family) Traits {
         // upstream source; the 4-step turbo LoRA is the intended fast path.
         .minimax_h3 => .{
             .label = "MiniMax H3 (joint audio-video DiT)",
+            .short = "MiniMax H3",
             // CPU only until the trunk exists at all, let alone its GPU twins.
             // Offering a device with no kernels reads as a hang, not a fallback.
             .backends = &.{.cpu},
@@ -220,6 +320,7 @@ pub fn traits(fam: Family) Traits {
         },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
+            .short = "SD 1.5",
             .backends = &all_backends,
             .width = 512,
             .height = 512,
@@ -231,6 +332,7 @@ pub fn traits(fam: Family) Traits {
         // knows it is being asked for a small image and renders like it.
         .sdxl => .{
             .label = "SDXL (UNet, dual CLIP)",
+            .short = "SDXL",
             .backends = &all_backends,
             .dual_conditioner = true,
             .width = 1024,
@@ -370,8 +472,10 @@ pub const Cache = struct {
 /// non-null means "scan against this family" (a side file).
 fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: ?Family) Probe {
     // Opens by MAGIC, so a GGUF denoiser works here exactly as it does in the
-    // pipeline, the GUI never has to care which container a file uses.
-    var c = pipeline.Container.open(gpa, io, path) catch |err| return .{ .failed = err };
+    // pipeline, the GUI never has to care which container a file uses. Header
+    // only: a probe answers from names and shapes, and mapping a 14 GB DiT to
+    // draw a settings line pulled the whole file through the page cache.
+    var c = pipeline.Container.openHeader(gpa, io, path) catch |err| return .{ .failed = err };
     defer c.deinit();
     const store = c.store();
     const family = fam orelse (pipeline.detectFamily(store) catch |err| return .{ .failed = err });
@@ -423,6 +527,7 @@ test "traits: each family has a label, a resolution and a positive step count" {
     inline for (@typeInfo(Family).@"enum".fields) |f| {
         const t = traits(@enumFromInt(f.value));
         try std.testing.expect(t.label.len > 0);
+        try std.testing.expect(t.short.len > 0 and t.short.len < t.label.len);
         try std.testing.expect(t.width > 0 and t.height > 0);
         try std.testing.expect(t.steps > 0);
         try std.testing.expect(t.cfg >= 1.0);
@@ -546,6 +651,38 @@ test "the GUI sees a GGUF text encoder as carrying a conditioner" {
     defer g.deinit();
     try std.testing.expect(storeHas(.{ .gguf = &g }, .zimage, .conditioner));
     try std.testing.expect(storeHas(.{ .gguf = &g }, .krea2, .conditioner));
+}
+
+fn viewOf(dims: []const usize) tp.weights.TensorView {
+    return .{
+        .info = .{ .name = "t", .dtype = .f32, .shape = tp.tensor.Shape.init(dims), .start = 0, .end = 0 },
+        .bytes = &.{},
+    };
+}
+
+test "componentFits tells the two Qwen3 encoders and the two KL VAEs apart" {
+    // The same probe name answers for all of these; only the width says which.
+    const q4b = viewOf(&.{ 151936, 2560 });
+    const q06b = viewOf(&.{ 151936, 1024 });
+    try std.testing.expect(componentFits(q4b, .zimage, .conditioner));
+    try std.testing.expect(!componentFits(q4b, .anima, .conditioner));
+    try std.testing.expect(componentFits(q06b, .anima, .conditioner));
+    try std.testing.expect(!componentFits(q06b, .zimage, .conditioner));
+    try std.testing.expect(componentFits(q4b, .krea2, .conditioner));
+
+    const kl4 = viewOf(&.{ 512, 4, 3, 3 });
+    const kl16 = viewOf(&.{ 512, 16, 3, 3 });
+    try std.testing.expect(componentFits(kl4, .sd15, .decoder));
+    try std.testing.expect(componentFits(kl4, .sdxl, .decoder));
+    try std.testing.expect(!componentFits(kl4, .zimage, .decoder));
+    try std.testing.expect(componentFits(kl16, .zimage, .decoder));
+    try std.testing.expect(!componentFits(kl16, .sd15, .decoder));
+
+    // CLIP-L and CLIP-G norms.
+    try std.testing.expect(componentFits(viewOf(&.{768}), .sd15, .conditioner));
+    try std.testing.expect(!componentFits(viewOf(&.{1280}), .sd15, .conditioner));
+    try std.testing.expect(componentFits(viewOf(&.{1280}), .sdxl, .conditioner2));
+    try std.testing.expect(!componentFits(viewOf(&.{768}), .sdxl, .conditioner2));
 }
 
 test "Contents.has covers every component" {

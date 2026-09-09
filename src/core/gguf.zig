@@ -225,8 +225,15 @@ pub const Gguf = struct {
     file: ?std.Io.File = null,
     /// The `Io` `file` was opened with; needed to read and to close it.
     io: ?std.Io = null,
-    /// Tensor data section (file bytes from the aligned data offset).
+    /// Tensor data section (file bytes from the aligned data offset). Empty on
+    /// a header-only open, where `payload_len` still says how long it is.
     payload: []const u8,
+    /// Declared data-section length. Equals `payload.len` except on a
+    /// header-only open.
+    payload_len: usize,
+    /// Opened with `openHeader`: metadata, names, shapes and dtypes are all
+    /// present, but no tensor has bytes (`get` returns an empty slice).
+    header_only: bool = false,
     /// Canonical tensor name -> info, in file order.
     index: std.StringArrayHashMapUnmanaged(TensorInfo),
     /// Metadata key -> value, in file order. Keys/strings point into the
@@ -278,8 +285,56 @@ pub const Gguf = struct {
 
     /// Parse from a caller-owned buffer (tests). Must outlive the Gguf.
     pub fn initFromSlice(gpa: std.mem.Allocator, data: []const u8) ParseError!Gguf {
+        return parse(gpa, data, null);
+    }
+
+    /// Open only the header (metadata plus tensor table), see
+    /// `SafeTensors.openHeader` for why a folder scan needs this. The table is
+    /// validated against the file's length exactly as `open` validates it.
+    pub fn openHeader(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Gguf {
+        return openHeaderIn(gpa, io, std.Io.Dir.cwd(), path);
+    }
+
+    pub fn openHeaderIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Gguf {
+        return openHeaderChunked(gpa, io, dir, path, 1 << 20);
+    }
+
+    /// The header's length is only known once the tensor table has been read, so
+    /// this reads `first_chunk` bytes and doubles until the parse stops running
+    /// off the end. A header that is genuinely malformed is told from a short
+    /// read by having the whole file in hand.
+    pub fn openHeaderChunked(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, first_chunk: usize) !Gguf {
+        const file = try dir.openFile(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+        const len: usize = @intCast(try file.length(io));
+        if (len < 24) return error.FileTooSmall;
+        var want: usize = @max(first_chunk, 24);
+        while (true) {
+            const n = @min(want, len, max_header_bytes);
+            const buf = try gpa.alloc(u8, n);
+            errdefer gpa.free(buf);
+            if (try file.readPositionalAll(io, buf, 0) != n) return error.ShortRead;
+            if (parse(gpa, buf, len)) |g| {
+                var out = g;
+                out.owned = buf;
+                return out;
+            } else |err| {
+                if (err != error.InvalidHeader or n >= len or n >= max_header_bytes) return err;
+            }
+            gpa.free(buf);
+            want = n * 2;
+        }
+    }
+
+    /// Largest header a chunked open will read before calling the file malformed.
+    const max_header_bytes: usize = 256 << 20;
+
+    /// `file_len` non-null means header-only: `data` holds at least the header,
+    /// the tensor table is checked against `file_len`, and no payload is kept.
+    fn parse(gpa: std.mem.Allocator, data: []const u8, file_len: ?usize) ParseError!Gguf {
         if (data.len < 24) return error.FileTooSmall;
         if (!std.mem.eql(u8, data[0..4], "GGUF")) return error.InvalidMagic;
+        const total = file_len orelse data.len;
 
         var r = Reader{ .data = data, .pos = 4 };
         const version = try r.int(u32);
@@ -288,7 +343,7 @@ pub const Gguf = struct {
         const n_kv = try r.int(u64);
         // A tensor entry is at least 24 bytes, a kv at least 12: cheap sanity
         // bound before trusting the counts.
-        if (n_tensors > data.len / 24 or n_kv > data.len / 12) return error.InvalidHeader;
+        if (n_tensors > total / 24 or n_kv > total / 12) return error.InvalidHeader;
 
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -342,10 +397,10 @@ pub const Gguf = struct {
                 if (tid == 42) any_q2_0 = true;
             }
             const ds = std.mem.alignForward(usize, r.pos, alignment);
-            if (ds > r.data.len) return error.InvalidOffsets;
+            if (ds > total) return error.InvalidOffsets;
             r.pos = table_start; // rewind for the real pass below
             if (!any_q2_0) break :blk .q2_0_g128; // unused; no tensor references it
-            break :blk try detectQ2_0Variant(alloc, spans, alignment, r.data.len - ds);
+            break :blk try detectQ2_0Variant(alloc, spans, alignment, total - ds);
         };
 
         // Tensor table: canonicalize names, reverse dims, validate spans
@@ -431,15 +486,16 @@ pub const Gguf = struct {
 
         // Data section starts at the next alignment boundary after the table.
         const data_start = std.mem.alignForward(usize, r.pos, alignment);
-        if (data_start > data.len) return error.InvalidOffsets;
-        const payload = data[data_start..];
+        if (data_start > total) return error.InvalidOffsets;
+        const payload_len = total - data_start;
+        const payload: []const u8 = if (file_len == null) data[data_start..] else &.{};
 
         var index: std.StringArrayHashMapUnmanaged(TensorInfo) = .empty;
         try index.ensureTotalCapacity(alloc, raw_infos.len);
         for (raw_infos) |ri| {
             const n_elems = ri.shape.count();
             const nbytes = ri.dt.storageBytes(n_elems);
-            if (ri.offset > payload.len or payload.len - ri.offset < nbytes) return error.InvalidOffsets;
+            if (ri.offset > payload_len or payload_len - ri.offset < nbytes) return error.InvalidOffsets;
             const slot = index.getOrPutAssumeCapacity(ri.name);
             if (slot.found_existing) return error.DuplicateTensor;
             slot.value_ptr.* = .{
@@ -455,6 +511,8 @@ pub const Gguf = struct {
         return .{
             .mapping = null,
             .payload = payload,
+            .payload_len = payload_len,
+            .header_only = file_len != null,
             .index = index,
             .kv = kv,
             .alignment = alignment,
@@ -513,7 +571,7 @@ pub const Gguf = struct {
 
     pub fn get(self: *const Gguf, name: []const u8) ?TensorView {
         const info = self.index.get(name) orelse return null;
-        return .{ .info = info, .bytes = self.payload[info.start..info.end] };
+        return .{ .info = info, .bytes = if (self.header_only) &.{} else self.payload[info.start..info.end] };
     }
 
     /// Like `get`, but a missing tensor is an error, for required weights.
@@ -879,6 +937,37 @@ test "a q2_0 file whose geometry fits neither variant is refused, not guessed" {
     defer gpa.free(file);
 
     try std.testing.expectError(error.AmbiguousQ2_0Variant, Gguf.initFromSlice(gpa, file));
+}
+
+test "openHeader grows past a short first chunk and keeps no bytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var b = try TestBuilder.init(gpa, 3, 1, 2);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "qwen3");
+    try b.kvStr("general.size_label", "4B");
+    try b.tensor("token_embd.weight", &.{ 4, 2 }, 0, 0);
+    const file = try b.finish(&([_]u8{0} ** 32));
+    defer gpa.free(file);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.gguf", .data = file });
+
+    // 24 bytes is just the fixed prefix, so every section forces a regrow.
+    var g = try Gguf.openHeaderChunked(gpa, io, tmp.dir, "m.gguf", 24);
+    defer g.deinit();
+    try std.testing.expect(g.header_only);
+    try std.testing.expectEqualStrings("4B", g.getStr("general.size_label").?);
+    try std.testing.expectEqual(@as(usize, 32), g.payload_len);
+    try std.testing.expectEqual(@as(usize, 0), g.payload.len);
+    const e = try g.require("embed_tokens.weight");
+    try std.testing.expectEqualSlices(usize, &.{ 2, 4 }, e.info.shape.slice());
+    try std.testing.expectEqual(@as(usize, 0), e.bytes.len);
+
+    // Declared data past the end of the file is still caught from the header.
+    try tmp.dir.writeFile(io, .{ .sub_path = "cut.gguf", .data = file[0 .. file.len - 8] });
+    try std.testing.expectError(error.InvalidOffsets, Gguf.openHeaderChunked(gpa, io, tmp.dir, "cut.gguf", 24));
 }
 
 test "reject malformed gguf" {

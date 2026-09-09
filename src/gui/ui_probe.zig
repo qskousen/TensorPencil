@@ -18,6 +18,10 @@ const Backend = @import("backend");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const shell = @import("shell.zig");
+const model_menu = @import("model_menu.zig");
+const model_lib = @import("model_lib.zig");
+const catalog = @import("catalog.zig");
+const selection = @import("selection.zig");
 const config = @import("config.zig");
 const config_view = @import("config_view.zig");
 const bubbles = @import("bubbles.zig");
@@ -45,6 +49,29 @@ const noise_names = [_][]const u8{ "flat", "front", "front steep", "first 40%", 
 /// first layer, zero at the LM head. Hardcoded rather than evaluated so the probe
 /// stays a pure renderer.
 const noise_shape = [_]f32{ 1.00, 0.90, 0.81, 0.72, 0.64, 0.56, 0.49, 0.42, 0.36, 0.30, 0.25, 0.20, 0.16, 0.12, 0.09, 0.06, 0.04, 0.02, 0.01, 0.00 };
+
+fn noopPick(_: model_menu.Pick) void {}
+
+// The two title-bar menus, as the catalog would build them: a supported class
+// with the current file checked, and a greyed class with its reason.
+const probe_llm_items = [_]model_menu.Item{
+    .{ .label = "Gemma-4-31B-it-Q4_K_M", .path = "/m/a.gguf", .selected = true },
+    .{ .label = "Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S", .path = "/m/b.gguf" },
+};
+const probe_llm_grey = [_]model_menu.Item{
+    .{ .label = "nomic-embed-text-v1.5.Q8_0", .path = "/m/c.gguf", .greyed = true, .note = "architecture 'nomic-bert' is not supported" },
+};
+const probe_llm_groups = [_]model_menu.Group{
+    .{ .label = "Gemma 4 31B", .items = &probe_llm_items },
+    .{ .label = "nomic-bert 137M", .items = &probe_llm_grey, .greyed = true },
+};
+const probe_llm_menu: model_menu.Menu = .{ .groups = &probe_llm_groups, .none_label = "no chat model" };
+const probe_image_items = [_]model_menu.Item{
+    .{ .label = "sdxl-turbo-fp16", .path = "/m/x.safetensors", .selected = true },
+    .{ .label = "dreamshaperXL10_alpha2Xl10", .path = "/m/y.safetensors" },
+};
+const probe_image_groups = [_]model_menu.Group{.{ .label = "SDXL", .items = &probe_image_items }};
+const probe_image_menu: model_menu.Menu = .{ .groups = &probe_image_groups, .none_label = "no image model" };
 
 const conv_today = [_]shell.ConvRow{
     .{ .id = 1, .title = "Lighthouse in fog, 4 looks", .sub = "2 studio edits" },
@@ -129,9 +156,11 @@ fn frame() void {
 
     shell.titleBar(.{
         .tab = g_tab,
-        .diff_model = "sdxl-turbo · fp16",
-        .residents = "qwen-7b + sdxl-turbo",
-    }, .{ .on_tab = onTab, .on_model_menu = noop });
+        .llm = .{ .label = "Gemma-4-31B-it-Q4_K_M", .resident = true },
+        .llm_menu = probe_llm_menu,
+        .image = .{ .label = "sdxl-turbo-fp16", .warn = true },
+        .image_menu = probe_image_menu,
+    }, .{ .on_tab = onTab, .on_llm_pick = noopPick, .on_image_pick = noopPick });
 
     {
         var body = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -525,6 +554,31 @@ var probe_cfg: config.Config = blk: {
     break :blk c;
 };
 
+/// A catalog the settings form can draw from: one folder, a Gemma 4 class with a
+/// matching and a non-matching tower, a Krea2 checkpoint with its side files.
+fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
+    const llm = catalog.Llm{ .arch = "gemma4", .size_label = "31B", .width = 5376, .blocks = 60, .supported = true, .vision = true, .class = "Gemma 4 31B" };
+    var te: catalog.Entry = .{ .path = "/models/text_encoders/qwen3VLInstruct4b.safetensors", .size = 1, .mtime_ns = 1 };
+    te.side.set(.krea2, .conditioner);
+    var vae: catalog.Entry = .{ .path = "/models/vae/krea2RealVae_v10.safetensors", .size = 1, .mtime_ns = 1 };
+    vae.side.set(.krea2, .decoder);
+    vae.side.set(.anima, .decoder);
+    var taew: catalog.Entry = .{ .path = "/models/vae_approx/taew2_1.safetensors", .size = 1, .mtime_ns = 1 };
+    taew.preview.fams[@intFromEnum(catalog.Family.krea2)] = true;
+    return catalog.Catalog.fromEntries(gpa, &.{
+        .{ .path = "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
+        .{ .path = "/models/llm/Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
+        .{ .path = "/models/llm/mmproj-gemma-4-31b.gguf", .size = 1, .mtime_ns = 1, .tower = .{ .projector = "gemma4v", .arch = "gemma4", .width = 5376 } },
+        .{ .path = "/models/llm/mmproj-gemma-4-12b.gguf", .size = 1, .mtime_ns = 1, .tower = .{ .projector = "gemma4uv", .arch = "gemma4", .width = 3840 } },
+        .{ .path = "/models/llm/nomic-embed.gguf", .size = 1, .mtime_ns = 1, .llm = .{ .arch = "nomic-bert", .size_label = "137M", .width = 768, .blocks = 12, .supported = false, .vision = false, .class = "nomic-bert 137M" }, .note = "architecture 'nomic-bert' is not supported" },
+        .{ .path = "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors", .size = 1, .mtime_ns = 1, .ckpt = .{ .family = .krea2, .contents = .{ .denoiser = true } } },
+        .{ .path = "/models/checkpoints/sdxl/dreamshaperXL.safetensors", .size = 1, .mtime_ns = 1, .ckpt = .{ .family = .sdxl, .contents = .{ .denoiser = true, .conditioner = true, .conditioner2 = true, .decoder = true } } },
+        te,
+        vae,
+        taew,
+    });
+}
+
 fn settingsFrame() void {
     // The app pushes this from a live capability probe; the probe has no model, so
     // it asserts the supported case, which is the one with a section to look at.
@@ -550,6 +604,11 @@ pub fn main(init: std.process.Init) !void {
             states_mode = true;
         } else if (std.mem.eql(u8, arg, "--settings")) {
             settings_mode = true;
+            // The form reads the catalog and the config's selection; give it both.
+            model_lib.setCanned(try cannedCatalog(std.heap.smp_allocator));
+            _ = probe_cfg.addModelDir("/models");
+            selection.selectLlm(&probe_cfg, &model_lib.cat, "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf");
+            selection.selectCheckpoint(&probe_cfg, &model_lib.cat, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
         } else if (std.fmt.parseInt(u32, arg, 10)) |n| {
             if (dims[0] == null) dims[0] = n else dims[1] = n;
         } else |_| {

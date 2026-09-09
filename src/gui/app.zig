@@ -18,6 +18,9 @@ const markdown_view = @import("markdown_view.zig");
 const viewer = @import("viewer.zig");
 const config = @import("config.zig");
 const config_view = @import("config_view.zig");
+const selection = @import("selection.zig");
+const model_lib = @import("model_lib.zig");
+const model_menu = @import("model_menu.zig");
 const image_view = @import("image_view.zig");
 const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
@@ -593,6 +596,16 @@ pub fn run(init: std.process.Init) !void {
     g_config = config.Config.load(init.io, gpa, init.environ_map, g_config_path);
     applyWeightRead(g_config.weight_read);
     if (model_override) |m| g_config.llm_model.set(m);
+    // The model catalog: its index lives beside the config, the folders come
+    // from the config (seeded from the configured files' folders the first time),
+    // and a config from before the catalog existed keeps its exact selection.
+    g_config.seedModelDirs();
+    {
+        const index_path = config.Config.siblingPath(init.io, gpa, init.environ_map, g_config_path, "catalog.json") catch null;
+        defer if (index_path) |p| gpa.free(p);
+        model_lib.init(g_gpa, g_io, wakeupFrame, index_path);
+    }
+    selection.resolveAll(&g_config, &model_lib.cat);
     g_config_baseline = g_config;
     // Seed the meter handles from the persisted fractions, clamped into the
     // grabbable range (recovers a config that saved a stuck limit at the edge).
@@ -636,6 +649,7 @@ pub fn run(init: std.process.Init) !void {
 
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
     config_view.setEnv(back.window, wakeupFrame, g_gpa, g_io);
+    model_lib.startScan(&g_config); // the wakeup event exists now
     syncDiffuser();
 
     // Conversation history lives beside the config file. With `--config <path>`
@@ -670,6 +684,7 @@ pub fn run(init: std.process.Init) !void {
         g_staged_images.deinit(g_gpa);
         image_view.deinit();
         config_view.deinit();
+        model_lib.deinit();
         status_bar.deinit();
     }
     defer if (g_viewer) |v| v.deinit();
@@ -678,6 +693,12 @@ pub fn run(init: std.process.Init) !void {
     main_loop: while (true) {
         maybeProcessEjects();
         maybeStartReload();
+        // A finished folder scan may have found a side file for a slot that had
+        // none; resolving fills it and, if that changed a path, applies it.
+        if (model_lib.poll()) {
+            selection.resolveAll(&g_config, &model_lib.cat);
+            if (!g_config.llmReloadEql(&g_config_baseline) or !g_config.diffPathsEql(&g_config_baseline)) commitConfig();
+        }
         maybeRefreshMeterPolicy();
         // Pump the app-level diffusion engine every frame (both modes; even under
         // Settings) so an in-flight generation finishes, it drains its own
@@ -952,7 +973,7 @@ fn configuredSupportsWeightNoise() bool {
 }
 
 fn probeWeightNoise(path: []const u8) bool {
-    var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
+    var gg = tp.Gguf.openHeader(g_gpa, g_io, path) catch return false;
     defer gg.deinit();
     return tp.llm.session.weightNoiseSupported(&gg);
 }
@@ -1004,7 +1025,7 @@ fn autoMessage() void {
 /// Any failure (missing/unreadable file, unknown arch) -> false.
 fn probeThinking(path: []const u8) bool {
     g_think_probe_effort = false;
-    var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
+    var gg = tp.Gguf.openHeader(g_gpa, g_io, path) catch return false;
     defer gg.deinit();
     const arch = gg.getStr("general.architecture") orelse return false;
     const fam = tp.llm.chat.familyForArch(arch) orelse return false;
@@ -1094,13 +1115,18 @@ fn frame() void {
     }
 
     const bands = shell.Bands.from(root);
-    var mbuf: [96]u8 = undefined;
-    var rbuf: [96]u8 = undefined;
-    shell.titleBar(.{
-        .tab = if (g_view == .image) .studio else .chat,
-        .diff_model = diffModelLabel(&mbuf),
-        .residents = residentLabel(&rbuf),
-    }, .{ .on_tab = onTabPicked, .on_model_menu = openSettings });
+    {
+        const arena = dvui.currentWindow().arena();
+        const llm_resident = !g_loading.load(.acquire) and g_session != null;
+        const image_resident = if (g_diffuser) |*d| d.vramBytes() > 0 else false;
+        shell.titleBar(.{
+            .tab = if (g_view == .image) .studio else .chat,
+            .llm = model_lib.llmChip(&g_config, llm_resident),
+            .llm_menu = model_lib.llmMenu(arena, &g_config),
+            .image = model_lib.imageChip(&g_config, image_resident),
+            .image_menu = model_lib.imageMenu(arena, &g_config),
+        }, .{ .on_tab = onTabPicked, .on_llm_pick = onLlmPick, .on_image_pick = onImagePick });
+    }
 
     {
         var body = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -1788,35 +1814,26 @@ fn onTabPicked(t: shell.Tab) void {
     }
 }
 
-/// The diffusion checkpoint's file name, for the title-bar chip.
-fn diffModelLabel(buf: []u8) []const u8 {
-    const p = g_config.diffusion_model.opt() orelse return "no image model";
-    const base = std.fs.path.basename(p);
-    const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
-    const n = @min(stem.len, buf.len);
-    @memcpy(buf[0..n], stem[0..n]);
-    return buf[0..n];
+/// A pick in the chat-model chip applies at once: save, and reload if the
+/// resident model changed, the way the thinking toggle applies.
+fn onLlmPick(p: model_menu.Pick) void {
+    std.log.info("[models] chat pick: {t}", .{p});
+    switch (p) {
+        .none => selection.clearLlm(&g_config),
+        .path => |path| selection.selectLlm(&g_config, &model_lib.cat, path),
+        .settings => return openSettings(),
+    }
+    commitConfig();
 }
 
-/// What is resident right now, for the second title-bar chip. Empty (chip
-/// hidden) when nothing is loaded — an empty chip is worse than no chip.
-fn residentLabel(buf: []u8) []const u8 {
-    var llm: []const u8 = "";
-    var lbuf: [64]u8 = undefined;
-    if (!g_loading.load(.acquire)) if (g_session != null) {
-        if (g_config.llm_model.opt()) |p| {
-            const base = std.fs.path.basename(p);
-            const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
-            const n = @min(stem.len, lbuf.len);
-            @memcpy(lbuf[0..n], stem[0..n]);
-            llm = lbuf[0..n];
-        }
-    };
-    const diff_on = if (g_diffuser) |*d| d.vramBytes() > 0 else false;
-    if (llm.len == 0 and !diff_on) return "";
-    if (llm.len == 0) return "image model resident";
-    if (!diff_on) return std.fmt.bufPrint(buf, "{s}", .{llm}) catch "";
-    return std.fmt.bufPrint(buf, "{s} + image", .{llm}) catch "";
+fn onImagePick(p: model_menu.Pick) void {
+    std.log.info("[models] image pick: {t}", .{p});
+    switch (p) {
+        .none => selection.clearCheckpoint(&g_config),
+        .path => |path| selection.selectCheckpoint(&g_config, &model_lib.cat, path),
+        .settings => return openSettings(),
+    }
+    commitConfig();
 }
 
 // ------------------------------------------------------------- queue rail
@@ -2476,6 +2493,14 @@ fn enterChatMode() void {
 /// resident; if it hasn't lazy-loaded yet, the new config is simply picked up on
 /// the first message.
 fn applyConfig() void {
+    commitConfig();
+    g_view = g_return_view;
+}
+
+/// Persist `g_config` and bring the engines in line with it: rebuild or retune
+/// the diffuser, reload the LLM when its model set changed, else push the live
+/// settings. Settings Apply and a chip pick both end here.
+fn commitConfig() void {
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
 
     // The diffusion engine is shared by both modes; reconcile it either way.
@@ -2511,7 +2536,6 @@ fn applyConfig() void {
     applyWeightRead(g_config.weight_read);
 
     g_config_baseline = g_config;
-    g_view = g_return_view;
 }
 
 /// Toolbar reasoning toggle: flip whether the model reasons before answering,

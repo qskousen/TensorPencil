@@ -14,6 +14,9 @@ const style = @import("style.zig");
 const bubbles = @import("bubbles.zig");
 const diffuser = @import("diffuser.zig");
 const model_spec = @import("model_spec.zig");
+const catalog = @import("catalog.zig");
+const selection = @import("selection.zig");
+const model_lib = @import("model_lib.zig");
 const SDLBackend = @import("backend");
 
 // SDL owns file picking: SDL_ShowOpen*Dialog parents the native dialog to the
@@ -73,10 +76,6 @@ pub fn deinit() void {
 // MUST outlive the dialog (module-level const, never a stack local).
 const gguf_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "GGUF models", .pattern = "gguf" },
-    .{ .name = "All files", .pattern = "*" },
-};
-const safetensors_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
-    .{ .name = "Safetensors", .pattern = "safetensors" },
     .{ .name = "All files", .pattern = "*" },
 };
 /// Any component that can arrive as its own file, the primary checkpoint, and the
@@ -268,23 +267,26 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     var body = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(6) });
     defer body.deinit();
 
-    section("Models");
-    help("The LLM is required for chat. Image generation needs only the diffusion " ++
-        "model: many checkpoints bundle their own text encoder(s) and VAE, and the " ++
-        "encoder/VAE fields below are OVERRIDES — set one only to supply a piece " ++
-        "the checkpoint lacks, or to replace one it has. Vision (chatting about " ++
-        "images) needs the vision tower. Any unset feature is simply disabled.");
-    pathRow("LLM model", &cfg.llm_model, &gguf_sdl);
-    pathRow("Vision tower", &cfg.vision_tower, &gguf_sdl);
-    pathRow("Diffusion model", &cfg.diffusion_model, &checkpoint_sdl);
-    pathRow("Text encoder", &cfg.text_encoder, &checkpoint_sdl);
-    // SDXL's second tower. Always shown rather than revealed only for a detected
-    // SDXL checkpoint: a row that appears and disappears as you edit the path
-    // above it moves everything below, and the panel already says when it is
-    // needed. Ignored by every single-tower architecture.
-    pathRow("Text encoder 2 (SDXL)", &cfg.text_encoder_2, &checkpoint_sdl);
-    pathRow("VAE", &cfg.vae, &safetensors_sdl);
-    pathRow("TAESD preview", &cfg.taesd, &safetensors_sdl);
+    consumePicks(cfg);
+    section("Model folders");
+    help("Folders searched, subfolders included, for chat models, image checkpoints, " ++
+        "text encoders, VAEs, vision towers and preview decoders. What is found fills the " ++
+        "menus below and the two chips in the title bar. Files the engine cannot use are " ++
+        "listed greyed with the reason.");
+    folderRows(cfg);
+
+    section("Chat model");
+    help("Pick an architecture, then a file. A vision tower (for chatting about images) " ++
+        "is offered only for architectures that take one, and only towers that match " ++
+        "the model's width, so a 12B tower cannot be paired with a 31B model.");
+    llmRows(cfg);
+
+    section("Image model");
+    help("Pick an architecture, then a checkpoint. The text encoder and VAE it needs " ++
+        "are filled in from what is compatible and remembered per architecture, so " ++
+        "switching between two Krea 2 files keeps the encoder and VAE that worked. A " ++
+        "checkpoint that bundles a piece uses its own copy unless you pick another.");
+    imageRows(cfg);
     checkpointPanel(cfg);
 
     section("Image generation");
@@ -893,39 +895,262 @@ fn startDir(buf: []u8, pb: *const config.PathBuf) ?[*:0]const u8 {
     return @ptrCast(buf.ptr);
 }
 
-fn pathRow(label: []const u8, pb: *config.PathBuf, filters: []const SDLBackend.c.SDL_DialogFileFilter) void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
-    defer row.deinit();
+// ── Model rows ────────────────────────────────────────────────────────────────
+// Every pick goes through `selection`, which writes the effective paths; these
+// rows only build the choice lists from the catalog and show the current state.
 
-    dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+/// Where an "Other file…" dialog's result goes once it lands.
+const PickTarget = enum { llm, tower, ckpt, text_encoder, text_encoder_2, vae, taesd };
+var g_pick_target: ?PickTarget = null;
+var g_pick_buf: config.PathBuf = .{};
+var g_dir_buf: config.PathBuf = .{};
 
-    var te = dvui.textEntry(@src(), .{
-        .text = .{ .buffer = &pb.data },
-        .placeholder = "not set",
-    }, .{ .expand = .horizontal, .gravity_y = 0.5 });
-    te.deinit();
-
-    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }) and !g_dialog_open) {
-        g_dialog_open = true;
-        // SDL copies default_location into its own property store, so this
-        // stack buffer only has to live across the call.
-        var dir_buf: [config.max_path]u8 = undefined;
-        SDLBackend.c.SDL_ShowOpenFileDialog(
-            dialogCallback,
-            @ptrCast(pb),
-            g_window,
-            filters.ptr,
-            @intCast(filters.len),
-            startDir(&dir_buf, pb),
-            false, // single selection
-        );
+/// Apply a finished dialog (the SDL callback wrote the buffer on an earlier
+/// frame) before the rows read the config.
+fn consumePicks(cfg: *config.Config) void {
+    if (g_dir_buf.opt()) |d| {
+        _ = cfg.addModelDir(d);
+        g_dir_buf.set("");
+        model_lib.startScan(cfg);
     }
-    if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
-        pb.set("");
+    if (g_pick_target) |t| if (g_pick_buf.opt()) |p| {
+        const cat = &model_lib.cat;
+        model_lib.addFile(cfg, p);
+        switch (t) {
+            .llm => selection.selectLlm(cfg, cat, p),
+            .tower => selection.chooseTower(cfg, cat, p),
+            .ckpt => selection.selectCheckpoint(cfg, cat, p),
+            .text_encoder => selection.chooseSide(cfg, cat, .text_encoder, p),
+            .text_encoder_2 => selection.chooseSide(cfg, cat, .text_encoder_2, p),
+            .vae => selection.chooseSide(cfg, cat, .vae, p),
+            .taesd => selection.chooseSide(cfg, cat, .taesd, p),
+        }
+        g_pick_buf.set("");
+        g_pick_target = null;
+    };
+}
+
+fn openFileDialog(target: PickTarget, filters: []const SDLBackend.c.SDL_DialogFileFilter, near: *const config.PathBuf) void {
+    if (g_dialog_open) return;
+    g_dialog_open = true;
+    g_pick_target = target;
+    var dir_buf: [config.max_path]u8 = undefined;
+    SDLBackend.c.SDL_ShowOpenFileDialog(dialogCallback, @ptrCast(&g_pick_buf), g_window, filters.ptr, @intCast(filters.len), startDir(&dir_buf, near), false);
+}
+
+fn folderRows(cfg: *config.Config) void {
+    for (cfg.model_dirs.slice(), 0..) |*d, i| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .padding = .{ .x = 4, .y = 2 } });
+        defer row.deinit();
+        dvui.labelNoFmt(@src(), d.path.slice(), .{}, .{ .gravity_y = 0.5, .expand = .horizontal, .font = style.F.mono });
+        if (dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5 })) {
+            cfg.removeModelDir(i);
+            model_lib.startScan(cfg);
+            return; // the list shifted under this loop
+        }
+    }
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+    if (dvui.button(@src(), "Add folder…", .{}, .{ .gravity_y = 0.5 }) and !g_dialog_open) {
+        g_dialog_open = true;
+        SDLBackend.c.SDL_ShowOpenFolderDialog(dialogCallback, @ptrCast(&g_dir_buf), g_window, null, false);
+    }
+    if (dvui.button(@src(), "Rescan", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) model_lib.startScan(cfg);
+    var buf: [128]u8 = undefined;
+    dvui.labelNoFmt(@src(), model_lib.statusLine(&buf), .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 10 }, .color_text = style.C.text_dim });
+}
+
+/// A labelled dropdown over runtime entries. Returns the index picked this frame.
+fn choiceRow(key: []const u8, label: []const u8, current: []const u8, entries: []const []const u8, warn: bool) ?usize {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(key), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+    dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+    var dd: dvui.DropdownWidget = undefined;
+    var opts: dvui.Options = .{ .gravity_y = 0.5, .min_size_content = .{ .w = 420 }, .max_size_content = .width(640) };
+    if (warn) opts.color_text = style.C.amber;
+    dd.init(@src(), .{ .label = current }, opts);
+    defer dd.deinit();
+    var picked: ?usize = null;
+    if (dd.dropped()) {
+        for (entries, 0..) |e, i| if (dd.addChoiceLabel(e)) {
+            picked = i;
+        };
+    }
+    return picked;
+}
+
+const other_file = "Other file…";
+
+fn stemOf(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+}
+
+fn llmRows(cfg: *config.Config) void {
+    const arena = dvui.currentWindow().arena();
+    const cat = &model_lib.cat;
+    const classes = cat.llmClasses(arena) catch return;
+    const cur = selection.llm(cfg, cat);
+
+    // Architecture: the classes, the current one named. An unknown file shows as
+    // itself so nothing pretends to know what it is.
+    var labels = arena.alloc([]const u8, classes.len + 1) catch return;
+    var cur_label: []const u8 = "none";
+    for (classes, 0..) |c, i| {
+        labels[i] = if (c.supported) c.label else std.fmt.allocPrint(arena, "{s} (unsupported)", .{c.label}) catch c.label;
+        if (cur) |e| if (std.mem.eql(u8, e.llm.?.class, c.label)) {
+            cur_label = labels[i];
+        };
+    }
+    labels[classes.len] = "none";
+    if (cur == null) if (cfg.llm_model.opt()) |p| {
+        cur_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch "other file";
+    };
+    if (choiceRow("llm/arch", "Architecture", cur_label, labels, false)) |i| {
+        if (i == classes.len) selection.clearLlm(cfg) else selection.selectLlm(cfg, cat, cat.entries[classes[i].members[0]].path);
+    }
+
+    // File: the class's members, then "other".
+    var files: std.ArrayList([]const u8) = .empty;
+    var file_paths: std.ArrayList([]const u8) = .empty;
+    var file_label: []const u8 = "none";
+    if (cur) |e| {
+        for (classes) |c| if (std.mem.eql(u8, e.llm.?.class, c.label)) {
+            for (c.members) |mi| {
+                const m = &cat.entries[mi];
+                files.append(arena, m.stem()) catch return;
+                file_paths.append(arena, m.path) catch return;
+            }
+        };
+        file_label = e.stem();
+    } else if (cfg.llm_model.opt()) |p| file_label = stemOf(p);
+    files.append(arena, other_file) catch return;
+    if (choiceRow("llm/file", "Model file", file_label, files.items, cur == null and cfg.llm_model.opt() != null)) |i| {
+        if (i == file_paths.items.len) openFileDialog(.llm, &gguf_sdl, &cfg.llm_model) else selection.selectLlm(cfg, cat, file_paths.items[i]);
+    }
+
+    // Vision tower, for an architecture that takes one.
+    const e = cur orelse return;
+    if (!e.llm.?.vision) return;
+    const towers = cat.towersFor(arena, cat.indexOf(e.path).?) catch return;
+    var tl: std.ArrayList([]const u8) = .empty;
+    tl.append(arena, "none") catch return;
+    var in_list = false;
+    for (towers) |ti| {
+        tl.append(arena, cat.entries[ti].stem()) catch return;
+        if (std.mem.eql(u8, cat.entries[ti].path, cfg.vision_tower.slice())) in_list = true;
+    }
+    tl.append(arena, other_file) catch return;
+    var tower_label: []const u8 = "none";
+    var tower_warn = false;
+    if (cfg.vision_tower.opt()) |p| {
+        tower_label = if (in_list) stemOf(p) else std.fmt.allocPrint(arena, "{s} (does not match this model)", .{stemOf(p)}) catch stemOf(p);
+        tower_warn = !in_list;
+    }
+    if (choiceRow("llm/tower", "Vision tower", tower_label, tl.items, tower_warn)) |i| {
+        if (i == 0) {
+            selection.chooseTower(cfg, cat, config.choice_none);
+        } else if (i == towers.len + 1) {
+            openFileDialog(.tower, &gguf_sdl, &cfg.vision_tower);
+        } else selection.chooseTower(cfg, cat, cat.entries[towers[i - 1]].path);
     }
 }
 
-/// Like `pathRow`, but browses for a directory (native folder-select dialog).
+fn imageRows(cfg: *config.Config) void {
+    const arena = dvui.currentWindow().arena();
+    const cat = &model_lib.cat;
+    const cur = selection.checkpoint(cfg, cat);
+    const fams = cat.families();
+
+    // Architecture: families with at least one checkpoint.
+    var fam_list: std.ArrayList(catalog.Family) = .empty;
+    var fam_labels: std.ArrayList([]const u8) = .empty;
+    var fam_label: []const u8 = "none";
+    inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
+        const fam: catalog.Family = @enumFromInt(ff.value);
+        if (fams.contains(fam)) {
+            fam_list.append(arena, fam) catch return;
+            fam_labels.append(arena, model_spec.traits(fam).short) catch return;
+        }
+    }
+    if (cur) |e| fam_label = model_spec.traits(e.ckpt.?.family).short;
+    if (cur == null) if (cfg.diffusion_model.opt()) |p| {
+        fam_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch "other file";
+    };
+    fam_labels.append(arena, "none") catch return;
+    if (choiceRow("image/arch", "Architecture", fam_label, fam_labels.items, false)) |i| {
+        if (i == fam_list.items.len) {
+            selection.clearCheckpoint(cfg);
+        } else if (cat.firstCheckpoint(fam_list.items[i])) |ci| selection.selectCheckpoint(cfg, cat, cat.entries[ci].path);
+    }
+
+    // Checkpoint: the family's files, then "other".
+    var files: std.ArrayList([]const u8) = .empty;
+    var paths: std.ArrayList([]const u8) = .empty;
+    var file_label: []const u8 = "none";
+    if (cur) |e| {
+        const idx = cat.checkpoints(arena, e.ckpt.?.family) catch return;
+        for (idx) |ci| {
+            files.append(arena, cat.entries[ci].stem()) catch return;
+            paths.append(arena, cat.entries[ci].path) catch return;
+        }
+        file_label = e.stem();
+    } else if (cfg.diffusion_model.opt()) |p| file_label = stemOf(p);
+    files.append(arena, other_file) catch return;
+    if (choiceRow("image/ckpt", "Checkpoint", file_label, files.items, cur == null and cfg.diffusion_model.opt() != null)) |i| {
+        if (i == paths.items.len) openFileDialog(.ckpt, &checkpoint_sdl, &cfg.diffusion_model) else selection.selectCheckpoint(cfg, cat, paths.items[i]);
+    }
+
+    const e = cur orelse return;
+    const ck = e.ckpt.?;
+    for (selection.Slot.all) |slot| {
+        if (!slot.applies(ck.family)) continue;
+        const cands = if (slot.component()) |c| (cat.sidesFor(arena, ck.family, c) catch return) else (cat.previewsFor(arena, ck.family) catch return);
+        const bundled = if (slot.component()) |c| ck.contents.has(c) else false;
+        // The preview row only when something can fill it or something is set:
+        // most families have no approx decoder here yet, and an empty row is a
+        // question with no answer.
+        if (slot == .taesd and cands.len == 0 and cfg.taesd.opt() == null) continue;
+
+        var labels: std.ArrayList([]const u8) = .empty;
+        if (bundled) labels.append(arena, "bundled (in the checkpoint)") catch return;
+        var in_list = false;
+        for (cands) |ci| {
+            labels.append(arena, cat.entries[ci].stem()) catch return;
+            if (std.mem.eql(u8, cat.entries[ci].path, slot.field(cfg).slice())) in_list = true;
+        }
+        labels.append(arena, "none") catch return;
+        labels.append(arena, other_file) catch return;
+
+        var label: []const u8 = "none";
+        var warn = false;
+        switch (selection.sideState(cfg, cat, slot)) {
+            .bundled => label = "bundled (in the checkpoint)",
+            .none => warn = slot.component() != null, // a required piece with nothing supplying it
+            .file => |p| {
+                label = if (in_list) stemOf(p) else std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch stemOf(p);
+            },
+        }
+        const target: PickTarget = switch (slot) {
+            .text_encoder => .text_encoder,
+            .text_encoder_2 => .text_encoder_2,
+            .vae => .vae,
+            .taesd => .taesd,
+        };
+        if (choiceRow(@tagName(slot), slot.label(), label, labels.items, warn)) |i| {
+            const first_cand: usize = if (bundled) 1 else 0;
+            if (bundled and i == 0) {
+                selection.chooseSide(cfg, cat, slot, config.choice_bundled);
+            } else if (i == first_cand + cands.len) {
+                selection.chooseSide(cfg, cat, slot, config.choice_none);
+            } else if (i == first_cand + cands.len + 1) {
+                openFileDialog(target, &checkpoint_sdl, slot.field(cfg));
+            } else selection.chooseSide(cfg, cat, slot, cat.entries[cands[i - first_cand]].path);
+        }
+    }
+}
+
+/// A directory row: a typed path plus a native folder-select dialog.
 fn dirRow(label: []const u8, pb: *config.PathBuf) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();

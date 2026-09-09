@@ -699,6 +699,35 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_modelspec_tests).step);
 
+            // Model-catalog tests: header-only classification of a synthetic
+            // model tree, the grouping queries and the JSON index. Same deps.
+            const gui_catalog_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/catalog.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_catalog_tests).step);
+
+            // Selection tests: how a chip or Settings pick becomes the effective
+            // model paths, over an in-memory catalog and config.
+            const gui_selection_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/selection.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_selection_tests).step);
+
             // Chat-session pure-helper tests (Message variants + the ‹/›
             // regenerate-navigation semantics). Same deps as the diffuser
             // tests (chat.zig imports it); CPU-only.
@@ -715,6 +744,28 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_chat_tests).step);
         }
+    }
+
+    // catalog-probe: scan model folders as tp-gui does and print each file's
+    // classification (`zig build catalog-probe -- <folder>...`). No dvui.
+    {
+        const cat_step = b.step("catalog-probe", "Scan model folders and print what tp-gui takes each file for");
+        const cat_exe = b.addExecutable(.{
+            .name = "catalog-probe",
+            .use_llvm = use_llvm,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/gui/catalog_probe.zig"),
+                .link_libc = true,
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "TensorPencil", .module = mod },
+                },
+            }),
+        });
+        const cat_run = b.addRunArtifact(cat_exe);
+        if (b.args) |args| cat_run.addArgs(args);
+        cat_step.dependOn(&cat_run.step);
     }
 
     // chat-probe: run a tp-gui chat.Session headlessly and print the raw reply.

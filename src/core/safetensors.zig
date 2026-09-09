@@ -112,8 +112,15 @@ pub const SafeTensors = struct {
     file: ?std.Io.File = null,
     /// The `Io` `file` was opened with; needed to read and to close it.
     io: ?std.Io = null,
-    /// Data section (file bytes after the JSON header).
+    /// Data section (file bytes after the JSON header). Empty on a header-only
+    /// open, where `payload_len` still says how long the file declares it.
     payload: []const u8,
+    /// Declared data-section length. Equals `payload.len` except on a
+    /// header-only open.
+    payload_len: usize,
+    /// Opened with `openHeader`: names, shapes, dtypes and metadata are all
+    /// present, but no tensor has bytes (`get` returns an empty slice).
+    header_only: bool = false,
     /// Tensor name -> info, in header order. Names point into the header
     /// bytes (or the arena), valid until deinit.
     index: std.StringArrayHashMapUnmanaged(TensorInfo),
@@ -176,12 +183,46 @@ pub const SafeTensors = struct {
     /// outlive the returned SafeTensors.
     pub fn initFromSlice(gpa: std.mem.Allocator, data: []const u8) ParseError!SafeTensors {
         if (data.len < 8) return error.FileTooSmall;
-        const header_len64 = std.mem.readInt(u64, data[0..8], .little);
-        if (header_len64 > max_header_len or header_len64 > data.len - 8) return error.InvalidHeader;
-        const header_len: usize = @intCast(header_len64);
-        const header_bytes = data[8 .. 8 + header_len];
-        const payload = data[8 + header_len ..];
+        const header_len = try headerLen(data[0..8], data.len);
+        var st = try parseHeader(gpa, data[8 .. 8 + header_len], data.len - 8 - header_len);
+        st.payload = data[8 + header_len ..];
+        st.header_only = false;
+        return st;
+    }
 
+    /// Open only the header: a folder scan over many multi-GB checkpoints must
+    /// not map them, let alone ask the kernel to prefetch them. The tensor table
+    /// is still validated against the file's length, so a truncated file is
+    /// refused here exactly as `open` refuses it.
+    pub fn openHeader(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !SafeTensors {
+        return openHeaderIn(gpa, io, std.Io.Dir.cwd(), path);
+    }
+
+    pub fn openHeaderIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !SafeTensors {
+        const file = try dir.openFile(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+        const len: usize = @intCast(try file.length(io));
+        if (len < 8) return error.FileTooSmall;
+        var prefix: [8]u8 = undefined;
+        if (try file.readPositionalAll(io, &prefix, 0) != 8) return error.ShortRead;
+        const header_len = try headerLen(&prefix, len);
+        const buf = try gpa.alloc(u8, header_len);
+        errdefer gpa.free(buf);
+        if (try file.readPositionalAll(io, buf, 8) != buf.len) return error.ShortRead;
+        var st = try parseHeader(gpa, buf, len - 8 - header_len);
+        st.owned = buf;
+        return st;
+    }
+
+    fn headerLen(prefix: *const [8]u8, file_len: usize) ParseError!usize {
+        const header_len64 = std.mem.readInt(u64, prefix, .little);
+        if (header_len64 > max_header_len or header_len64 > file_len - 8) return error.InvalidHeader;
+        return @intCast(header_len64);
+    }
+
+    /// Parse the JSON header against a data section of `payload_len` bytes. The
+    /// result is header-only (`payload` empty); `initFromSlice` attaches the bytes.
+    fn parseHeader(gpa: std.mem.Allocator, header_bytes: []const u8, payload_len: usize) ParseError!SafeTensors {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -203,7 +244,7 @@ pub const SafeTensors = struct {
                 if (entry.value_ptr.* == .object) metadata = entry.value_ptr.object;
                 continue;
             }
-            const info = try parseTensorEntry(name, entry.value_ptr.*, payload.len);
+            const info = try parseTensorEntry(name, entry.value_ptr.*, payload_len);
             const slot = try index.getOrPut(alloc, name);
             if (slot.found_existing) return error.DuplicateTensor;
             slot.value_ptr.* = info;
@@ -219,19 +260,21 @@ pub const SafeTensors = struct {
         // The reference implementation makes this check and refuses such a file with
         // "incomplete metadata, file not fully covered". Being more permissive buys
         // nothing but silent garbage.
-        if (covered != payload.len) {
+        if (covered != payload_len) {
             std.log.err(
                 "safetensors: the tensor table covers {d} of {d} payload bytes ({d} unaccounted). " ++
                     "The file is truncated or its header does not match its data; the reference " ++
                     "implementation refuses it too. Re-download or re-export the checkpoint.",
-                .{ covered, payload.len, payload.len -| covered },
+                .{ covered, payload_len, payload_len -| covered },
             );
             return error.IncompleteMetadata;
         }
 
         return .{
             .mapping = null,
-            .payload = payload,
+            .payload = &.{},
+            .payload_len = payload_len,
+            .header_only = true,
             .index = index,
             .metadata = metadata,
             .arena = arena,
@@ -323,7 +366,7 @@ pub const SafeTensors = struct {
 
     pub fn get(self: *const SafeTensors, name: []const u8) ?TensorView {
         const info = self.index.get(name) orelse return null;
-        return .{ .info = info, .bytes = self.payload[info.start..info.end] };
+        return .{ .info = info, .bytes = if (self.header_only) &.{} else self.payload[info.start..info.end] };
     }
 
     /// Like `get`, but a missing tensor is an error, for required weights.
@@ -506,6 +549,39 @@ test "open via mmap round trip" {
     const vals = try w.toF32Alloc(gpa);
     defer gpa.free(vals);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, vals);
+}
+
+test "openHeader reads the table and metadata, and no bytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const header =
+        \\{"__metadata__":{"format":"pt"},
+        \\ "w":{"dtype":"BF16","shape":[2,3],"data_offsets":[0,12]}}
+    ;
+    const payload = [_]u8{0xaa} ** 12;
+    const bytes = try buildTestFile(gpa, header, &payload);
+    defer gpa.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "h.safetensors", .data = bytes });
+
+    var st = try SafeTensors.openHeaderIn(gpa, io, tmp.dir, "h.safetensors");
+    defer st.deinit();
+    try std.testing.expect(st.header_only);
+    try std.testing.expectEqual(@as(usize, 1), st.count());
+    try std.testing.expectEqual(@as(usize, 12), st.payload_len);
+    try std.testing.expectEqual(@as(usize, 0), st.payload.len);
+    try std.testing.expectEqualStrings("pt", st.metadata.?.get("format").?.string);
+    const w = try st.require("w");
+    try std.testing.expectEqual(DType.bf16, w.info.dtype);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 3 }, w.info.shape.slice());
+    try std.testing.expectEqual(@as(usize, 0), w.bytes.len);
+
+    // A file cut short is refused from the header alone: the one tensor now
+    // ends past what the file actually holds.
+    try tmp.dir.writeFile(io, .{ .sub_path = "cut.safetensors", .data = bytes[0 .. bytes.len - 4] });
+    try std.testing.expectError(error.InvalidOffsets, SafeTensors.openHeaderIn(gpa, io, tmp.dir, "cut.safetensors"));
 }
 
 test "open via buffered read round trip (read_mode = .buffered)" {

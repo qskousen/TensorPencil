@@ -139,6 +139,39 @@ pub fn familyForArch(arch: []const u8) ?Family {
     return null;
 }
 
+/// A display name for a supported `general.architecture`, null for one this
+/// build cannot run. Kept beside `familyForArch` so the two lists cannot drift:
+/// a GUI that names an architecture it cannot load is a menu entry that fails.
+///
+/// `qwen35` is one llama.cpp architecture covering Qwen 3.5, 3.6 and 3.8, and
+/// the file metadata does not separate them reliably, hence "-class".
+pub fn archLabel(arch: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, arch, "qwen3")) return "Qwen 3";
+    if (std.mem.eql(u8, arch, "qwen35")) return "Qwen 3.5-class";
+    if (std.mem.eql(u8, arch, "k2-horizon")) return "K2 Horizon";
+    if (std.mem.eql(u8, arch, "llama")) return "Llama";
+    if (std.mem.eql(u8, arch, "gemma3")) return "Gemma 3";
+    if (std.mem.eql(u8, arch, "gemma4")) return "Gemma 4";
+    return null;
+}
+
+/// Whether a supported architecture takes a vision tower (mmproj) at all. The
+/// GUI offers a tower slot only for these; the session loader warns and drops a
+/// tower configured for any other.
+pub fn archHasVision(arch: []const u8) bool {
+    return std.mem.eql(u8, arch, "qwen35") or std.mem.eql(u8, arch, "gemma3") or std.mem.eql(u8, arch, "gemma4");
+}
+
+/// The LLM architecture a vision tower's `projector_type` serves, null for a
+/// projector no tower loader here accepts. One entry per `*_vit.zig` loader,
+/// each of which checks the same string.
+pub fn archForProjector(projector: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, projector, "gemma3")) return "gemma3";
+    if (std.mem.eql(u8, projector, "gemma4uv") or std.mem.eql(u8, projector, "gemma4v")) return "gemma4";
+    if (std.mem.eql(u8, projector, "qwen3vl_merger")) return "qwen35";
+    return null;
+}
+
 /// Select the chat template family (process-global, like the tokenizer).
 pub fn setFamily(f: Family) void {
     family = f;
@@ -489,6 +522,21 @@ test "arch→family mapping and family-scoped thinking probe (no global mutation
     try std.testing.expect(!familySupportsThinking(.gemma));
 
     try std.testing.expectEqual(Family.gemma, family); // untouched by the probes
+}
+
+test "archLabel names exactly the architectures familyForArch accepts" {
+    for ([_][]const u8{ "qwen3", "qwen35", "k2-horizon", "llama", "gemma3", "gemma4" }) |a| {
+        try std.testing.expect(familyForArch(a) != null);
+        try std.testing.expect(archLabel(a) != null);
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), archLabel("bert"));
+    try std.testing.expectEqual(@as(?[]const u8, null), archLabel(""));
+    // Every projector maps to a vision-capable architecture, never a text-only one.
+    for ([_][]const u8{ "gemma3", "gemma4uv", "gemma4v", "qwen3vl_merger" }) |p| {
+        try std.testing.expect(archHasVision(archForProjector(p).?));
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), archForProjector("llava"));
+    try std.testing.expect(!archHasVision("qwen3"));
 }
 
 // Thinking off must prepend an empty reasoning block to the assistant open (so

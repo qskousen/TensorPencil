@@ -608,6 +608,10 @@ contradicts the sections above, this section is right.
 | `src/gui/history.zig` | the conversation store (format, index, day grouping) |
 | `src/gui/framing.zig` | ratio + megapixels → model-legal dimensions |
 | `src/gui/ui_probe.zig` | `zig build ui-probe` — renders the whole screen from canned data to a PNG |
+| `src/gui/catalog.zig` | the model catalog: folder scan, header-only classification, grouping queries, the JSON index |
+| `src/gui/selection.zig` | a pick → the effective model paths, with the per-family and per-class memories |
+| `src/gui/model_lib.zig` | the app's live catalog (scan thread, index, swap-in) and the chip/menu data built from it |
+| `src/gui/model_menu.zig` | the title-bar model chip with its grouped submenu, over plain data |
 
 `shell`, `bubbles` and `queue_rail` render from plain data and report through
 callbacks, which is what lets `ui-probe` draw the real screen with no model, no
@@ -619,6 +623,40 @@ No traffic lights and no `TensorPencil` wordmark: the mockup was imitating a
 macOS window, and the real window has a title bar of its own (the SDL window
 title is `TensorPencil`). The bar starts with the Chat/Studio toggle, which is
 the first thing on it that is actually a control.
+
+The right group is two dropdown chips, chat model then image model, and no third
+"residents" chip: the VRAM bar already says what is loaded, so each chip carries a
+green dot while its model is resident instead. A chip's menu lists architecture
+classes ("Gemma 4 31B", "Krea 2"), each a submenu of files, with unsupported
+classes greyed at the bottom and their reason beside each file. A pick applies at
+once (save, and reload if the resident model changed), like the thinking toggle.
+Amber text on the image chip means the checkpoint lacks a piece nothing supplies.
+
+The chip is a submenu item inside a one-item `dvui.menu`, the way `dvui.dropdown`
+is built, and the leaf rows are single labels straight inside their menu item. Two
+things that looked equivalent were not: tracking "open" by hand from the focused
+subwindow closed the whole menu the moment the pointer entered a submenu, and a
+row built from a box with a mark and two labels never activated inside a nested
+submenu. Both were measured by swapping the variants on the same menu.
+
+### Settings: models
+
+The seven path rows are gone. Settings has a folder list (add, remove, rescan, a
+count line), then a chat-model block (architecture, file, vision tower) and an
+image-model block (architecture, checkpoint, then one row per side slot the
+family has). Every dropdown lists only what the catalog says is compatible, plus
+"none" and "Other file…", which probes the picked file and adds it to the catalog
+so it resolves like any other. A bundled component shows as "bundled (in the
+checkpoint)" and stays overridable. Side files are remembered per FAMILY and
+vision towers per LLM class (architecture plus width), so switching between two
+Krea 2 files keeps the encoder and VAE that worked, and a 12B Gemma 4 tower is
+never offered to a 31B model.
+
+A config from before the catalog keeps its exact selection: a slot that already
+holds a path with nothing remembered adopts it rather than replacing it (the first
+build of this replaced the user's encoder and VAE with the first compatible files
+on the first scan). `zig build ui-probe -- out.png 1200 2800 --settings` renders
+the form over a canned catalog.
 
 ### Type (§2)
 

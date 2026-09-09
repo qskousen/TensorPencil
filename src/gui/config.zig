@@ -579,6 +579,41 @@ pub fn TextBuf(comptime cap: usize) type {
 
 pub const PathBuf = TextBuf(max_path);
 
+/// Folders the model catalog scans (recursively). A struct wrapper so
+/// `FixedList`'s `T = .{}` default applies.
+pub const max_model_dirs = 16;
+pub const ModelDir = struct { path: PathBuf = .{} };
+pub const ModelDirList = FixedList(ModelDir, max_model_dirs);
+
+/// What a remembered side-file slot may hold besides a path. Neither can be a
+/// real path, so a stored value is never ambiguous.
+pub const choice_bundled = "<bundled>";
+pub const choice_none = "<none>";
+
+/// The side files last used with one diffusion FAMILY, keyed by the
+/// `pipeline.Family` tag name. Per family, not per checkpoint: switching between
+/// two Krea2 files keeps the encoder and VAE that worked with the first.
+pub const max_family_name = 24;
+pub const FamilySides = struct {
+    family: TextBuf(max_family_name) = .{},
+    text_encoder: PathBuf = .{},
+    text_encoder_2: PathBuf = .{},
+    vae: PathBuf = .{},
+    taesd: PathBuf = .{},
+};
+pub const max_family_sides = 8;
+pub const FamilySidesList = FixedList(FamilySides, max_family_sides);
+
+/// The vision tower last used with one LLM class ("gemma4|5376": architecture
+/// and width, which is what a tower has to match), or `choice_none`.
+pub const max_class_key = 96;
+pub const ClassTower = struct {
+    class: TextBuf(max_class_key) = .{},
+    vision_tower: PathBuf = .{},
+};
+pub const max_class_towers = 16;
+pub const ClassTowerList = FixedList(ClassTower, max_class_towers);
+
 /// Sentinel for an unsaved window position: SDL places the window itself (the
 /// WM's default / centered) instead of us restoring a stored coordinate.
 pub const pos_unset: i32 = std.math.minInt(i32);
@@ -621,6 +656,15 @@ pub const Config = struct {
     text_encoder_2: PathBuf = .{},
     vae: PathBuf = .{},
     taesd: PathBuf = .{},
+    /// Folders the model catalog scans. The catalog fills the EFFECTIVE paths
+    /// above from picks made in the chips and Settings (see gui/selection.zig),
+    /// so every consumer of those paths is untouched by how they were chosen.
+    model_dirs: ModelDirList = .{},
+    /// Single files picked from outside the folders ("Other file…"), so they
+    /// stay in the catalog across restarts.
+    model_files: ModelDirList = .{},
+    family_sides: FamilySidesList = .{},
+    class_towers: ClassTowerList = .{},
     /// Directory generated images are written to (chat + image studio). Empty
     /// means "not resolved"; `load` fills it with `<Pictures>/TensorPencil`
     /// (`~/Pictures/TensorPencil` on Linux) when unset, so the settings view
@@ -955,6 +999,86 @@ pub const Config = struct {
         return self.diffusion_model.opt() != null;
     }
 
+    /// Add a model folder unless it is already listed. False when full.
+    pub fn addModelDir(self: *Config, path: []const u8) bool {
+        const p = std.mem.trimEnd(u8, path, "/");
+        if (p.len == 0) return false;
+        for (self.model_dirs.slice()) |*d| if (std.mem.eql(u8, d.path.slice(), p)) return true;
+        if (self.model_dirs.count >= max_model_dirs) return false;
+        self.model_dirs.items[self.model_dirs.count] = .{};
+        self.model_dirs.items[self.model_dirs.count].path.set(p);
+        self.model_dirs.count += 1;
+        return true;
+    }
+
+    pub fn addModelFile(self: *Config, path: []const u8) bool {
+        if (path.len == 0) return false;
+        for (self.model_files.slice()) |*d| if (std.mem.eql(u8, d.path.slice(), path)) return true;
+        if (self.model_files.count >= max_model_dirs) return false;
+        self.model_files.items[self.model_files.count] = .{};
+        self.model_files.items[self.model_files.count].path.set(path);
+        self.model_files.count += 1;
+        return true;
+    }
+
+    pub fn removeModelDir(self: *Config, i: usize) void {
+        if (i >= self.model_dirs.count) return;
+        std.mem.copyForwards(ModelDir, self.model_dirs.items[i .. self.model_dirs.count - 1], self.model_dirs.items[i + 1 .. self.model_dirs.count]);
+        self.model_dirs.count -= 1;
+        self.model_dirs.items[self.model_dirs.count] = .{};
+    }
+
+    /// Seed the folder list from the files already configured, for a config
+    /// written before folders existed: their parent directories are where the
+    /// user keeps models. Only when the list is empty.
+    pub fn seedModelDirs(self: *Config) void {
+        if (self.model_dirs.count > 0) return;
+        for ([_]*const PathBuf{ &self.llm_model, &self.vision_tower, &self.diffusion_model, &self.text_encoder, &self.text_encoder_2, &self.vae, &self.taesd }) |pb| {
+            const p = pb.opt() orelse continue;
+            if (std.fs.path.dirname(p)) |d| _ = self.addModelDir(d);
+        }
+    }
+
+    pub fn familySides(self: *const Config, family: []const u8) ?*const FamilySides {
+        for (self.family_sides.slice()) |*f| if (std.mem.eql(u8, f.family.slice(), family)) return f;
+        return null;
+    }
+
+    /// The memory slot for `family`, created empty on first use. Null only when
+    /// the table is full, which takes more families than exist.
+    pub fn familySidesMut(self: *Config, family: []const u8) ?*FamilySides {
+        for (self.family_sides.items[0..self.family_sides.count]) |*f| if (std.mem.eql(u8, f.family.slice(), family)) return f;
+        if (self.family_sides.count >= max_family_sides) return null;
+        const f = &self.family_sides.items[self.family_sides.count];
+        f.* = .{};
+        f.family.set(family);
+        self.family_sides.count += 1;
+        return f;
+    }
+
+    pub fn classTower(self: *const Config, class: []const u8) ?[]const u8 {
+        for (self.class_towers.slice()) |*c| if (std.mem.eql(u8, c.class.slice(), class)) return c.vision_tower.slice();
+        return null;
+    }
+
+    /// Remember `choice` (a path or `choice_none`) for `class`. The oldest entry
+    /// is dropped when the table is full.
+    pub fn rememberClassTower(self: *Config, class: []const u8, choice: []const u8) void {
+        for (self.class_towers.items[0..self.class_towers.count]) |*c| if (std.mem.eql(u8, c.class.slice(), class)) {
+            c.vision_tower.set(choice);
+            return;
+        };
+        if (self.class_towers.count >= max_class_towers) {
+            std.mem.copyForwards(ClassTower, self.class_towers.items[0 .. max_class_towers - 1], self.class_towers.items[1..max_class_towers]);
+            self.class_towers.count -= 1;
+        }
+        const c = &self.class_towers.items[self.class_towers.count];
+        c.* = .{};
+        c.class.set(class);
+        c.vision_tower.set(choice);
+        self.class_towers.count += 1;
+    }
+
     /// Resolve the config directory (`<config>/tp-gui`); caller frees. Null if
     /// the platform has no known config location.
     /// Recompute `width`/`height` from the framing choice. Called after load and
@@ -980,6 +1104,16 @@ pub const Config = struct {
         const dir = (try dirPath(io, gpa, environ)) orelse return null;
         defer gpa.free(dir);
         return try std.fs.path.join(gpa, &.{ dir, file_name });
+    }
+
+    /// A file that lives beside the config: `<dir of the config>/<name>`. With a
+    /// `--config` override that is the override's directory, so a test config
+    /// keeps its index to itself. Caller frees; null when no config dir exists.
+    pub fn siblingPath(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, override: ?[]const u8, name: []const u8) !?[]u8 {
+        const cfg_path = (try filePath(io, gpa, environ, override)) orelse return null;
+        defer gpa.free(cfg_path);
+        const dir = std.fs.path.dirname(cfg_path) orelse ".";
+        return try std.fs.path.join(gpa, &.{ dir, name });
     }
 
     /// The default image-output directory: `<Pictures>/TensorPencil`
@@ -1877,6 +2011,87 @@ test "sampling + presets save/load round-trip" {
     try std.testing.expectEqual(a.presets.items[0].sampling, b.presets.items[0].sampling);
     try std.testing.expectEqualStrings("greedy", b.presets.items[1].name.slice());
     try std.testing.expectEqual(a.presets.items[1].sampling, b.presets.items[1].sampling);
+}
+
+test "model folders: add dedupes and caps, remove shifts, seed reads parents" {
+    var c: Config = .{};
+    try std.testing.expect(c.addModelDir("/models/llm/"));
+    try std.testing.expect(c.addModelDir("/models/llm")); // same folder, trailing slash
+    try std.testing.expectEqual(@as(usize, 1), c.model_dirs.count);
+    try std.testing.expect(!c.addModelDir(""));
+    try std.testing.expect(c.addModelDir("/models/diffusion"));
+    c.removeModelDir(0);
+    try std.testing.expectEqual(@as(usize, 1), c.model_dirs.count);
+    try std.testing.expectEqualStrings("/models/diffusion", c.model_dirs.items[0].path.slice());
+    c.removeModelDir(7); // out of range: no-op
+    try std.testing.expectEqual(@as(usize, 1), c.model_dirs.count);
+
+    var i: usize = 0;
+    while (c.model_dirs.count < max_model_dirs) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        try std.testing.expect(c.addModelDir(try std.fmt.bufPrint(&buf, "/d/{d}", .{i})));
+    }
+    try std.testing.expect(!c.addModelDir("/one/too/many"));
+
+    // Seeding only fills an EMPTY list, from the configured files' folders.
+    var fresh: Config = .{};
+    fresh.llm_model.set("/lm/stuff/model.gguf");
+    fresh.vision_tower.set("/lm/mmproj.gguf");
+    fresh.diffusion_model.set("/comfy/diffusion_models/krea2/x.safetensors");
+    fresh.vae.set("/comfy/vae/v.safetensors");
+    fresh.seedModelDirs();
+    try std.testing.expectEqual(@as(usize, 4), fresh.model_dirs.count);
+    try std.testing.expectEqualStrings("/lm/stuff", fresh.model_dirs.items[0].path.slice());
+    try std.testing.expectEqualStrings("/comfy/vae", fresh.model_dirs.items[3].path.slice());
+    fresh.seedModelDirs();
+    try std.testing.expectEqual(@as(usize, 4), fresh.model_dirs.count);
+}
+
+test "family sides and class towers: get-or-create, remember, round-trip" {
+    var c: Config = .{};
+    try std.testing.expect(c.familySides("krea2") == null);
+    const k = c.familySidesMut("krea2").?;
+    k.vae.set("/vae/wan.safetensors");
+    k.text_encoder.set(choice_bundled);
+    try std.testing.expectEqualStrings("/vae/wan.safetensors", c.familySides("krea2").?.vae.slice());
+    try std.testing.expectEqual(@as(usize, 1), c.family_sides.count);
+    _ = c.familySidesMut("krea2").?; // same slot, no growth
+    try std.testing.expectEqual(@as(usize, 1), c.family_sides.count);
+
+    try std.testing.expect(c.classTower("gemma4|5376") == null);
+    c.rememberClassTower("gemma4|5376", "/lm/mmproj-31b.gguf");
+    c.rememberClassTower("gemma4|3840", choice_none);
+    c.rememberClassTower("gemma4|5376", "/lm/other.gguf"); // replaces
+    try std.testing.expectEqualStrings("/lm/other.gguf", c.classTower("gemma4|5376").?);
+    try std.testing.expectEqualStrings(choice_none, c.classTower("gemma4|3840").?);
+    try std.testing.expectEqual(@as(usize, 2), c.class_towers.count);
+    // Overflow drops the oldest.
+    var i: usize = 0;
+    while (i < max_class_towers) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        c.rememberClassTower(try std.fmt.bufPrint(&buf, "arch{d}|1", .{i}), choice_none);
+    }
+    try std.testing.expectEqual(@as(usize, max_class_towers), c.class_towers.count);
+    try std.testing.expect(c.classTower("gemma4|5376") == null);
+    try std.testing.expect(c.classTower("gemma4|3840") == null);
+
+    // JSON round trip through the real save/load.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
+    var env: Environ = .init(gpa);
+    defer env.deinit();
+    _ = c.addModelDir("/models");
+    try c.save(io, gpa, &env, path);
+    const back = Config.load(io, gpa, &env, path);
+    try std.testing.expectEqual(@as(usize, 1), back.model_dirs.count);
+    try std.testing.expectEqualStrings("/models", back.model_dirs.items[0].path.slice());
+    try std.testing.expectEqualStrings("/vae/wan.safetensors", back.familySides("krea2").?.vae.slice());
+    try std.testing.expectEqualStrings(choice_bundled, back.familySides("krea2").?.text_encoder.slice());
+    try std.testing.expectEqual(@as(usize, max_class_towers), back.class_towers.count);
 }
 
 test "diffEnabled needs only the primary checkpoint" {

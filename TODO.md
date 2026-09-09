@@ -14,6 +14,15 @@
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - gui: studio (image_view) still uses its own form layout; bring the parameter form onto the shared chip/section primitives
+- preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
+  "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL
+  (`taesd_decoder.pth`, `taesdxl_decoder.pth`) and Z-Image (`taef1_decoder.pth`) needs
+  (a) a reader for PyTorch's zip+pickle `.pth` container, or a `tools/convert_taesd.py`
+  that rewrites them as safetensors, and (b) a `taesd.zig` decoder (TAESD is TAEHV
+  without the temporal memory blocks; `wan_vae.loadConv` and the taehv CPU/CUDA/Vulkan
+  kernels are the parts to reuse) plus a `previewFits` arm per latent format in
+  `gui/model_spec.zig`. The catalog and the settings row need nothing else: a file
+  that answers `previewFits` for a family is offered for it
 - the CPU steppers' `prefill()` is still one un-chunked forward over the whole
   tail, so it has no boundary to stop or re-plan at. Inert today (the GUI is
   CUDA-only and the CLI arms no cancel), but any CPU-backed frontend needs it

@@ -85,9 +85,12 @@ each has caught.
   not the other 600.
 - `zig build gui-test` — tp-gui unit tests (config, fonts, style, history, framing,
   markdown, meter math; not part of `test`)
-- `zig build ui-probe -- out.png [w h] [--states]` — render the whole chat workspace
-  (or the status bar under three loads) to a PNG from canned data, with no model,
-  GPU or engine. The GUI's failure modes are visual; this is how you see them.
+- `zig build ui-probe -- out.png [w h] [--states|--settings]` — render the whole chat
+  workspace (or the status bar under three loads, or the settings form) to a PNG from
+  canned data, with no model, GPU or engine. The GUI's failure modes are visual; this
+  is how you see them.
+- `zig build catalog-probe -- <folder>...` — scan model folders as tp-gui does and print
+  what each file was taken for. The answer to "why is my model not in the menu".
 - `zig build -Doptimize=ReleaseFast` — optimized; required for any timing measurement.
 
 The gate lives in `src/test_gate.zig` (`build_options.integration`): GPU `init` fails in
@@ -126,6 +129,15 @@ user- or model-visible string must go through its run splitter (`addStyled` /
 `richLabel`) or it renders tofu the moment it leaves Latin. `shell.zig`,
 `bubbles.zig` and `queue_rail.zig` render from plain data through callbacks, which
 is what lets `ui-probe` draw the real screen without an engine.
+
+**tp-gui picks models from a catalog, never from typed paths.** `gui/catalog.zig` scans
+the configured folders header-only (`Container.openHeader`, so a scan never maps a
+weight) and classifies each file by what the ENGINE says it is: `detectFamily` for a
+checkpoint, GGUF metadata plus `chat.familyForArch` for an LLM, and
+`model_spec.storeFits` (the pipeline's probe table plus a width and depth check) for a
+side file. `gui/selection.zig` is the one writer of the effective path fields, from a
+pick and the per-family / per-class memories; everything downstream still reads only
+those fields.
 
 A model architecture is normally three files: `foo.zig` (CPU reference and the loader),
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path

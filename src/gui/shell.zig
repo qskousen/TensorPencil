@@ -14,6 +14,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const style = @import("style.zig");
+const model_menu = @import("model_menu.zig");
 const fonts = @import("fonts.zig");
 
 const C = style.C;
@@ -37,16 +38,18 @@ pub const Bands = struct {
 
 pub const Title = struct {
     tab: Tab,
-    /// The diffusion checkpoint, as a dropdown chip ("sdxl-turbo · fp16").
-    diff_model: []const u8,
-    /// What is resident right now, static ("qwen-7b + sdxl-turbo"). Empty
-    /// hides the chip.
-    residents: []const u8 = "",
+    /// The chat model chip and its menu.
+    llm: model_menu.Chip,
+    llm_menu: model_menu.Menu = .{},
+    /// The image model chip and its menu.
+    image: model_menu.Chip,
+    image_menu: model_menu.Menu = .{},
 };
 
 pub const TitleActions = struct {
     on_tab: *const fn (Tab) void,
-    on_model_menu: *const fn () void,
+    on_llm_pick: *const fn (model_menu.Pick) void,
+    on_image_pick: *const fn (model_menu.Pick) void,
 };
 
 pub fn titleBar(m: Title, cb: TitleActions) void {
@@ -70,7 +73,9 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
     }
 
     // Right group. `gravity_x = 1` inside an expanded spacer is dvui's
-    // margin-left:auto.
+    // margin-left:auto. Two chips, LLM then image; each is a dropdown over the
+    // catalog and shows a dot while its model is resident (the VRAM bar says
+    // how much, so there is no third "residents" chip).
     var right = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .gravity_y = 0.5,
@@ -79,10 +84,8 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
     {
         var grp = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .gravity_y = 0.5 });
         defer grp.deinit();
-        if (style.chip(@src(), m.diff_model, .{ .dropdown = true, .fill = C.chip_hi })) cb.on_model_menu();
-        if (m.residents.len > 0) {
-            _ = style.chip(@src(), m.residents, .{ .fill = C.chip_hi, .id_extra = 1 });
-        }
+        if (model_menu.chip(@src(), m.llm, m.llm_menu, 0)) |p| cb.on_llm_pick(p);
+        if (model_menu.chip(@src(), m.image, m.image_menu, 1)) |p| cb.on_image_pick(p);
     }
 }
 
