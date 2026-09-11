@@ -661,7 +661,7 @@ pub fn main(init: std.process.Init) !void {
     // be resting on.
     const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else if (settings_mode) @as(u32, 2600) else 705);
 
-    var back = try Backend.initWindow(.{
+    const win_opts: Backend.InitOptions = .{
         .io = init.io,
         .allocator = gpa,
         .size = .{ .w = @floatFromInt(w), .h = @floatFromInt(h) },
@@ -669,7 +669,19 @@ pub fn main(init: std.process.Init) !void {
         .title = "ui-probe",
         .hidden = true,
         .environ_map = init.environ_map,
-    });
+    };
+    // The window is never shown, so a display is only worth having for the
+    // fidelity of it: SDL picks no driver at all without one, and its dummy
+    // driver lands on the software renderer, whose glyph blitting is blurrier.
+    // Layout is identical either way, which is what a headless run is asking
+    // about. Retry rather than probe for a display, so any reason SDL cannot
+    // reach one takes the same path.
+    var back = Backend.initWindow(win_opts) catch blk: {
+        Backend.c.SDL_Quit();
+        std.debug.print("ui-probe: no display, falling back to the SDL dummy video driver\n", .{});
+        _ = Backend.c.SDL_SetHint(Backend.c.SDL_HINT_VIDEO_DRIVER, "dummy");
+        break :blk try Backend.initWindow(win_opts);
+    };
     defer back.deinit();
 
     var win = try dvui.Window.init(@src(), gpa, back.backend(), .{});
