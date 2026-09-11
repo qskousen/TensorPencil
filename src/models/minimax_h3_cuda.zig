@@ -34,6 +34,7 @@
 const std = @import("std");
 const minimax_h3 = @import("minimax_h3.zig");
 const lora_cuda = @import("lora_cuda.zig");
+const lora_mod = @import("lora.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -88,7 +89,7 @@ pub fn supported(dit: *const DiT) bool {
             // A LoRA sidecar this backend cannot apply makes the whole trunk
             // unsupported, not "supported without the LoRA": running the base
             // GEMM alone is a different model, silently.
-            if (l.lora) |t| if (!lora_cuda.supported(t)) return false;
+            for (l.lora) |h| if (!lora_cuda.supported(h.target)) return false;
         }
     }
     const cfg = dit.cfg;
@@ -221,7 +222,7 @@ pub const Workspace = struct {
         var max_rank: usize = 0;
         for (dit.blocks) |b| {
             inline for (.{ b.attn.qkv, b.attn.out, b.mlp.fc1, b.mlp.fc2 }) |l| {
-                if (l.lora) |t| for (t.factors) |f| {
+                for (l.lora) |h| for (h.target.factors) |f| {
                     max_rank = @max(max_rank, f.a.rows);
                 };
             }
@@ -321,6 +322,7 @@ fn lin(be: *Backend, y: Buf, w: Weight) !void {
 fn sidecar(
     be: *Backend,
     ws: *Workspace,
+    stack: ?*const lora_mod.Stack,
     y: Buf,
     x: Buf,
     m: usize,
@@ -328,15 +330,19 @@ fn sidecar(
     row0: usize,
     n: usize,
 ) !void {
-    const t = l.lora orelse return;
+    if (l.lora.len == 0) return;
     // The scratch is sized by `loraScratch` from the same DiT, so a missing one
     // means the LoRA was attached after the workspace was built. That would
     // otherwise be a render with no sidecar anywhere.
-    if (ws.lora) |*lws| {
-        try lora_cuda.applyRange(be, lws, y, x, m, t, row0, n);
-    } else {
-        std.log.err("minimax_h3_cuda: {s} has a sidecar but the workspace has no LoRA scratch", .{t.tag});
+    const lws = if (ws.lora) |*w| w else {
+        std.log.err("minimax_h3_cuda: {s} has a sidecar but the workspace has no LoRA scratch", .{l.lora[0].target.tag});
         return error.Unsupported;
+    };
+    for (l.lora) |h| {
+        const s = stack.?.files.items[h.file].strength;
+        // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
+        if (s == 0) continue;
+        try lora_cuda.applyRange(be, lws, y, x, m, h.target, s, row0, n);
     }
 }
 
@@ -461,9 +467,9 @@ pub fn forward(
         try lin(be, ws.q_d, rowSlice(b.attn.qkv.w, 0, inner));
         try lin(be, ws.k_d, rowSlice(b.attn.qkv.w, inner, inner));
         try lin(be, ws.v_d, rowSlice(b.attn.qkv.w, 2 * inner, inner));
-        try sidecar(be, ws, ws.q_d, ws.t1_d, seq, b.attn.qkv, 0, inner);
-        try sidecar(be, ws, ws.k_d, ws.t1_d, seq, b.attn.qkv, inner, inner);
-        try sidecar(be, ws, ws.v_d, ws.t1_d, seq, b.attn.qkv, 2 * inner, inner);
+        try sidecar(be, ws, dit.lora, ws.q_d, ws.t1_d, seq, b.attn.qkv, 0, inner);
+        try sidecar(be, ws, dit.lora, ws.k_d, ws.t1_d, seq, b.attn.qkv, inner, inner);
+        try sidecar(be, ws, dit.lora, ws.v_d, ws.t1_d, seq, b.attn.qkv, 2 * inner, inner);
 
         const qn = try normBuf(be, b.attn.q_norm);
         const kn = try normBuf(be, b.attn.k_norm);
@@ -482,7 +488,7 @@ pub fn forward(
 
         try linPrep(be, ws.attn_d, seq, inner);
         try lin(be, ws.t1_d, b.attn.out.w);
-        try sidecar(be, ws, ws.t1_d, ws.attn_d, seq, b.attn.out, 0, h);
+        try sidecar(be, ws, dit.lora, ws.t1_d, ws.attn_d, seq, b.attn.out, 0, h);
         for (layout.segments) |sg| {
             const idx = segIdx(sg.kind, vmask, amask, 0);
             const base = if (idx == null) ts.rowFor(sg.kind) else 0;
@@ -529,14 +535,14 @@ pub fn forward(
             // fc1 is the fused swiglu gate+value; rows [0, ffn) are the GATE.
             try lin(be, ws.gate_d, rowSlice(b.mlp.fc1.w, 0, cfg.ffn));
             try lin(be, ws.up_d, rowSlice(b.mlp.fc1.w, cfg.ffn, cfg.ffn));
-            try sidecar(be, ws, ws.gate_d, ws.t1_d, tile, b.mlp.fc1, 0, cfg.ffn);
-            try sidecar(be, ws, ws.up_d, ws.t1_d, tile, b.mlp.fc1, cfg.ffn, cfg.ffn);
+            try sidecar(be, ws, dit.lora, ws.gate_d, ws.t1_d, tile, b.mlp.fc1, 0, cfg.ffn);
+            try sidecar(be, ws, dit.lora, ws.up_d, ws.t1_d, tile, b.mlp.fc1, cfg.ffn, cfg.ffn);
             try be.siluMul(ws.gate_d, ws.up_d, tile * cfg.ffn);
             try linPrep(be, ws.gate_d, tile, cfg.ffn);
             try lin(be, ws.t1_d, b.mlp.fc2.w);
             // `gate_d` is the fc2 activation, and `siluMul` wrote it in place,
             // so the sidecar reads the post-swiglu value like the base GEMM.
-            try sidecar(be, ws, ws.t1_d, ws.gate_d, tile, b.mlp.fc2, 0, h);
+            try sidecar(be, ws, dit.lora, ws.t1_d, ws.gate_d, tile, b.mlp.fc2, 0, h);
             for (layout.segments) |sg| {
                 const lo = @max(sg.start, c0);
                 const hi = @min(sg.stop, c0 + tile);

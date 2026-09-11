@@ -604,6 +604,27 @@ pub const FamilySides = struct {
 pub const max_family_sides = 8;
 pub const FamilySidesList = FixedList(FamilySides, max_family_sides);
 
+/// One LoRA the user turned on for a diffusion FAMILY, and its dial.
+///
+/// Keyed by family like `FamilySides`, and FLAT rather than a list nested inside
+/// each family's row: `Config` is already ~150 KB by value and `std.json`'s
+/// recursive parse overflows the stack as it grows (hence `parseJsonBigStack`).
+///
+/// ⚠️ **Never auto-filled.** A side file has a right answer to adopt when the
+/// user has not chosen one ("whatever the checkpoint carries"); a LoRA does not,
+/// and adopting the first compatible file would silently change every render.
+pub const FamilyLora = struct {
+    family: TextBuf(max_family_name) = .{},
+    path: PathBuf = .{},
+    /// Multiplies the file's own `alpha / rank`. Load-neutral: the engine reads
+    /// it at every apply, so moving it needs no reload.
+    strength: f32 = 1.0,
+    /// Off without forgetting the pick or the dial.
+    enabled: bool = true,
+};
+pub const max_family_loras = 12;
+pub const FamilyLoraList = FixedList(FamilyLora, max_family_loras);
+
 /// The vision tower last used with one LLM class ("gemma4|5376": architecture
 /// and width, which is what a tower has to match), or `choice_none`.
 pub const max_class_key = 96;
@@ -664,6 +685,9 @@ pub const Config = struct {
     /// stay in the catalog across restarts.
     model_files: ModelDirList = .{},
     family_sides: FamilySidesList = .{},
+    /// LoRA sidecars, per family. Load-BEARING (the stack is built at session
+    /// init), unlike the strengths inside them.
+    loras: FamilyLoraList = .{},
     class_towers: ClassTowerList = .{},
     /// Directory generated images are written to (chat + image studio). Empty
     /// means "not resolved"; `load` fills it with `<Pictures>/TensorPencil`
@@ -1056,6 +1080,44 @@ pub const Config = struct {
         return f;
     }
 
+    /// The LoRA row for (`family`, `path`), or null.
+    pub fn familyLoraMut(self: *Config, family: []const u8, path: []const u8) ?*FamilyLora {
+        for (self.loras.items[0..self.loras.count]) |*l| {
+            if (std.mem.eql(u8, l.family.slice(), family) and std.mem.eql(u8, l.path.slice(), path)) return l;
+        }
+        return null;
+    }
+
+    /// Add a LoRA for `family`, or return the row it already has. Null when the
+    /// table is full, which the caller reports rather than silently dropping the
+    /// pick.
+    pub fn addFamilyLora(self: *Config, family: []const u8, path: []const u8) ?*FamilyLora {
+        if (self.familyLoraMut(family, path)) |l| return l;
+        if (self.loras.count >= max_family_loras) return null;
+        const l = &self.loras.items[self.loras.count];
+        l.* = .{};
+        l.family.set(family);
+        l.path.set(path);
+        self.loras.count += 1;
+        return l;
+    }
+
+    /// Drop the LoRA row for (`family`, `path`), keeping the rest in order.
+    pub fn removeFamilyLora(self: *Config, family: []const u8, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.loras.count) : (i += 1) {
+            const l = &self.loras.items[i];
+            if (!std.mem.eql(u8, l.family.slice(), family) or !std.mem.eql(u8, l.path.slice(), path)) continue;
+            // Order is what fixes the float sum across runs, so this shifts
+            // rather than swapping the last entry in.
+            var j = i;
+            while (j + 1 < self.loras.count) : (j += 1) self.loras.items[j] = self.loras.items[j + 1];
+            self.loras.items[self.loras.count - 1] = .{};
+            self.loras.count -= 1;
+            return;
+        }
+    }
+
     pub fn classTower(self: *const Config, class: []const u8) ?[]const u8 {
         for (self.class_towers.slice()) |*c| if (std.mem.eql(u8, c.class.slice(), class)) return c.vision_tower.slice();
         return null;
@@ -1104,6 +1166,17 @@ pub const Config = struct {
         const dir = (try dirPath(io, gpa, environ)) orelse return null;
         defer gpa.free(dir);
         return try std.fs.path.join(gpa, &.{ dir, file_name });
+    }
+
+    /// Whether a settings file already exists. The caller uses it to tell a first
+    /// run from a run whose settings simply happen to equal the defaults, which
+    /// is what makes machine-dependent defaults (the backend) safe to apply
+    /// without overwriting a choice the user made.
+    pub fn exists(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, override: ?[]const u8) bool {
+        const path = (filePath(io, gpa, environ, override) catch return false) orelse return false;
+        defer gpa.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+        return true;
     }
 
     /// A file that lives beside the config: `<dir of the config>/<name>`. With a
@@ -1394,7 +1467,12 @@ fn parsePreset(val: []const u8) ?Preset {
 /// chat test roots too), which `zig build gui-test` runs in PARALLEL from the
 /// same cwd, a fixed filename races across binaries and flakes.
 fn testFile(buf: []u8, comptime tag: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, ".gui-config-{s}-test.{d}", .{ tag, std.posix.system.getpid() }) catch unreachable;
+    // `std.posix.system` has no getpid on Windows, where the pid is a DWORD.
+    const pid: u32 = if (@import("builtin").os.tag == .windows)
+        std.os.windows.GetCurrentProcessId()
+    else
+        @intCast(std.posix.system.getpid());
+    return std.fmt.bufPrint(buf, ".gui-config-{s}-test.{d}", .{ tag, pid }) catch unreachable;
 }
 
 test "PathBuf opt/set round-trips and reports empty as null" {
@@ -2092,6 +2170,72 @@ test "family sides and class towers: get-or-create, remember, round-trip" {
     try std.testing.expectEqualStrings("/vae/wan.safetensors", back.familySides("krea2").?.vae.slice());
     try std.testing.expectEqualStrings(choice_bundled, back.familySides("krea2").?.text_encoder.slice());
     try std.testing.expectEqual(@as(usize, max_class_towers), back.class_towers.count);
+}
+
+test "family loras: add dedupes, remove keeps order, table caps" {
+    var c: Config = .{};
+    // Two families in ONE flat table, which is the point of the family key: a
+    // lookup must not find the other family's row for the same file.
+    const a = c.addFamilyLora("sensenova", "/l/turbo.safetensors").?;
+    a.strength = 0.5;
+    const b = c.addFamilyLora("sensenova", "/l/ink.safetensors").?;
+    b.strength = 1.5;
+    _ = c.addFamilyLora("krea2", "/l/turbo.safetensors").?;
+    try std.testing.expectEqual(@as(usize, 3), c.loras.count);
+
+    // Adding the same pair again returns the existing row rather than a second.
+    const again = c.addFamilyLora("sensenova", "/l/turbo.safetensors").?;
+    try std.testing.expectEqual(@as(f32, 0.5), again.strength);
+    try std.testing.expectEqual(@as(usize, 3), c.loras.count);
+    try std.testing.expect(c.familyLoraMut("zimage", "/l/turbo.safetensors") == null);
+
+    // Removal SHIFTS: order is what fixes the float sum of the deltas across
+    // runs, so swapping the last entry in would reorder a stack silently.
+    c.removeFamilyLora("sensenova", "/l/turbo.safetensors");
+    try std.testing.expectEqual(@as(usize, 2), c.loras.count);
+    try std.testing.expectEqualStrings("/l/ink.safetensors", c.loras.items[0].path.slice());
+    try std.testing.expectEqualStrings("sensenova", c.loras.items[0].family.slice());
+    try std.testing.expectEqualStrings("krea2", c.loras.items[1].family.slice());
+    // The other family's row for the same path is untouched.
+    try std.testing.expect(c.familyLoraMut("krea2", "/l/turbo.safetensors") != null);
+
+    // Full table refuses rather than dropping the oldest: a LoRA silently
+    // falling out of a stack is a different render with no error.
+    var full: Config = .{};
+    var buf: [64]u8 = undefined;
+    for (0..max_family_loras) |i| {
+        const path = try std.fmt.bufPrint(&buf, "/l/{d}.safetensors", .{i});
+        try std.testing.expect(full.addFamilyLora("sensenova", path) != null);
+    }
+    try std.testing.expect(full.addFamilyLora("sensenova", "/l/one-too-many.safetensors") == null);
+}
+
+test "loras save/load round-trip, strengths and enabled flags included" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var c: Config = .{};
+    c.addFamilyLora("sensenova", "/l/turbo.safetensors").?.strength = 0.85;
+    const off = c.addFamilyLora("sensenova", "/l/ink.safetensors").?;
+    off.strength = 0.25;
+    off.enabled = false;
+
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "loras");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try c.save(io, gpa, &environ, file);
+
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 2), back.loras.count);
+    try std.testing.expectEqualStrings("/l/turbo.safetensors", back.loras.items[0].path.slice());
+    try std.testing.expectEqual(@as(f32, 0.85), back.loras.items[0].strength);
+    try std.testing.expect(back.loras.items[0].enabled);
+    // A disabled row SURVIVES: it is a pick the user turned off, not one they
+    // removed, and the dial they set is part of it.
+    try std.testing.expectEqual(@as(f32, 0.25), back.loras.items[1].strength);
+    try std.testing.expect(!back.loras.items[1].enabled);
 }
 
 test "diffEnabled needs only the primary checkpoint" {

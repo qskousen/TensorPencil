@@ -56,6 +56,9 @@ const qwen3 = @import("tp_models").models.qwen3;
 const qwen3_gpu = @import("tp_models").models.qwen3_gpu;
 const krea2_text = @import("tp_models").models.krea2_text;
 const dit_mod = @import("tp_models").models.dit;
+const sensenova = @import("tp_models").models.sensenova;
+const sensenova_cuda = @import("tp_models").models.sensenova_cuda;
+const sensenova_gpu = @import("tp_models").models.sensenova_gpu;
 const zimage = @import("tp_models").models.zimage;
 const zimage_text = @import("tp_models").models.zimage_text;
 const zimage_gpu = @import("tp_models").models.zimage_gpu;
@@ -131,6 +134,17 @@ pub const Backend = enum {
     }
 };
 
+/// The backend to DEFAULT to on a machine nobody has configured, from which
+/// driver libraries are installed: `zig_cuda` on an NVIDIA box, else `vulkan`,
+/// else `cpu`. A library being present is not proof a device is, so this picks a
+/// starting point; init still reports the truth. `cuda` is never chosen
+/// automatically because it additionally needs cuBLASLt and cuDNN 9.
+pub fn detectBackend() Backend {
+    if (cuda.cu.driverPresent()) return .zig_cuda;
+    if (gpu_mod.context.loaderPresent()) return .vulkan;
+    return .cpu;
+}
+
 /// VAE decode-path override (see `Options.vae_decode`). `auto` runs the adaptive
 /// chain; the others force the *starting* strategy but still degrade gracefully
 /// on OOM, so a forced path never hard-fails:
@@ -197,9 +211,21 @@ pub const Snapshot = struct {
     }
 };
 
+/// One LoRA file and its dial. `strength` multiplies the file's own
+/// `alpha / rank`; it is not folded into a factor, so a caller can move it on a
+/// live session (`Session.setLoraStrength`) without reloading.
+pub const LoraSpec = struct {
+    path: []const u8,
+    strength: f32 = 1.0,
+};
+
 pub const Options = struct {
     prompt: []const u8,
     negative: []const u8 = "",
+    /// SenseNova reference pictures for image editing, planar `[3][h][w]` in
+    /// [0, 1], in request order. Empty is text-to-image. Ignored by every other
+    /// family. See `EncodeOptions.sn_ref_images`.
+    sn_ref_images: []const sensenova.RefImage = &.{},
     /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax`,
     /// the two are not interchangeable spellings of the same thing.
     prompt_syntax: PromptSyntax = .comfy,
@@ -279,15 +305,17 @@ pub const Options = struct {
     /// they resolve independently, so this has its own path and its own flag.
     vae_2_path: []const u8 = "",
     explicit_vae_2: bool = false,
-    /// Optional denoiser LoRA, applied as a runtime low-rank sidecar rather than
-    /// merged (`models/lora.zig`). Empty means none.
+    /// Denoiser LoRAs, applied as runtime low-rank sidecars rather than merged
+    /// (`models/lora.zig`). Empty means none. Their deltas add, so the order is
+    /// only what fixes the float sum.
     ///
-    /// Not a resolvable `Component`: a LoRA never ships inside the checkpoint it
+    /// Not resolvable `Component`s: a LoRA never ships inside the checkpoint it
     /// patches, so there is nothing for `resolveComponent` to prefer, and a
     /// defaulted path would silently apply a LoRA nobody asked for.
+    loras: []const LoraSpec = &.{},
+    /// Single-LoRA shorthand, folded into `loras` at `init`. `lora_path` empty
+    /// means "use `loras`".
     lora_path: []const u8 = "",
-    /// Multiplies every factor's `alpha / rank`. Folded in at load, so changing
-    /// it means reloading the sidecar.
     lora_strength: f32 = 1.0,
     /// Optional per-step progress hook (see `Progress`).
     on_step: ?Progress = null,
@@ -363,7 +391,10 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
         // with 30 steps and cfg 4. H3 belongs here structurally rather than by
         // template: `schedule.Scheduler.defaultFor` keys on the sigma TABLE, and
         // H3's is `discrete_flow`, the same arm that already answers `simple`.
-        .krea2, .zimage, .anima, .minimax_h3 => .simple,
+        // SenseNova joins them by table rather than by template: its schedule is
+        // the same `discrete_flow` shift, and ComfyUI's own workflow leaves the
+        // KSampler on `normal`, which over a flow table IS `simple`.
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova => .simple,
         .sd15, .sdxl => .normal,
     };
 }
@@ -665,6 +696,16 @@ pub const Cond = struct {
     /// the layout and the payload need it, and deriving it again from a
     /// re-tokenized prompt is how the two would drift apart.
     h3: ?H3Refs = null,
+    /// SenseNova only: the RoPE t index the generated tokens take.
+    ///
+    /// It rides on the conditioning because it is NOT derivable from `seq`: a
+    /// reference picture's tokens all share ONE t index, so an edit prompt's t
+    /// runs short of its token count. Reconstructing it as `seq` puts the canvas
+    /// three positions past where the prefix ended, and the sequence axis has
+    /// theta 5e6, whose fastest channel turns a radian per position — so the
+    /// canvas attends against a prefix rotated out from under it and the render is
+    /// structured noise.
+    sn_time: ?u32 = null,
     /// SDXL's pooled CLIP-G vector (1280). Null for the families that do not use one.
     ///
     /// It rides on the conditioning rather than being folded into it because the vector
@@ -766,7 +807,21 @@ pub const EncodeOptions = struct {
     h3_keyframes: []const Session.KeyframeReq = &.{},
     h3_canvas_h: usize = 0,
     h3_canvas_w: usize = 0,
+    /// SenseNova reference pictures for image editing, in REQUEST order, planar
+    /// `[3][h][w]` in [0, 1]. Empty is text-to-image. Ignored by every other
+    /// family.
+    ///
+    /// NOT resized here, because the reference is not resized upstream either:
+    /// ComfyUI's node takes the picture as the workflow hands it over, and the
+    /// token count follows its extent. A caller that wants a budget applies it.
+    sn_ref_images: []const sensenova.RefImage = &.{},
+    /// Which conditioning branch this is. SenseNova's negative branch under
+    /// EDITING is not the unconditional text prompt: it presents the reference
+    /// pictures with no prompt at all.
+    prompt_type: PromptType = .positive,
 };
+
+pub const PromptType = enum { positive, negative };
 
 /// Which prompt dialect to parse. The two are NOT variations on a theme: see
 /// `core/prompt_a1111.zig` for the five things that differ.
@@ -1119,6 +1174,37 @@ fn warnAnimaCpu() void {
         "CPU. Expect CPU sampling speed.", .{});
 }
 
+/// The prompt layout for one SenseNova conditioning: plain causal when there are
+/// no reference pictures, block-causal with spliced image blocks when there are.
+fn senseNovaLayout(
+    gpa: std.mem.Allocator,
+    model: *const sensenova.Model,
+    ids: []const u32,
+    refs: []const sensenova.RefImage,
+    negative: bool,
+) !sensenova.PromptLayout {
+    if (refs.len == 0) return sensenova.plainLayout(gpa, ids);
+    const grids = try gpa.alloc([2]usize, refs.len);
+    defer gpa.free(grids);
+    for (refs, grids) |r, *g| g.* = r.grid(model.cfg);
+    return sensenova.editLayout(gpa, ids, grids, negative);
+}
+
+/// A `Cond` read back as the prefix KV cache `encode` put in it. The shape is not
+/// stored on the `Cond`, because it is fully determined by the model's own
+/// configuration and the token count.
+fn senseNovaPrefix(model: *const sensenova.Model, cond: Cond) sensenova.Prefix {
+    const kv_dim = model.cfg.kvDim();
+    std.debug.assert(cond.data.len == model.cfg.n_layers * 2 * cond.seq * kv_dim);
+    return .{
+        .kv = cond.data,
+        .seq = cond.seq,
+        .kv_dim = kv_dim,
+        .n_layers = model.cfg.n_layers,
+        .time = cond.sn_time orelse @intCast(cond.seq),
+    };
+}
+
 pub const Denoiser = struct {
     sess: *Session,
     lat_h: usize,
@@ -1191,6 +1277,14 @@ pub const Denoiser = struct {
     an_cu_ws: ?anima_cuda.Workspace = null,
     /// The folded modulation schedule both Anima device sessions borrow.
     an_mods: ?[]f32 = null,
+    /// SenseNova's device state. One session per branch, because a session holds
+    /// that branch's prefix KV cache on the device.
+    sn_cu: ?sensenova_cuda.Session = null,
+    sn_cu_neg: ?sensenova_cuda.Session = null,
+    sn_cu_ws: ?sensenova_cuda.Workspace = null,
+    sn_vk: ?sensenova_gpu.Session = null,
+    sn_vk_neg: ?sensenova_gpu.Session = null,
+    sn_vk_ws: ?sensenova_gpu.Workspace = null,
 
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.v_neg) |b| gpa.free(b);
@@ -1222,6 +1316,12 @@ pub const Denoiser = struct {
         if (self.an_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.an_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
         if (self.an_mods) |m| gpa.free(m);
+        if (self.sn_cu) |*x| x.deinit(self.sess.cu_be.?);
+        if (self.sn_cu_neg) |*x| x.deinit(self.sess.cu_be.?);
+        if (self.sn_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.sn_vk) |*x| x.deinit(self.sess.gpu_ctx.?);
+        if (self.sn_vk_neg) |*x| x.deinit(self.sess.gpu_ctx.?);
+        if (self.sn_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
         if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_neg) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
@@ -1270,6 +1370,7 @@ pub const Denoiser = struct {
         if (s.family().isSd()) return self.predictSd(gpa, v_out, latent, sigma, step, cancel);
         if (s.family() == .zimage) return self.predictZImage(gpa, v_out, latent, sigma, cancel);
         if (s.family() == .anima) return self.predictAnima(gpa, v_out, latent, sigma, step, cancel);
+        if (s.family() == .sensenova) return self.predictSenseNova(gpa, v_out, latent, sigma, cancel);
         const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
@@ -1291,6 +1392,52 @@ pub const Denoiser = struct {
         } else {
             try dit.forward(io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
         }
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    /// SenseNova's forward. The conditioning is a prefix KV cache rather than a
+    /// hidden state, and the model's own timestep is `1 - sigma`, so neither the
+    /// cache nor the timestep can be handed straight through.
+    ///
+    /// CFG mixes velocities exactly as it does for the other flow families: the
+    /// model returns the trajectory derivative, even though its head predicts x0.
+    fn predictSenseNova(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const model = &s.models.sensenova.dit;
+        std.debug.assert(v_out.len == sensenova.latent_channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+        const t = 1.0 - sigma;
+
+        if (self.sn_cu) |*cu| {
+            const b = s.cu_be.?;
+            try sensenova_cuda.forward(model, b, cu, &self.sn_cu_ws.?, s.io, gpa, v_out, latent, t, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg = self.v_neg.?;
+            try sensenova_cuda.forward(model, b, &self.sn_cu_neg.?, &self.sn_cu_ws.?, s.io, gpa, v_neg, latent, t, cancel);
+            sampler.applyCfg(v_out, v_neg, self.cfg);
+            return;
+        }
+        if (self.sn_vk) |*vk| {
+            const gc = s.gpu_ctx.?;
+            try sensenova_gpu.forward(model, gc, vk, &self.sn_vk_ws.?, s.io, gpa, v_out, latent, t, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg = self.v_neg.?;
+            try sensenova_gpu.forward(model, gc, &self.sn_vk_neg.?, &self.sn_vk_ws.?, s.io, gpa, v_neg, latent, t, cancel);
+            sampler.applyCfg(v_out, v_neg, self.cfg);
+            return;
+        }
+
+        try model.predict(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, senseNovaPrefix(model, self.cond_pos), t, cancel);
+        if (self.cfg == 1.0) return;
+        const v_neg = self.v_neg.?;
+        try model.predict(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, senseNovaPrefix(model, self.cond_neg.?), t, cancel);
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
@@ -1622,6 +1769,15 @@ pub const Container = union(enum) {
         return .{ .safetensors = try safetensors.SafeTensors.openIn(gpa, io, dir, path) };
     }
 
+    /// `open`, naming the file if it fails. A run opens several checkpoints, so a
+    /// bare `error.FileNotFound` does not say which one the user got wrong. Used
+    /// wherever the path came from the user; a speculative open of a defaulted
+    /// path stays on `open`, where a miss is expected and not reported.
+    pub fn openNamed(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
+        errdefer |err| std.log.err("cannot open {s}: {t}", .{ path, err });
+        return open(gpa, io, path);
+    }
+
     fn isGgufIn(io: std.Io, dir: std.Io.Dir, path: []const u8) !bool {
         var magic: [4]u8 = undefined;
         const f = try dir.openFile(io, path, .{ .mode = .read_only });
@@ -1685,7 +1841,7 @@ pub const Container = union(enum) {
 /// the denoiser).
 fn openIfGiven(gpa: std.mem.Allocator, io: std.Io, path: []const u8, explicit: bool) !?Container {
     if (path.len == 0) return null;
-    if (explicit) return try Container.open(gpa, io, path);
+    if (explicit) return try Container.openNamed(gpa, io, path);
     // A *defaulted* path may simply not exist (a box with only SD checkpoints has no
     // krea2 VAE), and that is not an error as long as the primary checkpoint carries
     // the component. An explicit path that cannot be opened still fails loudly.
@@ -1755,6 +1911,13 @@ pub const anima_probe = "llm_adapter.blocks.0.cross_attn.q_proj.weight";
 /// OR'd (any hit resolves the component), so the AND lives in `detectFamily`.
 pub const minimax_h3_video_probe = "video_patch_proj.weight";
 pub const minimax_h3_audio_probe = "audio_patch_proj.weight";
+
+/// The tensor PAIR that says "this is a SenseNova U1.5 checkpoint", ComfyUI's own
+/// test in `model_detection.py`. The first says the generation vision tower is
+/// present, the second that the layers carry their `_mot_gen` copy; a checkpoint
+/// with only the understanding half would match neither pair member alone.
+pub const sensenova_vision_probe = "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight";
+pub const sensenova_gen_probe = "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight";
 
 pub const ComponentSpec = struct { prefixes: []const []const u8, probes: []const []const u8 };
 
@@ -1863,6 +2026,23 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probes = &.{"decoder.conv_in.weight"} },
             .decoder2 => error.NoSuchComponent,
+        },
+        // SenseNova has no side components at all. The prompt is encoded by the
+        // trunk's own understanding half, so the "conditioner" is the same file
+        // resolved a second time, and the canvas is already RGB, so there is no
+        // decoder to resolve. The `denoiser` prefix list is ComfyUI's
+        // `unet_prefix_from_state_dict` answer for it: top level, no prefix, with
+        // the LDM spelling kept for a repackaged checkpoint.
+        .sensenova => switch (comp) {
+            .denoiser => .{
+                .prefixes = &.{ "model.diffusion_model.", "" },
+                .probes = &.{sensenova_vision_probe},
+            },
+            .conditioner => .{
+                .prefixes = &.{ "model.diffusion_model.", "" },
+                .probes = &.{"language_model.model.embed_tokens.weight"},
+            },
+            .conditioner2, .decoder, .decoder2 => error.NoSuchComponent,
         },
     };
 }
@@ -2008,6 +2188,13 @@ pub const Family = enum {
     /// (a ViT3D video VAE and a BigVGAN audio VAE) rather than one. See
     /// `models/minimax_h3.zig` and VIDEO_PLAN.md.
     minimax_h3,
+    /// SenseNova U1.5, the first family with neither a VAE nor a separate text
+    /// encoder. One Qwen3-shaped 8B trunk carries two weight copies per layer:
+    /// the prompt runs the base copy and leaves a KV cache, and the canvas, in
+    /// PIXEL space at 32 px per token, runs the `_mot_gen` copy against it. Flow
+    /// matching like krea2, but the head predicts x0 and the initial noise is
+    /// scaled by the token count. See `models/sensenova.zig`.
+    sensenova,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -2021,7 +2208,10 @@ pub const Family = enum {
     pub fn latentMustBeEven(self: Family) bool {
         return switch (self) {
             .krea2, .zimage, .anima, .minimax_h3 => true,
-            .sd15, .sdxl => false,
+            // SenseNova's canvas is pixels, and it is padded to 32 px per axis by
+            // the model itself, so "even" is not the constraint here; `latentShape`
+            // rounds to `tokenPx` instead.
+            .sd15, .sdxl, .sensenova => false,
         };
     }
 
@@ -2030,7 +2220,7 @@ pub const Family = enum {
     pub fn isVideo(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova => false,
         };
     }
 
@@ -2039,7 +2229,7 @@ pub const Family = enum {
     pub fn hasAudio(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova => false,
         };
     }
 };
@@ -2183,11 +2373,15 @@ pub const MiniMaxH3Models = struct {
     enc_view: ?*weights_mod.Prefixed,
     vae_view: ?*weights_mod.Prefixed,
     audio_view: ?*weights_mod.Prefixed,
-    /// Optional turbo/style LoRA, attached to `dit`'s linears. The container
-    /// must outlive the sidecar, which holds views into its mapping, and the
-    /// sidecar must outlive the DiT, which holds pointers into it.
-    lora_st: ?Container = null,
-    lora: ?lora_mod.Sidecar = null,
+};
+
+/// SenseNova U1.5: one file, one model. There is no side encoder and no VAE, so
+/// the set is a tokenizer and the trunk, and `enc_st` / `vae_st` have no analogue.
+pub const SenseNovaModels = struct {
+    /// Qwen2 BPE over the QWEN2.5 merge table, plus SenseNova's own image tokens.
+    tok: tokenizer_mod.Tokenizer,
+    dit_st: Container,
+    dit: sensenova.Model,
 };
 
 /// The loaded model set, tagged by family. A named type rather than an anonymous
@@ -2200,6 +2394,7 @@ pub const Models = union(Family) {
     zimage: ZImageModels,
     anima: AnimaModels,
     minimax_h3: MiniMaxH3Models,
+    sensenova: SenseNovaModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -2264,6 +2459,18 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const aud = std.fmt.bufPrint(&b2, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
         if (store.get(vid) != null and store.get(aud) != null) return .minimax_h3;
     }
+    // SenseNova U1.5, and this is ComfyUI's own test: the generation vision
+    // tower's patch embedding AND the generation stream's query projection. Both,
+    // because the first alone would also match a checkpoint that carried the
+    // understanding half only, and the second is what says the MoT copies are
+    // present at all.
+    for ((componentSpec(.sensenova, .denoiser) catch unreachable).prefixes) |pfx| {
+        var b1: [128]u8 = undefined;
+        var b2: [128]u8 = undefined;
+        const vis = std.fmt.bufPrint(&b1, "{s}" ++ sensenova_vision_probe, .{pfx}) catch continue;
+        const gen = std.fmt.bufPrint(&b2, "{s}" ++ sensenova_gen_probe, .{pfx}) catch continue;
+        if (store.get(vis) != null and store.get(gen) != null) return .sensenova;
+    }
     return error.UnknownArchitecture;
 }
 
@@ -2272,7 +2479,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima, .minimax_h3 => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova => unreachable,
     };
 }
 
@@ -2333,6 +2540,7 @@ pub fn defaultShift(fam: Family) f32 {
         // schedule; the audio stream's is derived from it in closed form inside
         // the model (`minimax_h3.timeShiftSigma`), so it is not a schedule knob.
         .minimax_h3 => minimax_h3.shift_video,
+        .sensenova => sensenova.default_shift,
         .sd15, .sdxl => sampler.default_shift,
     };
 }
@@ -2356,6 +2564,9 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // well-defined home. It is also NOT the CLIP interpolation form: it is a
         // plain per-row multiply (`out * t5xxl_weights`).
         .anima => true,
+        // SenseNova conditions on its own trunk's KV cache. There is no encoder to
+        // declare a capability, and no fixed token window to interpolate in.
+        .sensenova => false,
         .sd15, .sdxl => clip_text.TextEncoder.supports_prompt_weights,
     };
 }
@@ -2386,6 +2597,12 @@ pub const Session = struct {
     vae_st: safetensors.SafeTensors,
     vae: wan_vae.Decoder,
 
+    /// The LoRA sidecars, for every family. One container per file, which must
+    /// outlive `lora` (its factors are views into the mapping), and `lora` must
+    /// outlive whatever attached to it.
+    lora_sts: []Container = &.{},
+    lora: ?lora_mod.Stack = null,
+
     /// The loaded family. Shorthand for `@as(Family, self.models)`.
     pub fn family(self: *const Session) Family {
         return self.models;
@@ -2406,7 +2623,7 @@ pub const Session = struct {
     /// type, so every shared stage binds this once and needs no further family test.
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3 => null,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -2421,8 +2638,88 @@ pub const Session = struct {
             .zimage => |*m| m.dit_st.store(),
             .anima => |*m| m.dit_st.store(),
             .minimax_h3 => |*m| m.dit_st.store(),
+            .sensenova => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
+    }
+
+    /// Open every LoRA file, merge them into one stack and attach it.
+    ///
+    /// `lora_path` is the single-file shorthand and is applied on top of
+    /// `loras`, so a caller may use either.
+    fn loadLoras(self: *Session, io: std.Io, opts: Options, progress: ?*std.Io.Writer) !void {
+        const gpa = self.gpa;
+        const extra: usize = if (opts.lora_path.len > 0) 1 else 0;
+        const n = opts.loras.len + extra;
+        if (n == 0) return;
+        if (n > lora_mod.max_files) return error.TooManyLoras;
+
+        try note(progress, "loading {d} lora(s)...\n", .{n});
+        const sts = try gpa.alloc(Container, n);
+        errdefer gpa.free(sts);
+        var opened: usize = 0;
+        errdefer for (sts[0..opened]) |*st| st.deinit();
+
+        var stack: lora_mod.Stack = .{};
+        errdefer stack.deinit(gpa);
+
+        for (0..n) |i| {
+            const spec: LoraSpec = if (i < opts.loras.len)
+                opts.loras[i]
+            else
+                .{ .path = opts.lora_path, .strength = opts.lora_strength };
+            sts[i] = try Container.openNamed(gpa, io, spec.path);
+            opened += 1;
+            _ = try stack.add(gpa, sts[i].store(), spec.strength, spec.path);
+        }
+
+        // Install before attaching: the attach stores pointers into the stack,
+        // so it must run against the copy that lives in the session.
+        self.lora_sts = sts;
+        self.lora = stack;
+        const applied = try self.attachLoras();
+        try note(progress, "  lora: {d} sidecars over {d} file(s), {d} MB\n", .{
+            applied, n, self.lora.?.bytes() >> 20,
+        });
+    }
+
+    /// Resolve the installed stack against the family's linears, refusing a file
+    /// that patches nothing or disagrees on a width.
+    fn attachLoras(self: *Session) !usize {
+        // `&self.lora.?` and not `orelse`: the latter would take the address of
+        // a copy, and the attach stores pointers into whatever it is given.
+        if (self.lora == null) return 0;
+        const stack = &self.lora.?;
+        switch (self.models) {
+            // H3 resolves a hit list onto each `Lin` during its own walk.
+            .minimax_h3 => |*m| return m.dit.attachLora(stack),
+            .sensenova => |*m| {
+                m.dit.lora = stack;
+                // Both copies: the turbo LoRAs patch only `_mot_gen`, but a file
+                // that patched the base copy has to reach the prefix pass too,
+                // and an unpatched weight costs one name lookup.
+                stack.beginAttach();
+                for (m.dit.device_lins) |w| _ = try stack.resolve(w);
+                for (m.dit.prefix_lins) |w| _ = try stack.resolve(w);
+                return stack.finishAttach();
+            },
+            // These route their GEMMs through `lin_cuda` too, so wiring them is
+            // a `lora` field plus the plan hook; nothing has done it, and the
+            // Vulkan and host arms would still need their own funnels. Refusing
+            // beats a render that ignores the file on three of four backends.
+            .krea2, .zimage, .anima, .sd15, .sdxl => {
+                std.log.err("lora: the {t} family has no sidecar path in this build", .{self.family()});
+                return error.UnsupportedCheckpoint;
+            },
+        }
+    }
+
+    /// Move one file's dial on a live session. Nothing is reloaded: the strength
+    /// is read at every apply.
+    pub fn setLoraStrength(self: *Session, file: usize, strength: f32) void {
+        if (self.lora == null) return;
+        const stack = &self.lora.?;
+        if (file < stack.files.items.len) stack.files.items[file].strength = strength;
     }
 
     /// Payload bytes of the denoiser's container, for the VRAM meter.
@@ -2432,6 +2729,7 @@ pub const Session = struct {
             .zimage => |*m| m.dit_st.payloadLen(),
             .anima => |*m| m.dit_st.payloadLen(),
             .minimax_h3 => |*m| m.dit_st.payloadLen(),
+            .sensenova => |*m| m.dit_st.payloadLen(),
             .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
@@ -2444,6 +2742,10 @@ pub const Session = struct {
     pub fn init(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*std.Io.Writer) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
+        // `create` applies no field defaults, so anything the init below does not
+        // reach holds whatever the recycled allocation held. `loadLoras` returns
+        // early with no file configured, which leaves `lora`/`lora_sts` to this.
+        init_defaults.applyTo(self);
         self.gpa = gpa;
         self.io = io;
         self.compat = opts.compatConfig();
@@ -2501,7 +2803,7 @@ pub const Session = struct {
         // and its names are what `detectFamily` reads.
         try note(progress, "loading diffusion model...\n", .{});
         const t0 = std.Io.Clock.real.now(io).nanoseconds;
-        var den_st = try Container.open(gpa, io, opts.dit_path);
+        var den_st = try Container.openNamed(gpa, io, opts.dit_path);
         errdefer den_st.deinit();
         const fam = try detectFamily(den_st.store());
 
@@ -2710,31 +3012,6 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .minimax_h3 = m };
 
-                // The LoRA goes on last, after every base weight exists, and
-                // through `self.models` rather than the local `m`: the DiT holds
-                // POINTERS into the sidecar, so attaching before the struct is
-                // moved into place would mean reasoning about whether the move
-                // kept them valid. It also has to happen before any device
-                // workspace is sized, since the sidecar scratch comes from what
-                // is attached; the denoiser builds those per render, well after.
-                if (opts.lora_path.len > 0) {
-                    const h3m = &self.models.minimax_h3;
-                    try note(progress, "loading lora...\n", .{});
-                    h3m.lora_st = try Container.open(gpa, io, opts.lora_path);
-                    errdefer if (h3m.lora_st) |*st| st.deinit();
-                    h3m.lora = try lora_mod.Sidecar.load(gpa, h3m.lora_st.?.store(), opts.lora_strength);
-                    errdefer if (h3m.lora) |*s| s.deinit();
-                    const side = &h3m.lora.?;
-                    if (side.unclaimed > 0) {
-                        std.log.warn("lora: {d} denoiser keys in {s} use a spelling this loader does not know", .{ side.unclaimed, opts.lora_path });
-                    }
-                    const n = try h3m.dit.attachLora(side);
-                    if (n == 0) {
-                        std.log.err("lora: {s} patches none of this checkpoint's linears ({d} targets in the file)", .{ opts.lora_path, side.count() });
-                        return error.ComponentNotInCheckpoint;
-                    }
-                    try note(progress, "  lora: {d} linears, {d} MB, strength {d:.2}\n", .{ n, side.bytes() >> 20, opts.lora_strength });
-                }
             },
             .sd15, .sdxl => {
                 const cfgs = sdConfigs(fam);
@@ -2804,10 +3081,39 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima, .minimax_h3 => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3, .sensenova => unreachable,
                 };
             },
+            // One file, one model: the prompt is encoded by the trunk's own
+            // understanding half and the canvas is already RGB, so there is no
+            // second or third component to resolve. `t1` and `t2` land together.
+            .sensenova => {
+                var m: SenseNovaModels = .{
+                    .tok = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try sensenova.Model.load(gpa, den.store, sensenova.u15_8b);
+                errdefer m.dit.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                m.tok = try sensenova.initTokenizer(gpa);
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+                t2 = t1;
+                self.models = .{ .sensenova = m };
+            },
         }
+
+        // The LoRAs go on last, after every base weight exists, and through
+        // `self.models`: the attach stores pointers into the stack and hits
+        // keyed on the base weights' tags, so it has to see the models at their
+        // final addresses. It also has to happen before any device workspace is
+        // sized, since the sidecar scratch comes from what is attached; the
+        // denoiser builds those per render, well after.
+        try self.loadLoras(io, opts, progress);
 
         // Async weight streaming via a BOUNDED pinned staging ring (4×128 MB =
         // 512 MB), NOT registerHost, we deliberately do NOT page-lock the ~12 GB
@@ -2913,6 +3219,13 @@ pub const Session = struct {
         if (self.family() == .anima) {
             const fresh = try anima.DiT.load(self.gpa, store, try anima.detectConfig(store));
             const m = &self.models.anima;
+            m.dit.deinit();
+            m.dit = fresh;
+            return;
+        }
+        if (self.family() == .sensenova) {
+            const fresh = try sensenova.Model.load(self.gpa, store, sensenova.u15_8b);
+            const m = &self.models.sensenova;
             m.dit.deinit();
             m.dit = fresh;
             return;
@@ -3034,6 +3347,13 @@ pub const Session = struct {
         // CUDA's "current context" is per-thread, so bind before freeing device
         // memory / destroying the context.
         if (self.cu_be) |b| b.bindThread();
+        // The LoRA stack goes before the backend teardown for the same reason
+        // the checkpoints go after it: the stack's factors are views into the
+        // LoRA containers' mappings, and the device weight cache is keyed on
+        // those host pointers.
+        if (self.lora) |*s| s.deinit(gpa);
+        for (self.lora_sts) |*st| st.deinit();
+        if (self.lora_sts.len > 0) gpa.free(self.lora_sts);
         // Tear the compute backend down FIRST, before unmapping the checkpoint
         // safetensors below. The CUDA backend's prefetch thread streams weights
         // straight from those mmaps and DRAINS its queued requests as it joins
@@ -3101,8 +3421,6 @@ pub const Session = struct {
                 if (m.aenc_cu) |*v| v.deinit();
                 if (m.venc_cu) |*v| v.deinit();
                 if (m.audio_cu) |*s| s.deinit();
-                if (m.lora) |*s| s.deinit();
-                if (m.lora_st) |*st| st.deinit();
                 m.enc.deinit();
                 inline for (.{ &m.enc_view, &m.vae_view, &m.audio_view }) |slot| if (slot.*) |v| {
                     v.deinit(gpa);
@@ -3132,6 +3450,11 @@ pub const Session = struct {
                 m.unet_st.deinit();
                 m.tok.deinit();
             },
+            .sensenova => |*m| {
+                m.dit.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
         }
         gpa.destroy(self);
     }
@@ -3159,6 +3482,10 @@ pub const Session = struct {
             // carries the audio latent scaled onto this schedule and the model
             // converts, so there is one table for the pack.
             .minimax_h3 => .{ .discrete_flow = shift },
+            // `SenseNovaModelSampling` subclasses `ModelSamplingDiscreteFlow`, so
+            // this is the same 1000-rung table again. Only the default shift
+            // differs (3.0), and that is `defaultShift`'s answer, not this one's.
+            .sensenova => .{ .discrete_flow = shift },
             .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
         };
     }
@@ -3211,12 +3538,20 @@ pub const Session = struct {
     /// bit-identical no-op. The SD family multiplies by `sqrt(1 + sigma0²)`; see
     /// `sampler.sdScaleInitialNoise` for why that is not the same as `sigma0` and what
     /// getting it wrong costs.
-    pub fn scaleInitialNoise(self: *const Session, x: []f32, sigma0: f32) void {
+    ///
+    /// `shape` is here for SenseNova, whose scale is a function of the canvas size
+    /// and is 4.0 at 1024x1024. Nothing else reads it.
+    pub fn scaleInitialNoise(self: *const Session, x: []f32, sigma0: f32, shape: LatentShape) void {
         switch (self.models) {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
             .krea2, .zimage, .anima, .minimax_h3 => sampler.scaleInitialNoise(x, sigma0),
+            // The one family whose initial noise is not unit variance. Leaving the
+            // scale out does not soften the image, it renders noise.
+            .sensenova => {
+                sampler.scaleInitialNoise(x, sigma0 * sensenova.resolutionNoiseScale(sensenova.u15_8b, shape.h, shape.w));
+            },
             // Under `--compat a1111` this is the BARE sigma: A1111's
             // `sgm_noise_multiplier` defaults to False, and its own description of the
             // option ("match initial noise to official SDXL implementation - only useful
@@ -3236,7 +3571,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3 => .flow,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -3253,6 +3588,8 @@ pub const Session = struct {
             // The VISUAL stream's channels. H3's audio stream has its own count
             // (32) and is not part of this answer; `LatentShape` carries both.
             .minimax_h3 => minimax_h3.latent_channels,
+            // Not a latent: SenseNova's canvas is the RGB image itself.
+            .sensenova => sensenova.latent_channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -3271,6 +3608,10 @@ pub const Session = struct {
             .zimage => zimage.spatial_scale,
             .sd15, .sdxl => sd_vae.spatial_scale,
             .minimax_h3 => minimax_h3.spatial_downscale,
+            // 1: there is no VAE, so the sampler's canvas is the image. The model
+            // pads it to 32 px per axis itself and crops the velocity back, so any
+            // extent renders.
+            .sensenova => sensenova.spatial_scale,
         };
     }
 
@@ -3338,6 +3679,9 @@ pub const Session = struct {
             // The only arm that reads `shape.t`, and the only one for which
             // `frame` is not ignored.
             .minimax_h3 => minimax_h3.latentPreviewInto(rgb_out, z, shape.t, h, w, frame),
+            // Not an approximation: the canvas IS the image, so the preview is the
+            // decode.
+            .sensenova => sensenova.canvasToRgb(rgb_out, z, h * w),
             .sd15 => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
             .sdxl => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
         }
@@ -3743,6 +4087,37 @@ pub const Session = struct {
                 // `Adapter.forward`), so trimming `seq` here would be a different
                 // model rather than a saving.
                 return .{ .data = data, .seq = data.len / anima.anima_2b.context_dim };
+            },
+            // SenseNova has no text encoder. The conditioning IS the trunk's own
+            // prefix KV cache, produced by running the prompt through the BASE MoT
+            // copy, so `Cond.data` holds `[n_layers][2][seq][kv_dim]` here rather
+            // than `[seq][dim]` hidden states. `Cond.seq` is still the token count,
+            // which is also the rope position every image token then takes.
+            .sensenova => |*m| {
+                const ids = try sensenova.tokenize(gpa, &m.tok, text);
+                defer gpa.free(ids);
+                const t0 = std.Io.Clock.real.now(self.io);
+                const on_cuda = self.cu_be != null and sensenova_cuda.supported(&m.dit);
+                const on_vk = !on_cuda and self.gpu_ctx != null and sensenova_gpu.supported(self.gpu_ctx.?, &m.dit);
+                var layout = try senseNovaLayout(gpa, &m.dit, ids, o.sn_ref_images, o.prompt_type == .negative);
+                defer layout.deinit(gpa);
+                var pre = if (on_cuda)
+                    try sensenova_cuda.prefixForward(&m.dit, self.cu_be.?, self.io, gpa, layout, o.sn_ref_images, o.cancel)
+                else if (on_vk)
+                    try sensenova_gpu.prefixForward(&m.dit, self.gpu_ctx.?, self.io, gpa, layout, o.sn_ref_images, o.cancel)
+                else
+                    try m.dit.prefixForward(self.io, gpa, layout, o.sn_ref_images, o.cancel);
+                errdefer pre.deinit(gpa);
+                const t1 = std.Io.Clock.real.now(self.io);
+                // Which stack ran, because the prefix is a SECOND full 8B of
+                // weights: on a card that holds only the generation half, this is
+                // the pass that streams, and it will not look like the DiT's cost.
+                std.log.info("[encode] sensenova prefix {d} tok on {s} {d:.2}s", .{
+                    layout.ids.len,
+                    if (on_cuda) "cuda" else if (on_vk) "vulkan" else "cpu",
+                    @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9,
+                });
+                return .{ .data = pre.kv, .seq = pre.seq, .sn_time = pre.time };
             },
         }
     }
@@ -4246,6 +4621,41 @@ pub const Session = struct {
 
         // One workspace, shared by both conditioning passes, sized to the longer
         // of the two sequences.
+        // SenseNova takes its own arm because it has no text fusion to cache: the
+        // conditioning is already the prefix KV cache and the canvas is the latent,
+        // so its per-image state is the rope tables, that cache on the device and,
+        // on the host, the negative branch's velocity.
+        if (self.family() == .sensenova) {
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, sensenova.latent_channels * lat_h * lat_w);
+            const m = &self.models.sensenova;
+            if (self.cu_be) |b| {
+                if (sensenova_cuda.supported(&m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.sn_cu = try sensenova_cuda.Session.init(gpa, b, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cond_pos));
+                    if (cond_neg) |cn| d.sn_cu_neg = try sensenova_cuda.Session.init(gpa, b, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cn));
+                    const cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.sn_cu_ws = try sensenova_cuda.Workspace.init(b, &m.dit, &d.sn_cu.?, cap);
+                } else {
+                    std.log.warn("SenseNova: this device cannot run the trunk's GEMMs; it runs on the " ++
+                        "CPU. Expect CPU sampling speed.", .{});
+                }
+            } else if (self.gpu_ctx) |gc| {
+                if (sensenova_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.sn_vk = try sensenova_gpu.Session.init(gpa, gc, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cond_pos));
+                    if (cond_neg) |cn| d.sn_vk_neg = try sensenova_gpu.Session.init(gpa, gc, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cn));
+                    const cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.sn_vk_ws = try sensenova_gpu.Workspace.init(gc, &m.dit, &d.sn_vk.?, cap);
+                } else {
+                    std.log.warn("SenseNova: this device cannot run the trunk's GEMMs; it runs on the " ++
+                        "CPU. Expect CPU sampling speed.", .{});
+                }
+            }
+            return d;
+        }
+
         const seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
         const dit = &self.k().dit;
         if (self.cu_be) |b| {
@@ -5775,6 +6185,17 @@ pub const Session = struct {
             };
         }
 
+        // SenseNova has no VAE. The canvas already IS the image, so the whole of
+        // "decode" is the [-1, 1] to RGB8 mapping, and `decodePlanar`'s
+        // whole-image -> reclaim -> tiled ladder has nothing to recover from.
+        if (self.family() == .sensenova) {
+            if (latent.len != sensenova.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
+            const rgb = try gpa.alloc(u8, lat_h * lat_w * 3);
+            errdefer gpa.free(rgb);
+            sensenova.canvasToRgb(rgb, latent, lat_h * lat_w);
+            return .{ .rgb = rgb, .width = lat_w, .height = lat_h };
+        }
+
         if (self.family() == .zimage) {
             const m = self.zi();
             if (latent.len != zimage.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
@@ -6073,8 +6494,11 @@ pub const Session = struct {
         if (opts.steps < 1) return error.NoSteps;
         // Per-render, not per-session: the GUI snapshots a config per queued image.
         self.compat = opts.compatConfig();
-        const lat_h = opts.height / 8;
-        const lat_w = opts.width / 8;
+        // Per family, not `/ 8`: SenseNova generates in pixel space, so its
+        // "latent" is the canvas at full resolution.
+        const px_per_lat = self.spatialDownscale();
+        const lat_h = opts.height / px_per_lat;
+        const lat_w = opts.width / px_per_lat;
         // Family-dependent: 16 latent channels for krea2's Wan VAE, 4 for SD's
         // AutoencoderKL. Hardcoding 16 here ran SD's 4-channel UNet correctly for
         // four steps and then failed in `decode` with `LatentSizeMismatch`, the
@@ -6124,10 +6548,15 @@ pub const Session = struct {
             .emphasis = opts.emphasis,
             .steps = nsteps,
             .cancel = opts.cancel,
+            .sn_ref_images = opts.sn_ref_images,
         };
         var cond_pos = try self.encode(gpa, opts.prompt, enc_opts);
         defer cond_pos.deinit(gpa);
-        var cond_neg: ?Cond = if (use_cfg) try self.encode(gpa, opts.negative, enc_opts) else null;
+        // The negative branch says so, because SenseNova's negative under editing
+        // is the reference pictures with no prompt rather than an empty prompt.
+        var neg_opts = enc_opts;
+        neg_opts.prompt_type = .negative;
+        var cond_neg: ?Cond = if (use_cfg) try self.encode(gpa, opts.negative, neg_opts) else null;
         defer if (cond_neg) |*c| c.deinit(gpa);
         // The variant count is worth reporting: an A1111 `[a|b]` or `[a:b:0.5]` silently
         // becomes several conditionings, and "1 variant" is the difference between a
@@ -6239,9 +6668,13 @@ pub const Session = struct {
                 // The inequality is the one actually tested. The old line printed
                 // the WHOLE DiT against free VRAM, which framed streaming-by-design
                 // as a fit failure and implied dropping ~600 MB could make 13 GB fit.
-                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT still needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve > {d}MB free", .{
-                    freed >> 20,      dit_to_place >> 20, dit_bytes >> 20,
-                    dit_resident >> 20, pin_reserve >> 20, free_now >> 20,
+                // `free_now` is the figure that TRIGGERED the drop; print what free
+                // VRAM is after it too, since that is what the pinning below sees
+                // and the two differ by exactly what was freed.
+                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve, free {d} -> {d}MB", .{
+                    freed >> 20,        dit_to_place >> 20, dit_bytes >> 20,
+                    dit_resident >> 20, pin_reserve >> 20,  free_now >> 20,
+                    b.ctx.memGetInfo().free >> 20,
                 });
             }
         }
@@ -6255,6 +6688,7 @@ pub const Session = struct {
         // latent is scaled by `sigmas[0]`, which is 1.0 for krea2 (a bit-identical no-op)
         // and ~14.6 for SD.
 
+        const lat_shape: LatentShape = .{ .channels = self.latentChannels(), .h = lat_h, .w = lat_w };
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
         // Resume: restore the suspended latent instead of drawing fresh noise
@@ -6264,11 +6698,11 @@ pub const Session = struct {
         if (opts.resume_from) |r| {
             if (r.latent.len == x.len) @memcpy(x, r.latent) else {
                 sampler.fillNoiseFrom(x, opts.seed, self.compat.noise_src);
-                self.scaleInitialNoise(x, sigmas[0]);
+                self.scaleInitialNoise(x, sigmas[0], lat_shape);
             }
         } else {
             sampler.fillNoiseFrom(x, opts.seed, self.compat.noise_src);
-            self.scaleInitialNoise(x, sigmas[0]);
+            self.scaleInitialNoise(x, sigmas[0], lat_shape);
         }
 
         {
@@ -6579,6 +7013,18 @@ fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !voi
     }
 }
 
+test "a created session starts with the fields deinit frees defaulted" {
+    // The poison stands in for the recycled allocation a model switch hands back.
+    // Without the defaults `lora` reads as non-null and `deinit` walks a garbage map.
+    const gpa = std.testing.allocator;
+    const s = try gpa.create(Session);
+    defer gpa.destroy(s);
+    @memset(std.mem.asBytes(s), 0xaa);
+    init_defaults.applyTo(s);
+    try std.testing.expect(s.lora == null);
+    try std.testing.expectEqual(@as(usize, 0), s.lora_sts.len);
+}
+
 test "the live preview follows the family's own latent format" {
     // Regression: the per-step preview was krea2-only, `downsampleLatent` hardcoded 16
     // channels and the latent2rgb call went straight to `wan_vae`, so the first
@@ -6593,8 +7039,8 @@ test "the live preview follows the family's own latent format" {
     defer gpa.free(rgb);
 
     var sess: Session = init_defaults.of(Session);
-    var prev: [6][]u8 = undefined;
-    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3 }, 0..) |fam, fi| {
+    var prev: [7][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3, Family.sensenova }, 0..) |fam, fi| {
         sess.models = switch (fam) {
             .krea2 => .{ .krea2 = undefined },
             .sd15 => .{ .sd15 = undefined },
@@ -6602,12 +7048,14 @@ test "the live preview follows the family's own latent format" {
             .zimage => .{ .zimage = undefined },
             .anima => .{ .anima = undefined },
             .minimax_h3 => .{ .minimax_h3 = undefined },
+            .sensenova => .{ .sensenova = undefined },
         };
         const ch: usize = switch (fam) {
             .krea2 => wan_vae.latent_channels,
             .zimage => zimage.latent_channels,
             .anima => anima.latent_channels,
             .minimax_h3 => minimax_h3.latent_channels,
+            .sensenova => sensenova.latent_channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };
         // Exactly the family's channel count, a read one plane past the end is an

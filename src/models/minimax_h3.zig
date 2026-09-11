@@ -912,11 +912,18 @@ fn appendAudioGrid(
 /// sidecar in the same expression, and `matLin` below is the only host path.
 pub const Lin = struct {
     w: Weight,
-    lora: ?*const lora_mod.Target = null,
+    /// Every stacked LoRA that patches this weight, resolved once by
+    /// `attachLora` and pointing into the stack's index. Empty when none does.
+    /// The dial lives on the stack's file, not here, so a slider needs no
+    /// re-attach.
+    lora: []const lora_mod.Stack.Hit = &.{},
 };
 
-/// `y = W x (+ bias) + sidecar`. The one host path through a `Lin`, so the
+/// `y = W x (+ bias) + sidecars`. The one host path through a `Lin`, so a
 /// sidecar cannot be forgotten at a call site.
+///
+/// `stack` is where the dials live, so it must be the one `attachLora` resolved
+/// against; `Lin.lora` holds indexes into its file list.
 fn matLin(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -926,9 +933,15 @@ fn matLin(
     m: usize,
     l: Lin,
     bias: ?[]const f32,
+    stack: ?*const lora_mod.Stack,
 ) !void {
     try ops.matmul.matmul(io, gpa, y[0 .. m * y_stride], x, m, l.w, bias);
-    if (l.lora) |t| try t.applyHost(io, gpa, y, y_stride, x, m);
+    for (l.lora) |h| {
+        const s = stack.?.files.items[h.file].strength;
+        // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
+        if (s == 0) continue;
+        try h.target.applyHost(io, gpa, y, y_stride, x, m, s);
+    }
 }
 
 /// One attention, trunk or refiner. `qkv_proj` is fused; `q_norm`/`k_norm` are
@@ -1006,48 +1019,35 @@ pub const DiT = struct {
     blocks: []Block,
     final: FinalLayer,
 
+    /// The LoRA stack `attachLora` resolved against, borrowed. Every `Lin.lora`
+    /// holds indexes into its file list, so the two are read together.
+    lora: ?*const lora_mod.Stack = null,
+
     pub fn deinit(self: *DiT) void {
         self.arena.deinit();
         self.* = undefined;
     }
 
-    /// Point every trunk and refiner linear at its LoRA sidecar, if the file has
-    /// one for it. Borrows `side`, which must outlive the DiT.
+    /// Point every trunk and refiner linear at the stack's targets for it.
+    /// Borrows `stack`, which must outlive the DiT, and which is also where the
+    /// dials are read from at apply time.
     ///
-    /// Returns how many linears were patched. Zero means the file matched
-    /// nothing here, which is a mistake worth reporting rather than a render
-    /// that quietly ignores a flag the user passed.
-    pub fn attachLora(self: *DiT, side: *const lora_mod.Sidecar) !usize {
-        var n: usize = 0;
-        for (self.blocks) |*b| {
-            n += try attachBlockLora(&b.attn, &b.mlp, side);
-        }
-        for (self.refiner) |*b| {
-            n += try attachBlockLora(&b.attn, &b.mlp, side);
-        }
-        return n;
+    /// Returns how many (linear, file) pairs will apply. `Stack.check` is the
+    /// authority on whether the stack is usable at all; this is the resolution
+    /// that keeps the forward path off the name index.
+    pub fn attachLora(self: *DiT, stack: *lora_mod.Stack) !usize {
+        self.lora = stack;
+        stack.beginAttach();
+        for (self.blocks) |*b| try attachBlockLora(&b.attn, &b.mlp, stack);
+        for (self.refiner) |*b| try attachBlockLora(&b.attn, &b.mlp, stack);
+        return stack.finishAttach();
     }
 
-    fn attachBlockLora(a: *Attn, m: *Mlp, side: *const lora_mod.Sidecar) !usize {
-        var n: usize = 0;
+    fn attachBlockLora(a: *Attn, m: *Mlp, stack: *lora_mod.Stack) !void {
         inline for (.{ &a.qkv, &a.out, &m.fc1, &m.fc2 }) |l| {
-            switch (side.forWeight(l.w)) {
-                .none => {},
-                .ok => |t| {
-                    l.lora = t;
-                    n += 1;
-                },
-                // Refuse rather than skip: a trunk with only some of its
-                // sidecars applied renders plausibly and wrongly.
-                .mismatch => |t| {
-                    std.log.err("minimax_h3: LoRA {s} is {d}x{d} but the checkpoint's is {d}x{d}", .{ t.tag, t.out_dim, t.in_dim, l.w.rows, l.w.cols });
-                    return error.ShapeMismatch;
-                },
-            }
+            l.lora = try stack.resolve(l.w);
         }
-        return n;
     }
-
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1146,29 +1146,7 @@ const Loader = struct {
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [192]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, "");
-        const view = l.store.get(nm) orelse {
-            std.log.err("minimax_h3: missing tensor {s}", .{nm});
-            return error.MissingTensor;
-        };
-        const shape = view.info.shape.slice();
-        if (shape.len != 2 or shape[0] != rows or shape[1] != cols) {
-            std.log.err("minimax_h3: {s} has shape {any}, expected {d}x{d}", .{ nm, shape, rows, cols });
-            return error.ShapeMismatch;
-        }
-        const dt = view.info.dtype;
-        if (!ops.matmul.supportsDType(dt)) {
-            std.log.err("minimax_h3: {s} has unsupported dtype {t}", .{ nm, dt });
-            return error.UnsupportedDType;
-        }
-        var w = Weight.init(view.bytes, dt, rows, cols);
-        w.tag = try l.alloc.dupe(u8, nm);
-
-        if (dt == .i8 or dt == .i4) {
-            const meta = try quant_weight.int8ScaleConvrot(l.alloc, l.store, nm, rows, cols, "minimax_h3");
-            w.row_scale = meta.row_scale;
-            w.convrot = meta.convrot;
-        }
-        return w;
+        return quant_weight.load(l.alloc, l.store, nm, rows, cols, .{ .who = "minimax_h3" });
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
@@ -1798,7 +1776,7 @@ fn runAttn(
 ) !void {
     const cfg = dit.cfg;
     const inner = cfg.n_heads * cfg.head_dim;
-    try matLin(io, gpa, qkv[0 .. seq * 3 * inner], 3 * inner, x, seq, a.qkv, null);
+    try matLin(io, gpa, qkv[0 .. seq * 3 * inner], 3 * inner, x, seq, a.qkv, null, dit.lora);
 
     // The projection emits [seq][3][inner] per row; attention wants three
     // separate [seq][n_heads][head_dim] planes, so de-interleave in place-ish.
@@ -1837,7 +1815,7 @@ fn runAttn(
         // streams all see each other. There is no mask anywhere in H3.
         .causal = false,
     });
-    try matLin(io, gpa, out[0 .. seq * cfg.hidden], cfg.hidden, att, seq, a.out, null);
+    try matLin(io, gpa, out[0 .. seq * cfg.hidden], cfg.hidden, att, seq, a.out, null, dit.lora);
 }
 
 fn runMlp(
@@ -1852,7 +1830,7 @@ fn runMlp(
 ) !void {
     const cfg = dit.cfg;
     const two = 2 * cfg.ffn;
-    try matLin(io, gpa, ff[0 .. seq * two], two, x, seq, m.fc1, null);
+    try matLin(io, gpa, ff[0 .. seq * two], two, x, seq, m.fc1, null, dit.lora);
     // [gate; value] per row, gate first. `siluMul` wants the two halves as
     // separate slices, and they are strided by row here, so walk rows.
     const packed_gate = try gpa.alloc(f32, seq * cfg.ffn);
@@ -1863,7 +1841,7 @@ fn runMlp(
         @memcpy(g, row[0..cfg.ffn]);
         ops.act.siluMul(g, row[cfg.ffn..][0..cfg.ffn]);
     }
-    try matLin(io, gpa, out[0 .. seq * cfg.hidden], cfg.hidden, packed_gate, seq, m.fc2, null);
+    try matLin(io, gpa, out[0 .. seq * cfg.hidden], cfg.hidden, packed_gate, seq, m.fc2, null, dit.lora);
 }
 
 /// Patchify/pack both streams, project them, and assemble the packed sequence

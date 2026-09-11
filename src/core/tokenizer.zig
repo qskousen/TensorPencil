@@ -13,6 +13,8 @@ const prompt_weights = @import("prompt_weights.zig");
 
 const vocab_json = @embedFile("assets/qwen_tokenizer/vocab.json");
 const merges_txt = @embedFile("assets/qwen_tokenizer/merges.txt");
+/// The merge rules Qwen3 has and Qwen2.5 does not. See `Tokenizer.initQwen25`.
+const qwen25_dropped_merges = @embedFile("assets/qwen_tokenizer/qwen25_dropped_merges.txt");
 
 pub const pad_token: u32 = 151643; // <|endoftext|>
 pub const im_start: u32 = 151644;
@@ -210,6 +212,22 @@ pub const Tokenizer = struct {
     unigram_max_piece: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) !Tokenizer {
+        return initVariant(gpa, .qwen3);
+    }
+
+    /// The embedded table minus the 96 merge rules Qwen3 added over Qwen2.5, all
+    /// of them `#`-initial. Qwen2.5-vocabulary models (SenseNova U1.5) need it:
+    /// the two vocabularies are byte-identical, so only the merge table can
+    /// disagree, and it disagrees on any prompt containing a `#`. The common
+    /// rules keep their relative order, so dropping the extras and re-ranking
+    /// sequentially reproduces the Qwen2.5 ranks exactly.
+    pub fn initQwen25(gpa: std.mem.Allocator) !Tokenizer {
+        return initVariant(gpa, .qwen25);
+    }
+
+    pub const MergeSet = enum { qwen3, qwen25 };
+
+    fn initVariant(gpa: std.mem.Allocator, set: MergeSet) !Tokenizer {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -240,6 +258,14 @@ pub const Tokenizer = struct {
         for (byte_id) |id| if (id == 0xFFFF_FFFF) return error.IncompleteByteVocab;
 
         // Merges.
+        var dropped: std.StringHashMapUnmanaged(void) = .empty;
+        if (set == .qwen25) {
+            var dl = std.mem.splitScalar(u8, qwen25_dropped_merges, '\n');
+            while (dl.next()) |l| {
+                const line = std.mem.trimEnd(u8, l, "\r");
+                if (line.len != 0) try dropped.put(alloc, line, {});
+            }
+        }
         var merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty;
         var rank: u32 = 0;
         var lines = std.mem.splitScalar(u8, merges_txt, '\n');
@@ -252,11 +278,29 @@ pub const Tokenizer = struct {
                 continue;
             }
             first = false;
+            if (dropped.contains(line)) continue;
             try addMerge(alloc, &merges, &raw_to_id, line, rank);
             rank += 1;
         }
 
         return .{ .arena = arena, .id_to_bytes = id_to_bytes, .byte_id = byte_id, .merges = merges };
+    }
+
+    /// Extend the verbatim-matched special list, for a model that adds tokens
+    /// past the base vocabulary's own (SenseNova's `<img>` / `<IMG_CONTEXT>`).
+    /// The merged list is sorted longest-first so a token that is a prefix of
+    /// another cannot shadow it, and lives in the tokenizer's arena.
+    pub fn addSpecials(self: *Tokenizer, extra: []const Special) !void {
+        const alloc = self.arena.allocator();
+        const merged = try alloc.alloc(Special, self.specials.len + extra.len);
+        @memcpy(merged[0..self.specials.len], self.specials);
+        @memcpy(merged[self.specials.len ..], extra);
+        std.mem.sort(Special, merged, {}, struct {
+            fn lt(_: void, a: Special, b: Special) bool {
+                return a.text.len > b.text.len;
+            }
+        }.lt);
+        self.specials = merged;
     }
 
     /// Build from a GGUF's embedded tokenizer (tokenizer.ggml.* kv arrays):

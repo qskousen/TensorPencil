@@ -8,11 +8,7 @@ const std = @import("std");
 const tp = @import("TensorPencil");
 const c = @import("ggml").c;
 
-fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+const nowNs = tp.prof.monoNs;
 
 const Kind = struct { dt: tp.DType, g: c.enum_ggml_type, name: []const u8 };
 const dtypes = [_]Kind{

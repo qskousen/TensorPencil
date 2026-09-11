@@ -20,6 +20,7 @@
 const std = @import("std");
 const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
+const lin = @import("lin.zig");
 
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
@@ -213,26 +214,45 @@ pub fn int8Scale(
     return .{ .row_scale = row_scale, .convrot = rot };
 }
 
-/// `int8Scale` for a family whose activation prep always rotates (Anima, MiniMax H3):
-/// an unrotated weight there would be multiplied in a basis it was never quantized in,
-/// so refuse it where it is read rather than render noise. `who` names the family in the
-/// diagnostic. Drop this in favour of `int8Scale` the day that family's prep can skip
-/// the rotation, as krea2's can.
-pub fn int8ScaleConvrot(
+/// Build a `Weight` for a ComfyUI int8 or int4 layer, or null when `view` is neither.
+///
+/// Runs AFTER `nvfp4` and `w4a8`: those store `[rows, cols/2]` integer nibbles too, so
+/// the halved shape int4 is recognized by is also theirs, and only their own sidecars
+/// tell them apart.
+///
+/// `who` names the family in every diagnostic.
+pub fn int8(
     alloc: std.mem.Allocator,
     store: WeightStore,
+    view: weights_mod.TensorView,
     name: []const u8,
     rows: usize,
     cols: usize,
     who: []const u8,
-) !Int8Meta {
-    const meta = try int8Scale(alloc, store, name, rows, cols);
-    if (meta.convrot == 0) {
-        std.log.err("{s}: {s} is int8 with no convrot rotation, which this model's " ++
-            "activation prep cannot pair with", .{ who, name });
-        return error.UnsupportedCheckpoint;
+) !?Weight {
+    const dt = view.info.dtype;
+    if (dt != .i8 and dt != .u8) return null;
+
+    // int4 packs two nibbles per byte and so stores `[rows, cols/2]`. ComfyUI writes it
+    // as I8 as often as U8, so it is the HALVED column count that tells int4 from int8,
+    // not the dtype.
+    const shape = view.info.shape.slice();
+    const halved = shape.len == 2 and shape[0] == rows and cols % 2 == 0 and shape[1] == cols / 2;
+    const is_i4 = dt == .u8 or halved;
+    if (is_i4 and cols % 2 != 0) return error.ShapeMismatch;
+    const stored_cols = if (is_i4) cols / 2 else cols;
+    if (shape.len != 2 or shape[0] != rows or shape[1] != stored_cols) {
+        std.log.err("{s}: {s} has shape {any} ({t}), expected [{d}, {d}]", .{
+            who, name, shape, dt, rows, stored_cols,
+        });
+        return error.ShapeMismatch;
     }
-    return meta;
+
+    const meta = try int8Scale(alloc, store, name, rows, cols);
+    var w = Weight.init(view.bytes, if (is_i4) .i4 else .i8, rows, cols);
+    w.row_scale = meta.row_scale;
+    w.convrot = meta.convrot;
+    return w;
 }
 
 /// The rotation group an `int8_tensorwise` layer decodes with (0 = unrotated), from its
@@ -402,6 +422,81 @@ pub fn w4a8(
     w.convrot = ops.convrot.group_size;
     w.w4a8 = meta;
     return w;
+}
+
+/// What a family's loader wants that this cannot decide for it.
+pub const LoadOptions = struct {
+    /// The family, for every diagnostic. A bare `ShapeMismatch` across 450 weights
+    /// is not actionable.
+    who: []const u8,
+    /// What to do with a dtype no CPU GEMM reads. `.materialize` for the SD family,
+    /// where a merge in the wild stores f64.
+    unsupported: enum { refuse, materialize } = .refuse,
+};
+
+/// The whole ladder from a tensor name to a GEMM-ready `Weight`: every packed format
+/// in the right order, the shape check, the block-quant escape, the tag.
+///
+/// One function for every family. A family supplies its name formatting and its
+/// `LoadOptions`; the order of the rungs below is not its business, and omitting one
+/// of them is silent.
+pub fn load(
+    alloc: std.mem.Allocator,
+    store: WeightStore,
+    name: []const u8,
+    rows: usize,
+    cols: usize,
+    opts: LoadOptions,
+) !Weight {
+    const view = store.get(name) orelse {
+        std.log.err("{s}: missing tensor {s}", .{ opts.who, name });
+        return error.MissingTensor;
+    };
+
+    // NVFP4 and W4A8 before int8/int4: all three store integer nibbles at
+    // `[rows, cols/2]`, and only those two have a sidecar that names them. Read either
+    // as signed int4 times a per-row scale and the numbers are finite and wrong.
+    if (try nvfp4(alloc, store, name, rows, cols)) |w| return tag(alloc, w, name);
+    if (try w4a8(alloc, store, name, rows, cols)) |w| return tag(alloc, w, name);
+    if (try int8(alloc, store, view, name, rows, cols, opts.who)) |w| return tag(alloc, w, name);
+
+    // What is left stores one element per slot. A 1x1 convolution arrives as
+    // `[out, in, 1, 1]` and IS a GEMM over pixels, so the trailing dims fold into
+    // `cols`; for a plain `[rows, cols]` that fold is the identity.
+    const shape = view.info.shape.slice();
+    var flat: usize = 1;
+    if (shape.len >= 2) for (shape[1..]) |d| {
+        flat *= d;
+    };
+    if (shape.len < 2 or shape[0] != rows or flat != cols) {
+        std.log.err("{s}: {s} has shape {any} ({t}), expected [{d}, {d}]", .{
+            opts.who, name, shape, view.info.dtype, rows, cols,
+        });
+        return error.ShapeMismatch;
+    }
+
+    // A shape-fixed block quant tiles its blocks over the flat element sequence rather
+    // than each row, so no GEMM here can read it; it is small by construction.
+    if (view.info.flat_blocks) return flatBlocksF32(alloc, view, name, rows, cols);
+    if (!ops.matmul.supportsDType(view.info.dtype)) switch (opts.unsupported) {
+        .refuse => {
+            std.log.err("{s}: {s} has unsupported dtype {t}", .{ opts.who, name, view.info.dtype });
+            return error.UnsupportedDType;
+        },
+        .materialize => return tag(alloc, Weight.fromF32(try view.toF32Alloc(alloc), rows, cols), name),
+    };
+    const w = try tag(alloc, Weight.init(view.bytes, view.info.dtype, rows, cols), name);
+    // `--dequant-at-load`, which only ever touches a block quant and is off by default.
+    return lin.maybeDequant(alloc, w);
+}
+
+/// The checkpoint name on the Weight, which is what attributes a GEMM to a layer
+/// downstream (`ops.matmul.probe`, profiling, error messages). Duped because callers
+/// build the name in a stack buffer.
+fn tag(alloc: std.mem.Allocator, w: Weight, name: []const u8) !Weight {
+    var out = w;
+    out.tag = try alloc.dupe(u8, name);
+    return out;
 }
 
 // --- tests -----------------------------------------------------------------
@@ -706,4 +801,44 @@ test "int8Rotation refuses metadata it cannot honour" {
     try std.testing.expectEqual(@as(u32, 0), try int8Rotation(alloc, 1, rows, 256,
         \\{"format": "some_converters_private_name"}
     ));
+}
+
+test "load attaches an int8 weight's row scale, and reads a halved shape as int4" {
+    // `supportsDType(.i8)` is true, so a ladder missing the int8 rung still accepts the
+    // tensor and leaves `row_scale` null for the GEMM to dereference.
+    const gpa = std.testing.allocator;
+    const safetensors = @import("tp_core").safetensors;
+    const DType = @import("tp_core").dtype.DType;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const conf =
+        \\{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256, "per_row": true}
+    ;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try int8Store(gpa, &buf, 4, 256, &.{ 1, 2, 3, 4 }, conf);
+    var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+    defer st.deinit();
+
+    const w = try load(alloc, .{ .safetensors = &st }, "w.weight", 4, 256, .{ .who = "t" });
+    errdefer std.debug.print("dtype {t} convrot {d} row_scale {?any}\n", .{ w.dtype, w.convrot, w.row_scale });
+    try std.testing.expectEqual(DType.i8, w.dtype);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, w.row_scale.?);
+    try std.testing.expectEqual(@as(u32, ops.convrot.group_size), w.convrot);
+    try std.testing.expectEqualStrings("w.weight", w.tag.?);
+
+    // The same bytes read as int4: `int8Store` writes `I8 [rows, cols]`, so asking for
+    // twice the columns makes the stored shape the halved one, which is the only thing
+    // that tells nibble-packed int4 from full-width int8.
+    const w4 = try load(alloc, .{ .safetensors = &st }, "w.weight", 4, 512, .{ .who = "t" });
+    errdefer std.debug.print("i4: dtype {t} cols {d}\n", .{ w4.dtype, w4.cols });
+    try std.testing.expectEqual(DType.i4, w4.dtype);
+    try std.testing.expectEqual(@as(usize, 512), w4.cols);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, w4.row_scale.?);
+
+    // The third case, an integer weight with NO companion scale, is not asserted here:
+    // `int8Scale` reports it with `std.log.err`, and `testing.log_level` has no level
+    // below `err`, so asserting it would make every passing run print.
 }

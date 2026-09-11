@@ -130,6 +130,54 @@ pub fn main(init: std.process.Init) !void {
             } else path = args[i];
         }
         try teTest(arena, io, stdout, path, ref, variant, dump);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "sensenova-cuda-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/sensenova/sensenova_u15_q4_k.gguf";
+        var libs = false;
+        var layers: usize = 2;
+        var toks: usize = 20;
+        var sigma_arg: f32 = 0.75;
+        var lora_path: []const u8 = "";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) libs = true //
+            else if (std.mem.eql(u8, args[i], "--lora") and i + 1 < args.len) {
+                i += 1;
+                lora_path = args[i];
+            } else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch 2;
+            } else if (std.mem.eql(u8, args[i], "--prompt-tokens") and i + 1 < args.len) {
+                i += 1;
+                toks = std.fmt.parseInt(usize, args[i], 10) catch 20;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch 0.75;
+            } else ckpt = args[i];
+        }
+        try sensenovaCudaTest(arena, io, stdout, ckpt, libs, layers, toks, sigma_arg, lora_path);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "sensenova-vk-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors";
+        var layers: usize = 2;
+        var toks: usize = 20;
+        var sigma_arg: f32 = 0.75;
+        var lora_path: []const u8 = "";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--lora") and i + 1 < args.len) {
+                i += 1;
+                lora_path = args[i];
+            } else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch 2;
+            } else if (std.mem.eql(u8, args[i], "--prompt-tokens") and i + 1 < args.len) {
+                i += 1;
+                toks = std.fmt.parseInt(usize, args[i], 10) catch 20;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch 0.75;
+            } else ckpt = args[i];
+        }
+        try sensenovaVkTest(arena, io, stdout, ckpt, layers, toks, sigma_arg, lora_path);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "zimage-cuda-test")) {
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
         var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
@@ -292,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         try stdout.print(
-            \\TensorPencil — Krea 2 inference engine
+            \\TensorPencil — diffusion inference engine
             \\usage:
             \\  TensorPencil generate --prompt "..." [options]
             \\      --negative ""      negative prompt (needs --cfg != 1)
@@ -414,6 +462,11 @@ pub fn main(init: std.process.Init) !void {
             \\                         buffered = read the whole file into RAM up
             \\                         front. Use buffered on ZFS (mmap faulting
             \\                         can deadlock there under memory pressure).
+            \\      --ref-image <png>  SenseNova reference picture for image editing;
+            \\                         repeat for more than one. The pictures are
+            \\                         presented at the size given (32 px per
+            \\                         token), so resize before passing them.
+            \\                         Ignored by every other family
             \\      --out out.png      output file
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
             \\  TensorPencil bench-matmul                 time a DiT-sized fp8 GEMM
@@ -426,6 +479,14 @@ pub fn main(init: std.process.Init) !void {
             \\      check a Qwen3 text encoder on every GPU backend against its
             \\      own CPU forward (kernel check), and optionally against a
             \\      second encoder (quantization check). Accepts .gguf
+            \\  TensorPencil sensenova-cuda-test [<ckpt>] [libs] [--layers N]
+            \\      [--prompt-tokens N] [--sigma S]
+            \\      check sensenova_cuda's PREFIX pass and generation forward
+            \\      against the CPU ones on real weights, on both attention paths
+            \\      and at a padded and an aligned canvas; non-zero if any fails
+            \\  TensorPencil sensenova-vk-test [<ckpt>] [--layers N]
+            \\      [--prompt-tokens N] [--sigma S]
+            \\      the same checks against sensenova_gpu on Vulkan
             \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
             \\      check zimage_cuda's device forward against the CPU forward on
             \\      real weights, on both attention paths; non-zero if any fails
@@ -1931,7 +1992,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima, .minimax_h3 => &.{},
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -2323,6 +2384,264 @@ fn dumpF32(io: Io, arena: std.mem.Allocator, prefix: []const u8, arm: []const u8
     var w = f.writer(io, &buf);
     try w.interface.writeAll(std.mem.sliceAsBytes(data));
     try w.interface.flush();
+}
+
+/// Check a SenseNova device arm against the CPU forward on real checkpoint weights:
+/// the PREFIX pass (the conditioning, which is a whole second 8B stack) and then the
+/// generation forward, at two canvas shapes.
+///
+/// A CLI command rather than a test for the reason every device check here is one:
+/// the test binary brings up no device context. Truncated to a few layers by default
+/// so it loads in seconds; `--layers` is a real axis, because a defect that
+/// accumulates reads healthy at depth 2 and as noise at 42.
+///
+/// The two canvas shapes are not a cost knob either. One is a multiple of 32 and one
+/// is not, so the pad-and-crop path is live in exactly one of them, and a case that
+/// happened to be aligned would let a missing crop pass.
+fn sensenovaCudaTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    libs: bool,
+    layers: usize,
+    toks: usize,
+    sigma: f32,
+    lora_path: []const u8,
+) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const arm = TensorPencil.models.sensenova_cuda;
+
+    var ld = (try sensenovaTestLoad(arena, io, stdout, ckpt, "sensenova-cuda-test", layers, lora_path)) orelse return;
+    defer ld.deinit();
+    try ld.attachLora(stdout);
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== sensenova-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+    try sensenovaArmTest(arm, be, arena, io, stdout, &ld.model, toks, sigma, arm.supported(&ld.model));
+}
+
+/// The Vulkan twin of `sensenovaCudaTest`, over `sensenova_gpu`.
+fn sensenovaVkTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    layers: usize,
+    toks: usize,
+    sigma: f32,
+    lora_path: []const u8,
+) !void {
+    const gpu_mod = TensorPencil.gpu.context;
+    const arm = TensorPencil.models.sensenova_gpu;
+
+    var ld = (try sensenovaTestLoad(arena, io, stdout, ckpt, "sensenova-vk-test", layers, lora_path)) orelse return;
+    defer ld.deinit();
+    try ld.attachLora(stdout);
+
+    const ctx = gpu_mod.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== sensenova-vk-test ==\nvulkan device: {s}\n", .{ctx.deviceName()});
+    try sensenovaArmTest(arm, ctx, arena, io, stdout, &ld.model, toks, sigma, arm.supported(ctx, &ld.model));
+}
+
+/// The checkpoint and the model that reads it. The container OWNS the mapping every
+/// weight points into, so it must outlive the model, which is why it is handed back
+/// rather than closed here.
+const SenseNovaTestLoad = struct {
+    ck: TensorPencil.pipeline.Container,
+    model: TensorPencil.models.sensenova.Model,
+    /// The LoRA file, which must outlive `stack` (its factors are views into the
+    /// mapping), which must outlive `model`.
+    lora_ck: ?TensorPencil.pipeline.Container = null,
+    stack: ?TensorPencil.models.lora.Stack = null,
+    lora_path: []const u8 = "",
+
+    /// Point the model at the stack and report what attached. Called on the
+    /// FINAL address, after `sensenovaTestLoad`'s return has moved this struct.
+    ///
+    /// A real axis for a device check: the host and device applies are separate
+    /// code, so a whole-render PSNR cannot say which of the two moved, and
+    /// `--layers` sweeps the depth that tells a precision floor from a defect
+    /// that accumulates.
+    fn attachLora(self: *SenseNovaTestLoad, stdout: *Io.Writer) !void {
+        if (self.stack == null) return;
+        const st = &self.stack.?;
+        st.beginAttach();
+        for (self.model.device_lins) |w| _ = try st.resolve(w);
+        for (self.model.prefix_lins) |w| _ = try st.resolve(w);
+        const n = try st.finishAttach();
+        self.model.lora = st;
+        try stdout.print("lora: {s}\n  {d} sidecars over {d} layers, {d} MB\n", .{
+            self.lora_path, n, self.model.cfg.n_layers, st.bytes() >> 20,
+        });
+    }
+
+    fn deinit(self: *SenseNovaTestLoad) void {
+        self.model.deinit();
+        // The stack was built on the caller's arena, so its maps go with that;
+        // only the mappings need closing here.
+        self.ck.deinit();
+        if (self.lora_ck) |*c| c.deinit();
+    }
+};
+
+/// Open the checkpoint and load the trunk at `layers` depth, or print why not.
+fn sensenovaTestLoad(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    cmd: []const u8,
+    layers: usize,
+    lora_path: []const u8,
+) !?SenseNovaTestLoad {
+    const sensenova = TensorPencil.models.sensenova;
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("{s} needs a SenseNova checkpoint ({s})\n", .{ cmd, ckpt });
+        return null;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    errdefer ck.deinit();
+    var cfg = sensenova.u15_8b;
+    if (layers != 0) cfg.n_layers = layers;
+    var out: SenseNovaTestLoad = .{
+        .ck = ck,
+        .model = try sensenova.Model.load(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store()), cfg),
+    };
+    // Loaded here but ATTACHED by the caller: this struct is returned by value,
+    // and the model holds a pointer to the stack, so attaching before the move
+    // leaves it pointing at the old address.
+    if (lora_path.len > 0) {
+        out.lora_ck = try TensorPencil.pipeline.Container.open(arena, io, lora_path);
+        var stack: TensorPencil.models.lora.Stack = .{};
+        _ = try stack.add(arena, out.lora_ck.?.store(), 1.0, lora_path);
+        out.stack = stack;
+        out.lora_path = lora_path;
+    }
+    return out;
+}
+
+/// The checks themselves, over whichever arm `arm` is: the two differ only in what
+/// they take as a device handle and in `supported`'s arity, which the callers above
+/// have already resolved.
+fn sensenovaArmTest(
+    comptime arm: type,
+    dev: anytype,
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    model: *TensorPencil.models.sensenova.Model,
+    toks: usize,
+    sigma: f32,
+    supported: bool,
+) !void {
+    const sensenova = TensorPencil.models.sensenova;
+    const cfg = model.cfg;
+    try stdout.print("trunk depth {d} of {d}, prompt {d} tokens\n", .{ cfg.n_layers, sensenova.u15_8b.n_layers, toks });
+    if (!supported) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const ids = try arena.alloc(u32, toks);
+    for (ids, 0..) |*id, i| id.* = @intCast((i * 2731 + 11) % cfg.vocab);
+
+    var failures: usize = 0;
+
+    // --- the prefix pass -------------------------------------------------------
+    var layout = try sensenova.plainLayout(arena, ids);
+    defer layout.deinit(arena);
+    var want_pre = try model.prefixForward(io, arena, layout, &.{}, null);
+    defer want_pre.deinit(arena);
+    var got_pre = try arm.prefixForward(model, dev, io, arena, layout, &.{}, null);
+    defer got_pre.deinit(arena);
+    {
+        const rel = relL2f(want_pre.kv, got_pre.kv);
+        const ok = rel < 5e-3 and std.math.isFinite(rel);
+        if (!ok) failures += 1;
+        try stdout.print("prefix KV vs CPU              rel L2 {e:.4}  {s}\n", .{ rel, if (ok) "ok" else "FAILED" });
+    }
+
+    // --- the generation forward ------------------------------------------------
+    // 64x64 is 2x2 tokens and aligned; 96x40 pads to 96x64 and crops back.
+    const shapes = [_][2]usize{ .{ 64, 64 }, .{ 96, 40 } };
+    const t = 1.0 - sigma;
+    const saved = arm.force_naive_attn;
+    defer arm.force_naive_attn = saved;
+    for (shapes) |hw| {
+        const h = hw[0];
+        const w = hw[1];
+        const x = try arena.alloc(f32, 3 * h * w);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const want = try arena.alloc(f32, x.len);
+        try model.predict(io, arena, want, x, h, w, want_pre, t, null);
+
+        for ([_]bool{ false, true }) |naive| {
+            arm.force_naive_attn = naive;
+            var sess = try arm.Session.init(arena, dev, model, h, w, want_pre);
+            defer sess.deinit(dev);
+            var ws = try arm.Workspace.init(dev, model, &sess, want_pre.seq);
+            defer ws.deinit(dev);
+            const got = try arena.alloc(f32, x.len);
+            try arm.forward(model, dev, &sess, &ws, io, arena, got, x, t, null);
+
+            var nonfinite: usize = 0;
+            for (got) |v| {
+                if (!std.math.isFinite(v)) nonfinite += 1;
+            }
+            const rel = relL2f(want, got);
+            // The control row. `rel` divides by the CPU velocity's own magnitude, and
+            // that magnitude is not fixed: at a truncated depth on random input the
+            // prediction can land near the input, which shrinks the velocity and
+            // inflates the ratio without the absolute error moving. Printing both is
+            // what tells a real divergence from a small denominator.
+            var wsum: f64 = 0;
+            for (want) |v| wsum += @as(f64, v) * v;
+            const wrms = @sqrt(wsum / @as(f64, @floatFromInt(want.len)));
+            // Linear in depth, fitted to a measured sweep of BOTH arms (1, 2, 4, 8,
+            // 16 and 32 layers), which lands within 1.6x of this everywhere past 4.
+            // The GEMMs run tensor cores against the CPU's f32 accumulation, so the
+            // gap grows with the layer count rather than sitting at one figure, and
+            // a single bound is either slack at depth 2 or a false alarm at 32.
+            //
+            // The 64x64 canvas is where it is measured: at the same depth it runs
+            // ~25x the 96x40 case's error, on both arms alike and with the same
+            // reference magnitude (the printed control row), so it is a property of
+            // that shape and not of a backend. Unexplained, and left that way rather
+            // than tuned around.
+            const tol: f64 = 2e-3 + 1e-3 * @as(f64, @floatFromInt(cfg.n_layers));
+            const ok = nonfinite == 0 and rel < tol;
+            if (!ok) failures += 1;
+            try stdout.print("forward {d}x{d} ({s:<10}) rel L2 {e:.4}  (cpu v rms {d:.4})  {s}{s}\n", .{
+                h,                                       w,
+                if (naive) "naive attn" else "tc attn",  rel,
+                wrms,
+                if (ok) "ok" else "FAILED",              if (nonfinite != 0) " (non-finite output)" else "",
+            });
+        }
+    }
+    try summarize(stdout, failures);
+}
+
+fn relL2f(want: []const f32, got: []const f32) f64 {
+    std.debug.assert(want.len == got.len);
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |e, a| {
+        num += (@as(f64, e) - a) * (@as(f64, e) - a);
+        den += @as(f64, e) * e;
+    }
+    return if (den == 0) @sqrt(num) else @sqrt(num / den);
 }
 
 /// Check `zimage_cuda`'s device forward against `zimage.DiT.predict` on real
@@ -4532,6 +4851,14 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     // (it encodes to the unconditional embedding), so only the absent flag is an error.
     var prompt_given = false;
     var repeat: usize = 1; // --repeat N: reuse one pipeline.Session for N images (bench cross-queue residency)
+    // SenseNova reference pictures, in the order they were given, which is the
+    // order they are presented to the model in.
+    var ref_paths: std.ArrayList([]const u8) = .empty;
+    defer ref_paths.deinit(arena);
+    // LoRA sidecars, in the order given (which only fixes the float sum: the
+    // deltas add).
+    var loras: std.ArrayList(TensorPencil.pipeline.LoraSpec) = .empty;
+    defer loras.deinit(arena);
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         const flag = args[i];
@@ -4547,6 +4874,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             repeat = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, flag, "--negative")) {
             opts.negative = val;
+        } else if (std.mem.eql(u8, flag, "--ref-image")) {
+            try ref_paths.append(arena, val);
         } else if (std.mem.eql(u8, flag, "--width")) {
             opts.width = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, flag, "--height")) {
@@ -4655,6 +4984,19 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 std.log.err("--dit-dequant-at-load: expected off|f32|bf16 (got '{s}')", .{val});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, flag, "--lora-host-bf16")) {
+            // DIAGNOSTIC: the control row for a device-vs-host sidecar
+            // comparison. See `lora.host_bf16_act`.
+            TensorPencil.models.lora.host_bf16_act = std.mem.eql(u8, val, "on");
+        } else if (std.mem.eql(u8, flag, "--lora")) {
+            try loras.append(arena, parseLoraSpec(val));
+        } else if (std.mem.eql(u8, flag, "--lora-strength")) {
+            // Applies to the most recent `--lora`, like the `path:strength` form.
+            if (loras.items.len == 0) {
+                try stdout.print("--lora-strength before any --lora\n", .{});
+                return error.InvalidArgs;
+            }
+            loras.items[loras.items.len - 1].strength = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, flag, "--dit-gguf-gemm")) {
             TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, val) orelse {
                 try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, bf16, f16, mmq)\n", .{val});
@@ -4703,6 +5045,34 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     if (!prompt_given) {
         try stdout.print("--prompt is required (it may be empty: --prompt \"\")\n", .{});
         return error.InvalidArgs;
+    }
+
+    // SenseNova reference pictures. PNG only, through the engine's own decoder:
+    // the diffusion executable links libav for muxing but not libvips, so there is
+    // no general image decode here, and a rendered frame round-trips as a
+    // reference. They are NOT resized: the token count follows the extent, which
+    // is the workflow's call upstream too.
+    opts.loras = loras.items;
+    if (ref_paths.items.len != 0) {
+        const refs = try arena.alloc(TensorPencil.models.sensenova.RefImage, ref_paths.items.len);
+        for (ref_paths.items, refs, 0..) |path, *out, ri| {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 << 20));
+            defer arena.free(bytes);
+            const png = TensorPencil.image.decodePngRgb(arena, bytes) catch |err| {
+                try stdout.print("reference {d} ({s}) is not a PNG this build can read: {t}\n", .{ ri + 1, path, err });
+                return err;
+            };
+            defer arena.free(png.pixels);
+            const plane = png.height * png.width;
+            const rgb = try arena.alloc(f32, 3 * plane);
+            for (0..plane) |pix| {
+                for (0..3) |c| rgb[c * plane + pix] = @as(f32, @floatFromInt(png.pixels[pix * 3 + c])) / 255.0;
+            }
+            out.* = .{ .rgb = rgb, .h = png.height, .w = png.width };
+            try stdout.print("reference {d}: {s} ({d}x{d})\n", .{ ri + 1, path, png.width, png.height });
+        }
+        opts.sn_ref_images = refs;
+        try stdout.flush();
     }
 
     var cap: PreviewCap = .{ .arena = arena };
@@ -4879,6 +5249,19 @@ test "library module is reachable" {
 ///
 /// Separate from `generate` rather than a flag on it, because the result is a
 /// different thing: a clip has frames, a frame rate and audio, and no single
+/// `--lora <path>[:<strength>]`, one file per flag.
+///
+/// The strength is split from the RIGHT and only taken as one if it parses as a
+/// float, so a path that happens to contain a colon still resolves as a path.
+fn parseLoraSpec(arg: []const u8) TensorPencil.pipeline.LoraSpec {
+    if (std.mem.lastIndexOfScalar(u8, arg, ':')) |c| {
+        if (std.fmt.parseFloat(f32, arg[c + 1 ..])) |v| {
+            return .{ .path = arg[0..c], .strength = v };
+        } else |_| {}
+    }
+    return .{ .path = arg };
+}
+
 /// image to write. The default output is a muxed MP4 (`src/av.zig`); `--frames`
 /// writes a PNG sequence plus a WAV instead, for inspecting individual frames.
 fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
@@ -4894,6 +5277,10 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
     // ordinals count in the order they arrive on the command line.
     var ref_paths: std.ArrayList([]const u8) = .empty;
     defer ref_paths.deinit(gpa);
+    // LoRA sidecars, in the order given (which only fixes the float sum: the
+    // deltas add).
+    var loras: std.ArrayList(pipeline.LoraSpec) = .empty;
+    defer loras.deinit(gpa);
     // The reference's `ref_image_size` policy. `match` keeps a reference no more
     // expensive than a frame; `max` spends a 2048 px short edge on identity
     // fidelity. Reference tokens ride through EVERY sampling step, so `max` can be
@@ -4980,10 +5367,13 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
             } else return error.BadArgs;
             i += 1;
         } else if (std.mem.eql(u8, flag, "--lora")) {
-            opts.lora_path = val orelse return error.MissingValue;
+            try loras.append(gpa, parseLoraSpec(val orelse return error.MissingValue));
             i += 1;
         } else if (std.mem.eql(u8, flag, "--lora-strength")) {
-            opts.lora_strength = try std.fmt.parseFloat(f32, val orelse return error.MissingValue);
+            // Applies to the most recent `--lora`, which is also what the
+            // `path:strength` form does; either spelling works.
+            if (loras.items.len == 0) return error.BadArgs;
+            loras.items[loras.items.len - 1].strength = try std.fmt.parseFloat(f32, val orelse return error.MissingValue);
             i += 1;
         } else if (std.mem.eql(u8, flag, "--width")) {
             clip_opts.width = try std.fmt.parseInt(usize, val orelse return error.MissingValue, 10);
@@ -5053,6 +5443,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         }
     }.go;
 
+    opts.loras = loras.items;
     const refs = try gpa.alloc(pipeline.Session.RefImage, ref_paths.items.len);
     defer {
         for (refs) |r| gpa.free(@constCast(r.rgb));
@@ -5903,6 +6294,10 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
     };
     const m: usize = 150;
     const scale: f32 = 0.0625;
+    // The runtime dial, which is NOT folded into a factor: the device apply
+    // multiplies it on top of `Target.scale`, so a value other than 1 is what
+    // shows the two are actually multiplied rather than one of them dropped.
+    const strength: f32 = 0.75;
 
     var prng = std.Random.DefaultPrng.init(0x10ca);
     const rnd = prng.random();
@@ -5923,10 +6318,9 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
                 .a = Weight.init(a_b, .bf16, gr, c.in_dim),
                 .b = Weight.init(b_b, .bf16, go, gr),
                 .out_off = g * go,
-                .scale = scale,
             };
         }
-        const t: lora.Target = .{ .factors = factors, .in_dim = c.in_dim, .out_dim = c.out, .tag = c.name };
+        const t: lora.Target = .{ .factors = factors, .in_dim = c.in_dim, .out_dim = c.out, .scale = scale, .tag = c.name };
         if (!lora_cuda.supported(&t)) {
             try stdout.print("FAIL: {s} shapes have no device path\n", .{c.name});
             return error.Unsupported;
@@ -5948,7 +6342,7 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
         // Host: the full delta, then read the same ranges out of it.
         const want = try arena.alloc(f32, m * c.out);
         @memset(want, 0);
-        try t.applyHost(io, arena, want, c.out, x, m);
+        try t.applyHost(io, arena, want, c.out, x, m, strength);
 
         // The control row. The device GEMM rounds the activation to bf16 before
         // multiplying, so a residual of about bf16's own 2^-9 is the FLOOR, not a
@@ -5959,7 +6353,7 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
         for (x_bf, x) |*d, v| d.* = @bitCast(@as(u32, f32ToBf16(v)) << 16);
         const floor_ref = try arena.alloc(f32, m * c.out);
         @memset(floor_ref, 0);
-        try t.applyHost(io, arena, floor_ref, c.out, x_bf, m);
+        try t.applyHost(io, arena, floor_ref, c.out, x_bf, m, strength);
 
         var ws = try lora_cuda.Workspace.init(be, m * c.rank, m * c.out);
         defer ws.deinit(be);
@@ -5981,7 +6375,7 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
 
             try be.beginBatch();
             errdefer if (be.batching()) be.abortBatch();
-            try lora_cuda.applyRange(be, &ws, yd, xd, m, &t, r.off, r.n);
+            try lora_cuda.applyRange(be, &ws, yd, xd, m, &t, strength, r.off, r.n);
             try be.endBatch();
 
             const got = try arena.alloc(f32, m * r.n);

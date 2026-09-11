@@ -1,4 +1,4 @@
-//! Vulkan compute context: loads libvulkan at runtime (std.DynLib, no C
+//! Vulkan compute context: loads libvulkan at runtime (core.dynlib, no C
 //! linkage), owns one compute queue on the best available GPU, and executes
 //! the embedded SPIR-V matmul kernels.
 //!
@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const dynlib = @import("tp_core").dynlib;
 const build_options = @import("build_options");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
@@ -370,8 +371,9 @@ pub const KvFmt = enum { f32, f16, q8_0 };
 /// Reduction widths with a FUSED int8 prep kernel. Every convrot `cols` a model's
 /// device GEMMs use should appear here or that prep silently takes the 3-pass fallback,
 /// which round-trips a full f32 copy of the activation through global memory. krea2 needs
-/// 6144 and 16384; Anima needs 2048 (`dim`) and 8192 (`mlp_dim`).
-pub const i8_prep_cols = [_]u32{ 2048, 6144, 8192, 16384 };
+/// 6144 and 16384; Anima needs 2048 (`dim`) and 8192 (`mlp_dim`); SenseNova needs 4096
+/// (`dim`, and its q projection's output) and 12288 (`inter`).
+pub const i8_prep_cols = [_]u32{ 2048, 4096, 6144, 8192, 12288, 16384 };
 
 /// Which pass of the two-pass flash attention (`coopmat.buildFlashAttn`). Named rather than
 /// inline so a caller can pass it through `@call`.
@@ -382,7 +384,7 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g };
+pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("rmsnorm"),
     dualEntry("rms_apply_w"),
@@ -557,6 +559,10 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("layernorm_h16"),
     dualEntry("ln_mod"),
     dualEntry("l2norm_rows_g"),
+    dualEntry("rope_half_span_pos"),
+    dualEntry("rope_inter_span_pos"),
+    dualEntry("pixel_shuffle"),
+    dualEntry("im2col_stride"),
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -649,17 +655,31 @@ fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Dev
     }, null, out));
 }
 
-fn openVulkanLib() ?std.DynLib {
-    const candidates = [_][]const u8{
+/// The Vulkan loader names, per platform. One list, so `loaderPresent` and the
+/// real open cannot disagree about what counts as installed.
+const vulkan_names: []const []const u8 = switch (builtin.os.tag) {
+    .windows => &.{"vulkan-1.dll"},
+    // MoltenVK ships as the loader itself in the LunarG SDK layout, and as a
+    // bare framework when an app bundles it.
+    .macos => &.{ "libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib" },
+    else => &.{
         "libvulkan.so.1",
         "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
         "/usr/lib64/libvulkan.so.1",
         "/usr/lib/libvulkan.so.1",
-    };
-    for (candidates) |path| {
-        if (std.DynLib.open(path)) |lib| return lib else |_| {}
-    }
-    return null;
+    },
+};
+
+fn openVulkanLib() ?dynlib.Lib {
+    return dynlib.openFirst(vulkan_names);
+}
+
+/// Whether a Vulkan loader is installed. Cheap, and not a claim that a device
+/// exists behind it: `Context.init` is the real answer.
+pub fn loaderPresent() bool {
+    var lib = dynlib.openFirst(vulkan_names) orelse return false;
+    lib.close();
+    return true;
 }
 
 fn check(r: vk.Result) Error!void {
@@ -783,7 +803,7 @@ const WeightEntry = struct {
 
 pub const Context = struct {
     gpa: std.mem.Allocator,
-    lib: std.DynLib,
+    lib: dynlib.Lib,
     d: Dispatch,
     instance: vk.Instance,
     device: vk.Device,

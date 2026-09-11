@@ -65,7 +65,7 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 
 | Capability | cpu | vulkan | zig-cuda | cuda |
 |---|---|---|---|---|
-| **Diffusion txt2img** (all five families) | ⚠️ ref | ✅ | ✅ | ✅ **primary** |
+| **Diffusion txt2img** (all six families) | ⚠️ ref | ✅ | ✅ | ✅ **primary** |
 | **LLM text generation** | ⚠️ ref | ✅¹ | ✅ | ✅ **primary** |
 | **LLM vision (ViT/mmproj)** | ✅ | ⚠️ gemma3 only | ✅ | ✅ |
 | **GPU init failure** | — | → CPU fallback | → CPU fallback | → CPU fallback |
@@ -288,6 +288,26 @@ ONE packed token sequence, on two sigma schedules. See VIDEO_PLAN.md.
 | **MP4 muxing** (H.264 + AAC, `parameters` tag) | ✅ | ✅ | ✅ | ✅ | `lib/video/av_helper.c`, `src/av.zig` (exe only) |
 | **LoRA sidecar** (`--lora`, never merged) | ✅ any dtype | — | ✅ bf16 | ✅ bf16 | `lora{,_cuda}.zig`, architecture-independent |
 
+`--lora <path>[:<strength>]` is repeatable: `lora.Stack` is N files over one model,
+each with its own dial. The deltas ADD, so order changes nothing but the float sum,
+and `strength` is NOT folded into a factor (`Target.scale` holds the file's own
+`alpha / rank`), so `Session.setLoraStrength` moves one without reloading. Seven key
+dialects load, ComfyUI's whole table; `lora_mid` / `dora_scale` / `reshape_weight`
+are REFUSED by name, being a different calculation. Wired families:
+
+| family | cpu | vulkan | zig-cuda | cuda |
+|---|---|---|---|---|
+| `sensenova` | ✅ | — | ✅ | ✅ |
+| `minimax_h3` | ✅ | — | ✅ | ✅ |
+| `krea2`, `zimage`, `anima`, `sd15`, `sdxl` | — | — | — | — |
+
+The two CUDA arms need no per-family work: the apply hangs off `lin_cuda.gemm`, the
+one dispatcher every diffusion family's device GEMMs go through, so a family is a
+`lora` field plus a `plan.lora` assignment. An unwired family REFUSES a `--lora`
+rather than rendering without it, and `sensenova_gpu.supported` returns false when
+one is attached so the Vulkan arm falls back to the CPU instead of silently dropping
+the sidecar.
+
 Both VAE ENCODE sides are now on the device, validated by
 `minimax-h3-vae-encode-cuda-test` and `minimax-h3-audio-encode-cuda-test` against
 their CPU references on real weights (rel L2 ~2e-6 in both cases). Measured on a
@@ -378,7 +398,17 @@ base GEMM alone — a sidecar applied nowhere is a different model, silently.
 
 Device residual against the f32 host apply is **2.3e-3** relative, entirely
 explained: 1.66e-3 from rounding the activation to bf16 for each of the two GEMMs,
-in quadrature. That is under the int8 base path's own ~4e-3.
+in quadrature. That is under the int8 base path's own ~4e-3. `lora-cuda-test` prints
+the floor beside the residual, at a strength other than 1 so a dropped dial shows.
+
+⚠️ **A whole-render device-vs-host PSNR is not a reading on the sidecar.** With the
+8-step turbo LoRA, SenseNova's cpu-vs-cuda render fell from 53.8 dB to 38.5 dB, which
+is NOT the sidecar: per-forward agreement is unchanged by it (9.67e-4 with against
+9.68e-4 without, same shape and depth; at depth 8, 4.4e-3 against 6.2e-3), and
+rounding the HOST apply's activation to bf16 as the device does moves the render by
+only 65.9 dB (`--lora-host-bf16 on`, the control row). The turbo trajectory is simply
+more sensitive to the arm's own ~1e-3 forward divergence. Use
+`sensenova-cuda-test --lora ... --layers N` for a reading on the apply itself.
 
 The accumulate onto the base GEMM's output is folded into cuBLASLt's epilogue
 (`opGemmBf16Acc`, `beta = 1` with `C == D`), because materializing the delta and
@@ -397,7 +427,7 @@ Fixed by rounding up and guarding the tail; `prepButterflyIters` is the exposed
 form and a device-free test pins it. Any future model whose hidden width is not a
 multiple of 1024 would have hit the same thing.
 
-### 2E. Diffusion speed snapshot
+### 2F. Diffusion speed snapshot
 
 RTX 3090, ReleaseFast. Read a PSNR against its model's own precision floor, not in
 isolation — these models disagree with themselves across dtypes by 23-25 dB.
@@ -414,7 +444,117 @@ isolation — these models disagree with themselves across dtypes by 23-25 dB.
 The CPU path is the reference; no GPU arm is bit-identical to it. All three GPU arms agree
 with each other inside their models' own precision envelopes.
 
-### 2F. DiT block weight-dtype support
+### 2G. SenseNova U1.5 (pixel-space MoT)
+
+Not a DiT: one Qwen3-shaped 8B trunk carrying TWO weight copies per layer. The
+prompt runs the base copy causally and leaves a KV cache; the canvas -- in PIXEL
+space, one token per 32x32 px, no VAE -- runs the `_mot_gen` copy against it,
+unmasked. The head predicts x0 and the wrapper divides by sigma.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Where |
+|---|---|---|---|---|---|
+| **Prefix pass** (42 layers, base copy) | ✅ | ✅ | ✅ | ✅ | `sensenova{,_gpu,_cuda}.zig`. A second full 8B stack that no denoise step reads, so the CUDA arms prefetch it a layer ahead and leave it to the LRU rather than pinning it |
+| **Generation trunk** (42 layers, `_mot_gen` copy) | ✅ | ✅ | ✅ | ✅ | `sensenova{,_gpu,_cuda}.zig` |
+| **Vision patch embedder** (16x16 conv, interleaved 2-D rope, 2x2 merge) | ✅ | ✅ | ✅ | ✅ | `im2col_stride` + `rope_inter_span_pos`, both `dual/` kernels, so one source serves SPIR-V and PTX |
+| **`fm_head`** (shuffle 2, 3x3, shuffle 2, 3x3, shuffle 8) | ✅ | ✅ | ✅ | ✅ | `pixel_shuffle` + banded `im2col_sd` (cuDNN on `cuda`) |
+| **Understanding tower** (reference pictures) | ✅ | ✅ | ✅ | ✅ | host in every arm: ~30M parameters against the trunk's 8B, once per conditioning |
+| **Image editing** (1..n reference pictures) | ✅ | ✅ | ✅ | ✅ | block-causal prefix via `attention.kv_end`, then `opAttnBatched` on CUDA and `attnBatched` on Vulkan: both take the per-query key range as a BUFFER, so one kernel serves plain-causal and block-causal alike |
+| **Decode** | ✅ | ✅ | ✅ | ✅ | there is no VAE: the canvas IS the image, `clamp((x+1)/2)` |
+| **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | exact, for the same reason |
+| **LoRA sidecar** (8-step turbo) | ✅ | — | ✅ | ✅ | §6's stack. The shipped turbo LoRA patches only the `_mot_gen` copy: 294 targets, rank 128, alpha 8, bf16, no fused qkv, so the base tower and its KV conditioning are untouched. Vulkan falls back to the CPU |
+
+Weight dtypes follow §2H's table through the shared `lin_cuda` dispatcher, with one
+measured exception worth stating: **`mlp.down_proj` cannot be q4_k on this
+architecture.** Every other linear can. A conversion that quantizes all of them
+renders a photograph with no relation to the prompt -- two unrelated prompts at one
+seed render the SAME picture -- because the conditioning IS the prefix KV cache, and
+that cache is gone by layer 5.
+
+The attribution ran one prompt through both checkpoints' prefix pass on the CPU and
+compared the KV cache per layer, substituting one weight kind at a time from the
+dense file through a `weights.Overlay`:
+
+| what is q4_k | KV cos, layer 5 | KV cos, whole 42-layer cache |
+|---|---|---|
+| everything | 0.345 | 0.45 |
+| everything but `mlp.down_proj` | 0.997 | 0.988 |
+
+and no other weight kind moves it (q/k/v/o/gate/up each change the layer-5 cosine
+by under 0.04). Neither the file nor the reader is at fault: all 589
+quantized tensors sit in a tight 0.070-0.094 rel L2 against the bf16 source with no
+outlier, the 527 F32 ones are bit-exact, and our own dequantized weights reproduce
+those same figures. Nor is the trunk merely sensitive -- a bf16 device-vs-CPU
+perturbation grows only 1.8e-3 to 5.3e-3 from depth 4 to 42, so it does not amplify.
+`down_proj` is the contraction over the 12288-wide SiLU-gated hidden, which is where
+this model's activation outliers are, the same reason llama.cpp's k-quant mixes
+upgrade `ffn_down`.
+
+One extra bit is enough. Scaling `down_proj`'s error to a fraction of q4_k's, which
+stands in for a bit width, gives layer-5 KV cosine 0.953 at 1/2
+(~q5_k), 0.985 at 1/4 (~q6_k) and 0.994 at 1/8 (~q8_0), against 0.997 dense.
+
+**Only the BASE copy.** The `_mot_gen` copy's `down_proj` needs nothing: measured on
+the generation forward with both sides run against the same dense prefix, so the
+conditioning is held fixed and only the generation tower differs, q4_k throughout
+already sits at cos 0.9889 (256 px) / 1.0000 (512 px), and taking
+`mlp_mot_gen.down_proj` dense moves those to 0.9891 / 1.0000. The sensitivity is a
+property of the 42-layer causal TEXT pass, whose output is a deep hidden state,
+not of the architecture: a conversion should upgrade `mlp.down_proj` and can leave
+`mlp_mot_gen.down_proj` at q4_k.
+
+Measured on a 3090 with the vendor-library arm, bf16, 1024x1024, 8 steps, cfg 1:
+
+| | cpu | cuda |
+|---|---|---|
+| prefix (265 tokens) | 8.9 s | 0.4 s |
+| one step (1024 canvas tokens) | 30.3 s | **0.48 s** |
+| whole render | 250 s | **14.9 s** |
+
+Vulkan against `cuda` in one paired run (same prompt, seed and schedule), steady-state
+per step, since the first steps carry the weight upload:
+
+| | cuda | vulkan |
+|---|---|---|
+| one step (1024 canvas tokens) | 0.42 s | 0.57 s (**1.36x**) |
+| whole render | 12.0 s | 27.9 s |
+| edit prefix (322 tokens, one 8x8-token picture) | 3.7 s | 9.3 s |
+
+Device-vs-CPU agreement is `sensenova-cuda-test` / `sensenova-vk-test` (prefix KV and
+the generation forward, both attention paths, an aligned and a padded canvas) plus
+**56.9 dB** on a whole 42-layer 1024x1024 render.
+
+**Its tolerance is dtype-blind (`2e-3 + 1e-3 * n_layers`) and every
+activation-quantized format fails it**, where Anima's equivalent has a per-dtype
+base. Prefix KV rel L2 vs the CPU, `--layers` swept:
+
+| depth | dense | int8-convrot | asym_w4a8 | int4-convrot |
+|---|---|---|---|---|
+| 1 | 5.4e-4 | 2.9e-3 | — | — |
+| 2 | 1.2e-3 | 3.0e-2 | — | — |
+| 4 | — | 6.4e-2 | — | — |
+| 8 | 2.2e-3 | 9.1e-2 | 1.1e-1 | 7.4e-1 |
+
+int8 and W4A8 land in the same place from two unrelated weight decodes, which points
+at the W8A8 activation prep they share; the CPU reference dequantizes the weight and
+multiplies in f32, so it is not the same arithmetic either way. Which side is closer
+to ComfyUI is UNMEASURED, so the tolerance stands as it is. **The conditioning on
+this family IS the prefix KV** (the q4_k `down_proj` note above), so what settles
+whether int8 is usable here is two prompts through the int8 and dense files compared
+on conditioning and velocity, not this test.
+
+The two device arms agree to **59.3 dB** on a whole 1024x1024 render (max channel
+difference 3/255) and to **60.5 dB** on an edit at 512x512 through the block-causal
+prefix (max 1/255), which is the check that matters for the Vulkan arm: `cuda` is the
+one already validated against ComfyUI.
+
+The Vulkan arm takes the same two shapes a different way, and neither is a new kernel.
+Its generation attention is RECTANGULAR GQA (`seq_q` = canvas against `seq_kv` = prefix
++ canvas), which the two-pass flash pipeline already does; `attn_full` cannot express
+it, and `attn_cross` has no GQA, so neither is on this path. Its prefix attention is
+`attn_batched`, whose per-query `[start, end)` key range is read from a fifth storage
+buffer -- that is what makes the block-causal edit prefix a table rather than a kernel.
+
+### 2H. DiT block weight-dtype support
 
 The CUDA columns hold for every family (krea2, Z-Image, Anima): one dispatcher,
 `lin_cuda`, routes each block linear by its own dtype and shape. The Vulkan column is
@@ -471,6 +611,11 @@ rotated weight with an unrotated activation and the render is uncorrelated noise
 (rel RMSE 1.00 vs the CPU forward, measured). An unrotated checkpoint also tends to quantize
 the projections and the whole text-fusion stack, which the convrot files leave dense.
 The unrotated prep is `rowmax_i8` + `quantize_i8` on Vulkan and `iprep_nr` on CUDA.
+
+Both are reachable from every family: `lin_cuda` passes `Plan.rot` to `opI8PrepR`, and
+each Vulkan stepper's `prepGroup` reads `lin.convrot` over the group it is about to
+feed. int4 is the one exception, refused unrotated on both arms, because its decode
+emits a weight quantized after the rotation.
 
 ⚠️ **Unrotated costs accuracy, and that is the format, not the port.** Spreading activation
 outliers is the entire reason ComfyUI's int8 format is rotated at all. Measured on krea2 at

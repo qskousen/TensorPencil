@@ -18,6 +18,8 @@
 
 const std = @import("std");
 const lin = @import("lin.zig");
+const lora_mod = @import("lora.zig");
+const lora_cuda = @import("lora_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -144,10 +146,15 @@ pub const Plan = struct {
     rot: bool,
     /// The caller's block-quant route.
     blockq: BlockQGemm,
+    /// The LoRA sidecars, or null. Set by the family after `plan`, since it is a
+    /// property of the render and not of the checkpoint. `gemm` applies every
+    /// hit against the weight it just multiplied, which is what makes one hook
+    /// reach every family instead of one per architecture.
+    lora: ?*const lora_mod.Stack = null,
 };
 
 /// Why `check` refused a checkpoint.
-pub const Why = enum { mixed_convrot, no_gemm, int_shape, int4_unrotated, blockq_basis, nvfp4_shape, w4a8_group, gemm_shape };
+pub const Why = enum { mixed_convrot, no_gemm, int_shape, int4_unrotated, blockq_basis, nvfp4_shape, w4a8_group, gemm_shape, no_row_scale };
 
 pub const Refusal = struct { why: Why, tag: []const u8 = "", dtype: DType = .f32, rows: usize = 0, cols: usize = 0 };
 
@@ -159,6 +166,13 @@ pub fn check(lins: []const Weight, pol: BlockQGemm) Verdict {
     for (lins) |w| {
         const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows, .cols = w.cols };
         const r = routeOf(w, pol) orelse return .{ .refused = with(bad, .no_gemm) };
+        // Named here rather than met as `w.row_scale.?` in the GEMM below, where the
+        // null is a slice at address 0.
+        switch (w.dtype) {
+            .i8, .i4, .w4a8 => if (w.row_scale == null or w.row_scale.?.len != w.rows)
+                return .{ .refused = with(bad, .no_row_scale) },
+            else => {},
+        }
         switch (prepOf(r)) {
             // The int8 GEMMs launch `rows / 128` blocks and the prep rotates in groups of 256.
             .i8, .i4 => if (w.rows % 128 != 0 or w.cols % 256 != 0) return .{ .refused = with(bad, .int_shape) },
@@ -201,6 +215,7 @@ pub fn plan(lins: []const Weight, pol: BlockQGemm, who: []const u8) error{Unsupp
                 .nvfp4_shape => std.log.err("{s}: {s} is [{d}, {d}] nvfp4; the f16 GEMM it feeds needs rows % 128 == 0 and cols % 32 == 0", .{ who, r.tag, r.rows, r.cols }),
                 .w4a8_group => std.log.err("{s}: {s} is W4A8 with a group_size that is not a multiple of 8; this backend's decode kernel needs one scale per 8 columns", .{ who, r.tag }),
                 .gemm_shape => std.log.err("{s}: {s} is [{d}, {d}] {t}; the f16 dequant GEMM needs rows % 128 == 0 and cols % 32 == 0", .{ who, r.tag, r.rows, r.cols, r.dtype }),
+                .no_row_scale => std.log.err("{s}: {s} is {t} with no per-row scale for its {d} rows; its companion weight_scale is missing or the loader did not read it", .{ who, r.tag, r.dtype, r.rows }),
             }
             return error.UnsupportedCheckpoint;
         },
@@ -221,6 +236,37 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
     };
     if (bq != 0) try be.ensureDeviceBuffer(&be.bq_i8, bq);
     if (w4 != 0) try be.ensureDeviceBuffer(&be.w4a8_i8, w4);
+}
+
+/// Reach the sidecar scratch's final size before the first block, and refuse a
+/// factor no kernel here can run.
+///
+/// Two reasons this is not left to the growth in `sidecar`: growing a device
+/// buffer syncs the stream, and `opGemmBf16`'s hand-PTX arm fetches a zero bias
+/// per call and GROWS it, whose grown buffer is a NEW host pointer while the old
+/// one still sits in the pointer-keyed device weight cache.
+///
+/// `max_rows` is the most activation rows a render will pass, unpadded.
+pub fn presizeLora(be: *Backend, stack: *const lora_mod.Stack, lins: []const Weight, max_rows: usize) !void {
+    var widest_out: usize = 0;
+    for (lins) |w| {
+        for (stack.forWeight(w)) |h| {
+            // A trunk that ran the base GEMM alone for one linear is a different
+            // model, silently, so one unsupported factor refuses the whole thing
+            // rather than falling back per weight.
+            if (!lora_cuda.supported(h.target)) {
+                std.log.err("lin_cuda: LoRA {s} has a factor shape this backend has no GEMM for", .{h.target.tag});
+                return error.UnsupportedCheckpoint;
+            }
+            widest_out = @max(widest_out, w.rows);
+        }
+    }
+    if (widest_out == 0) return;
+    const f = stack.maxFactor();
+    const mpad = std.mem.alignForward(usize, max_rows, 128);
+    _ = try lora_cuda.borrowed(be, mpad * f.rank, mpad * widest_out);
+    // The A GEMM's own output width counts too: it is `rank` wide.
+    _ = try be.zeroBias(@max(f.rank, widest_out));
 }
 
 /// Stage the activation `x[m][cols]` once for every linear in `group`, if any of them
@@ -314,6 +360,43 @@ pub fn gemm(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, out_f16:
             error.UnsupportedKernelArm => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, null),
             else => return err,
         },
+    }
+    if (p.lora) |stack| try sidecar(be, stack, y, x, m, w, out_f16);
+}
+
+/// Every LoRA hit against `w`, accumulated onto the base GEMM's output.
+///
+/// A no-op when nothing patches `w`, so it sits beside the one dispatch every
+/// family's GEMMs go through and a sidecar cannot be skipped at some call site:
+/// that renders a finite, plausible, wrong image with no error anywhere.
+///
+/// `x` is the f32 activation the base GEMM read. The int8 arms only READ it
+/// during their prep rather than rewriting it, so it is still the unrotated
+/// activation the sidecar needs.
+fn sidecar(be: *Backend, stack: *const lora_mod.Stack, y: Buf, x: Buf, m: usize, w: Weight, out_f16: bool) !void {
+    const hits = stack.forWeight(w);
+    if (hits.len == 0) return;
+    // An f16 output plane cannot take an f32 accumulate. Nothing pairs the two
+    // today (only the SD family chains f16 activations, and no sidecar is wired
+    // there), and refusing beats writing f32 over half of it.
+    if (out_f16) {
+        std.log.err("lin_cuda: {s} has a LoRA sidecar and an f16 output plane, which cannot be accumulated onto", .{w.tag orelse "<untagged>"});
+        return error.UnsupportedCheckpoint;
+    }
+    // The A GEMM pads its row count to the tile, so the rank scratch is sized
+    // from the padded count. Sizing it from `m` lets the last tile's store run
+    // past the buffer.
+    const mpad = std.mem.alignForward(usize, m, 128);
+    var rank: usize = 0;
+    for (hits) |h| for (h.target.factors) |f| {
+        rank = @max(rank, f.rank());
+    };
+    var ws = try lora_cuda.borrowed(be, mpad * rank, mpad * w.rows);
+    for (hits) |h| {
+        const s = stack.files.items[h.file].strength;
+        // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
+        if (s == 0) continue;
+        try lora_cuda.applyRange(be, &ws, y, x, m, h.target, s, 0, w.rows);
     }
 }
 

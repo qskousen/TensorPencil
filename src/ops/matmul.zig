@@ -183,7 +183,7 @@ pub const Weight = struct {
     }
 };
 
-pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory } || std.Io.Cancelable;
+pub const Error = error{ UnsupportedDType, UnsupportedCheckpoint, QuantBackendUnavailable, OutOfMemory } || std.Io.Cancelable;
 
 /// Whether `matmul` can take a weight of this dtype at all, the same set its own
 /// validation switch accepts, exposed so a *loader* can decide up front instead of
@@ -334,8 +334,17 @@ pub fn matmul(
         .q2_0_g128 => std.debug.assert(w.cols % w.dtype.blockElems() == 0),
         else => return error.UnsupportedDType,
     }
-    if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8)
-        std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
+    // An error and not an assert: an assert is compiled out in ReleaseFast, and the
+    // null then reaches the panel pack as a slice at address 0. Loaders attach this
+    // in `quant_weight.load`.
+    if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8) {
+        if (w.row_scale == null or w.row_scale.?.len != w.rows) {
+            std.log.err("matmul: {s} is {t} with no per-row scale for its {d} rows", .{
+                w.tag orelse "<untagged weight>", w.dtype, w.rows,
+            });
+            return error.UnsupportedCheckpoint;
+        }
+    }
     // A `.w4a8` weight without its sidecars cannot be decoded at all, and the nibbles
     // would otherwise be read as signed int4, plausible values, wrong weight.
     if (w.dtype == .w4a8) std.debug.assert(w.w4a8 != null);

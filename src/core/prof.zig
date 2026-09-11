@@ -5,6 +5,7 @@
 //! the buckets sum to a meaningful total. No-op and ~free when disabled.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Cat = enum { matmul, deltanet, conv, attention, rope, norm, act, embed, other };
 const n_cat = @typeInfo(Cat).@"enum".fields.len;
@@ -42,8 +43,23 @@ pub fn report(w: *std.Io.Writer) !void {
     try w.print("  {s:<10} {d:>8.1} ms\n", .{ "TOTAL", tf / 1e6 });
 }
 
-fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+/// Monotonic nanoseconds, io-free (`std.time.Timer` is gone in 0.16 and
+/// `std.Io.Clock` needs an `Io` the callers here do not have). Shared with the
+/// CUDA backend and the benchmarks, which all time regions the same way.
+pub fn monoNs() u64 {
+    if (builtin.os.tag == .windows) {
+        var freq: u64 = undefined;
+        var counter: u64 = undefined;
+        _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(@ptrCast(&freq));
+        _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(@ptrCast(&counter));
+        if (freq == 0) return 0;
+        // Scale before dividing, in two halves, so neither overflows at uptimes
+        // a benchmark run can reach.
+        return (counter / freq) * 1_000_000_000 + ((counter % freq) * 1_000_000_000) / freq;
+    }
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
+
+const nowNs = monoNs;

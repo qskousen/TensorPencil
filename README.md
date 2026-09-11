@@ -4,10 +4,17 @@
 
 TensorPencil is about running inference backed by Zig so we have better control over memory.
 
-It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested for diffusion.
-For LLM side, it works with Qwen 3/3.5/3.6 of various sizes, K2 Horizon, and Gemma 3 12b. LLM's are only tested in GGUF currently
-(with the exception of the krea 2 text encoder, which is safetensors),
-while diffusion models are only supported in safetensors.
+On the diffusion side it runs six model families — Krea 2, SD 1.5, SDXL, Z-Image, Anima and
+SenseNova U1.5 — in safetensors or GGUF. The family is detected from the checkpoint's own
+tensor names, so there is no flag to get wrong. Weights can be fp8, bf16, int8/int4 ConvRot,
+W4A8, NVFP4 or GGUF block quants; not every format runs on every backend (see `BACKEND.md`).
+
+For LLM side, it works with Qwen 3/3.5/3.6/3.8, K2 Horizon, Gemma 3 and Gemma 4, Bonsai, and
+Mistral/llama-architecture models, with vision where the model has it. LLMs are only tested
+in GGUF (the exception is the Krea 2 text encoder, which is safetensors).
+
+There are three executables: `TensorPencil` (the diffusion CLI), `tp-llm` (the LLM CLI) and
+`tp-gui` (a desktop app that does both).
 
 ### AI Disclaimer
 TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
@@ -31,16 +38,22 @@ backends vs. a ComfyUI reference.
 
 ![Backend image delta comparison](testdata/int8_backend_comparison.png)
 
-This has been tested only on Linux with an RTX 3090 and RTX 4090. It's likely that other
-operating systems and GPUs will hit problems or run less efficiently.
+This has been tested on Linux with an RTX 3090 and RTX 4090, and the Vulkan backend on an
+Intel Arc A310. Other operating systems and GPUs will hit problems or run less efficiently.
+Two known limits: the PTX is built for one CUDA compute capability at a time (`-Dcuda-sm`,
+default 86, so pre-Ampere cards will not JIT it), and the AMD paths are written but untested.
 
-Not all backends support all model formats yet.
+Not all backends support all model formats yet. The full grid is in `BACKEND.md`; the short
+version for diffusion weights:
 
-| Model format | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
-|:-------------|:-----:|:--------:|:----------:|:------:|
-| FP8          |   ✅   |    ✅     |     ❌      |   ❌    |
-| INT8 ConvRot |   ✅   |    ✅     |     ✅      |   ✅    |
-| INT4 ConvRot |   ✅   |    ❌     |     ✅      |   ✅    |
+| Model format      | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
+|:------------------|:-----:|:--------:|:----------:|:------:|
+| FP8               |   ✅   |    ✅     |     ✅      |   ✅    |
+| BF16              |   ✅   |    ✅     |     ✅      |   ✅    |
+| INT8 ConvRot      |   ✅   |    ✅     |     ✅      |   ✅    |
+| INT4 ConvRot      |   ✅   |    ✅     |     ✅      |   ✅    |
+| W4A8 / NVFP4      |   ✅   |    ✅     |     ✅      |   ✅    |
+| GGUF block quants |   ✅   |    ❌     |     ✅      |   ✅    |
 
 Speeds vary widely depending on the model format and backend used. This table is from an RTX
 3090 / Ryzen 7 9800X3D generating a 1024x1024 cfg 1 image with full VRAM availability,
@@ -57,9 +70,34 @@ Plans for the future:
 
 ## Running it
 
-Requires Zig 0.16.0 and `libvips`.
+Requires Zig 0.16.0 and a few system C libraries. `zig build` (the two CLIs) needs:
 
-The GGUF loading code uses ggml, as a dependency. It will be fetched automatically on compile.
+- **libvips** — image decode for `tp-llm`'s `--image` / `@mentions`
+- **libavformat / libavcodec / libavutil / libswscale / libswresample** (ffmpeg) — clip
+  muxing in the diffusion CLI
+- **pkg-config**, which is how the build finds both
+
+`zig build gui` additionally needs **X11, Xcursor, Xi and wayland-client** for SDL3.
+
+On Debian/Ubuntu:
+
+```
+sudo apt install pkg-config libvips-dev libavformat-dev libavcodec-dev libavutil-dev \
+                 libswscale-dev libswresample-dev
+sudo apt install libx11-dev libxcursor-dev libxi-dev libwayland-dev   # for tp-gui
+```
+
+On Arch: `pacman -S pkgconf libvips ffmpeg` (plus `libx11 libxcursor libxi wayland` for the
+GUI).
+
+ggml, dvui/SDL3 and known-folders are Zig package dependencies and are fetched automatically
+on compile. ggml can be turned off with `-Dggml=false`, which costs the GGUF block-quant
+dtypes.
+
+If your distro is new enough to ship gcc 16 / recent binutils (Arch, CachyOS), Zig 0.16's ELF
+linker cannot process the `.sframe` relocations in its crt startup objects and every
+libc-linked build fails. Run `tools/patch-crt.sh` once; the build picks up the patched crt
+automatically after that.
 
 Backends other than `cpu` require additional runtime libraries:
 
@@ -83,14 +121,22 @@ Build with optimizations on (Debug is painfully slow for numeric code):
 zig build -Doptimize=ReleaseFast
 ```
 
-Model weights are not included. You will need a Krea 2 model in fp8/int8/int4 format, along
-with Qwen 3 VL 4b and Wan 2.2 VAE. Then:
+Model weights are not included. What you need depends on the family: a bundled SD1.5 or SDXL
+checkpoint carries its text encoder and VAE inside it, while Krea 2 wants a separate Qwen 3
+VL 4b text encoder and a Wan 2.1 VAE. Anything the primary checkpoint doesn't carry is given
+with `--text-encoder` / `--vae`. For example:
 
 ```
 zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --dit /path/to/krea2.safetensors --text-encoder /path/to/qwen3VL.safetensors --vae /path/to/vae.safetensors --backend vulkan --out cat.png
 ```
 
 Run with no command to see the available options and defaults.
+
+### GUI
+
+`zig build gui` builds `tp-gui`, a desktop app (dvui + SDL3) that runs chat and image
+generation together: models are picked from folders you point it at rather than typed as
+paths, and the two sides share one VRAM budget. `zig build run-gui` builds and runs it.
 
 ### VRAM offloading
 
@@ -122,8 +168,9 @@ NOTE: this has changed quite a bit since I wrote this, the speed numbers need to
 
 ### LLM
 
-Added another executable that processes LLM models, for fun: `tp-llm`. Only tested with the already-used Qwen 3 VL 4b
-text encoder model (embedded tables) and now supports gguf models and qwen 3.6 27b, with vision.
+Added another executable that processes LLM models, for fun: `tp-llm`. It started with the
+already-used Qwen 3 VL 4b text encoder model (embedded tables) and now covers GGUF models
+across the Qwen 3.x, Gemma 3/4, llama/Mistral and K2 Horizon architectures, with vision.
 
 Can run in single-response mode if you specify `--prompt <prompt>`, or runs in REPL (conversation) mode if you skip
 the prompt. In REPL mode, type `/exit` to exit. Most models run on all four backends; K2 Horizon runs on CPU and CUDA. Qwen 3 VL 4b:

@@ -1,0 +1,125 @@
+name: Build and Release
+
+# UNVERIFIED: written from the ggufy pipeline and adapted, but only the Linux
+# path matches a build that has actually been run. The Windows and macOS jobs
+# link the same system C libraries (libvips, ffmpeg) the Linux one does, which
+# is the part most likely to need adjusting on first run.
+#
+# Released binaries require an AVX2 CPU regardless of -Dcpu: build_ggml.zig
+# compiles ggml's kernels with -mavx -mavx2 unconditionally.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest
+            name: macos-aarch64
+          - os: macos-13
+            name: macos-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config \
+            libvips-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libx11-dev libxcursor-dev libxi-dev libwayland-dev
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config vips ffmpeg
+
+      # Zig finds libvips/ffmpeg through pkg-config, so Windows needs a package
+      # set that ships both plus their .pc files. MSYS2's mingw64 repo has them
+      # prebuilt; vcpkg would build them from source and take hours.
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-libvips
+            mingw-w64-x86_64-ffmpeg
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=baseline
+          zig build gui -Doptimize=ReleaseFast -Dcpu=baseline
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=x86_64-windows-gnu
+          zig build gui -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=x86_64-windows-gnu
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cd zig-out/bin
+          zip ../../dist/tensorpencil-${{ matrix.name }}.zip TensorPencil tp-llm tp-gui
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir dist
+          Compress-Archive -Path zig-out/bin/TensorPencil.exe,zig-out/bin/tp-llm.exe,zig-out/bin/tp-gui.exe `
+            -DestinationPath dist/tensorpencil-${{ matrix.name }}.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/tensorpencil-${{ matrix.name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*/tensorpencil-*.zip
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -74,7 +74,7 @@ pub const Info = struct {
     pub fn isComplete(self: Info) bool {
         const t = traits(self.family);
         return self.contents.denoiser and self.contents.conditioner and
-            self.contents.decoder and
+            (t.no_decoder or self.contents.decoder) and
             (!t.dual_conditioner or self.contents.conditioner2) and
             (!t.dual_decoder or self.contents.decoder2);
     }
@@ -137,6 +137,9 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
             .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
             .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
+            // Not a side file: SenseNova's "conditioner" is the trunk's own
+            // understanding half, in the checkpoint the denoiser came from.
+            .sensenova => dims.len == 2 and dims[1] == models.sensenova.u15_8b.dim,
             .sd15, .sdxl => dims.len == 1 and dims[0] == models.clip_text.clip_l.hidden,
         },
         .conditioner2 => switch (fam) {
@@ -148,7 +151,7 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             .sd15 => dims.len == 4 and dims[1] == models.sd_vae.sd15.z_channels,
             .sdxl => dims.len == 4 and dims[1] == models.sd_vae.sdxl.z_channels,
             .zimage => dims.len == 4 and dims[1] == models.sd_vae.flux.z_channels,
-            .krea2, .anima, .minimax_h3 => true,
+            .krea2, .anima, .minimax_h3, .sensenova => true,
         },
         .decoder2, .denoiser => true,
     };
@@ -188,7 +191,9 @@ fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
         .zimage => C.qwen3_4b,
         .anima => C.qwen3_0_6b,
         .minimax_h3 => C.qwen3vl_32b_h3,
-        .sd15, .sdxl => null,
+        // Not a Qwen3 encoder file: the depth check below is about a SIDE
+        // encoder's layer count, and SenseNova has no side encoder to check.
+        .sd15, .sdxl, .sensenova => null,
     };
 }
 
@@ -203,6 +208,132 @@ pub fn previewFits(store: tp.weights.WeightStore, fam: Family) bool {
     const dims = v.info.shape.slice();
     if (!(dims.len == 4 and dims[1] == tp.models.taehv.latent_channels)) return false;
     return fam == .krea2 or fam == .anima;
+}
+
+// ── LoRA sidecars ─────────────────────────────────────────────────────────────
+
+/// What a LoRA file turned out to be, for the menu row.
+pub const LoraInfo = struct {
+    /// Base linears it patches.
+    targets: u32 = 0,
+    /// Rank of the first factor read. Real files are one rank throughout, and
+    /// this is a label, not something the loader relies on.
+    rank: u32 = 0,
+    /// Deepest `layers.N` it names, plus one. Zero when it names no layer.
+    depth: u32 = 0,
+};
+
+/// Read a LoRA's shape from its header, or null when the file is not one.
+///
+/// One pass over the names, since a LoRA file is all factor keys and there is no
+/// single probe tensor to look for the way there is for a component.
+pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
+    const lora = tp.models.lora;
+    var out: LoraInfo = .{};
+    for (store.names()) |name| {
+        if (!std.mem.startsWith(u8, name, lora.Sidecar.prefix)) continue;
+        // A DoRA or conv-CP adapter is not a LoRA this engine applies, and the
+        // loader refuses it, so the menu must not offer it either.
+        if (lora.Sidecar.refusedSuffix(name) != null) return null;
+        const stem = lora.Sidecar.factorStem(name) orelse continue;
+        out.targets += 1;
+        if (out.rank == 0) {
+            if (store.get(name)) |v| {
+                const dims = v.info.shape.slice();
+                if (dims.len == 2) out.rank = @intCast(dims[0]);
+            }
+        }
+        if (layerIndex(stem)) |n| out.depth = @max(out.depth, n + 1);
+    }
+    return if (out.targets == 0) null else out;
+}
+
+/// Whether `store` is LoRA-shaped but under a key prefix this engine does not
+/// map: kohya's `lora_unet_*` / `lora_te_*`, which is what most SD-family LoRAs
+/// ship as.
+///
+/// Only for the note. `loraScan` returning null and this returning true is a very
+/// different thing from a file that is not a model at all, and a folder of these
+/// is exactly what someone points the scanner at.
+pub fn loraForeignDialect(store: tp.weights.WeightStore) bool {
+    const lora = tp.models.lora;
+    for (store.names()) |name| {
+        for (lora.dialects) |d| {
+            if (std.mem.endsWith(u8, name, d.a) or std.mem.endsWith(u8, name, d.b)) return true;
+        }
+    }
+    return false;
+}
+
+/// The `layers.<N>.` index in a base tensor name, or null.
+fn layerIndex(stem: []const u8) ?u32 {
+    const key = "layers.";
+    const at = std.mem.indexOf(u8, stem, key) orelse return null;
+    const rest = stem[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+/// Whether a LoRA `loraScan` accepted can patch `fam`'s denoiser.
+///
+/// The test is the family's own root and widths, read off the engine's config, so
+/// it cannot disagree with what the attach will then demand. ⚠️ Depth is a BOUND,
+/// not the equality `storeFits` uses for a side file: a style LoRA legitimately
+/// patches only some layers, and demanding it name the deepest one would reject a
+/// perfectly good file.
+pub fn loraFits(store: tp.weights.WeightStore, fam: Family) bool {
+    const spec = loraSpec(fam) orelse return false;
+    const info = loraScan(store) orelse return false;
+    if (info.depth > spec.layers) return false;
+    // One target, checked on both sides: `a` contracts the model's width and `b`
+    // emits the linear's own. A LoRA for another variant of this architecture has
+    // the right names and the wrong widths.
+    return loraTargetFits(store, spec.probe, spec.in_dim, spec.out_dim);
+}
+
+const LoraSpec = struct {
+    /// A base tensor name this family's LoRAs are certain to patch, without the
+    /// `.weight`.
+    probe: []const u8,
+    in_dim: usize,
+    out_dim: usize,
+    layers: u32,
+};
+
+/// The one linear every LoRA for a family patches, and its widths.
+///
+/// Only the families with a sidecar path get an entry; the rest refuse a LoRA in
+/// the engine (`Session.attachLoras`), so offering one here would be a menu entry
+/// that fails at load.
+fn loraSpec(fam: Family) ?LoraSpec {
+    return switch (fam) {
+        .sensenova => blk: {
+            const cfg = tp.models.sensenova.u15_8b;
+            break :blk .{
+                .probe = "language_model.model.layers.0.self_attn.q_proj_mot_gen",
+                .in_dim = cfg.dim,
+                .out_dim = cfg.qDim(),
+                .layers = @intCast(cfg.n_layers),
+            };
+        },
+        .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3 => null,
+    };
+}
+
+fn loraTargetFits(store: tp.weights.WeightStore, probe: []const u8, in_dim: usize, out_dim: usize) bool {
+    const lora = tp.models.lora;
+    var buf: [512]u8 = undefined;
+    for (lora.dialects) |d| {
+        const a = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ lora.Sidecar.prefix, probe, d.a }) catch continue;
+        const av = store.get(a) orelse continue;
+        const ad = av.info.shape.slice();
+        if (ad.len != 2 or ad[1] != in_dim) return false;
+        const b = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ lora.Sidecar.prefix, probe, d.b }) catch return false;
+        const bv = store.get(b) orelse return false;
+        const bd = bv.info.shape.slice();
+        return bd.len == 2 and bd[0] == out_dim and bd[1] == ad[0];
+    }
+    return false;
 }
 
 /// Everything `fam` could contribute, from one open store.
@@ -243,6 +374,11 @@ pub const Traits = struct {
     /// Whether this architecture has a SECOND decoder (H3's audio VAE), which
     /// resolves independently of the first.
     dual_decoder: bool = false,
+    /// Whether this architecture has NO decoder at all: SenseNova generates in
+    /// pixel space, so its canvas IS the image. Without this the settings form
+    /// shows a `VAE — none` row in amber, reporting a required piece missing
+    /// that cannot exist, and the readiness check never passes.
+    no_decoder: bool = false,
     /// Default pixel frame count. 1 for every still-image family; a video family
     /// SNAPS this to its own grid, so read the shape back from
     /// `Session.latentShape` rather than trusting it.
@@ -318,6 +454,23 @@ pub fn traits(fam: Family) Traits {
             .steps = 30,
             .cfg = 1.0,
         },
+        // The workflow the ComfyUI PR ships with: 1024x1024, 50 steps, cfg 4,
+        // euler + `normal`, shift 3. The 8-step distilled LoRA is the fast path,
+        // and it is a separate file rather than a checkpoint variant.
+        .sensenova => .{
+            .label = "SenseNova U1.5 (pixel-space MoT)",
+            .short = "SenseNova",
+            .backends = &all_backends,
+            .no_decoder = true,
+            .width = 1024,
+            .height = 1024,
+            // 8 steps at cfg 1, which is what this model is run at and what
+            // BACKEND.md 2G measures. 50 steps at cfg 4 is 12x the forwards for
+            // a worse picture: the schedule is short and the model wants no
+            // negative pass.
+            .steps = 8,
+            .cfg = 1.0,
+        },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
             .short = "SD 1.5",
@@ -382,7 +535,7 @@ pub fn missing(info: Info, have: Overrides) Missing {
     return .{
         .conditioner = !info.contents.conditioner and !have.conditioner,
         .conditioner2 = t.dual_conditioner and !info.contents.conditioner2 and !have.conditioner2,
-        .decoder = !info.contents.decoder and !have.decoder,
+        .decoder = !t.no_decoder and !info.contents.decoder and !have.decoder,
         .decoder2 = t.dual_decoder and !info.contents.decoder2 and !have.decoder2,
     };
 }
@@ -517,8 +670,9 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
         // Every family runs on the CPU, without exception, that is the floor.
         try std.testing.expect(t.supports(.cpu));
         for ([_]Backend{ .vulkan, .zig_cuda, .cuda }) |b| {
+            const want = !cpu_only.contains(fam);
             errdefer std.debug.print("{t} supports({t}) = {}\n", .{ fam, b, t.supports(b) });
-            try std.testing.expectEqual(!cpu_only.contains(fam), t.supports(b));
+            try std.testing.expectEqual(want, t.supports(b));
         }
     }
 }
@@ -544,6 +698,149 @@ test "traits: the families' defaults differ in the fields that matter" {
     try std.testing.expect(traits(.sdxl).dual_conditioner);
     try std.testing.expect(!traits(.sd15).dual_conditioner);
     try std.testing.expect(!traits(.krea2).dual_conditioner);
+}
+
+/// A zero-payload safetensors over the given tensors, which is all a
+/// header-only probe reads. Same idea as `catalog.stFile`, kept here so this
+/// module's tests do not depend on that one's private helper.
+fn loraFile(gpa: std.mem.Allocator, specs: []const struct { name: []const u8, dims: []const usize }) ![]u8 {
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(gpa);
+    var off: usize = 0;
+    try header.append(gpa, '{');
+    for (specs, 0..) |sp, i| {
+        var n: usize = 4;
+        for (sp.dims) |d| n *= d;
+        if (i > 0) try header.append(gpa, ',');
+        try header.print(gpa, "\"{s}\":{{\"dtype\":\"F32\",\"shape\":[", .{sp.name});
+        for (sp.dims, 0..) |d, j| try header.print(gpa, "{s}{d}", .{ if (j > 0) "," else "", d });
+        try header.print(gpa, "],\"data_offsets\":[{d},{d}]}}", .{ off, off + n });
+        off += n;
+    }
+    try header.append(gpa, '}');
+    const out = try gpa.alloc(u8, 8 + header.items.len + off);
+    std.mem.writeInt(u64, out[0..8], header.items.len, .little);
+    @memcpy(out[8 .. 8 + header.items.len], header.items);
+    @memset(out[8 + header.items.len ..], 0);
+    return out;
+}
+
+test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
+    const gpa = std.testing.allocator;
+    const cfg = tp.models.sensenova.u15_8b;
+    const rank: usize = 128;
+    const root = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen";
+
+    // The shipped turbo LoRA's spelling and shapes: kohya `lora_down`/`lora_up`,
+    // `a` contracting the model width and `b` emitting the linear's own.
+    {
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = root ++ ".lora_down.weight", .dims = &.{ rank, cfg.dim } },
+            .{ .name = root ++ ".lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+
+        const info = loraScan(store).?;
+        try std.testing.expectEqual(@as(u32, 1), info.targets);
+        try std.testing.expectEqual(@as(u32, rank), info.rank);
+        try std.testing.expectEqual(@as(u32, 1), info.depth);
+        try std.testing.expect(loraFits(store, .sensenova));
+        // No other family has a sidecar path, so none may claim it.
+        for ([_]Family{ .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3 }) |f| {
+            try std.testing.expect(!loraFits(store, f));
+        }
+    }
+
+    // Right names, wrong width: a LoRA for another variant of the architecture.
+    // Its factors would still multiply, into the wrong columns.
+    {
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = root ++ ".lora_down.weight", .dims = &.{ rank, cfg.dim / 2 } },
+            .{ .name = root ++ ".lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        try std.testing.expect(loraScan(store) != null); // it IS a LoRA...
+        try std.testing.expect(!loraFits(store, .sensenova)); // ...for something else
+    }
+
+    // Deeper than the trunk: also another variant. Depth is a BOUND, though, so
+    // a LoRA that patches only some layers is fine, which the next case pins.
+    {
+        var buf: [256]u8 = undefined;
+        const deep = try std.fmt.bufPrint(&buf, "diffusion_model.language_model.model.layers.{d}.self_attn.q_proj_mot_gen.lora_down.weight", .{cfg.n_layers});
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = deep, .dims = &.{ rank, cfg.dim } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        try std.testing.expect(!loraFits(store, .sensenova));
+    }
+}
+
+test "a partial-depth LoRA fits, and a DoRA is refused" {
+    const gpa = std.testing.allocator;
+    const cfg = tp.models.sensenova.u15_8b;
+    const rank: usize = 64;
+
+    // Layer 0 and layer 5 only, which is a perfectly good style LoRA. Demanding
+    // it name the deepest layer (the equality `storeFits` uses for a side file)
+    // would reject it.
+    {
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+            .{ .name = "diffusion_model.language_model.model.layers.5.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
+            .{ .name = "diffusion_model.language_model.model.layers.5.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        const info = loraScan(store).?;
+        try std.testing.expectEqual(@as(u32, 2), info.targets);
+        try std.testing.expectEqual(@as(u32, 6), info.depth);
+        try std.testing.expect(loraFits(store, .sensenova));
+    }
+
+    // DoRA rescales the BASE weight, so applying the low-rank half alone is the
+    // wrong magnitude. The engine refuses the file, so the menu must not offer
+    // it either.
+    {
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.dora_scale", .dims = &.{cfg.qDim()} },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        try std.testing.expect(loraScan(store) == null);
+        try std.testing.expect(!loraFits(store, .sensenova));
+    }
+
+    // A kohya SD LoRA: LoRA-shaped, but under a prefix this engine does not map.
+    // Distinguished from "not a model at all", which is what the note says.
+    {
+        const bytes = try loraFile(gpa, &.{
+            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight", .dims = &.{ 32, 320 } },
+            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight", .dims = &.{ 320, 32 } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        try std.testing.expect(loraScan(store) == null);
+        try std.testing.expect(loraForeignDialect(store));
+    }
 }
 
 test "missing: a bundled SD1.5 checkpoint needs no side files" {

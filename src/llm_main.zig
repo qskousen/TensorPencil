@@ -2383,6 +2383,9 @@ const ModelFile = union(enum) {
     gguf: TensorPencil.Gguf,
 
     fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
+        // A run names a model, an mmproj and sometimes a draft model, so a bare
+        // `error.FileNotFound` does not say which one was wrong.
+        errdefer |err| std.log.err("cannot open {s}: {t}", .{ path, err });
         if (std.ascii.endsWithIgnoreCase(path, ".gguf"))
             return .{ .gguf = try TensorPencil.Gguf.open(gpa, io, path) };
         return .{ .safetensors = try TensorPencil.SafeTensors.open(gpa, io, path) };

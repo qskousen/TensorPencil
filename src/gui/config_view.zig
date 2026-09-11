@@ -1148,6 +1148,83 @@ fn imageRows(cfg: *config.Config) void {
             } else selection.chooseSide(cfg, cat, slot, cat.entries[cands[i - first_cand]].path);
         }
     }
+    loraRows(cfg, ck.family);
+}
+
+/// The LoRA list: one row per sidecar that is on, plus an add dropdown.
+///
+/// Not a `Slot` row. A slot has one value and a right answer to adopt when the
+/// user has picked nothing; LoRAs are a list whose correct default is empty, and
+/// the dial is per file. The whole section is hidden when the family has no
+/// sidecar path and nothing is configured for it, since an empty row is a
+/// question with no answer.
+fn loraRows(cfg: *config.Config, fam: selection.Family) void {
+    const arena = dvui.currentWindow().arena();
+    const cat = &model_lib.cat;
+    const cands = cat.lorasFor(arena, fam) catch return;
+    const on = selection.lorasForFamily(cfg, fam);
+    if (cands.len == 0 and on.len == 0) return;
+
+    section("LoRAs");
+    help("Low-rank sidecars, applied beside the model's own weights rather than " ++
+        "merged into them, so strength stays a dial and nothing is rewritten. " ++
+        "Several stack; their effects add, so the order does not matter. " ++
+        "Changing a strength does not reload the model, adding or removing one does.");
+
+    // Copy out first: the rows below mutate `cfg.loras`, which would leave the
+    // filtered view mid-iteration pointing at shifted entries.
+    var rows: std.ArrayList(config.FamilyLora) = .empty;
+    for (on) |l| rows.append(arena, l) catch return;
+
+    for (rows.items, 0..) |l, ri| {
+        const path = l.path.slice();
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = ri, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+        defer row.deinit();
+
+        var enabled = l.enabled;
+        if (dvui.checkbox(@src(), &enabled, null, .{ .gravity_y = 0.5 })) {
+            if (cfg.familyLoraMut(selection.familyKey(fam), path)) |m| m.enabled = enabled;
+        }
+        // The file name, not the path: it sits next to a slider in a fixed width.
+        const known = cat.find(path) != null;
+        dvui.label(@src(), "{s}", .{stemOf(path)}, .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 240 },
+            .max_size_content = .width(240),
+            .color_text = if (known) null else style.C.amber,
+        });
+
+        var strength = l.strength;
+        if (dvui.sliderEntry(@src(), "{d:0.2}", .{ .value = &strength, .min = -1.0, .max = 2.0, .interval = 0.05 }, .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 130 },
+        })) {
+            if (cfg.familyLoraMut(selection.familyKey(fam), path)) |m| m.strength = strength;
+        }
+        if (dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5 })) {
+            cfg.removeFamilyLora(selection.familyKey(fam), path);
+        }
+    }
+
+    // Only what is not already on, so the dropdown never offers a duplicate.
+    var labels: std.ArrayList([]const u8) = .empty;
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (cands) |ci| {
+        const e = &cat.entries[ci];
+        if (cfg.familyLoraMut(selection.familyKey(fam), e.path) != null) continue;
+        const info = e.lora.?.info;
+        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} linears, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        paths.append(arena, e.path) catch return;
+    }
+    const full = selection.loraCount(cfg, fam) >= config.max_family_loras;
+    if (labels.items.len == 0 and !full) return;
+    if (full) {
+        help("The LoRA table is full; remove one to add another.");
+        return;
+    }
+    if (choiceRow("image/lora-add", "Add LoRA", "choose…", labels.items, false)) |i| {
+        _ = cfg.addFamilyLora(selection.familyKey(fam), paths.items[i]);
+    }
 }
 
 /// A directory row: a typed path plus a native folder-select dialog.

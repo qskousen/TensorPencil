@@ -1,4 +1,4 @@
-//! CUDA Driver API bindings, pure Zig, runtime-loaded via std.DynLib.
+//! CUDA Driver API bindings, pure Zig, runtime-loaded via `core.dynlib`.
 //!
 //! Mirrors the pure-Zig `vk.zig` Vulkan loader: `libcuda.so.1` is a system
 //! driver we `dlopen` (no linking, no CUDA toolkit, no nvcc), and PTX is device
@@ -14,6 +14,8 @@
 //!     strings are in `load()`.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const dynlib = @import("tp_core").dynlib;
 
 // ---- Handle / scalar typedefs ------------------------------------------------
 pub const CUdeviceptr = u64;
@@ -207,7 +209,7 @@ pub const Error = error{CudaError};
 /// (owned by the CUDA Context). All fields are non-null after a successful
 /// `load()`.
 pub const Api = struct {
-    lib: std.DynLib,
+    lib: dynlib.Lib,
 
     cuInit: PFN_cuInit,
     cuDriverGetVersion: PFN_cuDriverGetVersion,
@@ -274,10 +276,17 @@ pub const Api = struct {
     cuMemUnmap: ?PFN_cuMemUnmap = null,
     cuMemSetAccess: ?PFN_cuMemSetAccess = null,
 
+    /// The driver library names, per platform. One list, so a probe and a load
+    /// cannot disagree about what counts as present.
+    const driver_names: []const []const u8 = switch (builtin.os.tag) {
+        .windows => &.{"nvcuda.dll"},
+        else => &.{ "libcuda.so.1", "libcuda.so" },
+    };
+
     /// dlopen the driver and resolve every symbol. Returns error.CudaError if
     /// the library or any required symbol is missing.
     pub fn load() Error!Api {
-        var lib = std.DynLib.open("libcuda.so.1") catch std.DynLib.open("libcuda.so") catch return error.CudaError;
+        var lib = dynlib.openFirst(driver_names) orelse return error.CudaError;
         errdefer lib.close();
 
         var api: Api = undefined;
@@ -382,6 +391,15 @@ pub const Api = struct {
         return if (s) |p| std.mem.span(p) else "";
     }
 };
+
+/// Whether the CUDA driver library is installed. Cheap (a dlopen and a close),
+/// and not a claim that a device exists: a driver ships on boxes whose GPU was
+/// removed. `Api.load` plus `cuDeviceGetCount` is the real answer.
+pub fn driverPresent() bool {
+    var lib = dynlib.openFirst(Api.driver_names) orelse return false;
+    lib.close();
+    return true;
+}
 
 test "cuda driver loads and reports a device" {
     // Only meaningful where a driver + GPU exist; skip cleanly otherwise.

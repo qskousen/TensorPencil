@@ -1,4 +1,4 @@
-//! cuDNN bindings, pure Zig, runtime-loaded via std.DynLib.
+//! cuDNN bindings, pure Zig, runtime-loaded via `core.dynlib`.
 //!
 //! Loaded like the driver (`cu.zig`) and cuBLASLt (`cublaslt.zig`): `dlopen` the
 //! dispatch shim `libcudnn.so.9` (it pulls the graph/engine sub-libraries in
@@ -11,6 +11,8 @@
 //! drives it.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const dynlib = @import("tp_core").dynlib;
 const cu = @import("cu.zig");
 
 pub const Handle = ?*anyopaque;
@@ -145,7 +147,7 @@ pub const Error = error{CudnnError};
 
 /// Resolved cuDNN entry points (one per process, owned by the caller).
 pub const Api = struct {
-    lib: std.DynLib,
+    lib: dynlib.Lib,
 
     cudnnCreate: PFN_Create,
     cudnnDestroy: PFN_Destroy,
@@ -174,9 +176,10 @@ pub const Api = struct {
     /// dlopen cuDNN's dispatch shim and resolve the symbols (handle lifecycle +
     /// the backend-graph API used for fused SDPA attention).
     pub fn load() Error!Api {
-        var lib = std.DynLib.open("libcudnn.so.9") catch
-            std.DynLib.open("/usr/lib/x86_64-linux-gnu/libcudnn.so.9") catch
-            std.DynLib.open("libcudnn.so") catch return error.CudnnError;
+        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+            .windows => &.{ "cudnn64_9.dll", "cudnn64_8.dll" },
+            else => &.{ "libcudnn.so.9", "/usr/lib/x86_64-linux-gnu/libcudnn.so.9", "libcudnn.so" },
+        }) orelse return error.CudnnError;
         errdefer lib.close();
 
         var api: Api = undefined;

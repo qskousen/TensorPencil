@@ -700,67 +700,7 @@ const Loader = struct {
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [160]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, "");
-        const view = l.store.get(nm) orelse return error.MissingTensor;
-        const shape = view.info.shape.slice();
-
-        // Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
-        // below, and each by its OWN sidecar rather than by dtype or shape: NVFP4 is
-        // stored `U8 [rows, cols/2]` and W4A8 `I8 [rows, cols/2]`, which is exactly the
-        // signature that heuristic keys on. NVFP4's nibbles are E2M1 floats with a
-        // per-16-block fp8 scale and W4A8's are unsigned indices into a non-uniform
-        // Lloyd-Max codebook, so reading either as signed int4 times a per-row scale is
-        // finite, plausible and wrong. One implementation for all the families that
-        // ship them (`quant_weight.zig`).
-        if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
-            var w = nv;
-            w.tag = try l.alloc.dupe(u8, nm);
-            return w;
-        }
-        if (try quant_weight.w4a8(l.alloc, l.store, nm, rows, cols)) |q| {
-            var w = q;
-            w.tag = try l.alloc.dupe(u8, nm);
-            return w;
-        }
-
-        // int4 convrot weights are nibble-packed (two values per byte), so the
-        // on-disk shape is [rows, cols/2]. Our home-grown converter stores the
-        // packed bytes as U8; ComfyUI's official W4A4 converter stores the same
-        // bytes as I8 (the raw bits, and thus the nibble decode, are identical).
-        // A genuine int8-convrot weight is also I8 but at the full [rows, cols],
-        // so disambiguate int4 from int8 by the halved column count, not dtype
-        // alone. Everything else (fp8/f32/bf16) is one element per stored slot.
-        const dt = view.info.dtype;
-        const halved = shape.len == 2 and shape[0] == rows and cols % 2 == 0 and shape[1] == cols / 2;
-        const is_i4 = dt == .u8 or (dt == .i8 and halved);
-        const wdt = if (is_i4) @as(@TypeOf(dt), .i4) else dt;
-        const stored_cols = if (is_i4) cols / 2 else cols;
-        if (is_i4 and cols % 2 != 0) return error.ShapeMismatch;
-        if (shape.len != 2 or shape[0] != rows or shape[1] != stored_cols) {
-            // Say which tensor and what was expected: a bare ShapeMismatch over 230
-            // weights is not actionable, and the usual cause is a container whose
-            // dim order differs (GGUF stores them reversed and the reader flips
-            // them back).
-            std.log.err("dit: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, dt, rows, stored_cols });
-            return error.ShapeMismatch;
-        }
-
-        // A shape-fixed block quant tiles its blocks over the flat element sequence,
-        // not each row, so no GEMM here can read it; it is small by construction.
-        if (view.info.flat_blocks) return quant_weight.flatBlocksF32(l.alloc, view, nm, rows, cols);
-        var w = Weight.init(view.bytes, wdt, rows, cols);
-        // Carry the checkpoint name on the Weight so a GEMM can be attributed to a
-        // layer downstream (ops.matmul.probe, profiling, error messages). Duped into
-        // the model arena because `nm` lives in a stack buffer; ~230 short strings
-        // per model.
-        w.tag = try l.alloc.dupe(u8, nm);
-        if (wdt == .i8 or wdt == .i4) {
-            // A per-output-row `weight_scale` with the size-256 group rotation folded
-            // out at dequant time, or one scalar scale and no rotation at all.
-            const meta = try quant_weight.int8Scale(l.alloc, l.store, nm, rows, cols);
-            w.row_scale = meta.row_scale;
-            w.convrot = meta.convrot;
-        }
-        return w;
+        return quant_weight.load(l.alloc, l.store, nm, rows, cols, .{ .who = "dit" });
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {

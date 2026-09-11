@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dtypes = @import("dtype.zig");
+const filemap = @import("filemap.zig");
 const quants = @import("quants.zig");
 const tensors = @import("tensor.zig");
 
@@ -155,22 +156,15 @@ pub const SafeTensors = struct {
             return st;
         }
 
-        const mapping = try std.posix.mmap(
-            null,
-            @intCast(len),
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(mapping);
+        const mapping = try filemap.map(file.handle, @intCast(len));
+        errdefer filemap.unmap(mapping);
         // Kick off an async read-ahead of the whole file. The weights are
         // each touched once (GPU upload / transpose), so a cold file
         // otherwise faults in synchronously on first access, a 12 GB DiT
         // adds tens of seconds to the first sampling step, and the 4.9 GB
         // text encoder inflates the encode. WILLNEED overlaps that disk read
         // with setup/compute instead. Advisory and best-effort.
-        std.posix.madvise(@constCast(mapping.ptr), mapping.len, std.posix.MADV.WILLNEED) catch {};
+        filemap.willNeed(mapping);
         var st = try initFromSlice(gpa, mapping);
         st.mapping = mapping;
         st.file = file;
@@ -318,7 +312,7 @@ pub const SafeTensors = struct {
     pub fn deinit(self: *SafeTensors) void {
         if (self.owned) |b| self.gpa.free(b);
         self.arena.deinit();
-        if (self.mapping) |m| std.posix.munmap(m);
+        if (self.mapping) |m| filemap.unmap(m);
         if (self.file) |f| f.close(self.io.?);
         self.* = undefined;
     }

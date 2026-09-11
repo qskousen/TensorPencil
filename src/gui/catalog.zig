@@ -92,6 +92,23 @@ pub const Preview = struct {
     }
 };
 
+/// A LoRA sidecar file: which families it can patch, plus what the menu row
+/// shows about it. Cached, so the answer is in the menu without opening 40 files
+/// every time it is drawn.
+pub const Lora = struct {
+    fams: [family_count]bool = @splat(false),
+    /// Base linears it patches, its rank, and the depth it reaches.
+    info: model_spec.LoraInfo = .{},
+
+    pub fn has(self: Lora, fam: Family) bool {
+        return self.fams[@intFromEnum(fam)];
+    }
+    pub fn any(self: Lora) bool {
+        for (self.fams) |b| if (b) return true;
+        return false;
+    }
+};
+
 pub const Entry = struct {
     path: []const u8,
     size: u64,
@@ -101,6 +118,10 @@ pub const Entry = struct {
     ckpt: ?Ckpt = null,
     side: Slots = .{},
     preview: Preview = .{},
+    /// Set when the file is a LoRA at all, even if it fits no family here: the
+    /// note then says so, which is what the user needs from a file they put in a
+    /// LoRA folder on purpose.
+    lora: ?Lora = null,
     /// Why the file is offered nowhere, empty when it has a role. Shown greyed so
     /// the user knows the file was seen and why it is not a choice.
     note: []const u8 = "",
@@ -114,7 +135,8 @@ pub const Entry = struct {
     /// Nothing here can use this file.
     pub fn unused(self: *const Entry) bool {
         return self.llm == null and self.tower == null and self.ckpt == null and
-            !self.side.any() and !self.preview.any();
+            !self.side.any() and !self.preview.any() and
+            (if (self.lora) |l| !l.any() else true);
     }
 
     /// Offered as a chat model: known architecture, so it will load.
@@ -313,6 +335,16 @@ pub const Catalog = struct {
         return null;
     }
 
+    /// Every LoRA that can patch `fam`, by index, in path order.
+    pub fn lorasFor(self: *const Catalog, gpa: std.mem.Allocator, fam: Family) ![]usize {
+        var out: std.ArrayList(usize) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.entries, 0..) |*e, i| {
+            if (e.lora) |l| if (l.has(fam)) try out.append(gpa, i);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     pub fn firstPreview(self: *const Catalog, fam: Family) ?usize {
         for (self.entries, 0..) |*e, i| if (e.preview.has(fam)) return i;
         return null;
@@ -346,8 +378,20 @@ pub const Catalog = struct {
 
     // ── Index file ──────────────────────────────────────────────────────────
 
+    /// What `Entry` means. Bump when a field is ADDED, not only when one changes
+    /// meaning: `load` ignores unknown fields and `scan` reuses an entry whose
+    /// size and mtime still match, so a new role would read as "this file can be
+    /// nothing" on every cached entry and no rescan would fix it.
+    const index_version: u32 = 1;
+
+    const Index = struct {
+        version: u32 = 0,
+        entries: []const Entry = &.{},
+    };
+
     pub fn save(self: *const Catalog, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-        const json = try std.json.Stringify.valueAlloc(gpa, self.entries, .{ .whitespace = .indent_2 });
+        const doc: Index = .{ .version = index_version, .entries = self.entries };
+        const json = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
         defer gpa.free(json);
         if (std.fs.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
@@ -358,8 +402,8 @@ pub const Catalog = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
     }
 
-    /// A missing or unreadable index is an empty catalog, not an error: the next
-    /// scan rebuilds it.
+    /// A missing, unreadable or stale index is an empty catalog, not an error:
+    /// the next scan rebuilds it.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Catalog {
         var cat = Catalog.init(gpa);
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch return cat;
@@ -367,10 +411,12 @@ pub const Catalog = struct {
         const a = cat.arena.allocator();
         // `alloc_always`: by default a string that needs no unescaping is a slice
         // of the input, which is freed on return.
-        cat.entries = std.json.parseFromSliceLeaky([]Entry, a, bytes, .{
+        const doc = std.json.parseFromSliceLeaky(Index, a, bytes, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return cat;
+        if (doc.version != index_version) return cat;
+        cat.entries = @constCast(doc.entries);
         return cat;
     }
 };
@@ -524,9 +570,23 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
         if (model_spec.previewFits(store, fam)) e.preview.fams[ff.value] = true;
     }
 
+    // A LoRA is not a checkpoint and shares no tensor with one, so this is its
+    // own pass rather than another `Component`.
+    if (model_spec.loraScan(store)) |info| {
+        var l: Lora = .{ .info = info };
+        inline for (@typeInfo(Family).@"enum".fields) |ff| {
+            if (model_spec.loraFits(store, @enumFromInt(ff.value))) l.fams[ff.value] = true;
+        }
+        e.lora = l;
+    }
+
     if (e.unused()) {
         if (e.tower) |t| {
             if (t.arch == null) e.note = try std.fmt.allocPrint(a, "vision projector '{s}' has no tower here", .{t.projector});
+        } else if (e.lora) |l| {
+            e.note = try std.fmt.allocPrint(a, "lora ({d} linears, rank {d}) matches no architecture here", .{ l.info.targets, l.info.rank });
+        } else if (model_spec.loraForeignDialect(store)) {
+            e.note = "lora in a key dialect this build does not map (kohya lora_unet_* / lora_te_*)";
         } else if (unsupported_arch) |arch| {
             e.note = try std.fmt.allocPrint(a, "architecture '{s}' is not supported", .{arch});
         } else {
@@ -953,6 +1013,31 @@ test "index round trip, and a rescan reuses unchanged files" {
     var empty = Catalog.load(gpa, io, "/nonexistent/tp-gui-catalog.json");
     defer empty.deinit();
     try testing.expectEqual(@as(usize, 0), empty.entries.len);
+
+    // An index from a build that knew fewer roles is DISCARDED, not read with
+    // the new fields defaulted. Reading it would leave every cached file
+    // answering "I can be nothing" for the new role, and no rescan would fix
+    // that: size and mtime still match, so `scan` reuses the entry. Both the
+    // pre-envelope bare array and a wrong version number take that path.
+    try tree.put(io, "index/old.json", "[{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}]");
+    const old_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "old.json" });
+    defer gpa.free(old_idx);
+    var bare = Catalog.load(gpa, io, old_idx);
+    defer bare.deinit();
+    try testing.expectEqual(@as(usize, 0), bare.entries.len);
+
+    try tree.put(io, "index/v0.json", "{\"version\":0,\"entries\":[{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}]}");
+    const v0_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "v0.json" });
+    defer gpa.free(v0_idx);
+    var v0 = Catalog.load(gpa, io, v0_idx);
+    defer v0.deinit();
+    try testing.expectEqual(@as(usize, 0), v0.entries.len);
+
+    // ...and the CURRENT version is of course read, or the check above would
+    // pass by rejecting everything.
+    var good = Catalog.load(gpa, io, idx);
+    defer good.deinit();
+    try testing.expect(good.entries.len > 0);
     var rep3: ScanReport = .{};
     var gone = try scan(gpa, io, &.{"/nonexistent/tp-gui-models"}, &.{}, null, &rep3);
     defer gone.deinit();

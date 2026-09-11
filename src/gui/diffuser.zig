@@ -129,6 +129,12 @@ pub const ModelConfig = struct {
     text_encoder_2_path: []const u8,
     backend: pipeline.Backend,
     vae_decode: pipeline.VaeDecode,
+    /// LoRA sidecars, in order. The LIST is load-bearing (the stack is built at
+    /// session init, so a change reloads); the STRENGTHS are not, which is why
+    /// `eql` ignores them and `applyStrengths` moves them on a live session. A
+    /// slider that forced a reload would defeat the whole point of the dial
+    /// being live.
+    loras: []const pipeline.LoraSpec = &.{},
 
     /// Duplicate the path strings into gpa-owned storage. Takes a borrowed
     /// `ModelConfig` rather than a positional path list: with four paths, the
@@ -143,6 +149,7 @@ pub const ModelConfig = struct {
         var done: usize = 0;
         errdefer for (fields[0..done]) |f| gpa.free(f.*);
         while (done < fields.len) : (done += 1) fields[done].* = try gpa.dupe(u8, srcs[done]);
+        out.loras = try dupeLoras(gpa, src.loras);
         return out;
     }
 
@@ -151,6 +158,7 @@ pub const ModelConfig = struct {
         gpa.free(self.vae_path);
         gpa.free(self.text_encoder_path);
         gpa.free(self.text_encoder_2_path);
+        freeLoras(gpa, self.loras);
     }
 
     /// Do these two configs need the same resident pipeline? (Paths + backend +
@@ -160,7 +168,24 @@ pub const ModelConfig = struct {
             std.mem.eql(u8, a.dit_path, b.dit_path) and
             std.mem.eql(u8, a.vae_path, b.vae_path) and
             std.mem.eql(u8, a.text_encoder_path, b.text_encoder_path) and
-            std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path);
+            std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path) and
+            sameLoraPaths(a.loras, b.loras);
+    }
+
+    /// The LoRA LIST, ignoring strengths, which is what a reload turns on.
+    fn sameLoraPaths(a: []const pipeline.LoraSpec, b: []const pipeline.LoraSpec) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!std.mem.eql(u8, x.path, y.path)) return false;
+        return true;
+    }
+
+    /// Move a live session's dials onto this config's, no reload.
+    ///
+    /// Positional, because `Session` holds the stack in the order `Options.loras`
+    /// gave it. `eql` has already established the paths match, which is the only
+    /// thing that makes the index meaningful.
+    fn applyStrengths(self: ModelConfig, sess: *pipeline.Session) void {
+        for (self.loras, 0..) |l, i| sess.setLoraStrength(i, l.strength);
     }
 
     /// Write this model set onto `opts`, the only place the GUI's paths become
@@ -176,6 +201,7 @@ pub const ModelConfig = struct {
     /// settings screen ever suggests a path, it must leave the buffer empty until
     /// the user accepts it, or carry a separate "asked for" bit.
     pub fn applyTo(self: ModelConfig, opts: *pipeline.Options) void {
+        opts.loras = self.loras;
         opts.dit_path = self.dit_path;
         opts.text_encoder_path = self.text_encoder_path;
         opts.explicit_text_encoder = self.text_encoder_path.len > 0;
@@ -187,6 +213,26 @@ pub const ModelConfig = struct {
         opts.vae_decode = self.vae_decode;
     }
 };
+
+fn dupeLoras(gpa: std.mem.Allocator, src: []const pipeline.LoraSpec) ![]const pipeline.LoraSpec {
+    if (src.len == 0) return &.{};
+    const out = try gpa.alloc(pipeline.LoraSpec, src.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |l| gpa.free(l.path);
+        gpa.free(out);
+    }
+    while (done < src.len) : (done += 1) {
+        out[done] = .{ .path = try gpa.dupe(u8, src[done].path), .strength = src[done].strength };
+    }
+    return out;
+}
+
+fn freeLoras(gpa: std.mem.Allocator, loras: []const pipeline.LoraSpec) void {
+    if (loras.len == 0) return;
+    for (loras) |l| gpa.free(l.path);
+    gpa.free(loras);
+}
 
 /// An image awaiting or undergoing generation. Progress/status fields are
 /// atomics written by the diffusion worker and read by the UI thread; `rgba` is
@@ -381,6 +427,15 @@ pub const VramCoordinator = struct {
 
 /// Map the config's engine-decoupled backend enum onto `pipeline.Backend`.
 pub fn toPipelineBackend(b: config.Backend) pipeline.Backend {
+    return switch (b) {
+        .cpu => .cpu,
+        .vulkan => .vulkan,
+        .zig_cuda => .zig_cuda,
+        .cuda => .cuda,
+    };
+}
+
+pub fn fromPipelineBackend(b: pipeline.Backend) config.Backend {
     return switch (b) {
         .cpu => .cpu,
         .vulkan => .vulkan,
@@ -775,6 +830,7 @@ pub const Diffuser = struct {
             .text_encoder_2_path = self.opts.text_encoder_2_path,
             .backend = self.opts.backend,
             .vae_decode = self.opts.vae_decode,
+            .loras = self.opts.loras,
         };
     }
 
@@ -1068,6 +1124,12 @@ pub const Diffuser = struct {
     /// True while an image is generating (status-bar diffusion readout).
     pub fn busyNow(self: *Diffuser) bool {
         return self.busy.load(.acquire);
+    }
+
+    /// Whether anything is still queued. `busyNow` alone is not "the queue has
+    /// drained": an image sits pending before the worker picks it up.
+    pub fn anyPending(self: *Diffuser) bool {
+        return self.nextPending() != null;
     }
 
     /// Device VRAM (bytes) the resident diffusion model actually holds; 0 when
@@ -1386,6 +1448,8 @@ pub const Diffuser = struct {
             .text_encoder_2_path = a.dupe(u8, want.text_encoder_2_path) catch return,
             .backend = want.backend,
             .vae_decode = want.vae_decode,
+            // Into the same arena as the paths, so one reset frees the lot.
+            .loras = dupeLoras(a, want.loras) catch return,
         };
         owned.applyTo(&self.opts);
         // The config just changed, so any previous load failure describes a model
@@ -1630,6 +1694,10 @@ pub const Diffuser = struct {
             // Record what's resident (gpa-owned; freed on the next reload / free).
             self.loaded = ModelConfig.dupe(self.gpa, want) catch null;
         }
+        // A REUSED session was loaded for a config with the same LoRA paths but
+        // possibly different dials (`eql` ignores them on purpose), so move them
+        // here rather than reloading a gigabyte of factors for a slider.
+        want.applyStrengths(sess.?);
         // Unload-while-paused: generate writes the in-flight latent + step here
         // and returns error.Paused. The worker stores it on the image (status
         // .suspended) and exits; the UI frees the weights, and the next dispatch
@@ -1758,6 +1826,84 @@ test "applyTo: a set override is explicit (it outranks a bundled copy)" {
     try std.testing.expect(!opts.explicit_text_encoder);
     try std.testing.expectEqualStrings("/vae.safetensors", opts.vae_path);
     try std.testing.expectEqual(pipeline.VaeDecode.cpu_tiled, opts.vae_decode);
+}
+
+test "a LoRA LIST change reloads; a strength change does not" {
+    // The whole reason `strength` is not folded into a factor: moving a slider
+    // must not re-read a gigabyte of them. `eql` is what turns a change into a
+    // reload, so it has to see the paths and ignore the dials.
+    const base: ModelConfig = .{
+        .dit_path = "/d/sensenova.safetensors",
+        .vae_path = "",
+        .text_encoder_path = "",
+        .text_encoder_2_path = "",
+        .backend = .cuda,
+        .vae_decode = .auto,
+        .loras = &.{.{ .path = "/l/turbo.safetensors", .strength = 1.0 }},
+    };
+
+    var dialed = base;
+    dialed.loras = &.{.{ .path = "/l/turbo.safetensors", .strength = 0.25 }};
+    try std.testing.expect(ModelConfig.eql(base, dialed));
+
+    var added = base;
+    added.loras = &.{
+        .{ .path = "/l/turbo.safetensors", .strength = 1.0 },
+        .{ .path = "/l/ink.safetensors", .strength = 1.0 },
+    };
+    try std.testing.expect(!ModelConfig.eql(base, added));
+
+    var swapped = base;
+    swapped.loras = &.{.{ .path = "/l/ink.safetensors", .strength = 1.0 }};
+    try std.testing.expect(!ModelConfig.eql(base, swapped));
+
+    var removed = base;
+    removed.loras = &.{};
+    try std.testing.expect(!ModelConfig.eql(base, removed));
+
+    // ORDER is a reload too. The deltas add, so a reorder renders the same
+    // picture, but the stack's indexes are what `applyStrengths` writes through,
+    // and a session whose order disagrees with the config's would take each
+    // file's dial from its neighbour.
+    var reordered = added;
+    reordered.loras = &.{
+        .{ .path = "/l/ink.safetensors", .strength = 1.0 },
+        .{ .path = "/l/turbo.safetensors", .strength = 1.0 },
+    };
+    try std.testing.expect(!ModelConfig.eql(added, reordered));
+
+    // `applyTo` hands the list over, dials and all.
+    var opts: pipeline.Options = .{ .prompt = "" };
+    dialed.applyTo(&opts);
+    try std.testing.expectEqual(@as(usize, 1), opts.loras.len);
+    try std.testing.expectEqual(@as(f32, 0.25), opts.loras[0].strength);
+}
+
+test "dupeLoras owns its paths and survives the source going away" {
+    const gpa = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    const a = scratch.allocator();
+
+    const src = try a.alloc(pipeline.LoraSpec, 2);
+    src[0] = .{ .path = try a.dupe(u8, "/l/turbo.safetensors"), .strength = 0.5 };
+    src[1] = .{ .path = try a.dupe(u8, "/l/ink.safetensors"), .strength = 1.5 };
+
+    const owned = try dupeLoras(gpa, src);
+    defer freeLoras(gpa, owned);
+    // The whole reason this exists: `requestPaths` is handed borrowed slices
+    // into the live config buffers, and a queued image outlives the frame.
+    scratch.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqualStrings("/l/turbo.safetensors", owned[0].path);
+    try std.testing.expectEqual(@as(f32, 0.5), owned[0].strength);
+    try std.testing.expectEqualStrings("/l/ink.safetensors", owned[1].path);
+    try std.testing.expectEqual(@as(f32, 1.5), owned[1].strength);
+
+    // Empty stays empty rather than allocating a zero-length slice nobody frees.
+    const none = try dupeLoras(gpa, &.{});
+    freeLoras(gpa, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "loadError/loadedFamily round-trip through their atomic encodings" {

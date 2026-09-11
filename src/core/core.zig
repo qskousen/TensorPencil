@@ -14,6 +14,10 @@ pub const dtype = @import("dtype.zig");
 pub const tensor = @import("tensor.zig");
 pub const quants = @import("quants.zig");
 pub const quants_fixtures = @import("quants_fixtures.zig");
+/// Whole-file mapping and runtime library loading, the two places the checkpoint
+/// readers and the GPU backends touch OS APIs that differ per platform.
+pub const filemap = @import("filemap.zig");
+pub const dynlib = @import("dynlib.zig");
 pub const safetensors = @import("safetensors.zig");
 pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
@@ -59,6 +63,8 @@ test {
     _ = tensor;
     _ = quants;
     _ = quants_fixtures;
+    _ = filemap;
+    _ = dynlib;
     _ = safetensors;
     _ = gguf;
     _ = weights;

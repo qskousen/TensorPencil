@@ -25,7 +25,7 @@ When working on code, if you notice a problem or a comment that is extraneous or
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
 - There's no risk to trying big complicated work. We want to try unusual things. Be bold and adventerous.
 - However, bold is not the same as sprawling: keep it structured and organized, and generalize where generalizing is cheap.
-- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out.
+- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out. `zig build test -Dtarget=x86_64-windows` compiles the whole tree for Windows (it cannot run the binaries); the only expected failures are the system C libraries. `core/filemap.zig` (whole-file mapping) and `core/dynlib.zig` (runtime library loading, which `std.DynLib` has no Windows arm for) are where the per-platform branches live; a new one belongs there rather than at a call site.
 - After adding a new kernel feature like relo, supporting a new dtype like bf16 or qk_6 for a backend, or anything similar, check BACKEND.md and update it to reflect the current state.
 - Performance is CRITICAL, and we need to do what it takes to get there - don't skip out and do something easier if the hard work is what is needed.
 - **A negative/limiting conclusion requires a receipt.** Before claiming an optimization "isn't worth it," "won't help," "can't be done cleanly," or "is too fragile/expensive," you must have an ISOLATION measurement that removes exactly the component in question (e.g. disable the op and re-time) — not a proxy and not an assumption. State whether each claim is measured or assumed.
@@ -110,8 +110,16 @@ CUDA context. Each checks kernels against their CPU ops and then a whole forward
 CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
 (each block-quant weight decode against its CPU replica), `cuda-vae-test`,
 `zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
-`minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `lora-cuda-test` (needs no
+`minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `sensenova-cuda-test`
+(and `sensenova-vk-test`, the same checks over the Vulkan arm), `lora-cuda-test` (needs no
 checkpoint), plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
+
+**A quantized checkpoint that renders is not a quantized checkpoint that works.** A
+conditioning that is gone renders a clean picture that ignores the prompt, so a
+quantized file is checked against its dense source on an INTERMEDIATE, not on an
+image: two prompts through both checkpoints, comparing conditioning and velocity.
+`weights.Overlay` then attributes the damage by taking one weight kind from the dense
+file (BACKEND.md 2G, where this found a single tensor that cannot be q4_k).
 
 ## Architecture
 
@@ -120,7 +128,7 @@ depend on one tier. `LIBRARY.md` has the detail.
 
 | module | root | holds |
 |---|---|---|
-| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image |
+| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the two per-platform shims (`filemap`, `dynlib`) |
 | `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
 | `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
 | `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
@@ -203,7 +211,19 @@ of the stage API works on every family.
 | `sdxl` | `models/sd_unet.zig` | CLIP-L + CLIP-G | AutoencoderKL | 4 |
 | `zimage` | `models/zimage.zig` (NextDiT) | Qwen3-4B | AutoencoderKL (Flux) | 16 |
 | `anima` | `models/anima.zig` (Cosmos-Predict2 + LLM adapter) | Qwen3-0.6B + T5 | Wan 2.1 | 16 |
+| `sensenova` | `models/sensenova.zig` (Qwen3-shaped MoT trunk) | the trunk's own base copy | none (pixel space) | 3 |
 
+- **SenseNova is not a DiT and has no side components.** One 8B trunk carries TWO
+  weight copies per layer: the prompt runs the base copy causally and leaves a KV
+  cache (that cache IS the conditioning, carried in `Cond.data`), and the canvas
+  runs the `_mot_gen` copy against it, unmasked. It generates in PIXEL space at
+  32 px per token, so `decode` is `clamp((x+1)/2)` and `spatialDownscale` is 1. The
+  head predicts x0; `v = (x - x0) / max(sigma, 0.02)`. Reference pictures splice
+  `<img>` blocks into the user turn and make the prefix BLOCK-CAUSAL. Two traps
+  worth knowing before touching it: the understanding tower takes ImageNet-normalized
+  [0, 1] where the generation tower takes raw [-1, 1] behind identical convolution
+  shapes, and the initial noise is scaled by `min(sqrt(tokens/64), 16)`, without
+  which the render is noise.
 - **The family is detected from the denoiser's own tensor names** (`detectFamily`), never
   from a flag. SDXL must be tested before SD1.5 (both are LDM UNets; `label_emb` is what
   distinguishes them), and Anima is identified by its LLM adapter, not its trunk, which it

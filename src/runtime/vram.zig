@@ -681,7 +681,12 @@ pub const Arbiter = struct {
             // and the arm is a function of numbers you otherwise cannot see.
             const lu = if (self.llm) |q| q.usage() else 0;
             const du = if (self.diffusion) |q| q.usage() else 0;
-            std.log.info("[vram] plan {t}: limit {d} · llm need {d} (holds {d}) -> ceiling {d} · diff need {d} (holds {d}) -> ceiling {d}{s}", .{
+            // `allowed` is the room the OTHER side does not need, which is what
+            // `diffusionBudget` hands the pipeline; the ceilings are the plan's own
+            // two targets. Printing the allowance where a reader expects a need is
+            // how "diff need 19849 -> ceiling 17536" came to read as a squeeze when
+            // diffusion was being offered everything and asking for less.
+            std.log.info("[vram] plan {t}: limit {d} · llm need {d} (holds {d}) -> ceiling {d} · diff allowed {d} (holds {d}) -> ceiling {d}{s}", .{
                 p.arm,        self.limit >> 20,
                 p.llm_need >> 20, lu >> 20, p.llm >> 20,
                 (self.limit -| p.llm_need) >> 20, du >> 20, p.diffusion >> 20,

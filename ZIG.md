@@ -500,9 +500,16 @@ all processes, and the model stopped reasoning. It is invisible to buffer
 zeroing and to compute-sanitizer (the field is a host struct member), and stable
 under `setarch -R`, which is the signature of an uninitialised SCALAR.
 
+`gpa.create(T)` is the same on the heap, and worse: the recycled allocation holds
+live-looking POINTERS, so an unset `?T` field reads as non-null and `deinit` frees a
+stale one. A cold start survives it (fresh pages read as zero) and the second load
+crashes, which reads as a teardown-order bug in whatever it frees.
+
 Use `core/init_defaults.zig` (`tp_core.init_defaults`): `var self: T = init_defaults.of(T)` applies every
 declared default and leaves the rest undefined, so an init keeps its
-field-by-field shape without the class of bug.
+field-by-field shape without the class of bug. On a `create`d pointer call
+`init_defaults.applyTo(self)`, which does it in place and so does not push a
+large struct through a stack temporary.
 
 ## A slice of an inline array in a by-value return dangles at the `return`
 

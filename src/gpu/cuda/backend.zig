@@ -576,6 +576,14 @@ pub const Backend = struct {
     /// serves every linear in turn, which is the whole point: the packed weight stays
     /// resident and never expands in VRAM.
     bq_i8: DeviceBuffer = .{},
+    /// LoRA sidecar scratch: the `[m][rank]` A-GEMM output and the `[m][n]` delta
+    /// (the latter unused where the accumulate is fused into the B GEMM). Shared
+    /// by every linear, so it is sized once to the widest factor a render asks
+    /// for. `lora_cuda.borrowed` hands these out; `lin_cuda.presizeLora` sizes
+    /// them. H3 sizes its own instead, because it applies over row ranges of a
+    /// fused output and knows its widest before the first block.
+    lora_lo: DeviceBuffer = .{},
+    lora_hi: DeviceBuffer = .{},
 
     // tensor-core attention scratch (per-head, reused across heads/calls; grown
     // to the largest seq seen). f16 Q/K/Vt tiles, f32 scores, f16 probs, f32 out.
@@ -965,6 +973,8 @@ pub const Backend = struct {
         self.tensorDestroy(&self.i8_acc);
         self.tensorDestroy(&self.w4a8_i8);
         self.tensorDestroy(&self.bq_i8);
+        self.tensorDestroy(&self.lora_lo);
+        self.tensorDestroy(&self.lora_hi);
         self.tensorDestroy(&self.cudnn_q16);
         self.tensorDestroy(&self.cudnn_k16);
         self.tensorDestroy(&self.cudnn_v16);
@@ -3422,6 +3432,44 @@ pub const Backend = struct {
         std.debug.assert(4 * half <= head_dim);
         const total = rows * n_heads * 2 * half;
         try self.dualElems("rope_vision_gemma4", qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Rotate-half RoPE over the span `[off, off + 2*half)` of each head, with one
+    /// absolute position per row. Matches CPU `rope.applyRotateHalfPosSpan`.
+    pub fn opRopeHalfSpanPos(self: *Backend, qk: DeviceBuffer, positions: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, head_dim: usize, off: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(off + 2 * half <= head_dim);
+        const total = rows * n_heads * half;
+        try self.dualElems("rope_half_span_pos", qk, positions, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), @intCast(off), 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Interleaved-pair RoPE over the span `[off, off + 2*half)` of each row, with
+    /// one position per row. Matches CPU `rope.applyInterleavedPosSpan`.
+    pub fn opRopeInterSpanPos(self: *Backend, x: DeviceBuffer, positions: DeviceBuffer, freqs: DeviceBuffer, rows: usize, row_dim: usize, half: usize, sin_off: usize, off: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(off + 2 * half <= row_dim);
+        const total = rows * half;
+        try self.dualElems("rope_inter_span_pos", x, positions, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(row_dim), @intCast(off), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// `nn.PixelShuffle(r)` on a channel-last plane: `[h][w][co*r*r] -> [h*r][w*r][co]`.
+    pub fn opPixelShuffle(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, h: usize, w: usize, co: usize, r: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = h * w * co * r * r;
+        try self.dualElems("pixel_shuffle", src, dst, null, null, .{ @intCast(total), @intCast(co), @intCast(r), @intCast(w), 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Patch matrix of a non-overlapping k x k stride-k convolution over
+    /// channel-last `[h][w][ci]`, i.e. a pure gather: no padding is reachable.
+    pub fn opIm2colStride(self: *Backend, patch: DeviceBuffer, src: DeviceBuffer, h: usize, w: usize, ci: usize, kk: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(h % kk == 0 and w % kk == 0);
+        const total = (h / kk) * (w / kk) * kk * kk * ci;
+        try self.dualElems("im2col_stride", src, patch, null, null, .{ @intCast(total), @intCast(ci), @intCast(kk), @intCast(w), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Restride per-head slices between packed layouts (ViT: pad 72-dim

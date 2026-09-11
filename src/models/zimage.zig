@@ -814,23 +814,10 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
 // --- free helpers -----------------------------------------------------------
 
 /// Sinusoidal timestep embedding, `[cos(t w_i) ... sin(t w_i) ...]` with
-/// `w_i = 10000^(-i/half)`, `comfy/ldm/modules/diffusionmodules/util.py`.
-///
-/// f64 internals on purpose, the same reasoning `sd_unet.timestepEmbedding`
-/// records: at `i = 0` the argument is the scaled timestep itself (up to 1000), so
-/// a 1e-7 relative slip in `freq` becomes ~1e-4 in `cos`. Computing more accurately
-/// than the reference bounds the disagreement by the *reference's* own rounding
-/// instead of stacking two errors.
+/// `w_i = 10000^(-i/half)`, `comfy/ldm/modules/diffusionmodules/util.py`. The
+/// caller has already applied `time_scale`.
 pub fn timestepEmbedding(out: []f32, t: f32) void {
-    const half = out.len / 2;
-    std.debug.assert(out.len == half * 2);
-    const log_max: f64 = @log(10000.0);
-    for (0..half) |i| {
-        const exponent = -log_max * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(half));
-        const arg = @exp(exponent) * @as(f64, t);
-        out[i] = @floatCast(@cos(arg));
-        out[half + i] = @floatCast(@sin(arg));
-    }
+    ops.rope.sinCosEmbedding(out, t, 10000.0);
 }
 
 /// Row-wise AdaLN with no shift: `x = (1 + scale) * x`.
@@ -935,50 +922,7 @@ const Loader = struct {
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [192]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, "");
-        const view = l.store.get(nm) orelse {
-            std.log.err("zimage: missing tensor {s}", .{nm});
-            return error.MissingTensor;
-        };
-        const shape = view.info.shape.slice();
-        // The packed ComfyUI 4-bit formats come first, each detected by its OWN
-        // sidecar (`_scale_2` for NVFP4, `_s_rel` for W4A8) rather than by dtype or shape:
-        // both store `[rows, cols/2]`, so the plain shape check below would reject them.
-        // NVFP4's nibbles are E2M1 floats with a per-16-block fp8 scale and W4A8's are
-        // unsigned indices into a non-uniform Lloyd-Max codebook, one implementation for
-        // every family that ships them (`quant_weight.zig`).
-        //
-        // W4A8 is here because being krea2-only made the FIRST Anima W4A8 checkpoint
-        // unloadable, and nothing about Z-Image would have stopped it arriving here.
-        if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
-            var w = nv;
-            w.tag = try l.alloc.dupe(u8, nm);
-            return w;
-        }
-        if (try quant_weight.w4a8(l.alloc, l.store, nm, rows, cols)) |q| {
-            var w = q;
-            w.tag = try l.alloc.dupe(u8, nm);
-            return w;
-        }
-        if (shape.len != 2 or shape[0] != rows or shape[1] != cols) {
-            // Name the tensor and both shapes: a bare ShapeMismatch across ~450
-            // weights is not actionable, and the usual cause is a container whose
-            // dim order differs.
-            std.log.err("zimage: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, view.info.dtype, rows, cols });
-            return error.ShapeMismatch;
-        }
-        // A shape-fixed block quant tiles its blocks over the flat element sequence,
-        // not each row, so no GEMM here can read it; it is small by construction
-        // (a GGUF `x_embedder` is [dim, 64]).
-        if (view.info.flat_blocks) return quant_weight.flatBlocksF32(l.alloc, view, nm, rows, cols);
-        if (!ops.matmul.supportsDType(view.info.dtype)) {
-            std.log.err("zimage: {s} has unsupported dtype {t}", .{ nm, view.info.dtype });
-            return error.UnsupportedDType;
-        }
-        var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
-        // Carry the checkpoint name so a GEMM stays attributable to a layer
-        // downstream (ops.matmul.probe, profiling, error messages).
-        w.tag = try l.alloc.dupe(u8, nm);
-        return lin.maybeDequant(l.alloc, w);
+        return quant_weight.load(l.alloc, l.store, nm, rows, cols, .{ .who = "zimage" });
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {

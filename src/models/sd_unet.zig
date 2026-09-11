@@ -40,6 +40,7 @@ const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
+const quant_weight = @import("quant_weight.zig");
 
 const DType = tp_core.dtype.DType;
 const WeightStore = weights_mod.WeightStore;
@@ -400,29 +401,13 @@ const Loader = struct {
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, suffix: []const u8, rows: usize, cols: usize) !Weight {
         var buf: [200]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, suffix);
-        const v = try l.view(nm);
-        const shape = v.info.shape.slice();
-        // A 1x1 convolution is stored [out, in, 1, 1] and *is* a GEMM over pixels.
-        const flat_cols = blk: {
-            var c: usize = 1;
-            for (shape[1..]) |d| c *= d;
-            break :blk c;
-        };
-        if (shape.len < 2 or shape[0] != rows or flat_cols != cols) {
-            std.log.err("sd_unet: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, v.info.dtype, rows, cols });
-            return error.ShapeMismatch;
-        }
-        // `flat_blocks` means the blocks tile the flat element sequence rather than
-        // each logical row, the ComfyUI shape fix, which ggufy applies to 72.7% of an
-        // SD1.5 checkpoint's parameters (every convolution). `Weight.init` assumes
-        // row-aligned blocks and a logical row here need not be a multiple of 256, so
-        // such a tensor must be dequantized flat. See `TensorInfo.flat_blocks`.
-        var w = if (ops.matmul.supportsDType(v.info.dtype) and !v.info.flat_blocks)
-            Weight.init(v.bytes, v.info.dtype, rows, cols)
-        else
-            Weight.fromF32(try v.toF32Alloc(l.alloc), rows, cols);
-        w.tag = try l.alloc.dupe(u8, nm);
-        return w;
+        // An SD1.5 merge in the wild stores f64, which no GEMM reads. A 1x1
+        // convolution arrives as `[out, in, 1, 1]` and IS a GEMM over pixels; `load`
+        // folds those trailing dims into `cols`.
+        return quant_weight.load(l.alloc, l.store, nm, rows, cols, .{
+            .who = "sd_unet",
+            .unsupported = .materialize,
+        });
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, suffix: []const u8, len: usize) ![]f32 {

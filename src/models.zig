@@ -72,6 +72,11 @@ pub const lin_llm_gpu = @import("models/lin_llm_gpu.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
+/// SenseNova U1.5, a Qwen3-shaped MoT trunk that generates in pixel space: no VAE
+/// and no separate text encoder, the prompt's own KV cache is the conditioning.
+pub const sensenova = @import("models/sensenova.zig");
+pub const sensenova_gpu = @import("models/sensenova_gpu.zig");
+pub const sensenova_cuda = @import("models/sensenova_cuda.zig");
 /// Z-Image (`NextDiT`) denoiser, the architecture "zit" checkpoints use.
 pub const zimage = @import("models/zimage.zig");
 pub const zimage_text = @import("models/zimage_text.zig");
@@ -179,6 +184,9 @@ test {
     _ = dit;
     _ = dit_gpu;
     _ = dit_cuda;
+    _ = sensenova;
+    _ = sensenova_gpu;
+    _ = sensenova_cuda;
     _ = zimage;
     _ = zimage_text;
     _ = zimage_gpu;

@@ -773,6 +773,8 @@ pub const Session = struct {
         // the whole session (it is re-read when streamed weights re-upload).
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
+        // `create` applies no field defaults; 53 of the fields below have one.
+        tp.init_defaults.applyTo(self);
 
         // The file stem, stamped onto every turn this session generates so a
         // mixed-model conversation stays legible after a swap or a reload.

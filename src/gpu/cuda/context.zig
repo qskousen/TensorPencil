@@ -12,11 +12,7 @@ pub const MemTag = mem_tag.MemTag;
 pub const Error = error{ CudaError, OutOfMemory, DeviceOutOfMemory };
 
 /// Monotonic wall-clock nanoseconds (io-free; std.time.Timer is gone in 0.16).
-pub fn monoNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+pub const monoNs = @import("tp_core").prof.monoNs;
 
 /// Pinned staging-ring depth (slots in flight for async weight uploads).
 const stage_slots = 4;

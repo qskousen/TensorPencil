@@ -4,6 +4,8 @@
 //! reports `null`, never a hard dependency). Per-model VRAM accounting lives in
 //! the VRAM coordinator; this module only covers the system-wide meters.
 const std = @import("std");
+const builtin = @import("builtin");
+const dynlib = @import("TensorPencil").dynlib;
 
 /// Aggregate CPU jiffie counts parsed from the `cpu ...` line of `/proc/stat`.
 const CpuTimes = struct { total: u64, idle: u64 };
@@ -27,16 +29,22 @@ fn parseCpuLine(line: []const u8) ?CpuTimes {
     return .{ .total = total, .idle = idle };
 }
 
-/// Read `/proc/stat`'s first line into `buf` via a raw syscall (no allocation,
-/// no `std.Io` threading, the status bar samples this every frame).
-fn readProcStat(buf: []u8) ?CpuTimes {
-    const fd = std.os.linux.open("/proc/stat", .{ .ACCMODE = .RDONLY }, 0);
+/// Read the head of a procfs/sysfs file into `buf` via a raw syscall (no
+/// allocation, no `std.Io` threading, the status bar samples these every frame).
+/// Null off Linux, where neither file exists and there is no equivalent to read.
+fn readSysFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    const fd = std.os.linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     if (std.posix.errno(fd) != .SUCCESS) return null;
     const ifd: i32 = @intCast(fd);
     defer _ = std.os.linux.close(ifd);
     const n = std.os.linux.read(ifd, buf.ptr, buf.len);
     if (std.posix.errno(n) != .SUCCESS or n == 0) return null;
-    const bytes = buf[0..@intCast(n)];
+    return buf[0..@intCast(n)];
+}
+
+fn readProcStat(buf: []u8) ?CpuTimes {
+    const bytes = readSysFile("/proc/stat", buf) orelse return null;
     const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
     return parseCpuLine(bytes[0..nl]);
 }
@@ -70,16 +78,11 @@ pub const GpuStats = struct {
 };
 
 /// Current CPU frequency (MHz) from cpu0's cpufreq governor, 0 if unavailable
-/// (no cpufreq sysfs, e.g. some VMs). Raw syscall read, no allocation.
+/// (no cpufreq sysfs, e.g. some VMs, and anywhere but Linux).
 pub fn cpuFreqMhz() f32 {
     var buf: [32]u8 = undefined;
-    const fd = std.os.linux.open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", .{ .ACCMODE = .RDONLY }, 0);
-    if (std.posix.errno(fd) != .SUCCESS) return 0;
-    const ifd: i32 = @intCast(fd);
-    defer _ = std.os.linux.close(ifd);
-    const n = std.os.linux.read(ifd, &buf, buf.len);
-    if (std.posix.errno(n) != .SUCCESS or n == 0) return 0;
-    const s = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
+    const bytes = readSysFile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", &buf) orelse return 0;
+    const s = std.mem.trim(u8, bytes, " \t\r\n");
     const khz = std.fmt.parseInt(u64, s, 10) catch return 0;
     return @as(f32, @floatFromInt(khz)) / 1000.0; // kHz -> MHz
 }
@@ -147,7 +150,7 @@ pub fn nvmlClose() void {
 }
 
 pub const Nvml = struct {
-    lib: std.DynLib,
+    lib: dynlib.Lib,
     dev: NvmlDevice,
     getUtil: *const fn (NvmlDevice, *NvmlUtilization) callconv(.c) c_int,
     getMem: *const fn (NvmlDevice, *NvmlMemory) callconv(.c) c_int,
@@ -159,8 +162,10 @@ pub const Nvml = struct {
     proc_layout: enum { v2, v1 },
 
     pub fn open() ?Nvml {
-        var lib = std.DynLib.open("libnvidia-ml.so.1") catch
-            std.DynLib.open("libnvidia-ml.so") catch return null;
+        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+            .windows => &.{"nvml.dll"},
+            else => &.{ "libnvidia-ml.so.1", "libnvidia-ml.so" },
+        }) orelse return null;
         errdefer lib.close();
 
         const init_fn = lib.lookup(*const fn () callconv(.c) c_int, "nvmlInit_v2") orelse
@@ -214,8 +219,12 @@ pub const Nvml = struct {
     /// `procUsed` for our own process, what the meter actually wants.
     pub fn selfUsed(self: *Nvml) ?u64 {
         // `std.posix.getpid` doesn't exist in 0.16; `std.posix.system` is the
-        // portable spelling of the syscall (no std.os.linux dependency).
-        return self.procUsed(@intCast(std.posix.system.getpid()));
+        // portable spelling of the syscall, and has no getpid on Windows.
+        const pid: u32 = if (builtin.os.tag == .windows)
+            std.os.windows.GetCurrentProcessId()
+        else
+            @intCast(std.posix.system.getpid());
+        return self.procUsed(pid);
     }
 
     /// Returns null when NVML can't answer (symbols missing on an older driver,

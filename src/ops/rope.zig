@@ -387,6 +387,62 @@ pub fn applyRotateHalfPosSpan(
     }
 }
 
+/// Interleaved-pair RoPE over a contiguous sub-span [off, off+span) of each row,
+/// with an explicit absolute position per row. Pairs are (off+2i, off+2i+1), so
+/// this is the interleaved counterpart of `applyRotateHalfPosSpan`.
+///
+/// SenseNova's vision patch embedder is the caller: one row per patch, the first
+/// half of the channels rotating against the patch COLUMN and the second half
+/// against the ROW, both from the same frequency ladder. The two halves take
+/// different positions, which is why a span form is needed rather than treating
+/// them as two heads.
+pub fn applyInterleavedPosSpan(
+    x: []f32,
+    freqs: Freqs,
+    positions: []const usize,
+    row_dim: usize,
+    off: usize,
+    span: usize,
+) void {
+    const half = span / 2;
+    std.debug.assert(freqs.half == half);
+    std.debug.assert(off + span <= row_dim);
+    std.debug.assert(x.len == positions.len * row_dim);
+    for (positions, 0..) |pos, p| {
+        std.debug.assert((pos + 1) * half <= freqs.cos.len);
+        const cos = freqs.cos[pos * half ..][0..half];
+        const sin = freqs.sin[pos * half ..][0..half];
+        const base = p * row_dim + off;
+        for (0..half) |i| {
+            const x0 = x[base + 2 * i];
+            const x1 = x[base + 2 * i + 1];
+            x[base + 2 * i] = x0 * cos[i] - x1 * sin[i];
+            x[base + 2 * i + 1] = x0 * sin[i] + x1 * cos[i];
+        }
+    }
+}
+
+/// The `mmdit`/`ldm` sinusoidal embedding: out = [cos(t w_i) .. sin(t w_i) ..]
+/// with w_i = max_period^(-i/half), and NO 1000x scaling of `t`. Callers that
+/// need the scale apply it themselves, because whether it exists is a property of
+/// the model (Z-Image scales by `time_scale`; SenseNova feeds a raw t in [0, 1]).
+///
+/// f64 internals on purpose: at `i = 0` the argument is the timestep itself, so a
+/// 1e-7 relative slip in `freq` becomes ~1e-4 in `cos`. Computing more accurately
+/// than the reference bounds the disagreement by the reference's own rounding
+/// rather than stacking two errors.
+pub fn sinCosEmbedding(out: []f32, t: f32, max_period: f32) void {
+    const half = out.len / 2;
+    std.debug.assert(out.len == half * 2);
+    const log_max: f64 = @log(@as(f64, max_period));
+    for (0..half) |i| {
+        const exponent = -log_max * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(half));
+        const arg = @exp(exponent) * @as(f64, t);
+        out[i] = @floatCast(@cos(arg));
+        out[half + i] = @floatCast(@sin(arg));
+    }
+}
+
 /// FLUX sinusoidal timestep embedding: out = [cos(t' w_i) .. sin(t' w_i) ..]
 /// with t' = 1000 t, w_i = max_period^(-i/half). `out.len` must be even.
 pub fn timestepEmbedding(out: []f32, t: f32, max_period: f32) void {

@@ -1,6 +1,6 @@
 //! CUDA-backend LoRA sidecar apply, the device twin of `lora.Target.applyHost`.
 //!
-//! `dst[m][n] += scale * B[row0 .. row0+n] (A x)`: the A GEMM into a rank
+//! `dst[m][n] += strength * scale * B[row0 .. row0+n] (A x)`: the A GEMM into a rank
 //! scratch, then the B GEMM accumulating straight onto `dst`. Both go through
 //! `opGemmBf16`, so the factors live in the same pointer-keyed device weight
 //! cache as the trunk's own weights and the VRAM arbiter sees them.
@@ -80,6 +80,10 @@ pub const Workspace = struct {
     /// Whether the B GEMM accumulates onto `dst` itself. Decided once from the
     /// backend's kernel arm, so it cannot change under a render.
     fused: bool = false,
+    /// False when `lo`/`hi` are the backend's own shared buffers (`borrowed`),
+    /// so `deinit` leaves them alone. A borrowed workspace is a value, not a
+    /// resource.
+    owned: bool = true,
 
     pub fn init(be: *Backend, lo_elems: usize, hi_elems: usize) !Workspace {
         const fused = be.kernels == .libs and !bench_no_fuse;
@@ -95,13 +99,35 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        be.tensorDestroy(&self.lo);
-        be.tensorDestroy(&self.hi);
+        if (self.owned) {
+            be.tensorDestroy(&self.lo);
+            be.tensorDestroy(&self.hi);
+        }
         self.* = .{};
     }
 };
 
-/// `dst[m][n] += scale * B[row0 .. row0+n] (A x)`.
+/// A workspace over the backend's SHARED sidecar scratch, grown to fit.
+///
+/// For callers that do not know their widest factor before the first block, i.e.
+/// every family that goes through `lin_cuda` rather than sizing its own. Growth
+/// syncs the stream, so `lin_cuda.presizeLora` reaches the final size up front
+/// and this then only ever hands the buffers back.
+pub fn borrowed(be: *Backend, lo_elems: usize, hi_elems: usize) !Workspace {
+    const fused = be.kernels == .libs and !bench_no_fuse;
+    try be.ensureDeviceBuffer(&be.lora_lo, lo_elems * 4);
+    if (!fused) try be.ensureDeviceBuffer(&be.lora_hi, hi_elems * 4);
+    return .{
+        .lo = be.lora_lo,
+        .hi = if (fused) .{} else be.lora_hi,
+        .lo_elems = lo_elems,
+        .hi_elems = if (fused) 0 else hi_elems,
+        .fused = fused,
+        .owned = false,
+    };
+}
+
+/// `dst[m][n] += strength * t.scale * B[row0 .. row0+n] (A x)`.
 ///
 /// `x` is `[m][t.in_dim]` f32 (the SAME activation the base GEMM reads, before
 /// any int8 prep: the sidecar is in the unrotated space). `dst` is `[m][n]` f32,
@@ -117,6 +143,7 @@ pub fn applyRange(
     x: Buf,
     m: usize,
     t: *const Target,
+    strength: f32,
     row0: usize,
     n: usize,
 ) !void {
@@ -138,13 +165,14 @@ pub fn applyRange(
     // row-major weight are contiguous, so the slice is a view.
     const b_off = (row0 - f.out_off) * rank * 2;
     const b_rows = f.b.bytes[b_off..][0 .. n * rank * 2];
+    const scale = t.scale * strength;
     if (ws.fused) {
-        try be.opGemmBf16Acc(dst, ws.lo, m, b_rows, n, rank, f.scale);
+        try be.opGemmBf16Acc(dst, ws.lo, m, b_rows, n, rank, scale);
         return;
     }
     try be.opGemmBf16(ws.hi, ws.lo, m, b_rows, n, rank, null);
     if (bench_skip_add) return;
-    try be.opAddScaled(dst, ws.hi, m * n, f.scale);
+    try be.opAddScaled(dst, ws.hi, m * n, scale);
 }
 
 /// The factor whose output range contains `[row0, row0 + n)`, or null if it
@@ -177,9 +205,8 @@ test "a range resolves to the factor that contains it, and a straddle does not" 
         .a = bf16Weight(&a_bytes, 128, 32),
         .b = bf16Weight(&b_bytes, 64, 128),
         .out_off = i * 64,
-        .scale = 0.0625,
     };
-    const t: Target = .{ .factors = &factors, .in_dim = 32, .out_dim = 192, .tag = "qkv" };
+    const t: Target = .{ .factors = &factors, .in_dim = 32, .out_dim = 192, .scale = 0.0625, .tag = "qkv" };
 
     try testing.expectEqual(@as(usize, 0), factorFor(&t, 0, 64).?.out_off);
     try testing.expectEqual(@as(usize, 64), factorFor(&t, 64, 64).?.out_off);
@@ -200,15 +227,14 @@ test "device support is refused by shape rather than discovered at a launch" {
         .a = bf16Weight(&ok_a, 128, 64),
         .b = bf16Weight(&ok_b, 256, 128),
         .out_off = 0,
-        .scale = 1.0,
     };
-    var t: Target = .{ .factors = &.{f}, .in_dim = 64, .out_dim = 256, .tag = "ok" };
+    var t: Target = .{ .factors = &.{f}, .in_dim = 64, .out_dim = 256, .scale = 1.0, .tag = "ok" };
     try testing.expect(supported(&t));
 
     // rank 64: A's output width and B's contraction both miss the tile.
     const r64_a = [_]u8{0} ** (64 * 64 * 2);
     const r64_b = [_]u8{0} ** (256 * 64 * 2);
-    f = .{ .a = bf16Weight(&r64_a, 64, 64), .b = bf16Weight(&r64_b, 256, 64), .out_off = 0, .scale = 1.0 };
+    f = .{ .a = bf16Weight(&r64_a, 64, 64), .b = bf16Weight(&r64_b, 256, 64), .out_off = 0 };
     t.factors = &.{f};
     try testing.expect(!supported(&t));
 
@@ -216,7 +242,7 @@ test "device support is refused by shape rather than discovered at a launch" {
     const f32_a = [_]u8{0} ** (128 * 64 * 4);
     var fw = bf16Weight(&ok_a, 128, 64);
     fw = Weight.init(&f32_a, .f32, 128, 64);
-    f = .{ .a = fw, .b = bf16Weight(&ok_b, 256, 128), .out_off = 0, .scale = 1.0 };
+    f = .{ .a = fw, .b = bf16Weight(&ok_b, 256, 128), .out_off = 0 };
     t.factors = &.{f};
     try testing.expect(!supported(&t));
 }

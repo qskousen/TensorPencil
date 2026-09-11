@@ -69,6 +69,9 @@ pub const Slot = enum {
     pub fn applies(self: Slot, fam: Family) bool {
         return switch (self) {
             .text_encoder_2 => model_spec.traits(fam).dual_conditioner,
+            // A pixel-space family has no VAE, so neither the override nor the
+            // approx decoder that stands in for one means anything.
+            .vae, .taesd => !model_spec.traits(fam).no_decoder,
             else => true,
         };
     }
@@ -236,15 +239,202 @@ pub fn resolveTower(cfg: *Config, cat: *const Catalog) void {
     }
 }
 
+// ── LoRA sidecars ───────────────────────────────────────────────────────────
+//
+// Not a `Slot`. A slot has one value and a right answer to adopt when the user
+// has not picked ("whatever the checkpoint carries"); LoRAs are a LIST whose
+// correct default is empty, so nothing here ever adds one on its own.
+
+/// The LoRA rows for the configured checkpoint's family, in order.
+///
+/// Order only fixes the float sum, since the deltas add; it is the order they
+/// were turned on in, which is also what the settings list shows.
+pub fn loras(cfg: *const Config, cat: *const Catalog) []const config.FamilyLora {
+    const e = checkpoint(cfg, cat) orelse return &.{};
+    return lorasForFamily(cfg, e.ckpt.?.family);
+}
+
+/// The rows for one family, without needing a configured checkpoint.
+///
+/// `Config.loras` is one flat table for every family, so this filters rather
+/// than indexes. It compacts into a caller-visible scratch because the rows are
+/// interleaved; `loraCount` is the cheap form when only the number is wanted.
+pub fn lorasForFamily(cfg: *const Config, fam: Family) []const config.FamilyLora {
+    // A shared scratch: every caller is the UI thread drawing one frame, and the
+    // slice is read before the next call. Sized to the table, so it cannot spill.
+    const S = struct {
+        var buf: [config.max_family_loras]config.FamilyLora = undefined;
+    };
+    const key = familyKey(fam);
+    var n: usize = 0;
+    for (cfg.loras.slice()) |l| {
+        if (!std.mem.eql(u8, l.family.slice(), key)) continue;
+        S.buf[n] = l;
+        n += 1;
+    }
+    return S.buf[0..n];
+}
+
+pub fn loraCount(cfg: *const Config, fam: Family) usize {
+    const key = familyKey(fam);
+    var n: usize = 0;
+    for (cfg.loras.slice()) |l| if (std.mem.eql(u8, l.family.slice(), key)) {
+        n += 1;
+    };
+    return n;
+}
+
+/// Whether `path` is on for the configured checkpoint's family.
+pub fn loraEnabled(cfg: *const Config, cat: *const Catalog, path: []const u8) bool {
+    for (loras(cfg, cat)) |l| {
+        if (std.mem.eql(u8, l.path.slice(), path)) return l.enabled;
+    }
+    return false;
+}
+
+/// Turn `path` on or off for the configured checkpoint's family.
+///
+/// Off REMOVES the row rather than clearing `enabled`: a LoRA nobody wants
+/// should not sit in the config keeping a slot in a 12-entry table. Returns
+/// false when the table is full and the pick was dropped, which the caller
+/// reports.
+pub fn toggleLora(cfg: *Config, cat: *const Catalog, path: []const u8, on: bool) bool {
+    const e = checkpoint(cfg, cat) orelse return false;
+    const key = familyKey(e.ckpt.?.family);
+    if (!on) {
+        cfg.removeFamilyLora(key, path);
+        return true;
+    }
+    return cfg.addFamilyLora(key, path) != null;
+}
+
+/// Move one file's dial. Load-neutral, so a caller may do this mid-session.
+pub fn setLoraStrength(cfg: *Config, cat: *const Catalog, path: []const u8, strength: f32) void {
+    const e = checkpoint(cfg, cat) orelse return;
+    if (cfg.familyLoraMut(familyKey(e.ckpt.?.family), path)) |l| l.strength = strength;
+}
+
+/// Drop rows the catalog now says are wrong for their family.
+///
+/// Only what the catalog can JUDGE: a row whose file the catalog does not know
+/// (picked through "other file…", or a folder since removed) is left alone, like
+/// every other path here. An incompatible LoRA makes the whole session refuse to
+/// load, so this is worth doing on a rescan rather than at render time.
+pub fn pruneLoras(cfg: *Config, cat: *const Catalog) void {
+    var i: usize = 0;
+    while (i < cfg.loras.count) {
+        const l = cfg.loras.items[i];
+        const fam = std.meta.stringToEnum(Family, l.family.slice());
+        const e = cat.find(l.path.slice());
+        const bad = fam != null and e != null and
+            (if (e.?.lora) |lr| !lr.has(fam.?) else true);
+        if (!bad) {
+            i += 1;
+            continue;
+        }
+        std.log.warn("lora: dropping {s}, which the catalog says does not patch {s}", .{ l.path.slice(), l.family.slice() });
+        cfg.removeFamilyLora(l.family.slice(), l.path.slice());
+    }
+}
+
 /// After a rescan: whatever the catalog now knows about, re-resolve.
 pub fn resolveAll(cfg: *Config, cat: *const Catalog) void {
     resolveSides(cfg, cat);
     resolveTower(cfg, cat);
+    pruneLoras(cfg, cat);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+fn loraEntry(path: []const u8, fam: Family) catalog.Entry {
+    var e: catalog.Entry = .{ .path = path, .size = 1, .mtime_ns = 1 };
+    e.lora = .{ .info = .{ .targets = 294, .rank = 128, .depth = 42 } };
+    e.lora.?.fams[@intFromEnum(fam)] = true;
+    return e;
+}
+
+test "loras are per family, opt-in, and never adopted" {
+    const gpa = testing.allocator;
+    var cat = try Catalog.fromEntries(gpa, &.{
+        ckptEntry("/d/sensenova.safetensors", .sensenova, .{ .denoiser = true, .conditioner = true }),
+        ckptEntry("/d/krea2.safetensors", .krea2, .{ .denoiser = true }),
+        loraEntry("/l/turbo.safetensors", .sensenova),
+    });
+    defer cat.deinit();
+
+    var cfg: Config = .{};
+    selectCheckpoint(&cfg, &cat, "/d/sensenova.safetensors");
+    // A compatible LoRA sitting in the catalog is NOT adopted. A side file has a
+    // right answer to fall back on; a LoRA does not, and picking one up on a
+    // first scan would change every render the user makes.
+    try testing.expectEqual(@as(usize, 0), loras(&cfg, &cat).len);
+
+    try testing.expect(toggleLora(&cfg, &cat, "/l/turbo.safetensors", true));
+    try testing.expectEqual(@as(usize, 1), loras(&cfg, &cat).len);
+    try testing.expect(loraEnabled(&cfg, &cat, "/l/turbo.safetensors"));
+    setLoraStrength(&cfg, &cat, "/l/turbo.safetensors", 0.85);
+    try testing.expectEqual(@as(f32, 0.85), loras(&cfg, &cat)[0].strength);
+
+    // Switching family hides it without forgetting it: the row is keyed on
+    // sensenova, and krea2 must not inherit a sidecar it has no path for.
+    selectCheckpoint(&cfg, &cat, "/d/krea2.safetensors");
+    try testing.expectEqual(@as(usize, 0), loras(&cfg, &cat).len);
+    try testing.expectEqual(@as(usize, 1), loraCount(&cfg, .sensenova));
+    selectCheckpoint(&cfg, &cat, "/d/sensenova.safetensors");
+    try testing.expectEqual(@as(usize, 1), loras(&cfg, &cat).len);
+    try testing.expectEqual(@as(f32, 0.85), loras(&cfg, &cat)[0].strength);
+
+    try testing.expect(toggleLora(&cfg, &cat, "/l/turbo.safetensors", false));
+    try testing.expectEqual(@as(usize, 0), loraCount(&cfg, .sensenova));
+}
+
+test "pruneLoras drops what the catalog can judge wrong and nothing else" {
+    const gpa = testing.allocator;
+    var cat = try Catalog.fromEntries(gpa, &.{
+        ckptEntry("/d/sensenova.safetensors", .sensenova, .{ .denoiser = true, .conditioner = true }),
+        loraEntry("/l/for-krea2.safetensors", .krea2),
+        loraEntry("/l/ok.safetensors", .sensenova),
+        // In the catalog, but not a LoRA at all.
+        .{ .path = "/l/not-a-lora.safetensors", .size = 1, .mtime_ns = 1 },
+    });
+    defer cat.deinit();
+
+    var cfg: Config = .{};
+    _ = cfg.addFamilyLora("sensenova", "/l/ok.safetensors");
+    _ = cfg.addFamilyLora("sensenova", "/l/for-krea2.safetensors");
+    _ = cfg.addFamilyLora("sensenova", "/l/not-a-lora.safetensors");
+    // Picked through "other file…", or a folder since removed: the catalog has
+    // no opinion, so neither does this. An incompatible sidecar makes the whole
+    // session refuse to load, which is why the ones it CAN judge go.
+    _ = cfg.addFamilyLora("sensenova", "/l/unknown.safetensors");
+    try testing.expectEqual(@as(usize, 4), cfg.loras.count);
+
+    std.testing.log_level = .err; // the drop warns on purpose
+    pruneLoras(&cfg, &cat);
+    try testing.expectEqual(@as(usize, 2), cfg.loras.count);
+    try testing.expect(cfg.familyLoraMut("sensenova", "/l/ok.safetensors") != null);
+    try testing.expect(cfg.familyLoraMut("sensenova", "/l/unknown.safetensors") != null);
+    try testing.expect(cfg.familyLoraMut("sensenova", "/l/for-krea2.safetensors") == null);
+    try testing.expect(cfg.familyLoraMut("sensenova", "/l/not-a-lora.safetensors") == null);
+}
+
+test "a pixel-space family offers no VAE or preview slot" {
+    // SenseNova's canvas IS the image. Without this the settings form shows a
+    // `VAE — none` row in amber, reporting a required piece missing that cannot
+    // exist, and `missing` never clears.
+    try testing.expect(!Slot.vae.applies(.sensenova));
+    try testing.expect(!Slot.taesd.applies(.sensenova));
+    try testing.expect(Slot.text_encoder.applies(.sensenova));
+    // ...and every family that does have one still gets the rows.
+    for ([_]Family{ .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3 }) |f| {
+        try testing.expect(Slot.vae.applies(f));
+    }
+    const info: model_spec.Info = .{ .family = .sensenova, .contents = .{ .denoiser = true, .conditioner = true } };
+    try testing.expect(info.isComplete());
+    try testing.expect(!model_spec.missing(info, .{}).decoder);
+}
 
 fn ckptEntry(path: []const u8, fam: Family, contents: model_spec.Contents) catalog.Entry {
     return .{ .path = path, .size = 1, .mtime_ns = 1, .ckpt = .{ .family = fam, .contents = contents } };

@@ -429,7 +429,21 @@ fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const We
         // `sint4` coopmat, so its int4 weights are decoded to int8 per GEMM (`lin`) and the
         // activation stays 8-bit. The prep is a property of the BACKEND's GEMM, not of the
         // weight's storage, which is why this mapping is here rather than in `anima.zig`.
-        .i8, .i4 => try ctx.opI8Prep(x, m, cols),
+        .i8, .i4 => {
+            // Whether the prep rotates is the checkpoint's answer (`lin.convrot`): the
+            // group rotation cancels across the GEMM only when both sides apply it.
+            const rot = lin.convrot(group) orelse {
+                std.log.err("anima_gpu: a linear group mixes convrot and plain int8 weights; one activation prep cannot serve both", .{});
+                return error.UnsupportedCheckpoint;
+            };
+            // `i4Decode` emits a weight quantized after the rotation and has no
+            // unrotated build.
+            if (want == .i4 and !rot) {
+                std.log.err("anima_gpu: int4 without convrot has no unrotated decode on this backend", .{});
+                return error.UnsupportedCheckpoint;
+            }
+            try ctx.opI8PrepR(x, m, cols, rot);
+        },
         .none => {},
     }
 }

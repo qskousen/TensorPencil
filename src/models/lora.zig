@@ -15,9 +15,9 @@
 //!    `lora_A` tensor as it sits in the file. A fused factor whose A is three
 //!    rank-128 blocks concatenated has 384 rows and an alpha that was multiplied
 //!    by 3 to match, so both readings give the same number only if you use the
-//!    file's own shape. Deriving `s` before any splitting is what makes that
-//!    impossible to get wrong, and it is why `split` takes the scale rather than
-//!    computing one.
+//!    file's own shape. Deriving it before any splitting is what makes that
+//!    impossible to get wrong, and it is why the scale sits on the `Target` and
+//!    not on each `Factor`.
 //! 2. **`B` may be block diagonal.** A LoRA over a fused `qkv_proj` is three
 //!    independent factors stacked: `A [3r, in]` concatenated and `B [3 out, 3r]`
 //!    block diagonal. Treating it as one dense rank-`3r` factor is numerically
@@ -32,11 +32,29 @@
 //!    `minimax_h3.zig` is how that is made structural: the weight is reachable
 //!    only as `.w`, so the sidecar is beside it in every grep.
 //!
-//! Key convention is ComfyUI's generic LoRA format (`comfy/lora.py`): a base
-//! tensor `blocks.3.attn.qkv_proj.weight` is patched by
-//! `diffusion_model.blocks.3.attn.qkv_proj.{lora_A.weight, lora_B.weight, alpha}`.
-//! `Sidecar.forWeight` does that name transform, so a model loader passes the
-//! `Weight.tag` it already has.
+//! A base tensor `blocks.3.attn.qkv_proj.weight` is patched by
+//! `diffusion_model.blocks.3.attn.qkv_proj.<factors>`, and `Sidecar.forWeight`
+//! does that name transform, so a model loader passes the `Weight.tag` it
+//! already has.
+//!
+//! `dialects` is the spellings those factors come in, from
+//! `comfy/weight_adapter/lora.py`. Only the suffixes differ; the algebra does
+//! not. ⚠️ **The reference's own `A_name` holds `lora_B`**, inverted from PEFT's
+//! naming, so reading comfy's variable names rather than its shapes swaps the
+//! two. What is fixed is the shape: `a` is `[rank, in_dim]` (`lora_A`,
+//! `lora_down`) and `b` is `[out_dim, rank]` (`lora_B`, `lora_up`), and comfy
+//! divides alpha by `mat2.shape[0]`, which is `a`'s rows.
+//!
+//! Three sibling keys mean a file this loader must REFUSE rather than read as a
+//! plain LoRA: `lora_mid` (the conv CP form, three matrices), `dora_scale` (DoRA
+//! rescales the base weight, so the low-rank part alone is the wrong magnitude)
+//! and `reshape_weight`. Each is a finite, plausible, wrong render otherwise.
+//!
+//! `strength` is NOT folded into a factor. `Target.scale` holds the file's own
+//! `alpha / rank` and the dial is multiplied at apply time, so a GUI slider does
+//! not mean re-reading a gigabyte. `Stack` is N files over one model, each with
+//! its own live dial; their deltas add, so order does not matter and stacking is
+//! a merged name index.
 
 const std = @import("std");
 const ops = @import("tp_ops");
@@ -46,10 +64,43 @@ const Weight = ops.matmul.Weight;
 const WeightStore = weights_mod.WeightStore;
 const DType = @import("tp_core").dtype.DType;
 
+/// DIAGNOSTIC: round the host apply's activation to bf16 before each GEMM, the
+/// way the device apply's `opGemmBf16` does.
+///
+/// This is the control row for a whole-render device-vs-host comparison. The
+/// device sidecar sits at bf16's own 1.66e-3 per GEMM (`lora-cuda-test` prints
+/// it beside the residual), and without this there is no way to tell that floor
+/// amplified by a trajectory from a defect in the apply.
+pub var host_bf16_act: bool = false;
+
 /// Rows the host apply processes at a time. Bounds the `[rows][out]`
 /// intermediate: at the default H3 render an untiled one would be 38k x 21504 x
 /// 4 B = 3.3 GB for a delta. Rows are independent, so this is free.
 const host_band: usize = 512;
+
+/// How one file spells a factor pair, `a` first. Tried in this order, which is
+/// the reference's, so a file carrying two spellings resolves the way ComfyUI
+/// resolves it.
+pub const Dialect = struct {
+    /// `[rank][in_dim]`, comfy's `mat2`.
+    a: []const u8,
+    /// `[out_dim][rank]`, comfy's `mat1`.
+    b: []const u8,
+};
+
+pub const dialects = [_]Dialect{
+    .{ .a = ".lora_down.weight", .b = ".lora_up.weight" }, // kohya, and civitai at large
+    .{ .a = "_lora.down.weight", .b = "_lora.up.weight" }, // diffusers
+    .{ .a = ".lora_A.weight", .b = ".lora_B.weight" }, // PEFT
+    .{ .a = ".lora.down.weight", .b = ".lora.up.weight" },
+    .{ .a = ".lora_A", .b = ".lora_B" }, // mochi
+    .{ .a = ".lora_linear_layer.down.weight", .b = ".lora_linear_layer.up.weight" },
+    .{ .a = ".lora_A.default.weight", .b = ".lora_B.default.weight" },
+};
+
+/// Suffixes that make a file something other than a plain LoRA. Reading one as a
+/// plain LoRA renders finitely and wrongly, so `load` refuses instead.
+const refuse = [_][]const u8{ ".lora_mid.weight", ".dora_scale", ".reshape_weight" };
 
 /// One rank-`rank` factor covering output rows `[out_off, out_off + out_rows)`
 /// of a logical linear.
@@ -62,8 +113,6 @@ pub const Factor = struct {
     /// `[out_rows][rank]`.
     b: Weight,
     out_off: usize,
-    /// `strength * alpha / rank`, folded once at attach time.
-    scale: f32,
 
     pub fn rank(f: Factor) usize {
         return f.a.rows;
@@ -75,6 +124,11 @@ pub const Target = struct {
     factors: []const Factor,
     in_dim: usize,
     out_dim: usize,
+    /// `alpha / a.rows`, from the file's own shapes. Derived once before any
+    /// block-diagonal split, which is what makes a fused alpha read right, so it
+    /// belongs to the target and not to each factor. The runtime dial is
+    /// multiplied on top at apply time.
+    scale: f32,
     /// The base tensor's name, for diagnostics.
     tag: []const u8,
 
@@ -85,7 +139,7 @@ pub const Target = struct {
         return n;
     }
 
-    /// `y[m][y_stride] += s * B (A x)`, factor `f` writing columns
+    /// `y[m][y_stride] += strength * scale * B (A x)`, factor `f` writing columns
     /// `[f.out_off, f.out_off + f.b.rows)`.
     ///
     /// `y_stride` is the destination row stride, which is NOT `out_dim` when the
@@ -99,6 +153,7 @@ pub const Target = struct {
         y_stride: usize,
         x: []const f32,
         m: usize,
+        strength: f32,
     ) !void {
         std.debug.assert(x.len >= m * t.in_dim);
         std.debug.assert(y.len >= m * y_stride);
@@ -115,18 +170,35 @@ pub const Target = struct {
         const hi = try gpa.alloc(f32, band * max_out);
         defer gpa.free(hi);
 
+        // The bf16 control row, when asked for: one scratch band of the
+        // activation, rounded, standing in for `x`.
+        const xr: ?[]f32 = if (host_bf16_act) try gpa.alloc(f32, band * t.in_dim) else null;
+        defer if (xr) |b| gpa.free(b);
+        const lor: ?[]f32 = if (host_bf16_act) try gpa.alloc(f32, band * max_rank) else null;
+        defer if (lor) |b| gpa.free(b);
+
+        const s = t.scale * strength;
         var r0: usize = 0;
         while (r0 < m) : (r0 += band) {
             const n = @min(band, m - r0);
+            var xin = x[r0 * t.in_dim ..][0 .. n * t.in_dim];
+            if (xr) |b| {
+                roundBf16(b[0 .. n * t.in_dim], xin);
+                xin = b[0 .. n * t.in_dim];
+            }
             for (t.factors) |f| {
                 const r = f.rank();
                 const o = f.b.rows;
-                try ops.matmul.matmul(io, gpa, lo[0 .. n * r], x[r0 * t.in_dim ..][0 .. n * t.in_dim], n, f.a, null);
+                try ops.matmul.matmul(io, gpa, lo[0 .. n * r], xin, n, f.a, null);
+                if (lor) |b| {
+                    roundBf16(b[0 .. n * r], lo[0 .. n * r]);
+                    @memcpy(lo[0 .. n * r], b[0 .. n * r]);
+                }
                 try ops.matmul.matmul(io, gpa, hi[0 .. n * o], lo[0 .. n * r], n, f.b, null);
                 for (0..n) |i| {
                     const dst = y[(r0 + i) * y_stride + f.out_off ..][0..o];
                     const src = hi[i * o ..][0..o];
-                    for (dst, src) |*d, s| d.* += f.scale * s;
+                    for (dst, src) |*d, v| d.* += s * v;
                 }
             }
         }
@@ -140,11 +212,10 @@ pub const Sidecar = struct {
     arena: std.heap.ArenaAllocator,
     /// Base tensor name (without the `diffusion_model.` prefix) -> its target.
     index: std.StringHashMapUnmanaged(Target),
-    /// Denoiser-prefixed keys whose SPELLING this loader does not know (the
-    /// kohya `lora_up`/`lora_down` dialect, say). A file made entirely of those
-    /// loads as an empty sidecar, which would otherwise render as if no LoRA had
-    /// been asked for. A LoRA for a different architecture is a separate case,
-    /// caught by nothing attaching.
+    /// Denoiser-prefixed keys whose SPELLING this loader does not know. A file
+    /// made entirely of those loads as an empty sidecar, which would otherwise
+    /// render as if no LoRA had been asked for. A LoRA for a different
+    /// architecture is a separate case, caught by nothing attaching.
     unclaimed: usize,
 
     pub fn deinit(self: *Sidecar) void {
@@ -155,36 +226,41 @@ pub const Sidecar = struct {
     /// The prefix ComfyUI's generic format puts on a denoiser tensor name.
     pub const prefix = "diffusion_model.";
 
-    /// Load every `lora_A`/`lora_B` pair in `store`, keyed by the base tensor
-    /// name it patches.
+    /// Load every factor pair in `store`, in any dialect, keyed by the base
+    /// tensor name it patches.
     ///
-    /// `strength` is folded into each factor's scale here, so changing it means
-    /// reloading. That is deliberate: nothing downstream then holds a second
-    /// copy of the dial that could disagree with this one.
-    pub fn load(gpa: std.mem.Allocator, store: WeightStore, strength: f32) !Sidecar {
+    /// The runtime dial is not taken here: see `Stack.File.strength`.
+    pub fn load(gpa: std.mem.Allocator, store: WeightStore) !Sidecar {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
         var index: std.StringHashMapUnmanaged(Target) = .empty;
-        const names = store.names();
 
-        const a_suffix = ".lora_A.weight";
         var unclaimed: usize = 0;
-        for (names) |full| {
+        for (store.names()) |full| {
             // Only denoiser keys are this loader's business; anything else in
             // the file belongs to another component (a text-encoder LoRA) and is
             // not evidence of a problem.
             if (!std.mem.startsWith(u8, full, prefix)) continue;
-            var known = false;
-            inline for (.{ a_suffix, ".lora_B.weight", ".alpha" }) |sfx| {
-                if (std.mem.endsWith(u8, full, sfx)) known = true;
-            }
-            if (!known) unclaimed += 1;
-            if (!std.mem.endsWith(u8, full, a_suffix)) continue;
-            const stem = full[prefix.len .. full.len - a_suffix.len];
 
-            const t = try loadTarget(alloc, store, full[0 .. full.len - a_suffix.len], stem, strength);
+            if (refusedSuffix(full)) |sfx| {
+                std.log.err("lora: {s} is a {s} adapter, which is a different calculation and not a plain LoRA", .{ full, sfx[1..] });
+                return error.UnsupportedLora;
+            }
+
+            // The dialect a stem loads under is the FIRST that matches, and a
+            // stem is reached through its `a` key alone, so `b` and `alpha` are
+            // claimed here without being iterated to.
+            const d: Dialect = for (dialects) |cand| {
+                if (std.mem.endsWith(u8, full, cand.a)) break cand;
+            } else {
+                if (!claimedSuffix(full)) unclaimed += 1;
+                continue;
+            };
+
+            const stem = full[prefix.len .. full.len - d.a.len];
+            const t = try loadTarget(alloc, store, full[0 .. full.len - d.a.len], stem, d);
             const base = try std.fmt.allocPrint(alloc, "{s}.weight", .{stem});
             try index.put(alloc, base, t);
         }
@@ -194,6 +270,35 @@ pub const Sidecar = struct {
             .index = index,
             .unclaimed = unclaimed,
         };
+    }
+
+    /// The base tensor stem `name` is the `a` factor of, or null when it is not
+    /// one (a `b` key, an alpha, or another component's tensor).
+    ///
+    /// Keyed on the `a` side alone, which is what makes one pass over the names
+    /// visit each target exactly once.
+    pub fn factorStem(name: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, name, prefix)) return null;
+        for (dialects) |d| {
+            if (std.mem.endsWith(u8, name, d.a)) return name[prefix.len .. name.len - d.a.len];
+        }
+        return null;
+    }
+
+    /// The `refuse` suffix `name` carries, or null. Split from the reporting in
+    /// `load` so a test can assert the decision without making every passing run
+    /// print: `std.testing.log_level` has no level below `err`.
+    pub fn refusedSuffix(name: []const u8) ?[]const u8 {
+        for (refuse) |sfx| if (std.mem.endsWith(u8, name, sfx)) return sfx;
+        return null;
+    }
+
+    /// Whether `name` is a key some dialect accounts for, so it is not evidence
+    /// of a spelling this loader missed. `a` keys are handled by the caller.
+    fn claimedSuffix(name: []const u8) bool {
+        if (std.mem.endsWith(u8, name, ".alpha")) return true;
+        for (dialects) |d| if (std.mem.endsWith(u8, name, d.b)) return true;
+        return false;
     }
 
     /// What this LoRA has for one base weight.
@@ -239,18 +344,208 @@ pub const Sidecar = struct {
     }
 };
 
+/// N LoRA files over one model, each with its own live strength.
+///
+/// The deltas ADD, so order does not change the result; the hit list is kept in
+/// the order the files were given anyway, so a float sum is the same every run.
+pub const Stack = struct {
+    files: std.ArrayList(File) = .empty,
+    /// Base tensor name -> every file's target for it. Keys are borrowed from
+    /// the sidecars' own indexes, so every file outlives this map.
+    index: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Hit)) = .empty,
+    /// Per-file hit counts for the attach walk in progress. Only `beginAttach`
+    /// / `resolve` / `finishAttach` touch these.
+    hits: [max_files]usize = @splat(0),
+
+    pub const File = struct {
+        side: Sidecar,
+        /// The dial, read at every apply. Nothing folds it into a factor, so
+        /// moving it costs nothing and no second copy can disagree with it.
+        strength: f32,
+        /// The file it came from, for diagnostics and the GUI row. Owned.
+        path: []const u8,
+    };
+
+    pub const Hit = struct {
+        target: *const Target,
+        /// Index into `files`, so an apply reads the live strength.
+        file: u32,
+    };
+
+    pub fn deinit(self: *Stack, gpa: std.mem.Allocator) void {
+        var it = self.index.valueIterator();
+        while (it.next()) |list| list.deinit(gpa);
+        self.index.deinit(gpa);
+        for (self.files.items) |*f| {
+            f.side.deinit();
+            gpa.free(f.path);
+        }
+        self.files.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// Load one file and merge it in. `store` must outlive the stack: the dense
+    /// factors are views into its mapping.
+    ///
+    /// Returns how many targets the file holds, which is not yet how many will
+    /// apply; `check` answers that against a model.
+    pub fn add(
+        self: *Stack,
+        gpa: std.mem.Allocator,
+        store: WeightStore,
+        strength: f32,
+        path: []const u8,
+    ) !usize {
+        if (self.files.items.len >= max_files) return error.TooManyLoras;
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
+        var side = try Sidecar.load(gpa, store);
+        errdefer side.deinit();
+
+        const idx: u32 = @intCast(self.files.items.len);
+        try self.files.append(gpa, .{ .side = side, .strength = strength, .path = owned_path });
+        // Past this point the file is owned by `files` and freed by `deinit`.
+        errdefer _ = self.files.pop();
+
+        const own = &self.files.items[idx].side;
+        var it = own.index.iterator();
+        while (it.next()) |e| {
+            const gop = try self.index.getOrPut(gpa, e.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, .{ .target = e.value_ptr, .file = idx });
+        }
+        return own.count();
+    }
+
+    /// Every hit against `w`, empty when nothing patches it.
+    ///
+    /// Shape disagreements are not reported here. `check` has refused them
+    /// already, so the forward path carries no branch for a case that cannot
+    /// reach it.
+    pub fn forWeight(self: *const Stack, w: Weight) []const Hit {
+        const tag = w.tag orelse return &.{};
+        const list = self.index.getPtr(tag) orelse return &.{};
+        return list.items;
+    }
+
+    /// Zero the per-file counters before an attach walk.
+    ///
+    /// The walk is the model's own, not a shared linear list, because only the
+    /// model knows which linears it actually runs. Each family calls
+    /// `beginAttach`, then `resolve` for every linear, then `finishAttach`.
+    pub fn beginAttach(self: *Stack) void {
+        self.hits = @splat(0);
+    }
+
+    /// The validating lookup: `forWeight` plus the width check, and it counts the
+    /// hit against its file.
+    ///
+    /// A LoRA trained against another variant of the same architecture has all
+    /// the right NAMES and the wrong widths; its factors would still multiply,
+    /// into the wrong columns. Refusing beats skipping, since a trunk with only
+    /// some of its sidecars applied renders plausibly and wrongly.
+    pub fn resolve(self: *Stack, w: Weight) ![]const Hit {
+        const hits = self.forWeight(w);
+        for (hits) |h| {
+            const t = h.target;
+            if (t.in_dim != w.cols or t.out_dim != w.rows) {
+                std.log.err("lora: {s}: {s} is {d}x{d} but the checkpoint's is {d}x{d}", .{
+                    self.files.items[h.file].path, t.tag, t.out_dim, t.in_dim, w.rows, w.cols,
+                });
+                return error.ShapeMismatch;
+            }
+            self.hits[h.file] += 1;
+        }
+        return hits;
+    }
+
+    /// Close an attach walk, refusing a file that patched nothing.
+    ///
+    /// Returns how many (linear, file) pairs will apply. A file with no hits is a
+    /// LoRA for another architecture, which is a mistake worth reporting rather
+    /// than a render that quietly ignores the flag.
+    pub fn finishAttach(self: *const Stack) !usize {
+        if (self.fileWithNoHits()) |i| {
+            const f = self.files.items[i];
+            std.log.err("lora: {s} patches none of this checkpoint's linears ({d} targets in the file)", .{ f.path, f.side.count() });
+            return error.NoMatchingTargets;
+        }
+        var total: usize = 0;
+        for (self.files.items, 0..) |f, i| {
+            if (f.side.unclaimed > 0) {
+                std.log.warn("lora: {d} keys in {s} use a spelling this loader does not know", .{ f.side.unclaimed, f.path });
+            }
+            total += self.hits[i];
+        }
+        return total;
+    }
+
+    /// The first file the walk found no linear for, or null. Split from the
+    /// reporting for the same reason as `Sidecar.refusedSuffix`.
+    pub fn fileWithNoHits(self: *const Stack) ?usize {
+        for (self.files.items, 0..) |_, i| if (self.hits[i] == 0) return i;
+        return null;
+    }
+
+    /// The host apply for every hit against `w`, in file order.
+    pub fn applyHost(
+        self: *const Stack,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        y: []f32,
+        y_stride: usize,
+        x: []const f32,
+        m: usize,
+        w: Weight,
+    ) !void {
+        for (self.forWeight(w)) |h| {
+            const s = self.files.items[h.file].strength;
+            // Exact: adding `0 * delta` changes nothing, so a dial at zero is
+            // free rather than two GEMMs whose result is discarded.
+            if (s == 0) continue;
+            try h.target.applyHost(io, gpa, y, y_stride, x, m, s);
+        }
+    }
+
+    /// Widest `[m][rank]` and `[m][out]` any single apply needs, for sizing one
+    /// shared device scratch across the whole stack.
+    pub fn maxFactor(self: *const Stack) struct { rank: usize, out: usize } {
+        var rank: usize = 0;
+        var out: usize = 0;
+        for (self.files.items) |f| {
+            var it = f.side.index.valueIterator();
+            while (it.next()) |t| for (t.factors) |fa| {
+                rank = @max(rank, fa.rank());
+                out = @max(out, fa.b.rows);
+            };
+        }
+        return .{ .rank = rank, .out = out };
+    }
+
+    /// Total factor bytes across every file, i.e. what the stack costs resident.
+    pub fn bytes(self: *const Stack) usize {
+        var n: usize = 0;
+        for (self.files.items) |f| n += f.side.bytes();
+        return n;
+    }
+};
+
+/// Files one stack can hold. A dial per file is a GUI row, so the cap is what
+/// fits on screen rather than anything the algebra needs.
+pub const max_files: usize = 16;
+
 fn loadTarget(
     alloc: std.mem.Allocator,
     store: WeightStore,
     full_stem: []const u8,
     stem: []const u8,
-    strength: f32,
+    d: Dialect,
 ) !Target {
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
 
-    const a_view = store.get(try std.fmt.bufPrint(&buf, "{s}.lora_A.weight", .{full_stem})) orelse return error.MissingTensor;
-    const b_view = store.get(try std.fmt.bufPrint(&buf, "{s}.lora_B.weight", .{full_stem})) orelse {
-        std.log.err("lora: {s} has a lora_A but no lora_B", .{stem});
+    const a_view = store.get(try std.fmt.bufPrint(&buf, "{s}{s}", .{ full_stem, d.a })) orelse return error.MissingTensor;
+    const b_view = store.get(try std.fmt.bufPrint(&buf, "{s}{s}", .{ full_stem, d.b })) orelse {
+        std.log.err("lora: {s} has a {s} but no {s}", .{ stem, d.a[1..], d.b[1..] });
         return error.MissingTensor;
     };
 
@@ -274,15 +569,14 @@ fn loadTarget(
     // is the one reading that is right for both.
     var alpha: f32 = @floatFromInt(rank);
     if (store.get(try std.fmt.bufPrint(&buf, "{s}.alpha", .{full_stem}))) |av| {
-        const vals = try av.toF32Alloc(alloc);
-        defer alloc.free(vals);
-        if (vals.len != 1) {
-            std.log.err("lora: {s}.alpha has {d} entries, expected 1", .{ stem, vals.len });
+        // Rank 0 (`shape: []`) is how the turbo LoRAs ship it, and `Shape.count`
+        // reads that as one element.
+        alpha = av.asScalarF32() catch {
+            std.log.err("lora: {s}.alpha has {d} entries, expected 1", .{ stem, av.info.elemCount() });
             return error.ShapeMismatch;
-        }
-        alpha = vals[0];
+        };
     }
-    const scale = strength * alpha / @as(f32, @floatFromInt(rank));
+    const scale = alpha / @as(f32, @floatFromInt(rank));
 
     const a_dt = a_view.info.dtype;
     const b_dt = b_view.info.dtype;
@@ -297,7 +591,7 @@ fn loadTarget(
     const groups = blockGroups(b_full);
     const factors = try alloc.alloc(Factor, groups);
     if (groups == 1) {
-        factors[0] = .{ .a = a_full, .b = b_full, .out_off = 0, .scale = scale };
+        factors[0] = .{ .a = a_full, .b = b_full, .out_off = 0 };
     } else {
         const gr = rank / groups;
         const go = out_dim / groups;
@@ -308,7 +602,6 @@ fn loadTarget(
                 // B's are a sub-block of a wider tensor and must be repacked.
                 .b = try subBlock(alloc, b_full, g * go, go, g * gr, gr),
                 .out_off = g * go,
-                .scale = scale,
             };
         }
     }
@@ -317,6 +610,7 @@ fn loadTarget(
         .factors = factors,
         .in_dim = in_dim,
         .out_dim = out_dim,
+        .scale = scale,
         .tag = try alloc.dupe(u8, stem),
     };
 }
@@ -360,6 +654,14 @@ fn isBlockDiagonal(b: Weight, groups: usize) bool {
 fn allZero(bytes: []const u8) bool {
     for (bytes) |c| if (c != 0) return false;
     return true;
+}
+
+/// `dst = bf16(src)`, back in f32, round-to-nearest-even. The same conversion
+/// `lora-cuda-test` builds its floor row from, which is what makes the two
+/// numbers comparable.
+fn roundBf16(dst: []f32, src: []const f32) void {
+    const f32ToBf16 = @import("tp_core").dtype.f32ToBf16;
+    for (dst, src) |*d, v| d.* = @bitCast(@as(u32, f32ToBf16(v)) << 16);
 }
 
 fn elemBytes(dt: DType) usize {
@@ -417,11 +719,17 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
     const targets = [_]struct { name: []const u8, groups: usize }{
         .{ .name = "blocks.0.mlp.fc2", .groups = 1 },
         .{ .name = "blocks.0.attn.qkv_proj", .groups = 3 },
+        // Written in the kohya spelling by the generator, so this target is what
+        // makes the pass below cover the alias as well.
         .{ .name = "blocks.0.attn.out_proj", .groups = 1 },
     };
+    // ...and that stays true only while the fixture still ships one. A
+    // regenerated corpus that dropped the spelling would otherwise reduce this
+    // test's coverage in silence.
+    try testing.expect(store.get("diffusion_model.blocks.0.attn.out_proj.lora_down.weight") != null);
 
     for ([_]f32{ 1.0, 0.5 }) |strength| {
-        var side = try Sidecar.load(gpa, store, strength);
+        var side = try Sidecar.load(gpa, store);
         defer side.deinit();
         try testing.expectEqual(targets.len, side.count());
 
@@ -465,7 +773,7 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
             const got = try gpa.alloc(f32, m * out_dim);
             defer gpa.free(got);
             try ops.matmul.matmul(io, gpa, got, x, m, w, null);
-            try t.applyHost(io, gpa, got, out_dim, x, m);
+            try t.applyHost(io, gpa, got, out_dim, x, m, strength);
 
             const rel = relL2(want, got);
             errdefer std.debug.print("{s} @ strength {d}: rel {e}\nwant {any}\ngot  {any}\n", .{ spec.name, strength, rel, want, got });
@@ -490,7 +798,7 @@ test "a shape disagreement is distinguished from no entry at all" {
     var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, reference_fixture);
     defer st.deinit();
     const store: WeightStore = .{ .safetensors = &st };
-    var side = try Sidecar.load(gpa, store, 1.0);
+    var side = try Sidecar.load(gpa, store);
     defer side.deinit();
 
     const bytes = [_]u8{0} ** (16 * 9 * 4);
@@ -512,6 +820,124 @@ test "a shape disagreement is distinguished from no entry at all" {
     // another architecture) is visible as a nonzero count.
     try testing.expectEqual(@as(usize, 0), side.unclaimed);
     try testing.expect(side.bytes() > 0);
+}
+
+test "N stacked LoRAs add, and each file keeps its own live dial" {
+    // Two independent files at different strengths, against the reference
+    // merging both in sequence. This is what says a stack is a SUM: if it were
+    // a composition, adding sidecars beside one GEMM could not reproduce it.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, reference_fixture);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+    // The second file lives under `l2.` in the same fixture; a prefixed view is
+    // a store of its own, which is exactly what a second container would be.
+    var pfx = try weights_mod.Prefixed.init(gpa, store, "l2.");
+    defer pfx.deinit(gpa);
+
+    const s1: f32 = 0.75;
+    const s2: f32 = 0.25;
+    var stack: Stack = .{};
+    defer stack.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, store, s1, "file1"));
+    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, pfx.store(), s2, "file2"));
+
+    for ([_][]const u8{ "blocks.0.mlp.fc2", "blocks.0.attn.qkv_proj", "blocks.0.attn.out_proj" }) |name| {
+        var buf: [128]u8 = undefined;
+        const bv = store.get(try std.fmt.bufPrint(&buf, "base.{s}.weight", .{name})) orelse return error.MissingTensor;
+        const out_dim = bv.info.shape.slice()[0];
+        const in_dim = bv.info.shape.slice()[1];
+
+        var w = Weight.init(bv.bytes, bv.info.dtype, out_dim, in_dim);
+        const tag = try std.fmt.allocPrint(gpa, "{s}.weight", .{name});
+        defer gpa.free(tag);
+        w.tag = tag;
+
+        // Both files patch this weight, and the walk must say so.
+        stack.beginAttach();
+        try testing.expectEqual(@as(usize, 2), (try stack.resolve(w)).len);
+
+        const x = try (store.get(try std.fmt.bufPrint(&buf, "in.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        defer gpa.free(x);
+        const m = x.len / in_dim;
+        const want = try (store.get(try std.fmt.bufPrint(&buf, "out_stack.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        defer gpa.free(want);
+        const bare = try (store.get(try std.fmt.bufPrint(&buf, "out_base.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        defer gpa.free(bare);
+
+        const got = try gpa.alloc(f32, m * out_dim);
+        defer gpa.free(got);
+        try ops.matmul.matmul(io, gpa, got, x, m, w, null);
+        try stack.applyHost(io, gpa, got, out_dim, x, m, w);
+
+        const rel = relL2(want, got);
+        errdefer std.debug.print("{s}: stack rel {e}\n", .{ name, rel });
+        try testing.expect(rel < 1e-6);
+        // Both files moved it, so neither dial is being dropped.
+        try testing.expect(relL2(want, bare) > 0.05);
+
+        // The dial is live: zeroing file 2 leaves file 1's delta alone, with no
+        // reload anywhere. `out` is file 1 at strength 1, so its delta scales.
+        const only1 = try (store.get(try std.fmt.bufPrint(&buf, "out.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        defer gpa.free(only1);
+        const want1 = try gpa.alloc(f32, m * out_dim);
+        defer gpa.free(want1);
+        for (want1, bare, only1) |*d, b, o| d.* = b + s1 * (o - b);
+
+        stack.files.items[1].strength = 0;
+        @memset(got, 0);
+        try ops.matmul.matmul(io, gpa, got, x, m, w, null);
+        try stack.applyHost(io, gpa, got, out_dim, x, m, w);
+        const rel1 = relL2(want1, got);
+        errdefer std.debug.print("{s}: file1-only rel {e}\n", .{ name, rel1 });
+        try testing.expect(rel1 < 1e-6);
+        // ...and that really is a different picture from the stack.
+        try testing.expect(relL2(want, want1) > 0.02);
+        stack.files.items[1].strength = s2;
+    }
+}
+
+test "a file that patches nothing is refused rather than ignored" {
+    // A LoRA for another architecture has none of the right names. Loading it
+    // and rendering anyway is a flag that did nothing, silently.
+    const gpa = testing.allocator;
+
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, reference_fixture);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+
+    var stack: Stack = .{};
+    defer stack.deinit(gpa);
+    _ = try stack.add(gpa, store, 1.0, "file1");
+
+    const bytes = [_]u8{0} ** 16;
+    var other = Weight.init(&bytes, .f32, 2, 2);
+    other.tag = "some.other.arch.weight";
+
+    stack.beginAttach();
+    _ = try stack.resolve(other);
+    // The predicate, not `finishAttach`: the latter reports through `std.log.err`,
+    // and there is no test log level below it, so asserting the error itself
+    // would make every passing run print.
+    try testing.expectEqual(@as(?usize, 0), stack.fileWithNoHits());
+}
+
+test "a DoRA or conv-CP adapter is refused by name, not read as a plain LoRA" {
+    // Both are a different calculation: DoRA rescales the base weight and
+    // `lora_mid` is a three-matrix decomposition. Reading either as a plain
+    // LoRA renders finitely, plausibly and wrongly.
+    // The predicate rather than `load`, which reports through `std.log.err`.
+    try testing.expectEqualStrings(".dora_scale", Sidecar.refusedSuffix("diffusion_model.blocks.0.mlp.fc2.dora_scale").?);
+    try testing.expectEqualStrings(".lora_mid.weight", Sidecar.refusedSuffix("diffusion_model.blocks.0.attn.qkv.lora_mid.weight").?);
+    try testing.expectEqualStrings(".reshape_weight", Sidecar.refusedSuffix("diffusion_model.x.reshape_weight").?);
+    // A plain LoRA's own keys are not refused, or nothing would load at all.
+    for (dialects) |d| {
+        try testing.expect(Sidecar.refusedSuffix(d.a) == null);
+        try testing.expect(Sidecar.refusedSuffix(d.b) == null);
+    }
+    try testing.expect(Sidecar.refusedSuffix("diffusion_model.blocks.0.mlp.fc2.alpha") == null);
 }
 
 /// Relative L2 of `got` against `want`.
@@ -599,9 +1025,10 @@ test "splitting a block-diagonal factor reproduces the dense product" {
     const scale: f32 = 0.0625;
 
     const dense: Target = .{
-        .factors = &.{.{ .a = a_w, .b = b_w, .out_off = 0, .scale = scale }},
+        .factors = &.{.{ .a = a_w, .b = b_w, .out_off = 0 }},
         .in_dim = in_dim,
         .out_dim = g * out_g,
+        .scale = scale,
         .tag = "dense",
     };
 
@@ -616,13 +1043,13 @@ test "splitting a block-diagonal factor reproduces the dense product" {
             .a = rowSlice(a_w, gi * r, r),
             .b = Weight.fromF32(&blocks[gi], out_g, r),
             .out_off = gi * out_g,
-            .scale = scale,
         };
     }
     const split: Target = .{
         .factors = &split_factors,
         .in_dim = in_dim,
         .out_dim = g * out_g,
+        .scale = scale,
         .tag = "split",
     };
 
@@ -630,8 +1057,8 @@ test "splitting a block-diagonal factor reproduces the dense product" {
 
     var y_dense: [4 * g * out_g]f32 = @splat(0);
     var y_split: [4 * g * out_g]f32 = @splat(0);
-    try dense.applyHost(testing.io, testing.allocator, &y_dense, g * out_g, &x, 4);
-    try split.applyHost(testing.io, testing.allocator, &y_split, g * out_g, &x, 4);
+    try dense.applyHost(testing.io, testing.allocator, &y_dense, g * out_g, &x, 4, 1.0);
+    try split.applyHost(testing.io, testing.allocator, &y_split, g * out_g, &x, 4, 1.0);
     errdefer std.debug.print("dense {any}\nsplit {any}\n", .{ y_dense, y_split });
     for (y_dense, y_split) |d, s| try testing.expectApproxEqAbs(d, s, 1e-5);
     // And the delta is not trivially zero, or the comparison proves nothing.
@@ -656,15 +1083,15 @@ test "applyHost writes into a fused destination's own column range" {
             .a = Weight.fromF32(&a, 1, in_dim),
             .b = Weight.fromF32(&b, 2, 1),
             .out_off = 2,
-            .scale = 1.0,
         }},
         .in_dim = in_dim,
         .out_dim = 6,
+        .scale = 1.0,
         .tag = "mid",
     };
     const x = [_]f32{ 1, 9, 2, 9 };
     var y: [2 * 6]f32 = @splat(0);
-    try t.applyHost(testing.io, testing.allocator, &y, 6, &x, 2);
+    try t.applyHost(testing.io, testing.allocator, &y, 6, &x, 2, 1.0);
     // x row 0 is [1, 9] -> lo = 1 -> hi = [2, 3] at columns 2 and 3.
     try testing.expectEqualSlices(f32, &.{ 0, 0, 2, 3, 0, 0, 0, 0, 4, 6, 0, 0 }, &y);
 }
@@ -676,14 +1103,15 @@ test "applyHost accumulates rather than overwriting" {
     const a = [_]f32{1};
     const b = [_]f32{1};
     const t: Target = .{
-        .factors = &.{.{ .a = Weight.fromF32(&a, 1, 1), .b = Weight.fromF32(&b, 1, 1), .out_off = 0, .scale = 2.0 }},
+        .factors = &.{.{ .a = Weight.fromF32(&a, 1, 1), .b = Weight.fromF32(&b, 1, 1), .out_off = 0 }},
         .in_dim = 1,
         .out_dim = 1,
+        .scale = 2.0,
         .tag = "acc",
     };
     var y = [_]f32{100};
     const x = [_]f32{3};
-    try t.applyHost(testing.io, testing.allocator, &y, 1, &x, 1);
+    try t.applyHost(testing.io, testing.allocator, &y, 1, &x, 1, 1.0);
     try testing.expectEqual(@as(f32, 106), y[0]);
 }
 
@@ -707,10 +1135,10 @@ test "the host apply bands rows without changing the answer" {
             .a = Weight.fromF32(&a, rank, in_dim),
             .b = Weight.fromF32(&b, out_dim, rank),
             .out_off = 0,
-            .scale = 0.5,
         }},
         .in_dim = in_dim,
         .out_dim = out_dim,
+        .scale = 0.5,
         .tag = "band",
     };
 
@@ -720,7 +1148,7 @@ test "the host apply bands rows without changing the answer" {
     const y = try testing.allocator.alloc(f32, m * out_dim);
     defer testing.allocator.free(y);
     @memset(y, 0);
-    try t.applyHost(testing.io, testing.allocator, y, out_dim, x, m);
+    try t.applyHost(testing.io, testing.allocator, y, out_dim, x, m, 1.0);
 
     // Every row, computed directly.
     for (0..m) |i| {

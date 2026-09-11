@@ -1,4 +1,4 @@
-//! cuBLASLt bindings, pure Zig, runtime-loaded via std.DynLib.
+//! cuBLASLt bindings, pure Zig, runtime-loaded via `core.dynlib`.
 //!
 //! The 4th backend (`--backend cuda`) reaches ComfyUI-class GEMM speed by
 //! calling the same closed math library ComfyUI does. Loaded exactly like the
@@ -18,6 +18,8 @@
 //! `/usr/local/cuda` `.so.13` ahead of the system `.so.12`.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const dynlib = @import("tp_core").dynlib;
 const cu = @import("cu.zig");
 
 // ---- Handles / opaque descriptor pointers -----------------------------------
@@ -136,7 +138,7 @@ pub const Error = error{CublasLtError};
 
 /// Resolved cuBLASLt entry points (one per process, owned by the caller).
 pub const Api = struct {
-    lib: std.DynLib,
+    lib: dynlib.Lib,
 
     cublasLtCreate: PFN_Create,
     cublasLtDestroy: PFN_Destroy,
@@ -157,10 +159,15 @@ pub const Api = struct {
     /// dlopen cuBLASLt and resolve every symbol. Prefers the versioned
     /// `/usr/local/cuda` `.so.13`, then the plain soname, then `.so.12`.
     pub fn load() Error!Api {
-        var lib = std.DynLib.open("/usr/local/cuda/lib64/libcublasLt.so.13") catch
-            std.DynLib.open("libcublasLt.so.13") catch
-            std.DynLib.open("libcublasLt.so.12") catch
-            std.DynLib.open("libcublasLt.so") catch return error.CublasLtError;
+        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+            .windows => &.{ "cublasLt64_13.dll", "cublasLt64_12.dll" },
+            else => &.{
+                "/usr/local/cuda/lib64/libcublasLt.so.13",
+                "libcublasLt.so.13",
+                "libcublasLt.so.12",
+                "libcublasLt.so",
+            },
+        }) orelse return error.CublasLtError;
         errdefer lib.close();
 
         var api: Api = undefined;

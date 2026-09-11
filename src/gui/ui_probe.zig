@@ -565,6 +565,14 @@ fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
     vae.side.set(.anima, .decoder);
     var taew: catalog.Entry = .{ .path = "/models/vae_approx/taew2_1.safetensors", .size = 1, .mtime_ns = 1 };
     taew.preview.fams[@intFromEnum(catalog.Family.krea2)] = true;
+    // Two SenseNova LoRAs, so the LoRA section draws with one row on and one
+    // still on offer in the add dropdown. Both of its states in one frame.
+    var turbo: catalog.Entry = .{ .path = "/models/loras/sensenovaU158BMot_8StepTurboLora.safetensors", .size = 1, .mtime_ns = 1 };
+    turbo.lora = .{ .info = .{ .targets = 294, .rank = 128, .depth = 42 } };
+    turbo.lora.?.fams[@intFromEnum(catalog.Family.sensenova)] = true;
+    var style_lora: catalog.Entry = .{ .path = "/models/loras/sensenovaInkWash_v2.safetensors", .size = 1, .mtime_ns = 1 };
+    style_lora.lora = .{ .info = .{ .targets = 168, .rank = 64, .depth = 42 } };
+    style_lora.lora.?.fams[@intFromEnum(catalog.Family.sensenova)] = true;
     return catalog.Catalog.fromEntries(gpa, &.{
         .{ .path = "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
         .{ .path = "/models/llm/Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
@@ -573,10 +581,30 @@ fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
         .{ .path = "/models/llm/nomic-embed.gguf", .size = 1, .mtime_ns = 1, .llm = .{ .arch = "nomic-bert", .size_label = "137M", .width = 768, .blocks = 12, .supported = false, .vision = false, .class = "nomic-bert 137M" }, .note = "architecture 'nomic-bert' is not supported" },
         .{ .path = "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors", .size = 1, .mtime_ns = 1, .ckpt = .{ .family = .krea2, .contents = .{ .denoiser = true } } },
         .{ .path = "/models/checkpoints/sdxl/dreamshaperXL.safetensors", .size = 1, .mtime_ns = 1, .ckpt = .{ .family = .sdxl, .contents = .{ .denoiser = true, .conditioner = true, .conditioner2 = true, .decoder = true } } },
+        .{ .path = "/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors", .size = 1, .mtime_ns = 1, .ckpt = .{ .family = .sensenova, .contents = .{ .denoiser = true, .conditioner = true } } },
         te,
         vae,
         taew,
+        turbo,
+        style_lora,
     });
+}
+
+/// Swap the settings probe onto SenseNova with one LoRA on (`--settings --lora`).
+///
+/// Its own mode rather than the default, because the two diffusion states draw
+/// DIFFERENT rows and each is worth seeing: krea2 has the side-file and preview
+/// rows and no sidecar path, SenseNova has the LoRA list and no side files.
+/// Giving the canned krea2 entry a LoRA instead would have the fixture assert a
+/// capability the engine does not have.
+///
+/// The dial is set to something other than 1, since a slider parked at its
+/// default says nothing about whether the row renders the value it holds.
+fn cannedLoraSelection(cfg: *config.Config) void {
+    selection.selectCheckpoint(cfg, &model_lib.cat, "/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors");
+    if (cfg.addFamilyLora("sensenova", "/models/loras/sensenovaU158BMot_8StepTurboLora.safetensors")) |l| {
+        l.strength = 0.85;
+    }
 }
 
 fn settingsFrame() void {
@@ -597,6 +625,7 @@ pub fn main(init: std.process.Init) !void {
     var out_path: []const u8 = "ui_probe.png";
     var states_mode = false;
     var settings_mode = false;
+    var lora_mode = false;
     var dims: [2]?u32 = .{ null, null };
     var seen_out = false;
     for (args[1..]) |arg| {
@@ -609,6 +638,8 @@ pub fn main(init: std.process.Init) !void {
             _ = probe_cfg.addModelDir("/models");
             selection.selectLlm(&probe_cfg, &model_lib.cat, "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf");
             selection.selectCheckpoint(&probe_cfg, &model_lib.cat, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
+        } else if (std.mem.eql(u8, arg, "--lora")) {
+            lora_mode = true;
         } else if (std.fmt.parseInt(u32, arg, 10)) |n| {
             if (dims[0] == null) dims[0] = n else dims[1] = n;
         } else |_| {
@@ -621,6 +652,10 @@ pub fn main(init: std.process.Init) !void {
     // The mockups' own canvases, so a screenshot can be held next to them.
     const w: u32 = dims[0] orelse 1200;
     // The state sheet's height follows the number of states (head + bar each).
+    // The flag may arrive after `--settings`, so the swap happens once the whole
+    // command line has been read.
+    if (settings_mode and lora_mode) cannedLoraSelection(&probe_cfg);
+
     // Settings is a tall scrolled form; give it a canvas the whole thing fits on
     // so a capture shows every section rather than whatever the scroll happens to
     // be resting on.

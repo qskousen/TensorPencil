@@ -13,7 +13,14 @@ conventions that are all silent when wrong:
     representable whenever rank == in_dim, which one target here deliberately is.
   - the fused qkv's B is BLOCK DIAGONAL over 3 groups; splitting it must not
     change the answer.
-  - the key spelling: `diffusion_model.<base name without .weight>.lora_A.weight`.
+  - the key spelling. ComfyUI accepts seven of them; `SPELLING` puts one
+    target in the kohya `lora_down`/`lora_up` pair (what SenseNova's turbo LoRA
+    and most civitai files ship) and the rest in PEFT's `lora_A`/`lora_B`, and
+    asserts the reference merges both to the same weight. Note the reference's
+    own `A_name` holds the UP matrix, so its variable names are inverted from
+    PEFT's; only the shapes settle it.
+  - N stacked LoRAs ADD. `out_stack` merges two independent files at different
+    strengths, which is what says a stack is a sum and not a composition.
 
 The reference is executed, not re-derived: `comfy.lora.load_lora` builds the
 adapter and `LoRAAdapter.calculate_weight` produces the merged weight.
@@ -56,6 +63,20 @@ TARGETS = {
 }
 STRENGTH = 1.0
 
+# Which dialect each target's factors are written in, `a` (down) first. One
+# target in the kohya spelling is what gives the alias teeth.
+SPELLING = {
+    "blocks.0.mlp.fc2":       ("lora_A.weight", "lora_B.weight"),
+    "blocks.0.attn.qkv_proj": ("lora_A.weight", "lora_B.weight"),
+    "blocks.0.attn.out_proj": ("lora_down.weight", "lora_up.weight"),
+}
+
+# The second file in the stacking check, under this prefix in the same fixture
+# (safetensors is one flat namespace, and `weights.Prefixed` is how a Zig test
+# reads a sub-namespace as a store of its own).
+L2 = "l2."
+STACK = (0.75, 0.25)
+
 
 def make_lora(g, in_dim, out_dim, rank, groups):
     """`lora_A [rank, in]` and `lora_B [out, rank]`, block diagonal when groups>1."""
@@ -72,26 +93,38 @@ def make_lora(g, in_dim, out_dim, rank, groups):
     return a, b
 
 
-def merged(lora, base, name, strength):
-    """The reference's merge for one target, via comfy.lora."""
+def merged(lora, base_w, name, strength):
+    """The reference's merge for one target, via comfy.lora, onto `base_w`.
+
+    Applying two adapters in sequence is how a stack is composed: each adds its
+    own delta to the weight it is handed.
+    """
     key = name + ".weight"
     patches = comfy.lora.load_lora(lora, {"diffusion_model." + name: key}, log_missing=False)
     assert key in patches, "comfy.lora did not recognize %s" % name
     adapter = patches[key]
-    return adapter.calculate_weight(base[key].clone(), key, strength, strength, None, lambda v: v)
+    return adapter.calculate_weight(base_w.clone(), key, strength, strength, None, lambda v: v)
 
 
 def main():
     g = torch.Generator().manual_seed(20260827)
 
     lora = {}
+    lora2 = {}
     base = {}
     xs = {}
     for name, (in_dim, out_dim, rank, alpha, groups) in TARGETS.items():
+        a_sfx, b_sfx = SPELLING[name]
         a, b = make_lora(g, in_dim, out_dim, rank, groups)
-        lora["diffusion_model.%s.lora_A.weight" % name] = a
-        lora["diffusion_model.%s.lora_B.weight" % name] = b
+        lora["diffusion_model.%s.%s" % (name, a_sfx)] = a
+        lora["diffusion_model.%s.%s" % (name, b_sfx)] = b
         lora["diffusion_model.%s.alpha" % name] = torch.tensor(alpha, dtype=torch.float32)
+        # The second file: independent factors, a different alpha, and always the
+        # PEFT spelling, so the stack mixes dialects as well as files.
+        a2, b2 = make_lora(g, in_dim, out_dim, rank, groups)
+        lora2["diffusion_model.%s.lora_A.weight" % name] = a2
+        lora2["diffusion_model.%s.lora_B.weight" % name] = b2
+        lora2["diffusion_model.%s.alpha" % name] = torch.tensor(alpha * 0.5, dtype=torch.float32)
         base["%s.weight" % name] = torch.randn(out_dim, in_dim, generator=g, dtype=torch.float32) * 0.3
         xs[name] = torch.randn(M, in_dim, generator=g, dtype=torch.float32)
 
@@ -104,21 +137,35 @@ def main():
                     src[k] = src[k] * alpha_scale
         out = {}
         for name in TARGETS:
-            w = merged(src, base, name, strength)
+            w = merged(src, base["%s.weight" % name], name, strength)
             out[name] = xs[name] @ w.t()
         return out
 
     ref = run(STRENGTH)
     half = run(0.5)
 
+    # Both files in sequence, at different strengths: the stack.
+    stack = {}
+    for name in TARGETS:
+        w = merged(lora, base["%s.weight" % name], name, STACK[0])
+        w = merged(lora2, w, name, STACK[1])
+        stack[name] = xs[name] @ w.t()
+    only2 = {}
+    for name in TARGETS:
+        w = merged(lora2, base["%s.weight" % name], name, STACK[1])
+        only2[name] = xs[name] @ w.t()
+
     tensors = {}
     tensors.update(lora)
+    for k, v in lora2.items():
+        tensors[L2 + k] = v
     for k, v in base.items():
         tensors["base." + k] = v
     for name in TARGETS:
         tensors["in.%s" % name] = xs[name]
         tensors["out.%s" % name] = ref[name]
         tensors["out_half.%s" % name] = half[name]
+        tensors["out_stack.%s" % name] = stack[name]
         # The base GEMM on its own, so a Zig test can confirm the sidecar is
         # what moves the answer rather than asserting against a merged weight it
         # also computed.
@@ -133,6 +180,33 @@ def main():
         assert lin < 1e-4, "%s: strength is not linear (%.2e)" % (name, lin)
         hd = float((half[name] - ref[name]).norm() / ref[name].norm())
         assert hd > 0.02, "%s: strength 0.5 is indistinguishable (rel %.4f)" % (name, hd)
+
+    # The stack really is a sum of the two deltas, not a composition, and it is
+    # distinguishable from either file alone. If it were not a sum, adding the
+    # sidecars beside the GEMM would not reproduce a merge.
+    for name in TARGETS:
+        b0 = tensors["out_base." + name]
+        d1 = STACK[0] * (ref[name] - b0) / STRENGTH
+        d2 = only2[name] - b0
+        add = float((stack[name] - (b0 + d1 + d2)).norm() / stack[name].norm())
+        assert add < 1e-5, "%s: stacking is not additive (rel %.2e)" % (name, add)
+        for other, label in ((ref[name], "file 1"), (only2[name], "file 2")):
+            d = float((stack[name] - other).norm() / stack[name].norm())
+            assert d > 0.02, "%s: the stack is indistinguishable from %s (rel %.4f)" % (name, label, d)
+
+    # The kohya spelling is not a second code path in the reference: the same
+    # factors under either pair of names must merge to the same weight, or the
+    # alias in `lora.zig` is pinned against nothing.
+    spelled = [n for n in TARGETS if SPELLING[n][0] != "lora_A.weight"]
+    assert spelled, "no target ships in the kohya spelling, so the alias has no teeth"
+    for name in spelled:
+        a_sfx, b_sfx = SPELLING[name]
+        as_peft = dict(lora)
+        as_peft["diffusion_model.%s.lora_A.weight" % name] = as_peft.pop("diffusion_model.%s.%s" % (name, a_sfx))
+        as_peft["diffusion_model.%s.lora_B.weight" % name] = as_peft.pop("diffusion_model.%s.%s" % (name, b_sfx))
+        w_a = merged(lora, base["%s.weight" % name], name, STRENGTH)
+        w_b = merged(as_peft, base["%s.weight" % name], name, STRENGTH)
+        assert torch.equal(w_a, w_b), "%s: %s and lora_A/lora_B disagree" % (name, a_sfx)
 
     # Dropping the /rank is the classic scale error: it must be visible.
     for name, (_, _, rank, alpha, _) in TARGETS.items():
@@ -151,15 +225,17 @@ def main():
     tr = "blocks.0.attn.out_proj"
     in_dim, out_dim, rank, _, _ = TARGETS[tr]
     assert rank == in_dim, "the transpose target must have rank == in_dim to have teeth"
+    a_sfx = SPELLING[tr][0]
     swapped = dict(lora)
-    swapped["diffusion_model.%s.lora_A.weight" % tr] = lora["diffusion_model.%s.lora_A.weight" % tr].t().contiguous()
+    a_key = "diffusion_model.%s.%s" % (tr, a_sfx)
+    swapped[a_key] = lora[a_key].t().contiguous()
     alt = run(STRENGTH, use_lora=swapped)[tr]
     d = float((alt - ref[tr]).norm() / ref[tr].norm())
     assert d > 0.05, "reading A transposed is indistinguishable (rel %.4f)" % d
 
     # The block-diagonal split is an optimization, so confirm the reference's B
     # really is block diagonal (if it were not, our split would drop entries).
-    b = lora["diffusion_model.%s.lora_B.weight" % fused]
+    b = lora["diffusion_model.%s.%s" % (fused, SPELLING[fused][1])]
     _, out_dim_f, rank_f, _, groups_f = TARGETS[fused]
     go, gr = out_dim_f // groups_f, rank_f // groups_f
     for i in range(groups_f):
@@ -175,6 +251,8 @@ def main():
                                for k, v in TARGETS.items()}),
         "m": str(M),
         "strength": json.dumps([STRENGTH, 0.5]),
+        "spelling": json.dumps(SPELLING),
+        "stack": json.dumps({"prefix": L2, "strengths": list(STACK)}),
         "note": "generated by tools/gen_lora_fixtures.py from comfy.lora.load_lora + "
                 "LoRAAdapter.calculate_weight; do not hand-edit",
     }

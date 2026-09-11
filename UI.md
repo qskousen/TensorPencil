@@ -615,7 +615,52 @@ contradicts the sections above, this section is right.
 
 `shell`, `bubbles` and `queue_rail` render from plain data and report through
 callbacks, which is what lets `ui-probe` draw the real screen with no model, no
-GPU and no engine. Add `--states` to render the status bar under three loads.
+GPU and no engine. Add `--states` to render the status bar under three loads,
+`--settings` to render the settings form, and `--settings --lora` for the same
+form over a SenseNova selection with a sidecar on. That last is its own mode
+because the two diffusion states draw DIFFERENT rows and each is worth seeing:
+krea2 has the side-file and preview rows and no sidecar path, SenseNova has the
+LoRA list and no VAE.
+
+### LoRAs (Settings)
+
+A LoRA is not a side-file `Slot`. A slot holds one value and has a right answer
+to adopt when the user has picked nothing ("whatever the checkpoint carries");
+LoRAs are a LIST whose correct default is EMPTY, and each carries its own dial.
+So nothing ever adopts one: a first scan picking up a compatible sidecar would
+silently change every render the user makes.
+
+- `catalog.Lora` is the fourth role on an `Entry`, beside `ckpt` / `side` /
+  `preview`, and carries the per-family bits plus the target count, rank and
+  depth the menu row shows. Set at scan time from `model_spec.loraFits`, so
+  compatibility is in the menu without opening 40 files to draw it.
+- ⚠️ Depth is a **bound**, not the equality `storeFits` uses for a side file: a
+  style LoRA legitimately patches only some layers.
+- `Config.loras` is one FLAT table keyed by family name, not a list nested in
+  each family's row: `Config` is already ~150 KB by value and `std.json`'s
+  recursive parse overflows the stack as it grows.
+- The LIST is load-bearing and the STRENGTHS are not. `ModelConfig.eql` compares
+  paths and ignores dials, and `applyStrengths` moves them on a live session, so
+  a slider does not re-read a gigabyte of factors. Order IS a reload, because it
+  is what the stack's indexes mean.
+- ⚠️ **The configured family comes from the FILE, not the catalog**
+  (`app.configuredFamily`, over a memoizing `model_spec.Cache`). The catalog is
+  scanned on a worker thread, so on a cold start it is empty for the first frames
+  while `updateSettings` is already handing the engine its model set. Asking the
+  catalog there dropped the LoRA on exactly the run with no cached index, and the
+  model then rendered without its sidecar and said nothing.
+- The catalog index is versioned (`{ version, entries }`). Adding a role to
+  `Entry` without bumping it would leave every CACHED file answering "I can be
+  nothing" for the new role, and no rescan would fix it, since size and mtime
+  still match. An old bare-array index fails to parse and rebuilds, which is the
+  behaviour wanted.
+
+`TP_AUTO_IMAGE="<prompt>"` renders one image through the real app path and
+exits, the diffusion twin of `TP_AUTO_MESSAGE`. Run it with
+`DISPLAY= SDL_VIDEODRIVER=dummy` and a throwaway `--config`. It is what catches a
+break in the settings-to-engine chain (`selection` → `modelConfigFromConfig` →
+`requestPaths` → `ModelConfig.applyTo`), which the CLI exercises none of because
+it builds its own `Options`.
 
 ### Title bar (§5)
 

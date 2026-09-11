@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config \
+            libvips-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libx11-dev libxcursor-dev libxi-dev libwayland-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      # The gated suite (-Dintegration) needs a GPU and real checkpoints, so it
+      # cannot run here. This is the CPU unit suite only.
+      - name: Unit tests
+        run: zig build test
+
+      - name: GUI build and tests
+        run: |
+          zig build gui
+          zig build gui-test
+
+      # tp-gui's failure modes are visual: this renders the whole workspace from
+      # canned data with no model, GPU or engine, so a crash or a layout blowup
+      # shows up without a display.
+      - name: UI probe renders
+        run: |
+          zig build ui-probe -- ui.png
+          zig build ui-probe -- ui-states.png --states
+          test -s ui.png && test -s ui-states.png

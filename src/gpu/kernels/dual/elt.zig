@@ -1175,6 +1175,76 @@ pub inline fn ropeVisionGemma4(e: Env) void {
     rotateHalf(e, hp * e.u(4) + span * pairs + fi, half, e.ld(.c, pos * half + fi), e.ld(.c, e.u(2) + pos * half + fi));
 }
 
+/// Rotate-half RoPE over a contiguous span `[u5, u5 + 2*half)` of each `u4`-wide
+/// head, with one absolute position per ROW from b (u32).
+///
+/// SenseNova's trunk: a head splits 64 (sequence position, theta 5e6) + 32 (token
+/// row) + 32 (token column), each rotated against its own table, so a span form
+/// with its own positions is what the three calls need.
+/// u0 = rows*n_heads*half, u1 = half, u2 = sin_off, u3 = n_heads, u4 = head_dim,
+/// u5 = span offset within the head.
+pub inline fn ropeHalfSpanPos(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const half = e.u(1);
+    const p = i % half;
+    const hp = i / half;
+    const pos = e.ldW(.b, hp / e.u(3));
+    rotateHalf(e, hp * e.u(4) + e.u(5) + p, half, e.ld(.c, pos * half + p), e.ld(.c, e.u(2) + pos * half + p));
+}
+
+inline fn rotateInter(e: Env, base: u32, cos_v: f32, sin_v: f32) void {
+    const x0 = e.ld(.a, base);
+    const x1 = e.ld(.a, base + 1);
+    e.st(.a, base, x0 * cos_v - x1 * sin_v);
+    e.st(.a, base + 1, x0 * sin_v + x1 * cos_v);
+}
+
+/// Interleaved-pair RoPE over a contiguous span `[u4, u4 + 2*half)` of each
+/// `u3`-wide row, one position per row from b (u32). Pairs are (2i, 2i+1), NOT
+/// (i, i+half): SenseNova's vision patch embedder rotates interleaved pairs while
+/// its trunk rotates split halves, and the two are the same shape and different
+/// arithmetic. u0 = rows*half, u1 = half, u2 = sin_off, u3 = row_dim, u4 = offset.
+pub inline fn ropeInterSpanPos(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const half = e.u(1);
+    const p = i % half;
+    const row = i / half;
+    const pos = e.ldW(.b, row);
+    rotateInter(e, row * e.u(3) + e.u(4) + 2 * p, e.ld(.c, pos * half + p), e.ld(.c, e.u(2) + pos * half + p));
+}
+
+/// `nn.PixelShuffle(r)` on a channel-last plane: `[h][w][c*r*r] -> [h*r][w*r][c]`,
+/// the input channel split as `c * r * r + i * r + j`. a = src, b = dst.
+/// u0 = total output elements, u1 = out channels, u2 = r, u3 = input width.
+pub inline fn pixelShuffle(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const c = e.u(1);
+    const r = e.u(2);
+    const w = e.u(3);
+    const ow = w * r;
+    const ch = i % c;
+    const px = (i / c) % ow;
+    const py = i / (c * ow);
+    e.st(.b, i, e.ld(.a, ((py / r) * w + px / r) * (c * r * r) + ch * r * r + (py % r) * r + px % r));
+}
+
+/// Patch matrix of a NON-OVERLAPPING k x k stride-k convolution over channel-last
+/// `[h][w][ci]`: `b[oy*ow + ox][(dy*k + dx)*ci + c] = a[(oy*k + dy)*w + ox*k + dx][c]`.
+/// No padding, because a stride-k window never leaves the input. a = src, b = dst.
+/// u0 = total, u1 = ci, u2 = k, u3 = input width.
+pub inline fn im2colStride(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const ci = e.u(1);
+    const kk = e.u(2);
+    const w = e.u(3);
+    const plen = kk * kk * ci;
+    const col = i % plen;
+    const tok = i / plen;
+    const ow = w / kk;
+    const tap = col / ci;
+    e.st(.b, i, e.ld(.a, (((tok / ow) * kk + tap / kk) * w + (tok % ow) * kk + tap % kk) * ci + col % ci));
+}
+
 // ---- MiniMax H3 audio (channel-last 1-D) ---------------------------------------
 
 /// Patch matrix of a 1-D conv over channel-last [len][ci], columns ordered

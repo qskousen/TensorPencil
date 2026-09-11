@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const dtypes = @import("dtype.zig");
+const filemap = @import("filemap.zig");
 const tensors = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
 
@@ -265,16 +266,9 @@ pub const Gguf = struct {
             return g;
         }
 
-        const mapping = try std.posix.mmap(
-            null,
-            @intCast(len),
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(mapping);
-        std.posix.madvise(@constCast(mapping.ptr), mapping.len, std.posix.MADV.WILLNEED) catch {};
+        const mapping = try filemap.map(file.handle, @intCast(len));
+        errdefer filemap.unmap(mapping);
+        filemap.willNeed(mapping);
         var g = try initFromSlice(gpa, mapping);
         g.mapping = mapping;
         g.file = file;
@@ -542,7 +536,7 @@ pub const Gguf = struct {
     pub fn deinit(self: *Gguf) void {
         if (self.owned) |b| self.gpa.free(b);
         self.arena.deinit();
-        if (self.mapping) |m| std.posix.munmap(m);
+        if (self.mapping) |m| filemap.unmap(m);
         if (self.file) |f| f.close(self.io.?);
         self.* = undefined;
     }

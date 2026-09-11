@@ -19,6 +19,7 @@ const viewer = @import("viewer.zig");
 const config = @import("config.zig");
 const config_view = @import("config_view.zig");
 const selection = @import("selection.zig");
+const model_spec = @import("model_spec.zig");
 const model_lib = @import("model_lib.zig");
 const model_menu = @import("model_menu.zig");
 const image_view = @import("image_view.zig");
@@ -536,7 +537,11 @@ var g_io: std.Io = undefined;
 var g_gpa: std.mem.Allocator = undefined;
 var g_environ: *std.process.Environ.Map = undefined;
 
-var g_input_buf: [4096]u8 = [_]u8{0} ** 4096;
+/// The composer's text. Growable, because dvui's entry silently stops accepting
+/// input at the end of a fixed buffer; `input_limit` is the cap instead, and it
+/// bounds the per-frame text layout as much as the memory.
+var g_input: std.ArrayList(u8) = .empty;
+const input_limit = 64 << 10;
 var g_wakeup_event_type: u32 = 0;
 var g_load_err: ?anyerror = null;
 // Message-list scroll state (persistent so we can follow streaming output).
@@ -593,7 +598,16 @@ pub fn run(init: std.process.Init) !void {
     }
 
     // Load persisted settings (all fields default to unset / disabled).
+    const first_run = !config.Config.exists(init.io, gpa, init.environ_map, g_config_path);
     g_config = config.Config.load(init.io, gpa, init.environ_map, g_config_path);
+    // The compiled-in backend default is NVIDIA's, which is a failed first launch
+    // on any other machine. With no settings file yet, take what the box has.
+    if (first_run) {
+        const be = diffuser.fromPipelineBackend(tp.pipeline.detectBackend());
+        g_config.llm_backend = be;
+        g_config.diff_backend = be;
+        std.log.info("no settings file yet: defaulting both backends to {t}", .{be});
+    }
     applyWeightRead(g_config.weight_read);
     if (model_override) |m| g_config.llm_model.set(m);
     // The model catalog: its index lives beside the config, the folders come
@@ -978,6 +992,56 @@ fn probeWeightNoise(path: []const u8) bool {
     return tp.llm.session.weightNoiseSupported(&gg);
 }
 
+/// TP_AUTO_IMAGE: render one image through the REAL app path and exit.
+///
+/// Same argument as `autoMessage`: the CLI's `generate` builds its own
+/// `Options`, so it exercises none of what the app wraps around the engine, and
+/// the settings-to-engine chain (`selection` -> `modelConfigFromConfig` ->
+/// `requestPaths` -> `ModelConfig.applyTo`) is exactly where a configured LoRA
+/// would go missing. Run with no display (`DISPLAY= SDL_VIDEODRIVER=dummy`).
+///
+/// Exits non-zero when the render fails, so a harness cannot mistake a failure
+/// for a slow success.
+var g_auto_image_sent: bool = false;
+fn autoImage() void {
+    const prompt_z = getenv("TP_AUTO_IMAGE") orelse return;
+    const d = &(g_diffuser orelse return);
+    if (!g_auto_image_sent) {
+        // Only once the engine has the config: `updateSettings` runs per frame
+        // and `requestPaths` applies while the queue is idle, so enqueueing on
+        // the first frame would snapshot a half-built model set.
+        if (g_config.diffusion_model.opt() == null) {
+            std.log.err("[auto] TP_AUTO_IMAGE with no diffusion_model configured", .{});
+            std.process.exit(2);
+        }
+        g_auto_image_sent = true;
+        const gi = g_gpa.create(diffuser.GenImage) catch std.process.exit(2);
+        gi.* = .{
+            .prompt = g_gpa.dupe(u8, std.mem.span(prompt_z)) catch std.process.exit(2),
+            .wake = wakeupFrame,
+            .io = g_io,
+            .req_width = g_config.width,
+            .req_height = g_config.height,
+            .req_steps = g_config.steps,
+            .req_cfg = 1.0,
+            .from_studio = true,
+            .req_seed = 1234,
+        };
+        d.enqueue(gi) catch {
+            std.log.err("[auto] enqueue refused", .{});
+            std.process.exit(2);
+        };
+        d.pump();
+        return;
+    }
+    // Done when the queue has drained. `busy` alone is not enough: the image is
+    // pending before the worker picks it up.
+    if (d.busyNow() or d.anyPending()) return;
+    const failed = d.loadError() != null;
+    std.log.info("[auto] image done ({s})", .{if (failed) "FAILED" else "ok"});
+    std.process.exit(if (failed) 1 else 0);
+}
+
 /// TP_AUTO_MESSAGE: send one message through the REAL app path as soon as a
 /// session exists, then exit once it finishes. `chat-probe` drives the session
 /// directly and so misses everything the app wraps around it (the diffuser, the
@@ -1096,6 +1160,7 @@ fn tryPasteClipboardImage() bool {
 
 fn frame() void {
     autoMessage(); // TP_AUTO_MESSAGE; before any early return so it always runs
+    autoImage(); // TP_AUTO_IMAGE, likewise
 
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
@@ -1571,7 +1636,7 @@ fn applyPendingConversationLoad() void {
     freeLlmSuspend();
     clearStaged();
     dropPendingImageNotes(); // same boundary as `newChat`: this conversation is being left
-    @memset(&g_input_buf, 0);
+    g_input.clearRetainingCapacity();
     g_pending_regenerate = false;
     g_follow_bottom = true;
 
@@ -2350,6 +2415,46 @@ fn hasDiffModel(cfg: *const config.Config) bool {
 /// checkpoint. Never substitute a default here, a defaulted path that reaches
 /// `Options` is indistinguishable from a user request, which is what broke a
 /// joined SD1.5 checkpoint in the CLI.
+/// The configured checkpoint's family, from the FILE and not from the catalog.
+///
+/// ⚠️ The catalog is scanned on a worker thread, so on a cold start it is empty
+/// for the first frames while `updateSettings` is already handing the engine its
+/// model set. Asking the catalog here meant a configured LoRA was dropped on
+/// exactly the run that had no cached index, and the model then rendered without
+/// its sidecar and said nothing. `model_spec.Cache` memoizes by path, so this
+/// costs one header parse per checkpoint change.
+var g_family_cache: ?model_spec.Cache = null;
+fn configuredFamily() ?model_spec.Family {
+    const path = g_config.diffusion_model.opt() orelse return null;
+    if (g_family_cache == null) g_family_cache = model_spec.Cache.init(g_gpa, g_io);
+    return (g_family_cache.?.primary(path).info() orelse return null).family;
+}
+
+/// The LoRAs turned on for the configured checkpoint's family, as the engine
+/// takes them.
+///
+/// Borrowed, like every path in `modelConfigFromConfig`: `requestPaths` re-dupes
+/// into the engine's own store, so nothing here outlives the frame. A disabled
+/// row is left out rather than passed at strength 0, so a session that needs no
+/// factors does not hold a gigabyte of them.
+fn loraSpecsFromConfig() []const tp.pipeline.LoraSpec {
+    const S = struct {
+        var buf: [config.max_family_loras]tp.pipeline.LoraSpec = undefined;
+    };
+    const fam = configuredFamily() orelse return &.{};
+    const key = selection.familyKey(fam);
+    var n: usize = 0;
+    // Straight off `g_config.loras` rather than through `selection.loras`, whose
+    // filtered view lives in a static of its own: reading one static into
+    // another leaves the paths pointing at whatever the next caller filtered.
+    for (g_config.loras.slice()) |*l| {
+        if (!l.enabled or !std.mem.eql(u8, l.family.slice(), key)) continue;
+        S.buf[n] = .{ .path = l.path.slice(), .strength = l.strength };
+        n += 1;
+    }
+    return S.buf[0..n];
+}
+
 fn modelConfigFromConfig() diffuser.ModelConfig {
     return .{
         .dit_path = g_config.diffusion_model.opt().?,
@@ -2358,6 +2463,7 @@ fn modelConfigFromConfig() diffuser.ModelConfig {
         .text_encoder_2_path = g_config.text_encoder_2.slice(),
         .backend = diffuser.toPipelineBackend(g_config.diff_backend),
         .vae_decode = diffuser.toPipelineVae(g_config.vae_decode),
+        .loras = loraSpecsFromConfig(),
     };
 }
 
@@ -3790,11 +3896,12 @@ fn renderInput(s: ?*chat.Session) void {
         }
     }
 
-    var buf: [4096]u8 = undefined;
-    var n: usize = 0;
-
     var te = dvui.textEntry(@src(), .{
-        .text = .{ .buffer = &g_input_buf },
+        .text = .{ .array_list = .{
+            .backing = &g_input,
+            .allocator = g_gpa,
+            .limit = input_limit,
+        } },
         .multiline = true,
         .placeholder = "Describe an image, or ask for changes…",
         .scroll_horizontal = false,
@@ -3827,12 +3934,7 @@ fn renderInput(s: ?*chat.Session) void {
     // the quick-settings row, the block padding, and the attachment strip when
     // present.
     g_input_h = te.data().rect.h + 100 + (if (n_thumbs > 0) @as(f32, 72) else 0);
-    if (send) {
-        const t = te.getText();
-        n = @min(t.len, buf.len);
-        @memcpy(buf[0..n], t[0..n]);
-    }
-    te.deinit();
+    te.deinit(); // publishes the text back into `g_input.items`
 
     const pressed = bubbles.inputEnd(&frame_box, .{
         .busy = busy,
@@ -3864,22 +3966,20 @@ fn renderInput(s: ?*chat.Session) void {
     if (pressed) {
         if (busy) {
             if (s) |ss| ss.requestCancel();
-        } else if (!send) {
-            const t = std.mem.sliceTo(&g_input_buf, 0);
-            n = @min(t.len, buf.len);
-            @memcpy(buf[0..n], t[0..n]);
-            send = true;
-        }
+        } else send = true;
     }
 
     if (send and !busy) {
+        // Read straight from the backing: both `newChat` and `submitChat` copy what
+        // they keep, so nothing here outlives the clear below.
+        const text = g_input.items;
         // `/new` on its own line starts a fresh chat instead of sending.
-        if (std.mem.eql(u8, std.mem.trim(u8, buf[0..n], " \t\r\n"), "/new")) {
+        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/new")) {
             newChat();
         } else {
-            _ = submitChat(buf[0..n]);
+            _ = submitChat(text);
         }
-        @memset(&g_input_buf, 0);
+        g_input.clearRetainingCapacity();
     }
 }
 
@@ -3943,6 +4043,6 @@ fn newChat() void {
         if (!g_loading.load(.acquire)) if (g_session) |s| s.setPaused(false);
     }
     clearStaged(); // drop any images staged for a not-yet-loaded first message
-    @memset(&g_input_buf, 0);
+    g_input.clearRetainingCapacity();
     g_follow_bottom = true;
 }

@@ -21,6 +21,13 @@ pub const Params = struct {
     causal: bool = false,
     /// Per-key boolean mask, true = attend (Krea 2 text refiner). Length seq_kv.
     key_mask: ?[]const bool = null,
+    /// Per-query EXCLUSIVE key bound, length seq_q, overriding `causal` and
+    /// `bidirectional`. SenseNova's block-causal prefix is exactly this: a
+    /// reference image's tokens all share one time index and see each other in
+    /// full, everything else is causal, and because the time index never
+    /// decreases along the sequence each query's allowed set stays the
+    /// contiguous range `[0, kv_end[i])`.
+    kv_end: ?[]const u32 = null,
     /// Score scale; defaults to 1/sqrt(head_dim).
     scale: ?f32 = null,
     /// Sliding-window attention (Gemma 3 local layers): 0 = disabled (full
@@ -66,6 +73,10 @@ pub fn attention(
     if (p.causal) std.debug.assert(p.seq_q <= p.seq_kv);
     if (p.bidirectional) std.debug.assert(p.causal);
     if (p.key_mask) |mask| std.debug.assert(mask.len == p.seq_kv);
+    if (p.kv_end) |e| {
+        std.debug.assert(e.len == p.seq_q);
+        for (e) |x| std.debug.assert(x <= p.seq_kv);
+    }
 
     // Split each head's queries into chunks so even single-head attention
     // (the VAE mid-block: 1 head over all spatial positions) parallelizes.
@@ -130,7 +141,7 @@ fn headTask(
         // lower bound tracks it too. A bidirectional block extends only the
         // upper bound forward to the full sequence (keys added after the query).
         const causal_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
-        const kv_end = if (p.bidirectional) p.seq_kv else causal_end;
+        const kv_end = if (p.kv_end) |e| @as(usize, e[i]) else if (p.bidirectional) p.seq_kv else causal_end;
         // Sliding window: drop keys older than `window` positions back.
         const kv_start = if (p.window != 0 and causal_end > p.window) causal_end - p.window else 0;
 
@@ -525,6 +536,69 @@ test "tree attention: a node never sees its sibling branch" {
     // Node A (row 0) = causal row 1; node C (row 2) = causal row 2.
     for (attn_causal_out[8..16], out[0..8]) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
     for (attn_causal_out[16..24], out[16..24]) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+}
+
+test "kv_end bounds each query independently" {
+    // Against a brute-force reference rather than against `causal`, because the
+    // point of the bound is the case causality cannot express: a block whose
+    // queries see PAST their own position, to the end of their block.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const seq = 7;
+    const heads = 2;
+    const hd = 4;
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const q = try gpa.alloc(f32, seq * heads * hd);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, seq * heads * hd);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, seq * heads * hd);
+    defer gpa.free(v);
+    for ([_][]f32{ q, k, v }) |buf| for (buf) |*x| {
+        x.* = rnd.floatNorm(f32);
+    };
+
+    // Rows 2..4 are one block: causal outside it, bidirectional within.
+    const ends = [seq]u32{ 1, 2, 5, 5, 5, 6, 7 };
+    const got = try gpa.alloc(f32, q.len);
+    defer gpa.free(got);
+    try attention(io, gpa, got, q, k, v, .{
+        .seq_q = seq,
+        .seq_kv = seq,
+        .n_heads = heads,
+        .n_kv_heads = heads,
+        .head_dim = hd,
+        .causal = true,
+        .kv_end = &ends,
+    });
+
+    const scale = 1.0 / @sqrt(@as(f32, hd));
+    for (0..seq) |i| {
+        for (0..heads) |h| {
+            var w: [seq]f32 = undefined;
+            var mx = -std.math.inf(f32);
+            for (0..ends[i]) |j| {
+                var dp: f32 = 0;
+                for (0..hd) |d| dp += q[(i * heads + h) * hd + d] * k[(j * heads + h) * hd + d];
+                w[j] = dp * scale;
+                mx = @max(mx, w[j]);
+            }
+            var den: f32 = 0;
+            for (0..ends[i]) |j| {
+                w[j] = @exp(w[j] - mx);
+                den += w[j];
+            }
+            for (0..hd) |d| {
+                var acc: f32 = 0;
+                for (0..ends[i]) |j| acc += w[j] / den * v[(j * heads + h) * hd + d];
+                const g = got[(i * heads + h) * hd + d];
+                errdefer std.debug.print("query {d} head {d} dim {d}: want {d} got {d}\n", .{ i, h, d, acc, g });
+                try std.testing.expectApproxEqAbs(acc, g, 1e-5);
+            }
+        }
+    }
 }
 
 test "fully masked rows produce zeros" {
