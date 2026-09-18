@@ -682,6 +682,73 @@ pub fn loaderPresent() bool {
     return true;
 }
 
+/// The device-local heap of the card a `Context` WOULD pick, without creating
+/// one: instance, enumerate, read, tear down. Null when there is no loader or
+/// no device with a compute queue.
+///
+/// Exists because a host reports its card in telemetry long before anything
+/// loads a model, and the meter has to draw something. Reading it from a live
+/// `Context` would mean opening a device on an idle host; inventing a size
+/// means a 4 GB card draws as though it had 24, which is what this fixes.
+pub fn probeHeapBytes(gpa: std.mem.Allocator) ?u64 {
+    var lib = dynlib.openFirst(vulkan_names) orelse return null;
+    defer lib.close();
+    const gipa = lib.lookup(vk.PfnGetInstanceProcAddr, "vkGetInstanceProcAddr") orelse return null;
+    const create: vk.PfnCreateInstance = @ptrCast(gipa(.null_handle, "vkCreateInstance") orelse return null);
+    const app_info: vk.ApplicationInfo = .{
+        .p_application_name = "TensorPencil",
+        .application_version = 0,
+        .p_engine_name = "TensorPencil",
+        .engine_version = 0,
+        .api_version = vk.API_VERSION_1_2,
+    };
+    var instance: vk.Instance = .null_handle;
+    if (create(&.{ .p_application_info = &app_info }, null, &instance) != .success) return null;
+
+    const destroy: vk.PfnDestroyInstance = @ptrCast(gipa(instance, "vkDestroyInstance") orelse return null);
+    defer destroy(instance, null);
+    const enumerate: vk.PfnEnumeratePhysicalDevices = @ptrCast(gipa(instance, "vkEnumeratePhysicalDevices") orelse return null);
+    const dev_props: vk.PfnGetPhysicalDeviceProperties = @ptrCast(gipa(instance, "vkGetPhysicalDeviceProperties") orelse return null);
+    const queue_props: vk.PfnGetPhysicalDeviceQueueFamilyProperties = @ptrCast(gipa(instance, "vkGetPhysicalDeviceQueueFamilyProperties") orelse return null);
+    const mem_props_fn: vk.PfnGetPhysicalDeviceMemoryProperties = @ptrCast(gipa(instance, "vkGetPhysicalDeviceMemoryProperties") orelse return null);
+
+    var count: u32 = 0;
+    if (enumerate(instance, &count, null) != .success or count == 0) return null;
+    const devices = gpa.alloc(vk.PhysicalDevice, count) catch return null;
+    defer gpa.free(devices);
+    if (enumerate(instance, &count, devices.ptr) != .success) return null;
+
+    // The same rule `init` uses, so the number describes the card that would
+    // run the work: a compute queue, discrete preferred.
+    var best_score: i32 = -1;
+    var best: u64 = 0;
+    for (devices[0..count]) |dev| {
+        var p: vk.PhysicalDeviceProperties = undefined;
+        dev_props(dev, &p);
+        var qcount: u32 = 0;
+        queue_props(dev, &qcount, null);
+        var qprops: [16]vk.QueueFamilyProperties = undefined;
+        qcount = @min(qcount, 16);
+        queue_props(dev, &qcount, &qprops);
+        const has_compute = for (qprops[0..qcount]) |qp| {
+            if (qp.queue_flags & vk.QueueFlagBits.compute != 0) break true;
+        } else false;
+        if (!has_compute) continue;
+        const score: i32 = if (p.device_type == .discrete_gpu) 2 else 1;
+        if (score <= best_score) continue;
+        var mp: vk.PhysicalDeviceMemoryProperties = undefined;
+        mem_props_fn(dev, &mp);
+        var heap: u64 = 0;
+        for (mp.memory_heaps[0..mp.memory_heap_count]) |h| {
+            if (h.flags & vk.MemoryHeapFlagBits.device_local != 0 and h.size > heap) heap = h.size;
+        }
+        if (heap == 0) continue;
+        best_score = score;
+        best = heap;
+    }
+    return if (best > 0) best else null;
+}
+
 fn check(r: vk.Result) Error!void {
     if (r != .success) {
         std.log.err("vulkan call failed: {t}", .{r});
@@ -5271,6 +5338,44 @@ pub const Context = struct {
             return @min(self.budget_override -| self.device_used, live);
         }
         return live;
+    }
+
+    /// Same shape as the CUDA context's, so a caller can ask either backend
+    /// what the card holds without knowing which it has.
+    pub const MemInfo = struct {
+        free: usize,
+        total: usize,
+        /// What THIS process holds, which is what `VK_EXT_memory_budget`
+        /// reports directly; without the extension it is our own accounting.
+        proc: usize,
+    };
+
+    /// The device-local heap as the driver sees it. With
+    /// `VK_EXT_memory_budget` this accounts for other processes, the way
+    /// `cuMemGetInfo` does; without it, the heap size minus our own usage is
+    /// the best available and still names the right card. Null only when the
+    /// device reports no heap at all, which is not a zero: every consumer of a
+    /// free figure sheds something when it reads low.
+    pub fn memGetInfo(self: *Context) ?MemInfo {
+        const total = self.mem_props.memory_heaps[self.device_heap].size;
+        if (total == 0) return null;
+        if (self.has_memory_budget) {
+            var budget: vk.PhysicalDeviceMemoryBudgetPropertiesEXT = .{
+                .heap_budget = @splat(0),
+                .heap_usage = @splat(0),
+            };
+            var props2: vk.PhysicalDeviceMemoryProperties2 = .{
+                .p_next = &budget,
+                .memory_properties = undefined,
+            };
+            self.d.GetPhysicalDeviceMemoryProperties2(self.phys, &props2);
+            const cap = budget.heap_budget[self.device_heap];
+            const ours = budget.heap_usage[self.device_heap];
+            // `heap_budget` is what we may still reach in total, ours included,
+            // so the headroom is that minus what we already hold.
+            if (cap > 0) return .{ .free = cap -| ours, .total = total, .proc = ours };
+        }
+        return .{ .free = total -| self.device_used, .total = total, .proc = self.device_used };
     }
 
     /// Headroom from the driver's live view (VK_EXT_memory_budget sees other

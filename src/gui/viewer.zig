@@ -5,21 +5,29 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const SDLBackend = @import("backend");
-const diffuser = @import("diffuser.zig");
+const mirror = @import("client").mirror;
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
+const style = @import("style.zig");
 const viewmath = @import("viewmath.zig");
 
-pub const GenImage = diffuser.GenImage;
+const C = style.C;
+
+pub const Image = mirror.Image;
+pub const ImageId = mirror.ImageId;
 
 /// Where the viewer's navigable image list comes from, decoupled from any
-/// particular driver: the chat transcript or the image studio's gallery both
-/// provide one. `collect` fills `buf` with the done images in display order.
+/// particular driver. `collect` fills `buf` with the done images' ids in
+/// display order; `resolve` gives this frame's image behind an id, or null
+/// once it is gone, at which point the viewer closes itself.
 pub const ImageSource = struct {
     ctx: *anyopaque,
     gpa: std.mem.Allocator,
-    collect: *const fn (ctx: *anyopaque, buf: *std.ArrayList(*GenImage)) void,
+    collect: *const fn (ctx: *anyopaque, buf: *std.ArrayList(ImageId)) void,
+    resolve: *const fn (ctx: *anyopaque, id: ImageId) ?*const Image,
+    /// The host that made `id`, "" when unknown or when there is only one.
+    hostOf: *const fn (ctx: *anyopaque, id: ImageId) []const u8,
 };
 
 pub const Viewer = struct {
@@ -28,7 +36,7 @@ pub const Viewer = struct {
     win: dvui.Window,
     win_id: u32,
     src: ImageSource,
-    cur: *GenImage,
+    cur: ImageId,
     open: bool = true,
     shown: bool = false,
     // Fonts/theme are per-window; install the broad-coverage font once so the
@@ -45,7 +53,7 @@ pub const Viewer = struct {
     /// the `SDLBackend` (via `back.backend()`), so the backend must live at a
     /// stable address, a by-value return would leave the window pointing at a
     /// dead copy.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, src: ImageSource, cur: *GenImage) !*Viewer {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, src: ImageSource, cur: ImageId) !*Viewer {
         const self = try gpa.create(Viewer);
         errdefer gpa.destroy(self);
         self.gpa = gpa;
@@ -88,9 +96,18 @@ pub const Viewer = struct {
     }
 
     /// Point the viewer at a different image and reset the view.
-    pub fn setImage(self: *Viewer, gi: *GenImage) void {
-        self.cur = gi;
+    pub fn setImage(self: *Viewer, id: ImageId) void {
+        self.cur = id;
         self.resetView();
+    }
+
+    fn current(self: *Viewer) ?*const Image {
+        return self.src.resolve(self.src.ctx, self.cur);
+    }
+
+    fn copy(im: *const Image) void {
+        const px = im.pixels orelse return;
+        clipboard.copyImage(px, im.info.width, im.info.height);
     }
 
     fn resetView(self: *Viewer) void {
@@ -100,12 +117,12 @@ pub const Viewer = struct {
     }
 
     fn nav(self: *Viewer, dir: i64) void {
-        var buf: std.ArrayList(*GenImage) = .empty;
+        var buf: std.ArrayList(ImageId) = .empty;
         defer buf.deinit(self.src.gpa);
         self.src.collect(self.src.ctx, &buf);
         if (buf.items.len == 0) return;
         var idx: usize = 0;
-        for (buf.items, 0..) |gi, i| if (gi == self.cur) {
+        for (buf.items, 0..) |id, i| if (id == self.cur) {
             idx = i;
             break;
         };
@@ -116,7 +133,7 @@ pub const Viewer = struct {
     }
 
     fn navTo(self: *Viewer, last: bool) void {
-        var buf: std.ArrayList(*GenImage) = .empty;
+        var buf: std.ArrayList(ImageId) = .empty;
         defer buf.deinit(self.src.gpa);
         self.src.collect(self.src.ctx, &buf);
         if (buf.items.len == 0) return;
@@ -135,13 +152,18 @@ pub const Viewer = struct {
             self.fonts_ready = true;
         }
         self.handleKeys();
+        // The image is gone (its engine was torn down): there is nothing to show.
+        const cur = self.current() orelse {
+            self.open = false;
+            return;
+        };
 
         // Position/index label (which image, current zoom).
-        var buf: std.ArrayList(*GenImage) = .empty;
+        var buf: std.ArrayList(ImageId) = .empty;
         defer buf.deinit(self.src.gpa);
         self.src.collect(self.src.ctx, &buf);
         var idx: usize = 0;
-        for (buf.items, 0..) |gi, i| if (gi == self.cur) {
+        for (buf.items, 0..) |id, i| if (id == self.cur) {
             idx = i;
             break;
         };
@@ -155,16 +177,34 @@ pub const Viewer = struct {
             dvui.label(@src(), "image {d}/{d}   {d:.0}%   (← → navigate · scroll zoom · drag pan · 0 fit · 1 100% · Esc close)", .{
                 idx + 1, buf.items.len, self.zoom * 100,
             }, .{ .gravity_y = 0.5 });
+            const host = self.src.hostOf(self.src.ctx, self.cur);
+            if (host.len > 0) {
+                var hbuf: [96]u8 = undefined;
+                fonts.richLine(@src(), std.fmt.bufPrint(&hbuf, " · {s}", .{host}) catch "", .{
+                    .color_text = C.text_dim,
+                    .gravity_y = 0.5,
+                });
+            }
             {
                 var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
                 sp.deinit();
             }
+            // Dim and inert until the pixels are here: a button that silently
+            // does nothing reads as broken.
+            const have_px = cur.pixels != null;
             var wd: dvui.WidgetData = undefined;
-            if (dvui.button(@src(), "Copy", .{}, .{ .gravity_y = 0.5, .data_out = &wd })) clipboard.copyImage(self.cur);
-            hint.hover(@src(), &wd, "Copy image to clipboard");
+            const clicked = dvui.button(@src(), "Copy", .{}, .{
+                .gravity_y = 0.5,
+                .data_out = &wd,
+                .color_text = if (have_px) null else C.text_ghost,
+                .color_text_hover = if (have_px) null else C.text_ghost,
+                .color_text_press = if (have_px) null else C.text_ghost,
+            });
+            if (clicked and have_px) copy(cur);
+            hint.hover(@src(), &wd, if (have_px) "Copy image to clipboard" else "Waiting for the image to arrive");
         }
 
-        self.renderImageArea();
+        self.renderImageArea(cur);
     }
 
     fn handleKeys(self: *Viewer) void {
@@ -177,7 +217,7 @@ pub const Viewer = struct {
             // Cmd+C, Ctrl+Insert.
             if (ke.action == .down and ke.matchBind("copy")) {
                 e.handled = true;
-                clipboard.copyImage(self.cur);
+                if (self.current()) |im| copy(im);
                 continue;
             }
             switch (ke.code) {
@@ -227,7 +267,7 @@ pub const Viewer = struct {
         }
     }
 
-    fn renderImageArea(self: *Viewer) void {
+    fn renderImageArea(self: *Viewer, im: *const Image) void {
         var area = dvui.box(@src(), .{}, .{
             .expand = .both,
             .background = true,
@@ -235,10 +275,19 @@ pub const Viewer = struct {
         });
         defer area.deinit();
 
-        const gi = self.cur;
-        const rgba = gi.rgba orelse return;
-        const iw = gi.width;
-        const ih = gi.height;
+        // Listed but not yet transferred: the host has it, the bytes are still
+        // crossing the socket.
+        const rgba = im.pixels orelse {
+            fonts.richLine(@src(), "Receiving image…", .{
+                .color_text = C.text_ghost,
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+            });
+            dvui.refresh(null, @src(), null);
+            return;
+        };
+        const iw: usize = im.info.width;
+        const ih: usize = im.info.height;
         if (iw == 0 or ih == 0) return;
 
         const wd = area.data();

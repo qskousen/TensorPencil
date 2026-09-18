@@ -21,7 +21,9 @@
 //! own `jsonStringify`/`jsonParse` so they (de)serialize as a plain string /
 //! variable-length array rather than a raw byte/element array.
 const std = @import("std");
+const builtin = @import("builtin");
 const known_folders = @import("known-folders");
+const link = @import("serve").link;
 const framing = @import("framing.zig");
 
 const Environ = std.process.Environ.Map;
@@ -206,6 +208,21 @@ pub const Sampler = enum(u8) {
             if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
         }
         return null;
+    }
+};
+
+/// How the studio expresses image size: the composer's aspect-ratio + megapixel
+/// pair, or plain pixels. Two ways of naming ONE per-render value -- switching
+/// converts rather than resetting, so the size never jumps when you toggle.
+pub const StudioSizeMode = enum {
+    framing,
+    exact,
+
+    pub fn label(self: StudioSizeMode) []const u8 {
+        return switch (self) {
+            .framing => "ratio + MP",
+            .exact => "width × height",
+        };
     }
 };
 
@@ -635,11 +652,83 @@ pub const ClassTower = struct {
 pub const max_class_towers = 16;
 pub const ClassTowerList = FixedList(ClassTower, max_class_towers);
 
+/// One engine host beyond the local one. On this machine it is a socket path:
+/// with `spawn` the client starts a tp-serve of its own there, without it
+/// connects to one somebody else runs. A remote host is `host:port` under TLS
+/// with `cert` pinned and `token` presented, both from the pairing string its
+/// daemon printed (`link.Endpoint`'s text form).
+pub const max_host_name = 32;
+pub const max_cert_b64 = 1400;
+pub const HostEntry = struct {
+    name: TextBuf(max_host_name) = .{},
+    socket: PathBuf = .{},
+    spawn: bool = true,
+    enabled: bool = true,
+    /// The one certificate the client trusts, DER in base64url; empty for a
+    /// host on this machine.
+    cert: TextBuf(max_cert_b64) = .{},
+    /// The remote host's token, hex. Plaintext here, like every setting: the
+    /// file is the user's own and 0600 is what protects it.
+    token: TextBuf(65) = .{},
+    /// This host's own meter handles. Each host has its own card, so each has
+    /// its own split and reserve; the local host uses `Config`'s.
+    vram_split: f32 = 0.60,
+    vram_limit_frac: f32 = 0.95,
+
+    pub fn remote(self: *const HostEntry) bool {
+        return self.cert.opt() != null;
+    }
+
+    /// The same host, reachable the same way. Compares what identifies it and
+    /// NOT what is merely set on it: moving a meter handle must not look like
+    /// a different host and drop the connection.
+    pub fn sameEndpoint(self: *const HostEntry, other: *const HostEntry) bool {
+        return std.mem.eql(u8, self.socket.slice(), other.socket.slice()) and
+            self.spawn == other.spawn and
+            std.mem.eql(u8, self.cert.slice(), other.cert.slice()) and
+            std.mem.eql(u8, self.token.slice(), other.token.slice());
+    }
+
+    /// The short name of the token held here, null when this host needs none.
+    /// The daemon logs the same eight characters for the token it accepts.
+    pub fn tokenFingerprint(self: *const HostEntry) ?[8]u8 {
+        const token = link.parseSecretHex(self.token.slice()) orelse return null;
+        return link.fingerprint(link.hashSecret(token));
+    }
+
+    /// Where to connect (a spawned host is the caller's to start at `socket`).
+    /// Null when a remote entry's token does not parse.
+    pub fn endpoint(self: *const HostEntry) ?link.Endpoint {
+        if (!self.remote()) return .{ .unix = self.socket.slice() };
+        const hp = link.splitHostPort(self.socket.slice()) orelse return null;
+        const token = link.parseSecretHex(self.token.slice()) orelse return null;
+        return .{ .tls = .{ .host = hp.host, .port = hp.port, .cert_b64 = self.cert.slice(), .token = token } };
+    }
+};
+pub const max_hosts = 8;
+pub const HostList = FixedList(HostEntry, max_hosts);
+
+/// The settings fields naming a model file, plus each `loras[].path`. A host
+/// resolves an id text in any of them (`catalog.parseId`) against its own
+/// catalog before the engine sees it.
+pub const model_ref_fields = [_][]const u8{ "llm_model", "vision_tower", "diffusion_model", "text_encoder", "text_encoder_2", "vae", "taesd" };
+
+/// Host fields that describe the machine, not the user's wishes: a remote
+/// host keeps its own values when a client's settings arrive (the client's
+/// name a card it does not have).
+pub const machine_fields = [_][]const u8{ "llm_backend", "diff_backend", "weight_read" };
+
 /// Sentinel for an unsaved window position: SDL places the window itself (the
 /// WM's default / centered) instead of us restoring a stored coordinate.
 pub const pos_unset: i32 = std.math.minInt(i32);
 
+/// The settings file's schema. Additive changes need no bump (unknown keys
+/// are ignored, missing ones default); a rename or a moved field does, with
+/// its rewrite in `Config.migrate`. A file without the key is version 0.
+pub const settings_version: u32 = 1;
+
 pub const Config = struct {
+    version: u32 = 0,
     llm_model: PathBuf = .{},
     vision_tower: PathBuf = .{},
     /// The PRIMARY diffusion checkpoint, the only path image generation actually
@@ -678,7 +767,7 @@ pub const Config = struct {
     vae: PathBuf = .{},
     taesd: PathBuf = .{},
     /// Folders the model catalog scans. The catalog fills the EFFECTIVE paths
-    /// above from picks made in the chips and Settings (see gui/selection.zig),
+    /// above from picks made in the chips and Settings (see client/selection.zig),
     /// so every consumer of those paths is untouched by how they were chosen.
     model_dirs: ModelDirList = .{},
     /// Single files picked from outside the folders ("Other file…"), so they
@@ -706,6 +795,12 @@ pub const Config = struct {
     /// no longer has width/height rows.
     width: usize = 1024,
     height: usize = 1024,
+    /// Classifier-free guidance scale for new renders. 0 means "whatever this
+    /// architecture wants" (`model_spec.traits(fam).cfg`), which is the only
+    /// honest default for a field one number cannot answer: krea2 renders at 1.0,
+    /// which DISABLES guidance, and SD1.5 at 1.0 ignores the negative prompt
+    /// entirely and comes out washed.
+    cfg_scale: f32 = 0,
     /// Sampler for image generation. Load-neutral (it is per-render state, not part
     /// of the session), so a change applies to the next image with no reload.
     sampler: Sampler = .euler,
@@ -754,6 +849,11 @@ pub const Config = struct {
     /// tool stays fire-and-forget: the model asks, and never learns what
     /// happened, so it cannot offer a retry after a failure.
     image_tool_result: bool = true,
+    /// Offer the image tool to the model. The CLIENT sets this per host: a host
+    /// carrying the chat does not render, so its own checkpoint says nothing
+    /// about whether a picture can be made at all. Never read from the saved
+    /// file; it is rewritten on every push.
+    image_tool: bool = false,
     /// Replace a Gemma 4 model's own embedded chat_template with Google's
     /// current upstream "canonical" one. Some finetunes (e.g. DarkIdol 31B) ship
     /// an older/stripped template; this renders exactly what Google's
@@ -841,6 +941,104 @@ pub const Config = struct {
     viewer_x: i32 = pos_unset,
     viewer_y: i32 = pos_unset,
     viewer_max: bool = false,
+
+    /// Studio VIEW state, and nothing else. Which of the two size controls is
+    /// showing and which parameter sections are folded are properties of the
+    /// screen, not of a render, which is why the studio is allowed to write
+    /// these and no other config field: everything that changes an image rides
+    /// on the request instead, and reaches config only through "Save as
+    /// defaults".
+    studio_size_mode: StudioSizeMode = .framing,
+    studio_open_size: bool = true,
+    studio_open_sampling: bool = true,
+    studio_open_loras: bool = false,
+    studio_open_advanced: bool = false,
+
+    /// Engine hosts beyond the local child, which always exists and is never
+    /// listed. Client-only: a host knows nothing of its peers.
+    hosts: HostList = .{},
+    /// The host the chat is pinned to, by `HostEntry.name`; empty is the local one.
+    chat_host: TextBuf(max_host_name) = .{},
+
+    /// Find a listed host by name.
+    pub fn hostEntry(self: *const Config, name: []const u8) ?*const HostEntry {
+        for (self.hosts.slice()) |*h| if (std.mem.eql(u8, h.name.slice(), name)) return h;
+        return null;
+    }
+
+    pub fn hostEntryMut(self: *Config, name: []const u8) ?*HostEntry {
+        for (self.hosts.items[0..self.hosts.count]) |*h| if (std.mem.eql(u8, h.name.slice(), name)) return h;
+        return null;
+    }
+
+    /// What `addHost` did, or why it did nothing. A refusal must reach the
+    /// user: a silent one reads as "I pasted the new pairing string and it
+    /// still says the token is refused".
+    pub const AddHost = enum {
+        added,
+        /// A name already listed now points at what was pasted. Re-pairing a
+        /// host whose daemon minted a new token is this, not an error.
+        repaired,
+        no_name,
+        no_target,
+        bad_pairing,
+        list_full,
+
+        pub fn ok(self: AddHost) bool {
+            return self == .added or self == .repaired;
+        }
+
+        /// Why nothing happened, "" when something did.
+        pub fn why(self: AddHost) []const u8 {
+            return switch (self) {
+                .added, .repaired => "",
+                .no_name => "give this host a name",
+                .no_target => "paste a socket path, or the pairing string its daemon printed",
+                .bad_pairing => "that is not a whole pairing string (tp://host:port/certificate#token)",
+                .list_full => "the host list is full",
+            };
+        }
+    };
+
+    /// List `where` under `name`: a socket path on this machine, or a whole
+    /// pairing string (`tp://...`). A name already listed is re-pointed rather
+    /// than refused, keeping what is set ON that host (its meter handles,
+    /// whether it is enabled) and replacing only where and how to reach it.
+    pub fn addHost(self: *Config, name: []const u8, where: []const u8, spawn: bool) AddHost {
+        if (name.len == 0) return .no_name;
+        if (where.len == 0) return .no_target;
+        var h: HostEntry = .{ .spawn = spawn };
+        h.name.set(name);
+        if (std.mem.startsWith(u8, where, "tp://")) {
+            const ep = link.Endpoint.parse(where) orelse return .bad_pairing;
+            if (ep != .tls or ep.tls.cert_b64.len >= max_cert_b64) return .bad_pairing;
+            var hp_buf: [max_path]u8 = undefined;
+            h.socket.set(std.fmt.bufPrint(&hp_buf, "{s}:{d}", .{ ep.tls.host, ep.tls.port }) catch return .bad_pairing);
+            h.cert.set(ep.tls.cert_b64);
+            h.token.set(&link.secretHex(ep.tls.token));
+            h.spawn = false;
+        } else {
+            h.socket.set(where);
+        }
+        if (self.hostEntryMut(name)) |e| {
+            h.enabled = e.enabled;
+            h.vram_split = e.vram_split;
+            h.vram_limit_frac = e.vram_limit_frac;
+            e.* = h;
+            return .repaired;
+        }
+        if (self.hosts.count >= max_hosts) return .list_full;
+        self.hosts.items[self.hosts.count] = h;
+        self.hosts.count += 1;
+        return .added;
+    }
+
+    pub fn removeHost(self: *Config, i: usize) void {
+        if (i >= self.hosts.count) return;
+        std.mem.copyForwards(HostEntry, self.hosts.items[i .. self.hosts.count - 1], self.hosts.items[i + 1 .. self.hosts.count]);
+        self.hosts.count -= 1;
+        self.hosts.items[self.hosts.count] = .{};
+    }
 
     /// The LLM side (model, vision tower, VRAM limit) matches. A change here
     /// needs a reload, but a transcript-preserving one: the chat is carried
@@ -1270,6 +1468,7 @@ pub const Config = struct {
         // Debug and any future growth).
         if (parseJsonBigStack(gpa, bytes)) |parsed_value| {
             cfg = parsed_value;
+            cfg.migrate();
             cfg.fillOutputDir(io, gpa, environ);
             return cfg;
         }
@@ -1282,12 +1481,21 @@ pub const Config = struct {
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
             cfg.apply(key, val);
         }
+        cfg.migrate();
         cfg.fillOutputDir(io, gpa, environ);
         // Best-effort in-place upgrade to JSON; a failure just means we retry
         // the migration on the next load (the settings still loaded fine).
         cfg.save(io, gpa, environ, path_override) catch |err|
             std.log.warn("config: migrate to JSON failed: {t}", .{err});
         return cfg;
+    }
+
+    /// Bring a loaded file up to `settings_version`. Every version so far reads
+    /// as the flat struct above, so there is nothing to rewrite yet; a future
+    /// rename adds its arm here. A newer file is left as it is.
+    pub fn migrate(self: *Config) void {
+        if (self.version >= settings_version) return;
+        self.version = settings_version;
     }
 
     /// Legacy `key = value` line applier, used only to read pre-JSON config
@@ -1417,9 +1625,67 @@ pub const Config = struct {
                 else => return err,
             };
         }
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+        // The file holds every remote host's token and pinned certificate, so
+        // it is the user's alone. A create does not touch an existing file's
+        // mode, which is why it is set either way.
+        const perms: std.Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = perms });
+        defer f.close(io);
+        if (builtin.os.tag != .windows) f.setPermissions(io, perms) catch {};
+        try f.writeStreamingAll(io, json);
     }
 };
+
+/// The `Config` fields the host reads: what a client pushes on the wire, and
+/// all it pushes. Everything else is the client's (window geometry, saved
+/// prompts and presets, folder memories, the output folder). Adding a field
+/// the engine reads means adding its name here, or the engine never sees it.
+pub const host_fields = [_][]const u8{
+    "llm_model",                 "vision_tower",              "diffusion_model",
+    "diff_peak_resident",        "diff_peak_key",             "text_encoder",
+    "text_encoder_2",            "vae",                       "taesd",
+    "loras",                     "steps",                     "width",
+    "height",                    "sampler",                   "scheduler",
+    "prompt_syntax",             "emphasis",                  "compat",
+    "preview",                   "taesd_size",                "vram_split",
+    "vram_limit_frac",           "llm_backend",               "diff_backend",
+    "vae_decode",                "system_prompt",             "reasoning",
+    "reasoning_effort",          "image_tool_result",         "image_tool",
+    "gemma4_canonical_template",
+    "qwen35_fixed_template",     "weight_noise",              "weight_noise_curve",
+    "weight_noise_amount",       "kv_dtype",                  "weight_read",
+    "vision_budget",             "regen_cache_mb",            "max_new_tokens",
+    "sampling",
+};
+
+/// `Config` cut down to `host_fields`, each with the type and default it has
+/// there: a struct built from the names, so nothing can be spelled twice.
+pub const HostSettings = Subset(Config, &host_fields);
+
+fn Subset(comptime T: type, comptime names: []const []const u8) type {
+    @setEvalBranchQuota(20_000);
+    const src = @typeInfo(T).@"struct".fields;
+    var types: [names.len]type = undefined;
+    var attrs: [names.len]std.builtin.Type.StructField.Attributes = undefined;
+    for (names, &types, &attrs) |name, *ty, *at| {
+        const f = for (src) |f| {
+            if (std.mem.eql(u8, f.name, name)) break f;
+        } else @compileError("Config has no field named " ++ name);
+        ty.* = f.type;
+        at.* = .{ .default_value_ptr = f.default_value_ptr, .@"align" = f.alignment };
+    }
+    return @Struct(.auto, null, names, &types, &attrs);
+}
+
+pub fn hostSettings(cfg: *const Config) HostSettings {
+    var h: HostSettings = undefined;
+    inline for (host_fields) |name| @field(h, name) = @field(cfg, name);
+    return h;
+}
+
+pub fn applyHost(cfg: *Config, h: *const HostSettings) void {
+    inline for (host_fields) |name| @field(cfg, name) = @field(h, name);
+}
 
 /// Key a measured-residency figure to the model it was measured on, so a changed
 /// checkpoint invalidates it. Hash rather than path, see `diff_peak_key`.
@@ -2314,4 +2580,237 @@ test "sys_prompts save/load round-trip (JSON, multi-line text)" {
     try std.testing.expectEqualStrings("coder", b.sys_prompts.items[0].name.slice());
     try std.testing.expectEqualStrings("You write Zig.\nBe terse.", b.sys_prompts.items[0].text.slice());
     try std.testing.expectEqualStrings("pirate", b.sys_prompts.items[1].name.slice());
+}
+
+/// Stack for any thread that parses a `Config` from JSON. In Debug the
+/// std.json struct parser holds a copy of the struct per field in ONE frame,
+/// about 63 x 250 KB here, which overflows the 16 MiB a thread gets by default
+/// and segfaults inside the parser with no message.
+pub const parse_stack_size: usize = 64 << 20;
+
+test "the settings JSON parses on a spawned thread, as the engine host does" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{};
+    cfg.applyFraming();
+    const json = try std.json.Stringify.valueAlloc(gpa, cfg, .{});
+    defer gpa.free(json);
+    const Worker = struct {
+        fn run(bytes: []const u8, ok: *bool) void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            _ = std.json.parseFromSliceLeaky(Config, arena.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return;
+            ok.* = true;
+        }
+    };
+    var ok = false;
+    const t = try std.Thread.spawn(.{ .stack_size = parse_stack_size }, Worker.run, .{ json, &ok });
+    t.join();
+    try std.testing.expect(ok);
+}
+
+test "HostSettings carries every host field and none of the client's" {
+    const gpa = std.testing.allocator;
+    // Set every host field off its default by hand, then check each landed;
+    // no JSON in the loop, so a parser bug cannot pass a splitter bug.
+    var cfg: Config = .{};
+    cfg.llm_model.set("/h/llm.gguf");
+    cfg.vision_tower.set("/h/tower.gguf");
+    cfg.diffusion_model.set("/h/dit.safetensors");
+    cfg.diff_peak_resident = 123;
+    cfg.diff_peak_key = 77;
+    cfg.text_encoder.set("/h/te.safetensors");
+    cfg.text_encoder_2.set("/h/te2.safetensors");
+    cfg.vae.set("/h/vae.safetensors");
+    cfg.taesd.set("/h/taesd.safetensors");
+    if (cfg.addFamilyLora("krea2", "/h/lora.safetensors")) |l| l.strength = 0.5;
+    cfg.steps = 7;
+    cfg.width = 640;
+    cfg.height = 384;
+    cfg.sampler = .dpmpp_2m_sde;
+    cfg.scheduler = .karras;
+    cfg.prompt_syntax = .a1111;
+    cfg.emphasis = .no_norm;
+    cfg.compat = .a1111;
+    cfg.preview = .none;
+    cfg.taesd_size = .full;
+    cfg.vram_split = 0.33;
+    cfg.vram_limit_frac = 0.5;
+    cfg.llm_backend = .cpu;
+    cfg.diff_backend = .vulkan;
+    cfg.vae_decode = .cpu_tiled;
+    cfg.system_prompt.set("be brief");
+    cfg.reasoning = false;
+    cfg.reasoning_effort = .low;
+    cfg.image_tool_result = false;
+    cfg.image_tool = true;
+    cfg.gemma4_canonical_template = true;
+    cfg.qwen35_fixed_template = false;
+    cfg.weight_noise = true;
+    cfg.weight_noise_curve.set("a*t");
+    cfg.weight_noise_amount = 0.25;
+    cfg.kv_dtype = .f16;
+    cfg.weight_read = .mmap;
+    cfg.vision_budget = .low;
+    cfg.regen_cache_mb = 99;
+    cfg.max_new_tokens = 11;
+    cfg.sampling.temperature = 1.5;
+    // And the client's, which must stay behind.
+    cfg.output_dir.set("/c/pictures");
+    cfg.win_w = 333;
+    _ = cfg.upsertSysPrompt("secret", "the user's saved prompt");
+    _ = cfg.upsertPreset("mine", .{ .top_k = 3 });
+    _ = cfg.addModelDir("/c/models");
+    cfg.cfg_scale = 4.5;
+    _ = cfg.addHost("beta", "/c/run/beta.sock", true);
+    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("far", "tp://lydia:7777/AAAA#" ++ ("5e" ** 32), true));
+
+    const h = hostSettings(&cfg);
+    inline for (host_fields) |name| {
+        errdefer std.debug.print("host field {s} did not land\n", .{name});
+        try std.testing.expect(std.meta.eql(@field(h, name), @field(cfg, name)));
+        // Every host field was moved off its default above, so a field left at
+        // its default is one the list names and this test forgot.
+        try std.testing.expect(!std.meta.eql(@field(h, name), @field(@as(Config, .{}), name)));
+    }
+    inline for (.{ "output_dir", "win_w", "win_h", "viewer_w", "sys_prompts", "presets", "noise_curves", "model_dirs", "model_files", "family_sides", "class_towers", "cfg_scale", "framing_ratio", "studio_size_mode", "hosts", "chat_host" }) |name| {
+        try std.testing.expect(!@hasField(HostSettings, name));
+    }
+
+    // On the wire: the JSON names no client key, and read back onto a default
+    // Config it restores exactly the host fields.
+    const json = try std.json.Stringify.valueAlloc(gpa, h, .{});
+    defer gpa.free(json);
+    for ([_][]const u8{ "\"output_dir\"", "\"win_", "\"viewer_", "\"studio_", "\"sys_prompts\"", "\"presets\"", "\"noise_curves\"", "\"model_dirs\"", "\"family_sides\"", "\"class_towers\"", "\"hosts\"", "/c/", "secret", "mine", "beta", "lydia", "5e5e5e" }) |needle| {
+        errdefer std.debug.print("client data on the wire: {s}\n", .{needle});
+        try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const back = try std.json.parseFromSliceLeaky(HostSettings, arena.allocator(), json, .{ .ignore_unknown_fields = true });
+    var applied: Config = .{};
+    applyHost(&applied, &back);
+    try std.testing.expectEqualStrings("/h/llm.gguf", applied.llm_model.slice());
+    try std.testing.expectEqualStrings("be brief", applied.system_prompt.slice());
+    try std.testing.expectEqual(@as(f32, 0.5), applied.loras.slice()[0].strength);
+    try std.testing.expectEqual(@as(f32, 1.5), applied.sampling.temperature);
+    try std.testing.expectEqual(KvDtype.f16, applied.kv_dtype);
+    try std.testing.expect(applied.output_dir.opt() == null);
+    try std.testing.expectEqual(@as(usize, 0), applied.sys_prompts.count);
+    try std.testing.expectEqual(@as(usize, 0), applied.model_dirs.count);
+    // An older client omitting a field leaves the host's default, not garbage.
+    const sparse = try std.json.parseFromSliceLeaky(HostSettings, arena.allocator(), "{\"steps\":3}", .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(@as(usize, 3), sparse.steps);
+    try std.testing.expectEqual(@as(usize, 2048), sparse.max_new_tokens);
+}
+
+test "a settings file from before the version key loads, keeps its values and is stamped" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    var pbuf: [256]u8 = undefined;
+    const file = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/settings.json", .{tmp.sub_path});
+    // As the app wrote it before the key existed: a few of each side's fields.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data =
+        \\{"llm_model":"/m/llm.gguf","diffusion_model":"/m/dit.safetensors",
+        \\ "steps":9,"kv_dtype":"f16","system_prompt":"hi",
+        \\ "output_dir":"/p/out","win_w":800,"model_dirs":[{"path":"/m"}],
+        \\ "presets":[{"name":"p1","sampling":{"temperature":0.3}}]}
+    });
+    const cfg = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(settings_version, cfg.version);
+    try std.testing.expectEqualStrings("/m/llm.gguf", cfg.llm_model.slice());
+    try std.testing.expectEqual(@as(usize, 9), cfg.steps);
+    try std.testing.expectEqual(KvDtype.f16, cfg.kv_dtype);
+    try std.testing.expectEqualStrings("/p/out", cfg.output_dir.slice());
+    try std.testing.expectEqual(@as(usize, 800), cfg.win_w);
+    try std.testing.expectEqualStrings("/m", cfg.model_dirs.slice()[0].path.slice());
+    try std.testing.expectEqual(@as(f32, 0.3), cfg.presets.slice()[0].sampling.temperature);
+    // Saved, it carries the version; a newer file's version is left alone.
+    try cfg.save(io, gpa, &environ, file);
+    const again = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(settings_version, again.version);
+    var future: Config = .{ .version = settings_version + 5 };
+    future.migrate();
+    try std.testing.expectEqual(settings_version + 5, future.version);
+}
+
+test "a pairing string becomes a remote host entry whose endpoint carries the pin and token" {
+    var cfg: Config = .{};
+    const token_hex = "0f" ** 32;
+    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("far", "tp://[fd7a::8]:7777/MIIBcert_-#" ++ token_hex, true));
+    const e = cfg.hostEntry("far").?;
+    try std.testing.expect(e.remote());
+    try std.testing.expect(!e.spawn);
+    try std.testing.expectEqualStrings("fd7a::8:7777", e.socket.slice());
+    try std.testing.expectEqualStrings("MIIBcert_-", e.cert.slice());
+    try std.testing.expectEqualStrings(token_hex, e.token.slice());
+    const ep = e.endpoint().?;
+    try std.testing.expectEqualStrings("fd7a::8", ep.tls.host);
+    try std.testing.expectEqual(@as(u16, 7777), ep.tls.port);
+    try std.testing.expectEqual(@as(u8, 0x0f), ep.tls.token[31]);
+    // A local entry is a unix socket; a broken pairing string adds nothing.
+    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("near", "/run/near.sock", false));
+    try std.testing.expectEqualStrings("/run/near.sock", cfg.hostEntry("near").?.endpoint().?.unix);
+    try std.testing.expectEqual(Config.AddHost.bad_pairing, cfg.addHost("bad", "tp://x:1/AA#tooshort", true));
+    try std.testing.expectEqual(@as(usize, 2), cfg.hosts.count);
+    // The entry survives the settings file.
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, cfg, .{});
+    defer std.testing.allocator.free(json);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const back = try std.json.parseFromSliceLeaky(Config, arena.allocator(), json, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings(token_hex, back.hostEntry("far").?.token.slice());
+    try std.testing.expect(back.hostEntry("far").?.endpoint().? == .tls);
+}
+
+test "re-pairing a host under the name it already has takes the new token" {
+    var cfg: Config = .{};
+    const old_hex = "0f" ** 32;
+    const new_hex = "a3" ** 32;
+    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("lydia", "tp://10.0.0.130:7777/MIIBold#" ++ old_hex, false));
+    // What is set ON the host, as the meter rail leaves it.
+    cfg.hostEntryMut("lydia").?.vram_split = 0.42;
+    // The daemon minted another token: the same name, pasted again. Refusing
+    // this is what leaves a stale token in the file and a host saying its
+    // token was refused however often it is re-pasted.
+    try std.testing.expectEqual(Config.AddHost.repaired, cfg.addHost("lydia", "tp://10.0.0.130:7777/MIIBnew#" ++ new_hex, false));
+    try std.testing.expectEqual(@as(usize, 1), cfg.hosts.count);
+    const e = cfg.hostEntry("lydia").?;
+    try std.testing.expectEqualStrings(new_hex, e.token.slice());
+    try std.testing.expectEqualStrings("MIIBnew", e.cert.slice());
+    try std.testing.expectEqual(@as(f32, 0.42), e.vram_split);
+    // The new token is a different endpoint, so the client drops and redials.
+    var old: HostEntry = .{};
+    old.name.set("lydia");
+    old.socket.set("10.0.0.130:7777");
+    old.cert.set("MIIBold");
+    old.token.set(old_hex);
+    try std.testing.expect(!e.sameEndpoint(&old));
+
+    // Removed and added again under the same name, with nothing applied in
+    // between: the settings form's own sequence, and the one that has to leave
+    // the new token behind.
+    var two: Config = .{};
+    _ = two.addHost("lydia", "tp://10.0.0.130:7777/MIIBold#" ++ old_hex, false);
+    two.removeHost(0);
+    try std.testing.expectEqual(@as(usize, 0), two.hosts.count);
+    try std.testing.expectEqual(Config.AddHost.added, two.addHost("lydia", "tp://10.0.0.130:7777/MIIBnew#" ++ new_hex, false));
+    try std.testing.expectEqual(@as(usize, 1), two.hosts.count);
+    try std.testing.expectEqualStrings(new_hex, two.hostEntry("lydia").?.token.slice());
+
+    // Every other refusal says which one it is.
+    try std.testing.expectEqual(Config.AddHost.no_name, cfg.addHost("", "/run/x.sock", true));
+    try std.testing.expectEqual(Config.AddHost.no_target, cfg.addHost("x", "", true));
+    for (0..max_hosts) |i| {
+        var buf: [8]u8 = undefined;
+        _ = cfg.addHost(try std.fmt.bufPrint(&buf, "h{d}", .{i}), "/run/x.sock", true);
+    }
+    try std.testing.expectEqual(Config.AddHost.list_full, cfg.addHost("one-more", "/run/x.sock", true));
+    inline for (.{ .added, .repaired, .no_name, .no_target, .bad_pairing, .list_full }) |r| {
+        const res: Config.AddHost = r;
+        try std.testing.expectEqual(res.ok(), res.why().len == 0);
+    }
 }

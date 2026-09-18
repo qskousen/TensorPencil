@@ -1,8 +1,10 @@
 //! `zig build catalog-probe -- <folder>...`: scan model folders exactly as tp-gui
-//! does and print what each file was taken for. The answer to "why is my model
-//! not in the menu" without opening the GUI.
+//! does, through the same worker module, and print what each file was taken
+//! for. The answer to "why is my model not in the menu" without opening the GUI.
+//! This binary links no dvui, which is what keeps `model_scan.zig` free of it.
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const catalog = @import("shared").catalog;
+const model_scan = @import("engine").scan;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -18,14 +20,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.Writer.init(.stdout(), io, &buf);
+    var w = std.Io.File.Writer.initStreaming(.stdout(), io, &buf);
     const out = &w.interface;
 
+    model_scan.init(gpa, io, null, null);
+    defer model_scan.deinit();
     const t0 = std.Io.Clock.awake.now(io).nanoseconds;
-    var rep: catalog.ScanReport = .{};
-    var cat = try catalog.scan(gpa, io, folders.items, &.{}, null, &rep);
-    defer cat.deinit();
+    model_scan.startScan(folders.items, &.{});
+    while (model_scan.scanning()) {
+        if (model_scan.poll()) break;
+        std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .real) catch {};
+    }
     const ms = @divTrunc(std.Io.Clock.awake.now(io).nanoseconds - t0, std.time.ns_per_ms);
+    const rep = model_scan.lastReport();
+    const cat = &model_scan.cat;
 
     for (cat.entries) |*e| {
         try out.print("{s}\n", .{e.path});

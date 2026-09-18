@@ -8,10 +8,12 @@
 //! Every generation the model requests appears here as a tool call, with its
 //! prompt behind one disclosure: visible depth, collapsed by default.
 //!
-//! While a call is still rendering its tiles are DASHED EMPTY SLOTS. The pixels
-//! are in the queue rail during that window, and they move here as each one
-//! lands — so an image is in exactly one place at any moment. The card reserves
-//! the shape so the transcript does not jump when they arrive.
+//! A tile IS where a render is watched: once a host takes it, its live preview,
+//! step count and bar are drawn in the slot the card reserved, and the finished
+//! picture replaces them in place. The queue rail holds only what is still
+//! waiting for a host, so an image is in exactly one place at any moment. This
+//! is the studio canvas's job done in the transcript, which is why the tile is
+//! sized to be looked at rather than to pack four across.
 const std = @import("std");
 const dvui = @import("dvui");
 const style = @import("style.zig");
@@ -19,23 +21,44 @@ const fonts = @import("fonts.zig");
 const markdown_view = @import("markdown_view.zig");
 
 const C = style.C;
-/// Widest a tool-call tile is allowed to be. A thumbnail is an index entry;
-/// the viewer is where an image is actually looked at.
-const tile_max: f32 = 150;
+/// Widest a tool-call tile is allowed to be. Big enough to watch a render
+/// happen in; the viewer is still where an image is looked at closely.
+const tile_max: f32 = 250;
 const F = style.F;
 const R = style.R;
 const L = style.Layout;
 
+pub const Px = struct { px: []const u8, w: u32, h: u32 };
+
 /// One image tile in a tool call's grid.
 pub const Tile = union(enum) {
-    /// A slot the card has reserved for an image still in the queue. Dashed and
+    /// A slot the card has reserved for an image no host has started. Dashed and
     /// empty rather than a grey block, so it reads as "nothing here yet" and
     /// not as a render that came out black.
     pending,
+    /// A host is on it: the live preview, with what step it is on.
+    rendering: Rendering,
     /// Failed or canceled: the slot stays, so the grid does not reflow.
     failed,
-    rgba: struct { px: []const u8, w: u32, h: u32 },
+    rgba: Px,
 };
+
+pub const Rendering = struct {
+    /// The last preview frame, absent until the first one arrives.
+    px: ?Px = null,
+    step: u32 = 0,
+    steps: u32 = 0,
+    /// "step 12 / 34", "12 / 34 · lydia", "paused · 12/34".
+    label: []const u8 = "",
+};
+
+/// Longest side the card drew a tile at last frame, which is what live previews
+/// want to be fetched at.
+var g_tile_edge: f32 = tile_max;
+
+pub fn tileMaxEdge() u32 {
+    return @intFromFloat(@max(64, g_tile_edge));
+}
 
 pub const ToolCall = struct {
     /// The tool name, shown as an amber tag.
@@ -43,6 +66,10 @@ pub const ToolCall = struct {
     /// "1024² · seed 8812"
     meta: []const u8,
     tiles: []const Tile,
+    /// What was asked for, width over height. Every tile in a run is the same
+    /// render size, so the slot is that shape and a landing picture fills it
+    /// instead of letterboxing inside a square.
+    aspect: f32 = 1,
     /// Index into `tiles`, outlined in blue: the user's pick.
     selected: ?usize = null,
     /// Behind the card's own disclosure: the prompt, readable. The RAW call is
@@ -64,6 +91,9 @@ pub const ToolActions = struct {
     on_toggle: *const fn (*anyopaque) void,
     on_select: *const fn (*anyopaque, usize) void,
     on_open_studio: *const fn (*anyopaque) void,
+    /// Stop the render in that tile. The rail lists nothing under way, so this
+    /// is the only place in chat that can ask.
+    on_cancel: *const fn (*anyopaque, usize) void,
 };
 
 /// A right-aligned user message. The 3px bottom-right corner is the tail.
@@ -213,13 +243,12 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
 
     // ---- tiles
     //
-    // A CAPPED grid, wrapping at 4 across. Dividing the card width by the tile
-    // count made a single render 570px wide, which is a poster in the middle of
-    // a conversation; the tile is an index entry, and the viewer (click one) is
-    // where you actually look at a picture.
+    // A CAPPED grid, as many across as fit at the cap. Dividing the card width
+    // by the tile count made a single render 570px wide, which is a poster in
+    // the middle of a conversation; the cap is what keeps every run the same
+    // size whatever it holds.
     if (tc.tiles.len > 0) {
         const gap: f32 = 8;
-        const per_row: usize = 4;
 
         var grid = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .horizontal,
@@ -228,8 +257,12 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         defer grid.deinit();
 
         const avail = grid.data().contentRect().w;
+        const per_row = @max(1, @as(usize, @intFromFloat((avail + gap) / (tile_max + gap))));
         const across: f32 = @floatFromInt(@min(tc.tiles.len, per_row));
         const cell = @min(tile_max, @max(24, (avail - gap * (across - 1)) / across));
+        // A wild aspect would make a row of tiles taller than the screen.
+        const cell_h = cell / std.math.clamp(tc.aspect, 0.5, 2);
+        g_tile_edge = @max(cell, cell_h);
 
         var row_start: usize = 0;
         while (row_start < tc.tiles.len) : (row_start += per_row) {
@@ -243,10 +276,12 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
 
             for (tc.tiles[row_start..row_end], row_start..) |t, i| {
                 const sel = tc.selected == i;
-                var cellbox = dvui.box(@src(), .{}, .{
+                // Overlay, not a box: a tile being rendered wears its progress
+                // strip ON the picture, so nothing moves when the picture lands.
+                var cellbox = dvui.overlay(@src(), .{
                     .id_extra = i,
-                    .min_size_content = .{ .w = cell, .h = cell },
-                    .max_size_content = .size(.{ .w = cell, .h = cell }),
+                    .min_size_content = .{ .w = cell, .h = cell_h },
+                    .max_size_content = .size(.{ .w = cell, .h = cell_h }),
                     .margin = .{ .w = if (i + 1 < row_end) gap else 0 },
                     // No glow and no scale on selection: a 1.5px blue edge is
                     // enough, and anything else makes the grid jump.
@@ -255,20 +290,25 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                     .corner_radius = R.chip,
                 });
                 const crs = cellbox.data().contentRectScale();
+                var cancel = false;
                 switch (t) {
-                    .rgba => |px| _ = dvui.image(@src(), .{
-                        .source = .{ .pixels = .{ .rgba = px.px, .width = px.w, .height = px.h } },
-                        .shrink = .ratio,
-                    }, .{
-                        .expand = .both,
-                        .corner_radius = R.chip,
-                    }),
+                    .rgba => |px| tilePixels(@src(), px, cell, cell_h),
+                    .rendering => |r| {
+                        if (r.px) |px|
+                            tilePixels(@src(), px, cell, cell_h)
+                        else
+                            // The same two greys as the library's loading tile,
+                            // so nothing pops when the first preview swaps in.
+                            style.hatch(crs.r, C.raised, dvui.Color.fromHex("#161a1e"), 6 * @max(1, crs.s));
+                        liveStrip(@src(), r);
+                        cancel = tileCancel(@src());
+                    },
                     .pending => dashedSlot(crs.r, crs.s, style.hairline_hi),
                     .failed => dashedSlot(crs.r, crs.s, style.tint(C.danger, 90)),
                 }
                 const clicked = dvui.clicked(cellbox.data(), .{});
                 cellbox.deinit();
-                if (clicked) cb.on_select(cb.ctx, i);
+                if (cancel) cb.on_cancel(cb.ctx, i) else if (clicked) cb.on_select(cb.ctx, i);
             }
             // Keep a short row left-aligned instead of stretching its tiles.
             var fill = dvui.box(@src(), .{}, .{ .id_extra = row_start, .expand = .horizontal });
@@ -286,8 +326,8 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
 
         if (primaryButton(@src(), "Open in Studio", !tc.busy)) cb.on_open_studio(cb.ctx);
 
-        // While rendering, the right-hand caption says where the pixels are:
-        // the images are in the QUEUE until they land here (see queue_rail).
+        // While rendering, the right-hand caption counts the run; each tile says
+        // what its own render is doing.
         if (tc.busy and tc.status.len > 0) {
             dvui.labelNoFmt(@src(), tc.status, .{}, .{
                 .font = F.mono,
@@ -365,6 +405,73 @@ pub fn secondaryButton(src: std.builtin.SourceLocation, id: usize, label: []cons
     bw.drawFocus();
     bw.deinit();
     return clicked and enabled;
+}
+
+/// A picture fitted into its tile, whatever shape it is. A preview arrives at a
+/// fraction of the final size, so this grows as well as shrinks.
+fn tilePixels(src: std.builtin.SourceLocation, px: Px, cw: f32, ch: f32) void {
+    const fw: f32 = @floatFromInt(px.w);
+    const fh: f32 = @floatFromInt(px.h);
+    if (fw <= 0 or fh <= 0) return;
+    const scale = @min(cw / fw, ch / fh);
+    const sz: dvui.Size = .{ .w = fw * scale, .h = fh * scale };
+    _ = dvui.image(src, .{
+        .source = .{ .pixels = .{ .rgba = px.px, .width = px.w, .height = px.h } },
+        .shrink = .ratio,
+    }, .{
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+        .min_size_content = sz,
+        .max_size_content = .size(sz),
+        .corner_radius = R.chip,
+    });
+}
+
+/// The strip along the bottom of a tile a host is working on: what step it is
+/// on, and the bar. Amber, because this is the machine working.
+fn liveStrip(src: std.builtin.SourceLocation, r: Rendering) void {
+    var strip = dvui.box(src, .{ .dir = .vertical }, .{
+        .expand = .horizontal,
+        .gravity_y = 1.0,
+        .background = true,
+        .color_fill = style.tint(C.canvas, 205),
+        // Square on top, following the tile's own corners below.
+        .corner_radius = .{ .x = 0, .y = 0, .w = 5, .h = 5 },
+        .padding = .{ .x = 8, .y = 4, .w = 8, .h = 5 },
+    });
+    defer strip.deinit();
+
+    if (r.label.len > 0) dvui.labelNoFmt(@src(), r.label, .{}, .{
+        .font = F.mono_row,
+        .color_text = C.text_dim,
+        .padding = .{},
+    });
+    const frac: f32 = if (r.steps > 0)
+        @as(f32, @floatFromInt(r.step)) / @as(f32, @floatFromInt(r.steps))
+    else
+        0;
+    style.progressTrack(@src(), frac, 3);
+}
+
+/// Stop this one render, in the corner of the tile it is happening in. The wash
+/// under it is what keeps it visible over a bright picture.
+fn tileCancel(src: std.builtin.SourceLocation) bool {
+    var wrap = dvui.box(src, .{ .dir = .horizontal }, .{
+        .gravity_x = 1.0,
+        .background = true,
+        .color_fill = style.tint(C.canvas, 190),
+        .corner_radius = R.chip,
+        .margin = dvui.Rect.all(5),
+    });
+    defer wrap.deinit();
+    return dvui.buttonIcon(@src(), "cancel", dvui.entypo.cross, .{}, .{}, .{
+        .min_size_content = .{ .w = 12, .h = 12 },
+        .color_text = C.text_dim,
+        .background = false,
+        .corner_radius = R.chip,
+        .padding = dvui.Rect.all(3),
+        .margin = .{},
+    });
 }
 
 /// A dashed 1px outline: a reserved slot with nothing in it yet.

@@ -18,9 +18,9 @@
 //! or a folder since removed) is left exactly as configured. Only what the
 //! catalog can see is resolved; nothing here ever blanks a path it cannot judge.
 const std = @import("std");
-const config = @import("config.zig");
-const catalog = @import("catalog.zig");
-const model_spec = @import("model_spec.zig");
+const config = @import("shared").config;
+const catalog = @import("shared").catalog;
+const model_spec = @import("shared").model_spec;
 
 pub const Family = catalog.Family;
 pub const Component = catalog.Component;
@@ -102,7 +102,7 @@ pub fn classKey(buf: []u8, l: catalog.Llm) []const u8 {
 
 /// The configured checkpoint's catalog entry, when the catalog knows it.
 pub fn checkpoint(cfg: *const Config, cat: *const Catalog) ?*const catalog.Entry {
-    const e = cat.find(cfg.diffusion_model.slice()) orelse return null;
+    const e = cat.resolve(cfg.diffusion_model.slice()) orelse return null;
     return if (e.ckpt != null) e else null;
 }
 
@@ -188,7 +188,7 @@ pub fn sideState(cfg: *const Config, cat: *const Catalog, slot: Slot) SideState 
 // ── LLM ─────────────────────────────────────────────────────────────────────
 
 pub fn llm(cfg: *const Config, cat: *const Catalog) ?*const catalog.Entry {
-    const e = cat.find(cfg.llm_model.slice()) orelse return null;
+    const e = cat.resolve(cfg.llm_model.slice()) orelse return null;
     return if (e.llm != null) e else null;
 }
 
@@ -285,9 +285,35 @@ pub fn loraCount(cfg: *const Config, fam: Family) usize {
 }
 
 /// Whether `path` is on for the configured checkpoint's family.
+/// Do two references name the same file. Not a string compare: a reference is
+/// a path or an id text, and after a file is fetched from a host the config can
+/// hold the id while the catalog now has a real path for the same bytes.
+pub fn sameRef(cat: *const Catalog, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const ea = cat.resolve(a) orelse return false;
+    const eb = cat.resolve(b) orelse return false;
+    return ea == eb;
+}
+
+/// The reference the CONFIG stores for the file `ref` names, which is what a
+/// config write has to be keyed on. Null when no row names that file.
+fn storedLora(cfg: *const Config, cat: *const Catalog, fam: Family, ref: []const u8) ?[]const u8 {
+    // By pointer: `|l|` copies the row, and the slice would then point into a
+    // temporary the caller outlives.
+    for (lorasForFamily(cfg, fam)) |*l| {
+        if (sameRef(cat, l.path.slice(), ref)) return l.path.slice();
+    }
+    return null;
+}
+
+/// Is this file already in the family's list, however it is referenced there.
+pub fn loraListed(cfg: *const Config, cat: *const Catalog, fam: Family, ref: []const u8) bool {
+    return storedLora(cfg, cat, fam, ref) != null;
+}
+
 pub fn loraEnabled(cfg: *const Config, cat: *const Catalog, path: []const u8) bool {
-    for (loras(cfg, cat)) |l| {
-        if (std.mem.eql(u8, l.path.slice(), path)) return l.enabled;
+    for (loras(cfg, cat)) |*l| {
+        if (sameRef(cat, l.path.slice(), path)) return l.enabled;
     }
     return false;
 }
@@ -302,16 +328,19 @@ pub fn toggleLora(cfg: *Config, cat: *const Catalog, path: []const u8, on: bool)
     const e = checkpoint(cfg, cat) orelse return false;
     const key = familyKey(e.ckpt.?.family);
     if (!on) {
-        cfg.removeFamilyLora(key, path);
+        cfg.removeFamilyLora(key, storedLora(cfg, cat, e.ckpt.?.family, path) orelse path);
         return true;
     }
+    if (storedLora(cfg, cat, e.ckpt.?.family, path) != null) return true;
     return cfg.addFamilyLora(key, path) != null;
 }
 
 /// Move one file's dial. Load-neutral, so a caller may do this mid-session.
 pub fn setLoraStrength(cfg: *Config, cat: *const Catalog, path: []const u8, strength: f32) void {
     const e = checkpoint(cfg, cat) orelse return;
-    if (cfg.familyLoraMut(familyKey(e.ckpt.?.family), path)) |l| l.strength = strength;
+    const fam = e.ckpt.?.family;
+    const key = storedLora(cfg, cat, fam, path) orelse path;
+    if (cfg.familyLoraMut(familyKey(fam), key)) |l| l.strength = strength;
 }
 
 /// Drop rows the catalog now says are wrong for their family.
@@ -325,7 +354,7 @@ pub fn pruneLoras(cfg: *Config, cat: *const Catalog) void {
     while (i < cfg.loras.count) {
         const l = cfg.loras.items[i];
         const fam = std.meta.stringToEnum(Family, l.family.slice());
-        const e = cat.find(l.path.slice());
+        const e = cat.resolve(l.path.slice());
         const bad = fam != null and e != null and
             (if (e.?.lora) |lr| !lr.has(fam.?) else true);
         if (!bad) {

@@ -167,6 +167,19 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     const v = probeView(store, fam, comp) orelse return false;
     if (!componentFits(v, fam, comp)) return false;
     if (comp != .conditioner) return true;
+    // Krea2 wants Qwen3-VL-4B, Z-Image plain Qwen3-4B: same vocab, width and
+    // depth, different rope, and either can sit at `model.`. The vision tower
+    // is the only structural difference. A VL file stripped of its tower is
+    // the plain model as far as anything here can see.
+    // A GGUF keeps its vision tower in a separate mmproj file, so it never
+    // carries one and the question cannot be asked of it.
+    if ((fam == .krea2 or fam == .zimage) and store != .gguf) {
+        // Under whatever the probe answered under: a bundled checkpoint keeps
+        // its encoder beneath a prefix, and the tower sits beneath the same one.
+        // Asked flat, such a file answers "no tower" and is then offered to the
+        // one family it is wrong for.
+        if ((fam == .krea2) != tp.models.qwen3.Config.hasVisionTower(store, containerPrefix(v.info.name))) return false;
+    }
     const cfg = encoderConfig(fam) orelse return true;
     // The probe is `<root>embed_tokens.weight`; layers sit beside it.
     const suffix = "embed_tokens.weight";
@@ -174,6 +187,12 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     if (!std.mem.endsWith(u8, name, suffix)) return false;
     const root = name[0 .. name.len - suffix.len];
     return layerNormExists(store, root, cfg.n_layers - 1) and !layerNormExists(store, root, cfg.n_layers);
+}
+
+/// What a probed tensor name sits under, up to the language tower's own
+/// `model.`: empty for a split file, the container's prefix for a bundled one.
+fn containerPrefix(name: []const u8) []const u8 {
+    return name[0 .. std.mem.indexOf(u8, name, "model.") orelse 0];
 }
 
 fn layerNormExists(store: tp.weights.WeightStore, root: []const u8, layer: usize) bool {
@@ -703,7 +722,7 @@ test "traits: the families' defaults differ in the fields that matter" {
 /// A zero-payload safetensors over the given tensors, which is all a
 /// header-only probe reads. Same idea as `catalog.stFile`, kept here so this
 /// module's tests do not depend on that one's private helper.
-fn loraFile(gpa: std.mem.Allocator, specs: []const struct { name: []const u8, dims: []const usize }) ![]u8 {
+fn stFile(gpa: std.mem.Allocator, specs: []const struct { name: []const u8, dims: []const usize }) ![]u8 {
     var header: std.ArrayList(u8) = .empty;
     defer header.deinit(gpa);
     var off: usize = 0;
@@ -734,7 +753,7 @@ test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
     // The shipped turbo LoRA's spelling and shapes: kohya `lora_down`/`lora_up`,
     // `a` contracting the model width and `b` emitting the linear's own.
     {
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = root ++ ".lora_down.weight", .dims = &.{ rank, cfg.dim } },
             .{ .name = root ++ ".lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
         });
@@ -757,7 +776,7 @@ test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
     // Right names, wrong width: a LoRA for another variant of the architecture.
     // Its factors would still multiply, into the wrong columns.
     {
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = root ++ ".lora_down.weight", .dims = &.{ rank, cfg.dim / 2 } },
             .{ .name = root ++ ".lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
         });
@@ -774,7 +793,7 @@ test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
     {
         var buf: [256]u8 = undefined;
         const deep = try std.fmt.bufPrint(&buf, "diffusion_model.language_model.model.layers.{d}.self_attn.q_proj_mot_gen.lora_down.weight", .{cfg.n_layers});
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = deep, .dims = &.{ rank, cfg.dim } },
         });
         defer gpa.free(bytes);
@@ -794,7 +813,7 @@ test "a partial-depth LoRA fits, and a DoRA is refused" {
     // it name the deepest layer (the equality `storeFits` uses for a side file)
     // would reject it.
     {
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
             .{ .name = "diffusion_model.language_model.model.layers.5.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
@@ -814,7 +833,7 @@ test "a partial-depth LoRA fits, and a DoRA is refused" {
     // wrong magnitude. The engine refuses the file, so the menu must not offer
     // it either.
     {
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.dora_scale", .dims = &.{cfg.qDim()} },
@@ -830,7 +849,7 @@ test "a partial-depth LoRA fits, and a DoRA is refused" {
     // A kohya SD LoRA: LoRA-shaped, but under a prefix this engine does not map.
     // Distinguished from "not a model at all", which is what the note says.
     {
-        const bytes = try loraFile(gpa, &.{
+        const bytes = try stFile(gpa, &.{
             .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight", .dims = &.{ 32, 320 } },
             .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight", .dims = &.{ 320, 32 } },
         });
@@ -1055,4 +1074,85 @@ test "probe tables match a real checkpoint (opt-in)" {
     // users a working model is missing pieces.
     try std.testing.expect(info.contents.denoiser);
     try std.testing.expect(info.isComplete());
+}
+
+test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
+    const gpa = std.testing.allocator;
+    const hidden = tp.models.qwen3.Config.vl_4b.hidden;
+    const last = tp.models.qwen3.Config.vl_4b.n_layers - 1;
+    const tower = "model.visual.patch_embed.proj.weight";
+    var nb: [80]u8 = undefined;
+    var fb: [80]u8 = undefined;
+    const nested_norm = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.input_layernorm.weight", .{last});
+    const flat_norm = try std.fmt.bufPrint(&fb, "model.layers.{d}.input_layernorm.weight", .{last});
+
+    const check = struct {
+        fn f(bytes: []u8, what: []const u8, want_krea2: bool) !void {
+            var st = try tp.safetensors.SafeTensors.initFromSlice(std.testing.allocator, bytes);
+            defer st.deinit();
+            const store: tp.weights.WeightStore = .{ .safetensors = &st };
+            const k = storeFits(store, .krea2, .conditioner);
+            const z = storeFits(store, .zimage, .conditioner);
+            errdefer std.debug.print("{s}: krea2={} zimage={}\n", .{ what, k, z });
+            // Exactly one family may take any of them.
+            try std.testing.expectEqual(want_krea2, k);
+            try std.testing.expectEqual(!want_krea2, z);
+            // And the ENGINE must answer the same: the VL config resolves onto a
+            // prefix a krea2 encoder actually has, and onto one a plain Qwen3-4B
+            // does not, so that file fails by tensor name instead of loading at
+            // 1e6 where the diffusion model was trained against 5e6.
+            const vl = tp.models.qwen3.Config.vl_4b;
+            var pb: [96]u8 = undefined;
+            const embed = try std.fmt.bufPrint(&pb, "{s}embed_tokens.weight", .{vl.resolvePrefix(store)});
+            try std.testing.expectEqual(want_krea2, store.get(embed) != null);
+        }
+    }.f;
+
+    // `componentFits` reads the width only, so a short vocab keeps these small;
+    // the depth probe wants the last layer's norm and not the one past it.
+    {
+        const bytes = try stFile(gpa, &.{
+            .{ .name = "model.language_model.embed_tokens.weight", .dims = &.{ 4, hidden } },
+            .{ .name = nested_norm, .dims = &.{hidden} },
+            .{ .name = tower, .dims = &.{ 2, 2 } },
+        });
+        defer gpa.free(bytes);
+        try check(bytes, "VL nested", true);
+    }
+    {
+        const bytes = try stFile(gpa, &.{
+            .{ .name = "model.embed_tokens.weight", .dims = &.{ 4, hidden } },
+            .{ .name = flat_norm, .dims = &.{hidden} },
+            .{ .name = tower, .dims = &.{ 2, 2 } },
+        });
+        defer gpa.free(bytes);
+        try check(bytes, "VL flattened onto model.", true);
+    }
+    {
+        const bytes = try stFile(gpa, &.{
+            .{ .name = "model.embed_tokens.weight", .dims = &.{ 4, hidden } },
+            .{ .name = flat_norm, .dims = &.{hidden} },
+        });
+        defer gpa.free(bytes);
+        try check(bytes, "plain Qwen3-4B", false);
+    }
+    // A bundled checkpoint keeps the whole encoder under a prefix, tower and
+    // all. Asked flat, such a file answers "no tower" and is then taken for the
+    // one family it is wrong for.
+    {
+        var eb: [96]u8 = undefined;
+        var pnb: [96]u8 = undefined;
+        var tb: [96]u8 = undefined;
+        const bytes = try stFile(gpa, &.{
+            .{ .name = try std.fmt.bufPrint(&eb, "text_encoders.model.embed_tokens.weight", .{}), .dims = &.{ 4, hidden } },
+            .{ .name = try std.fmt.bufPrint(&pnb, "text_encoders.{s}", .{flat_norm}), .dims = &.{hidden} },
+            .{ .name = try std.fmt.bufPrint(&tb, "text_encoders.{s}", .{tower}), .dims = &.{ 2, 2 } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        try std.testing.expect(storeFits(store, .krea2, .conditioner));
+        try std.testing.expect(!storeFits(store, .zimage, .conditioner));
+    }
 }

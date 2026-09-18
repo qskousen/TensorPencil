@@ -233,6 +233,14 @@ conditioning. ⚠️ **One buffer per block on Vulkan**, not one buffer with a p
 Vulkan `DeviceBuffer.buf` is an opaque handle, so `zimage_cuda`'s `offsetBuf` trick is
 CUDA-only and gives `error_device_lost` here.
 
+⚠️ **On Alchemist the 8x8x16 coop config is the ONLY f16/bf16 GEMM there is.** The A310
+advertises f16 and bf16 cooperative matrices at 8x8x16 (and s8 at 8x8x32) and nothing else,
+and the bf16 shader is probed AT the shape the f16 scan chose: take the f16 config out and
+bf16 goes with it, leaving `anima_gpu` to refuse a bf16 weight outright (`... is bf16, which
+this device has no GEMM for`). There is no register-tiled fallback at those widths, so that
+one config carries every dense dtype this card can run, and it cannot be disabled to isolate
+it.
+
 ⚠️ **Anima calls `opAttnTCRect` directly, so both CUDA arms run the same hand-PTX kernels on
 its `seq × 512` cross-attention.** `SdpaPlan` does take a rectangular shape now, and the
 dispatching `opAttnCross` would send `--backend cuda` to cuDNN; Anima deliberately does not
@@ -1121,7 +1129,7 @@ token, so the UI can dim an inert field instead of letting it do nothing quietly
 
 In tp-gui the shapes are a saved library: the composer carries a toggle, a shape
 sparkline, a dropdown of named shapes and the amount field, while the expression
-itself is written in Settings (UI.md 13). `--weight-noise` takes the same
+itself is written in Settings. `--weight-noise` takes the same
 expression, so the CLI and the GUI describe schedules identically.
 
 **Sigma is a curve over depth, not a constant.** `core/noise_curve.zig` evaluates an

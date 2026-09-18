@@ -4,20 +4,29 @@
 //! mutex-guarded queue.
 //!
 //! Threading contract:
-//!  - The UI thread calls `submit` (starts a turn) and `poll` (drains streamed
-//!    bytes into the live assistant message, joins a finished worker). It only
-//!    touches `messages` and `ids` while no worker is running (`submit` refuses
-//!    to start a second turn, so the two never race).
+//!  - The engine thread (`Driver.engine_thread`, the host's loop) calls `submit`
+//!    (starts a turn) and `poll` (drains streamed bytes into the live assistant
+//!    message, joins a finished worker). It only touches `messages` and `ids`
+//!    while no worker is running (`submit` refuses to start a second turn, so
+//!    the two never race). Comments below that say "UI thread" mean this one.
 //!  - The worker thread runs `engine.generate`, whose per-token writes land in
 //!    `TokenSink.drain`, the only place `pending` is written. `drain` fires the
 //!    SDL wakeup so the event-driven render loop repaints promptly.
 const std = @import("std");
 const tp = @import("TensorPencil");
+const build_options = @import("build_options");
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-const config = @import("config.zig");
-const toolcall = @import("toolcall.zig");
+
+/// The two dumps below print the user's own prompt and reply. Under
+/// `-Dprivacy` (the default) they are not compiled at all, so a host cannot be
+/// talked into emitting either; `-Dprivacy=false` builds them back for
+/// `chat-probe`, which is where template work happens.
+const content_dumps = !build_options.privacy;
+const config = @import("shared").config;
+const toolcall = @import("shared").toolcall;
+const pipeline_map = @import("shared").pipeline_map;
 const diffuser = @import("diffuser.zig");
-const turn_stats = @import("turn_stats.zig");
+const turn_stats = @import("shared").turn_stats;
 
 const qwen3 = tp.models.qwen3;
 const qwen3_cuda = tp.models.qwen3_cuda;
@@ -99,11 +108,10 @@ const default_trained_context: usize = 32768;
 /// Raw decoded image (packed RGB) awaiting vision encoding.
 const RawImage = struct { rgb: []u8, width: usize, height: usize };
 
-/// Diffusion helpers now live with the engine (see diffuser.zig). Aliased so
-/// this module and its consumers (app.zig, viewer.zig) keep their `chat.*`
-/// references working.
+/// Diffusion helpers live in diffuser.zig; aliased so consumers keep their
+/// `chat.*` references.
 const parseGenAttrs = diffuser.parseGenAttrs;
-const rgbToRgba = diffuser.rgbToRgba;
+const rgbToRgba = tp.image.rgbToRgba;
 const freeGenImage = diffuser.freeGenImage;
 
 /// Tool-only description of the `<image>...</image>` image tool. This is NOT a
@@ -158,6 +166,7 @@ pub const Role = enum { user, assistant };
 /// Re-exported from the diffusion engine so consumers keep using `chat.*`.
 pub const GenStatus = diffuser.GenStatus;
 pub const GenImage = diffuser.GenImage;
+pub const ImageId = diffuser.ImageId;
 
 /// What a message's footer reports: how much of the turn was prompt, how much
 /// was generation, and where the context stood afterwards. ONE struct for both
@@ -180,8 +189,9 @@ pub const TurnStats = turn_stats.TurnStats;
 pub const Variant = struct {
     /// UTF-8 text; grows as tokens stream in (assistant) or fixed (user).
     text: std.ArrayList(u8) = .empty,
-    /// Images requested by this (assistant) variant, in emission order.
-    images: std.ArrayList(*GenImage) = .empty,
+    /// Images requested by this (assistant) variant, in emission order. Ids
+    /// into the engine's list; one that no longer resolves renders as gone.
+    images: std.ArrayList(ImageId) = .empty,
     /// Set once the completed variant has been scanned for image tool calls.
     images_scanned: bool = false,
     /// Set once the completed variant's raw text has been dumped (TP_DUMP_REPLY).
@@ -235,8 +245,6 @@ pub const Variant = struct {
         if (self.reason_open.len > 0) gpa.free(self.reason_open);
         if (self.reason_close.len > 0) gpa.free(self.reason_close);
         if (self.gen_model.len > 0) gpa.free(self.gen_model);
-        // `images` are BORROWED (the app-level engine owns generated images and
-        // frees them); only free the ArrayList storage.
         self.images.deinit(gpa);
     }
 };
@@ -251,7 +259,7 @@ pub const Message = struct {
     /// The message's takes, oldest first, always at least one (init/adopt
     /// guarantee it). `cur` selects the ACTIVE take: the one the UI displays
     /// and the one the model context contains. Regeneration appends a variant;
-    /// ‹/› navigation moves `cur` (see `navTarget`).
+    /// ‹/› navigation moves `cur`.
     variants: std.ArrayList(Variant) = .empty,
     cur: usize = 0,
     /// Images the user attached to this (user) message, displayed inline and
@@ -326,18 +334,6 @@ pub fn dropCheckpointsAfter(gpa: std.mem.Allocator, list: *std.ArrayList(Checkpo
 pub fn clearCheckpoints(gpa: std.mem.Allocator, list: *std.ArrayList(Checkpoint)) void {
     for (list.items) |cp| gpa.free(cp.snap);
     list.clearRetainingCapacity();
-}
-
-/// What the ‹ (back) / › (next) buttons on the last assistant response do,
-/// carousel-style: back/next step through the existing variants; next pressed
-/// on the NEWEST variant means "regenerate a fresh one". Back on the first
-/// variant does nothing (the UI disables it). Pure, so it's unit-testable.
-pub const Nav = union(enum) { none, select: usize, regenerate };
-pub fn navTarget(cur: usize, n_variants: usize, dir: enum { back, next }) Nav {
-    return switch (dir) {
-        .back => if (cur == 0) .none else .{ .select = cur - 1 },
-        .next => if (cur + 1 < n_variants) .{ .select = cur + 1 } else .regenerate,
-    };
 }
 
 pub const DiffConfig = diffuser.DiffConfig;
@@ -507,11 +503,11 @@ pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed:
         .system_prompt = try arena.dupe(u8, cfg.system_prompt.opt() orelse config.default_system_prompt),
         .seed = seed,
         .sampling = samplingParams(cfg),
-        .backend = diffuser.toPipelineBackend(cfg.llm_backend),
+        .backend = pipeline_map.toPipelineBackend(cfg.llm_backend),
         .weight_noise_curve = if (cfg.weight_noise) try arena.dupe(u8, cfg.weight_noise_curve.slice()) else "",
         .weight_noise_amount = cfg.weight_noise_amount,
         .weight_noise_seed = @truncate(seed),
-        .images_enabled = cfg.diffusion_model.opt() != null,
+        .images_enabled = cfg.image_tool,
         .mmproj_path = if (cfg.vision_tower.opt()) |m| try arena.dupe(u8, m) else null,
         .vram_split = cfg.vram_split,
         .vram_limit_frac = cfg.vram_limit_frac,
@@ -592,8 +588,8 @@ pub const Session = struct {
     /// `system_text` mid-turn in `buildRenderedTurn`, so it must not be swapped
     /// under it). Only staged for render-driven (template) sessions, where the
     /// re-rendered system turn + reconcile apply it on the next message; the
-    /// hand-glue path can't change it live (app.zig forces a reload there). Null
-    /// when nothing is pending.
+    /// hand-glue path can't change it live (`Driver.applySettings` reloads
+    /// there). Null when nothing is pending.
     pending_system_text: ?[]const u8 = null,
     /// Per-turn sampling seeds, drawn at each turn boundary (`submit`, UI
     /// thread, same discipline as `pending_sampling`). Deliberately NOT
@@ -659,12 +655,9 @@ pub const Session = struct {
     /// handed from `buildTurn` to `publishPromptStats`. Worker thread only.
     turn_prompt_tokens: usize = 0,
 
-    // Whether the image tool is available (a diffusion model is configured).
-    // The diffusion engine itself is owned app-level (persistent across mode
-    // switches); this session only PRODUCES tool-call GenImages (scanImageCalls)
-    // into its transcript and backs the engine's VRAM coordinator (LLM layer
-    // eviction) + queue source (nextPending over the transcript). The flag gates
-    // the image-tool system prompt and the post-turn scan.
+    /// Whether the image tool is available (a diffusion model is configured).
+    /// Gates the image-tool system prompt and the post-turn scan; the session
+    /// only REPORTS the calls it finds (`scanNewImages`), nothing renders here.
     images_enabled: bool = false,
     /// The LLM's dynamic-offload budget (bytes), the ceiling it keeps device
     /// usage under. Equals `vram_limit` (the meter's limit handle); the offload
@@ -799,9 +792,9 @@ pub const Session = struct {
             .cpu, .vulkan => return error.UnsupportedLlmBackend,
         };
         errdefer self.be.deinit();
-        // Weight noise from the config, here rather than in the app so a headless
-        // driver (chat-probe) perturbs identically. Live changes go straight to
-        // this atomic from the UI thread; see app.applyWeightNoise.
+        // Weight noise from the config, so a headless driver (chat-probe) perturbs
+        // identically. Live changes go straight to this atomic from the engine
+        // thread (`Driver.applySettings`).
         self.be.weight_noise.seed = cfg.weight_noise_seed;
         self.be.weight_noise.amount = cfg.weight_noise_amount;
         self.be.weight_noise.setCurve(cfg.weight_noise_curve);
@@ -1067,13 +1060,20 @@ pub const Session = struct {
             // bites when the image model actually loads (imageVramEnter settles
             // the LLM to its share then). With diffusion idle the LLM keeps
             // everything up to the ceiling.
-            const total: f32 = @floatFromInt(self.be.ctx.memGetInfo().total);
-            self.vram_limit = @intFromFloat(cfg.vram_limit_frac * total);
-            self.vram_share = @intFromFloat(cfg.vram_split * total);
-            self.vram_budget = self.vram_limit;
-            switch (self.arch) {
-                inline else => |*a| _ = a.model.autoOffload(self.vram_budget) catch |err|
-                    std.log.warn("dynamic offload disabled ({t}); staying resident", .{err}),
+            // A failed query must not resolve the fractions against a zero card:
+            // that is a zero ceiling, and it would offload the model being loaded.
+            // The budget fields stay 0, which every planner reads as "no ceiling".
+            if (self.be.ctx.memGetInfo()) |mi| {
+                const total: f32 = @floatFromInt(mi.total);
+                self.vram_limit = @intFromFloat(cfg.vram_limit_frac * total);
+                self.vram_share = @intFromFloat(cfg.vram_split * total);
+                self.vram_budget = self.vram_limit;
+                switch (self.arch) {
+                    inline else => |*a| _ = a.model.autoOffload(self.vram_budget) catch |err|
+                        std.log.warn("dynamic offload disabled ({t}); staying resident", .{err}),
+                }
+            } else {
+                std.log.warn("[vram] card size unknown: no offload ceiling this session", .{});
             }
         }
 
@@ -1230,7 +1230,7 @@ pub const Session = struct {
     }
 
     /// Park the decode worker at the next token boundary (holding KV + weights),
-    /// or release it. UI-thread; driven by the LLM's own pause button. On resume,
+    /// or release it. Engine thread; driven by the LLM's own pause verb. On resume,
     /// dispatch any turn that was queued while paused (staged by `submit` but
     /// never spawned, see the `turn_staged && !busy() && worker == null` state).
     pub fn setPaused(self: *Session, paused: bool) void {
@@ -1273,18 +1273,9 @@ pub const Session = struct {
         return self.pause.isPaused(self.io);
     }
 
-    /// Drop the transcript's BORROWED references to engine-owned generated
-    /// images (the pointers, not the images). The app calls this right before it
-    /// frees the diffusion engine (diffusion model cleared) so no message is
-    /// left pointing at freed memory. Text is untouched.
-    pub fn clearImageRefs(self: *Session) void {
-        for (self.messages.items) |*m|
-            for (m.variants.items) |*v| v.images.clearRetainingCapacity();
-    }
-
     /// Whether this session renders prompts from the model's embedded
     /// chat_template (vs the hand glue). A changed system prompt can be applied
-    /// live only in this mode; app.zig reloads otherwise.
+    /// live only in this mode; `Driver.applySettings` reloads otherwise.
     pub fn templateActive(self: *const Session) bool {
         return self.template != null;
     }
@@ -1320,13 +1311,20 @@ pub const Session = struct {
         self.pending_max_new_tokens = resolveMaxNew(cfg.max_new_tokens, self.opts.max_context);
         // Checkpoint budget likewise (the worker reads it in takeCheckpoint).
         self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
+        // Whether the model is told the image tool exists is the client's
+        // answer about the whole fleet, and it moves while a session is
+        // resident: a host that renders nothing itself gains the tool the
+        // moment one that does comes up. Live here, because everything reading
+        // it (the tools block, the system text, the reply scan) is per turn;
+        // a session that bakes its system prompt in is reloaded instead.
+        self.images_enabled = cfg.image_tool;
         // System prompt: for a render-driven (template) session, restage it so
         // the next turn re-renders the new system turn and `reconcile` rewinds
         // the KV to apply it, TODO #8, "changing system prompt takes effect on
         // the next message". Staged (not applied) to avoid racing the worker's
         // read of `system_text`; `submit`/`regenerate` adopt it at the boundary.
         // Non-template sessions bake the system into `initial_ids` and can't do
-        // this live, app.zig forces a transcript-preserving reload for them.
+        // this live; `Driver.applySettings` forces a transcript-preserving reload for them.
         if (self.template != null) {
             const base = cfg.system_prompt.opt() orelse config.default_system_prompt;
             const next = composeSystemText(self.gpa, self.images_enabled, base) catch return;
@@ -1633,10 +1631,11 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        // A worker parked at the pause gate returns only for a cancel or a resume.
+        self.requestCancel();
         if (self.worker) |t| t.join();
-        // The diffusion engine is owned app-level, not here, the app stops it
-        // (so no diffusion worker still touches a transcript GenImage) before
-        // tearing the session down.
+        // The Driver owns the diffusion engine and has stopped it before this, so
+        // no diffusion worker still touches a transcript GenImage.
         for (self.attach_view.items) |gi| freeGenImage(self.gpa, gi);
         self.attach_view.deinit(self.gpa);
         for (self.attach_rgb.items) |im| self.gpa.free(im.rgb);
@@ -1781,7 +1780,7 @@ pub const Session = struct {
         const rgb = try self.gpa.dupe(u8, rgb_src);
         errdefer self.gpa.free(rgb);
         const gi = try self.gpa.create(GenImage);
-        gi.* = .{ .prompt = try self.gpa.dupe(u8, ""), .wake = self.wake, .io = self.io, .width = w, .height = h };
+        gi.* = .{ .id = diffuser.nextImageId(), .prompt = try self.gpa.dupe(u8, ""), .wake = self.wake, .io = self.io, .width = w, .height = h };
         gi.rgba = try rgbToRgba(self.gpa, rgb, w, h);
         gi.status = .init(@intFromEnum(GenStatus.done));
         try self.attach_view.append(self.gpa, gi);
@@ -1801,26 +1800,6 @@ pub const Session = struct {
         self.wake();
     }
 
-    /// Attach an RGBA image (e.g. a generated one) to the next message so the
-    /// model can see it, converts to the RGB the encoder expects.
-    pub fn attachRgba(self: *Session, rgba: []const u8, w: usize, h: usize) !void {
-        if (!self.hasVit()) return;
-        const px = w * h;
-        const rgb = try self.gpa.alloc(u8, px * 3);
-        defer self.gpa.free(rgb);
-        for (0..px) |i| {
-            rgb[i * 3 + 0] = rgba[i * 4 + 0];
-            rgb[i * 3 + 1] = rgba[i * 4 + 1];
-            rgb[i * 3 + 2] = rgba[i * 4 + 2];
-        }
-        try self.attachImage(rgb, w, h);
-    }
-
-    /// Append a user turn and spawn the worker to stream the reply. No-op if a
-    /// turn is already generating or there is nothing to send. Also refused while
-    /// a turn is staged but not yet running (queued while paused, Tier 2): the
-    /// LLM runs one turn at a time, so a second submit would clobber the staged
-    /// turn's data. The queued turn must run (on resume) or be canceled first.
     /// Queue a note for the model to read at the next turn boundary. Takes
     /// ownership of `text`.
     pub fn queueNote(self: *Session, text: []u8) void {
@@ -1828,6 +1807,11 @@ pub const Session = struct {
         self.wake();
     }
 
+    /// Append a user turn and spawn the worker to stream the reply. No-op if a
+    /// turn is already generating or there is nothing to send. Also refused while
+    /// a turn is staged but not yet running (queued while paused, Tier 2): the
+    /// LLM runs one turn at a time, so a second submit would clobber the staged
+    /// turn's data. The queued turn must run (on resume) or be canceled first.
     pub fn submit(self: *Session, text: []const u8) !void {
         if (self.busy() or self.turn_staged) return;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -1846,17 +1830,7 @@ pub const Session = struct {
         // re-runs one that was already measured, and leaves its numbers alone).
         self.fresh_user_turn = true;
 
-        // Flush any queued outcome notes FIRST, as their own messages, so the
-        // model reads them before the user's message rather than having them
-        // glued onto it as if the user had typed them.
-        for (self.pending_notes.items) |n| {
-            var nm = try Message.init(self.gpa, .user);
-            nm.synthetic = true;
-            try nm.active().text.appendSlice(self.gpa, n);
-            try self.messages.append(self.gpa, nm);
-            self.gpa.free(n);
-        }
-        self.pending_notes.clearRetainingCapacity();
+        try flushNotes(self.gpa, &self.messages, &self.pending_notes);
 
         var um = try Message.init(self.gpa, .user);
         if (trimmed.len > 0) try um.active().text.appendSlice(self.gpa, trimmed);
@@ -2558,7 +2532,7 @@ pub const Session = struct {
         // What this turn's user message costs the prompt, for its footer.
         self.turn_prompt_tokens = self.measureTurnPrompt(ropts, msgs.items, exp, grids.items, desired.items.len);
 
-        if (getenv("TP_DUMP_CTX") != null) {
+        if (content_dumps and getenv("TP_DUMP_CTX") != null) {
             const dbg = self.tok.decodeAlloc(self.gpa, desired.items) catch "";
             defer if (dbg.len > 0) self.gpa.free(dbg);
             std.log.info("[tmpl] rendered prompt ({d} tok):\n{s}\n[tmpl] end", .{ desired.items.len, dbg });
@@ -2801,7 +2775,7 @@ pub const Session = struct {
         } else {
             try chat.appendUser(&self.tok, self.gpa, self.turn_text, &self.ids);
             try chat.openAssistant(&self.tok, self.gpa, &self.ids);
-            if (getenv("TP_DUMP_CTX") != null) {
+            if (content_dumps and getenv("TP_DUMP_CTX") != null) {
                 const dbg = self.tok.decodeAlloc(self.gpa, self.ids.items) catch "";
                 defer if (dbg.len > 0) self.gpa.free(dbg);
                 std.log.info("[chat] prompt ({d} tok):\n{s}\n[chat] end", .{ self.ids.items.len, dbg });
@@ -3017,12 +2991,14 @@ pub const Session = struct {
     }
 
     /// Once a turn completes, scan the last assistant message's ACTIVE variant
-    /// (once) for `<image>` tool calls and queue a GenImage for each into its
-    /// transcript, using the app-level engine's defaults + seed. Called by the
-    /// app after `poll` (chat mode). The app then pumps the engine.
-    pub fn scanNewImages(self: *Session, d: *diffuser.Diffuser) void {
+    /// (once) for `<image>` tool calls and append each to `out`. Nothing is
+    /// queued here: the client places these like any other render, so one the
+    /// model asked for can run on whichever host is free. Called by the host
+    /// after `poll`.
+    pub fn scanNewImages(self: *Session, gpa: std.mem.Allocator, defaults: CallDefaults, out: *std.ArrayList(ImageCall)) void {
         if (self.busy() or self.messages.items.len == 0) return;
-        const last = &self.messages.items[self.messages.items.len - 1];
+        const mi = self.messages.items.len - 1;
+        const last = &self.messages.items[mi];
         if (last.role != .assistant) return;
         const v = last.active();
         if (!v.reply_dumped) {
@@ -3031,7 +3007,21 @@ pub const Session = struct {
         }
         if (!self.images_enabled or v.images_scanned) return;
         v.images_scanned = true;
-        self.scanImageCalls(v, d) catch |err| std.log.err("scan image calls: {t}", .{err});
+        parseImageCalls(gpa, v, mi, last.cur, defaults, out) catch |err| std.log.err("scan image calls: {t}", .{err});
+    }
+
+    /// Parse the last reply's tool calls again, whether or not they were
+    /// reported before. A client that was not listening the first time has to
+    /// be told what it missed; placing one twice is prevented by the client,
+    /// which knows which calls it has already taken.
+    pub fn rescanImages(self: *Session, gpa: std.mem.Allocator, defaults: CallDefaults, out: *std.ArrayList(ImageCall)) void {
+        if (self.busy() or !self.images_enabled or self.messages.items.len == 0) return;
+        const mi = self.messages.items.len - 1;
+        const last = &self.messages.items[mi];
+        if (last.role != .assistant) return;
+        parseImageCalls(gpa, last.active(), mi, last.cur, defaults, out) catch |err| {
+            std.log.err("rescan image calls: {t}", .{err});
+        };
     }
 
     /// TP_DUMP_REPLY: print a finished variant's RAW text once, markers and all,
@@ -3040,7 +3030,7 @@ pub const Session = struct {
     /// since both render as a bare answer. Pairs with TP_DUMP_CTX, which shows
     /// the prompt the text was generated from.
     fn dumpReply(v: *const Variant) void {
-        if (getenv("TP_DUMP_REPLY") == null) return;
+        if (!content_dumps or getenv("TP_DUMP_REPLY") == null) return;
         std.log.info("[reply] {d} bytes, thought_len={d}, thought_primed={}, raw:\n{s}\n[reply] end", .{
             v.text.items.len, thoughtLen(v), v.thought_primed, v.text.items,
         });
@@ -3092,45 +3082,88 @@ pub const Session = struct {
         v.thought_primed = toolcall.endsInsideThought(tail, live);
     }
 
-    /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
-    /// variant and queue a GenImage (status .pending) for each. Optional tag
-    /// attributes (width/height/steps/seed) override the engine defaults.
-    fn scanImageCalls(self: *Session, v: *Variant, d: *diffuser.Diffuser) !void {
-        // Scan only the answer, not the reasoning block, and only line-anchored
-        // tags, see toolcall.answerText/nextImageCall for why (spurious fires
-        // from the model merely *mentioning* the tag while thinking/explaining).
-        var rest = toolcall.answerText(v.text.items, Variant.markersFor(v), v.thought_primed);
-        while (true) {
-            const c = switch (toolcall.nextImageCall(rest)) {
-                .none, .partial => break,
-                .call => |c| c,
-            };
-            if (c.prompt.len > 0) {
-                const gi = try self.gpa.create(GenImage);
-                gi.* = .{
-                    .prompt = try self.gpa.dupe(u8, c.prompt),
-                    .wake = self.wake,
-                    .io = self.io,
-                    .req_width = d.opts.width,
-                    .req_height = d.opts.height,
-                    .req_steps = d.opts.steps,
-                    .req_seed = 0,
-                };
-                parseGenAttrs(c.attrs, gi);
-                // Assign a fresh, distinct seed now (unless the tag set one
-                // explicitly) so it's known and displayable immediately, even
-                // while the image is still queued. Advancing per image keeps
-                // repeated generations varied.
-                if (gi.req_seed == 0) gi.req_seed = d.nextSeed();
-                // The engine OWNS the image (unified queue + history); the
-                // variant keeps a borrowed pointer for inline display.
-                try d.enqueue(gi);
-                try v.images.append(self.gpa, gi);
-            }
-            rest = c.after;
-        }
-    }
 };
+
+/// Write each queued note into the transcript as its own synthetic user
+/// message, ahead of the turn being submitted, so the model reads it as a note
+/// instead of having it glued onto what the user typed. Frees each note; a
+/// failure part way leaves the rest of them queued and intact.
+fn flushNotes(gpa: std.mem.Allocator, msgs: *std.ArrayList(Message), notes: *std.ArrayList([]u8)) !void {
+    while (notes.items.len > 0) {
+        const n = notes.orderedRemove(0);
+        defer gpa.free(n);
+        var nm = try Message.init(gpa, .user);
+        errdefer nm.deinit(gpa);
+        nm.synthetic = true;
+        try nm.active().text.appendSlice(gpa, n);
+        try msgs.append(gpa, nm);
+    }
+}
+
+/// The size a tool call renders at when its tag does not say. The host fills it
+/// from the settings, because a chat host may hold no image engine at all and
+/// must still report the call.
+pub const CallDefaults = struct { width: usize = 1024, height: usize = 1024, steps: usize = 20 };
+
+/// One `<image>` tool call a finished reply made. `prompt` borrows the
+/// variant's text, which stands until that variant is regenerated or freed.
+pub const ImageCall = struct {
+    msg: usize = 0,
+    variant: usize = 0,
+    prompt: []const u8 = "",
+    width: usize = 1024,
+    height: usize = 1024,
+    steps: usize = 20,
+    /// 0 unless the tag named one; whoever renders it draws a fresh seed.
+    seed: u64 = 0,
+};
+
+/// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
+/// variant into `out`. Optional tag attributes (width/height/steps/seed)
+/// override `defaults`. A free function so the scan is testable with no session.
+pub fn parseImageCalls(
+    gpa: std.mem.Allocator,
+    v: *const Variant,
+    msg: usize,
+    variant: usize,
+    defaults: CallDefaults,
+    out: *std.ArrayList(ImageCall),
+) !void {
+    // Scan only the answer, not the reasoning block, and only line-anchored
+    // tags, see toolcall.answerText/nextImageCall for why (spurious fires
+    // from the model merely *mentioning* the tag while thinking/explaining).
+    var rest = toolcall.answerText(v.text.items, Variant.markersFor(v), v.thought_primed);
+    while (true) {
+        const c = switch (toolcall.nextImageCall(rest)) {
+            .none, .partial => break,
+            .call => |c| c,
+        };
+        if (c.prompt.len > 0) {
+            // parseGenAttrs writes into a GenImage; that is the only reason
+            // one exists here.
+            var attrs: GenImage = .{
+                .prompt = "",
+                .wake = undefined,
+                .io = undefined,
+                .req_width = defaults.width,
+                .req_height = defaults.height,
+                .req_steps = defaults.steps,
+                .req_seed = 0,
+            };
+            parseGenAttrs(c.attrs, &attrs);
+            try out.append(gpa, .{
+                .msg = msg,
+                .variant = variant,
+                .prompt = c.prompt,
+                .width = attrs.req_width,
+                .height = attrs.req_height,
+                .steps = attrs.req_steps,
+                .seed = attrs.req_seed,
+            });
+        }
+        rest = c.after;
+    }
+}
 
 // ── Tests (pure, CPU-only; run via `zig build gui-test`) ─────────────────────
 
@@ -3145,18 +3178,6 @@ test "resolveMaxNew: 0 means the context ceiling, any other value passes through
     try std.testing.expectEqual(@as(usize, 2048), resolveMaxNew(2048, 32768));
     try std.testing.expectEqual(@as(usize, 99999), resolveMaxNew(99999, 4096));
     try std.testing.expectEqual(@as(usize, 1), resolveMaxNew(1, 4096));
-}
-
-test "navTarget: carousel semantics for the back/next buttons" {
-    // Single variant: back does nothing (the UI disables it), next regenerates.
-    try std.testing.expectEqual(Nav.none, navTarget(0, 1, .back));
-    try std.testing.expectEqual(Nav.regenerate, navTarget(0, 1, .next));
-    // Middle of three: both directions navigate.
-    try std.testing.expectEqual(Nav{ .select = 0 }, navTarget(1, 3, .back));
-    try std.testing.expectEqual(Nav{ .select = 2 }, navTarget(1, 3, .next));
-    // Newest of three: back navigates, next regenerates (appends a fourth).
-    try std.testing.expectEqual(Nav{ .select = 1 }, navTarget(2, 3, .back));
-    try std.testing.expectEqual(Nav.regenerate, navTarget(2, 3, .next));
 }
 
 test "checkpoint budget: oldest evicted first; an oversize newest is dropped too" {
@@ -3222,6 +3243,72 @@ test "Message variants: regenerate bookkeeping keeps older takes" {
     m.cur = 0;
     try std.testing.expectEqualStrings("first take", m.active().text.items);
     try std.testing.expect(m.active().images_scanned);
+}
+
+// A tool call is REPORTED, never rendered here: the client places it, so the
+// picture can be drawn on whichever host is free. Anything queued or recorded
+// on this side would pin it to the machine holding the chat.
+test "an image tool call is parsed and nothing is queued for it" {
+    const gpa = std.testing.allocator;
+    var v: Variant = .{};
+    defer v.deinit(gpa);
+    v.reason_open = try gpa.dupe(u8, "<think>");
+    v.reason_close = try gpa.dupe(u8, "</think>");
+    try v.text.appendSlice(gpa,
+        \\<think>
+        \\<image>a cat I am only considering</image>
+        \\</think>
+        \\Here you go, though an inline <image>mention</image> draws nothing.
+        \\<image>a red fox in snow</image>
+        \\<image width=1536 height=1024 steps=12 seed=42>a tall portrait</image>
+    );
+    var out: std.ArrayList(ImageCall) = .empty;
+    defer out.deinit(gpa);
+    try parseImageCalls(gpa, &v, 3, 1, .{ .width = 1024, .height = 768, .steps = 20 }, &out);
+
+    errdefer std.debug.print("{d} calls parsed\n", .{out.items.len});
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("a red fox in snow", out.items[0].prompt);
+    try std.testing.expectEqual(ImageCall{
+        .msg = 3,
+        .variant = 1,
+        .prompt = out.items[0].prompt,
+        .width = 1024,
+        .height = 768,
+        .steps = 20,
+        .seed = 0,
+    }, out.items[0]);
+    // The tag's attributes win over the defaults; the rest keep them.
+    try std.testing.expectEqualStrings("a tall portrait", out.items[1].prompt);
+    try std.testing.expectEqual(@as(usize, 1536), out.items[1].width);
+    try std.testing.expectEqual(@as(usize, 1024), out.items[1].height);
+    try std.testing.expectEqual(@as(usize, 12), out.items[1].steps);
+    try std.testing.expectEqual(@as(u64, 42), out.items[1].seed);
+    try std.testing.expectEqual(@as(usize, 0), v.images.items.len);
+}
+
+test "a queued note becomes its own synthetic message, in order, before the turn" {
+    const gpa = std.testing.allocator;
+    var msgs: std.ArrayList(Message) = .empty;
+    var notes: std.ArrayList([]u8) = .empty;
+    defer {
+        for (msgs.items) |*m| m.deinit(gpa);
+        msgs.deinit(gpa);
+        for (notes.items) |n| gpa.free(n);
+        notes.deinit(gpa);
+    }
+    try notes.append(gpa, try gpa.dupe(u8, "[image tool] finished: 1024x1024, seed 7"));
+    try notes.append(gpa, try gpa.dupe(u8, "[image tool] failed: out of VRAM"));
+    try flushNotes(gpa, &msgs, &notes);
+
+    try std.testing.expectEqual(@as(usize, 0), notes.items.len);
+    try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
+    for (msgs.items) |*m| {
+        try std.testing.expectEqual(Role.user, m.role);
+        try std.testing.expect(m.synthetic);
+    }
+    try std.testing.expectEqualStrings("[image tool] finished: 1024x1024, seed 7", msgs.items[0].active().text.items);
+    try std.testing.expectEqualStrings("[image tool] failed: out of VRAM", msgs.items[1].active().text.items);
 }
 
 // The arch list in `llm/session.zig` and the steppers that actually publish a

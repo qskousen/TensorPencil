@@ -232,6 +232,9 @@ pub const Gguf = struct {
     /// Declared data-section length. Equals `payload.len` except on a
     /// header-only open.
     payload_len: usize,
+    /// Bytes from the magic to the end of the tensor table, before the
+    /// alignment padding: the header exactly, whatever chunk size read it.
+    header_len: usize,
     /// Opened with `openHeader`: metadata, names, shapes and dtypes are all
     /// present, but no tensor has bytes (`get` returns an empty slice).
     header_only: bool = false,
@@ -506,6 +509,7 @@ pub const Gguf = struct {
             .mapping = null,
             .payload = payload,
             .payload_len = payload_len,
+            .header_len = r.pos,
             .header_only = file_len != null,
             .index = index,
             .kv = kv,

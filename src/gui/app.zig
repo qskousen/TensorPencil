@@ -10,248 +10,477 @@ const dvui = @import("dvui");
 const SDLBackend = @import("backend");
 const tp = @import("TensorPencil");
 const vram = tp.vram;
-const chat = @import("chat.zig");
-const toolcall = @import("toolcall.zig");
+const toolcall = @import("shared").toolcall;
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
 const markdown_view = @import("markdown_view.zig");
 const viewer = @import("viewer.zig");
-const config = @import("config.zig");
+const config = @import("shared").config;
 const config_view = @import("config_view.zig");
-const selection = @import("selection.zig");
-const model_spec = @import("model_spec.zig");
+const selection = @import("client").selection;
+const model_spec = @import("shared").model_spec;
 const model_lib = @import("model_lib.zig");
 const model_menu = @import("model_menu.zig");
 const image_view = @import("image_view.zig");
-const diffuser = @import("diffuser.zig");
+const prompt_history = @import("client").prompt_history;
+const pipeline_map = @import("shared").pipeline_map;
 const clipboard = @import("clipboard.zig");
 const meter = @import("meter.zig");
 const status_bar = @import("status_bar.zig");
+const toast = @import("toast.zig");
 const style = @import("style.zig");
 const shell = @import("shell.zig");
 const bubbles = @import("bubbles.zig");
 const queue_rail = @import("queue_rail.zig");
-const history = @import("history.zig");
-const framing = @import("framing.zig");
-const turn_stats = @import("turn_stats.zig");
-const sysmon = @import("sysmon.zig");
+const history = @import("client").history;
+const framing = @import("shared").framing;
+const turn_stats = @import("shared").turn_stats;
+const hosts = @import("client").hosts;
+const models = @import("client").models;
+const sync = @import("client").sync;
+const mirror = @import("client").mirror;
+const save_image = @import("client").save_image;
+const wire = @import("serve").wire;
 const vips = @import("vips");
 
-// dvui frames are argless, so app state is process-global (the dvui idiom).
-//
-// The session (LLM + optional diffusion/vision) is (re)loaded on a background
-// thread whenever settings change, so it can be swapped without a restart and
-// the UI stays responsive with a "Loading..." state. `g_session` is only read by
-// the UI thread while `g_loading` is false (release/acquire hand-off from the
-// loader), so the pointer swap is race-free without a lock.
-var g_session: ?*chat.Session = null;
-/// The single owner of LLM<->diffusion VRAM arbitration. Its `llm` participant is
-/// (re)bound to `g_session` under `g_session_mu` on every load/unload. Driven by
-/// the coordinator hooks (`vcEnter`/`vcExit`) and the meter policy.
-var g_arbiter: vram.Arbiter = .{};
-var g_session_arena: ?*std.heap.ArenaAllocator = null; // load-once weights, freed on reload
-var g_loading: std.atomic.Value(bool) = .init(false);
-var g_loader: ?std.Thread = null;
-var g_reload_requested: bool = false;
-// Text stashed when the user sends the first chat message with no LLM resident:
-// the model lazy-loads, then this is auto-submitted (see maybeStartReload).
-var g_pending_submit: ?[]u8 = null;
+/// The engine host: a tp-serve process, spawned beside this binary when none
+/// is listening, plus every host the settings list. The app talks to them only
+/// in wire requests and reads them only through their mirrors; `g_m` is the
+/// chat host's. No engine object exists in this process.
+var g_hosts: hosts.Hosts = undefined;
+var g_m: *mirror.Mirror = undefined;
 
-// Images dropped/pasted before the LLM has loaded (the lazy first message). Held
-// here with their decoded RGB (fed to `attachImage` once a session exists) plus
-// a display RGBA (for the pre-load thumbnail strip). `maybeStartReload` drains
-// them into the fresh session so the first message carries its attachments.
-const StagedImage = struct { rgb: []u8, rgba: []u8, width: usize, height: usize };
-var g_staged_images: std.ArrayList(StagedImage) = .empty;
+/// Every host's catalog as one list, one row per file (`client/models.zig`).
+/// Menus, the side-file pickers and the selection all read THIS, never one
+/// host's: a model the render host holds and the chat host does not is still a
+/// model this client can pick, and the scheduler is what decides where it runs.
+var g_models: models.Union = undefined;
+/// `Hosts.modelSeq` when `g_models` was built.
+var g_model_seq: u64 = 0;
 
-// Cached "does the configured LLM support a reasoning block?" answer, so the
-// thinking toggle can show before the model loads. Reading a GGUF header is
-// cheap but not per-frame cheap, so we memoize and re-probe only when the
-// configured model path changes (including a Settings model swap).
-var g_think_probe_path: [config.max_path]u8 = undefined;
-var g_think_probe_len: usize = 0;
-var g_think_probe_result: bool = false;
-var g_think_probe_effort: bool = false;
-var g_think_probe_valid: bool = false;
-/// Same memo for the weight-noise capability probe. Separate from the thinking
-/// one because the two answers come from different things (a chat template vs.
-/// which kernels were wired) and a model can support either without the other.
-var g_noise_probe_path: [config.max_path]u8 = undefined;
-var g_noise_probe_len: usize = 0;
-var g_noise_probe_result: bool = false;
-var g_noise_probe_valid: bool = false;
+/// Rebuild the merged view. Builds before freeing, so a failure leaves the
+/// view that was standing rather than an empty menu.
+fn rebuildModels() void {
+    var buf: [models.max_sources]models.Source = undefined;
+    const next = models.build(g_gpa, g_hosts.modelSources(&buf)) catch |err| {
+        std.log.err("merging the hosts' catalogs: {t}", .{err});
+        return;
+    };
+    g_models.deinit();
+    g_models = next;
+}
+/// VRAM meter handle positions (fractions of the card). The meter mutates them
+/// in place on drag; release sends them.
+/// One bar's sampling state per host, claimed by host id on first sight. The
+/// handles themselves live on the slot (`hosts.Slot.meter`), so the host list
+/// can greet a host with its own values without asking the view layer.
+var g_views: [config.max_hosts + 1]status_bar.View = @splat(.{});
+var g_view_ids: [config.max_hosts + 1]?hosts.HostId = @splat(null);
+/// Whose bar is being rendered: the meter's callbacks take no argument, so
+/// this is how a drag knows which host it moved.
+var g_meter_host: hosts.HostId = 0;
 
-// The diffusion engine, APP-LEVEL and persistent (survives chat<->image mode
-// switches, so the image model isn't reloaded each way). It owns the single
-// unified image queue/history shared by the chat tool-call path and the studio.
-// Built when a diffusion model is configured; its resident pipeline still loads
-// lazily on the first image. The VRAM coordinator it's given dispatches to
-// `g_session` when an LLM is resident, else no-ops (diffusion gets everything).
-var g_diffuser: ?diffuser.Diffuser = null;
-// VRAM meter handle positions (fractions of the card): split = LLM|diffusion
-// contention boundary, limit = ceiling. Seeded from config at startup, mutated
-// in place on drag, and (on release) persisted + applied live. Defaults are the
-// config defaults; run() overwrites them from the loaded config.
-var g_split: f32 = 0.60;
-var g_limit: f32 = 0.95;
-// Eject (⏏) state: set when the user clicks an end button. Fully unloads that
-// model to free VRAM. If the model is busy the request stays ARMED and fires
-// once it (and the shared image queue) go idle, see maybeProcessEjects. The
-// meter renders the armed state (accent border) so the deferral is visible.
-var g_llm_eject_armed: bool = false;
-var g_diff_eject_armed: bool = false;
-// LLM pause is mirrored app-level so it survives an unload (the gate itself lives
-// on the Session, which is destroyed on unload, unlike the diffuser's gate,
-// which lives on the persistent Diffuser). The button reads this; setPaused keeps
-// the session gate in sync while one is resident. (Tier 3.)
-var g_llm_paused: bool = false;
-// In-flight LLM state saved on an unload-while-paused: the raw `ids` (prompt +
-// partial open response) carried across the unload so a reload can reprefill +
-// continue that exact response. `g_carry` holds the display transcript alongside.
-const LlmSuspend = struct { ids: []u32, midturn: bool };
-var g_llm_suspend: ?LlmSuspend = null;
-// Set when a reload should CONTINUE a suspended mid-turn response (spawn a decode
-// worker after the fresh session adopts the carried `ids`). (Tier 3.)
-var g_pending_continue: bool = false;
-// Set when the user hits › (regenerate) while the LLM is unloaded: lazy-load,
-// then regenerate the last reply once the carried transcript is adopted.
-var g_pending_regenerate: bool = false;
-// Guards `g_session` teardown against the diffusion WORKER thread, which reads
-// the session in its VRAM-coordinator hooks (budget/reclaim). Held while a full
-// LLM eject frees the session so a concurrent worker can't touch freed memory.
-// The UI-thread hooks (enter/exit) never overlap the eject (same thread), so
-// only the worker-thread hooks + the teardown take it.
-var g_session_mu: std.Io.Mutex = std.Io.Mutex.init;
-// The MIRROR of g_session_mu: guards `g_diffuser` / `g_arbiter.diffusion` against
-// the LLM WORKER thread, which now reaches the image model through
-// `llmForeignReclaim` when an allocation can't be satisfied from its own context.
-// `syncDiffuser`/`freeDiffuser` (UI thread) publish and retract the participant
-// under it, so the worker never dereferences a freed engine.
-//
-// Lock order: g_session_mu ABOVE g_diff_mu. Nothing may take them the other way.
-//
-// Each worker thread takes exactly one: the diffusion worker takes g_session_mu
-// to reach the LLM, the LLM worker takes g_diff_mu to reach diffusion. The UI
-// thread nests them in that order and only there, via `applyMeterPolicy` ->
-// `Arbiter.rebalance` -> an idle LLM's settle -> `residency.promoteBack`, which
-// asks the image model for card space when its own promote won't fit. That
-// nesting cannot contend with the LLM worker's own `llmForeignReclaim`: `settle`
-// applies directly only while the LLM is idle, and the worker path only runs
-// while it is busy. `Diffuser.res_mu` sits below both and is only ever tryLock'd
-// from a foreign thread, so it cannot participate in a cycle either.
-var g_diff_mu: std.Io.Mutex = std.Io.Mutex.init;
+fn viewFor(id: hosts.HostId) *status_bar.View {
+    for (g_view_ids, 0..) |held, i| if (held == id) return &g_views[i];
+    for (g_view_ids, 0..) |held, i| if (held == null) {
+        g_view_ids[i] = id;
+        g_views[i] = .{};
+        return &g_views[i];
+    };
+    // More hosts than bars: the last one shares, which is only cosmetic.
+    return &g_views[g_views.len - 1];
+}
 
-/// The thread running the frame loop. A few cross-model paths are reachable from
-/// both the UI thread and a worker, and may only WAIT on the UI thread's own
-/// work from a worker (see `awaitDeferredRelease`).
-var g_ui_thread: std.Thread.Id = 0;
+/// Forget the sampling history of hosts that are gone, so a later host with a
+/// recycled id does not inherit somebody else's sparklines.
+fn dropStaleViews() void {
+    for (&g_view_ids) |*held| if (held.*) |id| {
+        if (g_hosts.slotOf(id) == null) held.* = null;
+    };
+}
+/// The text of a message sent while no LLM was resident, shown as a bubble
+/// until the host reports it taken.
+var g_pending_text: ?[]u8 = null;
+/// Images attached before a session existed: uploaded to the host, kept here
+/// for the thumbnail strip until the session has them.
+const StagedImage = struct { rgba: []u8, width: usize, height: usize };
 
-/// on_change: fired every drag-motion frame. The meter already mutated
-/// g_split/g_limit in place; motion repaints on its own, so this is a no-op (we
+/// Wall-clock milliseconds, the stamp the history stores use.
+fn nowMs() i64 {
+    return @intCast(@divTrunc(std.Io.Clock.real.now(g_io).nanoseconds, std.time.ns_per_ms));
+}
+var g_staged: std.ArrayList(StagedImage) = .empty;
+/// The configured checkpoint's family, from the FILE (the catalog is empty on
+/// a cold start), memoized per path.
+var g_family_cache: ?model_spec.Cache = null;
+
+fn post(req: wire.Request) void {
+    g_hosts.post(&g_config, req);
+}
+
+/// Hand every host its share of the settings as they stand (`config.host_fields`).
+fn postSettings() void {
+    g_hosts.postSettings(&g_config);
+}
+
+fn rescan() void {
+    g_hosts.postScan(&g_config);
+}
+
+var g_host_status: [96]u8 = undefined;
+
+/// Try a host the settings hold but nothing is connected with yet. Nothing is
+/// committed: the answer only decides what the row says.
+fn tryHost(e: *const config.HostEntry) void {
+    g_hosts.tryHost(e);
+}
+
+fn reconnectHost(name: []const u8) void {
+    g_hosts.reconnectNamed(name);
+}
+
+fn hostStatus(name: []const u8, e: *const config.HostEntry) config_view.HostState {
+    // The form's row and the live connection are two different things until
+    // Apply runs, and a status from the old connection under a freshly pasted
+    // pairing string reads as "the new token was refused too". While a row is
+    // ahead of the connection it reports the trial instead.
+    const s = g_hosts.slotByName(name);
+    const in_force = if (s) |sl| (sl.entry != null and sl.entry.?.sameEndpoint(e)) else false;
+    if (!in_force) {
+        const t = g_hosts.trialOf(e) orelse return .{ .text = "Apply & Reload to use it", .tone = .pending };
+        return .{ .text = t.text, .tone = if (t.state == .refused) .bad else .pending };
+    }
+    if (hosts.Hosts.troubleOf(s.?)) |t| return .{ .text = t, .tone = .bad, .offer_reconnect = true };
+    // A host that is up but never gets a render looks broken; say which.
+    const why = g_hosts.whyNotRender(s.?, &g_config) orelse return .{ .text = "up", .tone = .ok };
+    const text = std.fmt.bufPrint(&g_host_status, "up · {s}", .{why.long}) catch "up";
+    return .{ .text = text, .tone = .pending };
+}
+
+var g_sync: sync.Syncer = undefined;
+var g_sync_status: [64]u8 = undefined;
+
+fn hostSync(name: []const u8) config_view.HostSync {
+    var out: config_view.HostSync = .{};
+    // A finished transfer keeps its row until the next send, so its result is
+    // readable rather than vanishing on the frame it lands.
+    if (g_sync.forHost(name)) |j| {
+        out.sending = j.stem;
+        out.status = j.status(&g_sync_status);
+    }
+    const s = g_hosts.slotByName(name) orelse return out;
+    // What is still missing, transfer or no transfer: a finished send that
+    // hides the next file is why a host stays short after one was sent.
+    if (g_hosts.missingModel(s, &g_config)) |path| {
+        out.missing = g_models.cat.refName(path);
+        out.missing_count = g_hosts.missingAll(s, &g_config);
+    }
+    return out;
+}
+
+fn sendModel(name: []const u8) void {
+    const s = g_hosts.slotByName(name) orelse return;
+    const path = g_hosts.missingModel(s, &g_config) orelse return;
+    sendPath(name, path);
+}
+
+/// One named file to one host, from the library grid. `path` is this machine's:
+/// the local host is the only one whose files can be read to send.
+fn sendPath(name: []const u8, path: []const u8) void {
+    const s = g_hosts.slotByName(name) orelse return;
+    const entry = s.entry orelse return;
+    g_sync.start(name, entry, path) catch |err| std.log.err("sending to {s}: {t}", .{ name, err });
+}
+
+/// One file FROM a host into the first model folder, which is a folder the
+/// local host scans: the file then shows up in the local catalog and the id it
+/// was fetched by resolves here too.
+fn pullPath(name: []const u8, id: []const u8, stem: []const u8) void {
+    const s = g_hosts.slotByName(name) orelse return;
+    const entry = s.entry orelse return;
+    const dest = firstModelDir() orelse {
+        std.log.err("no model folder to put {s} in; add one in Settings", .{stem});
+        return;
+    };
+    g_sync.startPull(name, entry, id, stem, dest) catch |err| std.log.err("fetching from {s}: {t}", .{ name, err });
+}
+
+fn firstModelDir() ?[]const u8 {
+    for (g_config.model_dirs.slice()) |*d| if (d.path.opt()) |p| return p;
+    return null;
+}
+
+
+/// Apply every frame the host emitted since last time, pull the pixels the
+/// mirror wants, persist what the host measured, and save finished renders.
+/// Room over what a chat tile draws a preview at, so a hi-dpi screen is not
+/// upscaling. No more than that: on a remote host the finished picture queues
+/// behind these frames.
+const preview_headroom: f32 = 1.5;
+
+/// Full pictures held in memory before the oldest ones already on disk are
+/// dropped to their thumbnails. Sixteen 1024 squares is about 64 MiB.
+const pixels_kept: usize = 16;
+
+/// The pictures a view is showing at full size, canvas and viewer. Not dropped
+/// while shown, and read back from file when they already were. Cleared at the
+/// top of every frame and re-asserted by whatever draws.
+var g_shown: [2]?wire.ImageId = .{ null, null };
+
+/// Note that `im` is on screen at full size, and ask for its pixels back when
+/// they were dropped.
+fn shown(slot: usize, im: *mirror.Image) *const mirror.Image {
+    g_shown[slot] = im.info.id;
+    return im;
+}
+
+fn pumpHost() void {
+    g_hosts.pump(&g_config);
+    g_sync.poll();
+    // A pulled file is on this disk but not in this machine's catalog until the
+    // local host looks again; until it is, the id it was fetched by resolves
+    // nowhere here.
+    if (g_sync.takeLanded()) g_hosts.rescanNamed("local", &g_config);
+    if (g_retry_request) |id| {
+        g_retry_request = null;
+        g_hosts.retry(&g_config, id);
+    }
+    g_m = g_hosts.chatMirror();
+    g_hosts.setPreviewMaxEdge(if (g_view == .image)
+        image_view.canvasMaxEdge()
+    else
+        @intFromFloat(@as(f32, @floatFromInt(bubbles.tileMaxEdge())) * preview_headroom));
+    const now = std.Io.Clock.real.now(g_io).nanoseconds;
+    for (g_hosts.slots.items) |slot| {
+        slot.mirror.pollFetches(now, slot, hosts.Slot.postCtx);
+        if (slot.mirror.takeDiffPeak()) |u| persistDiffPeak(u.peak, u.key);
+        if (slot.mirror.takeErr()) |e| {
+            std.log.warn("host {s}: {t}: {s}", .{ slot.name, e.code, e.text });
+            if (e.text.len > 0) toast.post(.err, "{s}: {s}", .{ slot.name, e.text });
+            g_gpa.free(e.text);
+        }
+    }
+    reportFailures();
+    // The host has the message, or the load that will take it: drop the
+    // provisional bubble.
+    if (g_pending_text != null and (g_m.state.llm_resident and !g_m.state.pending_submit)) {
+        g_gpa.free(g_pending_text.?);
+        g_pending_text = null;
+    }
+    if (g_m.state.llm_resident and g_m.state.staged == 0) clearStaged();
+    saveNewRenders();
+    var pins: [g_shown.len]wire.ImageId = undefined;
+    var n_pins: usize = 0;
+    for (g_shown) |p| if (p) |id| {
+        pins[n_pins] = id;
+        n_pins += 1;
+    };
+    for (g_hosts.slots.items) |slot| _ = slot.mirror.evictPixels(pixels_kept, pins[0..n_pins]);
+    restoreShown();
+}
+
+/// Read back the file of a picture a view wants at full size whose pixels were
+/// dropped. One per frame: decoding is not free and only one can be looked at.
+fn restoreShown() void {
+    for (g_shown) |p| {
+        const id = p orelse continue;
+        const slot = g_hosts.imageOwner(id) orelse continue;
+        const im = slot.mirror.byId(id) orelse continue;
+        // A slot that already has its pixels is not the one to stop at, or a
+        // pinned slot below it never gets read back at all.
+        if (im.pixels != null or !im.restorable()) continue;
+        _ = fullPixels(id);
+        return;
+    }
+}
+
+/// This picture at full size, reading its file again when the pixels were
+/// dropped to save memory. Null when there are none and none can be had.
+fn fullPixels(id: wire.ImageId) ?[]const u8 {
+    const slot = g_hosts.imageOwner(id) orelse return null;
+    const im = slot.mirror.byId(id) orelse return null;
+    if (im.pixels) |px| return px;
+    if (!im.restorable()) return null;
+    const path = im.saved_path.?;
+    const dec = vips.loadRgb(g_gpa, path) catch |err| {
+        std.log.warn("cannot read {s} again: {t}", .{ path, err });
+        slot.mirror.markLost(id, "SavedImageMissing");
+        return null;
+    };
+    defer g_gpa.free(dec.pixels);
+    const rgba = tp.image.rgbToRgba(g_gpa, dec.pixels, dec.width, dec.height) catch return null;
+    slot.mirror.restorePixels(id, rgba, @intCast(dec.width), @intCast(dec.height));
+    return slot.mirror.byId(id).?.pixels;
+}
+
+/// Say what happened to every render that failed, and where it went. A failed
+/// job leaves the queue it was in, so without this the user watches an image
+/// disappear and gets nothing to read, on any host.
+fn reportFailures() void {
+    while (g_hosts.takeFailure(&g_config)) |f| {
+        if (f.moved_to) |to| {
+            toast.post(.warn, "Image failed on {s}: {s}. Trying {s} instead.", .{ f.host, f.why, to });
+        } else if (f.requeued) {
+            toast.post(.warn, "Image failed on {s}: {s}. Back in the queue for another host.", .{ f.host, f.why });
+        } else {
+            toast.post(.err, "Image failed on {s}: {s}. No other host can take it.", .{ f.host, f.why });
+        }
+        std.log.warn("image failed on host {s}: {s}", .{ f.host, f.why });
+    }
+}
+
+/// Write every finished render whose pixels have arrived and that has not
+/// been written yet, when saving is on. Once per image, success or not.
+fn saveNewRenders() void {
+    const dir = g_config.output_dir.opt() orelse return;
+    for (g_hosts.slots.items) |slot| for (slot.mirror.images.items) |*im| {
+        if (im.save_tried or im.local or im.status() != .done) continue;
+        const px = im.pixels orelse continue;
+        im.save_tried = true;
+        const path = save_image.save(g_gpa, g_io, dir, &im.info, px, im.info.width, im.info.height) catch |err| {
+            std.log.err("image save failed: {t}", .{err});
+            continue;
+        };
+        std.log.info("saved image to {s}", .{path});
+        im.saved_path = path;
+    };
+}
+
+fn configuredFamily() ?model_spec.Family {
+    const path = g_config.diffusion_model.opt() orelse return null;
+    if (g_family_cache == null) g_family_cache = model_spec.Cache.init(g_gpa, g_io);
+    return (g_family_cache.?.primary(path).info() orelse return null).family;
+}
+
+fn llmPaused() bool {
+    return g_m.state.llm_paused;
+}
+fn diffPaused() bool {
+    return g_m.state.diff_paused;
+}
+fn toggleLlmPause() void {
+    const s = g_hosts.slotOf(g_meter_host) orelse g_hosts.chatSlot();
+    s.post(.{ .chat_pause = .{ .paused = !s.mirror.state.llm_paused } });
+}
+fn toggleDiffPause() void {
+    const s = g_hosts.slotOf(g_meter_host) orelse g_hosts.chatSlot();
+    s.post(.{ .img_pause = .{ .paused = !s.mirror.state.diff_paused } });
+}
+
+/// The rail's pause button is about the whole queue, which spans every host,
+/// so this one broadcasts. The per-host pause lives on that host's meter.
+fn toggleDiffPauseEverywhere() void {
+    post(.{ .img_pause = .{ .paused = !diffPaused() } });
+}
+
+/// Same entry point the send button uses. Returns false when the message went
+/// nowhere (empty, or no model to load), so a headless driver does not wait
+/// forever. The host may still refuse it; that comes back as an error event.
+fn submitChat(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (!g_m.state.llm_resident) {
+        if (g_config.llm_model.opt() == null) return false;
+        if (g_pending_text) |p| g_gpa.free(p);
+        g_pending_text = g_gpa.dupe(u8, trimmed) catch null;
+    }
+    post(.{ .chat_submit = .{ .text = trimmed } });
+    return true;
+}
+
+/// Start a fresh conversation, clearing the input box. Only the transcript is
+/// reset; generated images stay in the studio gallery (and the viewer keeps
+/// working).
+fn newChat() void {
+    post(.chat_new);
+    g_handover_rev = g_m.transcript_rev;
+    if (g_pending_text) |p| g_gpa.free(p);
+    g_pending_text = null;
+    clearStaged();
+    g_input.clearRetainingCapacity();
+    g_follow_bottom = true;
+}
+
+/// Attach decoded RGB to the next message: uploaded to the host, and, while no
+/// session exists to hold it, kept here for the thumbnail strip.
+fn attachImage(rgb: []const u8, w: usize, h: usize) void {
+    const payload = g_gpa.dupe(u8, rgb) catch return;
+    if (!g_m.state.llm_resident) {
+        if (tp.image.rgbToRgba(g_gpa, rgb, w, h)) |rgba| {
+            g_staged.append(g_gpa, .{ .rgba = rgba, .width = w, .height = h }) catch g_gpa.free(rgba);
+        } else |_| {}
+    }
+    g_hosts.chatSlot().postFrame(g_gpa, .{ .bin = .{
+        .hdr = .{ .kind = .rgb_upload, .id = 0, .rev = 0, .w = @intCast(w), .h = @intCast(h), .len = @intCast(payload.len) },
+        .payload = payload,
+    } });
+}
+
+/// Let the chat model see a picture the client holds: by id when the chat
+/// host minted it, else by its pixels (another host's render, or a reopened
+/// file).
+/// The pixels travel from here, never by naming the id: a host frees an image
+/// the moment this client takes delivery, so its own copy is the only one left.
+fn attachFromMirror(im: *const mirror.Image) void {
+    const rgba = fullPixels(im.info.id) orelse return;
+    const w: usize = im.info.width;
+    const h: usize = im.info.height;
+    const rgb = g_gpa.alloc(u8, w * h * 3) catch return;
+    defer g_gpa.free(rgb);
+    for (0..w * h) |i| @memcpy(rgb[i * 3 .. i * 3 + 3], rgba[i * 4 .. i * 4 + 3]);
+    attachImage(rgb, w, h);
+}
+
+fn clearStaged() void {
+    for (g_staged.items) |st| g_gpa.free(st.rgba);
+    g_staged.clearRetainingCapacity();
+}
+
+/// Persist the diffusion pipeline's measured peak residency, so the NEXT run's
+/// first image plans against a measurement instead of the file-size bootstrap.
+fn persistDiffPeak(peak: u64, key: u64) void {
+    g_config.diff_peak_resident = peak;
+    g_config.diff_peak_key = key;
+    g_config_baseline.diff_peak_resident = peak;
+    g_config_baseline.diff_peak_key = key;
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err|
+        std.log.warn("[vram] could not persist measured diffusion peak: {t}", .{err});
+}
+
+/// on_change: fired every drag-motion frame. The meter already mutated that
+/// host's handles in place; motion repaints on its own, so this is a no-op (we
 /// deliberately do NOT reshuffle VRAM mid-drag, only on release).
 fn meterChanged() void {}
 
-/// on_commit: fired on drag release, persist the settled fractions and apply
-/// the new policy to the live session.
+/// on_commit: fired on drag release. Persist the settled fractions where that
+/// host's values live, and send them to that host alone, which applies the new
+/// policy to its live session.
 fn meterCommit() void {
-    g_config.vram_split = g_split;
-    g_config.vram_limit_frac = g_limit;
-    g_config_baseline.vram_split = g_split;
-    g_config_baseline.vram_limit_frac = g_limit;
-    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
-    applyMeterPolicy();
-}
-
-/// Resolve the meter handles against the live card and hand the result to the
-/// arbiter, which drives BOTH models (soft residency): the limit is a WHOLE-CARD
-/// ceiling, so our budget for LLM + diffusion is `limit − system` (system =
-/// OS/desktop + CUDA-context overhead we don't control), and the split handle is
-/// the LLM's guaranteed share under contention.
-///
-/// Carrying the diffusion half by hand does not work: settling the LLM first and then
-/// offering diffusion `available - (the LLM's just-shrunk usage)` gives a second target
-/// that algebraically cancels to diffusion's own residency, so the image model never
-/// yields a byte. Both targets come
-/// from one `Arbiter.plan`, which is also what makes the split handle mean
-/// something. No-op with no session or mid-load.
-fn applyMeterPolicy() void {
-    const s = g_session orelse return;
-    if (g_loading.load(.acquire)) return;
-    // cuMemGetInfo reads the CALLING thread's current CUDA context, and this
-    // runs on the UI thread, which starts with none bound (the LLM's context
-    // is created on the loader thread). Bind it first, or the query fails and
-    // returns zeros, and that silent zero skips `setBudgets` entirely, leaving the
-    // arbiter uninitialized and the first message mass-offloading. Binding here is
-    // the same thing the idle-settle path
-    // (`vpApply`) already does on this thread.
-    s.be.bindThread();
-    const mi = s.be.ctx.memGetInfo();
-    const total: u64 = mi.total;
-    if (total == 0) {
-        std.log.warn("[vram] meter policy skipped: VRAM query failed — arbiter budgets NOT updated", .{});
-        return;
-    }
-    // ONE coherent pass over the card, then one rule (see `vram.resolve`).
-    //
-    // This replaced `budget = limit - system`, where `system` was the residual
-    // `device_used - our_tracked`. That put an unreliable number alone on the
-    // right-hand side: it is sampled here, right after a load, when our own CUDA
-    // context / JIT'd modules / library workspaces do not exist yet, so it read
-    // ~1.1 GiB low, the budget came out that much too generous, the LLM promoted
-    // every layer to fill it, and the next batched allocation OOM'd and offloaded
-    // them straight back. `resolve` frames the handle as a RESERVE instead, where
-    // an under-read can only fall back to what the user asked for.
-    const tf: f32 = @floatFromInt(total);
-    const llm_res: u64 = s.be.deviceUsed();
-    const diff_res: u64 = if (g_diffuser) |*d| d.vramBytes() else 0;
-    var card: vram.Card = .{
-        .total = total,
-        .foreign = null, // no NVML: degrade to the residual (conservative)
-        .ours_tracked = llm_res + diff_res,
-        .device_used = total -| mi.free,
-    };
-    if (sysmon.nvml()) |nv| {
-        if (nv.selfUsed()) |proc| {
-            // Same pass as `mi` above. `foreign` is then OTHER PROCESSES ONLY, and
-            // our unattributed bytes land in `ours_total` where they belong.
-            card.foreign = card.device_used -| proc;
-            card.ours_total = proc;
+    const s = g_hosts.slotOf(g_meter_host) orelse return;
+    if (s.entry == null) {
+        // The local child's handles are the settings' own pair.
+        g_config.vram_split = s.meter.split;
+        g_config.vram_limit_frac = s.meter.limit;
+        g_config_baseline.vram_split = s.meter.split;
+        g_config_baseline.vram_limit_frac = s.meter.limit;
+    } else {
+        // A listed host keeps its handles on its own entry. The baseline gets
+        // the same write, so a meter drag never reads as an unsaved edit.
+        if (g_config.hostEntryMut(s.name)) |e| {
+            e.vram_split = s.meter.split;
+            e.vram_limit_frac = s.meter.limit;
+        }
+        if (g_config_baseline.hostEntryMut(s.name)) |e| {
+            e.vram_split = s.meter.split;
+            e.vram_limit_frac = s.meter.limit;
+        }
+        if (s.entry) |*entry| {
+            entry.vram_split = s.meter.split;
+            entry.vram_limit_frac = s.meter.limit;
         }
     }
-    // High-water the untracked term: it is ~0 on a cold model and grows as modules
-    // and workspaces are JIT'd/allocated. Letting it fall back would re-inflate the
-    // budget mid-session and restart the promote -> OOM -> offload cycle. It is
-    // deliberately NOT reset per model load, the CUDA context and compiled modules
-    // behind most of it outlive any one session.
-    const res = vram.resolve(.{ .fraction = g_limit }, card, g_untracked_high_water);
-    g_untracked_high_water = res.untracked;
-
-    const available: u64 = res.tracked; // cap on LLM + diffusion TRACKED bytes
-    // The split handle stays a fraction of the CARD (that is what the meter draws),
-    // clamped into what is actually ours to give away.
-    const share: u64 = @min(@as(u64, @intFromFloat(g_split * tf)), available);
-
-    // Guarded so a direct (idle) settle can't race the diffusion worker's reclaim
-    // hook, both touch the LLM context. The diffusion half of the rebalance takes
-    // the engine's own `res_mu` internally.
-    g_session_mu.lockUncancelable(g_io);
-    defer g_session_mu.unlock(g_io);
-    s.vram_limit = available;
-    s.vram_share = share;
-    s.vram_budget = available;
-    var rbuf: [200]u8 = undefined;
-    std.log.info("[vram] card {d} MiB · limit {d} · {s}{s}", .{
-        total >> 20,
-        @as(u64, @intFromFloat(g_limit * tf)) >> 20,
-        res.render(&rbuf),
-        if (card.foreign == null) " (no NVML: foreign is a residual)" else "",
-    });
-    vram.logResidency("LLM", s.residencyNeed(), s.residencyHave());
-    // The itemized counterpart: `logResidency` reports `scratch` as a subtraction,
-    // this reports what each allocation path actually claimed. When the two
-    // disagree the difference is the thing to chase.
-    s.logMemTags(card.ours_total);
-    g_arbiter.setBudgets(available, share);
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+    s.postMeter();
 }
 
 /// Restore a persisted window geometry onto a freshly created SDL window. Size
@@ -323,181 +552,24 @@ fn saveGeometry() void {
     g_config_baseline.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save window geometry failed: {t}", .{err});
 }
 
+// The eject and pause buttons live on a host's own bar, so they act on that
+// host rather than on whoever carries the chat.
 fn meterEjectLlm() void {
-    g_llm_eject_armed = true; // fires (or fires now) via maybeProcessEjects
+    if (g_hosts.slotOf(g_meter_host)) |s| s.post(.chat_eject); // fires once the model is idle
 }
 fn meterEjectDiff() void {
-    g_diff_eject_armed = true;
+    if (g_hosts.slotOf(g_meter_host)) |s| s.post(.img_eject);
 }
 fn meterActions() meter.Actions {
     return .{ .on_change = meterChanged, .on_commit = meterCommit, .on_eject_llm = meterEjectLlm, .on_eject_diff = meterEjectDiff, .on_toggle_pause_llm = toggleLlmPause, .on_toggle_pause_diff = toggleDiffPause };
 }
 
-/// Diffusion's gate lives on the persistent Diffuser, so it IS the source of
-/// truth (queried live, survives an unload). The LLM mirrors its state in
-/// `g_llm_paused` because the gate dies with the session on unload.
-fn llmPaused() bool {
-    return g_llm_paused;
-}
-fn diffPaused() bool {
-    return if (g_diffuser) |*d| d.isPaused() else false;
-}
-fn toggleLlmPause() void {
-    const now_paused = !g_llm_paused;
-    g_llm_paused = now_paused;
-    if (g_loading.load(.acquire)) return; // applied to the fresh gate on publish
-    if (g_session) |s| {
-        // Resident: drive the session gate (unpause also dispatches a turn that
-        // was queued while paused, see Session.setPaused).
-        s.setPaused(now_paused);
-    } else if (!now_paused) {
-        // Resuming with nothing resident: fire any load we HELD while paused, a
-        // message / regenerate stashed by submitChat / requestRegenLoad (both set
-        // g_reload_requested), or a suspended turn to resume. Wake a frame so
-        // maybeStartReload runs now that the gate is lifted. Nothing pending ⇒
-        // nothing loads (a bare pause->resume on a cold engine is a no-op).
-        if (g_reload_requested or g_pending_submit != null or g_pending_regenerate or g_llm_suspend != null) {
-            g_reload_requested = true;
-            wakeupFrame();
-        }
-    }
-}
-fn toggleDiffPause() void {
-    if (g_diffuser) |*d| {
-        d.setPaused(!d.isPaused());
-        // Wake a frame so the next pump() runs at once: on resume it loads +
-        // starts any image queued while paused (pump defers all loads while
-        // paused, so nothing loaded until now). Harmless on pause.
-        wakeupFrame();
-    }
-}
-
-/// Main-loop hook: carry out any armed eject once ITS OWN model is idle. Each
-/// model ejects independently, the LLM can drop while diffusion is still
-/// generating (it isn't generating anything, so there's nothing to wait for),
-/// and vice versa. A model that's busy when clicked stays armed and ejects the
-/// moment it finishes.
-fn maybeProcessEjects() void {
-    if (g_diff_eject_armed) {
-        if (g_diffuser) |*d| {
-            if (d.isPaused()) {
-                // Unload-while-paused (Tier 3): snapshot the in-flight image to
-                // host, then free the weights and KEEP the queue (incl. the
-                // suspended image), which resumes on unpause. Free even with
-                // pending images, they're parked by the pause gate anyway.
-                if (d.busyNow()) {
-                    d.requestSuspend(); // worker snapshots + exits; poll next frame
-                } else {
-                    d.reapAndFree();
-                    g_diff_eject_armed = false;
-                    applyMeterPolicy();
-                }
-            } else if (!d.busyNow() and !d.hasPending()) {
-                d.freeSession();
-                g_diff_eject_armed = false;
-                // Diffusion is gone: let the LLM borrow the freed VRAM back.
-                applyMeterPolicy();
-            }
-        } else g_diff_eject_armed = false;
-    }
-    if (g_llm_eject_armed) {
-        if (g_session == null or g_loading.load(.acquire)) {
-            g_llm_eject_armed = false; // nothing loaded / a (re)load is in flight
-        } else if (g_session) |s| {
-            if (g_llm_paused and s.busy()) {
-                // Unload-while-paused (Tier 3): the worker is parked mid-decode.
-                // Ask it to suspend (stop with the turn left OPEN); we finish the
-                // unload once it clears below.
-                s.requestSuspend();
-            } else if (!s.busy()) {
-                // Fire as soon as the LLM itself is idle, do NOT wait on
-                // diffusion. The worker only touches the session through the
-                // coordinator hooks, which unloadLlm serializes with g_session_mu.
-                // If we suspended a mid-turn response, carry its raw `ids` so the
-                // reload can reprefill + continue it.
-                if (g_llm_paused and s.suspended_midturn) saveLlmSuspend(s);
-                unloadLlm();
-                g_llm_eject_armed = false;
-            }
-        }
-    }
-}
-
-/// Carry the suspended LLM's raw `ids` (prompt + partial open response) across an
-/// unload-while-paused so a reload can reprefill + continue it. `g_carry` holds
-/// the display transcript alongside. Drains pending bytes first so the displayed
-/// text matches the tokens. (Tier 3.)
-fn saveLlmSuspend(s: *chat.Session) void {
-    s.poll(); // drain streamed bytes into messages so display matches `ids`
-    const ids = g_gpa.dupe(u32, s.ids.items) catch |err| {
-        std.log.err("save suspend ids: {t}", .{err});
-        return;
-    };
-    if (g_llm_suspend) |old| g_gpa.free(old.ids); // one suspend at a time
-    g_llm_suspend = .{ .ids = ids, .midturn = s.suspended_midturn };
-}
-
-fn freeLlmSuspend() void {
-    if (g_llm_suspend) |sus| {
-        g_gpa.free(sus.ids);
-        g_llm_suspend = null;
-    }
-    g_pending_continue = false;
-}
-
-/// Fully unload the LLM (free its VRAM) while KEEPING the conversation: the
-/// transcript is detached into `g_carry` (rendered read-only until a message
-/// reloads + replays it, see renderMessages), never wiped. Runs synchronously
-/// on the UI thread (LLM is idle here); the teardown is serialized with the
-/// diffusion worker's session access via `g_session_mu`. A model swap / new-chat
-/// is unaffected, only a "new chat" click ever resets the transcript.
-fn unloadLlm() void {
-    const s = g_session orelse return;
-    if (s.worker) |t| { // idle here, but be safe
-        t.join();
-        s.worker = null;
-    }
-    g_session_mu.lockUncancelable(g_io);
-    s.be.bindThread(); // context current on THIS thread to free its device memory
-    {
-        g_carry_mu.lockUncancelable(g_io);
-        defer g_carry_mu.unlock(g_io);
-        g_carry = s.detachTranscript();
-    }
-    s.deinit();
-    g_session = null;
-    g_arbiter.llm = null; // participant points into the freed session
-    g_session_mu.unlock(g_io);
-    if (g_session_arena) |a| {
-        a.deinit();
-        g_gpa.destroy(a);
-        g_session_arena = null;
-    }
-    // Diffusion (if resident) can now borrow the whole card: with no session,
-    // imageBudget returns 0 (pin all free VRAM) on the next image.
-    wakeupFrame();
-}
-// The conversation transcript carried across a model-swap reload (detached from
-// the old session before teardown, adopted by the new one) so a settings save
-// never wipes the chat. Owned by g_gpa; freed if there's no new session to adopt.
-var g_carry: ?std.ArrayList(chat.Message) = null;
-// Guards `g_carry`, which the `!g_loading` gate CANNOT protect the way it
-// protects `g_session`: the UI reads the carried transcript precisely while a
-// load runs, since rendering it is what keeps the chat on screen across a swap.
-// Meanwhile the loader thread publishes it (`detachTranscript`), hands it to the
-// fresh session (`adoptTranscript`) and clears it. Every read and every write
-// takes this, on both threads.
-//
-// Held across the WALK, not just the fetch: the messages the renderers and
-// `saveHistory` follow live inside that list, so a lock that ends at the load of
-// the pointer protects nothing. That makes it the INNERMOST lock — nothing may
-// take `g_session_mu` or `g_diff_mu` while holding it, and the two places that
-// nest (the detach paths) take it under `g_session_mu`, never the other way.
-var g_carry_mu: std.Io.Mutex = std.Io.Mutex.init;
-
 // Conversation history: the on-disk store plus the sidebar's selection state.
 // Saved after every completed turn (see maybeSaveHistory) and on exit.
 var g_history: history.Store = .{};
+/// The image studio's prompt library, beside the transcripts. Text only: a row
+/// restores what was written, never the knobs it was written with.
+var g_prompts: prompt_history.Store = .{};
 /// A sidebar row was clicked; the load happens at the top of the next frame,
 /// never mid-render, because it swaps the session's whole transcript.
 var g_load_conv: ?u64 = null;
@@ -509,13 +581,13 @@ var g_saved_tail: usize = 0;
 /// without this the newest turn was saved before its files existed and a reload
 /// reported them missing until some later turn re-saved the conversation.
 var g_saved_images: usize = 0;
+/// The mirror's transcript revision when this client handed the host a
+/// different conversation. Until it moves, `g_m.messages` still holds the
+/// PREVIOUS one while `g_history.current` already names the new file, and a save
+/// in that window writes one conversation into the other's file.
+var g_handover_rev: ?u64 = null;
 
-// Queue rail state. `g_rail_jobs` maps the row indices the rail reports back
-// (from a drag) onto the engine's images; it is rebuilt every frame right
-// before the rail renders, so an index can never outlive the list it came from.
 var g_rail_tab: queue_rail.Tab = .queue;
-var g_rail_jobs: [16]*chat.GenImage = undefined;
-var g_rail_jobs_len: usize = 0;
 
 // Persistent settings + which full-window view is showing. `g_config_path`
 // (from `--config`) overrides the well-known settings-file location; null uses
@@ -543,7 +615,6 @@ var g_environ: *std.process.Environ.Map = undefined;
 var g_input: std.ArrayList(u8) = .empty;
 const input_limit = 64 << 10;
 var g_wakeup_event_type: u32 = 0;
-var g_load_err: ?anyerror = null;
 // Message-list scroll state (persistent so we can follow streaming output).
 // g_follow_bottom sticks the view to the newest content; it turns off when the
 // user scrolls up and back on when they return to the bottom. g_prev_offset
@@ -559,7 +630,7 @@ var g_input_h: f32 = 52;
 // Full-size image viewer (a second window). g_viewer_request is set when an
 // image is clicked; the main loop opens/refocuses the viewer.
 var g_viewer: ?*viewer.Viewer = null;
-var g_viewer_request: ?*chat.GenImage = null;
+var g_viewer_request: ?wire.ImageId = null;
 
 /// Pushed from worker threads (via the token sink) to unblock
 /// `waitEventTimeout` so streamed tokens repaint promptly.
@@ -578,7 +649,6 @@ pub fn run(init: std.process.Init) !void {
     g_gpa = std.heap.smp_allocator;
     g_io = init.io;
     g_environ = init.environ_map;
-    g_ui_thread = std.Thread.getCurrentId();
 
     // Parse CLI. `--config <path>` overrides the settings-file location (handy
     // for testing without touching the user's real config); `--model <path>`
@@ -603,28 +673,26 @@ pub fn run(init: std.process.Init) !void {
     // The compiled-in backend default is NVIDIA's, which is a failed first launch
     // on any other machine. With no settings file yet, take what the box has.
     if (first_run) {
-        const be = diffuser.fromPipelineBackend(tp.pipeline.detectBackend());
+        const be = pipeline_map.fromPipelineBackend(tp.pipeline.detectBackend());
         g_config.llm_backend = be;
         g_config.diff_backend = be;
         std.log.info("no settings file yet: defaulting both backends to {t}", .{be});
     }
-    applyWeightRead(g_config.weight_read);
     if (model_override) |m| g_config.llm_model.set(m);
-    // The model catalog: its index lives beside the config, the folders come
-    // from the config (seeded from the configured files' folders the first time),
-    // and a config from before the catalog existed keeps its exact selection.
+    g_sync = sync.Syncer.init(g_gpa, g_io);
+    g_hosts = try hosts.Hosts.init(g_gpa, g_io, g_environ, wakeupFrame, g_config_path, null);
+    g_m = g_hosts.chatMirror();
+    g_models = models.empty(g_gpa);
+    // The model folders come from the config (seeded from the configured files'
+    // folders the first time); each host scans them and its catalog lands in its
+    // mirror. A config from before the catalog existed keeps its exact selection.
     g_config.seedModelDirs();
-    {
-        const index_path = config.Config.siblingPath(init.io, gpa, init.environ_map, g_config_path, "catalog.json") catch null;
-        defer if (index_path) |p| gpa.free(p);
-        model_lib.init(g_gpa, g_io, wakeupFrame, index_path);
-    }
-    selection.resolveAll(&g_config, &model_lib.cat);
+    selection.resolveAll(&g_config, &g_models.cat);
     g_config_baseline = g_config;
     // Seed the meter handles from the persisted fractions, clamped into the
     // grabbable range (recovers a config that saved a stuck limit at the edge).
-    g_split = std.math.clamp(g_config.vram_split, 0.02, 0.96);
-    g_limit = std.math.clamp(g_config.vram_limit_frac, 0.10, 0.985);
+    g_config.vram_split = std.math.clamp(g_config.vram_split, 0.02, 0.96);
+    g_config.vram_limit_frac = std.math.clamp(g_config.vram_limit_frac, 0.10, 0.985);
 
     var back = try SDLBackend.initWindow(.{
         .io = init.io,
@@ -663,8 +731,14 @@ pub fn run(init: std.process.Init) !void {
 
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
     config_view.setEnv(back.window, wakeupFrame, g_gpa, g_io);
-    model_lib.startScan(&g_config); // the wakeup event exists now
-    syncDiffuser();
+    // The hosts: a tp-serve already listening at the local socket, else one
+    // spawned now, plus every host the settings list. Connects run on their
+    // own threads; a host that is not there yet is retried from `pump`.
+    // Each starts on default settings and takes ours; every later change is
+    // a settings request from `commitConfig`. A spawned child is told our
+    // `--config` so its catalog cache sits beside the same file.
+    g_hosts.sync(&g_config);
+    g_m = g_hosts.chatMirror();
 
     // Conversation history lives beside the config file. With `--config <path>`
     // it goes next to THAT file, so a throwaway config gets a throwaway history
@@ -675,53 +749,37 @@ pub fn run(init: std.process.Init) !void {
     // diffusion thread is still touching a transcript/gallery image as those are
     // freed; then the LLM, then the gallery.
     defer {
-        // Join the loader BEFORE the flush: while it runs it owns the session and
-        // the carried transcript, so `saveHistory` steps aside and would write
-        // nothing. Neither frees the transcript, so the flush still happens before
-        // anything that does.
-        if (g_loader) |t| t.join();
-        saveHistory(true); // flush the live transcript before anything frees it
+        // The last events land in the mirror, which the flush below writes
+        // from; then the host goes (a spawned one exits with us).
+        pumpHost();
+        saveHistory(true);
         g_history.deinit(g_gpa);
-        freeDiffuser();
-        if (g_session) |s| {
-            s.be.bindThread();
-            s.deinit();
-        }
-        if (g_session_arena) |a| {
-            a.deinit();
-            g_gpa.destroy(a);
-        }
-        freeCarry();
-        freeLlmSuspend();
-        if (g_pending_submit) |p| g_gpa.free(p);
+        g_prompts.deinit(g_gpa);
+        g_sync.deinit();
+        g_models.deinit();
+        g_hosts.deinit();
+        if (g_pending_text) |p| g_gpa.free(p);
         clearStaged();
-        g_staged_images.deinit(g_gpa);
+        g_staged.deinit(g_gpa);
+        if (g_family_cache) |*c| c.deinit();
         image_view.deinit();
         config_view.deinit();
-        model_lib.deinit();
-        status_bar.deinit();
     }
     defer if (g_viewer) |v| v.deinit();
 
     var interrupted = false;
     main_loop: while (true) {
-        maybeProcessEjects();
-        maybeStartReload();
+        pumpHost();
         // A finished folder scan may have found a side file for a slot that had
-        // none; resolving fills it and, if that changed a path, applies it.
-        if (model_lib.poll()) {
-            selection.resolveAll(&g_config, &model_lib.cat);
+        // none; resolving fills it and, if that changed a path, applies it. Any
+        // host's scan can be the one that did, so the merged view is rebuilt
+        // first and the selection resolved against that.
+        if (g_hosts.modelSeq() != g_model_seq) {
+            g_model_seq = g_hosts.modelSeq();
+            rebuildModels();
+            selection.resolveAll(&g_config, &g_models.cat);
             if (!g_config.llmReloadEql(&g_config_baseline) or !g_config.diffPathsEql(&g_config_baseline)) commitConfig();
         }
-        maybeRefreshMeterPolicy();
-        // Pump the app-level diffusion engine every frame (both modes; even under
-        // Settings) so an in-flight generation finishes, it drains its own
-        // unified queue. Gated on !loading so no diffusion worker touches the
-        // session while the LLM (re)loads (see maybeStartReload).
-        if (!g_loading.load(.acquire)) if (g_diffuser) |*d| {
-            maybeReleaseDiffuser(d);
-            d.pump();
-        };
         const nstime = win.beginWait(interrupted);
 
         // Pump SDL events once, routing each to the window it targets (main or
@@ -744,6 +802,11 @@ pub fn run(init: std.process.Init) !void {
         }
 
         // ── Main window ──────────────────────────────────────────────────
+        // A slot is pinned only while a view is actually drawing that picture:
+        // both are re-asserted below by whatever renders. Cleared here rather
+        // than at each teardown, since a view can stop drawing one without any
+        // teardown to hang the clear on.
+        g_shown = .{ null, null };
         try win.begin(nstime);
         _ = SDLBackend.c.SDL_SetRenderDrawColor(back.renderer, 0, 0, 0, 255);
         _ = SDLBackend.c.SDL_RenderClear(back.renderer);
@@ -762,21 +825,21 @@ pub fn run(init: std.process.Init) !void {
 
         // A clicked image (chat transcript or studio gallery) opens/refocuses
         // the viewer, which navigates the engine's unified image history.
-        var vreq: ?*chat.GenImage = null;
-        if (g_viewer_request) |gi| {
+        var vreq: ?wire.ImageId = null;
+        if (g_viewer_request) |id| {
             g_viewer_request = null;
-            vreq = gi;
-        } else if (image_view.viewer_request) |gi| {
+            vreq = id;
+        } else if (image_view.viewer_request) |id| {
             image_view.viewer_request = null;
-            vreq = gi;
+            vreq = id;
         }
         const vsrc = diffuserSource();
-        if (vreq) |gi| {
+        if (vreq) |id| {
             if (g_viewer) |v| {
-                v.setImage(gi);
+                v.setImage(id);
                 _ = SDLBackend.c.SDL_RaiseWindow(v.back.window);
             } else {
-                g_viewer = viewer.Viewer.init(init.gpa, init.io, vsrc, gi) catch |err| vblk: {
+                g_viewer = viewer.Viewer.init(init.gpa, init.io, vsrc, id) catch |err| vblk: {
                     std.log.err("open viewer failed: {t}", .{err});
                     break :vblk null;
                 };
@@ -787,8 +850,8 @@ pub fn run(init: std.process.Init) !void {
         }
 
         // ── Viewer window ────────────────────────────────────────────────
-        // Closed (window's X, or a "new chat" that freed its image): tear down
-        // without rendering, since `v.cur` may now be dangling.
+        // Closed (window's X, or its image no longer resolves): tear down
+        // without rendering.
         if (g_viewer) |v| if (!v.open) {
             v.deinit();
             g_viewer = null;
@@ -855,143 +918,6 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
     };
 }
 
-/// Can the next message carry an image? True when a vision tower is resident,
-/// or, before the lazy first-message load, when the configured model has one
-/// (an mmproj path is set alongside an LLM). Lets drop/paste and "Discuss this
-/// image" work as the first message, staging into `g_staged_images` until the
-/// session comes up. While a load is in flight the session is off-limits to the
-/// UI thread, so only the config answers.
-fn visionAvailable() bool {
-    if (!g_loading.load(.acquire)) if (g_session) |s| return s.visionEnabled();
-    return g_config.vision_tower.opt() != null and g_config.llm_model.opt() != null;
-}
-
-/// Attach a decoded RGB image to the next message. Hands it to the live session,
-/// or (lazy first message) stages it and kicks a load. Callers decode the source
-/// and confirm `visionAvailable()` first.
-fn attachOrStage(rgb: []const u8, w: usize, h: usize) void {
-    // Only while the session is ours to touch. Mid-load it belongs to the loader
-    // thread, and the fall-through is exactly what that case wants anyway:
-    // stage the image and let `maybeStartReload` attach it to the fresh session.
-    if (!g_loading.load(.acquire)) if (g_session) |s| {
-        s.attachImage(rgb, w, h) catch |err| std.log.err("attach image: {t}", .{err});
-        return;
-    };
-    const rgb_own = g_gpa.dupe(u8, rgb) catch return;
-    const rgba = diffuser.rgbToRgba(g_gpa, rgb_own, w, h) catch {
-        g_gpa.free(rgb_own);
-        return;
-    };
-    g_staged_images.append(g_gpa, .{ .rgb = rgb_own, .rgba = rgba, .width = w, .height = h }) catch {
-        g_gpa.free(rgb_own);
-        g_gpa.free(rgba);
-        return;
-    };
-    // Kick the lazy load so the staged image (and any first message) lands in a
-    // session; maybeStartReload drains g_staged_images once it's live.
-    if (!g_loading.load(.acquire)) g_reload_requested = true;
-}
-
-/// RGBA variant of `attachOrStage` for images that already live as display
-/// pixels (generated images). `s` is the UI-safe session (null while loading).
-fn attachOrStageRgba(s: ?*chat.Session, rgba: []const u8, w: usize, h: usize) void {
-    if (s) |ss| {
-        ss.attachRgba(rgba, w, h) catch |err| std.log.err("attach image: {t}", .{err});
-        return;
-    }
-    const px = w * h;
-    const rgb = g_gpa.alloc(u8, px * 3) catch return;
-    defer g_gpa.free(rgb);
-    for (0..px) |i| {
-        rgb[i * 3 + 0] = rgba[i * 4 + 0];
-        rgb[i * 3 + 1] = rgba[i * 4 + 1];
-        rgb[i * 3 + 2] = rgba[i * 4 + 2];
-    }
-    attachOrStage(rgb, w, h);
-}
-
-/// Drop a not-yet-loaded staged attachment by index (pre-session mirror of
-/// `Session.removeAttachment`).
-fn removeStaged(idx: usize) void {
-    if (idx >= g_staged_images.items.len) return;
-    const st = g_staged_images.orderedRemove(idx);
-    g_gpa.free(st.rgb);
-    g_gpa.free(st.rgba);
-}
-
-/// Free all staged attachments (load failed, or "new chat" before load).
-fn clearStaged() void {
-    for (g_staged_images.items) |st| {
-        g_gpa.free(st.rgb);
-        g_gpa.free(st.rgba);
-    }
-    g_staged_images.clearRetainingCapacity();
-}
-
-/// Whether the *configured* LLM (by GGUF architecture) can reason, so the
-/// thinking toggle can show before the model loads. A live session's loaded
-/// family is authoritative (see `renderInput`); this covers the pre-load window
-/// and re-probes whenever the configured model path changes.
-fn configuredSupportsThinking() bool {
-    const path = g_config.llm_model.opt() orelse {
-        g_think_probe_valid = false;
-        g_think_probe_len = 0;
-        return false;
-    };
-    if (!(g_think_probe_valid and g_think_probe_len == path.len and
-        std.mem.eql(u8, g_think_probe_path[0..g_think_probe_len], path)))
-    {
-        g_think_probe_result = probeThinking(path);
-        @memcpy(g_think_probe_path[0..path.len], path);
-        g_think_probe_len = path.len;
-        g_think_probe_valid = true;
-    }
-    return g_think_probe_result;
-}
-
-fn configuredSupportsReasoningEffort() bool {
-    _ = configuredSupportsThinking();
-    return g_think_probe_valid and g_think_probe_effort;
-}
-
-/// Whether the weight-noise controls should be offered at all: the loaded model's
-/// answer when there is one, otherwise the CONFIGURED file's.
-///
-/// The pre-load half is the point. tp-gui loads the LLM lazily, on the first
-/// message, so gating on a live session hid the controls during exactly the window
-/// someone wants to set them up in — you had to send a message before you could
-/// choose how the reply would be perturbed. Same shape as `visionAvailable` and
-/// `configuredSupportsThinking`, for the same reason.
-fn noiseAvailable() bool {
-    if (!g_loading.load(.acquire)) if (g_session) |s| return s.weightNoiseSupported();
-    return configuredSupportsWeightNoise();
-}
-
-/// Whether the *configured* checkpoint would honor weight noise, by reading its
-/// header. Re-probed whenever the configured path changes.
-fn configuredSupportsWeightNoise() bool {
-    const path = g_config.llm_model.opt() orelse {
-        g_noise_probe_valid = false;
-        g_noise_probe_len = 0;
-        return false;
-    };
-    if (!(g_noise_probe_valid and g_noise_probe_len == path.len and
-        std.mem.eql(u8, g_noise_probe_path[0..g_noise_probe_len], path)))
-    {
-        g_noise_probe_result = probeWeightNoise(path);
-        @memcpy(g_noise_probe_path[0..path.len], path);
-        g_noise_probe_len = path.len;
-        g_noise_probe_valid = true;
-    }
-    return g_noise_probe_result;
-}
-
-fn probeWeightNoise(path: []const u8) bool {
-    var gg = tp.Gguf.openHeader(g_gpa, g_io, path) catch return false;
-    defer gg.deinit();
-    return tp.llm.session.weightNoiseSupported(&gg);
-}
-
 /// TP_AUTO_IMAGE: render one image through the REAL app path and exit.
 ///
 /// Same argument as `autoMessage`: the CLI's `generate` builds its own
@@ -1003,43 +929,50 @@ fn probeWeightNoise(path: []const u8) bool {
 /// Exits non-zero when the render fails, so a harness cannot mistake a failure
 /// for a slow success.
 var g_auto_image_sent: bool = false;
+/// The queue reference the probe's one render was given. The queue mints it,
+/// so it cannot be chosen here.
+var g_auto_image_ref: u64 = 0;
 fn autoImage() void {
     const prompt_z = getenv("TP_AUTO_IMAGE") orelse return;
-    const d = &(g_diffuser orelse return);
-    if (!g_auto_image_sent) {
-        // Only once the engine has the config: `updateSettings` runs per frame
-        // and `requestPaths` applies while the queue is idle, so enqueueing on
-        // the first frame would snapshot a half-built model set.
+    if (!g_m.state.diff_present) {
         if (g_config.diffusion_model.opt() == null) {
             std.log.err("[auto] TP_AUTO_IMAGE with no diffusion_model configured", .{});
             std.process.exit(2);
         }
+        return; // the host has not reported its engine yet
+    }
+    if (!g_auto_image_sent) {
         g_auto_image_sent = true;
-        const gi = g_gpa.create(diffuser.GenImage) catch std.process.exit(2);
-        gi.* = .{
-            .prompt = g_gpa.dupe(u8, std.mem.span(prompt_z)) catch std.process.exit(2),
-            .wake = wakeupFrame,
-            .io = g_io,
-            .req_width = g_config.width,
-            .req_height = g_config.height,
-            .req_steps = g_config.steps,
-            .req_cfg = 1.0,
+        g_auto_image_ref = g_hosts.enqueueImage(&g_config, .{
+            .prompt = std.mem.span(prompt_z),
+            .width = @intCast(g_config.width),
+            .height = @intCast(g_config.height),
+            .steps = @intCast(g_config.steps),
+            .cfg = 1.0,
+            .seed = 1234,
             .from_studio = true,
-            .req_seed = 1234,
-        };
-        d.enqueue(gi) catch {
-            std.log.err("[auto] enqueue refused", .{});
-            std.process.exit(2);
-        };
-        d.pump();
+        });
         return;
     }
-    // Done when the queue has drained. `busy` alone is not enough: the image is
-    // pending before the worker picks it up.
-    if (d.busyNow() or d.anyPending()) return;
-    const failed = d.loadError() != null;
-    std.log.info("[auto] image done ({s})", .{if (failed) "FAILED" else "ok"});
-    std.process.exit(if (failed) 1 else 0);
+    if (g_auto_image_ref == 0) return;
+    // Done when the image reports a terminal status AND its pixels have been
+    // fetched and (if saving is on) written, which is the whole client path.
+    for (g_hosts.slots.items) |slot| for (slot.mirror.images.items) |*im| {
+        if (im.info.client_ref != g_auto_image_ref) continue;
+        switch (im.status()) {
+            .done => {
+                if (im.pixels == null) return;
+                if (g_config.output_dir.opt() != null and !im.save_tried) return;
+                std.log.info("[auto] image done (ok)", .{});
+                std.process.exit(0);
+            },
+            .failed, .canceled => {
+                std.log.info("[auto] image done (FAILED: {s})", .{im.info.failure});
+                std.process.exit(1);
+            },
+            else => return,
+        }
+    };
 }
 
 /// TP_AUTO_MESSAGE: send one message through the REAL app path as soon as a
@@ -1063,45 +996,40 @@ fn autoMessage() void {
         }
         return;
     }
-    // Done when the deferred submit has been consumed and the turn is finished.
-    if (g_pending_submit != null or g_loading.load(.acquire)) return;
-    const s = g_session orelse return;
-    // turnPending: a turn queued behind the pause gate has its empty assistant
-    // message in the transcript already, and dumping that as the reply would
-    // report a 0-byte success.
-    if (s.busy() or s.turnPending() or s.messages.items.len == 0) return;
-    const last = &s.messages.items[s.messages.items.len - 1];
+    // Done when the host reports the turn ended and the reply is mirrored.
+    if (g_m.turns_ended == 0) return;
+    const msgs = g_m.messages.items;
+    if (msgs.len == 0) return;
+    const last = &msgs[msgs.len - 1];
     if (last.role != .assistant) return;
-    // Dump here rather than leaning on scanNewImages: this hook runs at the top
-    // of the frame, so the process would exit before that ever fired.
-    const v = last.activeConst();
-    const sp = s.opts.sampling;
-    std.log.info("[sampling] temp={d:.3} top_k={d} top_p={d:.4} min_p={d:.3} rp={d:.3} rln={d}", .{
-        sp.temperature, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty, sp.repeat_last_n,
-    });
+    const v = last.active();
     std.log.info("[reply] {d} bytes, thought_len={d}\n{s}\n[reply] end", .{
-        v.text.items.len, chat.Session.thoughtLen(v), v.text.items,
+        v.text.items.len, thoughtLen(v), v.text.items,
     });
     std.process.exit(0);
 }
 
-/// Read the configured GGUF's architecture and map it to reasoning support.
-/// Any failure (missing/unreadable file, unknown arch) -> false.
-fn probeThinking(path: []const u8) bool {
-    g_think_probe_effort = false;
-    var gg = tp.Gguf.openHeader(g_gpa, g_io, path) catch return false;
-    defer gg.deinit();
-    const arch = gg.getStr("general.architecture") orelse return false;
-    const fam = tp.llm.chat.familyForArch(arch) orelse return false;
-    g_think_probe_effort = tp.llm.chat.familySupportsReasoningEffort(fam);
-    return tp.llm.chat.familySupportsThinking(fam);
+/// Characters of reasoning in a finished take, split with its own markers.
+fn thoughtLen(v: *const mirror.Variant) usize {
+    const s2 = toolcall.splitThought(v.text.items, markersFor(v), v.thought_primed);
+    return if (s2.think) |t| std.mem.trim(u8, t, " \t\r\n").len else 0;
+}
+
+/// The markers to split a take with: the ones recorded when it was generated,
+/// else the resident model's, else none. With nothing loaded we deliberately
+/// do NOT guess: a wrong split silently eats or invents part of a reply.
+fn markersFor(v: *const mirror.Variant) ?toolcall.Reasoning {
+    if (v.reason_open.len > 0 and v.reason_close.len > 0) return .{ .open = v.reason_open, .close = v.reason_close };
+    const st = &g_m.state;
+    if (st.reason_open.len > 0 and st.reason_close.len > 0) return .{ .open = st.reason_open, .close = st.reason_close };
+    return null;
 }
 
 /// A file was dropped on the window: decode it (libvips -> RGB) and attach it
 /// to the next message for the model to see.
 fn handleDropFile(path: []const u8) void {
-    if (g_loading.load(.acquire)) return; // session being rebuilt on the loader thread
-    if (!visionAvailable()) {
+    if (g_m.state.loading) return; // the session is being rebuilt
+    if (!g_m.state.vision) {
         std.log.warn("dropped {s} but vision is unavailable", .{path});
         return;
     }
@@ -1111,7 +1039,7 @@ fn handleDropFile(path: []const u8) void {
         return;
     };
     defer gpa.free(dec.pixels);
-    attachOrStage(dec.pixels, dec.width, dec.height);
+    attachImage(dec.pixels, dec.width, dec.height);
 }
 
 /// Ctrl/Cmd+V with an image on the clipboard: decode the raw bytes (any
@@ -1122,8 +1050,8 @@ fn handleDropFile(path: []const u8) void {
 /// image, letting normal text paste proceed.
 fn tryPasteClipboardImage() bool {
     const SDL = SDLBackend.c;
-    if (g_loading.load(.acquire)) return false; // session being rebuilt on the loader thread
-    if (!visionAvailable()) return false;
+    if (g_m.state.loading) return false; // the session is being rebuilt
+    if (!g_m.state.vision) return false;
 
     var count: usize = 0;
     const mimes = SDL.SDL_GetClipboardMimeTypes(&count);
@@ -1154,11 +1082,13 @@ fn tryPasteClipboardImage() bool {
         return true;
     };
     defer gpa.free(dec.pixels);
-    attachOrStage(dec.pixels, dec.width, dec.height);
+    attachImage(dec.pixels, dec.width, dec.height);
     return true;
 }
 
 fn frame() void {
+    // Whatever the host pump learned between frames, now that there is a window.
+    toast.pump();
     autoMessage(); // TP_AUTO_MESSAGE; before any early return so it always runs
     autoImage(); // TP_AUTO_IMAGE, likewise
 
@@ -1174,23 +1104,40 @@ fn frame() void {
     if (g_view == .config) {
         // The view is handed a config, not a session, so the capability answer is
         // pushed rather than asked for. Same answer the composer gates on.
-        config_view.g_noise_supported = noiseAvailable();
-        config_view.render(&g_config, .{ .apply = applyConfig, .cancel = cancelConfig });
+        config_view.g_noise_supported = g_m.state.weight_noise;
+        config_view.render(&g_config, g_m, &g_models, .{
+            .apply = applyConfig,
+            .cancel = cancelConfig,
+            .rescan = rescan,
+            .hostStatus = hostStatus,
+            .hostSync = hostSync,
+            .sendModel = sendModel,
+            .sendPath = sendPath,
+            .pullPath = pullPath,
+            .tryHost = tryHost,
+            .reconnectHost = reconnectHost,
+        });
         return;
     }
 
-    const bands = shell.Bands.from(root);
+    const bands = shell.Bands.from(root, @as(f32, @floatFromInt(@max(g_hosts.slots.items.len, 1))) * status_bar.bar_outer_height);
     {
         const arena = dvui.currentWindow().arena();
-        const llm_resident = !g_loading.load(.acquire) and g_session != null;
-        const image_resident = if (g_diffuser) |*d| d.vramBytes() > 0 else false;
+        const llm_resident = g_m.state.llm_resident;
+        const t = &g_m.telemetry;
+        const image_resident = t.diff_te + t.diff_dit + t.diff_latent + t.diff_vae > 0;
         shell.titleBar(.{
             .tab = if (g_view == .image) .studio else .chat,
-            .llm = model_lib.llmChip(&g_config, llm_resident),
-            .llm_menu = model_lib.llmMenu(arena, &g_config),
-            .image = model_lib.imageChip(&g_config, image_resident),
-            .image_menu = model_lib.imageMenu(arena, &g_config),
-        }, .{ .on_tab = onTabPicked, .on_llm_pick = onLlmPick, .on_image_pick = onImagePick });
+            .llm = model_lib.llmChip(arena, &g_config, &g_models, llm_resident),
+            .llm_menu = model_lib.llmMenu(arena, &g_config, &g_models),
+            .image = model_lib.imageChip(arena, &g_config, &g_models, image_resident),
+            .image_menu = model_lib.imageMenu(arena, &g_config, &g_models),
+        }, .{
+            .on_tab = onTabPicked,
+            .on_llm_pick = onLlmPick,
+            .on_image_pick = onImagePick,
+            .on_settings = openSettings,
+        });
     }
 
     {
@@ -1201,24 +1148,75 @@ fn frame() void {
         });
         defer body.deinit();
 
-        if (g_view == .image) {
-            // Studio takes the whole body: it has its own gallery and its own
-            // parameter form, and the queue rail would duplicate both.
-            const ready = !g_loading.load(.acquire);
-            const d: ?*diffuser.Diffuser = if (g_diffuser) |*dd| dd else null;
-            var area = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .min_size_content = .{ .w = 0 } });
-            defer area.deinit();
-            image_view.render(&g_config, d, ready, .{ .settings = openSettings });
-        } else {
-            chatBody();
-        }
+        if (g_view == .image) studioBody() else chatBody();
     }
 
-    // `!g_loading`: only touch the session when no reload is tearing it down on
-    // the loader thread (the release/acquire hand-off only guarantees the
-    // pointer valid while g_loading is false).
-    const ready = !g_loading.load(.acquire);
-    status_bar.render(if (ready) g_session else null, !ready, diffBusy(), diffVram(), diffOffload(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+    // One bar per host, in list order (the local child first). Each carries
+    // its own card's meter and its own handles.
+    dropStaleViews();
+    const several = g_hosts.several();
+    for (g_hosts.slots.items, 0..) |slot, i| {
+        g_meter_host = slot.id;
+        status_bar.render(
+            viewFor(slot.id),
+            &slot.mirror,
+            if (several) slot.name else "",
+            hosts.Hosts.troubleOf(slot) orelse "",
+            if (g_hosts.whyNotRender(slot, &g_config)) |w| w.short else "",
+            i,
+            &slot.meter.split,
+            &slot.meter.limit,
+            meterActions(),
+        );
+    }
+}
+
+/// The studio workspace body: prompt rail | canvas + form + composer | queue rail.
+///
+/// The SAME three bands as chat, at the same widths, so switching tabs does not
+/// reflow the window; only the left rail's contents and the middle column
+/// differ. The queue rail is shared outright: an image belongs in exactly one
+/// place, and Library is where a finished one lives whichever tab made it.
+fn studioBody() void {
+    recordStudioPrompt();
+    renderPromptSidebar();
+
+    {
+        // Computed, not left to the box layout, for the reason chatBody states:
+        // a child's min size propagates up, so one long unbroken line grows the
+        // column and squeezes both rails to slivers.
+        const band_w = dvui.parentGet().data().contentRect().w;
+        const col_w = @max(320, band_w - style.Layout.sidebar_w - style.Layout.rail_w);
+        var col = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .vertical,
+            .min_size_content = .{ .w = col_w },
+            .max_size_content = .width(col_w),
+        });
+        defer col.deinit();
+
+        // The host that would take the next render, not the chat host: its
+        // models, its queue and its load errors are what this form describes.
+        const target = g_hosts.renderTarget(&g_config, @intCast(g_config.width), @intCast(g_config.height), @intCast(g_config.steps));
+        image_view.render(&g_config, &target.mirror, &g_models, studioImages(), post, !target.mirror.state.loading, .{
+            .settings = openSettings,
+            .save_defaults = saveStudioDefaults,
+            .cancel = onCancelImage,
+        });
+    }
+
+    renderQueueRail();
+}
+
+/// "Save as defaults": copy the studio form's recipe into the config the form
+/// (and the chat tool path) seed from. The one route by which a value the studio
+/// edits reaches config, and it is explicit.
+fn saveStudioDefaults() void {
+    image_view.saveDefaults(&g_config, configuredFamily());
+    // Both dependent views seed their buffers once, so both have to be told the
+    // numbers under them moved. `commitConfig` saves and reconciles the engines.
+    image_view.reseed();
+    config_view.reseed();
+    commitConfig();
 }
 
 /// The chat workspace body: sidebar | transcript + composer | queue rail.
@@ -1227,34 +1225,19 @@ fn chatBody() void {
     // the just-sent message shows as a normal user bubble, and the assistant
     // slot shows a small "Loading…" until the session is live (see
     // renderMessages). No spinner flashing in and out.
-    const loading = g_loading.load(.acquire);
-    // While a (re)load is in flight the loader thread is tearing down / rebuilding
-    // g_session on its own thread, so the UI MUST NOT dereference the session
-    // pointer (the release/acquire hand-off only guarantees it valid when
-    // g_loading is false, see the g_session doc comment). Treat it as unavailable
-    // and fall back to the carried transcript; otherwise a backend switch that
-    // triggers a reload use-after-frees the session mid-frame. (This is why every
-    // session-consuming render below takes `s_ui`, not `g_session`.)
-    const s_ui: ?*chat.Session = if (loading) null else g_session;
+    const st = &g_m.state;
+    const loading = st.loading;
 
     // The "no model" notice replaces the TRANSCRIPT, not the workspace: the
     // rails still show, so the queue and the settings shortcut stay reachable
     // while nothing is configured. True when there is genuinely nothing set, or
     // when the last load failed (e.g. a non-mmproj file in the vision-tower
     // slot) and there is no working session at all. During a load `loading` is
-    // set, so the transiently-null session never trips it.
-    const no_model = !loading and g_session == null and
-        (g_config.llm_model.opt() == null or g_load_err != null);
+    // set, so the transiently-absent session never trips it.
+    const no_model = !loading and !st.llm_resident and
+        (g_config.llm_model.opt() == null or st.load_err.len > 0);
 
     applyPendingConversationLoad();
-
-    if (s_ui) |s| {
-        s.poll();
-        if (g_diffuser) |*d| {
-            s.scanNewImages(d);
-            noteFinishedImages(s, d);
-        }
-    }
     saveHistory(false);
 
     renderSidebar();
@@ -1282,59 +1265,76 @@ fn chatBody() void {
             // min size, so as a plain flex child it would push the composer
             // off-screen.
             const list_h = @max(120, col.data().contentRect().h - g_input_h);
-            renderMessages(s_ui, list_h, loading);
-            renderInput(s_ui);
+            renderMessages(list_h);
+            renderInput();
         }
     }
 
     renderQueueRail();
 }
 
-/// Build the queue rail's model from the live engine. The Queue tab shows only
-/// in-flight images (they move into the transcript's tool card as they land);
-/// the Library tab shows every finished one, newest first.
+/// Build the queue rail's model from the live engine. The Queue tab shows what
+/// is still waiting for a host, plus what failed; a render in motion is drawn
+/// where its pixels are (the studio canvas, or the transcript's tool card). The
+/// Library tab shows every finished one, newest first.
 fn renderQueueRail() void {
     var jobs_buf: [16]queue_rail.Job = undefined;
     var lib_buf: [24]queue_rail.LibraryItem = undefined;
     var titles: [16][80]u8 = undefined;
     var n_jobs: usize = 0;
     var n_lib: usize = 0;
-    g_rail_jobs_len = 0;
 
-    if (g_diffuser) |*d| {
-        const items = d.items();
-        for (items) |gi| {
-            if (n_jobs >= jobs_buf.len) break;
-            const st = gi.get();
-            if (st != .pending and st != .generating and st != .suspended) continue;
-            const done = gi.step.load(.monotonic);
-            const total = gi.total.load(.monotonic);
-            jobs_buf[n_jobs] = .{
-                .id = @intFromPtr(gi),
-                .title = railTitle(&titles[n_jobs], gi),
-                .thumb = previewThumb(gi),
-                .state = if (st == .generating) .{ .running = .{
-                    .step = done,
-                    .steps = @max(total, 1),
-                    .it_s = itPerSec(gi),
-                } } else .{ .queued = .{ .eta_s = null } },
-                .from_studio = gi.from_studio,
-            };
-            g_rail_jobs[n_jobs] = gi;
-            n_jobs += 1;
-        }
-        g_rail_jobs_len = n_jobs;
+    // What no host has taken yet, first: it is the front of the queue, and a
+    // job invisible until a machine picks it up looks like a click that did
+    // nothing. Only these can be reordered; the rest are already somewhere.
+    var waiting_buf: [16]*const hosts.Hosts.Asked = undefined;
+    var notes: [16][64]u8 = undefined;
+    for (g_hosts.waiting(&waiting_buf)) |a| {
+        if (n_jobs >= jobs_buf.len) break;
+        jobs_buf[n_jobs] = .{
+            .id = a.ref,
+            .title = style.ellipsize(&titles[n_jobs], a.req.prompt, style.F.row_hi, 150),
+            .state = .{ .queued = .{ .note = waitNote(&notes[n_jobs], a) } },
+            .from_studio = a.req.from_studio,
+            .host = "",
+        };
+        n_jobs += 1;
+    }
 
-        // Finished images, newest first. Only the Library tab draws these, so
-        // nothing here is also sitting inline in the transcript.
-        var i = items.len;
-        while (i > 0 and n_lib < lib_buf.len) {
-            i -= 1;
-            const gi = items[i];
-            if (gi.get() != .done) continue;
-            lib_buf[n_lib] = .{ .id = @intFromPtr(gi), .thumb = doneThumb(gi) };
-            n_lib += 1;
+    // Then what a host has taken but not started, oldest first however many
+    // hosts they are spread over; a job names its host once there is more than
+    // one. A render under way is drawn where its pixels are, never here: in the
+    // studio that is the canvas, in chat the tool card's tile.
+    var run_buf: [16]hosts.Hosts.Shot = undefined;
+    for (g_hosts.running(&run_buf)) |sh| {
+        if (n_jobs >= jobs_buf.len) break;
+        const im = sh.im;
+        switch (im.status()) {
+            .generating, .suspended => continue,
+            else => {},
         }
+        jobs_buf[n_jobs] = .{
+            .id = im.info.id,
+            .title = railTitle(&titles[n_jobs], im),
+            .state = switch (im.status()) {
+                // A render that failed keeps its row and says why. Dropping it
+                // leaves the user watching a job disappear.
+                .failed => .{ .failed = .{ .why = mirror.failureText(im.info.failure) } },
+                else => .{ .queued = .{ .eta_s = null } },
+            },
+            .from_studio = im.info.from_studio,
+            .host = sh.host,
+            .draggable = false,
+        };
+        n_jobs += 1;
+    }
+
+    // Finished images, newest first across every host. Only the Library tab
+    // draws these, so nothing here is also sitting inline in the transcript.
+    var lib_shots: [lib_buf.len]hosts.Hosts.Shot = undefined;
+    for (g_hosts.finished(&lib_shots)) |sh| {
+        lib_buf[n_lib] = .{ .id = sh.im.info.id, .thumb = doneThumb(sh.im), .host = sh.host };
+        n_lib += 1;
     }
 
     queue_rail.render(.{
@@ -1344,17 +1344,18 @@ fn renderQueueRail() void {
         .paused = diffPaused(),
     }, .{
         .on_tab = onRailTab,
-        .on_pause_all = toggleDiffPause,
-        .on_open = onOpenImage,
+        .on_pause_all = toggleDiffPauseEverywhere,
+        .on_open_library = onOpenLibraryImage,
         .on_cancel = onCancelImage,
+        .on_retry = onRetryImage,
         .on_reorder = onReorderQueue,
     });
 }
 
 /// A queue row's title: the first line of the prompt, since that is what the
 /// user recognizes. Truncation is left to the rail, which knows its own width.
-fn railTitle(buf: []u8, gi: *chat.GenImage) []const u8 {
-    const p = std.mem.trim(u8, gi.prompt, " \t\r\n");
+fn railTitle(buf: []u8, im: *const mirror.Image) []const u8 {
+    const p = std.mem.trim(u8, im.info.prompt, " \t\r\n");
     const line = p[0 .. std.mem.indexOfScalar(u8, p, '\n') orelse p.len];
     if (line.len == 0) return "untitled";
     const n = @min(line.len, buf.len);
@@ -1362,96 +1363,120 @@ fn railTitle(buf: []u8, gi: *chat.GenImage) []const u8 {
     return buf[0..n];
 }
 
-fn itPerSec(gi: *chat.GenImage) f32 {
-    const first = gi.first_step_ns.load(.monotonic);
-    const last = gi.last_step_ns.load(.monotonic);
-    const steps = gi.step.load(.monotonic);
-    if (first == 0 or last <= first or steps < 2) return 0;
-    const secs = @as(f32, @floatFromInt(last - first)) / 1e9;
-    return @as(f32, @floatFromInt(steps - 1)) / @max(secs, 1e-6);
+/// Why a waiting render has not gone out, in the rail's few words.
+fn waitNote(buf: []u8, a: *const hosts.Hosts.Asked) []const u8 {
+    return switch (g_hosts.waitReason(&g_config, a)) {
+        .ready => "",
+        .behind => |host| if (host.len == 0) "" else std.fmt.bufPrint(buf, "waiting for {s}", .{host}) catch "",
+        .nowhere => "no host can run this yet",
+    };
 }
 
-/// A running image shows its live preview; a queued one has nothing to show
-/// yet, and says so with a dashed slot rather than an empty grey box.
-fn previewThumb(gi: *chat.GenImage) queue_rail.Thumb {
-    if (gi.preview) |pv| {
-        const w = gi.preview_w.load(.acquire);
-        const h = gi.preview_h.load(.acquire);
-        if (w > 0 and h > 0 and pv.len >= @as(usize, w) * h * 4) {
-            return .{ .rgba = .{ .px = pv[0 .. @as(usize, w) * h * 4], .w = w, .h = h } };
-        }
-    }
-    return .dashed;
-}
-
-fn doneThumb(gi: *chat.GenImage) queue_rail.Thumb {
-    if (gi.rgba) |px| return .{ .rgba = .{ .px = px, .w = @intCast(gi.width), .h = @intCast(gi.height) } };
+fn doneThumb(im: *const mirror.Image) queue_rail.Thumb {
+    if (im.thumb()) |t| return .{ .rgba = .{ .px = t.px, .w = t.w, .h = t.h } };
     return .loading;
 }
 
 // ----------------------------------------------------------- tool-call card
 
 /// Which card has its prompt open, and which tile is selected in it, both keyed
-/// by the variant's address. One card at a time: an accordion keeps the
-/// transcript from growing several screens of prompt text at once.
+/// by where the run sits in the transcript. One card at a time: an accordion
+/// keeps the transcript from growing several screens of prompt text at once.
 var g_card_open: ?usize = null;
 var g_card_sel_key: ?usize = null;
 var g_card_sel_tile: usize = 0;
 /// The image run the in-flight callbacks below act on, set immediately before
 /// the card renders (dvui callbacks fire inside the same call).
-var g_card_imgs: []const *chat.GenImage = &.{};
+var g_card_imgs: []const wire.ImageId = &.{};
 
-/// One card over `imgs` — a run of images the model asked for in one breath.
-fn renderToolCard(imgs: []const *chat.GenImage, id: usize) void {
-    if (imgs.len == 0) return;
-    const key = @intFromPtr(imgs[0]);
+/// This frame's image behind an id, or null once it is gone.
+fn imageById(id: wire.ImageId) ?*mirror.Image {
+    return g_hosts.imageById(id);
+}
+
+/// A card's identity, which it carries through dvui as an opaque context
+/// pointer: where the run sits in the transcript, offset so it cannot be null.
+/// Not the first image's id, which a retry replaces with one minted elsewhere.
+fn cardKey(msg: usize, variant: usize, at: usize) usize {
+    return (msg << 20 | variant << 8 | (at & 0xff)) + 1;
+}
+
+/// One card over a run of images the model asked for in one breath. `slots` is
+/// the whole run, `imgs` the part of it this client has an image for; the rest
+/// are still in its queue and draw as reserved slots. An id that no longer
+/// resolves (its engine is gone) draws as a failed slot.
+fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usize) void {
+    if (slots == 0) return;
     g_card_imgs = imgs;
 
     var tiles_buf: [12]bubbles.Tile = undefined;
-    const n = @min(imgs.len, tiles_buf.len);
+    var step_bufs: [12][32]u8 = undefined;
+    const n = @min(slots, tiles_buf.len);
     var n_done: usize = 0;
     var busy = false;
-    for (imgs[0..n], 0..) |gi, i| {
-        switch (gi.get()) {
+    var first: ?*mirror.Image = null;
+    for (tiles_buf[0..n], 0..) |*tile, i| {
+        if (i >= imgs.len) {
+            // Asked for, and this client has not put it anywhere yet: the rail
+            // has the row that says why.
+            tile.* = .pending;
+            busy = true;
+            continue;
+        }
+        const im = imageById(imgs[i]) orelse {
+            tile.* = .failed;
+            continue;
+        };
+        if (first == null) first = im;
+        switch (im.status()) {
             .done => {
                 n_done += 1;
-                tiles_buf[i] = if (gi.rgba) |px|
-                    .{ .rgba = .{ .px = px, .w = @intCast(gi.width), .h = @intCast(gi.height) } }
+                tile.* = if (im.thumb()) |t|
+                    .{ .rgba = .{ .px = t.px, .w = t.w, .h = t.h } }
                 else
                     .pending;
+                if (im.receiving()) busy = true;
             },
-            .failed, .canceled => tiles_buf[i] = .failed,
-            // Still in the queue: the card holds the slot, the rail holds the
-            // pixels. See queue_rail.
-            .pending, .generating, .suspended => {
-                tiles_buf[i] = .pending;
+            .failed, .canceled => tile.* = .failed,
+            // A host has it but has not started it. See queue_rail.
+            .pending => {
+                tile.* = .pending;
+                busy = true;
+            },
+            // Under way: this tile is where it is watched, so the preview and
+            // the step count come here and the rail lists nothing.
+            .generating, .suspended => {
+                tile.* = .{ .rendering = liveTile(im, &step_bufs[i]) };
                 busy = true;
             },
         }
     }
     if (busy) dvui.refresh(null, @src(), null);
 
-    const first = imgs[0];
     var meta_buf: [80]u8 = undefined;
     var cbuf: [8]u8 = undefined;
-    const meta = std.fmt.bufPrint(&meta_buf, "{s}{d}×{d} · seed {d}", .{
+    const meta = if (first) |f| std.fmt.bufPrint(&meta_buf, "{s}{d}×{d} · seed {d}", .{
         if (n > 1) (std.fmt.bufPrint(&cbuf, "×{d} · ", .{n}) catch "") else "",
-        first.req_width,
-        first.req_height,
-        first.req_seed,
-    }) catch "";
+        f.info.req_width,
+        f.info.req_height,
+        f.info.req_seed,
+    }) catch "" else "";
 
     var status_buf: [40]u8 = undefined;
     const status = if (busy)
-        (std.fmt.bufPrint(&status_buf, "rendering {d} of {d} · in queue", .{ @min(n_done + 1, n), n }) catch "rendering")
+        (std.fmt.bufPrint(&status_buf, "rendering {d} of {d}", .{ @min(n_done + 1, n), n }) catch "rendering")
     else
         "";
 
     bubbles.toolCard(@src(), .{
         .meta = meta,
         .tiles = tiles_buf[0..n],
+        .aspect = if (first) |f| (if (f.info.req_height > 0)
+            @as(f32, @floatFromInt(f.info.req_width)) / @as(f32, @floatFromInt(f.info.req_height))
+        else
+            1) else 1,
         .selected = if (g_card_sel_key == key) g_card_sel_tile else null,
-        .prompt = first.prompt,
+        .prompt = if (first) |f| f.info.prompt else "",
         .expanded = g_card_open == key,
         .busy = busy,
         .status = status,
@@ -1461,7 +1486,38 @@ fn renderToolCard(imgs: []const *chat.GenImage, id: usize) void {
         .on_toggle = cardToggle,
         .on_select = cardSelect,
         .on_open_studio = cardOpenStudio,
+        .on_cancel = cardCancel,
     });
+}
+
+/// The × on a tile that is rendering.
+fn cardCancel(_: *anyopaque, i: usize) void {
+    if (i < g_card_imgs.len) onCancelImage(g_card_imgs[i]);
+}
+
+/// A tile for a render under way: its last preview frame, where it is, and the
+/// host doing it when there is more than one.
+fn liveTile(im: *const mirror.Image, buf: []u8) bubbles.Rendering {
+    const host = g_hosts.hostOf(im.info.id);
+    const label = switch (im.status()) {
+        .suspended => std.fmt.bufPrint(buf, "paused · {d}/{d}", .{ im.info.step, im.info.total }) catch "paused",
+        else => if (host.len > 0)
+            std.fmt.bufPrint(buf, "{d} / {d} · {s}", .{ im.info.step, im.info.total, host }) catch ""
+        else
+            std.fmt.bufPrint(buf, "step {d} / {d}", .{ im.info.step, im.info.total }) catch "",
+    };
+    return .{
+        .px = if (im.preview) |pv|
+            (if (im.preview_w > 0 and im.preview_h > 0)
+                bubbles.Px{ .px = pv, .w = im.preview_w, .h = im.preview_h }
+            else
+                null)
+        else
+            null,
+        .step = im.info.step,
+        .steps = im.info.total,
+        .label = label,
+    };
 }
 
 fn cardToggle(ctx: *anyopaque) void {
@@ -1475,8 +1531,8 @@ fn cardSelect(ctx: *anyopaque, i: usize) void {
     g_card_sel_key = @intFromPtr(ctx);
     g_card_sel_tile = i;
     if (i < g_card_imgs.len) {
-        const gi = g_card_imgs[i];
-        if (gi.get() == .done) g_viewer_request = gi;
+        const im = imageById(g_card_imgs[i]) orelse return;
+        if (im.status() == .done) g_viewer_request = im.info.id;
     }
 }
 
@@ -1485,7 +1541,7 @@ fn cardOpenStudio(ctx: *anyopaque) void {
     const key = @intFromPtr(ctx);
     if (g_card_imgs.len == 0) return;
     const idx = if (g_card_sel_key == key and g_card_sel_tile < g_card_imgs.len) g_card_sel_tile else 0;
-    image_view.loadFrom(g_card_imgs[idx]);
+    image_view.loadFrom(imageById(g_card_imgs[idx]) orelse return);
     enterImageMode();
 }
 
@@ -1498,7 +1554,7 @@ fn renderSidebar() void {
     var groups: [3]shell.ConvGroup = undefined;
     var n_groups: usize = 0;
 
-    const now = @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms);
+    const now = nowMs();
     const tz = history.localOffsetSeconds(@divTrunc(now, 1000));
     var n: usize = 0;
     // The store is already newest-first, so each group is a contiguous run.
@@ -1533,6 +1589,69 @@ fn renderSidebar() void {
     });
 }
 
+/// The studio's left rail: the prompt library, grouped by day exactly as the
+/// conversation list is. A row restores TEXT and nothing else -- the knobs stay
+/// where they were, which is what makes the library a place to keep phrasings
+/// rather than a second copy of the recipe the PNG already carries.
+fn renderPromptSidebar() void {
+    var rows: [64]shell.ConvRow = undefined;
+    var groups: [3]shell.ConvGroup = undefined;
+    var n_groups: usize = 0;
+
+    const now = nowMs();
+    const tz = prompt_history.localOffsetSeconds(@divTrunc(now, 1000));
+    var n: usize = 0;
+    // The store is already newest-first, so each group is a contiguous run.
+    inline for ([_]prompt_history.Group{ .today, .yesterday, .earlier }) |grp| {
+        const start = n;
+        for (g_prompts.entries.items) |e| {
+            if (n >= rows.len) break;
+            if (prompt_history.groupOf(e.updated_ms, now, tz) != grp) continue;
+            // No sub-line: the prompt IS the row, and a second line of it would
+            // be the same text twice.
+            rows[n] = .{ .id = e.id, .title = e.prompt };
+            n += 1;
+        }
+        if (n > start) {
+            groups[n_groups] = .{ .head = grp.head(), .rows = rows[start..n] };
+            n_groups += 1;
+        }
+    }
+
+    shell.sidebar(.{
+        .groups = groups[0..n_groups],
+        .new_label = "New prompt",
+        .empty = "Prompts you generate from are kept here.",
+        // No footer: the gear in the title bar is the studio's route to
+        // Settings, and a second one a hand's width away is two answers to the
+        // same question.
+        .footer = false,
+    }, .{
+        .on_new_chat = image_view.clearPrompt,
+        .on_select = onSelectPrompt,
+        .on_delete = onDeletePrompt,
+        .on_models = openSettings,
+        .on_settings = openSettings,
+    });
+}
+
+fn onSelectPrompt(id: u64) void {
+    const e = g_prompts.find(id) orelse return;
+    image_view.setPrompt(e.prompt, e.negative);
+}
+
+fn onDeletePrompt(id: u64) void {
+    g_prompts.remove(g_gpa, g_io, id);
+}
+
+/// Take whatever the studio just generated into the prompt library. Polled
+/// rather than pushed so `image_view` needs nothing from the store.
+fn recordStudioPrompt() void {
+    const rec = image_view.recorded_prompt orelse return;
+    image_view.recorded_prompt = null;
+    _ = g_prompts.record(g_gpa, g_io, nowMs(), rec.prompt, rec.negative);
+}
+
 /// Point the store at `<config dir>/conversations` and scan it.
 fn openHistory() void {
     const dir: ?[]u8 = blk: {
@@ -1551,6 +1670,10 @@ fn openHistory() void {
     };
     defer g_gpa.free(d);
     g_history.open(g_gpa, g_io, d);
+    // The prompt library lives beside the transcripts, in the same directory an
+    // explicit --config redirects, so a throwaway config leaves nothing behind.
+    const parent = std.fs.path.dirname(d) orelse ".";
+    g_prompts.open(g_gpa, g_io, parent);
 }
 
 fn onNewConversation() void {
@@ -1584,16 +1707,14 @@ fn onDeleteConversation(id: u64) void {
 /// message list.
 fn applyPendingConversationLoad() void {
     const id = g_load_conv orelse return;
-    if (g_loading.load(.acquire)) { // the loader owns the session right now
+    if (g_m.state.loading) { // the loader owns the session right now
         g_load_conv = null;
         return;
     }
     // A turn in flight owns both the transcript and the KV it is decoding
-    // against: `reset` refuses, and the `adoptTranscript` below would then swap
-    // `messages` out from under a worker that renders its prompt from them. Hold
-    // the click (keep `g_load_conv`) and apply it when the turn ends, rather than
-    // dropping it or corrupting the session.
-    if (g_session) |s| if (s.busy()) return;
+    // against: the host would refuse the adopt. Hold the click (keep
+    // `g_load_conv`) and apply it when the turn ends, rather than dropping it.
+    if (g_m.state.llm_busy) return;
     g_load_conv = null;
 
     var loaded = g_history.load(g_gpa, g_io, id) orelse return;
@@ -1601,59 +1722,41 @@ fn applyPendingConversationLoad() void {
 
     saveHistory(true); // flush the conversation we are leaving
 
-    var msgs: std.ArrayList(chat.Message) = .empty;
+    // The wire form of the stored turns, built in an arena for the one request.
+    var arena = std.heap.ArenaAllocator.init(g_gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var msgs: std.ArrayList(wire.Message) = .empty;
+    var n_saved: usize = 0;
     for (loaded.turns) |t| {
-        var m = chat.Message.init(g_gpa, if (t.role == .user) .user else .assistant) catch break;
-        m.synthetic = t.synthetic;
-        m.active().text.appendSlice(g_gpa, t.text) catch {};
-        // Without this a primed reply parses as having no thought at all and
-        // the whole reasoning block spills into the answer (see history.Turn).
-        m.active().thought_primed = t.primed;
-        // The tool calls in this text have ALREADY been acted on. Marking the
-        // variant scanned is what stops `scanNewImages` re-dispatching the last
-        // assistant turn's calls every time a conversation is reopened —
-        // regenerating images the user already has.
-        m.active().images_scanned = true;
-        // The markers this turn was generated with, so it splits the same way it
-        // did when it was live — with a different model loaded, or none.
-        if (t.reason_open.len > 0 and t.reason_close.len > 0) {
-            if (g_gpa.dupe(u8, t.reason_open)) |o| {
-                if (g_gpa.dupe(u8, t.reason_close)) |c| {
-                    m.active().reason_open = o;
-                    m.active().reason_close = c;
-                } else |_| g_gpa.free(o);
-            } else |_| {}
-        }
-        if (t.model.len > 0) m.active().gen_model = g_gpa.dupe(u8, t.model) catch "";
-        restoreImages(&m, t.images);
-        msgs.append(g_gpa, m) catch {
-            m.deinit(g_gpa);
-            break;
+        const v = a.alloc(wire.Variant, 1) catch break;
+        v[0] = .{
+            .text = t.text,
+            // Without this a primed reply parses as having no thought at all and
+            // the whole reasoning block spills into the answer (see history.Turn).
+            .thought_primed = t.primed,
+            // The markers this turn was generated with, so it splits the same way
+            // it did when it was live, with a different model loaded, or none.
+            .reason_open = t.reason_open,
+            .reason_close = t.reason_close,
+            .gen_model = t.model,
+            .images = restoreImages(a, t.images),
         };
+        n_saved += v[0].images.len;
+        msgs.append(a, .{
+            .role = if (t.role == .user) .user else .assistant,
+            .synthetic = t.synthetic,
+            .variants = v,
+        }) catch break;
     }
-
-    freeCarry();
-    freeLlmSuspend();
-    clearStaged();
-    dropPendingImageNotes(); // same boundary as `newChat`: this conversation is being left
+    // The host replaces its transcript (replaying each turn into the model's
+    // tokenizer when one is resident) and sends the mirror the result.
+    post(.{ .chat_adopt = .{ .messages = msgs.items } });
+    // Everything below names the conversation just opened; the mirror still
+    // holds the one being left until the host answers the adopt.
+    g_handover_rev = g_m.transcript_rev;
     g_input.clearRetainingCapacity();
-    g_pending_regenerate = false;
     g_follow_bottom = true;
-
-    if (g_session) |s| {
-        _ = s.reset(); // takes: the busy check above is the only thing that refuses
-        // Takes ownership of `msgs` and replays each turn into this model's
-        // tokenizer; the next prefill rebuilds KV from the whole context.
-        s.adoptTranscript(msgs) catch |err| {
-            std.log.err("history: adopting conversation {d} failed: {t}", .{ id, err });
-        };
-    } else {
-        // No LLM resident: the transcript still shows (read-only) and is adopted
-        // by the fresh session when one loads.
-        g_carry_mu.lockUncancelable(g_io);
-        defer g_carry_mu.unlock(g_io);
-        g_carry = msgs;
-    }
 
     g_history.current = id;
     // The conversation you are looking at belongs at the top of the list. Done
@@ -1661,61 +1764,11 @@ fn applyPendingConversationLoad() void {
     // thing that broke the ordering in the first place. Across a restart the
     // list falls back to last-modified order, which is the honest thing for a
     // conversation nobody has touched.
-    g_history.touch(id, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms));
+    g_history.touch(id, nowMs());
     g_saved_turns = loaded.turns.len;
     g_saved_tail = if (loaded.turns.len > 0) loaded.turns[loaded.turns.len - 1].text.len else 0;
-    // Same function the saver compares against, so opening never rewrites.
-    g_saved_images = savedImageCount(msgs.items);
-}
-
-/// Report each image's terminal state to the model, once, as a note it reads
-/// at the next turn boundary.
-///
-/// This is what closes the loop the image tool has never had: the model asks
-/// for a picture and, until now, never learned whether one appeared. Knowing a
-/// render ran out of VRAM is what lets it offer a smaller retry instead of the
-/// user wondering why nothing happened.
-///
-/// Off by setting (`image_tool_result`), which restores the fire-and-forget
-/// behaviour exactly: nothing is queued, so nothing reaches the model.
-/// Conversation boundary: an image still in flight belongs to the chat being
-/// left, so its outcome must not be announced to the next one. `Session.reset`
-/// drops the notes already queued; this covers the other half, images that
-/// finish AFTER the boundary (the queue deliberately keeps generating across a
-/// new chat). Marking them reported is what the toggle-off and reopened-
-/// conversation paths already do: the render stays in the queue and the gallery,
-/// only the sentence to the model is dropped.
-fn dropPendingImageNotes() void {
-    const d = &(g_diffuser orelse return);
-    for (d.items()) |gi| gi.outcome_noted = true;
-}
-
-fn noteFinishedImages(s: *chat.Session, d: *diffuser.Diffuser) void {
-    for (d.items()) |gi| {
-        if (gi.outcome_noted) continue;
-        const st = gi.get();
-        switch (st) {
-            .pending, .generating, .suspended => continue,
-            .done, .failed, .canceled => {},
-        }
-        // Marked even when the setting is off, so flipping it on mid-session
-        // does not suddenly announce a backlog of old images.
-        gi.outcome_noted = true;
-        if (!g_config.image_tool_result) continue;
-
-        var buf: [220]u8 = undefined;
-        const text = switch (st) {
-            .done => std.fmt.bufPrint(&buf, "[image tool] finished: {d}×{d}, seed {d}", .{
-                gi.width, gi.height, gi.req_seed,
-            }) catch continue,
-            .canceled => std.fmt.bufPrint(&buf, "[image tool] canceled by the user", .{}) catch continue,
-            .failed => std.fmt.bufPrint(&buf, "[image tool] failed: {s}", .{
-                if (gi.failure()) |err| diffuser.failureText(err) else "unknown error",
-            }) catch continue,
-            else => continue,
-        };
-        s.queueNote(g_gpa.dupe(u8, text) catch continue);
-    }
+    // Same count the saver compares against, so opening never rewrites.
+    g_saved_images = n_saved;
 }
 
 /// Rebuild a turn's finished renders from disk so its card shows the images
@@ -1726,76 +1779,59 @@ fn noteFinishedImages(s: *chat.Session, d: *diffuser.Diffuser) void {
 /// picture once, and silently spending VRAM to remake it is the behaviour this
 /// whole path exists to remove.
 ///
-/// The engine takes ownership, so restored renders live in the same unified list
-/// as everything else and show up in Library and the viewer. With no engine
-/// (no diffusion model configured) there is nowhere to put them, and the card
-/// renders its slots empty.
-fn restoreImages(m: *chat.Message, recs: []const history.ImageRec) void {
-    const d = if (g_diffuser) |*dd| dd else return;
+/// These are the client's own images (the host never sees them): they live in
+/// the mirror beside the host's, so they show up in Library and the viewer,
+/// and the transcript carries their ids like any other. Returns the ids, in
+/// `a`.
+fn restoreImages(a: std.mem.Allocator, recs: []const history.ImageRec) []const wire.ImageId {
+    var ids: std.ArrayList(wire.ImageId) = .empty;
     for (recs) |rec| {
-        // Already here? Reuse it. The engine owns every image and a variant
-        // only borrows, so the same render can appear in two conversations
-        // without being loaded twice — and reopening one conversation
-        // repeatedly cannot keep growing the Library.
-        if (diffuser.Diffuser.findSaved(d.items(), rec.path)) |have| {
-            m.active().images.append(g_gpa, have) catch return;
+        // Already here? Reuse it. The same render can appear in two
+        // conversations without being loaded twice, and reopening one
+        // conversation repeatedly cannot keep growing the Library.
+        if (g_hosts.bySavedPath(rec.path)) |have| {
+            ids.append(a, have.info.id) catch return ids.items;
             continue;
         }
-        const gi = g_gpa.create(chat.GenImage) catch return;
-        gi.* = .{
+        var info: wire.ImageInfo = .{
             // Left EMPTY on purpose: the request lives in the PNG's own
             // metadata, which `image_view.loadFrom` reads when reopening it.
-            .prompt = g_gpa.dupe(u8, "") catch {
-                g_gpa.destroy(gi);
-                return;
-            },
-            .wake = wakeupFrame,
-            .io = g_io,
-            .req_width = rec.width,
-            .req_height = rec.height,
-            .req_steps = rec.steps,
+            .req_width = @intCast(rec.width),
+            .req_height = @intCast(rec.height),
+            .req_steps = @intCast(rec.steps),
             .req_seed = rec.seed,
-            .width = rec.width,
-            .height = rec.height,
-            .saved_path = g_gpa.dupe(u8, rec.path) catch null,
-            // Already terminal, and already reported when it was generated.
-            .outcome_noted = true,
+            .width = @intCast(rec.width),
+            .height = @intCast(rec.height),
         };
+        var pixels: ?[]u8 = null;
         if (vips.loadRgb(g_gpa, rec.path)) |dec| {
             defer g_gpa.free(dec.pixels);
-            if (diffuser.rgbToRgba(g_gpa, dec.pixels, dec.width, dec.height)) |rgba| {
-                gi.rgba = rgba;
-                gi.width = dec.width;
-                gi.height = dec.height;
-                gi.status = .init(@intFromEnum(chat.GenStatus.done));
-            } else |_| gi.fail(error.OutOfMemory);
+            if (tp.image.rgbToRgba(g_gpa, dec.pixels, dec.width, dec.height)) |rgba| {
+                pixels = rgba;
+                info.width = @intCast(dec.width);
+                info.height = @intCast(dec.height);
+                info.status = .done;
+                info.pixels_rev = 1;
+            } else |_| {
+                info.status = .failed;
+                info.failure = "OutOfMemory";
+            }
         } else |_| {
-            gi.fail(error.SavedImageMissing);
+            // Moved or deleted since: a FAILED image, not a fresh generation.
+            info.status = .failed;
+            info.failure = "SavedImageMissing";
         }
-        d.adoptFinished(gi) catch {
-            diffuser.freeGenImage(g_gpa, gi);
-            return;
-        };
-        m.active().images.append(g_gpa, gi) catch return;
+        const id = g_hosts.addLocal(info, pixels, g_gpa.dupe(u8, rec.path) catch null);
+        if (id != 0) ids.append(a, id) catch return ids.items;
     }
+    return ids.items;
 }
 
 /// Persist the live transcript if it changed since the last save. Skipped while
 /// a turn is streaming (`force` overrides, for a conversation switch or exit):
 /// writing on every token would rewrite the file once per frame.
 fn saveHistory(force: bool) void {
-    // While a load is in flight the loader thread owns the session: reading it
-    // here is a use-after-free (the crash was here: a model switch reached
-    // `s.deinit()` while this frame walked `s.messages`), and unlike the
-    // renderers there is no `s_ui` to fall back to. Nothing is lost by waiting:
-    // `maybeStartReload` flushes just before it arms the loader, and the fresh
-    // session's first frame saves whatever changed after that.
-    if (g_loading.load(.acquire)) return;
-    // The carry is reachable here with no load running (the LLM is ejected), and
-    // taken across the whole walk below for the reason on `g_carry_mu`.
-    g_carry_mu.lockUncancelable(g_io);
-    defer g_carry_mu.unlock(g_io);
-    const msgs: []chat.Message = if (g_session) |s| s.messages.items else if (g_carry) |c| c.items else return;
+    const msgs: []mirror.Message = g_m.messages.items;
     if (msgs.len == 0) return;
     // `force` bypasses the BUSY gate only, so a switch or an exit can flush a
     // turn that is still streaming. It does NOT bypass the change check:
@@ -1803,8 +1839,14 @@ fn saveHistory(force: bool) void {
     // since the list is ordered by that, merely opening conversations
     // reshuffled them — the one you left jumped to the top. Reading must not
     // write.
-    if (!force) if (g_session) |s| if (s.busy()) return;
-    const tail = msgs[msgs.len - 1].activeConst().text.items.len;
+    if (!force and g_m.state.llm_busy) return;
+    // The host has not swapped the transcript yet, so what is on screen belongs
+    // to the conversation we just left, not the one `g_history.current` names.
+    if (g_handover_rev) |rev| {
+        if (g_m.transcript_rev == rev) return;
+        g_handover_rev = null;
+    }
+    const tail = msgs[msgs.len - 1].active().text.items.len;
     const n_images = savedImageCount(msgs);
     if (msgs.len == g_saved_turns and tail == g_saved_tail and n_images == g_saved_images) return;
 
@@ -1826,15 +1868,17 @@ fn saveHistory(force: bool) void {
         // there is nothing to point at otherwise, and a reload shows the call
         // without the picture rather than generating it again.
         var recs: std.ArrayList(history.ImageRec) = .empty;
-        for (m.activeConst().images.items) |gi| {
-            if (gi.get() != .done) continue;
-            const path = gi.saved_path orelse continue;
+        const v = m.active();
+        for (v.images.items) |id| {
+            const im = imageById(id) orelse continue;
+            if (im.status() != .done) continue;
+            const path = im.saved_path orelse continue;
             recs.append(g_gpa, .{
                 .path = path,
-                .width = gi.width,
-                .height = gi.height,
-                .steps = gi.req_steps,
-                .seed = gi.req_seed,
+                .width = im.info.width,
+                .height = im.info.height,
+                .steps = im.info.req_steps,
+                .seed = im.info.req_seed,
             }) catch break;
         }
         // Owned by `image_recs` so the slices outlive the save call below.
@@ -1842,30 +1886,31 @@ fn saveHistory(force: bool) void {
         image_recs.append(g_gpa, owned) catch {};
         turns.append(g_gpa, .{
             .role = role,
-            .text = m.activeConst().text.items,
-            .primed = m.activeConst().thought_primed,
+            .text = v.text.items,
+            .primed = v.thought_primed,
             .images = owned,
             // What produced this turn. Without the markers a reopened
             // conversation splits its replies with whatever model is loaded now.
-            .reason_open = m.activeConst().reason_open,
-            .reason_close = m.activeConst().reason_close,
-            .model = m.activeConst().gen_model,
+            .reason_open = v.reason_open,
+            .reason_close = v.reason_close,
+            .model = v.gen_model,
             .synthetic = m.synthetic,
         }) catch return;
     }
     if (turns.items.len == 0) return;
 
-    g_history.save(g_gpa, g_io, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms), turns.items);
+    g_history.save(g_gpa, g_io, nowMs(), turns.items);
     g_saved_turns = msgs.len;
-    g_saved_tail = msgs[msgs.len - 1].activeConst().text.items.len;
+    g_saved_tail = msgs[msgs.len - 1].active().text.items.len;
     g_saved_images = n_images;
 }
 
 /// Renders that reached disk, the ones `saveHistory` records.
-fn savedImageCount(msgs: []const chat.Message) usize {
+fn savedImageCount(msgs: []const mirror.Message) usize {
     var n: usize = 0;
-    for (msgs) |*m| for (m.activeConst().images.items) |gi| {
-        if (gi.get() == .done and gi.saved_path != null) n += 1;
+    for (msgs) |*m| for (m.active().images.items) |id| {
+        const im = imageById(id) orelse continue;
+        if (im.status() == .done and im.saved_path != null) n += 1;
     };
     return n;
 }
@@ -1885,7 +1930,7 @@ fn onLlmPick(p: model_menu.Pick) void {
     std.log.info("[models] chat pick: {t}", .{p});
     switch (p) {
         .none => selection.clearLlm(&g_config),
-        .path => |path| selection.selectLlm(&g_config, &model_lib.cat, path),
+        .path => |path| selection.selectLlm(&g_config, &g_models.cat, path),
         .settings => return openSettings(),
     }
     commitConfig();
@@ -1895,7 +1940,7 @@ fn onImagePick(p: model_menu.Pick) void {
     std.log.info("[models] image pick: {t}", .{p});
     switch (p) {
         .none => selection.clearCheckpoint(&g_config),
-        .path => |path| selection.selectCheckpoint(&g_config, &model_lib.cat, path),
+        .path => |path| selection.selectCheckpoint(&g_config, &g_models.cat, path),
         .settings => return openSettings(),
     }
     commitConfig();
@@ -1926,10 +1971,10 @@ fn applyFraming() void {
     g_config_baseline.framing_mp = g_config.framing_mp;
     g_config_baseline.width = g_config.width;
     g_config_baseline.height = g_config.height;
-    if (g_diffuser) |*d| d.setDefaults(g_config.steps, g_config.width, g_config.height);
     image_view.reseed();
     config_view.reseed();
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+    postSettings();
 }
 
 /// The weight-noise curve's shape preview: the curve sampled first-layer-to-head
@@ -1978,17 +2023,9 @@ fn noiseShape() []const f32 {
 ///
 /// Applied LIVE rather than at a turn boundary: the curve lands in a table the
 /// decode kernels re-read at every launch, so turning the knob mid-reply takes
-/// effect on the next token. Gated on `g_loading` for the same reason every other
-/// `g_session` touch is: the session is being torn down and rebuilt under us.
+/// effect on the next token.
 fn applyWeightNoise() void {
-    if (!g_loading.load(.acquire)) {
-        if (g_session) |s| {
-            s.be.weight_noise.amount = g_config.weight_noise_amount;
-            s.be.weight_noise.setCurve(
-                if (g_config.weight_noise) g_config.weight_noise_curve.slice() else "",
-            );
-        }
-    }
+    postSettings();
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
 }
 
@@ -2074,44 +2111,35 @@ fn onRailTab(t: queue_rail.Tab) void {
     g_rail_tab = t;
 }
 
-fn onOpenImage(id: u64) void {
-    if (g_diffuser) |*d| for (d.items()) |gi| {
-        if (@intFromPtr(gi) == id) {
-            g_viewer_request = gi;
-            return;
-        }
-    };
+/// A failed job asked for another go. Deferred to `pumpHost` rather than run
+/// here: `retry` appends an image to a mirror's list, and that list may
+/// reallocate under every `*Image` this frame is still drawing from.
+var g_retry_request: ?wire.ImageId = null;
+
+fn onRetryImage(id: u64) void {
+    g_retry_request = id;
 }
 
+/// A library thumbnail was clicked: "look at that picture". Always the viewer,
+/// in both views. Sending a finished picture to the studio canvas would park it
+/// over whatever is rendering, and the only way back out was to press Generate.
+fn onOpenLibraryImage(id: u64) void {
+    if (imageById(id) == null) return;
+    g_viewer_request = id;
+}
+
+/// The × on a queue row, or on a tile that is rendering. A render still to come
+/// or under way is cancelled; a row that only records a failure is cleared away,
+/// since there is nothing left to stop.
 fn onCancelImage(id: u64) void {
-    if (g_diffuser) |*d| for (d.items()) |gi| {
-        if (@intFromPtr(gi) == id) {
-            gi.cancel.store(true, .release);
-            gi.wake();
-            return;
-        }
-    };
+    if (g_hosts.forget(id)) return;
+    post(.{ .img_cancel = .{ .image = id } });
 }
 
-/// Drag-to-reorder. The rail hands back indices into the row list it was given,
-/// which `renderQueueRail` recorded in `g_rail_jobs` for exactly this.
-fn onReorderQueue(from: usize, to: usize) void {
-    const d = if (g_diffuser) |*dd| dd else return;
-    if (from >= g_rail_jobs_len) return;
-    const move = g_rail_jobs[from];
-    const before: ?*chat.GenImage = if (to < g_rail_jobs_len) g_rail_jobs[to] else null;
-    d.movePending(move, before);
-}
-
-fn diffBusy() bool {
-    return if (g_diffuser) |*d| d.busyNow() else false;
-}
-fn diffVram() diffuser.VramBreakdown {
-    return if (g_diffuser) |*d| d.vramBreakdown() else .{};
-}
-/// Pipeline bytes streaming from host RAM instead of sitting in VRAM.
-fn diffOffload() u64 {
-    return if (g_diffuser) |*d| d.offloadBytes() else 0;
+/// Drag-to-reorder. The rail hands back the ids of the row dragged and the row
+/// it was dropped before (null for the end).
+fn onReorderQueue(move: u64, before: ?u64) void {
+    post(.{ .img_move = .{ .image = move, .before = before } });
 }
 
 /// Chat view while the session (re)loads on the background thread.
@@ -2152,12 +2180,13 @@ fn renderNoModel() void {
     {
         var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5, .background = false });
         defer tl.deinit();
-        if (g_load_err) |err| {
+        if (g_m.state.load_err.len > 0) {
+            const err = g_m.state.load_err;
             var msg: [320]u8 = undefined;
-            const text = if (err == error.MmprojNotVisionTower)
+            const text = if (std.mem.eql(u8, err, "MmprojNotVisionTower"))
                 "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
             else
-                (std.fmt.bufPrint(&msg, "Failed to load the model: {t}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
+                (std.fmt.bufPrint(&msg, "Failed to load the model: {s}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
             fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = style.C.text });
         } else {
             fonts.addStyled(tl, "No LLM model is set.\n\nOpen Settings to choose a model file and get started.", .{}, .{
@@ -2180,404 +2209,66 @@ fn openSettings() void {
     g_view = .config;
 }
 
-/// The viewer navigates the engine's unified image list (chat + studio).
-fn diffuserSource() viewer.ImageSource {
-    return .{ .ctx = undefined, .gpa = g_gpa, .collect = diffuserCollect };
-}
-fn diffuserCollect(_: *anyopaque, buf: *std.ArrayList(*chat.GenImage)) void {
-    buf.clearRetainingCapacity();
-    if (g_diffuser) |*d| for (d.items()) |gi| {
-        if (gi.get() == .done) buf.append(g_gpa, gi) catch {};
-    };
+/// What the studio canvas draws from: every host's renders, not just the one
+/// the form is configured against.
+fn studioImages() image_view.Images {
+    return .{ .ctx = undefined, .live = liveImages, .newest = newestImage, .hostOf = hostOfImage };
 }
 
-// ── App-level diffusion engine VRAM coordinator ──────────────────────────────
-// The engine calls these through a type-erased ctx pointer; the ctx is unused
-// (we dispatch off app globals). Coordination goes to the resident LLM if there
-// is one, else no-ops (diffusion has the device to itself). The engine owns its
-// queue directly now, so there is no source hook.
-fn vcEnter(_: *anyopaque) void {
-    // Image queue started -> the arbiter drives the LLM down to its share. Under
-    // the lock: an idle LLM is settled directly on this (UI) thread, which must
-    // not race the diffusion worker's reclaim hook (both touch the LLM context).
-    // A busy LLM is only published to its control point (an atomic) and yields at
-    // its next token, the fix for the old "no-op while generating" bug.
-    g_session_mu.lockUncancelable(g_io);
-    defer g_session_mu.unlock(g_io);
-    g_arbiter.setDiffusionActive(true);
-}
-fn vcExit(_: *anyopaque) void {
-    // Queue drained -> idle. The image model's residency becomes opportunistic
-    // cache, so the LLM gets priority over it again. One rebalance settles BOTH
-    // sides: a `setDiffusionActive` plus a separate hand-written diffusion trim is
-    // two passes that disagree.
-    //
-    // The flag is set directly rather than via `setDiffusionActive` so the ceiling
-    // re-resolve below is what triggers the single rebalance; flipping it first
-    // would rebalance twice, the first time against a stale `system` reading.
-    {
-        g_session_mu.lockUncancelable(g_io);
-        defer g_session_mu.unlock(g_io);
-        g_arbiter.diff_active = false;
-    }
-    persistDiffPeak();
-    applyMeterPolicy();
-}
-
-/// Persist the diffusion pipeline's measured peak residency when it grows. Called
-/// on the queue-drain edge (once per batch, not per frame) so the NEXT session's
-/// first image plans against a measurement instead of the file-size bootstrap.
-fn persistDiffPeak() void {
-    const d = if (g_diffuser) |*x| x else return;
-    const peak = d.peakResident();
-    if (peak <= g_config.diff_peak_resident) return;
-    const model = g_config.diffusion_model.opt() orelse return;
-    g_config.diff_peak_resident = peak;
-    g_config.diff_peak_key = config.modelKey(model);
-    g_config_baseline.diff_peak_resident = peak;
-    g_config_baseline.diff_peak_key = g_config.diff_peak_key;
-    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err|
-        std.log.warn("[vram] could not persist measured diffusion peak: {t}", .{err});
-    std.log.info("[vram] measured diffusion peak {d} MiB (persisted; supersedes the checkpoint-size estimate)", .{peak >> 20});
-}
-
-fn vcBudget(_: *anyopaque) u64 {
-    // Called on the diffusion WORKER thread, serialize with a concurrent LLM
-    // eject (unloadLlm) that may be freeing the session right now. Pure read.
-    g_session_mu.lockUncancelable(g_io);
-    defer g_session_mu.unlock(g_io);
-    return g_arbiter.diffusionBudget();
-}
-fn vcReclaim(_: *anyopaque, needed: u64) u64 {
-    // Worker thread; the reclaim hook binds the LLM context, so it must not race
-    // an eject freeing that context. (LLM idle is checked inside imageReclaim.)
-    g_session_mu.lockUncancelable(g_io);
-    defer g_session_mu.unlock(g_io);
-    return if (g_session) |s| s.imageReclaim(needed) else 0;
-}
-fn appCoordinator() diffuser.VramCoordinator {
-    return .{ .ctx = undefined, .enter = vcEnter, .exit = vcExit, .budget = vcBudget, .reclaim = vcReclaim };
-}
-
-// ── The reverse direction: LLM reclaims from diffusion ────────────────────────
-// `vcReclaim` above has always let a diffusion worker migrate LLM layers to the
-// host mid-image. This is its mirror, and it was simply missing: an LLM
-// allocation that didn't fit under a resident-but-idle image model had no way to
-// reach that model's bytes (separate device contexts, and LLM weights are all
-// pinned so its own eviction ladder reclaims nothing), so the turn died with
-// DeviceOutOfMemory, the "llm sometimes ooms when diffusion is loaded" report.
-//
-// Two callers, both of which must be able to reach a peer in another context:
-// the last rung of `cuda.Backend`'s OOM ladder (LLM worker thread), and
-// `residency.promoteBack`, which asks BEFORE allocating, since declining to
-// promote allocates nothing and so can never trigger the OOM ladder on its own
-// behalf. The second reaches here from the UI thread too, under `g_session_mu`;
-// see the lock-order note on `g_diff_mu`.
-//
-// It does NOT take `g_session_mu` itself: the LLM session cannot be freed
-// underneath its own worker (every teardown path joins the worker first), and
-// taking it here would invert that order.
-fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
-    var got: u64 = 0;
-    {
-        g_diff_mu.lockUncancelable(g_io);
-        defer g_diff_mu.unlock(g_io);
-        got = g_arbiter.requestRoom(.llm, needed);
-    }
-    if (got != 0) return got;
-    // The lock is DROPPED before waiting, and that is the whole point: the
-    // release below is enacted by the UI thread, which needs `g_diff_mu` to do
-    // it. Waiting while holding it deadlocks until the timeout.
-    return awaitDeferredRelease(needed);
-}
-
-/// The rung between "the image model accepted a release" and "the allocation
-/// fails": wait for a release the arbiter asked for to actually be enacted, and
-/// report the bytes it returned.
-///
-/// `Diffuser.requestRelease` is a REQUEST — the free happens in `fulfillRelease`
-/// on the UI thread, because the session pointer has one writer and its readers
-/// load it unlocked. So `Arbiter.requestRoom` returns 0 for a release that was
-/// accepted and is about to happen, which is indistinguishable, to the caller,
-/// from a peer that had nothing to give. For `residency.promoteBack` that is
-/// fine: it allocated nothing and picks the room up at its next boundary poll.
-/// For the OOM ladder it is not — there is no next poll, the allocation fails
-/// now, and the turn dies. It died for 16 MiB that the log shows arriving in the
-/// very next line.
-///
-/// Only ever from a WORKER. On the UI thread this would wait on work only that
-/// same thread can do; its caller there (`promoteBack` under `applyMeterPolicy`)
-/// is the one that already has a next poll.
-fn awaitDeferredRelease(needed: u64) u64 {
-    if (std.Thread.getCurrentId() == g_ui_thread) return 0;
-
-    // Reads under `g_diff_mu`, which `maybeReleaseDiffuser` holds across BOTH
-    // clearing the request flag and the teardown. So every observation here is
-    // of a settled state — release pending, or release done — never of the
-    // half-torn-down middle.
-    const before = pendingReleaseUsage() orelse return 0;
-    const deadline = std.Io.Clock.real.now(g_io).nanoseconds + release_wait_ns;
-    while (std.Io.Clock.real.now(g_io).nanoseconds < deadline) {
-        std.Io.sleep(g_io, .{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
-        if (pendingReleaseUsage() != null) continue; // still queued for the UI thread
-        const freed = before -| diffusionUsage();
-        std.log.info("[vram] llm waited for the peer's release: {d} MiB returned (needed {d} MiB)", .{
-            freed >> 20, needed >> 20,
-        });
-        return freed;
-    }
-    std.log.warn("[vram] llm waited {d} ms for the peer's release and it never landed; the allocation will fail", .{
-        release_wait_ns / std.time.ns_per_ms,
-    });
-    return 0;
-}
-
-/// How long a worker waits for the UI thread to enact a release. Generous
-/// against the work involved (freeing a multi-GiB pipeline, behind at most one
-/// frame, since `requestRelease` wakes the loop) and it is not a poll interval:
-/// the wait ends the moment the release lands, and the only way to reach the
-/// deadline is a UI thread that has stopped servicing frames, in which case
-/// failing the allocation is the right answer.
-const release_wait_ns: i96 = 2 * std.time.ns_per_s;
-
-/// The image model's residency if a release is pending for it, else null (which
-/// covers "no engine" too: nothing is coming, so there is nothing to wait for).
-fn pendingReleaseUsage() ?u64 {
-    g_diff_mu.lockUncancelable(g_io);
-    defer g_diff_mu.unlock(g_io);
-    return g_arbiter.pendingRelease(.llm);
-}
-
-fn diffusionUsage() u64 {
-    g_diff_mu.lockUncancelable(g_io);
-    defer g_diff_mu.unlock(g_io);
-    const p = g_arbiter.diffusion orelse return 0;
-    return p.usage();
-}
-
-/// Main-loop hook: enact a release the LLM asked for through the arbiter's rung
-/// (`Diffuser.requestRelease`). Runs HERE, on the UI thread, because the session
-/// pointer has exactly one writer by design and its readers load it unlocked;
-/// `g_diff_mu` additionally locks out the LLM worker, which reads this engine
-/// through the arbiter's participant while holding that same lock.
-fn maybeReleaseDiffuser(d: *diffuser.Diffuser) void {
-    if (!d.releaseRequested()) return;
-    g_diff_mu.lockUncancelable(g_io);
-    defer g_diff_mu.unlock(g_io);
-    _ = d.fulfillRelease();
-}
-
-/// Throttle for `llmMidTurnReplan`. Written only under `g_diff_mu`.
-var g_last_replan_ns: i96 = 0;
-
-/// Interval between mid-turn re-plans. A prefill chunk is tens of milliseconds
-/// on the GPU, so this is per-chunk work; a quarter second is far more often
-/// than a peer's residency can meaningfully move, and the poll itself is a plan
-/// over counters, no device query.
-const replan_interval_ns: i96 = 250 * std.time.ns_per_ms;
-
-/// `chat.Session.replan`: the LLM worker asking, at a prefill-chunk or token
-/// boundary, whether the plan now allows it more than it holds — the mirror of
-/// `llmForeignReclaim` for the case where nothing failed and so nothing reactive
-/// fires. Same thread and same lock (`g_diff_mu` guards the participant against
-/// a concurrent `freeDiffuser`), and, like it, deliberately NOT under
-/// `g_session_mu`: the session cannot be freed underneath its own worker, and
-/// taking it here would invert the documented order.
-///
-/// Nothing under this lock can re-enter `llmForeignReclaim`, which takes the
-/// same non-reentrant mutex: `pollLlmGrowth` runs only while the LLM is busy, so
-/// its settle publishes and returns instead of promoting layers here. The
-/// promote (and any reclaim it asks for) happens after this returns, when the
-/// worker enacts the published ceiling.
-fn llmMidTurnReplan() void {
-    g_diff_mu.lockUncancelable(g_io);
-    defer g_diff_mu.unlock(g_io);
-    const now = std.Io.Clock.real.now(g_io).nanoseconds;
-    if (now - g_last_replan_ns < replan_interval_ns) return;
-    g_last_replan_ns = now;
-    _ = g_arbiter.pollLlmGrowth();
-}
-
-/// Whether a diffusion model is configured. ONE path, the primary checkpoint,
-/// is the requirement; the text encoder and VAE are overrides for whatever it
-/// does not carry itself (see `config.diffEnabled`, and `model_spec.missing` for
-/// the advisory "is this set actually complete" preview the settings screen
-/// shows). Whether the components resolve is the pipeline's call at load time.
-fn hasDiffModel(cfg: *const config.Config) bool {
-    return cfg.diffusion_model.opt() != null;
-}
-
-/// The model set the current config selects, as the engine's own type. One
-/// builder, used by both `dcfgFromConfig` (first build) and `syncDiffuser`
-/// (live swap), so the two cannot drift as components are added.
-///
-/// "" = not overridden; the pipeline resolves that component out of the primary
-/// checkpoint. Never substitute a default here, a defaulted path that reaches
-/// `Options` is indistinguishable from a user request, which is what broke a
-/// joined SD1.5 checkpoint in the CLI.
-/// The configured checkpoint's family, from the FILE and not from the catalog.
-///
-/// ⚠️ The catalog is scanned on a worker thread, so on a cold start it is empty
-/// for the first frames while `updateSettings` is already handing the engine its
-/// model set. Asking the catalog here meant a configured LoRA was dropped on
-/// exactly the run that had no cached index, and the model then rendered without
-/// its sidecar and said nothing. `model_spec.Cache` memoizes by path, so this
-/// costs one header parse per checkpoint change.
-var g_family_cache: ?model_spec.Cache = null;
-fn configuredFamily() ?model_spec.Family {
-    const path = g_config.diffusion_model.opt() orelse return null;
-    if (g_family_cache == null) g_family_cache = model_spec.Cache.init(g_gpa, g_io);
-    return (g_family_cache.?.primary(path).info() orelse return null).family;
-}
-
-/// The LoRAs turned on for the configured checkpoint's family, as the engine
-/// takes them.
-///
-/// Borrowed, like every path in `modelConfigFromConfig`: `requestPaths` re-dupes
-/// into the engine's own store, so nothing here outlives the frame. A disabled
-/// row is left out rather than passed at strength 0, so a session that needs no
-/// factors does not hold a gigabyte of them.
-fn loraSpecsFromConfig() []const tp.pipeline.LoraSpec {
-    const S = struct {
-        var buf: [config.max_family_loras]tp.pipeline.LoraSpec = undefined;
-    };
-    const fam = configuredFamily() orelse return &.{};
-    const key = selection.familyKey(fam);
+/// Every render in motion, oldest first, across every host. A paused one counts:
+/// it is parked, not over, and its preview is still the last thing it drew.
+fn liveImages(_: *anyopaque, out: []*const mirror.Image) []const *const mirror.Image {
+    var run_buf: [32]hosts.Hosts.Shot = undefined;
     var n: usize = 0;
-    // Straight off `g_config.loras` rather than through `selection.loras`, whose
-    // filtered view lives in a static of its own: reading one static into
-    // another leaves the paths pointing at whatever the next caller filtered.
-    for (g_config.loras.slice()) |*l| {
-        if (!l.enabled or !std.mem.eql(u8, l.family.slice(), key)) continue;
-        S.buf[n] = .{ .path = l.path.slice(), .strength = l.strength };
+    for (g_hosts.running(run_buf[0..@min(run_buf.len, out.len)])) |sh| {
+        switch (sh.im.status()) {
+            .generating, .suspended => {},
+            else => continue,
+        }
+        out[n] = sh.im;
         n += 1;
     }
-    return S.buf[0..n];
+    return out[0..n];
 }
 
-fn modelConfigFromConfig() diffuser.ModelConfig {
+/// The newest finished picture, for a canvas with nothing to watch. Held at
+/// full size while it is on screen.
+fn newestImage(_: *anyopaque) ?*const mirror.Image {
+    var fin_buf: [1]hosts.Hosts.Shot = undefined;
+    const fin = g_hosts.finished(&fin_buf);
+    if (fin.len == 0) return null;
+    return shown(0, fin[0].im);
+}
+
+fn hostOfImage(_: *anyopaque, id: wire.ImageId) []const u8 {
+    return g_hosts.hostOf(id);
+}
+
+/// The viewer navigates every finished render, oldest to newest so the right
+/// arrow moves forward in time, and can show any of them, an attachment
+/// included. One still arriving is listed too: skipping it would make the
+/// arrows jump over a picture that is about to appear.
+fn diffuserSource() viewer.ImageSource {
     return .{
-        .dit_path = g_config.diffusion_model.opt().?,
-        .vae_path = g_config.vae.slice(),
-        .text_encoder_path = g_config.text_encoder.slice(),
-        .text_encoder_2_path = g_config.text_encoder_2.slice(),
-        .backend = diffuser.toPipelineBackend(g_config.diff_backend),
-        .vae_decode = diffuser.toPipelineVae(g_config.vae_decode),
-        .loras = loraSpecsFromConfig(),
+        .ctx = undefined,
+        .gpa = g_gpa,
+        .collect = diffuserCollect,
+        .resolve = viewerResolve,
+        .hostOf = hostOfImage,
     };
 }
-
-fn dcfgFromConfig() diffuser.DiffConfig {
-    const m = modelConfigFromConfig();
-    return .{
-        .dit_path = m.dit_path,
-        .vae_path = m.vae_path,
-        .text_encoder_path = m.text_encoder_path,
-        .text_encoder_2_path = m.text_encoder_2_path,
-        .steps = g_config.steps,
-        .width = g_config.width,
-        .height = g_config.height,
-        .sampler = diffuser.toPipelineSampler(g_config.sampler),
-        .scheduler = diffuser.toPipelineScheduler(g_config.scheduler),
-        .prompt_syntax = diffuser.toPipelineSyntax(g_config.prompt_syntax),
-        .emphasis = diffuser.toPipelineEmphasis(g_config.emphasis),
-        .compat = diffuser.toPipelineCompat(g_config.compat),
-        .backend = m.backend,
-        .vae_decode = m.vae_decode,
-        .preview_enabled = g_config.preview != .none,
-        .taew_path = if (g_config.preview == .taesd) g_config.taesd.opt() else null,
-        .preview_ds = g_config.taesd_size.divisor(),
-        .output_dir = g_config.output_dir.opt(),
-    };
+fn diffuserCollect(_: *anyopaque, buf: *std.ArrayList(wire.ImageId)) void {
+    buf.clearRetainingCapacity();
+    var shots: [256]hosts.Hosts.Shot = undefined;
+    const fin = g_hosts.finished(&shots);
+    var i = fin.len;
+    while (i > 0) {
+        i -= 1;
+        buf.append(g_gpa, fin[i].im.info.id) catch {};
+    }
 }
-
-/// Reconcile the app-level engine with the current config: build it when a
-/// diffusion model is (newly) configured, free it when cleared, and push
-/// path/default/preview changes into a live one (a model swap defers until the
-/// queue is idle). Called at startup and on every settings Apply.
-fn syncDiffuser() void {
-    if (!hasDiffModel(&g_config)) {
-        freeDiffuser();
-        return;
-    }
-    if (g_diffuser == null) {
-        g_diffuser = diffuser.Diffuser.init(g_gpa, g_io, wakeupFrame, dcfgFromConfig(), appCoordinator());
-        g_diffuser.?.seedBase(@truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))));
-        // Carry the previously MEASURED peak residency across sessions, so the
-        // first image of a run sizes the LLM's eviction by what this pipeline
-        // actually costs instead of by what its checkpoints weigh. Keyed on the
-        // DiT path: a different model invalidates the figure.
-        if (g_config.diff_peak_resident != 0) {
-            if (g_config.diffusion_model.opt()) |m| {
-                if (config.modelKey(m) == g_config.diff_peak_key)
-                    g_diffuser.?.seedPeakResident(g_config.diff_peak_resident);
-            }
-        }
-        // Register the image model as an arbiter participant so a growing LLM can
-        // reclaim its idle residency (the direction that never worked). The
-        // participant borrows the engine; `freeDiffuser` drops it before teardown.
-        // `g_diff_mu` because the LLM's worker thread reads it (foreignReclaim).
-        g_diff_mu.lockUncancelable(g_io);
-        g_arbiter.diffusion = g_diffuser.?.participant();
-        g_diff_mu.unlock(g_io);
-    }
-    var d = &g_diffuser.?;
-    // requestPaths re-dupes the paths into the engine's owned store (nothing
-    // aliases the live config buffers) and applies/swaps once the queue is idle.
-    d.requestPaths(
-        modelConfigFromConfig(),
-        if (g_config.preview == .taesd) g_config.taesd.opt() else null,
-    );
-    d.setDefaults(g_config.steps, g_config.width, g_config.height);
-    d.setSampler(diffuser.toPipelineSampler(g_config.sampler));
-    d.setScheduler(diffuser.toPipelineScheduler(g_config.scheduler));
-    d.setPromptSyntax(
-        diffuser.toPipelineSyntax(g_config.prompt_syntax),
-        diffuser.toPipelineEmphasis(g_config.emphasis),
-        diffuser.toPipelineCompat(g_config.compat),
-    );
-    d.setPreview(g_config.preview);
-    d.setPreviewSize(g_config.taesd_size.divisor());
-    d.setOutputDir(g_config.output_dir.opt());
-}
-
-/// Tear down the app-level engine (diffusion model cleared, or at exit): cancel
-/// any in-flight/queued generation so the worker aborts instead of blocking the
-/// join, then free it (frees the whole image history it owns).
-fn freeDiffuser() void {
-    if (g_diffuser) |*d| {
-        // Drop the arbiter's participant FIRST: it borrows the engine we are about
-        // to free, and the LLM's worker thread can be reading it right now through
-        // `llmForeignReclaim`. Mirrors `g_arbiter.llm = null` on the LLM side.
-        // `diff_active` goes with it, we tear down without pumping, so the
-        // queue-drain edge that normally clears it never fires, and a stale `true`
-        // would keep the LLM pinned to its share with nothing left to use the rest.
-        g_diff_mu.lockUncancelable(g_io);
-        g_arbiter.diffusion = null;
-        g_arbiter.diff_active = false;
-        g_diff_mu.unlock(g_io);
-        d.cancelAll();
-        // Drop every BORROWED reference to the images d.deinit is about to free:
-        // the chat transcript (live + carried) and the open viewer. Otherwise a
-        // model-clear would leave dangling pointers behind.
-        if (g_viewer) |v| v.open = false;
-        {
-            // Under the same locks the loader uses, because clearing an LLM model
-            // and swapping the diffusion model are both settings actions and can
-            // overlap: `g_session_mu` makes this either-or against a teardown (the
-            // refs are in the session, or already moved to the carry), and
-            // `g_carry_mu` against the publish/adopt of the carried copy.
-            g_session_mu.lockUncancelable(g_io);
-            defer g_session_mu.unlock(g_io);
-            if (g_session) |s| s.clearImageRefs();
-            g_carry_mu.lockUncancelable(g_io);
-            defer g_carry_mu.unlock(g_io);
-            if (g_carry) |*c| for (c.items) |*m|
-                for (m.variants.items) |*v| v.images.clearRetainingCapacity();
-        }
-        d.deinit();
-        g_diffuser = null;
-    }
+fn viewerResolve(_: *anyopaque, id: wire.ImageId) ?*const mirror.Image {
+    return shown(1, g_hosts.imageById(id) orelse return null);
 }
 
 /// Mode switches are PURE VIEW changes, they never free, unload, or reload a
@@ -2608,39 +2299,12 @@ fn applyConfig() void {
 /// settings. Settings Apply and a chip pick both end here.
 fn commitConfig() void {
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
-
-    // The diffusion engine is shared by both modes; reconcile it either way.
-    syncDiffuser();
-
-    // A system-prompt edit applies live on a render-driven (template) session,
-    // updateSettings restages it and the next message re-renders (TODO #8). A
-    // hand-glue session bakes the system into the prompt prefix, so it needs a
-    // transcript-preserving reload instead.
-    const sys_changed = !std.mem.eql(u8, g_config.system_prompt.slice(), g_config_baseline.system_prompt.slice());
-    const sys_needs_reload = sys_changed and g_session != null and
-        !g_loading.load(.acquire) and !g_session.?.templateActive();
-    const llm_reload = !g_config.llmReloadEql(&g_config_baseline) or
-        (g_config.diffEnabled() != g_config_baseline.diffEnabled()) or // tool prompt changes
-        sys_needs_reload;
-    // A KV-dtype change needs only a CONTEXT rebuild (weights stay resident),
-    // never the full weight reload above.
-    const ctx_reload = !g_config.ctxReloadEql(&g_config_baseline);
-    if (g_session != null) {
-        if (llm_reload) {
-            g_reload_requested = true; // transcript-preserving (see loaderMain)
-        } else if (!g_loading.load(.acquire)) {
-            g_session.?.updateSettings(&g_config); // reasoning / VRAM priority, live
-            if (ctx_reload) g_session.?.rebuildContext(chat.toKvDtype(g_config.kv_dtype)) catch |err|
-                std.log.err("kv-dtype context rebuild failed: {t}", .{err});
-        }
-    }
-    // If no session is loaded yet (lazy), the new config is used at first chat.
-
-    // Governs LOADING, so no reload is forced: the next model load picks it up.
-    // (Nothing resident changes, which is why it is absent from both
-    // `llmReloadEql` and `ctxReloadEql`.)
-    applyWeightRead(g_config.weight_read);
-
+    // Each host diffs the new settings against the ones in force and decides
+    // what the change costs (nothing, a live update, a context rebuild, a reload).
+    postSettings();
+    // The host list and the chat pin may have moved too.
+    g_hosts.sync(&g_config);
+    g_m = g_hosts.chatMirror();
     g_config_baseline = g_config;
 }
 
@@ -2652,7 +2316,7 @@ fn toggleReasoning() void {
     g_config.reasoning = !g_config.reasoning;
     g_config_baseline.reasoning = g_config.reasoning;
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
-    if (g_session) |s| if (!g_loading.load(.acquire)) s.updateSettings(&g_config);
+    postSettings();
 }
 
 fn cycleReasoningEffort() void {
@@ -2663,316 +2327,18 @@ fn cycleReasoningEffort() void {
     };
     g_config_baseline.reasoning_effort = g_config.reasoning_effort;
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
-    if (g_session) |s| if (!g_loading.load(.acquire)) s.updateSettings(&g_config);
+    postSettings();
 }
 
 /// Cancel button: discard unsaved edits by reloading the on-disk settings, and
 /// return to wherever Settings was opened from (chat or the studio).
 fn cancelConfig() void {
     g_config = config.Config.load(g_io, g_gpa, g_environ, g_config_path);
-    applyWeightRead(g_config.weight_read);
     g_config_baseline = g_config;
     g_view = g_return_view;
 }
 
-/// Tracks the LLM's busy edge for `maybeRefreshMeterPolicy`.
-var g_llm_was_busy: bool = false;
-
-/// High-water mark of OUR unattributed card footprint (CUDA context, JIT'd
-/// modules, library workspaces, UI textures). See `applyMeterPolicy`.
-var g_untracked_high_water: u64 = 0;
-
-/// Main-loop hook: re-resolve the meter policy when the LLM finishes a turn.
-///
-/// The arbiter's residency targets come from `residency.demand`, and for an
-/// LLM-only session the plan behind them was computed exactly once, at load,
-/// when the model is COLD. Its RoPE tables, activation/logits scratch and dequant
-/// buffers are not allocated until the first forward, so `demand`'s cold bound
-/// cannot see them and reports less than full residency costs. That
-/// under-estimate then sticks as the ceiling for the whole session: the LLM
-/// offloads layers to obey a target below its real footprint while GiBs of the
-/// card sit unused (measured on gemma4-31B: target 19796 MiB against a 21527 MiB
-/// budget, 6/60 layers pushed to the host with 2 GiB idle).
-///
-/// Re-planning at a turn boundary keeps residency tracking a budget that moves:
-/// `system` steps once as our untracked CUDA/library footprint materializes, and
-/// the KV grows all session.
-///
-/// BOTH edges matter, because `Arbiter.plan` gates the split handle on who is
-/// actually working:
-///   idle -> busy   the LLM starts a turn, so the split now binds and it reclaims
-///                  the layers an image model borrowed while it was idle.
-///   busy -> idle   the turn ended, so a working diffuser may take what it needs.
-/// Edge-triggered, so an idle UI re-plans nothing; cheap when it does fire (one
-/// memGetInfo plus a plan).
-fn maybeRefreshMeterPolicy() void {
-    // Same rule as the renderers: the loader thread owns the session while a load
-    // is in flight, so `busy()` below would read freed memory. Nothing is missed —
-    // `maybeStartReload` re-applies the policy the moment the fresh session is
-    // published, and clearing the edge here makes its first turn a real idle->busy.
-    if (g_loading.load(.acquire)) {
-        g_llm_was_busy = false;
-        return;
-    }
-    const s = g_session orelse {
-        g_llm_was_busy = false;
-        return;
-    };
-    const busy = s.busy();
-    defer g_llm_was_busy = busy;
-    if (g_llm_was_busy != busy) return applyMeterPolicy();
-    retryUnsettledPlan();
-}
-
-/// Throttle for `retryUnsettledPlan`: a lost yield resolves in frames, so a
-/// quarter second between attempts is far more often than it can matter.
-var g_last_retry_ns: i96 = 0;
-
-/// Main-loop hook: re-run a plan a model did not actually enact.
-///
-/// `Diffuser.giveUpToBudget` tryLocks its residency mutex and declines rather
-/// than block a foreign thread, so a yield can be lost to a frame in which the
-/// pump happened to hold it. Nothing noticed: the settle was fire-and-forget and
-/// the next rebalance waits on an external edge that may never come, leaving the
-/// LLM squeezed next to an image model that agreed to shrink and didn't. The
-/// arbiter bounds its own retries, so this cannot spin on a peer that genuinely
-/// has nothing left; the throttle only keeps a lost race off the frame path.
-fn retryUnsettledPlan() void {
-    if (!g_arbiter.unsettled) return;
-    const now = std.Io.Clock.real.now(g_io).nanoseconds;
-    if (now - g_last_retry_ns < 250 * std.time.ns_per_ms) return;
-    g_last_retry_ns = now;
-    g_session_mu.lockUncancelable(g_io);
-    defer g_session_mu.unlock(g_io);
-    _ = g_arbiter.retryUnsettled();
-}
-
-/// Main-loop hook: reap a finished loader, and start a pending (re)load when
-/// none is in flight. Runs on the UI thread so the loading-flag hand-off to the
-/// loader is well-ordered.
-fn maybeStartReload() void {
-    if (g_loader) |t| {
-        if (!g_loading.load(.acquire)) {
-            t.join();
-            g_loader = null;
-            // Load finished. Apply the current meter policy to the fresh session
-            // (settles the LLM to its share if diffusion is already resident).
-            if (g_session != null) applyMeterPolicy();
-            // Clearing the diffusion model is a settings action like the reload
-            // itself, so the two overlap. `freeDiffuser` drops the borrowed image
-            // pointers it can reach, but a session still being BUILT is not one of
-            // them, so a transcript adopted from the carry can come back pointing
-            // at freed images. Nothing rendered them in that window (an
-            // unpublished session shows as no transcript at all); drop them now
-            // that this thread owns the session again.
-            if (g_diffuser == null) if (g_session) |s| s.clearImageRefs();
-            // Move any images staged before the lazy load into the fresh session
-            // (BEFORE the deferred submit, so the first message carries them). If
-            // the load failed (no session) or the model has no vision tower, drop
-            // them, attachImage no-ops without a tower.
-            if (g_session) |s| {
-                for (g_staged_images.items) |st|
-                    s.attachImage(st.rgb, st.width, st.height) catch |err| std.log.err("attach staged image: {t}", .{err});
-            }
-            clearStaged();
-            // If the first message was stashed while the LLM lazy-loaded, submit
-            // it now that the session is live.
-            if (g_pending_submit) |text| {
-                g_pending_submit = null;
-                if (g_session) |s| s.submit(text) catch |err| std.log.err("deferred submit: {t}", .{err});
-                g_gpa.free(text);
-            }
-            // Resume-continue a mid-turn response suspended by unload-while-paused
-            // (Tier 3): `ids` was restored verbatim; continue decoding it.
-            if (g_pending_continue) {
-                g_pending_continue = false;
-                if (g_session) |s| s.continueOpenTurn() catch |err| std.log.err("resume continue: {t}", .{err});
-            }
-            // Regenerate requested while unloaded (the › button): the fresh
-            // session has adopted the carried transcript, so regenerate its last
-            // reply now.
-            if (g_pending_regenerate) {
-                g_pending_regenerate = false;
-                if (g_session) |s| s.regenerate() catch |err| std.log.err("deferred regenerate: {t}", .{err});
-            }
-        }
-    }
-    if (!g_reload_requested or g_loading.load(.acquire) or g_loader != null) return;
-    // Paused with nothing resident: HOLD the load. A message / regenerate / turn
-    // queued while paused keeps `g_reload_requested` set but loads NOTHING until
-    // the user resumes (toggleLlmPause kicks this the moment the gate lifts),
-    // mirroring the diffusion side, where Diffuser.pump defers loads while paused.
-    if (g_llm_paused and g_session == null) return;
-    // The LLM (re)loads CONCURRENTLY with diffusion, a running image keeps
-    // generating on its own context while the LLM builds on a fresh one, so a
-    // chat sent mid-image loads and responds right away instead of waiting for
-    // the image. The only shared state is the session pointer, which the loader's
-    // teardown/publish and the worker-thread coordinator hooks serialize with
-    // `g_session_mu`. The pump stays gated while g_loading is set (below), so no
-    // NEW image starts mid-load; the in-flight one is left running (not reaped).
-    g_reload_requested = false;
-    g_load_err = null;
-    // Flush while this thread still owns the transcript: past the store below the
-    // loader is free to detach and free it, and `saveHistory` steps aside for the
-    // whole load. Forced, because the turn being torn down may still be streaming.
-    saveHistory(true);
-    g_loading.store(true, .release);
-    g_loader = std.Thread.spawn(.{}, loaderMain, .{}) catch |err| {
-        std.log.err("spawn loader failed: {t}", .{err});
-        g_load_err = err;
-        g_loading.store(false, .release);
-        return;
-    };
-}
-
-/// Background (re)load: tear down the old session, then build a new one from
-/// `g_config`. Runs on its own thread, creates the CUDA context there; the
-/// generation/diffusion workers bind to it as before. On completion it publishes
-/// `g_session` and clears `g_loading` (release) so the UI thread can adopt it.
-fn loaderMain() void {
-    // Tear down the previous session first. Its CUDA context must be current on
-    // this thread to free device memory, so bind it before deinit. Before
-    // freeing it, stop the LLM turn but let any in-flight image FINISH (don't
-    // cancel it), then detach the transcript so the chat survives the swap.
-    if (g_session) |s| {
-        s.be.bindThread();
-        s.requestCancel();
-        if (s.worker) |t| {
-            t.join();
-            s.worker = null;
-        }
-        // Diffusion may be generating concurrently (its worker reads the session
-        // via the coordinator hooks), so serialize the teardown with
-        // `g_session_mu`, the same guard unloadLlm uses. The transcript is
-        // detached (carried) so the chat survives the swap.
-        g_session_mu.lockUncancelable(g_io);
-        {
-            // The UI renders this the moment it lands, so publish it as one
-            // step rather than letting a frame catch a half-written optional.
-            g_carry_mu.lockUncancelable(g_io);
-            defer g_carry_mu.unlock(g_io);
-            g_carry = s.detachTranscript();
-        }
-        s.deinit();
-        g_session = null;
-        g_arbiter.llm = null; // participant points into the freed session
-        g_session_mu.unlock(g_io);
-    }
-    if (g_session_arena) |a| {
-        a.deinit();
-        g_gpa.destroy(a);
-        g_session_arena = null;
-    }
-
-    if (g_config.llm_model.opt() == null) {
-        // Nothing to load (LLM cleared): drop the carried transcript and leave
-        // the notice showing.
-        freeCarry();
-        freeLlmSuspend();
-        g_loading.store(false, .release);
-        wakeupFrame();
-        return;
-    }
-
-    const arena_obj = g_gpa.create(std.heap.ArenaAllocator) catch |err| return finishLoad(err);
-    arena_obj.* = std.heap.ArenaAllocator.init(g_gpa);
-    g_session_arena = arena_obj;
-
-    const t0 = std.Io.Clock.real.now(g_io).nanoseconds;
-    const s = buildSession(arena_obj.allocator()) catch |err| {
-        std.log.err("failed to load session: {t}", .{err});
-        arena_obj.deinit();
-        g_gpa.destroy(arena_obj);
-        g_session_arena = null;
-        freeCarry(); // no session to adopt the transcript
-        freeLlmSuspend();
-        return finishLoad(err);
-    };
-    // Replay the carried transcript into the new model (KV empty; the next turn's
-    // prefill replays it) so a model swap keeps the chat.
-    // The hold spans the ADOPT, not just the clear: `adoptTranscript` moves the
-    // list into the new session on its first line, so a frame that read `g_carry`
-    // between that move and the clear would walk messages the session now owns
-    // (and is re-tokenizing). A few ms of a blocked render is the price.
-    g_carry_mu.lockUncancelable(g_io);
-    if (g_carry) |m| {
-        s.be.bindThread();
-        if (g_llm_suspend) |sus| {
-            // Unload-while-paused resume (Tier 3): restore the exact `ids` (open
-            // turn) verbatim instead of replaying (which would close the turn),
-            // then continue decoding that response after publish.
-            s.adoptSuspended(m, sus.ids) catch |err| std.log.err("adopt suspended failed: {t}", .{err});
-            if (sus.midturn) g_pending_continue = true;
-            g_gpa.free(sus.ids);
-            g_llm_suspend = null;
-        } else {
-            s.adoptTranscript(m) catch |err| std.log.err("adopt transcript failed: {t}", .{err});
-        }
-        g_carry = null;
-    }
-    g_carry_mu.unlock(g_io);
-    // A paused reload that is NOT a resume (e.g. a backend switch while paused)
-    // starts the fresh gate paused so the state matches the button.
-    if (g_llm_paused) s.pause.pause(g_io);
-    const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(g_io).nanoseconds - t0)) / 1e9;
-    std.log.info("[vram] LLM session loaded/ready in {d:.1}s", .{dt});
-    // Publish under the lock: the diffusion worker's coordinator hooks read
-    // `g_session` and must see either null or a fully-built session, never a tear.
-    g_session_mu.lockUncancelable(g_io);
-    g_session = s;
-    g_arbiter.llm = s.participant();
-    s.replan = llmMidTurnReplan; // re-plan at the worker's own boundaries
-    g_session_mu.unlock(g_io);
-    finishLoad(null);
-}
-
-/// Free a carried transcript that has no destination (LLM cleared or load
-/// failed). Messages are gpa-owned.
-fn freeCarry() void {
-    g_carry_mu.lockUncancelable(g_io);
-    defer g_carry_mu.unlock(g_io);
-    if (g_carry) |*m| {
-        for (m.items) |*msg| msg.deinit(g_gpa);
-        m.deinit(g_gpa);
-        g_carry = null;
-    }
-}
-
-/// Publish the load result: record any error, then clear the loading flag
-/// (release) as the last write so the UI thread's acquire read sees a settled
-/// `g_session`.
-fn finishLoad(err: ?anyerror) void {
-    g_load_err = err;
-    g_loading.store(false, .release);
-    wakeupFrame();
-}
-
-/// Build the LLM session from the current settings. Vision needs the tower; the
-/// image tool is available when a diffusion model is configured (the engine
-/// itself is app-level). Paths are duped into `arena` so the session never
-/// aliases the live config edit buffers.
-fn buildSession(arena: std.mem.Allocator) !*chat.Session {
-    const seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds)));
-    const s = try chat.Session.init(arena, g_gpa, g_io, wakeupFrame, try chat.sessionOptions(arena, &g_config, seed));
-    s.be.foreign_reclaim = .{ .ctx = undefined, .call = llmForeignReclaim };
-    return s;
-}
-
-/// Map the GUI's local KV-dtype enum onto the library's `kv_cache.KvDtype`
-/// (config.zig stays free of a TensorPencil import). Same field names, explicit
-/// so adding a variant is a compile error until both sides agree.
-/// Push the checkpoint-read setting to the core global every loader consults.
-/// Called wherever the config is loaded or applied; it governs LOADING, so the
-/// effect lands on the next model load rather than on anything resident.
-fn applyWeightRead(w: config.WeightRead) void {
-    tp.safetensors.read_mode = switch (w) {
-        .pread => .pread,
-        .mmap => .mmap,
-        .buffered => .buffered,
-    };
-}
-
-fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
+fn renderMessages(list_h: f32) void {
     {
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &g_scroll_info }, .{
             .expand = .horizontal,
@@ -2987,23 +2353,16 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         });
         defer list.deinit();
 
-        // With no live session, fall back to the CARRIED transcript (present when
-        // the LLM was ejected / is between loads) so the conversation stays on
-        // screen read-only and is never visually "reset", only a "new chat"
-        // click clears it. It reloads + replays on the next message.
-        //
-        // That fallback is the one place the UI reads shared state DURING a load,
-        // so it holds `g_carry_mu` for as long as it follows pointers into the
-        // list — the whole render below. A live session needs no lock: it is the
-        // UI's own while `g_loading` is clear, which is what `s` already means.
-        const carried = s == null;
-        if (carried) g_carry_mu.lockUncancelable(g_io);
-        defer if (carried) g_carry_mu.unlock(g_io);
-        const msgs: []chat.Message = if (s) |ss| ss.messages.items else if (g_carry) |c| c.items else &.{};
-        if (msgs.len == 0 and !loading and g_pending_submit == null) {
+        // The mirror holds the transcript whether or not a model is resident
+        // (the host carries it across an unload), so the conversation stays on
+        // screen and is never visually "reset"; only a "new chat" click clears it.
+        const st = &g_m.state;
+        const loading = st.loading;
+        const msgs: []mirror.Message = g_m.messages.items;
+        if (msgs.len == 0 and !loading and g_pending_text == null) {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = dvui.Rect.all(16) });
             defer tl.deinit();
-            fonts.addStyled(tl, if (s == null)
+            fonts.addStyled(tl, if (!st.llm_resident)
                 "Say something to start — the model loads on your first message."
             else
                 "Say something to start the conversation.", .{}, .{
@@ -3011,21 +2370,21 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
                 .color_text = style.C.text_ghost,
             });
         } else {
-            for (msgs, 0..) |*m, idx| renderMessage(s, msgs, m, idx);
+            for (msgs, 0..) |*m, idx| renderMessage(msgs, m, idx);
         }
         // While the model (re)loads in the background: the just-sent message
         // (not yet in the transcript, it submits once the session is live) shows
         // as a normal user bubble, and the assistant slot shows a small "Loading..."
         // The instant the session is ready these are replaced by the real turn.
         if (loading) {
-            if (g_pending_submit) |txt| pendingUserBubble(txt);
+            if (g_pending_text) |txt| pendingUserBubble(txt);
             loadingAssistantBubble();
-        } else if (g_llm_paused) {
+        } else if (st.llm_paused and !st.llm_resident) {
             // Paused with nothing resident: the just-sent message is HELD (no load
             // at all) until resume. Show it + a paused hint rather than "Loading..."
-            // or the empty-state placeholder. (Session-resident pause is Tier 2,
-            // shown inline per-message above, g_pending_submit is null then.)
-            if (g_pending_submit) |txt| {
+            // or the empty-state placeholder. (A resident pause is shown inline
+            // per message above.)
+            if (g_pending_text) |txt| {
                 pendingUserBubble(txt);
                 queuedAssistantBubble();
             }
@@ -3090,13 +2449,21 @@ fn processingRow() void {
 /// The assistant bubble's body when there is nothing to show and nothing is
 /// running: a generation error, or a turn queued behind a paused LLM.
 /// (The live case is the "Processing..." spinner in `renderMessage`.)
-fn renderEmptyAssistant(s: ?*chat.Session, idx: usize) void {
+fn renderEmptyAssistant(idx: usize) void {
     var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
     defer tl.deinit();
-    if (if (s) |ss| ss.gen_err else null) |err| {
-        var msg: [128]u8 = undefined;
-        fonts.addRich(tl, std.fmt.bufPrint(&msg, "generation error: {t}", .{err}) catch "generation error");
-    } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
+    const st = &g_m.state;
+    if (st.llm_resident and st.gen_err.len > 0) {
+        // A lost CUDA context fails every turn from here on with the same opaque
+        // CudaError. Say what actually happened, once, instead of letting the user
+        // retry into it.
+        if (st.ctx_lost) {
+            fonts.addRich(tl, "the GPU context was lost (a kernel faulted). Restart TensorPencil to use the GPU again; the terminal log names the kernels it was running.");
+        } else {
+            var msg: [128]u8 = undefined;
+            fonts.addRich(tl, std.fmt.bufPrint(&msg, "generation error: {s}", .{st.gen_err}) catch "generation error");
+        }
+    } else if (st.llm_resident and idx + 1 == g_m.messages.items.len and st.llm_paused) {
         // A turn queued while the LLM is paused, it runs on resume (Tier 2).
         // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
         // lacks media-control glyphs, see fonts.isEmoji).
@@ -3104,12 +2471,12 @@ fn renderEmptyAssistant(s: ?*chat.Session, idx: usize) void {
     }
 }
 
-fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx: usize) void {
+fn renderMessage(msgs: []mirror.Message, m: *mirror.Message, idx: usize) void {
     // An app-written note (an image outcome), not something the user typed:
     // centred, quiet, and no bubble. Giving it a user bubble would put words in
     // the user's mouth in their own transcript.
     if (m.synthetic) {
-        dvui.labelNoFmt(@src(), m.activeConst().text.items, .{}, .{
+        dvui.labelNoFmt(@src(), m.active().text.items, .{}, .{
             .id_extra = idx,
             .font = style.F.mono_sm,
             .color_text = style.C.text_ghost,
@@ -3148,17 +2515,17 @@ fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx:
     defer bubble.deinit();
 
     // Images the user attached to this message.
-    for (m.attachments.items, 0..) |gi, ai| renderGenImage(s, gi, ai);
+    for (m.attachments.items, 0..) |id, ai| if (g_hosts.imageById(id)) |im| renderGenImage(im, ai);
 
     // Everything below shows the message's ACTIVE variant (the ‹/› nav on the
     // last assistant response switches it; older takes stay stored).
-    const v = m.activeConst();
+    const v = m.active();
     const p = parseThink(v);
     // Only the last assistant message is actively generating; "Thinking..." means
     // the block is still open AND generation is live. A think block left open
     // because generation stopped (e.g. hit max tokens) reads "Thoughts". With no
-    // live session (carried transcript), nothing is generating.
-    const live = if (s) |ss| ss.busy() and idx + 1 == ss.messages.items.len else false;
+    // resident model, nothing is generating.
+    const live = g_m.state.llm_busy and idx + 1 == msgs.len;
 
     // The model is working but has not emitted a single token yet: prompt
     // processing (prefill), plus the short gap before the first token.
@@ -3210,7 +2577,7 @@ fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx:
     }
 
     if (p.answer.len > 0) {
-        renderReply(v, p.answer, if (is_user) style.C.text_hi else style.C.text);
+        renderReply(v, p.answer, if (is_user) style.C.text_hi else style.C.text, idx, @min(m.cur, m.variants.items.len - 1));
         // Selection copies rendered text; this copies the raw markdown of
         // the whole reply (assistant messages only, a user's own text is
         // already in their hands).
@@ -3229,7 +2596,7 @@ fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx:
     } else if (!nothing_yet and m.role == .assistant and p.think == null and v.images.items.len == 0) {
         // Text exists but currently renders to nothing (e.g. a half-streamed
         // marker); keep the working indicator rather than flashing an empty card.
-        if (live) processingRow() else renderEmptyAssistant(s, idx);
+        if (live) processingRow() else renderEmptyAssistant(idx);
     }
 
     // The turn's measurement (see chat.TurnStats): what the prompt cost under a
@@ -3249,9 +2616,8 @@ fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx:
         // two is live and holds the lock that makes the carried one safe to walk.
         const nmsg = msgs.len;
         const prev_user = nmsg >= 2 and msgs[nmsg - 2].role == .user;
-        const busy = if (s) |ss| ss.busy() else false;
-        if (idx + 1 == nmsg and nmsg >= 2 and prev_user and !busy)
-            renderVariantNav(s, m);
+        if (idx + 1 == nmsg and nmsg >= 2 and prev_user and !g_m.state.llm_busy)
+            renderVariantNav(m, idx);
     }
 }
 
@@ -3260,11 +2626,11 @@ fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx:
 /// until there is something measured, a bubble that has only just appeared
 /// (or a transcript carried across a model swap) would otherwise show a row of
 /// zeros. The strings come from `turn_stats`, which is where they're tested.
-fn renderStatsFooter(st: chat.TurnStats, is_user: bool, gen_model: []const u8) void {
+fn renderStatsFooter(st: wire.TurnStats, is_user: bool, gen_model: []const u8) void {
     // The model is named only when it is NOT the one loaded now: in a
     // single-model conversation it would be the same string under every turn,
     // and after a swap or a reload it is the thing you actually want to know.
-    const live: []const u8 = if (g_loading.load(.acquire)) "" else if (g_session) |sess| sess.model_name else "";
+    const live: []const u8 = g_m.state.llm_model;
     const show_model = gen_model.len > 0 and !std.mem.eql(u8, gen_model, live);
 
     if (!(if (is_user) st.hasPrompt() else st.hasGen())) {
@@ -3306,9 +2672,9 @@ fn renderStatsFooter(st: chat.TurnStats, is_user: bool, gen_model: []const u8) v
 
 /// The ‹ n/m › variant-navigation row (see renderMessage). Back is disabled
 /// (dimmed, inert) on the first take; next past the newest take regenerates.
-/// `s` may be null (carried transcript, LLM unloaded): ‹/› switch the shown
-/// take by mutating `m.cur` directly, and › regenerate lazy-loads the LLM.
-fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
+/// With no model resident the host switches the shown take on the transcript
+/// it carries, and › regenerate lazy-loads the LLM.
+fn renderVariantNav(m: *mirror.Message, idx: usize) void {
     const n = m.variants.items.len;
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 2 } });
     defer row.deinit();
@@ -3324,12 +2690,10 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
     opts.data_out = &bwd;
     if (!can_back) opts.color_text = style.C.text_ghost;
     if (dvui.buttonIcon(@src(), "prev-variant", dvui.entypo.chevron_small_left, .{}, .{}, opts) and can_back) {
-        switch (chat.navTarget(m.cur, n, .back)) {
-            // Loaded: selectVariant re-syncs the KV for the next turn. Unloaded:
-            // just switch the shown take (a reload replays the active one).
-            .select => |i| if (s) |ss| ss.selectVariant(i) else {
-                m.cur = i;
-            },
+        switch (mirror.navTarget(m.cur, n, .back)) {
+            // The host re-syncs the KV for the next turn (or just switches the
+            // shown take when nothing is resident) and sends the transcript back.
+            .select => |i| post(.{ .chat_select_variant = .{ .msg = @intCast(idx), .variant = @intCast(i) } }),
             else => {},
         }
     }
@@ -3346,16 +2710,11 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
     opts = icon_opts;
     opts.data_out = &nwd;
     if (dvui.buttonIcon(@src(), "next-variant", dvui.entypo.chevron_small_right, .{}, .{}, opts)) {
-        switch (chat.navTarget(m.cur, n, .next)) {
-            .select => |i| if (s) |ss| ss.selectVariant(i) else {
-                m.cur = i;
-            },
-            // Regenerate needs the LLM: run it now if loaded, else lazy-load and
-            // regenerate once the carried transcript is adopted (maybeStartReload).
-            .regenerate => if (s) |ss|
-                ss.regenerate() catch |err| std.log.err("regenerate failed: {t}", .{err})
-            else
-                requestRegenLoad(),
+        switch (mirror.navTarget(m.cur, n, .next)) {
+            .select => |i| post(.{ .chat_select_variant = .{ .msg = @intCast(idx), .variant = @intCast(i) } }),
+            // Regenerate needs the LLM: the host runs it now if loaded, else
+            // lazy-loads and regenerates once the carried transcript is adopted.
+            .regenerate => post(.chat_regenerate),
             .none => {},
         }
     }
@@ -3383,12 +2742,23 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
 /// Consecutive calls (nothing but whitespace between them) collapse into ONE
 /// card, which is what makes a four-image request a 2x2 grid rather than four
 /// stacked cards.
-fn renderReply(v: *const chat.Variant, answer: []const u8, color: dvui.Color) void {
+fn renderReply(v: *const mirror.Variant, answer: []const u8, color: dvui.Color, msg: usize, variant: usize) void {
+    // Calls this client has placed nowhere yet: they have no image to point at,
+    // and the card holds a slot for each so the grid does not grow under the
+    // reader as they go out.
+    const unplaced = g_hosts.unplacedFor(@intCast(msg), @intCast(variant));
     // The walk itself is pure and tested in toolcall.zig; this only draws.
     var segs: [16]toolcall.Segment = undefined;
     for (toolcall.segments(answer, v.images.items.len, &segs), 0..) |seg, i| switch (seg) {
         .prose => |t| renderProse(i, t, color),
-        .calls => |c| renderCallRun(v.images.items[c.start..][0..c.len], c.n_calls, c.text, i),
+        .calls => |c| renderCallRun(
+            v.images.items[c.start..][0..c.len],
+            c.n_calls,
+            @min(c.n_calls, c.len + unplaced),
+            c.text,
+            cardKey(msg, variant, i),
+            i,
+        ),
     };
 }
 
@@ -3407,11 +2777,14 @@ fn renderProse(id: usize, text: []const u8, color: dvui.Color) void {
 /// One run of calls the model made in one breath: the collapsible call section
 /// above, the card below.
 ///
-/// `imgs` can be SHORTER than `n_calls` (or empty): a reopened conversation only
-/// rebuilds renders whose files it can find, and files only exist when saving is
-/// on. The section always shows, so a reply never loses the fact that it asked
-/// for a picture.
-fn renderCallRun(imgs: []const *chat.GenImage, n_calls: usize, raw: []const u8, id: usize) void {
+/// `imgs` can be SHORTER than `n_calls` (or empty): a render still in the client
+/// queue has no image yet, and a reopened conversation only rebuilds the ones
+/// whose files it can find (files only exist when saving is on). `slots` is how
+/// many tiles the card reserves, which is `imgs` plus what is still coming --
+/// never `n_calls`, or a conversation reopened without its files would sit
+/// waiting on pictures nobody is making. The section always shows, so a reply
+/// never loses the fact that it asked for a picture.
+fn renderCallRun(imgs: []const wire.ImageId, n_calls: usize, slots: usize, raw: []const u8, key: usize, id: usize) void {
     if (n_calls == 0) return;
 
     // Same expander treatment as Thoughts: this is the machine's working, and it
@@ -3437,8 +2810,8 @@ fn renderCallRun(imgs: []const *chat.GenImage, n_calls: usize, raw: []const u8, 
         fonts.addStyled(tl, raw, .{}, .{ .font = style.F.code, .color_text = style.C.text_dim });
     }
 
-    if (imgs.len > 0) {
-        renderToolCard(imgs, id * 64 + 3);
+    if (slots > 0) {
+        renderToolCard(imgs, slots, key, id * 64 + 3);
         return;
     }
 
@@ -3451,7 +2824,7 @@ fn renderCallRun(imgs: []const *chat.GenImage, n_calls: usize, raw: []const u8, 
             n_calls,
             if (n_calls == 1) "" else "s",
         }) catch "generated, not kept")
-    else if (g_diffuser == null)
+    else if (!g_m.state.diff_present)
         "generated earlier · no image model loaded to show them"
     else
         (std.fmt.bufPrint(&buf, "{d} image{s} generated · the saved file{s} could not be found", .{
@@ -3479,24 +2852,26 @@ fn fitSize(w: usize, h: usize, max: f32) dvui.Size {
     return .{ .w = @as(f32, @floatFromInt(w)) * scale, .h = @as(f32, @floatFromInt(h)) * scale };
 }
 
-fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
+fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
     var b = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = gi_idx, .expand = .horizontal, .margin = .{ .y = 4, .h = 4 } });
     defer b.deinit();
 
-    switch (gi.get()) {
+    const info = &im.info;
+    switch (im.status()) {
         .pending, .generating, .suspended => {
-            const st_now = gi.get();
+            const st_now = im.status();
             const generating = st_now == .generating;
-            const done = gi.step.load(.monotonic);
-            const total = gi.total.load(.monotonic);
-            // Live preview (re-uploaded each frame as its bytes update).
-            if (gi.preview) |pv| {
-                const pw = gi.preview_w.load(.acquire);
-                const ph = gi.preview_h.load(.acquire);
+            const done = info.step;
+            const total = info.total;
+            // Live preview: a fetched frame is a new buffer, so dvui's
+            // pointer-keyed texture cache re-uploads once per fetch, not per frame.
+            if (im.preview) |pv| {
+                const pw = im.preview_w;
+                const ph = im.preview_h;
                 if (pw > 0 and ph > 0) {
                     const sz = fitSize(pw, ph, 200);
                     _ = dvui.image(@src(), .{
-                        .source = .{ .pixels = .{ .rgba = pv[0 .. pw * ph * 4], .width = pw, .height = ph, .invalidation = .always } },
+                        .source = .{ .pixels = .{ .rgba = pv, .width = pw, .height = ph } },
                         .shrink = .ratio,
                     }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(6) });
                 }
@@ -3505,9 +2880,9 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             // steps (excludes model-load time), and an ETA from that rate. Keep
             // the frame repainting so the elapsed timer ticks between step wakes.
             if (generating) dvui.refresh(null, @src(), null);
-            const start = gi.start_ns.load(.acquire);
-            const first = gi.first_step_ns.load(.acquire);
-            const last = gi.last_step_ns.load(.acquire);
+            const start = info.start_ns;
+            const first = info.first_step_ns;
+            const last = info.last_step_ns;
             const now_ns: i64 = @intCast(std.Io.Clock.real.now(g_io).nanoseconds);
             const elapsed_s: f64 = if (start > 0) @as(f64, @floatFromInt(now_ns - start)) / 1e9 else 0;
             const sps: f64 = if (done >= 2 and first > 0 and last > first)
@@ -3538,33 +2913,29 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                     std.fmt.bufPrint(&tbuf, "{d:.1}s elapsed", .{elapsed_s}) catch "";
                 dvui.label(@src(), "{s}", .{timing}, .{ .margin = .{ .y = 1 } });
             }
-            genInfo(gi);
-            // Stop this generation (or drop it from the queue): the flag is
-            // polled by the pipeline between steps and by `nextPending`.
+            genInfo(im);
+            // Stop this generation (or drop it from the queue): the host sets
+            // the flag the pipeline polls between steps.
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 4 } })) {
-                gi.cancel.store(true, .release);
-                gi.wake();
-                // If we're paused, the worker is parked at the gate, wake it so
-                // it re-checks this image's cancel flag now, not on resume.
-                if (g_diffuser) |*d| d.wakePaused();
+                post(.{ .img_cancel = .{ .image = info.id } });
             }
         },
         .done => {
-            if (gi.rgba) |rgba| {
+            if (im.pixels) |rgba| {
                 // Wrap in a box so a click anywhere on the image opens the
                 // full-size viewer window. Size to the image's own aspect so
                 // there's no letterbox padding before the button.
-                const sz = fitSize(gi.width, gi.height, 200);
+                const sz = fitSize(info.width, info.height, 200);
                 var ib = dvui.box(@src(), .{}, .{});
                 _ = dvui.image(@src(), .{
-                    .source = .{ .pixels = .{ .rgba = rgba, .width = @intCast(gi.width), .height = @intCast(gi.height) } },
+                    .source = .{ .pixels = .{ .rgba = rgba, .width = info.width, .height = info.height } },
                     .shrink = .ratio,
                 }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(6) });
                 const clicked = dvui.clicked(ib.data(), .{});
                 ib.deinit();
-                if (clicked) g_viewer_request = gi;
+                if (clicked) g_viewer_request = info.id;
 
-                genInfo(gi);
+                genInfo(im);
 
                 {
                     var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 4 } });
@@ -3575,16 +2946,16 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                         .min_size_content = .{ .w = 18, .h = 18 },
                         .gravity_y = 0.5,
                         .data_out = &cwd,
-                    })) clipboard.copyImage(gi);
+                    })) clipboard.copyImage(rgba, info.width, info.height);
                     hint.hover(@src(), &cwd, "Copy image to clipboard");
 
                     // Let the model see this image: attach it to the next
                     // message. Shown whenever the configured model can see
                     // images (not just while a session is resident); with the
-                    // LLM unloaded the image is staged and the lazy load kicks.
-                    if (visionAvailable()) {
+                    // LLM unloaded the host stages it and the lazy load kicks.
+                    if (g_m.state.vision and (!im.local or im.pixels != null)) {
                         if (dvui.button(@src(), "Discuss this image", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 6 } })) {
-                            attachOrStageRgba(s, rgba, gi.width, gi.height);
+                            attachFromMirror(im);
                         }
                     }
                 }
@@ -3595,63 +2966,63 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             // common cause here, VRAM, is one the user can actually fix
             // (unload the LLM, drop the resolution) and then retry into.
             var fbuf: [160]u8 = undefined;
-            const msg = if (gi.failure()) |err|
-                std.fmt.bufPrint(&fbuf, "image generation failed: {s}", .{diffuser.failureText(err)}) catch "image generation failed"
+            const msg = if (info.failure.len > 0)
+                std.fmt.bufPrint(&fbuf, "image generation failed: {s}", .{mirror.failureText(info.failure)}) catch "image generation failed"
             else
                 "image generation failed";
             fonts.richLabel(@src(), msg, .{});
-            genInfo(gi);
-            retryButton(gi);
+            genInfo(im);
+            retryButton(im);
         },
         .canceled => {
             fonts.richLabel(@src(), "image generation canceled", .{});
-            genInfo(gi);
-            retryButton(gi);
+            genInfo(im);
+            retryButton(im);
         },
     }
 }
 
-/// "Try again" for a failed or canceled image: re-queues it IN PLACE, so this
-/// same tile turns back into a progress bar rather than a second image
-/// appearing. Retrying picks up the CURRENT model/backend (see `Diffuser.retry`)
-/// which is the point, since the usual fix for the usual failure is to change
-/// something first.
-fn retryButton(gi: *chat.GenImage) void {
-    if (g_diffuser) |*d| {
-        if (dvui.button(@src(), "Try again", .{}, .{ .margin = .{ .y = 4 } }))
-            d.retry(gi) catch |err| std.log.err("retry image: {t}", .{err});
-    }
+/// "Try again" for a failed or canceled image: asks for the same render again,
+/// as a new job that any host can take. It picks up the CURRENT model and
+/// backend, which is the point, since the usual fix for the usual failure is to
+/// change something first. A local image (a reopened render whose file is gone)
+/// has nothing to retry.
+fn retryButton(im: *const mirror.Image) void {
+    if (im.local) return;
+    if (dvui.button(@src(), "Try again", .{}, .{ .margin = .{ .y = 4 } }))
+        g_hosts.retry(&g_config, im.info.id);
 }
 
 /// A compact metadata line (resolution * seed) plus a collapsed-by-default
 /// prompt expander, shown under an image in every state. Uses the actual output
 /// dimensions once known, else the requested ones; the seed is shown once
 /// assigned (non-zero).
-fn genInfo(gi: *chat.GenImage) void {
-    const w = if (gi.width > 0) gi.width else gi.req_width;
-    const h = if (gi.height > 0) gi.height else gi.req_height;
+fn genInfo(im: *const mirror.Image) void {
+    const info = &im.info;
+    const w = if (info.width > 0) info.width else info.req_width;
+    const h = if (info.height > 0) info.height else info.req_height;
     var buf: [160]u8 = undefined;
     // Seed is assigned at scan time (never 0 here), so always show it. Once
     // done, append the average s/step (sampling only) and total wall time.
-    const meta = if (gi.get() == .done) blk: {
-        const start = gi.start_ns.load(.acquire);
-        const dn = gi.done_ns.load(.acquire);
-        const first = gi.first_step_ns.load(.acquire);
-        const last = gi.last_step_ns.load(.acquire);
+    const meta = if (im.status() == .done) blk: {
+        const start = info.start_ns;
+        const dn = info.done_ns;
+        const first = info.first_step_ns;
+        const last = info.last_step_ns;
         const total_s: f64 = if (start > 0 and dn > start) @as(f64, @floatFromInt(dn - start)) / 1e9 else 0;
-        const sps: f64 = if (gi.req_steps >= 2 and first > 0 and last > first)
-            (@as(f64, @floatFromInt(last - first)) / 1e9) / @as(f64, @floatFromInt(gi.req_steps - 1))
+        const sps: f64 = if (info.req_steps >= 2 and first > 0 and last > first)
+            (@as(f64, @floatFromInt(last - first)) / 1e9) / @as(f64, @floatFromInt(info.req_steps - 1))
         else
             0;
-        break :blk std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, gi.req_steps, gi.req_seed, sps, total_s }) catch "";
-    } else std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, gi.req_steps, gi.req_seed }) catch "";
+        break :blk std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, info.req_steps, info.req_seed, sps, total_s }) catch "";
+    } else std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, info.req_steps, info.req_seed }) catch "";
     // Rendered through a text layout (not a plain label) so the metadata,
     // seed especially, is mouse-selectable.
     fonts.richLabel(@src(), meta, .{ .margin = .{ .y = 2 } });
     if (dvui.expander(@src(), "Prompt", .{ .default_expanded = false }, .{})) {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 4 } });
         defer tl.deinit();
-        fonts.addRich(tl, gi.prompt);
+        fonts.addRich(tl, info.prompt);
     }
 }
 
@@ -3673,8 +3044,8 @@ const Parsed = struct { think: ?[]const u8, answer: []const u8, thinking: bool }
 /// recorded when it was generated, else the live model's, else none. Splitting
 /// with the live model's markers is what left a reopened conversation showing a
 /// bare `</think>` in its prose.
-fn parseThink(v: *const chat.Variant) Parsed {
-    const s = toolcall.splitThought(v.text.items, chat.Variant.markersFor(v), v.thought_primed);
+fn parseThink(v: *const mirror.Variant) Parsed {
+    const s = toolcall.splitThought(v.text.items, markersFor(v), v.thought_primed);
     return .{ .think = s.think, .answer = s.answer, .thinking = s.open };
 }
 
@@ -3703,34 +3074,40 @@ fn renderPendingThumb(pi: usize, rgba: []const u8, w: usize, h: usize) bool {
     return false;
 }
 
-fn renderInput(s: ?*chat.Session) void {
+fn renderInput() void {
     var container = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal });
     defer container.deinit();
 
+    const st = &g_m.state;
     // Thumbnails of images attached but not yet sent, each with a hover-only X
-    // to remove it before sending. Once the LLM is live these come from the
-    // session's pending attachments; before the lazy first-message load they
-    // come from the pre-session staging buffer (dropped/pasted first images).
-    const n_thumbs = if (s) |ss| ss.pendingAttachments().len else g_staged_images.items.len;
+    // to remove it before sending. Once the LLM is live these are the session's
+    // pending attachments (mirrored images whose pixels were fetched); before
+    // the lazy first-message load they are this client's own staged copies.
+    const n_thumbs = if (st.llm_resident) st.attachments.len else g_staged.items.len;
     if (n_thumbs > 0) {
         var remove_idx: ?usize = null;
         {
             var strip = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 8, .y = 4, .w = 8 } });
             defer strip.deinit();
-            if (s) |ss| {
-                for (ss.pendingAttachments(), 0..) |gi, pi| {
-                    if (gi.rgba) |rgba| if (renderPendingThumb(pi, rgba, gi.width, gi.height)) {
+            if (st.llm_resident) {
+                for (st.attachments, 0..) |id, pi| {
+                    const im = g_hosts.imageById(id) orelse continue;
+                    if (im.pixels) |rgba| if (renderPendingThumb(pi, rgba, im.info.width, im.info.height)) {
                         remove_idx = pi;
                     };
                 }
             } else {
-                for (g_staged_images.items, 0..) |st, pi| {
-                    if (renderPendingThumb(pi, st.rgba, st.width, st.height)) remove_idx = pi;
+                for (g_staged.items, 0..) |sti, pi| {
+                    if (renderPendingThumb(pi, sti.rgba, sti.width, sti.height)) remove_idx = pi;
                 }
             }
         }
         if (remove_idx) |ri| {
-            if (s) |ss| ss.removeAttachment(ri) else removeStaged(ri);
+            post(.{ .chat_remove_attachment = .{ .index = @intCast(ri) } });
+            if (!st.llm_resident and ri < g_staged.items.len) {
+                const gone = g_staged.orderedRemove(ri);
+                g_gpa.free(gone.rgba);
+            }
         }
     }
 
@@ -3747,7 +3124,7 @@ fn renderInput(s: ?*chat.Session) void {
     });
     defer block.deinit();
 
-    const busy = if (s) |ss| ss.busy() else false;
+    const busy = st.llm_busy;
 
     // Quick settings: the three knobs a beginner ever needs. Everything else is
     // in Studio, and the link says so rather than leaving the user to guess.
@@ -3802,7 +3179,7 @@ fn renderInput(s: ?*chat.Session) void {
 
         // The reasoning toggle is a quick setting too: it changes what the next
         // turn does, which is what this row is for. Only for a family that can.
-        const can_reason = if (s != null) tp.llm.chat.supportsThinking() else configuredSupportsThinking();
+        const can_reason = st.thinking;
         if (can_reason) {
             const on = g_config.reasoning;
             if (style.chip(@src(), if (on) "thinking: on" else "thinking: off", .{
@@ -3812,7 +3189,7 @@ fn renderInput(s: ?*chat.Session) void {
                 .text = if (on) style.C.blue else style.C.text_dim,
             })) toggleReasoning();
 
-            const has_effort = if (s != null) tp.llm.chat.supportsReasoningEffort() else configuredSupportsReasoningEffort();
+            const has_effort = st.reasoning_effort;
             if (on and has_effort) {
                 const label = switch (g_config.reasoning_effort) {
                     .high => "effort: high",
@@ -3938,13 +3315,13 @@ fn renderInput(s: ?*chat.Session) void {
 
     const pressed = bubbles.inputEnd(&frame_box, .{
         .busy = busy,
-        .can_attach = visionAvailable(),
+        .can_attach = st.vision,
         // Gated on CAPABILITY, not on a live session: the model is lazy-loaded, so
         // requiring one hid these controls until after the first message. Only a
         // checkpoint whose arch publishes a layer index and whose linears are in a
         // wired dtype gets them, so the affordance never promises an effect it
         // cannot have (see `noiseAvailable`).
-        .noise = if (noiseAvailable()) .{
+        .noise = if (st.weight_noise) .{
             .on = g_config.weight_noise,
             .shape = noiseShape(),
             .valid = g_noise_valid,
@@ -3964,9 +3341,7 @@ fn renderInput(s: ?*chat.Session) void {
         .on_noise_amount = composerNoiseAmount,
     });
     if (pressed) {
-        if (busy) {
-            if (s) |ss| ss.requestCancel();
-        } else send = true;
+        if (busy) post(.chat_cancel) else send = true;
     }
 
     if (send and !busy) {
@@ -3981,68 +3356,4 @@ fn renderInput(s: ?*chat.Session) void {
         }
         g_input.clearRetainingCapacity();
     }
-}
-
-/// Send a chat message. If the LLM is resident, submit directly. Otherwise
-/// (lazy first chat) stash the text and kick a load; `maybeStartReload`
-/// auto-submits it once the model is live.
-///
-/// Returns false when the message went nowhere (empty after trimming, no model
-/// configured, the session refused it, allocation failed). The button ignores
-/// that -- the text stays in the box and the user sees nothing happen -- but a
-/// headless driver has no such feedback and would otherwise wait forever.
-fn submitChat(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    // Never touch the session while a (re)load is in flight, the loader thread is
-    // freeing/rebuilding it. Submit only when it's live; otherwise stash the text
-    // and the load-completion path (maybeStartReload) auto-submits it.
-    if (!g_loading.load(.acquire)) if (g_session) |s| {
-        s.submit(trimmed) catch |err| {
-            std.log.err("submit failed: {t}", .{err});
-            return false;
-        };
-        // submit itself no-ops on a turn already in flight or queued.
-        return s.busy() or s.turnPending();
-    };
-    if (g_config.llm_model.opt() == null) return false; // no model to load
-    if (g_pending_submit) |p| g_gpa.free(p);
-    g_pending_submit = g_gpa.dupe(u8, trimmed) catch null;
-    if (g_pending_submit == null) return false; // nothing stashed, so don't reload for it
-    if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load will pick it up
-    return true;
-}
-
-/// The › (regenerate) button was hit while the LLM is unloaded: lazy-load it and
-/// regenerate the carried transcript's last reply once the fresh session adopts
-/// it (see maybeStartReload). No-op if no model is configured.
-fn requestRegenLoad() void {
-    if (g_config.llm_model.opt() == null) return; // no model to load
-    g_pending_regenerate = true;
-    if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load picks it up
-}
-
-/// Start a fresh conversation, clearing the input box. Only the transcript is
-/// reset; generated images live in the engine's shared history and stay in the
-/// studio gallery (and the viewer keeps working). No-op if no session is loaded.
-fn newChat() void {
-    // The note drop follows the RESET: a session that refused (a turn is
-    // generating) is still on the same conversation, and dropping its notes there
-    // would lose the report for an image that chat did ask for. With no live
-    // session the boundary is the carry clear below, which always happens.
-    const ended = if (g_loading.load(.acquire)) true else if (g_session) |s| s.reset() else true;
-    if (ended) dropPendingImageNotes(); // in-flight renders belong to the chat being left
-    // If the LLM is ejected, the transcript lives in g_carry, clear it too so
-    // "new chat" starts fresh even while unloaded. (No-op when a session is
-    // live, since g_carry is null then.)
-    freeCarry();
-    freeLlmSuspend(); // drop any suspended-turn carry; a new chat won't resume it
-    g_pending_regenerate = false; // a fresh chat cancels a queued unloaded-regenerate
-    if (g_llm_paused) { // a fresh chat starts unpaused
-        g_llm_paused = false;
-        if (!g_loading.load(.acquire)) if (g_session) |s| s.setPaused(false);
-    }
-    clearStaged(); // drop any images staged for a not-yet-loaded first message
-    g_input.clearRetainingCapacity();
-    g_follow_bottom = true;
 }

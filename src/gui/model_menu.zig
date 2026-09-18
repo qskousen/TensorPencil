@@ -5,6 +5,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 const C = style.C;
 
@@ -15,6 +16,8 @@ pub const Item = struct {
     selected: bool = false,
     /// Shown dimmed and inert, with `note` after the name saying why.
     greyed: bool = false,
+    /// Trailing text after the name: why a greyed row cannot be picked, or
+    /// where a pickable one's file is. Drawn dimmer than the name.
     note: []const u8 = "",
 };
 
@@ -43,6 +46,9 @@ pub const Pick = union(enum) {
 
 pub const Chip = struct {
     label: []const u8,
+    /// Where the model is, drawn dimmer after the name. Empty when there is
+    /// nothing to say (see `model_lib.where`).
+    note: []const u8 = "",
     /// Loaded right now: a green dot before the name.
     resident: bool = false,
     /// Something is missing for this model to run: amber text.
@@ -103,6 +109,15 @@ pub fn chip(src: std.builtin.SourceLocation, c: Chip, menu: Menu, id_extra: usiz
             .padding = .{},
             .gravity_y = 0.5,
         });
+        if (c.note.len > 0) {
+            dvui.labelNoFmt(@src(), c.note, .{}, .{
+                .font = style.F.ui_sm,
+                .color_text = C.text_faint,
+                .padding = .{},
+                .margin = .{ .x = 6 },
+                .gravity_y = 0.5,
+            });
+        }
         style.mark(@src(), .caret_down, 11, text_color, .{ .margin = .{ .x = 4 } });
     }
     const active = mi.activeRect();
@@ -157,13 +172,16 @@ fn menuBody(menu: Menu) ?Pick {
     return pick;
 }
 
-/// One pickable row: the name, blue when it is the current choice, ghosted with
-/// its note when greyed. A greyed row draws but never picks.
+/// One pickable row: the name, blue when it is the current choice, ghosted when
+/// greyed, with its note after it in a dimmer colour so the name is what the eye
+/// lands on. A greyed row draws but never picks.
 ///
-/// One label straight inside the menu item, as `dvui.menuItemLabel` does. A row
-/// built from a box with a mark and two labels looked the same but never
-/// activated inside a nested submenu: the press closed the menu chain before the
-/// release arrived. Measured by swapping the two on the same menu.
+/// The name and the note are two runs of ONE inert text layout
+/// (`fonts.richLineNote`), not two labels: a row built from a box with a mark
+/// and two labels looked the same but never activated inside a nested submenu,
+/// because the press closed the menu chain before the release arrived. Measured
+/// by swapping the two on the same menu. A text layout built by hand skips
+/// `processEvents`, so it claims nothing and the row still picks.
 fn pickRow(src: std.builtin.SourceLocation, label: []const u8, selected: bool, greyed: bool, note: []const u8, id_extra: usize) bool {
     var mi = dvui.menuItem(src, .{}, .{
         .id_extra = id_extra,
@@ -171,14 +189,9 @@ fn pickRow(src: std.builtin.SourceLocation, label: []const u8, selected: bool, g
         .corner_radius = style.R.chip,
     });
     defer mi.deinit();
-    var buf: [512]u8 = undefined;
-    const text = if (greyed and note.len > 0)
-        std.fmt.bufPrint(&buf, "{s}   {s}", .{ label, note }) catch label
-    else
-        label;
     const color = if (greyed) C.text_ghost else if (selected) C.blue else C.text;
-    dvui.labelNoFmt(@src(), text, .{}, mi.style().strip().override(.{
-        .label = .{ .for_id = mi.data().id },
+    const note_color = if (greyed) C.text_ghost else C.text_faint;
+    fonts.richLineNote(@src(), label, note, note_color, mi.style().strip().override(.{
         .font = style.F.ui,
         .color_text = color,
     }));

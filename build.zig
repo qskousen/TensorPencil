@@ -262,8 +262,16 @@ pub fn build(b: *std.Build) void {
     const self_hosted = b.option(bool, "self-hosted", "Build executables with the self-hosted backend (no LLVM)") orelse false;
     const use_llvm: ?bool = if (self_hosted) false else null;
 
+    // Privacy: the code paths that print the user's prompt or reply are
+    // COMPILED OUT of the engine layer, which since the socket split is linked
+    // only by tp-serve and the engine probes (tp-gui has no engine). A flag is
+    // a promise; a missing code path is a fact. `-Dprivacy=false` puts the
+    // dumps back for a debugging build of chat-probe.
+    const privacy = b.option(bool, "privacy", "Compile the prompt/reply debug dumps out of the engine layer (default true)") orelse true;
+
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
+    build_opts.addOption(bool, "privacy", privacy);
     // Tie the compile-time flag to whether ggml was actually wired: if the
     // dependency is disabled (or unavailable), the library compiles its
     // block-quant paths to a clean runtime error instead of a missing-module
@@ -414,11 +422,102 @@ pub fn build(b: *std.Build) void {
     }
     run_llm_step.dependOn(&run_llm_cmd.step);
 
+    // The tp-gui / tp-serve layers: `shared` is what both hold, `engine` is
+    // what owns a GPU, `client` is tp-gui's own state. Each is a module rather
+    // than a directory because a test or probe rooted in one directory cannot
+    // `@import` a file above it. Gated on known-folders (config.zig needs it) so
+    // `zig build test` stays free of it.
+    // The tp-serve protocol layer: wire types, certificates, framing. Below every
+    // layer (they all carry its types) and free of known-folders, so its tests
+    // ride in the fast `test` step.
+    const serve_mod = b.createModule(.{
+        .root_source_file = b.path("src/serve/serve.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tp_core", .module = core_mod },
+            .{ .name = "TensorPencil", .module = mod },
+        },
+    });
+
+    // NOTE on every `lazyDependency` below: asking for one MARKS it needed, and
+    // the build script cannot see which step was requested, so a fresh checkout
+    // fetches all of them on any `zig build`, `test` included. `.lazy` buys the
+    // manifest, not the step: what it saves is a checkout that never builds
+    // these at all. Gating it properly would mean parsing the runner's argv.
+    const Layers = struct { shared: *std.Build.Module, engine: *std.Build.Module, client: *std.Build.Module };
+    const layers: ?Layers = if (b.lazyDependency("known_folders", .{})) |kf| blk: {
+        const shared_mod = b.createModule(.{
+            .root_source_file = b.path("src/shared/shared.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = mod },
+                .{ .name = "serve", .module = serve_mod },
+                .{ .name = "known-folders", .module = kf.module("known-folders") },
+            },
+        });
+        const engine_mod = b.createModule(.{
+            .root_source_file = b.path("src/engine/engine.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = mod },
+                .{ .name = "serve", .module = serve_mod },
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "build_options", .module = opts_mod },
+            },
+        });
+        const client_mod = b.createModule(.{
+            .root_source_file = b.path("src/client/client.zig"),
+            .link_libc = true, // localtime_r, for history's local-day grouping
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = mod },
+                .{ .name = "serve", .module = serve_mod },
+                .{ .name = "shared", .module = shared_mod },
+            },
+        });
+        break :blk .{ .shared = shared_mod, .engine = engine_mod, .client = client_mod };
+    } else null;
+
+    // tp-serve: the engine host behind a socket. `zig build serve` installs
+    // it; the gui steps install it too, since tp-gui spawns it as the sibling
+    // binary of its own installed path. tls.zig is the server end of a remote
+    // link (std has only the client); it is linked by the serve exes and the
+    // tls-spike step alone, so no test binary carries it.
+    const tls_dep = b.lazyDependency("tls", .{ .target = target, .optimize = optimize });
+    const serve_step = b.step("serve", "Build tp-serve (the engine host daemon)");
+    const serve_install: ?*std.Build.Step.InstallArtifact = if (layers != null and tls_dep != null) blk: {
+        const L = layers.?;
+        const serve_exe = b.addExecutable(.{
+            .name = "tp-serve",
+            .use_llvm = use_llvm,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/serve_main.zig"),
+                .link_libc = true,
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "TensorPencil", .module = mod },
+                    .{ .name = "serve", .module = serve_mod },
+                    .{ .name = "shared", .module = L.shared },
+                    .{ .name = "engine", .module = L.engine },
+                    .{ .name = "tls", .module = tls_dep.?.module("tls") },
+                },
+            }),
+        });
+        const si = b.addInstallArtifact(serve_exe, .{});
+        serve_step.dependOn(&si.step);
+        break :blk si;
+    } else null;
+
     // tp-gui: desktop GUI (dvui + SDL3) — a conversational image studio that
-    // drives the same TensorPencil library (LLM chat + diffusion). GUI deps
-    // (dvui/SDL3, X11/Wayland) are lazy: only fetched/built when the gui or
-    // run-gui step is actually requested, so `zig build test` stays lean and
-    // dependency-free. Mirrors DiffKeep's proven dvui-0.5.0-dev wiring.
+    // drives the same TensorPencil library (LLM chat + diffusion). The GUI deps
+    // (dvui/SDL3, X11/Wayland) are BUILT only for the gui steps; see the note
+    // on lazyDependency above for what "lazy" does and does not save.
+    // Mirrors DiffKeep's proven dvui-0.5.0-dev wiring.
     const gui_step = b.step("gui", "Build tp-gui (desktop GUI)");
     const run_gui_step = b.step("run-gui", "Run tp-gui");
     const gui_test_step = b.step("gui-test", "Run tp-gui config unit tests (not part of `test`)");
@@ -445,6 +544,10 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "vips", .module = vips_module },
                         // Platform config-dir resolution for the settings file.
                         .{ .name = "known-folders", .module = kf.module("known-folders") },
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "shared", .module = layers.?.shared },
+                        // No `engine`: tp-gui runs none, and the build says so.
+                        .{ .name = "client", .module = layers.?.client },
                     },
                 }),
             });
@@ -458,9 +561,12 @@ pub fn build(b: *std.Build) void {
             // Install only via the `gui` / `run-gui` steps, never the default
             // step, so `zig build` / `zig build test` stay free of the GUI deps.
             const install_gui = b.addInstallArtifact(gui_exe, .{});
+            if (serve_install) |si| install_gui.step.dependOn(&si.step);
             gui_step.dependOn(&install_gui.step);
 
-            const run_gui_cmd = b.addRunArtifact(gui_exe);
+            // The installed binary, not the cached artifact: tp-gui finds
+            // tp-serve beside its own executable.
+            const run_gui_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "tp-gui")});
             run_gui_cmd.step.dependOn(&install_gui.step);
             if (b.args) |args| run_gui_cmd.addArgs(args);
             run_gui_step.dependOn(&run_gui_cmd.step);
@@ -514,6 +620,9 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
                         .{ .name = "backend", .module = dvui_dep.module("sdl3") },
                         .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "shared", .module = layers.?.shared },
+                        .{ .name = "client", .module = layers.?.client },
                     },
                 }),
             });
@@ -527,34 +636,16 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| run_ui_probe.addArgs(args);
             ui_probe_step.dependOn(&run_ui_probe.step);
 
-            // GUI config unit tests. Kept off the default `test` step (which
-            // stays free of GUI deps); `config.zig` only pulls std + known-folders.
-            const gui_config_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/config.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "known-folders", .module = kf.module("known-folders") },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_config_tests).step);
-
-            // Tool-call (`<image>…</image>` + native blocks) parser unit tests.
-            // Needs the library's `llm.tool_call`; kept off the default `test` step for the same
-            // reason as the config tests.
-            const gui_toolcall_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/toolcall.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_toolcall_tests).step);
+            // The three layers, one test binary each: settings, catalog, model
+            // spec, tool-call parsing, turn stats and meter math (shared); the
+            // chat and diffusion engines' pure helpers, the scanner and the
+            // sampler ABI (engine); selection, history and the prompt library
+            // (client). All CPU-only. Kept off the default `test` step, which
+            // stays free of known-folders.
+            const L = layers.?;
+            gui_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = L.shared })).step);
+            gui_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = L.engine })).step);
+            gui_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = L.client })).step);
 
             // Markdown parser unit tests. Pure std — the dvui-facing
             // markdown_view.zig stays out of the test build.
@@ -567,17 +658,6 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_markdown_tests).step);
 
-            // Message-footer telemetry: rates + formatting. Pure std — the
-            // struct lives here rather than in chat.zig so it stays testable.
-            const gui_turn_stats_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/turn_stats.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_turn_stats_tests).step);
-
             // Viewer zoom/pan math unit tests. Pure std — the dvui-facing
             // viewer.zig stays out of the test build.
             const gui_viewmath_tests = b.addTest(.{
@@ -588,53 +668,6 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_viewmath_tests).step);
-
-            // VRAM meter attribution math (ours-untracked vs other processes',
-            // and the smoothing that keeps our allocation churn out of the
-            // "system" block). Pure std.
-            const gui_vramsplit_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/vram_split.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_vramsplit_tests).step);
-
-            // NVML/proc sampler helpers: the per-process VRAM struct ABI + list
-            // scan the meter depends on. Pure std (NVML itself is dlopen'd).
-            const gui_sysmon_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/sysmon.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_sysmon_tests).step);
-
-            // Conversation store: the transcript format (a length-prefixed
-            // parse that must survive truncation), the local-day grouping the
-            // sidebar sections by, and title derivation. Pure std.
-            const gui_history_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/history.zig"),
-                    .link_libc = true, // localtime_r, for the timezone offset
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_history_tests).step);
-
-            // Composer framing: ratio + megapixels -> model-legal dimensions,
-            // and the round trip back to the chips. Pure std.
-            const gui_framing_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/framing.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_framing_tests).step);
 
             // Font tier routing: the cmap coverage parse plus which face each
             // codepoint lands on. Needs the dvui module for `Font`, but no
@@ -681,104 +714,66 @@ pub fn build(b: *std.Build) void {
             }
             gui_test_step.dependOn(&b.addRunArtifact(gui_style_tests).step);
 
-            // Diffusion-engine pure-helper tests (clampDim / parseGenAttrs /
-            // seed advance). Pulls in the TensorPencil module (for pipeline
-            // types) + known-folders (via config.zig), but stays CPU-only.
-            const gui_diffuser_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/diffuser.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                        .{ .name = "known-folders", .module = kf.module("known-folders") },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_diffuser_tests).step);
-
-            // Checkpoint-inspection tests (family traits, component presence,
-            // the probe memo). Pulls in the TensorPencil module for the
-            // pipeline's Family/DitContainer; no dvui, CPU-only.
-            const gui_modelspec_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/model_spec.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_modelspec_tests).step);
-
-            // Model-catalog tests: header-only classification of a synthetic
-            // model tree, the grouping queries and the JSON index. Same deps.
-            const gui_catalog_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/catalog.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_catalog_tests).step);
-
-            // Selection tests: how a chip or Settings pick becomes the effective
-            // model paths, over an in-memory catalog and config.
-            const gui_selection_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/selection.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                        .{ .name = "known-folders", .module = kf.module("known-folders") },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_selection_tests).step);
-
-            // Chat-session pure-helper tests (Message variants + the ‹/›
-            // regenerate-navigation semantics). Same deps as the diffuser
-            // tests (chat.zig imports it); CPU-only.
-            const gui_chat_tests = b.addTest(.{
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/chat.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "TensorPencil", .module = mod },
-                        .{ .name = "known-folders", .module = kf.module("known-folders") },
-                    },
-                }),
-            });
-            gui_test_step.dependOn(&b.addRunArtifact(gui_chat_tests).step);
+            // The views with arithmetic in them: the meter's segment maths, the
+            // status bar's sampling, and the studio form's defaults. Each had
+            // tests that no step compiled, so none of them were running.
+            for ([_][]const u8{
+                "src/gui/meter.zig",
+                "src/gui/status_bar.zig",
+                "src/gui/image_view.zig",
+                "src/gui/model_lib.zig",
+            }) |path| {
+                const t = b.addTest(.{
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path(path),
+                        .link_libc = true,
+                        .target = target,
+                        .optimize = optimize,
+                        .imports = &.{
+                            .{ .name = "TensorPencil", .module = mod },
+                            .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                            .{ .name = "serve", .module = serve_mod },
+                            .{ .name = "shared", .module = layers.?.shared },
+                            .{ .name = "client", .module = layers.?.client },
+                        },
+                    }),
+                });
+                if (target.result.os.tag == .linux) {
+                    t.root_module.linkSystemLibrary("X11", .{});
+                    t.root_module.linkSystemLibrary("Xcursor", .{});
+                    t.root_module.linkSystemLibrary("Xi", .{});
+                    t.root_module.linkSystemLibrary("wayland-client", .{});
+                }
+                gui_test_step.dependOn(&b.addRunArtifact(t).step);
+            }
         }
     }
 
-    // catalog-probe: scan model folders as tp-gui does and print each file's
-    // classification (`zig build catalog-probe -- <folder>...`). No dvui.
+    // catalog-probe: scan model folders as tp-gui does, through the engine's
+    // scanner, and print each file's classification
+    // (`zig build catalog-probe -- <folder>...`). No dvui: this is what keeps
+    // the engine and shared layers free of it.
     {
         const cat_step = b.step("catalog-probe", "Scan model folders and print what tp-gui takes each file for");
-        const cat_exe = b.addExecutable(.{
-            .name = "catalog-probe",
-            .use_llvm = use_llvm,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/gui/catalog_probe.zig"),
-                .link_libc = true,
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "TensorPencil", .module = mod },
-                },
-            }),
-        });
-        const cat_run = b.addRunArtifact(cat_exe);
-        if (b.args) |args| cat_run.addArgs(args);
-        cat_step.dependOn(&cat_run.step);
+        if (layers) |L| {
+            const cat_exe = b.addExecutable(.{
+                .name = "catalog-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/engine/catalog_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "shared", .module = L.shared },
+                        .{ .name = "engine", .module = L.engine },
+                    },
+                }),
+            });
+            const cat_run = b.addRunArtifact(cat_exe);
+            if (b.args) |args| cat_run.addArgs(args);
+            cat_step.dependOn(&cat_run.step);
+        }
     }
 
     // chat-probe: run a tp-gui chat.Session headlessly and print the raw reply.
@@ -788,18 +783,19 @@ pub fn build(b: *std.Build) void {
     // `zig build chat-probe -- --config <copy> --message <text>`
     {
         const cp_step = b.step("chat-probe", "Run a tp-gui chat session headlessly and dump the raw reply");
-        if (b.lazyDependency("known_folders", .{})) |kf| {
+        if (layers) |L| {
             const cp_exe = b.addExecutable(.{
                 .name = "chat-probe",
                 .use_llvm = use_llvm,
                 .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/gui/chat_probe.zig"),
+                    .root_source_file = b.path("src/engine/chat_probe.zig"),
                     .link_libc = true,
                     .target = target,
                     .optimize = optimize,
                     .imports = &.{
                         .{ .name = "TensorPencil", .module = mod },
-                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                        .{ .name = "shared", .module = L.shared },
+                        .{ .name = "engine", .module = L.engine },
                     },
                 }),
             });
@@ -812,6 +808,123 @@ pub fn build(b: *std.Build) void {
             cp_run.step.dependOn(&cp_install.step);
             if (b.args) |args| cp_run.addArgs(args);
             cp_step.dependOn(&cp_run.step);
+        }
+    }
+
+    // driver-probe: run the engine host headlessly on scripted wire requests and
+    // print every event (`zig build driver-probe -- --config <copy> --message <text>`).
+    // The protocol's behaviour against a real model, with no socket and no window.
+    {
+        const dp_step = b.step("driver-probe", "Drive the engine host with wire requests and print its events");
+        if (layers) |L| {
+            const dp_exe = b.addExecutable(.{
+                .name = "driver-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/engine/driver_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "shared", .module = L.shared },
+                        .{ .name = "engine", .module = L.engine },
+                    },
+                }),
+            });
+            const dp_install = b.addInstallArtifact(dp_exe, .{});
+            dp_step.dependOn(&dp_install.step);
+            const dp_run = b.addRunArtifact(dp_exe);
+            dp_run.step.dependOn(&dp_install.step);
+            if (b.args) |args| dp_run.addArgs(args);
+            dp_step.dependOn(&dp_run.step);
+        }
+    }
+
+    // serve-probe: driver-probe's script through a spawned tp-serve over its
+    // socket. Installs both, since the probe spawns the daemon as its sibling.
+    {
+        const sp_step = b.step("serve-probe", "Drive a spawned tp-serve over its socket and print its events");
+        if (layers) |L| {
+            const sp_exe = b.addExecutable(.{
+                .name = "serve-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/client/serve_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "shared", .module = L.shared },
+                        .{ .name = "client", .module = L.client },
+                    },
+                }),
+            });
+            const sp_install = b.addInstallArtifact(sp_exe, .{});
+            if (serve_install) |si| sp_install.step.dependOn(&si.step);
+            const sp_run = b.addRunArtifact(sp_exe);
+            sp_run.step.dependOn(&sp_install.step);
+            if (b.args) |args| sp_run.addArgs(args);
+            sp_step.dependOn(&sp_run.step);
+        }
+    }
+
+    // hosts-probe: tp-gui's multi-host path (client/hosts.zig) over two spawned
+    // tp-serve children on private sockets, with the renderer killed mid-image.
+    {
+        const hp_step = b.step("hosts-probe", "Drive two spawned tp-serve hosts as tp-gui does and check the split");
+        if (layers) |L| {
+            const hp_exe = b.addExecutable(.{
+                .name = "hosts-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/client/hosts_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "shared", .module = L.shared },
+                        .{ .name = "client", .module = L.client },
+                    },
+                }),
+            });
+            const hp_install = b.addInstallArtifact(hp_exe, .{});
+            if (serve_install) |si| hp_install.step.dependOn(&si.step);
+            const hp_run = b.addRunArtifact(hp_exe);
+            hp_run.step.dependOn(&hp_install.step);
+            if (b.args) |args| hp_run.addArgs(args);
+            hp_step.dependOn(&hp_run.step);
+        }
+    }
+
+    // tls-spike: the remote link end to end on a loopback socket with no
+    // engine: the real server routing behind tls.zig, the real client link
+    // (std's TLS client pinned to the minted certificate), the right token,
+    // a wrong token, a wrong pin, a pushed multi-MiB frame and a multi-MiB
+    // upload. Exits non-zero on any failure. Pulls the lazy `tls` dep.
+    {
+        const spike_step = b.step("tls-spike", "Run the remote-link gate on a loopback socket");
+        if (tls_dep) |td| {
+            const spike_exe = b.addExecutable(.{
+                .name = "tls-spike",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/tls_spike.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "serve", .module = serve_mod },
+                        .{ .name = "tls", .module = td.module("tls") },
+                    },
+                }),
+            });
+            const spike_run = b.addRunArtifact(spike_exe);
+            spike_step.dependOn(&spike_run.step);
         }
     }
 
@@ -965,7 +1078,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_unalias_tests = b.addRunArtifact(unalias_tests);
 
+    const serve_tests = b.addTest(.{
+        .root_module = serve_mod,
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    const run_serve_tests = b.addRunArtifact(serve_tests);
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_serve_tests.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_unalias_tests.step);
     test_step.dependOn(&run_core_tests.step);

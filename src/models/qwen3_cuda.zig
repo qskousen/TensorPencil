@@ -1945,7 +1945,7 @@ test "cuda cpu split survives a kv dtype toggle (reinitCache)" {
     }
 }
 
-// The GUI session (gui/chat.zig) drives this stepper through prefill /
+// The GUI session (engine/chat.zig) drives this stepper through prefill /
 // zero-byte turn checkpoints / resetResidency. Exercise a full GUI turn shape
 // on the real model: prefill the prompt boundary, greedy-generate, roll back
 // to the boundary and regenerate (append-only KV, restore = truncate),
@@ -1982,7 +1982,7 @@ test "cuda gui turn lifecycle: prefill, checkpoint rollback, residency reset" {
     var model = try CudaLM.init(gpa, be, &lm, .{ .initial = 16, .max = 256 }, 512);
     defer model.deinit();
 
-    // GUI turn shape (gui/chat.zig prepareTurn): grow to the prompt, prefill
+    // GUI turn shape (engine/chat.zig prepareTurn): grow to the prompt, prefill
     // everything but the last token, snapshot the boundary (zero bytes for
     // append-only qwen3), then generate.
     try model.ensureCapacity(prompt_len);
@@ -2098,7 +2098,7 @@ test "cpu split plan respects live free VRAM" {
 
     try model.enableCpuSplit(.attn, 1 << 40, true); // budget far beyond the card
     errdefer std.debug.print("n_cpu={d}, free={d} MiB\n", .{
-        if (model.split) |sp| sp.n_cpu else 0, be.ctx.memGetInfo().free >> 20,
+        if (model.split) |sp| sp.n_cpu else 0, be.ctx.freeMiB(),
     });
     try std.testing.expect(model.split != null);
     try std.testing.expect(model.split.?.n_cpu > 0);

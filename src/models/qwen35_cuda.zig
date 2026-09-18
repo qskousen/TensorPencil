@@ -1874,7 +1874,7 @@ test "cpu split plan respects live free VRAM" {
 
     try model.enableCpuSplit(.attn, 1 << 40, true); // budget far beyond the card
     errdefer std.debug.print("n_cpu={d}, free={d} MiB\n", .{
-        if (model.split) |sp| sp.n_cpu else 0, be.ctx.memGetInfo().free >> 20,
+        if (model.split) |sp| sp.n_cpu else 0, be.ctx.freeMiB(),
     });
     try std.testing.expect(model.split != null);
     try std.testing.expect(model.split.?.n_cpu > 0);
@@ -1884,7 +1884,7 @@ test "cpu split plan respects live free VRAM" {
 // prefills first, and an over-budget model has host layers from init. With the
 // stepper's `io` unseeded that is undefined-pointer UB (a GP fault deep
 // in the host matmul's groupAsync); it must instead fail closed, and work once
-// the session owner seeds it (gui/chat.zig Session.init does).
+// the session owner seeds it (engine/chat.zig Session.init does).
 test "cpu split prefill before any step needs a seeded io" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

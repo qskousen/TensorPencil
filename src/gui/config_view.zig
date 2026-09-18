@@ -8,15 +8,18 @@
 //! app (save + reload vs. discard).
 const std = @import("std");
 const dvui = @import("dvui");
-const config = @import("config.zig");
+const config = @import("shared").config;
 const noise_curve = @import("TensorPencil").noise_curve;
 const style = @import("style.zig");
 const bubbles = @import("bubbles.zig");
-const diffuser = @import("diffuser.zig");
-const model_spec = @import("model_spec.zig");
-const catalog = @import("catalog.zig");
-const selection = @import("selection.zig");
+const pipeline_map = @import("shared").pipeline_map;
+const model_spec = @import("shared").model_spec;
+const catalog = @import("shared").catalog;
+const models = @import("client").models;
+const selection = @import("client").selection;
 const model_lib = @import("model_lib.zig");
+const fonts = @import("fonts.zig");
+const mirror = @import("client").mirror;
 const SDLBackend = @import("backend");
 
 // SDL owns file picking: SDL_ShowOpen*Dialog parents the native dialog to the
@@ -107,7 +110,60 @@ pub const Callbacks = struct {
     apply: *const fn () void,
     /// Discard edits and return to chat.
     cancel: *const fn () void,
+    /// Ask the host to scan the config's folders again.
+    rescan: *const fn () void,
+    /// A listed host's state, said in words, for its row.
+    hostStatus: *const fn (name: []const u8, e: *const config.HostEntry) HostState,
+    /// What a host row says about model files.
+    hostSync: *const fn (name: []const u8) HostSync,
+    /// Send that host the image model it lacks.
+    sendModel: *const fn (name: []const u8) void,
+    /// Send that host one named file, picked from the library grid. The path
+    /// is this machine's, so only a file the local host holds can be offered.
+    sendPath: *const fn (name: []const u8, path: []const u8) void,
+    /// Fetch one file FROM that host into a folder this machine scans. Named by
+    /// the host's catalog id: this machine has no path for a file it lacks.
+    pullPath: *const fn (name: []const u8, id: []const u8, stem: []const u8) void,
+    /// Reach this host now, without applying anything: a pasted pairing string
+    /// is worth nothing until something has answered with it.
+    tryHost: *const fn (e: *const config.HostEntry) void,
+    /// Reach a host that is already configured but down, dropping whatever
+    /// backoff it is waiting out. A daemon restarted by hand comes back here.
+    reconnectHost: *const fn (name: []const u8) void,
 };
+
+/// What a host row says about its connection, and how loudly. `pending` is
+/// something for the user to do, not a fault, and must not wear the fault
+/// colour: the row that says "reached it" is the good news.
+pub const HostState = struct {
+    text: []const u8 = "",
+    tone: enum { ok, pending, bad } = .ok,
+    /// This row's own connection is down, so the row offers to reach for it
+    /// again. A row merely waiting on Apply is not offered one: there is no
+    /// connection behind it yet to retry.
+    offer_reconnect: bool = false,
+};
+
+/// A host row's model-file line: a transfer in flight or just finished, or a
+/// model this machine has and that host does not.
+pub const HostSync = struct {
+    /// What is being sent, "" when nothing is.
+    sending: []const u8 = "",
+    /// "hashing", "42%", "done", or why it failed.
+    status: []const u8 = "",
+    /// A model this host lacks; the Send button appears when it is set.
+    missing: []const u8 = "",
+    /// How many files it is short of in total. `missing` names the next one to
+    /// go, so without this a host short of three files looks short of one.
+    missing_count: usize = 0,
+};
+
+/// The mirror and callbacks of the frame being rendered, for the rows below.
+var g_m: *const mirror.Mirror = undefined;
+/// Every host's catalog as one list. The pickers read this, so a model only a
+/// remote host holds is still a choice here (`client/models.zig`).
+var g_u: *const models.Union = undefined;
+var g_cb: Callbacks = undefined;
 
 // Transient view state: numeric fields are edited as text, seeded from the
 // config the first frame after `open()`.
@@ -227,7 +283,10 @@ fn commitSampling(cfg: *config.Config) void {
     s.frequency_penalty = std.math.clamp(parseFloatBuf(&fpen_buf, s.frequency_penalty), -10, 10);
 }
 
-pub fn render(cfg: *config.Config, cb: Callbacks) void {
+pub fn render(cfg: *config.Config, m: *const mirror.Mirror, u: *const models.Union, cb: Callbacks) void {
+    g_m = m;
+    g_u = u;
+    g_cb = cb;
     if (!seeded) seed(cfg);
 
     // Settings takes the whole window (it is a mode, not a place in the
@@ -274,6 +333,16 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         "menus below and the two chips in the title bar. Files the engine cannot use are " ++
         "listed greyed with the reason.");
     folderRows(cfg);
+
+    section("Hosts");
+    help("Engine hosts beyond the one TensorPencil starts for itself. On this machine, " ++
+        "a socket path: started here means a second tp-serve at that socket, otherwise " ++
+        "one somebody else listens with. On another machine, the pairing string its " ++
+        "tp-serve printed (tp://…), which carries the certificate this side will trust " ++
+        "and the token it presents; that host offers its own model files, by name only. " ++
+        "The chat runs on one host; a new image goes to whichever host has the shortest queue.");
+    hostRows(cfg);
+    modelLibraryRows();
 
     section("Chat model");
     help("Pick an architecture, then a file. A vision tower (for chatting about images) " ++
@@ -911,11 +980,12 @@ fn consumePicks(cfg: *config.Config) void {
     if (g_dir_buf.opt()) |d| {
         _ = cfg.addModelDir(d);
         g_dir_buf.set("");
-        model_lib.startScan(cfg);
+        g_cb.rescan();
     }
     if (g_pick_target) |t| if (g_pick_buf.opt()) |p| {
-        const cat = &model_lib.cat;
-        model_lib.addFile(cfg, p);
+        const cat = &g_u.cat;
+        _ = cfg.addModelFile(p);
+        g_cb.rescan();
         switch (t) {
             .llm => selection.selectLlm(cfg, cat, p),
             .tower => selection.chooseTower(cfg, cat, p),
@@ -945,7 +1015,7 @@ fn folderRows(cfg: *config.Config) void {
         dvui.labelNoFmt(@src(), d.path.slice(), .{}, .{ .gravity_y = 0.5, .expand = .horizontal, .font = style.F.mono });
         if (dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5 })) {
             cfg.removeModelDir(i);
-            model_lib.startScan(cfg);
+            g_cb.rescan();
             return; // the list shifted under this loop
         }
     }
@@ -955,13 +1025,372 @@ fn folderRows(cfg: *config.Config) void {
         g_dialog_open = true;
         SDLBackend.c.SDL_ShowOpenFolderDialog(dialogCallback, @ptrCast(&g_dir_buf), g_window, null, false);
     }
-    if (dvui.button(@src(), "Rescan", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) model_lib.startScan(cfg);
+    if (dvui.button(@src(), "Rescan", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) g_cb.rescan();
     var buf: [128]u8 = undefined;
-    dvui.labelNoFmt(@src(), model_lib.statusLine(&buf), .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 10 }, .color_text = style.C.text_dim });
+    dvui.labelNoFmt(@src(), model_lib.statusLine(g_m, g_u, &buf), .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 10 }, .color_text = style.C.text_dim });
+}
+
+// ── Model library ────────────────────────────────────────────────────────────
+
+/// One column per host, wide enough for a short name.
+const host_col_w: f32 = 92;
+/// The file-name column. Fixed, so the dots sit beside the names they belong to
+/// rather than a screen-width away.
+const model_col_w: f32 = 340;
+/// Every row the same height, whether or not its cells hold a button.
+const model_row_h: f32 = 28;
+
+/// What the library is split into, in the order the sections are drawn. A file
+/// lands in the FIRST class it qualifies for, so nothing is listed twice: a
+/// checkpoint that also carries a VAE is a checkpoint, not two rows.
+const LibClass = enum {
+    chat,
+    tower,
+    checkpoint,
+    lora,
+    text_encoder,
+    vae,
+    preview,
+    unusable,
+
+    fn title(self: LibClass) []const u8 {
+        return switch (self) {
+            .chat => "Chat models",
+            .tower => "Vision towers",
+            .checkpoint => "Image checkpoints",
+            .lora => "LoRAs",
+            .text_encoder => "Text encoders",
+            .vae => "VAEs",
+            .preview => "Preview decoders",
+            .unusable => "Not usable here",
+        };
+    }
+
+    fn holds(self: LibClass, e: *const catalog.Entry) bool {
+        return switch (self) {
+            .chat => e.llm != null,
+            .tower => e.tower != null,
+            .checkpoint => e.ckpt != null,
+            .lora => if (e.lora) |l| l.any() else false,
+            .text_encoder => sideAny(e, .conditioner) or sideAny(e, .conditioner2),
+            .vae => sideAny(e, .decoder) or sideAny(e, .decoder2),
+            .preview => e.preview.any(),
+            .unusable => true, // whatever reached here fits nowhere above
+        };
+    }
+};
+
+fn sideAny(e: *const catalog.Entry, comp: catalog.Component) bool {
+    inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
+        if (e.side.has(@enumFromInt(ff.value), comp)) return true;
+    }
+    return false;
+}
+
+/// The class a file belongs to: the first that claims it.
+fn classOf(e: *const catalog.Entry) LibClass {
+    inline for (@typeInfo(LibClass).@"enum".fields) |cf| {
+        const c: LibClass = @enumFromInt(cf.value);
+        if (c != .unusable and c.holds(e)) return c;
+    }
+    return .unusable;
+}
+
+/// Sections start closed: the library is long, and it is a reference, not
+/// something to read on the way past. Public so `ui-probe` can draw an open one
+/// beside the closed ones, which are two different pictures.
+pub var g_lib_open: [@typeInfo(LibClass).@"enum".fields.len]bool = @splat(false);
+
+/// A cell's dot. Green and filled means that host could RUN the file; a smaller,
+/// fainter green that it holds the file but is short something the file needs,
+/// which for a checkpoint is a render that loads nothing.
+fn presenceDot(size: f32, color: style.Color, id_extra: usize) void {
+    var d = dvui.box(@src(), .{}, .{
+        .id_extra = id_extra,
+        .min_size_content = .{ .w = size, .h = size },
+        .max_size_content = .{ .w = size, .h = size },
+        .background = true,
+        .color_fill = color,
+        .corner_radius = dvui.Rect.all(size / 2),
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+    });
+    d.deinit();
+}
+
+/// Which machines hold which model files, by class. Drawn only with more than
+/// one host: with one, every row would say the same thing.
+fn modelLibraryRows() void {
+    const u = g_u;
+    const n = u.names.len;
+    if (n <= 1) return;
+
+    section("Model library");
+    help("Every model file the hosts between them hold. A green dot means that host could " ++
+        "run the file on its own; a smaller, fainter one that it has the file but not " ++
+        "everything the file needs, which for a checkpoint means a render that loads " ++
+        "nothing. Get brings a file here; Send puts one there.");
+
+    inline for (@typeInfo(LibClass).@"enum".fields) |cf| {
+        const class: LibClass = @enumFromInt(cf.value);
+        var count: usize = 0;
+        for (u.cat.entries) |*e| count += @intFromBool(classOf(e) == class);
+        if (count > 0) librarySection(class, count, n);
+    }
+}
+
+fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
+    const idx = @intFromEnum(class);
+    const expanded = g_lib_open[idx];
+    {
+        var b: dvui.ButtonWidget = undefined;
+        b.init(@src(), .{}, .{
+            .id_extra = idx,
+            .expand = .horizontal,
+            .background = false,
+            .color_fill_hover = style.hover_wash,
+            .color_fill_press = style.hover_wash,
+            .corner_radius = style.R.chip,
+            .padding = .{ .x = 4, .y = 5, .w = 4, .h = 5 },
+            .margin = .{ .y = 4 },
+        });
+        b.processEvents();
+        b.drawBackground();
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+            style.mark(@src(), if (expanded) .disclosure_open else .disclosure, 9, style.C.text_dim, .{ .margin = .{ .w = 6 } });
+            dvui.labelNoFmt(@src(), class.title(), .{}, .{
+                .font = style.F.ui,
+                .color_text = style.C.text,
+                .padding = .{},
+                .gravity_y = 0.5,
+            });
+            dvui.label(@src(), "{d}", .{count}, .{
+                .font = style.F.ui_sm,
+                .color_text = style.C.text_faint,
+                .padding = .{},
+                .margin = .{ .x = 8 },
+                .gravity_y = 0.5,
+            });
+        }
+        const clicked = b.clicked();
+        b.deinit();
+        if (clicked) g_lib_open[idx] = !expanded;
+    }
+    if (!expanded) return;
+
+    const u = g_u;
+    // Header: the host names. A host that is down still gets a column, since
+    // what it holds is why it is worth bringing back.
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idx, .expand = .horizontal, .padding = .{ .x = 4, .y = 2 } });
+        defer row.deinit();
+        dvui.labelNoFmt(@src(), "", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = model_col_w } });
+        for (0..n_hosts) |i| {
+            // The name inside a fixed-width cell, exactly as a data row's dot
+            // is: given the width itself, a centred label floats to the middle
+            // of the whole row and the names print over each other.
+            var cell = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                .id_extra = i,
+                .min_size_content = .{ .w = host_col_w },
+                .max_size_content = .width(host_col_w),
+            });
+            defer cell.deinit();
+            fonts.richLabel(@src(), u.nameOf(i), .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .font = style.F.ui_sm,
+                .color_text = if (models.has(u.up, i)) style.C.text_dim else style.C.text_ghost,
+            });
+        }
+    }
+
+    for (u.cat.entries, 0..) |*e, ei| {
+        if (classOf(e) != class) continue;
+        const r = u.row(ei);
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = ei,
+            .expand = .horizontal,
+            .min_size_content = .{ .h = model_row_h },
+            .max_size_content = .height(model_row_h),
+            .padding = .{ .x = 4 },
+        });
+        defer row.deinit();
+        // The file's own name: through the run splitter, or a non-Latin stem
+        // renders tofu.
+        fonts.richLabel(@src(), e.stem(), .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = model_col_w },
+            .max_size_content = .width(model_col_w),
+            .font = style.F.mono,
+            .color_text = if (models.count(r.render & u.up) > 0) style.C.text else style.C.text_dim,
+        });
+        for (0..n_hosts) |i| {
+            var cell = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                .id_extra = i,
+                .min_size_content = .{ .w = host_col_w },
+                .max_size_content = .width(host_col_w),
+                .gravity_y = 0.5,
+            });
+            defer cell.deinit();
+            if (models.has(r.render, i)) {
+                presenceDot(7, style.C.meter_gpu, i);
+            } else if (models.has(r.on, i)) {
+                presenceDot(5, style.C.meter_gpu.opacity(0.45), i);
+            } else if (i == 0) {
+                // Nothing here: offer to bring it from a host that is up and
+                // has it. The id is what the host knows the file as, since this
+                // machine has no path for a file it does not hold.
+                if (models.first(r.on & u.up)) |from| {
+                    if (dvui.button(@src(), "Get", .{}, .{ .id_extra = i, .gravity_x = 0.5, .gravity_y = 0.5, .font = style.F.ui_sm })) {
+                        var id_buf: [catalog.id_text_len]u8 = undefined;
+                        g_cb.pullPath(u.nameOf(from), catalog.idText(r.id, &id_buf), e.stem());
+                    }
+                }
+            } else if (models.has(r.on, 0)) {
+                // Only a file THIS machine holds can be sent, and only to
+                // another host; `e.path` is a real path exactly then.
+                if (dvui.button(@src(), "Send", .{}, .{ .id_extra = i, .gravity_x = 0.5, .gravity_y = 0.5, .font = style.F.ui_sm })) {
+                    g_cb.sendPath(u.nameOf(i), e.path);
+                }
+            }
+        }
+    }
+}
+
+/// The add-host form's fields, kept until Add is pressed.
+var g_new_host_name: config.TextBuf(config.max_host_name) = .{};
+/// A socket path, or a whole pairing string.
+var g_new_host_sock: config.TextBuf(2048) = .{};
+var g_new_host_spawn: bool = true;
+/// What the last Add/Re-pair did, so a refusal says why instead of nothing.
+pub var g_add_host: config.Config.AddHost = .added;
+
+fn hostRows(cfg: *config.Config) void {
+    for (cfg.hosts.slice(), 0..) |*h, i| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .padding = .{ .x = 4, .y = 2 } });
+        defer row.deinit();
+        var enabled = h.enabled;
+        if (dvui.checkbox(@src(), &enabled, null, .{ .gravity_y = 0.5 })) cfg.hosts.items[i].enabled = enabled;
+        // A host name and the path or pairing string beside it are the user's
+        // own text: through the run splitter, or they render tofu.
+        fonts.richLabel(@src(), h.name.slice(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 } });
+        fonts.richLabel(@src(), h.socket.slice(), .{ .gravity_y = 0.5, .expand = .horizontal, .font = style.F.mono });
+        const kind = if (h.remote()) "remote" else if (h.spawn) "started here" else "external";
+        dvui.labelNoFmt(@src(), kind, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = style.C.text_dim });
+        // The short name of the token this row holds, which is what the daemon
+        // logs for the one it wants: a refusal is then two numbers to compare
+        // instead of a word.
+        if (h.tokenFingerprint()) |fp| {
+            dvui.labelNoFmt(@src(), &fp, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono, .color_text = style.C.text_ghost });
+        }
+        const status = g_cb.hostStatus(h.name.slice(), h);
+        if (status.text.len > 0) {
+            dvui.labelNoFmt(@src(), status.text, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = switch (status.tone) {
+                .ok => style.C.text_dim,
+                .pending => style.C.blue,
+                .bad => style.C.amber,
+            } });
+        }
+        if (status.offer_reconnect and dvui.button(@src(), "Reconnect", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+            g_cb.reconnectHost(h.name.slice());
+        }
+        if (dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5 })) {
+            cfg.removeHost(i);
+            return; // the list shifted under this loop
+        }
+    }
+    hostSyncRows(cfg);
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+        defer row.deinit();
+        // Height too, or dvui clamps a single-line entry flat (see numRow).
+        var name = dvui.textEntry(@src(), .{ .text = .{ .buffer = &g_new_host_name.data }, .placeholder = "name" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120, .h = 20 } });
+        name.deinit();
+        var sock = dvui.textEntry(@src(), .{ .text = .{ .buffer = &g_new_host_sock.data }, .placeholder = "socket path, or a pairing string (tp://…)" }, .{ .expand = .horizontal, .gravity_y = 0.5, .margin = .{ .x = 4 } });
+        sock.deinit();
+        _ = dvui.checkbox(@src(), &g_new_host_spawn, "start it here", .{ .gravity_y = 0.5, .margin = .{ .x = 8 } });
+        // A name already listed is re-pointed at what was pasted, which is what
+        // re-pairing a host is; the button says so rather than looking like it
+        // will add a second one.
+        const known = cfg.hostEntry(g_new_host_name.slice()) != null;
+        if (dvui.button(@src(), if (known) "Re-pair" else "Add host", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+            g_add_host = cfg.addHost(g_new_host_name.slice(), g_new_host_sock.slice(), g_new_host_spawn);
+            if (g_add_host.ok()) {
+                if (cfg.hostEntry(g_new_host_name.slice())) |e| g_cb.tryHost(e);
+                g_new_host_name.set("");
+                g_new_host_sock.set("");
+            }
+        }
+    }
+    if (g_add_host.why().len > 0) {
+        fonts.richLabel(@src(), g_add_host.why(), .{ .padding = .{ .x = 8, .y = 2 }, .color_text = style.C.danger });
+    }
+    // The chat pin: local, or any listed host.
+    var names: [config.max_hosts + 1][]const u8 = undefined;
+    names[0] = "local";
+    var n: usize = 1;
+    for (cfg.hosts.slice()) |*h| {
+        names[n] = h.name.slice();
+        n += 1;
+    }
+    const cur = cfg.chat_host.opt() orelse "local";
+    if (choiceRow("chat_host", "Chat host", cur, names[0..n], false)) |i| {
+        cfg.chat_host.set(if (i == 0) "" else names[i]);
+    }
+}
+
+/// One line per host with a model file in flight, or with a model this
+/// machine has and it does not. Sending is the user's call: pushing several
+/// gigabytes over somebody's uplink unasked is not a default.
+fn hostSyncRows(cfg: *config.Config) void {
+    for (cfg.hosts.slice(), 0..) |*h, i| {
+        const s = g_cb.hostSync(h.name.slice());
+        if (s.sending.len == 0 and s.missing.len == 0) continue;
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .padding = .{ .x = 24, .y = 2 } });
+        defer row.deinit();
+        // A model stem is model-visible text: through the run splitter.
+        var buf: [256]u8 = undefined;
+        // Both, when both apply: a transfer that just finished must not hide
+        // the next file still to go, or a host short of three files takes one
+        // and looks done.
+        if (s.sending.len > 0) {
+            const line = std.fmt.bufPrint(&buf, "sending {s} to {s}", .{ s.sending, h.name.slice() }) catch "sending a model";
+            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = style.C.text_dim });
+            dvui.labelNoFmt(@src(), s.status, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono });
+        }
+        if (s.missing.len > 0) {
+            var mbuf: [64]u8 = undefined;
+            const more = if (s.missing_count > 1)
+                std.fmt.bufPrint(&mbuf, " · {d} files still missing", .{s.missing_count}) catch ""
+            else
+                "";
+            const line = std.fmt.bufPrint(&buf, "{s}{s} is not on {s}{s}", .{
+                if (s.sending.len > 0) "next: " else "",
+                s.missing,
+                h.name.slice(),
+                more,
+            }) catch "a model is missing there";
+            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .margin = .{ .x = if (s.sending.len > 0) @as(f32, 12) else 0 }, .color_text = style.C.text_dim });
+            if (dvui.button(@src(), "Send it", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 } })) g_cb.sendModel(h.name.slice());
+        }
+    }
 }
 
 /// A labelled dropdown over runtime entries. Returns the index picked this frame.
 fn choiceRow(key: []const u8, label: []const u8, current: []const u8, entries: []const []const u8, warn: bool) ?usize {
+    return notedRow(key, label, current, entries, &.{}, warn);
+}
+
+/// `choiceRow` whose open list carries a second, dimmer column: where each
+/// file is. `notes` runs parallel to `entries` and may be short or empty.
+///
+/// The open rows are built from `addChoice` rather than `addChoiceLabel` so the
+/// name and the note can be two colours; the CLOSED row stays one, since dvui
+/// draws that label inside `DropdownWidget.init` with no hook to colour part of
+/// it. The note is joined into the closed text instead.
+fn notedRow(key: []const u8, label: []const u8, current: []const u8, entries: []const []const u8, notes: []const []const u8, warn: bool) ?usize {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(key), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
     dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
@@ -972,23 +1401,45 @@ fn choiceRow(key: []const u8, label: []const u8, current: []const u8, entries: [
     defer dd.deinit();
     var picked: ?usize = null;
     if (dd.dropped()) {
-        for (entries, 0..) |e, i| if (dd.addChoiceLabel(e)) {
-            picked = i;
-        };
+        for (entries, 0..) |e, i| {
+            var mi = dd.addChoice();
+            defer mi.deinit();
+            const note = if (i < notes.len) notes[i] else "";
+            fonts.richLineNote(@src(), e, note, style.C.text_faint, mi.data().options.strip().override(mi.style()));
+            if (mi.activeRect() != null) {
+                dd.close();
+                picked = i;
+            }
+        }
     }
     return picked;
 }
 
+
 const other_file = "Other file…";
 
-fn stemOf(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+
+/// A dropdown label: the file's name, and which machines have it when that is
+/// worth saying. The same rule the title-bar menus use, so a model does not
+/// read one way in the menu and another in Settings. The closed row gets it
+/// too: where the CHOSEN model runs is the part worth reading without opening
+/// anything.
+fn withWhere(arena: std.mem.Allocator, e: *const catalog.Entry) []const u8 {
+    const note = whereNote(arena, e);
+    if (note.len == 0) return e.stem();
+    return std.fmt.allocPrint(arena, "{s}  ·  {s}", .{ e.stem(), note }) catch e.stem();
+}
+
+/// Just the note: which machines have the file, "" when there is nothing to
+/// say. The open dropdown rows draw this in their own colour.
+fn whereNote(arena: std.mem.Allocator, e: *const catalog.Entry) []const u8 {
+    const r = g_u.byId(e.id()) orelse return "";
+    return model_lib.where(arena, g_u, r).note;
 }
 
 fn llmRows(cfg: *config.Config) void {
     const arena = dvui.currentWindow().arena();
-    const cat = &model_lib.cat;
+    const cat = &g_u.cat;
     const classes = cat.llmClasses(arena) catch return;
     const cur = selection.llm(cfg, cat);
 
@@ -1004,7 +1455,7 @@ fn llmRows(cfg: *config.Config) void {
     }
     labels[classes.len] = "none";
     if (cur == null) if (cfg.llm_model.opt()) |p| {
-        cur_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch "other file";
+        cur_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
     };
     if (choiceRow("llm/arch", "Architecture", cur_label, labels, false)) |i| {
         if (i == classes.len) selection.clearLlm(cfg) else selection.selectLlm(cfg, cat, cat.entries[classes[i].members[0]].path);
@@ -1012,6 +1463,7 @@ fn llmRows(cfg: *config.Config) void {
 
     // File: the class's members, then "other".
     var files: std.ArrayList([]const u8) = .empty;
+    var notes: std.ArrayList([]const u8) = .empty;
     var file_paths: std.ArrayList([]const u8) = .empty;
     var file_label: []const u8 = "none";
     if (cur) |e| {
@@ -1019,13 +1471,15 @@ fn llmRows(cfg: *config.Config) void {
             for (c.members) |mi| {
                 const m = &cat.entries[mi];
                 files.append(arena, m.stem()) catch return;
+                notes.append(arena, whereNote(arena, m)) catch return;
                 file_paths.append(arena, m.path) catch return;
             }
         };
-        file_label = e.stem();
-    } else if (cfg.llm_model.opt()) |p| file_label = stemOf(p);
+        file_label = withWhere(arena, e);
+    } else if (cfg.llm_model.opt()) |p| file_label = cat.refName(p);
     files.append(arena, other_file) catch return;
-    if (choiceRow("llm/file", "Model file", file_label, files.items, cur == null and cfg.llm_model.opt() != null)) |i| {
+    notes.append(arena, "") catch return;
+    if (notedRow("llm/file", "Model file", file_label, files.items, notes.items, cur == null and cfg.llm_model.opt() != null)) |i| {
         if (i == file_paths.items.len) openFileDialog(.llm, &gguf_sdl, &cfg.llm_model) else selection.selectLlm(cfg, cat, file_paths.items[i]);
     }
 
@@ -1034,20 +1488,24 @@ fn llmRows(cfg: *config.Config) void {
     if (!e.llm.?.vision) return;
     const towers = cat.towersFor(arena, cat.indexOf(e.path).?) catch return;
     var tl: std.ArrayList([]const u8) = .empty;
+    var tn: std.ArrayList([]const u8) = .empty;
     tl.append(arena, "none") catch return;
+    tn.append(arena, "") catch return;
     var in_list = false;
     for (towers) |ti| {
         tl.append(arena, cat.entries[ti].stem()) catch return;
-        if (std.mem.eql(u8, cat.entries[ti].path, cfg.vision_tower.slice())) in_list = true;
+        tn.append(arena, whereNote(arena, &cat.entries[ti])) catch return;
+        if (selection.sameRef(cat, cat.entries[ti].path, cfg.vision_tower.slice())) in_list = true;
     }
     tl.append(arena, other_file) catch return;
+    tn.append(arena, "") catch return;
     var tower_label: []const u8 = "none";
     var tower_warn = false;
     if (cfg.vision_tower.opt()) |p| {
-        tower_label = if (in_list) stemOf(p) else std.fmt.allocPrint(arena, "{s} (does not match this model)", .{stemOf(p)}) catch stemOf(p);
+        tower_label = if (in_list) cat.refName(p) else std.fmt.allocPrint(arena, "{s} (does not match this model)", .{cat.refName(p)}) catch cat.refName(p);
         tower_warn = !in_list;
     }
-    if (choiceRow("llm/tower", "Vision tower", tower_label, tl.items, tower_warn)) |i| {
+    if (notedRow("llm/tower", "Vision tower", tower_label, tl.items, tn.items, tower_warn)) |i| {
         if (i == 0) {
             selection.chooseTower(cfg, cat, config.choice_none);
         } else if (i == towers.len + 1) {
@@ -1058,7 +1516,7 @@ fn llmRows(cfg: *config.Config) void {
 
 fn imageRows(cfg: *config.Config) void {
     const arena = dvui.currentWindow().arena();
-    const cat = &model_lib.cat;
+    const cat = &g_u.cat;
     const cur = selection.checkpoint(cfg, cat);
     const fams = cat.families();
 
@@ -1075,7 +1533,7 @@ fn imageRows(cfg: *config.Config) void {
     }
     if (cur) |e| fam_label = model_spec.traits(e.ckpt.?.family).short;
     if (cur == null) if (cfg.diffusion_model.opt()) |p| {
-        fam_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch "other file";
+        fam_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
     };
     fam_labels.append(arena, "none") catch return;
     if (choiceRow("image/arch", "Architecture", fam_label, fam_labels.items, false)) |i| {
@@ -1086,18 +1544,21 @@ fn imageRows(cfg: *config.Config) void {
 
     // Checkpoint: the family's files, then "other".
     var files: std.ArrayList([]const u8) = .empty;
+    var notes: std.ArrayList([]const u8) = .empty;
     var paths: std.ArrayList([]const u8) = .empty;
     var file_label: []const u8 = "none";
     if (cur) |e| {
         const idx = cat.checkpoints(arena, e.ckpt.?.family) catch return;
         for (idx) |ci| {
             files.append(arena, cat.entries[ci].stem()) catch return;
+            notes.append(arena, whereNote(arena, &cat.entries[ci])) catch return;
             paths.append(arena, cat.entries[ci].path) catch return;
         }
-        file_label = e.stem();
-    } else if (cfg.diffusion_model.opt()) |p| file_label = stemOf(p);
+        file_label = withWhere(arena, e);
+    } else if (cfg.diffusion_model.opt()) |p| file_label = cat.refName(p);
     files.append(arena, other_file) catch return;
-    if (choiceRow("image/ckpt", "Checkpoint", file_label, files.items, cur == null and cfg.diffusion_model.opt() != null)) |i| {
+    notes.append(arena, "") catch return;
+    if (notedRow("image/ckpt", "Checkpoint", file_label, files.items, notes.items, cur == null and cfg.diffusion_model.opt() != null)) |i| {
         if (i == paths.items.len) openFileDialog(.ckpt, &checkpoint_sdl, &cfg.diffusion_model) else selection.selectCheckpoint(cfg, cat, paths.items[i]);
     }
 
@@ -1113,14 +1574,21 @@ fn imageRows(cfg: *config.Config) void {
         if (slot == .taesd and cands.len == 0 and cfg.taesd.opt() == null) continue;
 
         var labels: std.ArrayList([]const u8) = .empty;
-        if (bundled) labels.append(arena, "bundled (in the checkpoint)") catch return;
+        var side_notes: std.ArrayList([]const u8) = .empty;
+        if (bundled) {
+            labels.append(arena, "bundled (in the checkpoint)") catch return;
+            side_notes.append(arena, "") catch return;
+        }
         var in_list = false;
         for (cands) |ci| {
             labels.append(arena, cat.entries[ci].stem()) catch return;
-            if (std.mem.eql(u8, cat.entries[ci].path, slot.field(cfg).slice())) in_list = true;
+            side_notes.append(arena, whereNote(arena, &cat.entries[ci])) catch return;
+            if (selection.sameRef(cat, cat.entries[ci].path, slot.field(cfg).slice())) in_list = true;
         }
         labels.append(arena, "none") catch return;
         labels.append(arena, other_file) catch return;
+        side_notes.append(arena, "") catch return;
+        side_notes.append(arena, "") catch return;
 
         var label: []const u8 = "none";
         var warn = false;
@@ -1128,7 +1596,7 @@ fn imageRows(cfg: *config.Config) void {
             .bundled => label = "bundled (in the checkpoint)",
             .none => warn = slot.component() != null, // a required piece with nothing supplying it
             .file => |p| {
-                label = if (in_list) stemOf(p) else std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{stemOf(p)}) catch stemOf(p);
+                label = if (in_list) cat.refName(p) else std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch cat.refName(p);
             },
         }
         const target: PickTarget = switch (slot) {
@@ -1137,7 +1605,7 @@ fn imageRows(cfg: *config.Config) void {
             .vae => .vae,
             .taesd => .taesd,
         };
-        if (choiceRow(@tagName(slot), slot.label(), label, labels.items, warn)) |i| {
+        if (notedRow(@tagName(slot), slot.label(), label, labels.items, side_notes.items, warn)) |i| {
             const first_cand: usize = if (bundled) 1 else 0;
             if (bundled and i == 0) {
                 selection.chooseSide(cfg, cat, slot, config.choice_bundled);
@@ -1160,7 +1628,7 @@ fn imageRows(cfg: *config.Config) void {
 /// question with no answer.
 fn loraRows(cfg: *config.Config, fam: selection.Family) void {
     const arena = dvui.currentWindow().arena();
-    const cat = &model_lib.cat;
+    const cat = &g_u.cat;
     const cands = cat.lorasFor(arena, fam) catch return;
     const on = selection.lorasForFamily(cfg, fam);
     if (cands.len == 0 and on.len == 0) return;
@@ -1187,7 +1655,7 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
         }
         // The file name, not the path: it sits next to a slider in a fixed width.
         const known = cat.find(path) != null;
-        dvui.label(@src(), "{s}", .{stemOf(path)}, .{
+        dvui.label(@src(), "{s}", .{cat.refName(path)}, .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 240 },
             .max_size_content = .width(240),
@@ -1208,12 +1676,14 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
 
     // Only what is not already on, so the dropdown never offers a duplicate.
     var labels: std.ArrayList([]const u8) = .empty;
+    var lora_notes: std.ArrayList([]const u8) = .empty;
     var paths: std.ArrayList([]const u8) = .empty;
     for (cands) |ci| {
         const e = &cat.entries[ci];
-        if (cfg.familyLoraMut(selection.familyKey(fam), e.path) != null) continue;
+        if (selection.loraListed(cfg, cat, fam, e.path)) continue;
         const info = e.lora.?.info;
         labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} linears, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        lora_notes.append(arena, whereNote(arena, e)) catch return;
         paths.append(arena, e.path) catch return;
     }
     const full = selection.loraCount(cfg, fam) >= config.max_family_loras;
@@ -1222,7 +1692,7 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
         help("The LoRA table is full; remove one to add another.");
         return;
     }
-    if (choiceRow("image/lora-add", "Add LoRA", "choose…", labels.items, false)) |i| {
+    if (notedRow("image/lora-add", "Add LoRA", "choose…", labels.items, lora_notes.items, false)) |i| {
         _ = cfg.addFamilyLora(selection.familyKey(fam), paths.items[i]);
     }
 }
@@ -1393,7 +1863,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     // this normally says nothing, it stays because "which backends" is a
     // per-family fact (it was cpu-only for the SD family until its device kernels
     // landed) and the next architecture will arrive CPU-first.
-    const want = diffuser.toPipelineBackend(cfg.diff_backend);
+    const want = pipeline_map.toPipelineBackend(cfg.diff_backend);
     if (!t.supports(want)) statusFmt(
         &buf,
         "{s} has no kernels for the {t} backend — pick another below, " ++

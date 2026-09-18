@@ -1851,10 +1851,10 @@ test "Arbiter.pollLlmGrowth: never shrinks a running turn, and no-ops when idle"
 }
 
 test "Arbiter.diffusionBudget: uninitialized budgets mean auto (0), not the 256 MiB floor" {
-    // Regression: pure image-studio mode (no LLM session) never runs the meter
-    // policy, so `limit` stays 0. Returning max(256 MiB, 0) there is a hard 256 MiB
-    // pin budget that pins a sliver of the image model and evicts the rest. 0 is the
-    // pipeline's AUTO sentinel.
+    // Budgets genuinely unresolved (nothing has run the meter policy yet).
+    // Returning max(256 MiB, 0) here is a hard 256 MiB pin budget that pins a
+    // sliver of the image model and evicts the rest; 0 is the pipeline's AUTO
+    // sentinel. A host with no LLM no longer STAYS here -- see the test below.
     std.testing.log_level = .err; // the auto fallback logs on purpose
     var arb: Arbiter = .{};
     try std.testing.expectEqual(@as(u64, 0), arb.diffusionBudget());
@@ -1872,6 +1872,24 @@ test "Arbiter.diffusionBudget: uninitialized budgets mean auto (0), not the 256 
     m.used = 22 << 30;
     m.want = 22 << 30;
     try std.testing.expectEqual(@as(u64, 256 << 20), arb.diffusionBudget()); // floored
+}
+
+test "Arbiter.diffusionBudget: with no LLM the reserve binds and the split does not" {
+    // What `Driver.applyDiffusionOnlyPolicy` hands over on an image-only host:
+    // the reserve in bytes, and no share, because there is nothing to split
+    // against. Diffusion then gets the whole allowance -- but an allowance, not
+    // the card.
+    //
+    // Left at 0 (the old behaviour) the pipeline pins against live free VRAM
+    // with nothing held back for the per-image working set: measured on a 4 GB
+    // Arc, a 3645 MiB peak against 3196 MiB free, and the GPU was reset.
+    var arb: Arbiter = .{};
+    arb.setBudgets(3 << 30, 0);
+    try std.testing.expectEqual(@as(u64, 3 << 30), arb.diffusionBudget());
+    // A tighter dial reaches the pipeline: that is the whole point of the
+    // handle on a host that runs images only.
+    arb.setBudgets(2 << 30, 0);
+    try std.testing.expectEqual(@as(u64, 2 << 30), arb.diffusionBudget());
 }
 
 test "ControlPoint: budget intent round-trips and clears" {

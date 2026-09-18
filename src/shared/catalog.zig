@@ -18,6 +18,11 @@
 //! files must not be mapped, let alone prefetched, to draw a menu. Results are kept
 //! in a JSON index keyed on path, size and mtime, so a rescan re-reads only what
 //! changed. `scan` is synchronous; the app runs it on a worker thread.
+//!
+//! A `ModelId` says two hosts hold a file with the same name, size and header; it
+//! is not a proof of content, and a host receiving a sent file checks the bytes
+//! against the SENDER's digests, so anyone holding the token can place a parseable
+//! container under a name.
 const std = @import("std");
 const tp = @import("TensorPencil");
 const model_spec = @import("model_spec.zig");
@@ -125,11 +130,21 @@ pub const Entry = struct {
     /// Why the file is offered nowhere, empty when it has a role. Shown greyed so
     /// the user knows the file was seen and why it is not a choice.
     note: []const u8 = "",
+    /// The stem, set when `path` is an id text rather than a path to derive it
+    /// from (an entry a remote host sent).
+    name: []const u8 = "",
+    /// `headerHash` of the container header; 0 when the header did not parse.
+    header_hash: u64 = 0,
 
     /// The file name without its extension, what a menu shows.
     pub fn stem(self: *const Entry) []const u8 {
+        if (self.name.len > 0) return self.name;
         const base = std.fs.path.basename(self.path);
         return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+    }
+
+    pub fn id(self: *const Entry) ModelId {
+        return modelId(self.stem(), self.size, self.header_hash);
     }
 
     /// Nothing here can use this file.
@@ -148,6 +163,7 @@ pub const Entry = struct {
         var out = self;
         out.path = try a.dupe(u8, self.path);
         out.note = try a.dupe(u8, self.note);
+        out.name = try a.dupe(u8, self.name);
         if (self.llm) |l| out.llm = .{
             .arch = try a.dupe(u8, l.arch),
             .size_label = try a.dupe(u8, l.size_label),
@@ -165,6 +181,62 @@ pub const Entry = struct {
         return out;
     }
 };
+
+/// Names a model with no path in it: a hash of the file's stem, size and
+/// container header, so the same file on two machines has one id, and a host
+/// resolves an id the client picked from another host's catalog when it holds
+/// that file too. A settings field may hold the text form (`id:<16 hex>`) in
+/// place of a path.
+pub const ModelId = u64;
+pub const id_prefix = "id:";
+pub const id_text_len = id_prefix.len + 16;
+
+pub fn modelId(stem: []const u8, size: u64, header_hash: u64) ModelId {
+    var h = std.hash.Wyhash.init(0x6d6f64656c);
+    h.update(stem);
+    var le: [16]u8 = undefined;
+    std.mem.writeInt(u64, le[0..8], size, .little);
+    std.mem.writeInt(u64, le[8..16], header_hash, .little);
+    h.update(&le);
+    return h.final();
+}
+
+/// The header bytes a header-only open read: the safetensors JSON, or the GGUF
+/// metadata and tensor table. Empty for a container opened another way.
+fn headerBytes(c: *const pipeline.Container) []const u8 {
+    switch (c.*) {
+        .safetensors => |*st| return st.owned orelse &.{},
+        .gguf => |*g| {
+            const b = g.owned orelse return &.{};
+            return b[0..@min(b.len, g.header_len)];
+        },
+    }
+}
+
+/// A hash of the header a header-only open holds, the same for the same file
+/// on any machine.
+pub fn headerHash(c: *const pipeline.Container) u64 {
+    return std.hash.Wyhash.hash(0x686472, headerBytes(c));
+}
+
+/// The id of a file on disk, as a scan would compute it.
+pub fn fileId(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ModelId {
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    var c = try pipeline.Container.openHeader(gpa, io, path);
+    defer c.deinit();
+    const base = std.fs.path.basename(path);
+    const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+    return modelId(stem, st.size, headerHash(&c));
+}
+
+pub fn idText(id: ModelId, buf: *[id_text_len]u8) []const u8 {
+    return std.fmt.bufPrint(buf, id_prefix ++ "{x:0>16}", .{id}) catch unreachable;
+}
+
+pub fn parseId(text: []const u8) ?ModelId {
+    if (text.len != id_text_len or !std.mem.startsWith(u8, text, id_prefix)) return null;
+    return std.fmt.parseInt(ModelId, text[id_prefix.len..], 16) catch null;
+}
 
 pub const ScanReport = struct {
     /// Model files seen under the folders.
@@ -229,6 +301,36 @@ pub const Catalog = struct {
     pub fn indexOf(self: *const Catalog, path: []const u8) ?usize {
         for (self.entries, 0..) |*e, i| if (std.mem.eql(u8, e.path, path)) return i;
         return null;
+    }
+
+    pub fn byId(self: *const Catalog, id: ModelId) ?*const Entry {
+        for (self.entries) |*e| if (e.id() == id) return e;
+        return null;
+    }
+
+    /// A settings value: a path of this catalog's, or an id text.
+    ///
+    /// An id that matches nothing still falls through to the path compare: a
+    /// remote entry's `path` IS its id text, so the literal match is the last
+    /// thing that can answer, and skipping it turns a model the catalog holds
+    /// into one it says it has never seen.
+    pub fn resolve(self: *const Catalog, ref: []const u8) ?*const Entry {
+        if (parseId(ref)) |id| {
+            if (self.byId(id)) |e| return e;
+        }
+        return self.find(ref);
+    }
+
+    /// What to CALL a settings value on screen. A reference is a path or an id
+    /// text, and an id is not a name: deriving the label from the reference
+    /// puts `id:7da8e81dfa8c1632` in front of the user wherever the file lives
+    /// on another machine. Resolve first; fall back to the basename, which is
+    /// right for a path the catalog does not know and is all there is.
+    pub fn refName(self: *const Catalog, ref: []const u8) []const u8 {
+        if (self.resolve(ref)) |e| return e.stem();
+        if (parseId(ref) != null) return "a model no host has";
+        const base = std.fs.path.basename(ref);
+        return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
     }
 
     // ── Queries ─────────────────────────────────────────────────────────────
@@ -382,12 +484,54 @@ pub const Catalog = struct {
     /// meaning: `load` ignores unknown fields and `scan` reuses an entry whose
     /// size and mtime still match, so a new role would read as "this file can be
     /// nothing" on every cached entry and no rescan would fix it.
-    const index_version: u32 = 1;
+    const index_version: u32 = 2;
 
     const Index = struct {
         version: u32 = 0,
         entries: []const Entry = &.{},
     };
+
+    /// The index document as one JSON text: what `save` writes and what a host
+    /// sends its client. gpa-owned.
+    pub fn toJsonAlloc(self: *const Catalog, gpa: std.mem.Allocator) ![]u8 {
+        const doc: Index = .{ .version = index_version, .entries = self.entries };
+        return std.json.Stringify.valueAlloc(gpa, doc, .{});
+    }
+
+    /// The document a host sends over a network: each entry's path replaced by
+    /// its id text and the stem carried in `name`, so the host's disk layout
+    /// never leaves it. With `hide_paths` false this is `toJsonAlloc`.
+    pub fn toWireJsonAlloc(self: *const Catalog, gpa: std.mem.Allocator, hide_paths: bool) ![]u8 {
+        if (!hide_paths) return self.toJsonAlloc(gpa);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const out = try a.alloc(Entry, self.entries.len);
+        for (self.entries, out) |*e, *o| {
+            o.* = e.*;
+            o.name = e.stem();
+            const buf = try a.alloc(u8, id_text_len);
+            o.path = idText(e.id(), buf[0..id_text_len]);
+        }
+        const doc: Index = .{ .version = index_version, .entries = out };
+        return std.json.Stringify.valueAlloc(gpa, doc, .{});
+    }
+
+    /// A catalog from `toJsonAlloc`'s text. A stale version is an empty catalog.
+    pub fn fromJson(gpa: std.mem.Allocator, bytes: []const u8) !Catalog {
+        var cat = Catalog.init(gpa);
+        errdefer cat.deinit();
+        const a = cat.arena.allocator();
+        // `alloc_always`: by default a string that needs no unescaping is a slice
+        // of the input, which the caller may free.
+        const doc = try std.json.parseFromSliceLeaky(Index, a, bytes, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        if (doc.version != index_version) return cat;
+        cat.entries = @constCast(doc.entries);
+        return cat;
+    }
 
     pub fn save(self: *const Catalog, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
         const doc: Index = .{ .version = index_version, .entries = self.entries };
@@ -405,19 +549,9 @@ pub const Catalog = struct {
     /// A missing, unreadable or stale index is an empty catalog, not an error:
     /// the next scan rebuilds it.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Catalog {
-        var cat = Catalog.init(gpa);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch return cat;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch return Catalog.init(gpa);
         defer gpa.free(bytes);
-        const a = cat.arena.allocator();
-        // `alloc_always`: by default a string that needs no unescaping is a slice
-        // of the input, which is freed on return.
-        const doc = std.json.parseFromSliceLeaky(Index, a, bytes, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch return cat;
-        if (doc.version != index_version) return cat;
-        cat.entries = @constCast(doc.entries);
-        return cat;
+        return fromJson(gpa, bytes) catch Catalog.init(gpa);
     }
 };
 
@@ -530,6 +664,7 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
         return e;
     };
     defer c.deinit();
+    e.header_hash = headerHash(&c);
     const store = c.store();
 
     var unsupported_arch: ?[]const u8 = null;
@@ -987,6 +1122,7 @@ test "index round trip, and a rescan reuses unchanged files" {
         try testing.expectEqualStrings(a.path, b.path);
         try testing.expectEqual(a.size, b.size);
         try testing.expectEqual(a.mtime_ns, b.mtime_ns);
+        try testing.expectEqual(a.header_hash, b.header_hash);
         try testing.expectEqual(a.ckpt, b.ckpt);
         try testing.expectEqual(a.side, b.side);
         try testing.expectEqual(a.preview, b.preview);
@@ -1042,4 +1178,105 @@ test "index round trip, and a rescan reuses unchanged files" {
     var gone = try scan(gpa, io, &.{"/nonexistent/tp-gui-models"}, &.{}, null, &rep3);
     defer gone.deinit();
     try testing.expectEqual(@as(usize, 1), rep3.bad_folders);
+}
+
+test "a wire catalog with hidden paths names files by id and stem, and the ids resolve at home" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tree = try fixtureTree(gpa, io);
+    defer tree.deinit(gpa);
+    var cat = try scan(gpa, io, &.{tree.root}, &.{}, null, null);
+    defer cat.deinit();
+    try testing.expect(cat.entries.len > 2);
+
+    const json = try cat.toWireJsonAlloc(gpa, true);
+    defer gpa.free(json);
+    // Nothing of the disk layout crosses: the root's name appears nowhere.
+    try testing.expect(std.mem.indexOf(u8, json, tree.root) == null);
+    var wire = try Catalog.fromJson(gpa, json);
+    defer wire.deinit();
+    try testing.expectEqual(cat.entries.len, wire.entries.len);
+    for (wire.entries) |*w| {
+        errdefer std.debug.print("wire entry {s} / {s}\n", .{ w.path, w.name });
+        const id = parseId(w.path) orelse return error.TestUnexpectedResult;
+        try testing.expect(std.mem.indexOfAny(u8, w.path, "/\\") == null);
+        try testing.expect(std.mem.indexOfAny(u8, w.name, "/\\") == null);
+        // The same file at home: same stem, same roles, and the id text a
+        // client would put in its settings resolves to it.
+        const home = cat.byId(id) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(home.stem(), w.stem());
+        try testing.expectEqual(home.ckpt, w.ckpt);
+        try testing.expectEqual(home.side, w.side);
+        try testing.expectEqual(id, w.id());
+        try testing.expectEqual(home, cat.resolve(w.path).?);
+    }
+    // A plain path still resolves, an unknown id does not.
+    try testing.expectEqual(&cat.entries[0], cat.resolve(cat.entries[0].path).?);
+    try testing.expect(cat.resolve("id:0000000000000000") == null);
+    try testing.expect(parseId("id:xyz") == null);
+    var buf: [id_text_len]u8 = undefined;
+    try testing.expectEqualStrings("id:00000000000000ff", idText(0xff, &buf));
+    // Same stem, size and header anywhere is one id; a different size or a
+    // different header (a re-export under the old name) is not.
+    try testing.expectEqual(modelId("a", 5, 9), modelId("a", 5, 9));
+    try testing.expect(modelId("a", 5, 9) != modelId("a", 6, 9));
+    try testing.expect(modelId("a", 5, 9) != modelId("a", 5, 10));
+    // A scan hashes every header it parsed; a file it could not read hashes to 0,
+    // and `fileId` computes what the scan did.
+    for (cat.entries) |*e| {
+        errdefer std.debug.print("entry {s}\n", .{e.path});
+        try testing.expectEqual(e.note.len == 0 or !std.mem.startsWith(u8, e.note, "unreadable"), e.header_hash != 0);
+        if (e.header_hash != 0) try testing.expectEqual(e.id(), try fileId(gpa, io, e.path));
+        // The GGUF hash covers the table exactly, however the header was read.
+        if (e.header_hash != 0 and std.ascii.endsWithIgnoreCase(e.path, ".gguf")) {
+            var c: pipeline.Container = .{ .gguf = try tp.Gguf.openHeaderChunked(gpa, io, std.Io.Dir.cwd(), e.path, 24) };
+            defer c.deinit();
+            try testing.expectEqual(e.header_hash, headerHash(&c));
+        }
+    }
+    const a_ent = entryNamed(&cat, "ae");
+    const v_ent = entryNamed(&cat, "sdxl.vae");
+    try testing.expect(a_ent.header_hash != v_ent.header_hash);
+    // The plain form is the index document itself.
+    const plain = try cat.toWireJsonAlloc(gpa, false);
+    defer gpa.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, tree.root) != null);
+}
+
+// A reference is a path or an id text, and an id is not a name. Every label in
+// the app derives from `refName`, because the one that did not put a hex id in
+// front of the user the moment a model lived only on another machine.
+test "a reference is named from the catalog, never from its own text" {
+    const gpa = testing.allocator;
+    // What a remote host sends: an id for a path, and the stem beside it.
+    var remote: Entry = .{ .path = "", .size = 900, .mtime_ns = 1, .name = "wan_2.1_vae" };
+    var id_buf: [id_text_len]u8 = undefined;
+    remote.path = idText(modelId("wan_2.1_vae", 900, 0), &id_buf);
+    var cat = try Catalog.fromEntries(gpa, &.{
+        .{ .path = "/models/vae/local_vae.safetensors", .size = 10, .mtime_ns = 1 },
+        remote,
+    });
+    defer cat.deinit();
+
+    try testing.expectEqualStrings("wan_2.1_vae", cat.refName(remote.path));
+    try testing.expectEqualStrings("local_vae", cat.refName("/models/vae/local_vae.safetensors"));
+    // A path nothing knows is still best named by its own basename.
+    try testing.expectEqualStrings("mystery", cat.refName("/elsewhere/mystery.safetensors"));
+    // An id nothing knows has no name to give, and the hex is not one.
+    var gone: [id_text_len]u8 = undefined;
+    try testing.expectEqualStrings("a model no host has", cat.refName(idText(modelId("gone", 1, 0), &gone)));
+}
+
+// The same file reached two ways is one file: after a pull the config holds the
+// id it asked for while the catalog now has a real path for those bytes.
+test "an id and the path it resolves to name the same file" {
+    const gpa = testing.allocator;
+    var cat = try Catalog.fromEntries(gpa, &.{
+        .{ .path = "/models/loras/ink.safetensors", .size = 40, .mtime_ns = 1 },
+    });
+    defer cat.deinit();
+    var id_buf: [id_text_len]u8 = undefined;
+    const as_id = idText(modelId("ink", 40, 0), &id_buf);
+    try testing.expect(cat.resolve(as_id) == cat.resolve("/models/loras/ink.safetensors"));
+    try testing.expect(cat.resolve(as_id) != null);
 }

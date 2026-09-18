@@ -16,6 +16,11 @@
   mma.m16n8k32), and a kernel needing an instruction an older target lacks would still
   have to be written by hand. A startup check against `cc_major` that says so, rather
   than a JIT log, is the missing piece
+- lora: only SenseNova and MiniMax H3 have a sidecar path at all, and tp-gui now drives
+  LoRAs PER IMAGE (a list change swaps the stack on the live session instead of
+  reloading), so the missing family funnels below are what gates the feature for
+  everyone else. `Family.supportsLora` is the list the UI asks first; it and
+  `Session.attachLoras` must stay in step
 - lora: the Vulkan arm has no sidecar apply, so `sensenova_gpu.supported` refuses a
   model with one attached and the trunk falls back to the CPU. `sensenova_gpu.linear`
   is the single funnel to hang it off; the kernel is two `opMatmulCoopBf16` calls plus
@@ -27,7 +32,6 @@
   (`lora_te_` / `lora_te1_` / `lora_te2_`), neither of which `lora.zig` has
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
-- gui: studio (image_view) still uses its own form layout; bring the parameter form onto the shared chip/section primitives
 - preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
   "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL
   (`taesd_decoder.pth`, `taesdxl_decoder.pth`) and Z-Image (`taef1_decoder.pth`) needs
@@ -35,7 +39,7 @@
   that rewrites them as safetensors, and (b) a `taesd.zig` decoder (TAESD is TAEHV
   without the temporal memory blocks; `wan_vae.loadConv` and the taehv CPU/CUDA/Vulkan
   kernels are the parts to reuse) plus a `previewFits` arm per latent format in
-  `gui/model_spec.zig`. The catalog and the settings row need nothing else: a file
+  `shared/model_spec.zig`. The catalog and the settings row need nothing else: a file
   that answers `previewFits` for a family is offered for it
 - the CPU steppers' `prefill()` is still one un-chunked forward over the whole
   tail, so it has no boundary to stop or re-plan at. Inert today (the GUI is
@@ -71,6 +75,31 @@
   `tp-llm --reasoning-markers`): a fine-tune whose markers are in NEITHER
   `known_reasoning` nor the flag still falls back to the family guess, and tp-gui has
   no override field, so a GUI user cannot answer for such a model
+- serve: the privacy hardening the canary suite does NOT cover, in the plan but unbuilt:
+  a `Content` type whose formatters print a length (so logging a prompt is a compile
+  error rather than a review question), a `-Dprivacy-audit` build refusing `{any}` under
+  `serve/`, and a runtime taint check on emitted log lines. What exists instead: the
+  sinks are gone from the engine, the two content dumps are compiled out under
+  `-Dprivacy`, `serve/privacy_test.zig` walks for a canary with teeth, and
+  `serve_main.zig`'s module doc lists every write path, diffed against a real strace run.
+  A lost host is respawned once; a second loss is final until restart, by design. The scheduler places at enqueue and never moves a job afterwards, so a host
+  that dies with pending work fails it rather than re-placing it; `chat_contention` and
+  the cold-start step cost are assumed figures with no measurement behind them. Two
+  local hosts share one card with two arbiters that only see each other as "others
+  hold": a 31B chat model beside a diffusion pipeline prefilled at 1 tok/s, so the
+  second local host is for a second card or a small model until the scheduler weighs
+  VRAM. A non-NVIDIA host now reports its card (Vulkan heap budget for VRAM, DRM fdinfo
+  for busy time), with two caveats worth knowing: the busy figure is THIS PROCESS's, not
+  the whole card's, so another program's work on a shared GPU is invisible; and i915's
+  counter overshoots (107% measured), so it is clamped. Remote host gaps: the token sits
+  in the settings file in plaintext (a `token_file` per host, or a keychain shim, would move it); and on
+  Windows std's TLS client falls back to the OS certificate store when the pinned
+  bundle lacks the presented issuer, so there a peer with any OS-trusted certificate
+  gets past the pin and is sent the token (tls.zig's client, which has no such
+  fallback, is the strict alternative; Linux and macOS pin strictly today). A remote
+  host has no `--idle-exit`, and one client at a time is still the rule. Model sync is
+  one direction only (client to host) and offers just the image checkpoint, not its
+  side files or LoRAs; a host never asks for a file, and nothing removes one
 - gui: a transcript does not record the system prompt it was generated under, so
   reloading replays an old conversation under current settings (e.g. with or
   without the image-tool description). Same class as the markers were
@@ -96,12 +125,6 @@
   Next probe is `img_cfg_scale` -- SenseNova's own `modeling_neo_chat.py` guides
   editing with TWO scales and ComfyUI's port carries one, though at cfg 1 the two
   agree, which is where the defect already shows
-- sensenova: q4_k is measured as unusable for this architecture and the receipt is in
-  BACKEND.md 2G. What is NOT measured is where the ceiling actually is: q8_0, q6_k and
-  the int8-convrot conversions (`jtreminio/SenseNova-U1.5-8B-MoT-int8_convrot`) are all
-  wired through `lin_cuda` already and none has been rendered on either GPU arm. That
-  also leaves the 4096 / 12288 `i8_prep_cols` entries the Vulkan port added untested,
-  so a quantized checkpoint there may silently take the 3-pass prep fallback
 - h3 text encoder: the 50-layer encode streams all 23 GB every prompt (2.4 s) because the
   weight cache is LRU and a sequential walk larger than the cache evicts each layer just
   before its next use. Keeping the first ~25 layers resident across prompts (a pin
@@ -116,3 +139,18 @@
   ~290 s/step. The Vulkan arm would reach it through MoltenVK (`openVulkanLib` already
   names the dylibs) but coopmat is unlikely to be there, so the non-coop GEMM path is
   what would have to carry it
+- cuda: a context that faulted in tp-gui with both models resident (image generated,
+  then a chat turn) is now reported once, by `Context.check`, with the kernels the ring
+  still holds. The FAULT ITSELF is unattributed: the only capture is aftermath, every
+  call in the context already failing with the same sticky code. The next occurrence
+  should name a kernel; `CUDA_LAUNCH_BLOCKING=1` pins it to one launch. Suspect the
+  paths the handover exercises, LLM promote-at-boundary and the growable KV, not the
+  copy that reports it
+- hosts: a failed render is now reported and moved to a host that has not had it
+  (`Hosts.takeFailure` / `replay`). The move itself is UNCOVERED by a unit test: the
+  fake `Remote` these tests build is `undefined` apart from `failed`, so posting to one
+  faults, and a slot has to be up to be chosen. The decision is tested directly
+  (`placeExcluding` with a skip list, the `Asked` bookkeeping); what is not is that the
+  replayed enqueue reaches the wire. A `Remote` that can be stood up with a link that
+  answers nothing would close it, and `hosts-probe` is where it would run
+

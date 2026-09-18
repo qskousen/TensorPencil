@@ -1,0 +1,58 @@
+name: tensorpencil
+
+# A long-lived build/test shell, not a service: it holds the toolchain and the
+# GPU, and work is driven with `docker exec tensorpencil zig build ...`.
+services:
+  tensorpencil:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tensorpencil:dev
+    container_name: tensorpencil
+    init: true
+    command: ["sleep", "infinity"]
+    working_dir: /work
+    # Host networking so a tp-serve --remote bind address is the box's real
+    # address: the pairing string a client pins is minted from it.
+    network_mode: host
+    environment:
+      # `graphics` is what makes the toolkit inject the NVIDIA Vulkan ICD;
+      # compute+utility alone leave --backend vulkan with no device.
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      ZIG_GLOBAL_CACHE_DIR: /cache/zig-global
+      ZIG_LOCAL_CACHE_DIR: /cache/zig-local
+    volumes:
+      - ${SRC:-/opt/tensorpencil/src}:/work
+      - tensorpencil-cache:/cache
+      # The container toolkit injects the NVIDIA Vulkan driver libraries but
+      # only looks for ICD manifests under /usr/share/vulkan; Ubuntu 26.04 ships
+      # NVIDIA's under /etc/vulkan, so without this the loader enumerates no
+      # device and --backend vulkan sees an empty machine.
+      - /etc/vulkan/icd.d:/etc/vulkan/icd.d:ro
+      - /etc/vulkan/implicit_layer.d:/etc/vulkan/implicit_layer.d:ro
+      # Checkpoints. A named volume, not a bind under /opt: root is a 100 GB LV
+      # and single checkpoints run past 20 GB, while the volume root is the
+      # 900 GB disk. Writable: a client pushes models to a remote host's
+      # incoming folder, and gated tests self-skip when a file is absent.
+      - tensorpencil-models:/models
+      # tp-serve mints its certificate and token into a state dir; losing it
+      # invalidates every pairing string already handed out.
+      - ${STATE:-/opt/tensorpencil/state}:/state
+    # Graphics nodes the toolkit does not inject. Vulkan still does not come up
+    # in the container: the NVIDIA ICD hands back a null vkCreateInstance where
+    # the same driver enumerates the card on the host. CUDA is unaffected.
+    devices:
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU:-0}"]
+              capabilities: [gpu]
+
+volumes:
+  tensorpencil-cache:
+  tensorpencil-models:

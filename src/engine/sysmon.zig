@@ -77,6 +77,164 @@ pub const GpuStats = struct {
     clock_mhz: u32,
 };
 
+/// GPU busy time and clock for a card NVML cannot answer for: every open
+/// driver (i915, xe, amdgpu). The kernel publishes cumulative per-engine busy
+/// nanoseconds for each DRM client in `/proc/self/fdinfo`, which needs no
+/// privilege, unlike the i915 PMU: that one reads through `perf_event_open`
+/// and is refused outright where `perf_event_paranoid` is above 2, which is
+/// the default on Ubuntu.
+///
+/// ⚠️ This is OUR busy time, not the whole card's. NVML's number counts every
+/// process; nobody else's work shows up here. On a host that exists to run
+/// these engines the two nearly agree, and a figure that under-reports a
+/// shared card is the honest direction to be wrong in.
+pub const DrmMeter = struct {
+    /// Per client, because the counters are CUMULATIVE and a client appears
+    /// mid-run: the pipeline opens its own when a model loads. Counting a new
+    /// client's whole history as one interval's work reads as 100% for a
+    /// sample, which is how this was caught.
+    clients: [max_clients]Client = @splat(.{}),
+    n_clients: usize = 0,
+    last_wall_ns: i96 = 0,
+    /// `cardN` whose PCI address matched, for the clock. Empty until found.
+    card: [16]u8 = @splat(0),
+    card_len: u8 = 0,
+
+    pub const max_clients = 16;
+    const Client = struct { id: u64 = 0, busy_ns: u64 = 0 };
+
+    pub const Sample = struct { util: f32 = 0, clock_mhz: u32 = 0, found: bool = false };
+
+    pub fn sample(self: *DrmMeter, io: std.Io, now_ns: i96) Sample {
+        if (builtin.os.tag != .linux) return .{};
+        var pdev: [24]u8 = @splat(0);
+        var pdev_len: usize = 0;
+        var cur: [max_clients]Client = @splat(.{});
+        const n = scanFdinfo(io, &cur, &pdev, &pdev_len) orelse return .{};
+        if (self.card_len == 0 and pdev_len > 0) self.findCard(io, pdev[0..pdev_len]);
+
+        // Only clients present in BOTH samples can have a delta; one seen for
+        // the first time contributes nothing until the next round.
+        var delta: u64 = 0;
+        for (cur[0..n]) |c| {
+            for (self.clients[0..self.n_clients]) |p| {
+                if (p.id != c.id) continue;
+                delta += c.busy_ns -| p.busy_ns;
+                break;
+            }
+        }
+        @memcpy(self.clients[0..n], cur[0..n]);
+        self.n_clients = n;
+        const prev_wall = self.last_wall_ns;
+        self.last_wall_ns = now_ns;
+
+        var out: Sample = .{ .found = true, .clock_mhz = self.clockMhz() };
+        if (prev_wall == 0 or now_ns <= prev_wall) return out;
+        const dt: u64 = @intCast(now_ns - prev_wall);
+        if (dt == 0) return out;
+        const pct = @as(f64, @floatFromInt(delta)) / @as(f64, @floatFromInt(dt)) * 100.0;
+        // MEASURED on an Arc A310 mid-render: the render engine alone reported
+        // 107.3% of the elapsed nanoseconds, with no other engine busy. i915
+        // sums per-context runtimes and overlapping contexts on one engine each
+        // count their whole window, so the raw figure runs over. The clamp is
+        // the answer, not a defensive guess: one card is still one card.
+        out.util = @floatCast(@min(pct, 100.0));
+        return out;
+    }
+
+    /// Every DRM client this process holds, with its cumulative engine-busy
+    /// nanoseconds, plus the PCI address they belong to. Returns how many were
+    /// written, or null when this process holds no DRM fd at all.
+    fn scanFdinfo(io: std.Io, out: []Client, pdev: []u8, pdev_len: *usize) ?usize {
+        var dir = std.Io.Dir.openDirAbsolute(io, "/proc/self/fdinfo", .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+        var it = dir.iterate();
+        // One fd per client is enough: two fds sharing a client id report the
+        // same counters, and adding them would double the busy time.
+        var n: usize = 0;
+        var any = false;
+        while (it.next(io) catch null) |ent| {
+            if (ent.kind != .file) continue;
+            var buf: [4096]u8 = undefined;
+            const bytes = dir.readFile(io, ent.name, &buf) catch continue;
+            if (std.mem.indexOf(u8, bytes, "drm-driver:") == null) continue;
+            any = true;
+            const id = fieldU64(bytes, "drm-client-id:") orelse continue;
+            var dup = false;
+            for (out[0..n]) |c| if (c.id == id) {
+                dup = true;
+            };
+            if (dup) continue;
+            if (pdev_len.* == 0) if (fieldText(bytes, "drm-pdev:")) |p| {
+                const k = @min(p.len, pdev.len);
+                @memcpy(pdev[0..k], p[0..k]);
+                pdev_len.* = k;
+            };
+            if (n == out.len) continue;
+            out[n] = .{ .id = id, .busy_ns = engineNs(bytes) };
+            n += 1;
+        }
+        return if (any) n else null;
+    }
+
+    /// Sum of every `drm-engine-<name>: <n> ns` line. The `capacity` lines have
+    /// no `ns` and are skipped by the suffix check.
+    fn engineNs(bytes: []const u8) u64 {
+        var total: u64 = 0;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "drm-engine-")) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const v = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+            if (!std.mem.endsWith(u8, v, " ns")) continue;
+            total += std.fmt.parseInt(u64, v[0 .. v.len - 3], 10) catch 0;
+        }
+        return total;
+    }
+
+    fn fieldText(bytes: []const u8, key: []const u8) ?[]const u8 {
+        const at = std.mem.indexOf(u8, bytes, key) orelse return null;
+        const rest = bytes[at + key.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        return std.mem.trim(u8, rest[0..end], " \t\r");
+    }
+
+    fn fieldU64(bytes: []const u8, key: []const u8) ?u64 {
+        return std.fmt.parseInt(u64, fieldText(bytes, key) orelse return null, 10) catch null;
+    }
+
+    /// The `cardN` whose PCI slot matches, so the clock comes from the card we
+    /// are actually running on rather than whichever enumerates first.
+    fn findCard(self: *DrmMeter, io: std.Io, pdev: []const u8) void {
+        var dir = std.Io.Dir.openDirAbsolute(io, "/sys/class/drm", .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |ent| {
+            if (!std.mem.startsWith(u8, ent.name, "card")) continue;
+            if (std.mem.indexOfScalar(u8, ent.name, '-') != null) continue; // a connector
+            var path: [96]u8 = undefined;
+            const uevent = std.fmt.bufPrintZ(&path, "/sys/class/drm/{s}/device/uevent", .{ent.name}) catch continue;
+            var buf: [1024]u8 = undefined;
+            const bytes = readSysFile(uevent, &buf) orelse continue;
+            const slot = fieldText(bytes, "PCI_SLOT_NAME=") orelse continue;
+            if (!std.mem.eql(u8, slot, pdev)) continue;
+            const n = @min(ent.name.len, self.card.len);
+            @memcpy(self.card[0..n], ent.name[0..n]);
+            self.card_len = @intCast(n);
+            return;
+        }
+    }
+
+    fn clockMhz(self: *const DrmMeter) u32 {
+        if (self.card_len == 0) return 0;
+        var path: [96]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&path, "/sys/class/drm/{s}/gt_act_freq_mhz", .{self.card[0..self.card_len]}) catch return 0;
+        var buf: [32]u8 = undefined;
+        const bytes = readSysFile(p, &buf) orelse return 0;
+        return std.fmt.parseInt(u32, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch 0;
+    }
+};
+
 /// Current CPU frequency (MHz) from cpu0's cpufreq governor, 0 if unavailable
 /// (no cpufreq sysfs, e.g. some VMs, and anywhere but Linux).
 pub fn cpuFreqMhz() f32 {
@@ -336,4 +494,58 @@ test "CpuMeter first sample returns 0 (no baseline)" {
     const di = cur.idle - prev.idle;
     const pct = @as(f32, @floatFromInt(dt - di)) / @as(f32, @floatFromInt(dt)) * 100.0;
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), pct, 0.01);
+}
+
+test "DRM fdinfo: engine nanoseconds, client id and the card's address" {
+    // Verbatim from an Arc A310 (i915, kernel 6.8) mid-render, which is where
+    // the shape of this file was learned. `capacity` lines carry no `ns` and
+    // must not be summed; the memory lines must not either.
+    const fdinfo = "pos:\t0\n" ++
+        "flags:\t02100002\n" ++
+        "drm-driver:\ti915\n" ++
+        "drm-client-id:\t36\n" ++
+        "drm-pdev:\t0000:3d:00.0\n" ++
+        "drm-total-local0:\t2700188 KiB\n" ++
+        "drm-resident-local0:\t2698140 KiB\n" ++
+        "drm-engine-render:\t52044119560 ns\n" ++
+        "drm-engine-copy:\t0 ns\n" ++
+        "drm-engine-video:\t7 ns\n" ++
+        "drm-engine-capacity-video:\t2\n" ++
+        "drm-engine-compute:\t0 ns\n";
+    try std.testing.expectEqual(@as(u64, 52044119567), DrmMeter.engineNs(fdinfo));
+    try std.testing.expectEqual(@as(u64, 36), DrmMeter.fieldU64(fdinfo, "drm-client-id:").?);
+    try std.testing.expectEqualStrings("0000:3d:00.0", DrmMeter.fieldText(fdinfo, "drm-pdev:").?);
+    try std.testing.expect(DrmMeter.fieldText(fdinfo, "drm-nothing:") == null);
+    // A file from a process holding no GPU says nothing about engines.
+    try std.testing.expectEqual(@as(u64, 0), DrmMeter.engineNs("pos:\t0\nflags:\t02\n"));
+}
+
+test "a DRM client that appears mid-run does not count its whole history as one interval" {
+    // The pipeline opens its own client when a model loads. Counting that
+    // client's cumulative total against one 200 ms sample reads as a pegged
+    // card, which is exactly how this was caught on the Arc.
+    var m: DrmMeter = .{};
+    const sec = std.time.ns_per_s;
+    // First sample: one idle client, nothing to compare against yet.
+    m.clients[0] = .{ .id = 1, .busy_ns = 0 };
+    m.n_clients = 1;
+    m.last_wall_ns = sec;
+
+    // Second: the old client did 100 ms of work and a NEW one shows up holding
+    // 52 seconds of history. Only the 100 ms is this interval's.
+    var cur = [_]DrmMeter.Client{
+        .{ .id = 1, .busy_ns = sec / 10 },
+        .{ .id = 2, .busy_ns = 52 * sec },
+    };
+    var delta: u64 = 0;
+    for (cur[0..2]) |c| {
+        for (m.clients[0..m.n_clients]) |p| {
+            if (p.id != c.id) continue;
+            delta += c.busy_ns -| p.busy_ns;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, sec / 10), delta);
+    const pct = @as(f64, @floatFromInt(delta)) / @as(f64, @floatFromInt(sec)) * 100.0;
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), pct, 0.001);
 }

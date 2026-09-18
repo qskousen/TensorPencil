@@ -1049,6 +1049,21 @@ pub const DiT = struct {
         }
     }
 
+    /// Give back everything `attachLora` borrowed, so the stack can be freed.
+    /// Every `Lin.lora` is a slice INTO the stack's index, so clearing `self.lora`
+    /// alone would leave each linear pointing at freed hits.
+    pub fn detachLora(self: *DiT) void {
+        self.lora = null;
+        for (self.blocks) |*b| detachBlockLora(&b.attn, &b.mlp);
+        for (self.refiner) |*b| detachBlockLora(&b.attn, &b.mlp);
+    }
+
+    fn detachBlockLora(a: *Attn, m: *Mlp) void {
+        inline for (.{ &a.qkv, &a.out, &m.fc1, &m.fc2 }) |l| {
+            l.lora = &.{};
+        }
+    }
+
     pub fn load(gpa: std.mem.Allocator, store: WeightStore) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();

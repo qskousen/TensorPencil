@@ -39,7 +39,7 @@ pub const VramBalloon = struct {
         var self: VramBalloon = .{ .be = be, .gpa = gpa };
         errdefer self.deinit();
         while (true) {
-            const free = be.ctx.memGetInfo().free;
+            const free = (be.ctx.memGetInfo() orelse break).free;
             if (free <= target_free) break;
             const chunk: u64 = @min(1 << 30, free - target_free);
             if (chunk < (64 << 20)) break; // close enough; tiny allocs just churn

@@ -17,8 +17,8 @@
 //! Point `--config` at a COPY of the settings file.
 
 const std = @import("std");
-const config = @import("config.zig");
-const chat = @import("chat.zig");
+const config = @import("shared").config;
+const chat = @import("engine").chat;
 
 fn noopWake() void {}
 
@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     if (messages.items.len == 0) try messages.append(arena, "hi");
 
     var buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.Writer.init(.stdout(), io, &buf);
+    var stdout_w = std.Io.File.Writer.initStreaming(.stdout(), io, &buf);
     const out = &stdout_w.interface;
     // Every exit path, not just the one that prints a reply: a run where every
     // turn failed would otherwise buffer its diagnostics and exit 0 in silence,

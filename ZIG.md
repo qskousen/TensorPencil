@@ -21,6 +21,18 @@ Recent moves seen here: the blocking primitives (`Mutex`, `Condition`,
 `std.time` onto **`std.Io`** (they now take an `io: std.Io` argument). See the
 individual entries below.
 
+## `@import("../x.zig")` above a module root is an error
+
+A module's file set is rooted at its root source file's DIRECTORY, and
+`@import` of a file outside it fails with "import of file outside module
+path". A test unit or probe rooted at `src/client/selection.zig` therefore
+cannot reach `src/shared/config.zig` by a relative path even though the tp-gui
+exe (rooted at `src/gui_main.zig`) can. Split by directory means split by
+module: `build.zig` creates `shared` / `engine` / `client` modules and code
+writes `@import("shared").config`. A file may belong to ONE module: a relative
+import of a file that another module also owns compiles it twice, and the two
+copies of every type in it are distinct.
+
 ## `std.Io` futex (cross-platform, replaces `std.Thread.Futex`)
 
 `std.Thread.Futex` is gone; use `std.Io`'s futex, which is cross-platform
@@ -362,6 +374,19 @@ defer tmp.cleanup(); // no io argument
 try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = bytes });
 ```
 
+## `std.fmt.bufPrint`'s error hands back nothing usable; `Io.Writer.fixed` truncates
+
+`bufPrint` returns `error.NoSpaceLeft` when the output does not fit, and there is
+no way to ask how much it wrote. `catch buf[0..]` therefore hands on the WHOLE
+array with an uninitialised tail, which is how 240 bytes of stack reached a
+toast. For "print what fits", use a fixed writer and take what it buffered:
+
+```zig
+var w = std.Io.Writer.fixed(&buf);
+w.print(fmt, args) catch {};   // over-long input just stops here
+return w.buffered();           // exactly the bytes written
+```
+
 ## `std.Io.Dir` has no `realpathAlloc`
 
 `fs.Dir.realpathAlloc` did not survive the move to `std.Io.Dir`. Instead of resolving
@@ -546,6 +571,128 @@ slice of a field of a by-value struct, not just `Shape`.
 The single-level form is `createDir(dir, io, sub_path, permissions)`. There is no
 `makePath` / `makeDir` any more, so the old names fail to compile rather than
 silently doing nothing.
+
+## A Debug `std.json` struct parse needs a stack of about fields × `@sizeOf(T)`
+
+`parseFromSliceLeaky(Config, ...)` segfaulted inside `innerParse` on a `std.Thread`
+with no message: in Debug the generated per-field code keeps a copy of the whole
+struct per field in ONE frame, and 63 fields of a 250 KB struct is the thread's
+default 16 MiB. The main thread's tests passed, so the crash only showed on the
+engine thread. Spawn any thread that parses a big struct with
+`.stack_size = config.parse_stack_size` (64 MiB); the regression test in
+`shared/config.zig` does the parse on such a thread.
+
+## A refused unix connect is `error.Unexpected` (errno 111), with a Debug trace
+
+`Io.Threaded`'s unix-socket connect switch has no `CONNREFUSED` arm, so
+connecting to a socket file whose listener died returns `error.Unexpected`,
+and in Debug `posix.unexpectedErrno` prints "unexpected errno: 111" plus a stack
+trace first. Nothing crashed: the error is returned. Code probing a stale socket
+(`serve/link.zig`'s `listenLocal`) must catch every error, not `ConnectionRefused`.
+
+## `process.Child.kill` reaps; a `wait` after it asserts
+
+`Child.kill(io)` terminates the child AND waits for it, leaving `child.id` null
+(and closing its pipes). A later `child.wait(io)` hits `assert(child.id != null)`
+and aborts. A teardown that may run after a kill checks `c.id != null` before
+waiting; `client/remote.zig`'s `deinit` is the case.
+
+## `@Type` is gone; a struct is reified with `@Struct`
+
+`@Struct(.auto, null, &names, &types, &attrs)` builds a struct type from
+parallel arrays: the field names, their types, and one
+`std.builtin.Type.StructField.Attributes` each (`default_value_ptr`,
+`@"align"`, `@"comptime"`). A field copied from an existing struct carries its
+default by passing `f.default_value_ptr` through. Integers are `@Int(.unsigned,
+bits)`, enums `@Enum`. The name lookup over a 60-field struct needs
+`@setEvalBranchQuota` in the builder. `shared/config.zig`'s `Subset` is the
+in-tree example.
+
+## Unix sockets, HTTP server errors, and waking a blocked socket reader
+
+- `Io.net.UnixAddress.init(path)` then `.listen(io, .{})` / `.connect(io)`; support
+  is per Io BACKEND (`Threaded` has it, `Uring`/`Dispatch` return
+  `AddressFamilyUnsupported`, `Kqueue` panics), and `Io.net.has_unix_sockets` is the
+  comptime OS gate. `listen` does not unlink a leftover socket file: `AddressInUse` on
+  a path nobody answers means delete and retry (`serve/link.zig`).
+- `std.http.Server.receiveHead`'s error set names a closed peer as
+  `HttpConnectionClosing` or `HttpRequestTruncated`, never `EndOfStream`; matching on
+  the latter is a compile error.
+- `Stream.close` does not wake a thread blocked in a read on that socket;
+  `Stream.shutdown(io, .both)` does. Shut down, join, then close.
+- `std.process.spawn(io, .{ .argv, .stdin = .pipe, .stdout = .pipe })` returns a
+  `Child` whose `stdin`/`stdout` are `?Io.File`; the parent's write end of stdin is the
+  child's liveness signal (EOF when the parent dies), since `SpawnOptions` has no other
+  fd inheritance.
+
+## A TLS layer's writer stops at the socket writer's buffer
+
+`std.crypto.tls.Client.writer`'s flush encrypts the plaintext into `output`'s buffer
+and returns; tls.zig's `Connection.Writer` does the same through `conn.writeAll`. The
+socket writer under either is never flushed by them, so a protocol that flushes its
+writer once per message and waits for the reply hangs with the request sitting in
+memory. `serve/link.zig`'s `Through` is the writer both TLS links hand upward: its
+`flush` (an `Io.Writer.VTable` entry, overridable) drains its own buffer into the TLS
+writer, flushes that, then flushes the socket writer. Two more things about that seam:
+`std.http.Server` asks its writer for `writableArray(28)` in `respondWebSocket`, and an
+unbuffered `Io.Writer` (`buffer = &.{}`) then panics in `defaultRebase`, so a wrapper
+writer needs a real buffer; and std's `tls.Client` asserts its `input` reader's buffer
+holds a max ciphertext record (`min_buffer_len`), while the `read_buffer` it decrypts
+into must hold whatever the layer above takes in one piece (an HTTP head).
+
+## `Io.File.Writer.init` is positional: a redirected stdout overwrites its own log
+
+`Io.File.Writer.init(.stdout(), io, &buf)` writes with `pwrite` from the writer's own
+`pos`, which starts at 0, while `std.debug.print` (stderr) writes at the descriptor's
+shared offset. With `> log 2>&1` the two share one open file, so every stderr line
+lands on top of whatever stdout put at the same offset, and a long stdout line (the
+daemon's pairing string) comes back in pieces with log lines in the middle. The split
+point moves from run to run, which is the tell that it is not buffering. A process
+that writes stdout as a stream uses `Io.File.Writer.initStreaming` (`initDetect` picks
+positional for a regular file, which is the wrong answer here); tp-serve and the
+probes do. Only a `pos`-tracking writer is affected: `std.debug.print` is streaming.
+
+## A test binary's root module is its test runner, not the module under test
+
+`std_options` (and so a custom `logFn`) is read from the COMPILATION's root
+module. For `addTest` that root is the test runner, so declaring
+`pub const std_options` in the module being tested binds nothing and the
+capture stays empty, silently. There is no runtime hook to install one either.
+A test that needs to assert on log output has to get it from a subprocess's
+stderr instead; `serve/privacy_test.zig` walks files and leaves the log check
+to a real daemon run. Related: `std.Thread.Mutex` is gone, and `Io.Mutex` needs
+an `Io` that a `logFn` is never handed, so such a capture needs an atomic
+spin lock.
+
+## `testing.tmpDir(.{})` cannot be walked
+
+The handle comes back without `iterate`, and `Dir.walk` on it fails with EBADF
+from an internal seek rather than a permission error, which reads as a
+use-after-close. Ask for `testing.tmpDir(.{ .iterate = true })`.
+
+## std has no free-space call, and a file writer's `pos` is the seek
+
+`statvfs`/`fstatfs` are wrapped nowhere in 0.16, not even in `std.c`, and there is no
+`GetDiskFreeSpaceEx` binding: a free-space check is a raw `syscall2(.statfs, ...)` with
+its own `extern struct` on Linux and a `kernel32` extern on Windows, which is why it
+lives in `core/diskspace.zig` beside the other per-platform shims. A raw syscall's
+return is `-errno` in the top of `usize`, so the check is `@as(isize, @bitCast(rc)) < 0`;
+`std.os.linux.E.init` does not exist. For writing at an offset, `Io.File.Writer` is
+positional and its `pos` field IS the write position: set `w.pos = offset` before the
+first write rather than looking for a seek (`seekTo` flushes and moves it too).
+`std.os.linux.fallocate(fd, 0, 0, len)` reserves space up front; `File.setLength` is
+`ftruncate` and reserves nothing, so ENOSPC then lands mid-transfer.
+
+## std's pinned-bundle TLS client falls back to the OS store, on Windows only
+
+`tls.Client.Options.ca = .{ .bundle = ... }` verifies the leaf against the bundle; when
+the issuer is not in it, `tryDownloadRootCert` asks `Certificate.Chain`, which is `void`
+on every OS but Windows (so the handshake fails there, strictly) and CryptoAPI on
+Windows (so an OS-trusted chain passes and the OS bundle is swapped into yours). A
+mismatched pin surfaces as `TlsCertificateNotVerified` or, when the impostor reuses the
+subject name, `CertificateSignatureInvalid`; `CertificateIssuerNotFound` never escapes
+`init`, and naming it in a switch on the connect error set is a compile error. Also
+`std.posix.gethostname` has no Windows arm without libc: gate it on `builtin.os.tag`.
 
 ## `{e}` is the scientific-notation specifier, not `{d:.3e}`
 

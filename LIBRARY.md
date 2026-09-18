@@ -147,6 +147,24 @@ main namespaces, low to high:
 | `tokenizer`, `sampler`, `image` | tokenization, sampling, image I/O + comparison metrics (`psnr`, `ssim`, `detailEnergy`) |
 | `llm` | LLM orchestration: chat templating, generation `engine`, `kv_cache`, speculative decode |
 | `pipeline` | the end-to-end diffusion pipeline, and the composable stages it is built from (`Session.encode` / `schedule` / `Session.denoiser` + `predict` / `Session.decode`), plus `Session.replaceDit` to swap the diffusion weights of a live session |
+| `filemap`, `dynlib`, `diskspace` | the per-platform shims: whole-file mapping, runtime library loading, free space |
+
+## The app tiers above the library
+
+The desktop app is four build modules over this library, and a consumer may
+depend on any of them without the ones above it. They are not part of the
+`TensorPencil` module and are wired separately in `build.zig`.
+
+| module | root | what it is for |
+|---|---|---|
+| `serve` | `src/serve/serve.zig` | the protocol: wire types, WebSocket framing, the link (unix socket, loopback, or pinned TLS), the HTTP client half, the engine-free server routing, certificates and the chunked model-file store. Pure std plus this library's vocabulary, so it carries no engine and no UI |
+| `shared` | `src/shared/shared.zig` | what a client and a host both hold: settings, the model catalog, the pipeline enum maps |
+| `engine` | `src/engine/engine.zig` | what owns a GPU: the chat session, the diffusion queue, the scanner, and `host.zig`, which runs them behind an inbox and outbox of wire frames |
+| `client` | `src/client/client.zig` | what a client holds: the mirror of a host rebuilt from events, selection memory, history, the host list, placement, and model sync |
+
+A headless consumer that wants a GPU host over a socket takes `serve` plus
+`engine` and reads `src/serve_main.zig`, which is the whole daemon in one file.
+One that wants to drive such a host takes `serve` plus `client`.
 
 ## Minimal example
 

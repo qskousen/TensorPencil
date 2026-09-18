@@ -42,7 +42,6 @@ pub const C = struct {
     pub const sel_row = Color.fromHex("#1a1f24"); // selected conversation
     pub const bubble_user = Color.fromHex("#1e2429");
     pub const seg_track = Color.fromHex("#181c20"); // Chat/Studio toggle well
-    pub const queue_active = Color.fromHex("#141a1f");
     pub const queue_idle = Color.fromHex("#111417");
     pub const meter_track = Color.fromHex("#22282d");
 
@@ -620,6 +619,86 @@ pub fn sectionHead(src: std.builtin.SourceLocation, text: []const u8, opts: dvui
     dvui.labelNoFmt(src, text, .{}, o);
 }
 
+pub const CollapsibleOpts = struct {
+    id_extra: usize = 0,
+    /// A right-aligned recap of what is inside, shown only while collapsed. A
+    /// folded section that says nothing about its contents is one nobody opens,
+    /// so every caller should pass something ("2 active", "euler · 20 · 4.0").
+    summary: []const u8 = "",
+};
+
+/// A titled section that folds, for a form too long to show at once. The header
+/// is the control: clicking anywhere on it flips `flag`.
+///
+/// Begin/end rather than a callback, matching `bubbles.inputBegin`/`inputEnd`,
+/// so the caller draws its own body with its own buffers.
+pub const Collapsible = struct {
+    outer: *dvui.BoxWidget,
+    body: ?*dvui.BoxWidget,
+
+    /// Draw the body? False while collapsed.
+    pub fn open(self: Collapsible) bool {
+        return self.body != null;
+    }
+};
+
+pub fn collapsibleBegin(src: std.builtin.SourceLocation, title: []const u8, flag: *bool, o: CollapsibleOpts) Collapsible {
+    const outer = dvui.box(src, .{ .dir = .vertical }, .{
+        .id_extra = o.id_extra,
+        .expand = .horizontal,
+        .margin = .{ .h = 4 },
+    });
+
+    var hdr: dvui.ButtonWidget = undefined;
+    hdr.init(@src(), .{}, .{
+        .expand = .horizontal,
+        .background = false,
+        .color_fill_hover = hover_wash,
+        .color_fill_press = hover_wash,
+        .corner_radius = R.chip,
+        .padding = .{ .x = 6, .y = 6, .w = 6, .h = 6 },
+        .margin = .{},
+    });
+    hdr.processEvents();
+    hdr.drawBackground();
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer row.deinit();
+        mark(@src(), if (flag.*) .disclosure_open else .disclosure, 9, C.text_dim, .{ .margin = .{ .w = 6 } });
+        dvui.labelNoFmt(@src(), title, .{}, .{
+            .font = F.mono_hd,
+            .color_text = C.text_dim,
+            .padding = .{},
+            .gravity_y = 0.5,
+        });
+        if (!flag.* and o.summary.len > 0) dvui.labelNoFmt(@src(), o.summary, .{}, .{
+            .font = F.mono,
+            .color_text = C.text_faint,
+            .padding = .{},
+            .gravity_x = 1.0,
+            .gravity_y = 0.5,
+        });
+    }
+    const clicked = hdr.clicked();
+    hdr.drawFocus();
+    hdr.deinit();
+    if (clicked) flag.* = !flag.*;
+
+    if (!flag.*) return .{ .outer = outer, .body = null };
+    return .{
+        .outer = outer,
+        .body = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .padding = .{ .x = 15, .y = 2, .w = 6, .h = 6 },
+        }),
+    };
+}
+
+pub fn collapsibleEnd(c: *Collapsible) void {
+    if (c.body) |b| b.deinit();
+    c.outer.deinit();
+}
+
 /// A vertical hairline the height of its parent's content, for splitting groups
 /// inside a bar.
 pub fn vsep(src: std.builtin.SourceLocation) void {
@@ -725,6 +804,31 @@ pub fn historyMeter(src: std.builtin.SourceLocation, id: usize, label: []const u
         });
     }
     sparkline(@src(), values, color, 22);
+}
+
+/// The app's one progress bar: a sunken track with an AMBER fill, because a
+/// running job is the machine working. Drawn by hand rather than through
+/// `dvui.progress`, whose fill colour is the theme's and would be blue.
+pub fn progressTrack(src: std.builtin.SourceLocation, frac: f32, h: f32) void {
+    var t = dvui.box(src, .{}, .{
+        .expand = .horizontal,
+        .min_size_content = .{ .h = h },
+        .max_size_content = .height(h),
+        .background = true,
+        .color_fill = C.meter_track,
+        .corner_radius = dvui.Rect.all(h / 2),
+        .margin = .{ .y = 4 },
+    });
+    defer t.deinit();
+    const r = t.data().contentRectScale().r;
+    if (r.w <= 0) return;
+    const fill: dvui.Rect.Physical = .{
+        .x = r.x,
+        .y = r.y,
+        .w = r.w * std.math.clamp(frac, 0, 1),
+        .h = r.h,
+    };
+    fill.fill(.{}, .{ .color = C.amber });
 }
 
 /// A 6×6 legend swatch.

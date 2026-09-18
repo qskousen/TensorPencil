@@ -354,6 +354,24 @@ pub fn richLine(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Op
     addStyled(&tl, text, .{}, .{ .font = opts.font, .color_text = opts.color_text });
 }
 
+/// `richLine` in two colours: a name, then a dimmer note after it.
+///
+/// For a menu or dropdown row, where the note is secondary and a second widget
+/// is not an option: a `dvui.label` takes one colour for the whole string, and
+/// a row built from two of them stops activating inside a nested submenu (see
+/// `model_menu.pickRow`). This is one inert widget, like `richLine`, so the row
+/// under it still gets the click.
+pub fn richLineNote(src: std.builtin.SourceLocation, name: []const u8, note: []const u8, note_color: dvui.Color, opts: dvui.Options) void {
+    var tl: dvui.TextLayoutWidget = undefined;
+    tl.init(src, .{ .break_lines = false }, noBackground(opts));
+    defer tl.deinit();
+    addStyled(&tl, name, .{}, .{ .font = opts.font, .color_text = opts.color_text });
+    if (note.len > 0) {
+        addStyled(&tl, "   ", .{}, .{ .font = opts.font, .color_text = note_color });
+        addStyled(&tl, note, .{}, .{ .font = opts.font, .color_text = note_color });
+    }
+}
+
 // ------------------------------------------------------------------- tests
 
 fn testCoverage() void {

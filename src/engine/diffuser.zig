@@ -5,23 +5,20 @@
 //! at a time on a background thread + its own CUDA context. It is deliberately
 //! LLM-agnostic: the chat session composes one (backing the VRAM hooks with LLM
 //! layer eviction), and the no-LLM image studio composes another (with no-op
-//! hooks, so diffusion pins all free VRAM). Two things are injected so the
-//! engine never has to know who is driving it:
+//! hooks, so diffusion pins all free VRAM). `VramCoordinator` is the injected
+//! piece, how to make room for the image model and how much resident-weight
+//! budget it gets, so the engine never has to know who is driving it.
 //!
-//!  - `Source`, where the next pending `GenImage` comes from (chat scans its
-//!    message transcript; the studio scans its gallery list). The engine never
-//!    owns the images.
-//!  - `VramCoordinator`, how to make room for the image model and how much
-//!    resident-weight budget it gets (chat evicts/promotes LLM layers; the
-//!    studio no-ops and hands back a 0 "auto / pin all free VRAM" budget).
-//!
-//! Threading: the UI thread calls `pump` once per frame (reaps a finished
-//! worker, starts the next pending image). The worker thread writes the
-//! `GenImage` atomics (`onStep`, and the final `rgba`/`status`).
+//! Threading: the engine thread (`Driver.engine_thread`, the host's loop) calls
+//! `pump` once per pass (reaps a finished worker, starts the next pending
+//! image); comments below that say "UI thread" mean this one. The worker
+//! thread writes the `GenImage` atomics (`onStep`, and the final `rgba`/`status`).
 const std = @import("std");
 const tool_call = @import("TensorPencil").llm.tool_call;
 const tp = @import("TensorPencil");
-const config = @import("config.zig");
+const config = @import("shared").config;
+const wire = @import("serve").wire;
+const pipeline_map = @import("shared").pipeline_map;
 
 const pipeline = tp.pipeline;
 const pause_gate = tp.ops.pause;
@@ -75,7 +72,7 @@ const LogWriter = struct {
     }
 };
 
-pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled, suspended };
+pub const GenStatus = wire.ImageStatus;
 
 /// A short human explanation of a generation failure, for the tile that reports
 /// it. The recognized cases are the ones a user can ACT on; everything else
@@ -129,11 +126,15 @@ pub const ModelConfig = struct {
     text_encoder_2_path: []const u8,
     backend: pipeline.Backend,
     vae_decode: pipeline.VaeDecode,
-    /// LoRA sidecars, in order. The LIST is load-bearing (the stack is built at
-    /// session init, so a change reloads); the STRENGTHS are not, which is why
-    /// `eql` ignores them and `applyStrengths` moves them on a live session. A
-    /// slider that forced a reload would defeat the whole point of the dial
-    /// being live.
+    /// LoRA sidecars, in order. NEITHER the list nor the strengths reload the
+    /// model: a sidecar is attached beside the resident weights and never merged
+    /// into them, so `Session.setLoras` swaps the whole stack for the cost of the
+    /// LoRA files, and `applyStrengths` moves a dial for nothing. Hence
+    /// `sessionEql` ignores this field entirely and the worker reconciles it
+    /// separately.
+    ///
+    /// Order still matters and is preserved: it is what `applyStrengths`'
+    /// positional indexes mean.
     loras: []const pipeline.LoraSpec = &.{},
 
     /// Duplicate the path strings into gpa-owned storage. Takes a borrowed
@@ -163,16 +164,20 @@ pub const ModelConfig = struct {
 
     /// Do these two configs need the same resident pipeline? (Paths + backend +
     /// decode path, the fields `pipeline.Session.init` keys the session on.)
-    fn eql(a: ModelConfig, b: ModelConfig) bool {
+    ///
+    /// LoRAs are NOT part of this. They are reconciled on the live session by
+    /// the worker, which is the whole point of a sidecar: a stack swap costs the
+    /// LoRA files, where a reload costs the checkpoint.
+    fn sessionEql(a: ModelConfig, b: ModelConfig) bool {
         return a.backend == b.backend and a.vae_decode == b.vae_decode and
             std.mem.eql(u8, a.dit_path, b.dit_path) and
             std.mem.eql(u8, a.vae_path, b.vae_path) and
             std.mem.eql(u8, a.text_encoder_path, b.text_encoder_path) and
-            std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path) and
-            sameLoraPaths(a.loras, b.loras);
+            std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path);
     }
 
-    /// The LoRA LIST, ignoring strengths, which is what a reload turns on.
+    /// The LoRA LIST, ignoring strengths. A difference here is a stack swap; a
+    /// difference in the dials alone is `applyStrengths` and nothing else.
     fn sameLoraPaths(a: []const pipeline.LoraSpec, b: []const pipeline.LoraSpec) bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| if (!std.mem.eql(u8, x.path, y.path)) return false;
@@ -234,12 +239,37 @@ fn freeLoras(gpa: std.mem.Allocator, loras: []const pipeline.LoraSpec) void {
     gpa.free(loras);
 }
 
+/// How everything outside the engine names an image. Unique for the life of
+/// the process, across engines: a transcript that outlives the engine that
+/// rendered its pictures keeps ids that resolve to nothing, never to a
+/// different picture in the next engine. 0 is "none".
+pub const ImageId = u64;
+
+var next_image_id = std.atomic.Value(u64).init(1);
+
+pub fn nextImageId() ImageId {
+    return next_image_id.fetchAdd(1, .monotonic);
+}
+
+/// Start minting ids at `base`, before any image exists. A host derives it
+/// from its generation so two hosts a client holds, or one host and its
+/// restarted self, never hand out the same id.
+pub fn seedImageIds(base: ImageId) void {
+    next_image_id.store(base, .monotonic);
+}
+
 /// An image awaiting or undergoing generation. Progress/status fields are
 /// atomics written by the diffusion worker and read by the UI thread; `rgba` is
 /// published before `status` flips to done (acquire/release), so a done image
 /// always has its pixels. Also used (status pre-set to `.done`) for images the
 /// user attaches for the model to see.
 pub const GenImage = struct {
+    /// Stamped by `enqueue`; resolved through `Diffuser.byId`. Holders keep
+    /// the id, never the pointer, past the frame they got it in.
+    id: ImageId = 0,
+    /// The requester's own handle, echoed on the wire so it can tie the id the
+    /// engine minted to the row it already drew. 0 = none.
+    client_ref: u64 = 0,
     prompt: []u8, // owned (gpa)
     status: std.atomic.Value(u8) = .init(@intFromEnum(GenStatus.pending)),
     step: std.atomic.Value(u32) = .init(0),
@@ -255,6 +285,9 @@ pub const GenImage = struct {
     preview: ?[]u8 = null,
     preview_w: std.atomic.Value(u32) = .init(0),
     preview_h: std.atomic.Value(u32) = .init(0),
+    /// Bumped after each preview write and its dimensions, so a reader that
+    /// fetches by revision moves one image per sampling step, never per frame.
+    preview_rev: std.atomic.Value(u32) = .init(0),
     /// Set by the UI's Cancel button. Polled by the diffusion pipeline between
     /// steps (a generating image aborts) and by the source's next-pending scan
     /// (a queued image is dropped before it starts).
@@ -263,10 +296,10 @@ pub const GenImage = struct {
     /// `Diffuser.load_error`, and read through `failure()` so an invalid code can
     /// never reach `@errorFromInt`.
     ///
-    /// Recorded because the reason has to leave this thread: the LLM's tool
-    /// outcome line reports it back to the model ("out of VRAM" is actionable,
-    /// "failed" is not), and the retry UI needs it. Logging it is not enough: that
-    /// makes it visible to nobody but a terminal.
+    /// Recorded because the reason has to leave this thread: the client shows it
+    /// on the tile and tells the model ("out of VRAM" is actionable, "failed" is
+    /// not). Logging it is not enough: that makes it visible to nobody but a
+    /// terminal.
     gen_error: std.atomic.Value(u16) = .init(0),
     wake: *const fn () void,
     /// Clock source for the worker's timing timestamps (set at creation).
@@ -292,17 +325,9 @@ pub const GenImage = struct {
     /// images that never went through the queue (e.g. user-attached inputs, tests);
     /// the worker falls back to the engine's live config for those.
     model: ?ModelConfig = null,
-    /// Where the finished PNG was written, or null when saving was off or the
-    /// write failed. gpa-owned. This is what a saved conversation stores so a
-    /// reload can show the render instead of producing it again.
-    saved_path: ?[]u8 = null,
-    /// Set once this image's outcome has been reported to the model, so a
-    /// terminal state is announced exactly once. UI-thread only.
-    ///
-    /// An image REBUILT from a reopened conversation sets this at construction:
-    /// it was reported when it was first generated, and re-announcing every old
-    /// render on each load would bury the one that just happened.
-    outcome_noted: bool = false,
+    /// The per-render recipe, stamped by `enqueue` alongside `model`. Null has
+    /// the same meaning: use whatever the engine holds live.
+    params: ?RenderParams = null,
     /// Where this image came from. The queue rail says so on a waiting row,
     /// because "the model asked for this" and "I set this up by hand" are
     /// different enough that a user reordering a queue needs to tell them apart.
@@ -333,7 +358,6 @@ pub const GenImage = struct {
 };
 
 pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
-    if (gi.saved_path) |p| gpa.free(p);
     gpa.free(gi.prompt);
     if (gi.req_negative.len > 0) gpa.free(gi.req_negative);
     if (gi.rgba) |r| gpa.free(r);
@@ -342,6 +366,23 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
     if (gi.resume_snapshot) |*s| s.deinit(gpa);
     gpa.destroy(gi);
 }
+
+/// The per-render recipe (see `wire.RenderParams`), snapshotted onto each
+/// `GenImage` at `enqueue`, the way `ModelConfig` is, so a sampler picked after
+/// an image was queued does not retro-apply to it.
+///
+/// What is deliberately NOT in it:
+///
+///   - `vae_decode` and the paths, which say which SESSION is needed and so live
+///     on `ModelConfig`. Carrying either in both places is two writers for one
+///     value, and the last one written would silently win.
+///   - the live preview method and resolution, which the sampling loop re-reads
+///     every step on purpose, so a change shows on the image already rendering.
+///     Pinning them per image would take that away.
+///   - `req_width` / `req_steps` / `req_cfg` / `req_seed`, which were already
+///     per-image fields on `GenImage` before this existed and are read by name
+///     from the A1111 metadata parser and the studio form.
+pub const RenderParams = wire.RenderParams;
 
 /// Diffusion configuration for a session. The architecture is detected from the
 /// primary checkpoint (`pipeline.detectFamily`), never configured here.
@@ -383,9 +424,6 @@ pub const DiffConfig = struct {
     /// computed (the "None" preview method). When true, `taew_path` selects
     /// TAESD vs. the built-in latent2rgb fallback.
     preview_enabled: bool = true,
-    /// Directory finished images are written to (with AUTOMATIC1111 metadata).
-    /// Null (or empty) disables saving. Duped into the engine on init.
-    output_dir: ?[]const u8 = null,
 };
 
 /// Injected VRAM coordination. The chat session backs these with LLM layer
@@ -425,94 +463,9 @@ pub const VramCoordinator = struct {
     };
 };
 
-/// Map the config's engine-decoupled backend enum onto `pipeline.Backend`.
-pub fn toPipelineBackend(b: config.Backend) pipeline.Backend {
-    return switch (b) {
-        .cpu => .cpu,
-        .vulkan => .vulkan,
-        .zig_cuda => .zig_cuda,
-        .cuda => .cuda,
-    };
-}
-
-pub fn fromPipelineBackend(b: pipeline.Backend) config.Backend {
-    return switch (b) {
-        .cpu => .cpu,
-        .vulkan => .vulkan,
-        .zig_cuda => .zig_cuda,
-        .cuda => .cuda,
-    };
-}
-
-/// Map the config's decode-path enum onto `pipeline.VaeDecode`.
-pub fn toPipelineVae(v: config.VaeDecode) pipeline.VaeDecode {
-    return switch (v) {
-        .auto => .auto,
-        .whole => .whole,
-        .gpu_tiled => .gpu_tiled,
-        .cpu_tiled => .cpu_tiled,
-    };
-}
-
-/// Map the config's sampler enum onto `sampler.Kind`.
-/// Config -> pipeline, for the two prompt-dialect knobs. Separate enums because the
-/// config's carry UI labels and a stable serialized spelling.
-pub fn toPipelineSyntax(s: config.PromptSyntax) pipeline.PromptSyntax {
-    return switch (s) {
-        .comfy => .comfy,
-        .a1111 => .a1111,
-    };
-}
-
-pub fn toPipelineCompat(c: config.Compat) pipeline.Compat {
-    return switch (c) {
-        .comfy => .comfy,
-        .a1111 => .a1111,
-    };
-}
-
-pub fn toPipelineEmphasis(e: config.Emphasis) pipeline.Emphasis {
-    return switch (e) {
-        .original => .original,
-        .no_norm => .no_norm,
-        .ignore => .ignore,
-    };
-}
-
-pub fn toPipelineSampler(s: config.Sampler) tp.sampler.Kind {
-    return switch (s) {
-        .euler => .euler,
-        .dpmpp_2m_sde => .dpmpp_2m_sde,
-        .dpmpp_2m_sde_heun => .dpmpp_2m_sde_heun,
-    };
-}
-
-/// Map the config's scheduler enum onto `?schedule.Scheduler`; `.default` -> null,
-/// meaning "the architecture's own", which `Session.scheduleWith` resolves per family.
-pub fn toPipelineScheduler(s: config.Scheduler) ?tp.sampler.Scheduler {
-    return switch (s) {
-        .default => null,
-        .normal => .normal,
-        .karras => .karras,
-        .exponential => .exponential,
-        .sgm_uniform => .sgm_uniform,
-        .simple => .simple,
-        .ddim_uniform => .ddim_uniform,
-        .beta => .beta,
-        .linear_quadratic => .linear_quadratic,
-        .kl_optimal => .kl_optimal,
-    };
-}
-
-/// Round to a multiple of 16 (pipeline requirement) within sane bounds.
-pub fn clampDim(n: usize) usize {
-    const c = std.math.clamp(n, 256, 4096);
-    return c / 16 * 16;
-}
-
 /// Parse `key=value` tokens from an `<image ...>` tag into the GenImage.
 /// `attrs` is either the `<image ...>` tag's `key=value` list or a native K2
-/// tool-call body (see gui/toolcall.zig), whose arg pairs carry the same keys.
+/// tool-call body (see shared/toolcall.zig), whose arg pairs carry the same keys.
 pub fn parseGenAttrs(attrs: []const u8, gi: *GenImage) void {
     if (std.mem.indexOf(u8, attrs, "<ifm|arg_key>") != null) {
         var it = tool_call.k2Args(attrs);
@@ -528,9 +481,9 @@ pub fn parseGenAttrs(attrs: []const u8, gi: *GenImage) void {
 
 fn applyGenAttr(key: []const u8, val: []const u8, gi: *GenImage) void {
     if (std.mem.eql(u8, key, "width")) {
-        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_width = clampDim(n) else |_| {}
+        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_width = pipeline_map.clampDim(n) else |_| {}
     } else if (std.mem.eql(u8, key, "height")) {
-        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_height = clampDim(n) else |_| {}
+        if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_height = pipeline_map.clampDim(n) else |_| {}
     } else if (std.mem.eql(u8, key, "steps")) {
         if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_steps = std.math.clamp(n, 1, 100) else |_| {}
     } else if (std.mem.eql(u8, key, "seed")) {
@@ -543,112 +496,19 @@ pub fn nowNs(io: std.Io) i64 {
     return @intCast(std.Io.Clock.real.now(io).nanoseconds);
 }
 
-/// The AUTOMATIC1111 name for the sigma schedule a family samples on.
-///
-/// Not cosmetic, this field is what a reader re-renders with. krea2 walks
-/// a continuous flow-matching schedule (ComfyUI calls it "Simple"); the SD family
-/// walks the discrete beta ladder linearly (A1111's default, "Normal", as opposed
-/// to "Karras"). Stamping every render "Simple" would tell anyone reproducing an
-/// SDXL image to use the wrong discretization. Null when the architecture is not
-/// known, and then the field is omitted rather than guessed.
-/// Moved to the library alongside `buildA1111Params`, which is its only caller.
-const defaultSchedulerFor = pipeline.defaultSchedulerFor;
-
-/// The AUTOMATIC1111 `parameters` block builder, which now lives in the library
-/// (`pipeline.buildA1111Params`) so the CLI's clip muxer writes the SAME format
-/// into an MP4 metadata tag that this writes into a PNG text chunk. Two copies of
-/// a format whose whole purpose is round-tripping is exactly the drift that makes
-/// a reader re-render the wrong image.
-pub const buildA1111Params = pipeline.buildA1111Params;
-
-/// The fields of an AUTOMATIC1111 `parameters` block that describe a REQUEST,
-/// as read back off a saved PNG. Slices borrow the input.
-pub const A1111Params = struct {
-    prompt: []const u8 = "",
-    negative: []const u8 = "",
-    steps: ?usize = null,
-    cfg: ?f32 = null,
-    seed: ?u64 = null,
-    width: ?usize = null,
-    height: ?usize = null,
-};
-
-/// Parse what `buildA1111Params` wrote. The saved PNG is the record of how an
-/// image was made, so reopening one reads it back rather than the transcript
-/// carrying a second copy that can disagree with the file.
-///
-/// Deliberately lenient: this also has to read blocks written by ComfyUI and
-/// A1111 themselves, where field order, spelling and which keys are present all
-/// vary. Anything unrecognised is skipped and the field stays null.
-pub fn parseA1111Params(text: []const u8) A1111Params {
-    var out: A1111Params = .{};
-
-    // The settings line is the LAST line that starts with "Steps:"; everything
-    // before it is prompt (and negative). Searching from the end is what keeps a
-    // prompt that itself contains "Steps:" from splitting the block early.
-    const neg_tag = "\nNegative prompt:";
-    var head_end = text.len;
-    var settings: []const u8 = "";
-    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
-    var scanned: usize = 0;
-    while (it.next()) |line| {
-        scanned += line.len + 1;
-        if (std.mem.startsWith(u8, line, "Steps:")) {
-            settings = line;
-            head_end = text.len - scanned + 1;
-            break;
-        }
-    }
-    const head = std.mem.trimEnd(u8, text[0..@min(head_end, text.len)], "\n");
-
-    if (std.mem.indexOf(u8, head, neg_tag)) |i| {
-        out.prompt = std.mem.trim(u8, head[0..i], " \t\r\n");
-        out.negative = std.mem.trim(u8, head[i + neg_tag.len ..], " \t\r\n");
-    } else {
-        out.prompt = std.mem.trim(u8, head, " \t\r\n");
-    }
-
-    var f = std.mem.splitScalar(u8, settings, ',');
-    while (f.next()) |field| {
-        const colon = std.mem.indexOfScalar(u8, field, ':') orelse continue;
-        const key = std.mem.trim(u8, field[0..colon], " \t");
-        const val = std.mem.trim(u8, field[colon + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "Steps")) {
-            out.steps = std.fmt.parseInt(usize, val, 10) catch null;
-        } else if (std.mem.eql(u8, key, "CFG scale")) {
-            out.cfg = std.fmt.parseFloat(f32, val) catch null;
-        } else if (std.mem.eql(u8, key, "Seed")) {
-            out.seed = std.fmt.parseInt(u64, val, 10) catch null;
-        } else if (std.mem.eql(u8, key, "Size")) {
-            const x = std.mem.indexOfScalar(u8, val, 'x') orelse continue;
-            out.width = std.fmt.parseInt(usize, val[0..x], 10) catch null;
-            out.height = std.fmt.parseInt(usize, val[x + 1 ..], 10) catch null;
-        }
-    }
-    return out;
-}
-
 /// The file stem of a path (basename minus final extension), the a1111 "Model".
-fn modelStem(path: []const u8) []const u8 {
+pub fn modelStem(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
-}
-
-pub fn rgbToRgba(gpa: std.mem.Allocator, rgb: []const u8, w: usize, h: usize) ![]u8 {
-    const rgba = try gpa.alloc(u8, w * h * 4);
-    for (0..w * h) |i| {
-        rgba[i * 4 + 0] = rgb[i * 3 + 0];
-        rgba[i * 4 + 1] = rgb[i * 3 + 1];
-        rgba[i * 4 + 2] = rgb[i * 3 + 2];
-        rgba[i * 4 + 3] = 255;
-    }
-    return rgba;
 }
 
 /// The diffusion engine. Compose one per driver (chat / studio); at most one is
 /// ever alive at a time in tp-gui (a mode switch tears one down before building
 /// the other), so only one diffusion pipeline is ever resident.
 pub const Diffuser = struct {
+    /// How many finished images to hold when nobody acks them; see `trimTerminal`.
+    pub const max_terminal: usize = 64;
+
     gpa: std.mem.Allocator,
     io: std.Io,
     wake: *const fn () void,
@@ -685,16 +545,17 @@ pub const Diffuser = struct {
     /// against this to decide whether to reuse the pipeline or reload at the seam.
     loaded: ?ModelConfig = null,
 
-    /// Directory finished images are saved to (gpa-owned; null = saving off).
-    /// Updated live from settings via `setOutputDir` (UI thread, queue idle);
-    /// read by the worker after a generation completes.
-    output_dir: ?[]u8 = null,
-
-    /// The single unified image queue + history: every generated image (chat
-    /// tool-call and studio) lives here, in creation order. The engine OWNS
-    /// these (freed on deinit); the chat transcript and the studio gallery both
-    /// view into it (borrowed `*GenImage`). Drained FIFO, one at a time.
+    /// The single unified image queue: every image (chat tool-call and studio)
+    /// waiting, running, or finished but not yet acked, in creation order. The
+    /// engine OWNS these (freed on deinit); holders keep `ImageId`s and resolve
+    /// them through `byId` each frame. Drained FIFO, one at a time.
+    ///
+    /// This is not a history. A finished image leaves on `drop`, which is what
+    /// keeps a daemon that runs for days from holding every picture it ever made.
     queue: std.ArrayList(*GenImage) = .empty,
+    /// A worker failed with an error that leaves the resident session unusable.
+    /// `pump` frees it at the next reap, where nothing is in flight.
+    poisoned: std.atomic.Value(bool) = .init(false),
 
     vram: VramCoordinator,
     /// True between `vram.enter` (an image started) and the matching
@@ -715,8 +576,8 @@ pub const Diffuser = struct {
     ///
     /// Held across pump's free/spawn decision and across each yield. Foreign
     /// callers use `tryLock` and DECLINE rather than block, so no lock-ordering
-    /// cycle with the LLM-side `g_session_mu` is possible even if a future
-    /// reclaim path nests the two.
+    /// cycle with `Driver.session_mu` is possible even if a future reclaim path
+    /// nests the two.
     res_mu: std.Io.Mutex = std.Io.Mutex.init,
     /// Cross-thread residency intent published by the app's `vram.Arbiter` (the
     /// `tp.vram.Participant` half of `res_mu`'s story). Unlike the LLM, this engine
@@ -793,23 +654,38 @@ pub const Diffuser = struct {
             .taew_owned = cfg.taew_path,
             .path_store = std.heap.ArenaAllocator.init(gpa),
             .vram = vram,
-            .output_dir = if (cfg.output_dir) |o|
-                (if (o.len > 0) gpa.dupe(u8, o) catch null else null)
-            else
-                null,
         };
     }
 
     /// Append a generation request to the unified queue (engine takes ownership
-    /// of `gi`). The caller may keep a borrowed pointer for its own display.
+    /// of `gi`). The caller keeps `gi.id` for its own display.
     ///
     /// Stamps the CURRENT model config (paths / backend / VAE decode) onto the
     /// image so a later backend/model switch only affects images enqueued after
     /// this one, already-queued images finish on the config they were created
     /// with (the worker reloads the pipeline at the seam where they disagree).
     pub fn enqueue(self: *Diffuser, gi: *GenImage) !void {
+        if (gi.id == 0) gi.id = nextImageId();
         if (gi.model == null) gi.model = try ModelConfig.dupe(self.gpa, self.liveConfig());
+        // Same rule for the recipe: a caller that set one (the studio, which
+        // edits per image) keeps it; one that did not (the chat tool path) gets
+        // the current defaults frozen here rather than read at dispatch.
+        if (gi.params == null) gi.params = RenderParams.from(&self.opts);
         try self.queue.append(self.gpa, gi);
+    }
+
+    /// Stamp `gi` with a LoRA set of its own, overriding the engine's defaults.
+    /// Call before `enqueue` (which only stamps an image that has no snapshot).
+    ///
+    /// This is what makes sidecars a per-image choice: the worker reconciles the
+    /// stack against whatever the image carries, so two images queued back to
+    /// back can run different LoRAs with no reload between them. `loras` is
+    /// borrowed; the paths are duped here.
+    pub fn setImageLoras(self: *Diffuser, gi: *GenImage, loras: []const pipeline.LoraSpec) !void {
+        if (gi.model) |m| m.deinit(self.gpa);
+        var want = self.liveConfig();
+        want.loras = loras;
+        gi.model = try ModelConfig.dupe(self.gpa, want);
     }
 
     /// The model set the engine would load right now, read back out of `opts`.
@@ -834,53 +710,43 @@ pub const Diffuser = struct {
         };
     }
 
-    /// Re-queue a failed or canceled image, IN PLACE. The `*GenImage` is unchanged,
-    /// so a chat variant holding a borrowed pointer re-renders the same tile going
-    /// pending -> generating -> done: "try this one again", not "make another".
-    ///
-    /// The model snapshot is REFRESHED to the live config, deliberately
-    /// inverting `enqueue`'s rule that an image finishes on the config it was
-    /// created with. That rule protects a queue from a mid-run switch; a retry is a
-    /// fresh request the user is making NOW, and the whole reason to press it after
-    /// an OOM is that they just changed something (unloaded the LLM, picked a
-    /// smaller model, switched backend). Honouring the old snapshot would retry the
-    /// exact configuration that just failed.
-    pub fn retry(self: *Diffuser, gi: *GenImage) !void {
-        switch (gi.get()) {
-            .failed, .canceled => {},
-            // Never touch one the worker may be holding, and never re-run a
-            // finished one (that would discard a good image in place).
-            .pending, .generating, .suspended, .done => return,
+    /// Forget a finished image: the client that acked it holds its final state
+    /// and its pixels, and nothing here needs either again. False when the id
+    /// names nothing droppable, which includes anything the worker may still
+    /// be holding.
+    pub fn drop(self: *Diffuser, id: ImageId) bool {
+        const gi = self.byId(id) orelse return false;
+        if (!terminal(gi.get())) return false;
+        const at = std.mem.indexOfScalar(*GenImage, self.queue.items, gi) orelse return false;
+        _ = self.queue.orderedRemove(at);
+        freeGenImage(self.gpa, gi);
+        return true;
+    }
+
+    fn terminal(st: GenStatus) bool {
+        return switch (st) {
+            .done, .failed, .canceled => true,
+            .pending, .generating, .suspended => false,
+        };
+    }
+
+    /// Drop the oldest finished images past `max_terminal`. This is the host
+    /// nobody acks to: no client attached, or one that never fetches.
+    fn trimTerminal(self: *Diffuser) void {
+        var n: usize = 0;
+        for (self.queue.items) |gi| n += @intFromBool(terminal(gi.get()));
+        var over = n -| max_terminal;
+        var i: usize = 0;
+        while (over > 0 and i < self.queue.items.len) {
+            const gi = self.queue.items[i];
+            if (!terminal(gi.get())) {
+                i += 1;
+                continue;
+            }
+            _ = self.queue.orderedRemove(i);
+            freeGenImage(self.gpa, gi);
+            over -= 1;
         }
-        const fresh = try ModelConfig.dupe(self.gpa, self.liveConfig());
-        if (gi.model) |m| m.deinit(self.gpa);
-        gi.model = fresh;
-        // A stale latent from some earlier pause would resume mid-render into a run
-        // that has nothing to do with it; a retry starts clean.
-        if (gi.resume_snapshot) |*s| {
-            s.deinit(self.gpa);
-            gi.resume_snapshot = null;
-        }
-        // Drop the resident pipeline first (only when nothing is in flight,
-        // `freeSession` requires that). This is what makes the retry a
-        // genuinely different attempt rather than a replay of the conditions
-        // that just failed: after a VRAM failure the resident session is
-        // holding the memory the retry needs, and after a device fault a fresh
-        // session is the only recovery available at all. The cost is one model
-        // reload on a path the user explicitly asked for, after a failure.
-        //
-        // NOT verified to clear a sticky CUDA fault, `CUDA_ERROR_ILLEGAL_
-        // ADDRESS` poisons its context, and whether tearing the session down
-        // rebuilds far enough to escape that has not been measured here. If it
-        // does not, the retry reports the same error again, which is at least
-        // honest.
-        if (!self.busyNow()) self.freeSession();
-        gi.gen_error.store(0, .release);
-        gi.step.store(0, .monotonic);
-        gi.total.store(0, .monotonic);
-        gi.cancel.store(false, .release);
-        gi.status.store(@intFromEnum(GenStatus.pending), .release);
-        gi.wake();
     }
 
     /// The unified image list (creation order) for rendering / viewer nav.
@@ -888,40 +754,26 @@ pub const Diffuser = struct {
         return self.queue.items;
     }
 
-    /// The image already in `items` that came from `path`, if any.
-    ///
-    /// A finished render's file is its identity. Reopening a conversation must
-    /// find the image it already has rather than building a second one: without
-    /// this every load appended another copy and the Library filled with
-    /// duplicates of the same picture.
-    pub fn findSaved(list: []const *GenImage, path: []const u8) ?*GenImage {
-        if (path.len == 0) return null;
-        for (list) |gi| {
-            const p = gi.saved_path orelse continue;
-            if (std.mem.eql(u8, p, path)) return gi;
-        }
+    /// The image behind an id, for this frame. Null once it is gone, which is
+    /// the whole point of holding ids rather than pointers.
+    pub fn byId(self: *const Diffuser, id: ImageId) ?*GenImage {
+        if (id == 0) return null;
+        for (self.queue.items) |gi| if (gi.id == id) return gi;
         return null;
     }
 
-    /// Take ownership of an already-finished image and put it in the unified
-    /// list, WITHOUT queueing any work. Used when a reloaded conversation
-    /// rebuilds its renders from disk: they are history, so Library and the
-    /// viewer should see them like anything else, but there is nothing to
-    /// generate. `pump` skips them because they are not `.pending`.
-    pub fn adoptFinished(self: *Diffuser, gi: *GenImage) !void {
-        try self.queue.append(self.gpa, gi);
-    }
-
-    /// Move a still-pending image so it sits before the one currently at
-    /// `to_id`, for the queue rail's drag-to-reorder. Both are identified by
-    /// pointer, since an index into a filtered view of the queue is not an index
-    /// into the queue.
+    /// Move a still-pending image so it sits before `before_id`, or to the end
+    /// when that is null, for the queue rail's drag-to-reorder. Both are ids,
+    /// since an index into a filtered view of the queue is not an index into
+    /// the queue. An id that no longer resolves is a no-op.
     ///
     /// UI-thread only, which is what makes it safe without a lock: `pump` (also
     /// UI-thread) is the only other mutator, the worker holds one borrowed
     /// `*GenImage` and never touches the list, and a `.generating` image is
     /// refused here so a reorder can never move the one in flight.
-    pub fn movePending(self: *Diffuser, move: *GenImage, before: ?*GenImage) void {
+    pub fn movePending(self: *Diffuser, move_id: ImageId, before_id: ?ImageId) void {
+        const move = self.byId(move_id) orelse return;
+        const before: ?*GenImage = if (before_id) |b| self.byId(b) orelse return else null;
         if (move.get() != .pending) return;
         if (before) |b| if (b == move or b.get() != .pending) return;
         const from = std.mem.indexOfScalar(*GenImage, self.queue.items, move) orelse return;
@@ -940,6 +792,15 @@ pub const Diffuser = struct {
     pub fn hasPending(self: *const Diffuser) bool {
         for (self.queue.items) |gi| if (gi.get() == .pending) return true;
         return false;
+    }
+
+    /// How many are still queued (not yet started).
+    pub fn pendingCount(self: *const Diffuser) usize {
+        var n: usize = 0;
+        for (self.queue.items) |gi| {
+            if (gi.get() == .pending) n += 1;
+        }
+        return n;
     }
 
     /// Cancel every queued/in-flight image (teardown / clear).
@@ -1033,6 +894,20 @@ pub const Diffuser = struct {
         self.freeSession();
     }
 
+    /// Record which sidecars the resident session is actually carrying, after a
+    /// stack swap moved them without a reload.
+    ///
+    /// Worker-thread only, like the `self.loaded` write after a load: the UI
+    /// thread reads it in `pump`/`dropStaleSession`, both of which return early
+    /// while a worker is running.
+    fn setResidentLoras(self: *Diffuser, loras: []const pipeline.LoraSpec) void {
+        if (self.loaded) |*l| {
+            const owned = dupeLoras(self.gpa, loras) catch return;
+            freeLoras(self.gpa, l.loras);
+            l.loras = owned;
+        }
+    }
+
     /// Free the resident pipeline (returns its VRAM). Binds its own CUDA
     /// context. Caller must ensure no worker is in flight.
     ///
@@ -1070,8 +945,8 @@ pub const Diffuser = struct {
         return self.release_req.load(.acquire);
     }
 
-    /// Enact a pending `requestRelease`, on the UI thread. The caller holds
-    /// whatever guards foreign readers of this engine (the app takes `g_diff_mu`,
+    /// Enact a pending `requestRelease`, on the engine thread. The caller holds
+    /// whatever guards foreign readers of this engine (the Driver takes `diff_mu`,
     /// which is what the LLM worker holds while it reads the participant).
     /// Re-checks everything: the queue may have moved on since the ask.
     pub fn fulfillRelease(self: *Diffuser) u64 {
@@ -1114,7 +989,6 @@ pub const Diffuser = struct {
     pub fn deinit(self: *Diffuser) void {
         if (self.thread) |t| t.join();
         self.freeSession();
-        if (self.output_dir) |o| self.gpa.free(o);
         self.path_store.deinit();
         // The engine owns every queued image (chat + studio); free them here.
         for (self.queue.items) |gi| freeGenImage(self.gpa, gi);
@@ -1147,6 +1021,14 @@ pub const Diffuser = struct {
 
     /// MEASURED per-component VRAM breakdown (TE / DiT / VAE / latent) for the
     /// status-bar meter; all zero when no pipeline is resident.
+    /// What the image backend's card holds, for the status bar on a host whose
+    /// GPU has no NVML to ask (every non-NVIDIA one). Null until a pipeline
+    /// exists, since the device is opened with it.
+    pub fn vramInfo(self: *Diffuser) ?pipeline.Session.VramInfo {
+        const s = self.session.load(.acquire) orelse return null;
+        return s.vramInfo();
+    }
+
     pub fn vramBreakdown(self: *Diffuser) VramBreakdown {
         const b: VramBreakdown = if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
         // Same high-water as `vramBytes`, because THIS is the accessor the status
@@ -1226,8 +1108,18 @@ pub const Diffuser = struct {
     // growing LLM, was left to a separate app-level call that always cancelled
     // to a no-op. See the `vram.Arbiter` doc comment.
 
+    /// Foreign thread, and `vramBytes` dereferences the session pointer. The
+    /// engine thread frees it under `res_mu` (`freeSession`), and this engine's
+    /// rule for a foreign caller is to decline rather than block -- which also
+    /// gives the right answer, since contention here means the pipeline is being
+    /// torn down and is about to hold nothing. `res_mu` and not `Driver.diff_mu`
+    /// because `pump` frees from inside a call that takes `session_mu`, and
+    /// `session_mu` sits ABOVE `diff_mu`.
     fn vpUsage(ctx: *anyopaque) u64 {
-        return fromCtx(ctx).vramBytes(); // high-waters `peak_resident` internally
+        const self = fromCtx(ctx);
+        if (!self.res_mu.tryLock()) return 0;
+        defer self.res_mu.unlock(self.io);
+        return self.vramBytes(); // high-waters `peak_resident` internally
     }
     /// Footprint if nothing contended.
     ///
@@ -1262,7 +1154,10 @@ pub const Diffuser = struct {
     /// residency exists to avoid.
     fn vpFloor(ctx: *anyopaque) u64 {
         const self = fromCtx(ctx);
-        return if (self.busyNow()) self.vramBytes() else 0;
+        if (!self.busyNow()) return 0;
+        if (!self.res_mu.tryLock()) return 0; // see `vpUsage`
+        defer self.res_mu.unlock(self.io);
+        return self.vramBytes();
     }
     fn vpBusy(ctx: *anyopaque) bool {
         return fromCtx(ctx).busyNow();
@@ -1323,10 +1218,25 @@ pub const Diffuser = struct {
     /// image), but it self-corrects after one generation, `peak_resident`
     /// supersedes this the moment a real measurement exists.
     pub fn estimateResidentBytes(self: *Diffuser) u64 {
+        // Foreign thread: the paths are `requestPaths`'s to replace, so they are
+        // copied out under the lock and statted outside it. Declining rather
+        // than blocking is this engine's rule for a foreign caller, and erring
+        // low is the safe direction (see above).
+        var buf: [2][std.fs.max_path_bytes]u8 = undefined;
+        var paths: [2][]const u8 = .{ "", "" };
+        {
+            if (!self.res_mu.tryLock()) return 0;
+            defer self.res_mu.unlock(self.io);
+            // An unset override contributes nothing (its component is inside the
+            // primary checkpoint, already counted).
+            for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path }, 0..) |p, i| {
+                if (p.len == 0 or p.len > buf[i].len) continue;
+                @memcpy(buf[i][0..p.len], p);
+                paths[i] = buf[i][0..p.len];
+            }
+        }
         var total: u64 = 0;
-        // An unset override contributes nothing (its component is inside the
-        // primary checkpoint, already counted).
-        for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path }) |p| {
+        for (paths) |p| {
             if (p.len == 0) continue;
             const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
             total += st.size;
@@ -1385,20 +1295,6 @@ pub const Diffuser = struct {
         self.opts.scheduler = sched;
     }
 
-    /// Update the directory finished images are saved to (from settings). Null
-    /// or empty disables saving. Only touched when idle (the worker reads it at
-    /// completion); a live change takes effect for the next generation.
-    pub fn setOutputDir(self: *Diffuser, dir: ?[]const u8) void {
-        if (self.busy.load(.acquire)) return;
-        const want: ?[]const u8 = if (dir) |d| (if (d.len > 0) d else null) else null;
-        // No change? (both null, or same string) leave the owned copy alone.
-        if (want == null and self.output_dir == null) return;
-        if (want != null and self.output_dir != null and
-            std.mem.eql(u8, want.?, self.output_dir.?)) return;
-        if (self.output_dir) |o| self.gpa.free(o);
-        self.output_dir = if (want) |w| self.gpa.dupe(u8, w) catch null else null;
-    }
-
     /// Set the live-preview method. Takes effect on the NEXT sampling step, even
     /// mid-image: the running worker reads `live_preview` each step, so there's no
     /// busy-bail. `taehv` is preloaded up front (whenever a taew is configured) so
@@ -1439,25 +1335,40 @@ pub const Diffuser = struct {
     /// enums a positional list is one transposition away from loading the VAE as
     /// a text encoder, with no type error to catch it.
     pub fn requestPaths(self: *Diffuser, want: ModelConfig, taew: ?[]const u8) void {
-        _ = self.path_store.reset(.retain_capacity);
-        const a = self.path_store.allocator();
-        const owned: ModelConfig = .{
-            .dit_path = a.dupe(u8, want.dit_path) catch return,
-            .vae_path = a.dupe(u8, want.vae_path) catch return,
-            .text_encoder_path = a.dupe(u8, want.text_encoder_path) catch return,
-            .text_encoder_2_path = a.dupe(u8, want.text_encoder_2_path) catch return,
-            .backend = want.backend,
-            .vae_decode = want.vae_decode,
-            // Into the same arena as the paths, so one reset frees the lot.
-            .loras = dupeLoras(a, want.loras) catch return,
-        };
-        owned.applyTo(&self.opts);
-        // The config just changed, so any previous load failure describes a model
-        // set that no longer exists, clear it rather than warn about the old one.
-        self.load_error.store(0, .release);
-        self.taew_owned = if (taew) |t| (a.dupe(u8, t) catch null) else null;
-        self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
-        self.dropStaleSession();
+        {
+            // Under `res_mu`: `estimateResidentBytes` reads these same slices
+            // from the LLM's worker thread. The arena is reset only when the
+            // queue is idle — a running worker holds `opts.taew_path` and, for
+            // an image with no snapshot, its paths, for the whole render — so a
+            // switch made mid-render costs a few hundred bytes until the next
+            // idle one. And nothing is published until every dupe has
+            // succeeded: a half-replaced config points at the reset arena.
+            self.res_mu.lockUncancelable(self.io);
+            defer self.res_mu.unlock(self.io);
+            if (!self.busy.load(.acquire) and self.nextPending() == null) {
+                _ = self.path_store.reset(.retain_capacity);
+            }
+            const a = self.path_store.allocator();
+            const owned: ModelConfig = .{
+                .dit_path = a.dupe(u8, want.dit_path) catch return,
+                .vae_path = a.dupe(u8, want.vae_path) catch return,
+                .text_encoder_path = a.dupe(u8, want.text_encoder_path) catch return,
+                .text_encoder_2_path = a.dupe(u8, want.text_encoder_2_path) catch return,
+                .backend = want.backend,
+                .vae_decode = want.vae_decode,
+                // Into the same arena as the paths, so one reset frees the lot.
+                .loras = dupeLoras(a, want.loras) catch return,
+            };
+            const taew_next: ?[]const u8 = if (taew) |t| (a.dupe(u8, t) catch return) else null;
+            owned.applyTo(&self.opts);
+            // The config just changed, so any previous load failure describes a
+            // model set that no longer exists; clear it rather than warn about
+            // the old one.
+            self.load_error.store(0, .release);
+            self.taew_owned = taew_next;
+            self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
+        }
+        self.dropStaleSession(); // takes `res_mu` itself
     }
 
     /// Free the resident pipeline when it's loaded for a config the current
@@ -1469,7 +1380,7 @@ pub const Diffuser = struct {
         if (self.busy.load(.acquire)) return;
         if (self.nextPending() != null) return;
         const l = self.loaded orelse return; // nothing resident
-        if (!ModelConfig.eql(l, self.liveConfig())) {
+        if (!ModelConfig.sessionEql(l, self.liveConfig())) {
             self.freeSession();
             std.log.info("diffusion model switched", .{});
         }
@@ -1478,10 +1389,14 @@ pub const Diffuser = struct {
     /// UI-thread, once per frame: reap a finished diffusion, then start the next
     /// pending one (at most one at a time to bound VRAM).
     pub fn pump(self: *Diffuser) void {
+        self.trimTerminal();
         if (self.thread) |t| {
             if (self.busy.load(.acquire)) return; // still running
             t.join();
             self.thread = null;
+            // The worker just failed on something the session cannot survive,
+            // and this is the one point where nothing is in flight.
+            if (self.poisoned.swap(false, .acq_rel)) self.freeSession();
         }
         // While paused, don't START (or load for) new work, leave it queued
         // until resumed. A generation already in flight is parked at the step
@@ -1509,7 +1424,7 @@ pub const Diffuser = struct {
         // takes `res_mu` itself, so a concurrent foreign yield can't interleave.)
         if (gi.model) |m| {
             if (self.loaded) |l| {
-                if (!ModelConfig.eql(l, m)) self.freeSession();
+                if (!ModelConfig.sessionEql(l, m)) self.freeSession();
             }
         }
         // Make VRAM room for the image model before it loads (the worker
@@ -1558,76 +1473,38 @@ pub const Diffuser = struct {
         };
     }
 
+    /// Errors after which the resident session has to go before anything is run
+    /// on it again: the VRAM family, where it is holding the memory the next
+    /// attempt needs, and a device fault, where a fresh session is the only
+    /// recovery there is. Not verified to clear a sticky CUDA fault
+    /// (`CUDA_ERROR_ILLEGAL_ADDRESS` poisons its context and whether the
+    /// rebuild reaches far enough has not been measured); if it does not, the
+    /// next image reports the same error, which is at least honest.
+    fn sessionPoisoning(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.DeviceOutOfMemory,
+            error.CudaError,
+            error.CublasLtError,
+            error.CudnnError,
+            error.VulkanFailed,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Record a worker failure, arming the session teardown when the error is
+    /// one the session cannot survive. Worker thread; the free itself happens in
+    /// `pump`, which is the only place nothing is in flight.
+    fn failImage(self: *Diffuser, gi: *GenImage, err: anyerror) void {
+        if (sessionPoisoning(err)) self.poisoned.store(true, .release);
+        gi.fail(err);
+    }
+
     /// pipeline `Reclaim.call` thunk (recovers the Diffuser from the ctx).
     fn reclaimThunk(ctx: *anyopaque, needed: u64) u64 {
         const self: *Diffuser = @ptrCast(@alignCast(ctx));
         return self.vram.reclaim(self.vram.ctx, needed);
-    }
-
-    /// Write a finished image to `output_dir` as a PNG with AUTOMATIC1111
-    /// `parameters` metadata. Best-effort: any failure is logged, not fatal (the
-    /// image still shows in the UI). Runs on the worker thread. `rgb` is packed
-    /// [h][w][3]; `opts` is the worker's per-image options (paths, params).
-    fn saveImage(self: *Diffuser, gi: *GenImage, opts: *const pipeline.Options, rgb: []const u8, w: usize, h: usize) void {
-        const dir = self.output_dir orelse return; // saving disabled
-        const gpa = self.gpa;
-
-        const params = buildA1111Params(
-            gpa,
-            gi.prompt,
-            gi.req_negative,
-            gi.req_steps,
-            gi.req_cfg,
-            gi.req_seed,
-            w,
-            h,
-            modelStem(opts.dit_path),
-            self.loadedFamily(),
-            opts.sampler,
-            opts.scheduler,
-            opts.prompt_syntax,
-            opts.emphasis,
-            opts.compat,
-            opts.compatConfig(),
-        ) catch |err| {
-            std.log.err("image save (metadata) failed: {t}", .{err});
-            return;
-        };
-        defer gpa.free(params);
-
-        var png: std.ArrayList(u8) = .empty;
-        defer png.deinit(gpa);
-        tp.image.encodePngRgbText(gpa, &png, rgb, w, h, &.{
-            .{ .keyword = "parameters", .text = params },
-        }) catch |err| {
-            std.log.err("image save (encode) failed: {t}", .{err});
-            return;
-        };
-
-        // Unique, roughly time-sortable filename: tp_<ns>_<seed>.png.
-        const name = std.fmt.allocPrint(gpa, "tp_{d}_{d}.png", .{ gi.start_ns.load(.acquire), gi.req_seed }) catch return;
-        defer gpa.free(name);
-        const path = std.fs.path.join(gpa, &.{ dir, name }) catch return;
-
-        std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => {
-                std.log.err("image save (mkdir {s}) failed: {t}", .{ dir, err });
-                return;
-            },
-        };
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = png.items }) catch |err| {
-            std.log.err("image save (write {s}) failed: {t}", .{ path, err });
-            gpa.free(path);
-            return;
-        };
-        std.log.info("saved image to {s}", .{path});
-        // Kept, not freed: a saved conversation stores this so a reload can show
-        // the render rather than generating it again. Written on the worker
-        // thread before the image is published as `.done`, so the UI thread only
-        // ever sees it fully set.
-        if (gi.saved_path) |old| gpa.free(old);
-        gi.saved_path = path;
     }
 
     fn worker(self: *Diffuser, gi: *GenImage) void {
@@ -1638,6 +1515,7 @@ pub const Diffuser = struct {
         var opts = self.opts;
         const want: ModelConfig = gi.model orelse self.liveConfig();
         want.applyTo(&opts);
+        (gi.params orelse RenderParams.from(&self.opts)).applyTo(&opts);
         opts.prompt = gi.prompt;
         opts.negative = gi.req_negative;
         opts.cfg = gi.req_cfg;
@@ -1679,7 +1557,7 @@ pub const Diffuser = struct {
             sess = pipeline.Session.init(self.io, self.gpa, opts, progress) catch |err| {
                 std.log.err("diffusion model load failed: {t}", .{err});
                 self.load_error.store(@intFromError(err), .release);
-                gi.fail(err);
+                self.failImage(gi, err);
                 self.busy.store(false, .release);
                 self.wake();
                 return;
@@ -1694,9 +1572,33 @@ pub const Diffuser = struct {
             // Record what's resident (gpa-owned; freed on the next reload / free).
             self.loaded = ModelConfig.dupe(self.gpa, want) catch null;
         }
-        // A REUSED session was loaded for a config with the same LoRA paths but
-        // possibly different dials (`eql` ignores them on purpose), so move them
-        // here rather than reloading a gigabyte of factors for a slider.
+        // Reconcile the sidecars on whatever session we now hold. This is the
+        // worker thread on purpose: the attach stores pointers into the stack,
+        // so a swap must sit between forwards, and this is the only place that
+        // is true of.
+        //
+        // A freshly loaded session already carries `want`'s stack (it was built
+        // from the same `opts`), so only a REUSED one can disagree.
+        if (self.loaded) |l| {
+            if (!ModelConfig.sameLoraPaths(l.loras, want.loras)) {
+                sess.?.setLoras(self.io, want.loras) catch |err| {
+                    // The old stack is already gone: `setLoras` drops before it
+                    // installs. Record that the session now carries nothing, or
+                    // the next image compares against a list that is not there
+                    // and skips the swap it needs.
+                    self.setResidentLoras(&.{});
+                    std.log.err("lora: cannot apply this sidecar set: {t}", .{err});
+                    self.failImage(gi, err);
+                    self.busy.store(false, .release);
+                    self.wake();
+                    return;
+                };
+                self.setResidentLoras(want.loras);
+                std.log.info("lora: stack swapped to {d} file(s), no reload", .{want.loras.len});
+            }
+        }
+        // Dials are live whether or not the list moved, so this runs either way:
+        // nothing folds a strength into a factor.
         want.applyStrengths(sess.?);
         // Unload-while-paused: generate writes the in-flight latent + step here
         // and returns error.Paused. The worker stores it on the image (status
@@ -1717,7 +1619,7 @@ pub const Diffuser = struct {
                 gi.status.store(@intFromEnum(GenStatus.canceled), .release);
             } else {
                 std.log.err("image generation failed: {t}", .{err});
-                gi.fail(err);
+                self.failImage(gi, err);
             }
             self.busy.store(false, .release);
             self.wake();
@@ -1730,14 +1632,10 @@ pub const Diffuser = struct {
             gi.resume_snapshot = null;
         }
 
-        // Persist the finished image (packed RGB) with a1111 metadata before the
-        // RGBA conversion. Best-effort, a save failure never fails the gen.
-        self.saveImage(gi, &opts, img.rgb, img.width, img.height);
-
-        // The pipeline returns packed RGB; dvui wants RGBA. Convert once.
+        // The pipeline returns packed RGB; clients want RGBA. Convert once.
         const px = img.width * img.height;
         const rgba = self.gpa.alloc(u8, px * 4) catch |err| {
-            gi.fail(err);
+            self.failImage(gi, err);
             self.busy.store(false, .release);
             self.wake();
             return;
@@ -1778,6 +1676,7 @@ pub const Diffuser = struct {
                     }
                     gi.preview_w.store(@intCast(pv.width), .release);
                     gi.preview_h.store(@intCast(pv.height), .release);
+                    _ = gi.preview_rev.fetchAdd(1, .release);
                 }
             }
         }
@@ -1828,10 +1727,10 @@ test "applyTo: a set override is explicit (it outranks a bundled copy)" {
     try std.testing.expectEqual(pipeline.VaeDecode.cpu_tiled, opts.vae_decode);
 }
 
-test "a LoRA LIST change reloads; a strength change does not" {
-    // The whole reason `strength` is not folded into a factor: moving a slider
-    // must not re-read a gigabyte of them. `eql` is what turns a change into a
-    // reload, so it has to see the paths and ignore the dials.
+test "no LoRA change reloads the model; a list change is a stack swap" {
+    // A sidecar sits BESIDE the resident weights, so neither the list nor the
+    // dials decide which session is needed: `sessionEql` must ignore the field
+    // outright, and `sameLoraPaths` is what tells a swap from a slider.
     const base: ModelConfig = .{
         .dit_path = "/d/sensenova.safetensors",
         .vae_path = "",
@@ -1844,33 +1743,38 @@ test "a LoRA LIST change reloads; a strength change does not" {
 
     var dialed = base;
     dialed.loras = &.{.{ .path = "/l/turbo.safetensors", .strength = 0.25 }};
-    try std.testing.expect(ModelConfig.eql(base, dialed));
+    try std.testing.expect(ModelConfig.sameLoraPaths(base.loras, dialed.loras));
 
     var added = base;
     added.loras = &.{
         .{ .path = "/l/turbo.safetensors", .strength = 1.0 },
         .{ .path = "/l/ink.safetensors", .strength = 1.0 },
     };
-    try std.testing.expect(!ModelConfig.eql(base, added));
+    try std.testing.expect(!ModelConfig.sameLoraPaths(base.loras, added.loras));
 
     var swapped = base;
     swapped.loras = &.{.{ .path = "/l/ink.safetensors", .strength = 1.0 }};
-    try std.testing.expect(!ModelConfig.eql(base, swapped));
+    try std.testing.expect(!ModelConfig.sameLoraPaths(base.loras, swapped.loras));
 
     var removed = base;
     removed.loras = &.{};
-    try std.testing.expect(!ModelConfig.eql(base, removed));
+    try std.testing.expect(!ModelConfig.sameLoraPaths(base.loras, removed.loras));
 
-    // ORDER is a reload too. The deltas add, so a reorder renders the same
-    // picture, but the stack's indexes are what `applyStrengths` writes through,
-    // and a session whose order disagrees with the config's would take each
-    // file's dial from its neighbour.
+    // ORDER counts as a different list. The deltas add, so a reorder renders the
+    // same picture, but the stack's indexes are what `applyStrengths` writes
+    // through, and a session whose order disagrees with the config's would take
+    // each file's dial from its neighbour.
     var reordered = added;
     reordered.loras = &.{
         .{ .path = "/l/ink.safetensors", .strength = 1.0 },
         .{ .path = "/l/turbo.safetensors", .strength = 1.0 },
     };
-    try std.testing.expect(!ModelConfig.eql(added, reordered));
+    try std.testing.expect(!ModelConfig.sameLoraPaths(added.loras, reordered.loras));
+
+    // None of the four is a reload: every one of them keeps the same session.
+    for ([_]ModelConfig{ dialed, added, swapped, removed, reordered }) |v| {
+        try std.testing.expect(ModelConfig.sessionEql(base, v));
+    }
 
     // `applyTo` hands the list over, dials and all.
     var opts: pipeline.Options = .{ .prompt = "" };
@@ -1940,6 +1844,172 @@ test "a failure records its cause, and only a failure does" {
     try std.testing.expectEqual(@as(?anyerror, error.DeviceOutOfMemory), gi.failure());
 }
 
+test "an image id resolves while the image is listed, never to another image, and dies with its engine" {
+    const nop = struct {
+        fn f() void {}
+    }.f;
+    const gpa = std.testing.allocator;
+    var stale: ImageId = 0;
+    {
+        var d = Diffuser.init(gpa, std.testing.io, nop, .{ .dit_path = "" }, VramCoordinator.none);
+        defer d.deinit();
+        const a = try gpa.create(GenImage);
+        a.* = .{ .prompt = try gpa.dupe(u8, "a"), .wake = nop, .io = std.testing.io };
+        try d.enqueue(a);
+        const b = try gpa.create(GenImage);
+        b.* = .{ .prompt = try gpa.dupe(u8, "b"), .wake = nop, .io = std.testing.io };
+        try d.enqueue(b);
+        try std.testing.expect(a.id != 0 and b.id != 0 and a.id != b.id);
+        try std.testing.expectEqual(a, d.byId(a.id).?);
+        try std.testing.expectEqual(b, d.byId(b.id).?);
+        try std.testing.expectEqual(@as(?*GenImage, null), d.byId(0));
+        // A reorder naming an id that is not here does nothing, and does not crash.
+        d.movePending(a.id + 1000, null);
+        d.movePending(a.id, b.id + 1000);
+        stale = a.id;
+    }
+    // The next engine mints fresh ids: the transcript's old id names nothing.
+    var d2 = Diffuser.init(gpa, std.testing.io, nop, .{ .dit_path = "" }, VramCoordinator.none);
+    defer d2.deinit();
+    const c = try gpa.create(GenImage);
+    c.* = .{ .prompt = try gpa.dupe(u8, "c"), .wake = nop, .io = std.testing.io };
+    try d2.enqueue(c);
+    try std.testing.expect(c.id > stale);
+    try std.testing.expectEqual(@as(?*GenImage, null), d2.byId(stale));
+}
+
+// The host is an execution engine with no memory of finished work: once the
+// client holds an image, the engine drops it. What may NOT go is a render the
+// worker could still be writing to.
+test "only a finished image drops, and its id then names nothing" {
+    const nop = struct {
+        fn f() void {}
+    }.f;
+    const gpa = std.testing.allocator;
+    var d = Diffuser.init(gpa, std.testing.io, nop, .{ .dit_path = "" }, VramCoordinator.none);
+    defer d.deinit();
+
+    const mk = struct {
+        fn f(dd: *Diffuser, st: GenStatus) !*GenImage {
+            const gi = try dd.gpa.create(GenImage);
+            gi.* = .{ .prompt = try dd.gpa.dupe(u8, "p"), .wake = nop, .io = std.testing.io };
+            gi.status = .init(@intFromEnum(st));
+            try dd.enqueue(gi);
+            return gi;
+        }
+    }.f;
+
+    const live = try mk(&d, .generating);
+    const waiting = try mk(&d, .pending);
+    const done = try mk(&d, .done);
+
+    // Nothing the worker may still be writing to.
+    try std.testing.expect(!d.drop(live.id));
+    try std.testing.expect(!d.drop(waiting.id));
+    const id = done.id;
+    try std.testing.expect(d.drop(id));
+    try std.testing.expectEqual(@as(?*GenImage, null), d.byId(id));
+    try std.testing.expectEqual(@as(usize, 2), d.items().len);
+    // Gone is gone: a second ack for the same id finds nothing.
+    try std.testing.expect(!d.drop(id));
+    try std.testing.expect(!d.drop(0));
+    try std.testing.expect(!d.drop(id + 9999));
+}
+
+test "the terminal cap sheds oldest-first and never touches live work" {
+    const nop = struct {
+        fn f() void {}
+    }.f;
+    const gpa = std.testing.allocator;
+    var d = Diffuser.init(gpa, std.testing.io, nop, .{ .dit_path = "" }, VramCoordinator.none);
+    defer d.deinit();
+
+    // One pending image FIRST, so the eviction walk has to step over it.
+    const waiting = try gpa.create(GenImage);
+    waiting.* = .{ .prompt = try gpa.dupe(u8, "w"), .wake = nop, .io = std.testing.io };
+    try d.enqueue(waiting);
+
+    const extra = 5;
+    var first_kept: ImageId = 0;
+    for (0..Diffuser.max_terminal + extra) |i| {
+        const gi = try gpa.create(GenImage);
+        gi.* = .{ .prompt = try gpa.dupe(u8, "t"), .wake = nop, .io = std.testing.io };
+        gi.status = .init(@intFromEnum(GenStatus.done));
+        try d.enqueue(gi);
+        if (i == extra) first_kept = gi.id;
+    }
+    // Nothing is pending that can run (`waiting` has no model and pump would
+    // spawn a worker for it), so drive the cap directly.
+    d.trimTerminal();
+
+    errdefer std.debug.print("{d} images left\n", .{d.items().len});
+    try std.testing.expectEqual(@as(usize, Diffuser.max_terminal + 1), d.items().len);
+    try std.testing.expectEqual(waiting, d.byId(waiting.id).?);
+    // The oldest `extra` went; the one just after them is now the oldest kept.
+    try std.testing.expectEqual(first_kept, d.items()[1].id);
+}
+
+test "a VRAM or device failure arms the session teardown; an ordinary one does not" {
+    // A client re-enqueue after an out-of-VRAM failure would otherwise land on
+    // the session still holding the memory it needs.
+    for ([_]anyerror{ error.OutOfMemory, error.DeviceOutOfMemory, error.CudaError, error.CublasLtError, error.CudnnError, error.VulkanFailed }) |e| {
+        errdefer std.debug.print("error {t}\n", .{e});
+        try std.testing.expect(Diffuser.sessionPoisoning(e));
+    }
+    for ([_]anyerror{ error.FileNotFound, error.UnsupportedCheckpoint, error.SavedImageMissing }) |e| {
+        errdefer std.debug.print("error {t}\n", .{e});
+        try std.testing.expect(!Diffuser.sessionPoisoning(e));
+    }
+}
+
+test "the render recipe is snapshotted, so a later change cannot reach a queued image" {
+    // The defect this rules out: pick dpmpp for the NEXT image and the three
+    // already waiting silently change sampler too, because the worker read the
+    // engine's live opts at dispatch instead of what was stamped at enqueue.
+    var opts: pipeline.Options = .{ .prompt = "" };
+    opts.sampler = .euler;
+    opts.scheduler = null;
+    opts.compat = .comfy;
+
+    const stamped = RenderParams.from(&opts);
+
+    // The user changes their mind after the image is in the queue.
+    opts.sampler = .dpmpp_2m_sde;
+    opts.scheduler = .karras;
+    opts.compat = .a1111;
+
+    var applied: pipeline.Options = .{ .prompt = "" };
+    stamped.applyTo(&applied);
+    errdefer std.debug.print("applied sampler {t}, compat {t}\n", .{ applied.sampler, applied.compat });
+    try std.testing.expectEqual(tp.sampler.Kind.euler, applied.sampler);
+    try std.testing.expectEqual(@as(?tp.sampler.Scheduler, null), applied.scheduler);
+    try std.testing.expectEqual(pipeline.Compat.comfy, applied.compat);
+
+    // And the live recipe really did move, or the check above proves nothing.
+    const now = RenderParams.from(&opts);
+    try std.testing.expectEqual(tp.sampler.Kind.dpmpp_2m_sde, now.sampler);
+    try std.testing.expectEqual(@as(?tp.sampler.Scheduler, .karras), now.scheduler);
+}
+
+test "every render-recipe field survives the round trip through Options" {
+    // A field added to `RenderParams` but forgotten in `applyTo` is a knob that
+    // silently does nothing, so walk them rather than spot-checking two.
+    var src: pipeline.Options = .{ .prompt = "" };
+    src.sampler = .dpmpp_2m_sde_heun;
+    src.scheduler = .exponential;
+    src.prompt_syntax = .a1111;
+    src.emphasis = .no_norm;
+    src.compat = .a1111;
+
+    var dst: pipeline.Options = .{ .prompt = "" };
+    RenderParams.from(&src).applyTo(&dst);
+
+    inline for (@typeInfo(RenderParams).@"struct".fields) |f| {
+        errdefer std.debug.print("field {s} did not survive\n", .{f.name});
+        try std.testing.expectEqual(@field(src, f.name), @field(dst, f.name));
+    }
+}
+
 // VRAM exhaustion arrives under four different names (the CUDA libraries
 // report an out-of-workspace as their own error, and the hand-PTX path surfaces
 // a post-OOM fault as `CudaError`), so the one failure a user can actually act
@@ -1969,22 +2039,14 @@ test "ModelConfig.dupe owns all four paths and eql sees each of them" {
 
     // Equal by value, distinct storage (the source may be a caller's arena that
     // gets reset under a queued image).
-    try std.testing.expect(ModelConfig.eql(src, copy));
+    try std.testing.expect(ModelConfig.sessionEql(src, copy));
     try std.testing.expect(src.text_encoder_2_path.ptr != copy.text_encoder_2_path.ptr);
 
     // Each path participates in the reload decision. The second tower especially:
     // if `eql` ignored it, switching CLIP-G would silently keep the old pipeline.
     var other = src;
     other.text_encoder_2_path = "/other_g.safetensors";
-    try std.testing.expect(!ModelConfig.eql(src, other));
-}
-
-test "clampDim rounds to multiple of 16 within bounds" {
-    try std.testing.expectEqual(@as(usize, 1024), clampDim(1024));
-    try std.testing.expectEqual(@as(usize, 1024), clampDim(1030)); // 1030/16*16
-    try std.testing.expectEqual(@as(usize, 256), clampDim(10)); // floor
-    try std.testing.expectEqual(@as(usize, 4096), clampDim(99999)); // ceil
-    try std.testing.expectEqual(@as(usize, 512), clampDim(519));
+    try std.testing.expect(!ModelConfig.sessionEql(src, other));
 }
 
 test "parseGenAttrs overrides only provided fields" {
@@ -2010,136 +2072,6 @@ test "modelStem strips directory and extension" {
     try std.testing.expectEqualStrings("v1.0", modelStem("/m/v1.0.ckpt")); // last dot only
 }
 
-test "buildA1111Params formats prompt, settings, and optional negative" {
-    const gpa = std.testing.allocator;
-
-    const with_neg = try buildA1111Params(gpa, "a cat", "blurry", 20, 3.5, 42, 1024, 768, "krea2", .krea2, .euler, null, .comfy, .original, .comfy, .{});
-    defer gpa.free(with_neg);
-    try std.testing.expectEqualStrings(
-        "a cat\n" ++
-            "Negative prompt: blurry\n" ++
-            "Steps: 20, Sampler: Euler, Schedule type: Simple, CFG scale: 3.5, Seed: 42, Size: 1024x768, Model: krea2, Prompt syntax: ComfyUI",
-        with_neg,
-    );
-
-    // No negative -> the "Negative prompt:" line is omitted entirely.
-    const no_neg = try buildA1111Params(gpa, "a dog", "", 8, 1.0, 7, 512, 512, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
-    defer gpa.free(no_neg);
-    try std.testing.expectEqualStrings(
-        "a dog\n" ++
-            "Steps: 8, Sampler: Euler, Schedule type: Simple, CFG scale: 1.0, Seed: 7, Size: 512x512, Model: m, Prompt syntax: ComfyUI",
-        no_neg,
-    );
-}
-
-test "buildA1111Params records the sampler actually used" {
-    // A saved PNG is the record a user (or ComfyUI's metadata importer) re-renders
-    // from, so a hardcoded sampler name is a wrong answer nothing else would catch,
-    // and the a1111 spelling is not the CLI's.
-    const gpa = std.testing.allocator;
-    for ([_]struct { k: tp.sampler.Kind, want: []const u8 }{
-        .{ .k = .euler, .want = "Sampler: Euler," },
-        .{ .k = .dpmpp_2m_sde, .want = "Sampler: DPM++ 2M SDE," },
-        .{ .k = .dpmpp_2m_sde_heun, .want = "Sampler: DPM++ 2M SDE Heun," },
-    }) |c| {
-        const s = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, c.k, null, .comfy, .original, .comfy, .{});
-        defer gpa.free(s);
-        errdefer std.debug.print("{s}\n", .{s});
-        try std.testing.expect(std.mem.indexOf(u8, s, c.want) != null);
-    }
-}
-
-test "buildA1111Params records the sampling compat, and overrides only when overridden" {
-    const gpa = std.testing.allocator;
-
-    // An ordinary ComfyUI render's block is byte-for-byte what it was before compat
-    // existed, no new fields, so nothing that parses these PNGs has to change.
-    const plain = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .of(.comfy));
-    defer gpa.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "Compat") == null);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "RNG") == null);
-
-    // A1111's defaults are named once, not spelled out three times.
-    const a = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, .of(.a1111));
-    defer gpa.free(a);
-    errdefer std.debug.print("{s}\n", .{a});
-    try std.testing.expect(std.mem.indexOf(u8, a, "Compat: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "RNG") == null);
-
-    // An override has to be recorded or the block does not describe the render: with
-    // `RNG: CPU` this is a different starting latent from the line above, at the same
-    // seed. Same reasoning that stopped `Sampler` being hardcoded.
-    var cc: pipeline.CompatConfig = .of(.a1111);
-    cc.noise_src = .torch_cpu;
-    const ov = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, cc);
-    defer gpa.free(ov);
-    errdefer std.debug.print("{s}\n", .{ov});
-    try std.testing.expect(std.mem.indexOf(u8, ov, "Compat: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ov, "RNG: CPU") != null);
-    // And the two knobs still at A1111's defaults stay out of it.
-    try std.testing.expect(std.mem.indexOf(u8, ov, "SGM") == null);
-
-    // The reverse: ComfyUI conventions with A1111's noise, which is the single-variable
-    // experiment someone chasing a mismatch would actually run.
-    var cn: pipeline.CompatConfig = .of(.comfy);
-    cn.noise_src = .nv_philox;
-    const nv = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, cn);
-    defer gpa.free(nv);
-    try std.testing.expect(std.mem.indexOf(u8, nv, "RNG: NV") != null);
-    try std.testing.expect(std.mem.indexOf(u8, nv, "Compat") == null);
-}
-
-test "buildA1111Params records the prompt dialect, and the emphasis only when it applies" {
-    // The same prompt text renders a DIFFERENT image in the two dialects, so a block that
-    // does not say which one was used cannot be re-rendered from. `Emphasis` appears only
-    // under a1111, where it is a real choice.
-    const gpa = std.testing.allocator;
-    const a = try buildA1111Params(gpa, "(a:1.2) [b]", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .a1111, .no_norm, .comfy, .{});
-    defer gpa.free(a);
-    try std.testing.expect(std.mem.indexOf(u8, a, "Prompt syntax: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "Emphasis: No norm") != null);
-
-    const c = try buildA1111Params(gpa, "(a:1.2)", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .{});
-    defer gpa.free(c);
-    try std.testing.expect(std.mem.indexOf(u8, c, "Prompt syntax: ComfyUI") != null);
-    try std.testing.expect(std.mem.indexOf(u8, c, "Emphasis") == null);
-}
-
-test "buildA1111Params names the family's own schedule, and omits it when unknown" {
-    const gpa = std.testing.allocator;
-
-    // The SD family samples the discrete beta ladder linearly, A1111's "Normal",
-    // not krea2's flow-matching "Simple". A reader re-renders from this field.
-    for ([_]pipeline.Family{ .sd15, .sdxl }) |f| {
-        const s = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", f, .euler, null, .comfy, .original, .comfy, .{});
-        defer gpa.free(s);
-        try std.testing.expect(std.mem.indexOf(u8, s, "Schedule type: Normal,") != null);
-    }
-    const k = try buildA1111Params(gpa, "p", "", 8, 1.0, 1, 1024, 1024, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
-    defer gpa.free(k);
-    try std.testing.expect(std.mem.indexOf(u8, k, "Schedule type: Simple,") != null);
-
-    // An EXPLICIT scheduler wins over the family default, and this is what the
-    // field is for: with schedulers selectable, deriving it from the architecture
-    // stamps a name the image was not rendered with.
-    const karras = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sd15, .euler, .karras, .comfy, .original, .comfy, .{});
-    defer gpa.free(karras);
-    try std.testing.expect(std.mem.indexOf(u8, karras, "Schedule type: Karras,") != null);
-    const kl = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .krea2, .euler, .kl_optimal, .comfy, .original, .comfy, .{});
-    defer gpa.free(kl);
-    try std.testing.expect(std.mem.indexOf(u8, kl, "Schedule type: KL Optimal,") != null);
-
-    // Unknown architecture: drop the field rather than stamp a guess a reader
-    // would reproduce with. Everything around it stays well-formed.
-    const unknown = try buildA1111Params(gpa, "p", "", 8, 1.0, 1, 512, 512, "m", null, .euler, null, .comfy, .original, .comfy, .{});
-    defer gpa.free(unknown);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "Schedule type") == null);
-    try std.testing.expectEqualStrings(
-        "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 1, Size: 512x512, Model: m, Prompt syntax: ComfyUI",
-        unknown,
-    );
-}
-
 test "nextSeed advances deterministically and distinctly" {
     var d: Diffuser = tp.init_defaults.of(Diffuser);
     d.seed = 0;
@@ -2149,59 +2081,3 @@ test "nextSeed advances deterministically and distinctly" {
     try std.testing.expect(a != b);
 }
 
-test "an a1111 parameters block round-trips through its own parser" {
-    const gpa = std.testing.allocator;
-    const params = try buildA1111Params(
-        gpa,
-        "a lighthouse in heavy fog\nsecond line of prompt",
-        "blurry, low quality",
-        34,
-        4.2,
-        8812,
-        1216,
-        832,
-        "krea2",
-        null,
-        .euler,
-        null,
-        .comfy,
-        .original,
-        .comfy,
-        .of(.comfy),
-    );
-    defer gpa.free(params);
-
-    const got = parseA1111Params(params);
-    try std.testing.expectEqualStrings("a lighthouse in heavy fog\nsecond line of prompt", got.prompt);
-    try std.testing.expectEqualStrings("blurry, low quality", got.negative);
-    try std.testing.expectEqual(@as(?usize, 34), got.steps);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.2), got.cfg.?, 0.001);
-    try std.testing.expectEqual(@as(?u64, 8812), got.seed);
-    try std.testing.expectEqual(@as(?usize, 1216), got.width);
-    try std.testing.expectEqual(@as(?usize, 832), got.height);
-}
-
-test "parsing tolerates blocks we did not write" {
-    // No negative, extra unknown keys, different order: all of these come off
-    // images made by ComfyUI or A1111 itself.
-    const p = parseA1111Params(
-        "just a prompt\nSteps: 20, Sampler: DPM++ 2M, Schedule type: Karras, " ++
-            "CFG scale: 7, Seed: 1234, Size: 512x768, Model hash: abc123, Model: sd15",
-    );
-    try std.testing.expectEqualStrings("just a prompt", p.prompt);
-    try std.testing.expectEqualStrings("", p.negative);
-    try std.testing.expectEqual(@as(?usize, 20), p.steps);
-    try std.testing.expectEqual(@as(?u64, 1234), p.seed);
-    try std.testing.expectEqual(@as(?usize, 512), p.width);
-    try std.testing.expectEqual(@as(?usize, 768), p.height);
-
-    // A prompt that itself mentions "Steps:" must not be mistaken for the
-    // settings line; the LAST one wins.
-    const q = parseA1111Params("Steps: how many steps?\nSteps: 12, Seed: 9");
-    try std.testing.expectEqualStrings("Steps: how many steps?", q.prompt);
-    try std.testing.expectEqual(@as(?usize, 12), q.steps);
-
-    // Nothing at all, and a block with no settings line, must not fault.
-    try std.testing.expectEqual(@as(?usize, null), parseA1111Params("").steps);
-    try std.testing.expectEqualStrings("only a prompt", parseA1111Params("only a prompt").prompt);
-}

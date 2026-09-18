@@ -8,9 +8,7 @@
 const std = @import("std");
 const SDLBackend = @import("backend");
 const tp = @import("TensorPencil");
-const diffuser = @import("diffuser.zig");
 
-const GenImage = diffuser.GenImage;
 const SDL = SDLBackend.c;
 
 // SDL owns the clipboard payload until the clipboard changes, well past the
@@ -22,13 +20,9 @@ const png_mime = "image/png";
 /// What SDL holds onto between the copy and the eventual paste/cleanup.
 const Payload = struct { bytes: []u8 };
 
-/// Encode `gi`'s pixels to PNG and place them on the OS clipboard. No-op if the
-/// image hasn't finished rendering (no `rgba` yet). Logs and bails on failure,
-/// a failed copy should never take down the viewer.
-pub fn copyImage(gi: *GenImage) void {
-    const rgba = gi.rgba orelse return;
-    const w = gi.width;
-    const h = gi.height;
+/// Encode RGBA pixels to PNG and place them on the OS clipboard. Logs and bails
+/// on failure, a failed copy should never take down the viewer.
+pub fn copyImage(rgba: []const u8, w: usize, h: usize) void {
     if (w == 0 or h == 0 or rgba.len < w * h * 4) return;
 
     // encodePngRgb wants tightly packed RGB; drop the (always-opaque) alpha.

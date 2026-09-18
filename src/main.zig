@@ -310,6 +310,8 @@ pub fn main(init: std.process.Init) !void {
         try minimaxH3AudioCudaTest(arena, io, stdout, ck, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "lora-cuda-test")) {
         try loraCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
+    } else if (args.len >= 4 and std.mem.eql(u8, args[1], "lora-restack-test")) {
+        try loraRestackTest(arena, io, stdout, args[2], args[3]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "dual-cuda-test")) {
         try dualCudaTest(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-cuda-test")) {
@@ -487,6 +489,9 @@ pub fn main(init: std.process.Init) !void {
             \\  TensorPencil sensenova-vk-test [<ckpt>] [--layers N]
             \\      [--prompt-tokens N] [--sigma S]
             \\      the same checks against sensenova_gpu on Vulkan
+            \\  TensorPencil lora-restack-test <ckpt> <lora>
+            \\      swap a LoRA stack on a live session: the image must come back
+            \\      bit-identical and the factors' VRAM be handed back
             \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
             \\      check zimage_cuda's device forward against the CPU forward on
             \\      real weights, on both attention paths; non-zero if any fails
@@ -6257,6 +6262,110 @@ fn erf64(x: f64) f64 {
     const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
     const er = 1.0 - poly * @exp(-ax * ax);
     return if (x < 0) -er else er;
+}
+
+/// `lora-restack-test <ckpt> <lora>`: swap a LoRA stack on a LIVE session and
+/// prove the swap is both real and clean. Non-zero exit on either failure.
+///
+/// Three renders of one prompt at one seed through ONE resident session:
+///
+///   1. with the sidecar   2. after `setLoras(&.{})`   3. after putting it back
+///
+/// and the two checks that matter are different defects.
+///
+/// **1 vs 2 must DIFFER**, or the removal did nothing and the whole per-image
+/// LoRA feature is decoration.
+///
+/// **1 vs 3 must be BIT-IDENTICAL**, so a re-attach cannot come back subtly
+/// unlike what it replaced. Bytes rather than a tolerance because the two runs
+/// are the same weights at the same seed and anything but equality is a defect.
+///
+/// **And the device must give the factors BACK.** This is the check that earns
+/// the command, because the pixels cannot see it: the device weight cache is
+/// keyed on the host POINTER of each factor (`lora_cuda`'s header), so a restack
+/// that frees a stack without evicting its factors leaves the old device copies
+/// resident forever. Re-attaching the SAME file renders identically either way
+/// -- stale bytes and fresh bytes are the same bytes -- so run 3 passes both
+/// image checks while VRAM has silently grown by a whole stack. MEASURED on a
+/// SenseNova int4 + the 8-step turbo LoRA (777 MB of factors), with the eviction
+/// deliberately disabled: `dit` went 4789 -> 4789 -> 5566 MB where the correct
+/// build goes 4789 -> 4012 -> 4789. That is a leak of the entire stack per swap,
+/// and a user flipping a LoRA a few times would meet it as an OOM with no
+/// explanation. Hence the two memory assertions below.
+fn loraRestackTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, lora_path: []const u8) !void {
+    const pipeline = TensorPencil.pipeline;
+    const specs = [_]pipeline.LoraSpec{.{ .path = lora_path, .strength = 0.8 }};
+
+    // Small and short on purpose: this is about the stack, not the picture, and
+    // three renders of a full canvas is minutes of nothing being tested.
+    const opts: pipeline.Options = .{
+        .prompt = "a red ceramic cube on a wooden table",
+        .dit_path = ckpt,
+        .width = 256,
+        .height = 256,
+        .steps = 4,
+        .seed = 42,
+        .backend = .cuda,
+        .preview = false,
+        .loras = &specs,
+    };
+
+    try stdout.print("== lora-restack-test ==\nckpt: {s}\nlora: {s}\n", .{ ckpt, lora_path });
+    var sess = pipeline.Session.init(io, arena, opts, stdout) catch |err| {
+        try stdout.print("cannot load: {t}\n", .{err});
+        return;
+    };
+    defer sess.deinit();
+    if (!sess.family().supportsLora()) {
+        try stdout.print("{t} has no sidecar path in this build; nothing to test\n", .{sess.family()});
+        return;
+    }
+
+    const stack_bytes = sess.loraBytes();
+
+    var with1 = try sess.generate(opts, stdout);
+    defer with1.deinit(arena);
+    const a = try arena.dupe(u8, with1.rgb);
+    const vram_with1 = sess.deviceUsed();
+
+    try sess.setLoras(io, &.{});
+    var without = try sess.generate(opts, stdout);
+    defer without.deinit(arena);
+    const vram_without = sess.deviceUsed();
+
+    try sess.setLoras(io, &specs);
+    var with2 = try sess.generate(opts, stdout);
+    defer with2.deinit(arena);
+    const vram_with2 = sess.deviceUsed();
+
+    // Half the stack, so ordinary workspace jitter cannot trip either way. The
+    // defect this separates from noise is a WHOLE stack, not a few MB.
+    const slack = stack_bytes / 2;
+    const removed_differs = !std.mem.eql(u8, a, without.rgb);
+    const restored_exact = std.mem.eql(u8, a, with2.rgb);
+    const freed = vram_without + slack < vram_with1;
+    const no_leak = vram_with2 < vram_with1 + slack;
+
+    try stdout.print("\nstack: {d} MB of factors\n", .{stack_bytes >> 20});
+    try stdout.print("device used: with {d} MB · without {d} MB · with again {d} MB\n", .{
+        vram_with1 >> 20, vram_without >> 20, vram_with2 >> 20,
+    });
+    try stdout.print("removing the sidecar changes the image: {s}\n", .{if (removed_differs) "yes" else "NO"});
+    try stdout.print("putting it back reproduces it exactly: {s}\n", .{if (restored_exact) "yes" else "NO"});
+    try stdout.print("removing it returns its VRAM: {s}\n", .{if (freed) "yes" else "NO"});
+    try stdout.print("putting it back does not grow VRAM: {s}\n", .{if (no_leak) "yes" else "NO"});
+
+    if (!removed_differs or !restored_exact or !freed or !no_leak) {
+        // Say WHICH: the four mean different things, and only the last two can
+        // see a missing eviction.
+        if (!removed_differs) try stdout.print("FAIL: the LoRA is not reaching the forward at all\n", .{});
+        if (!restored_exact) try stdout.print("FAIL: the re-attached stack does not match the original\n", .{});
+        if (!freed) try stdout.print("FAIL: the removed factors are still resident (missing device eviction)\n", .{});
+        if (!no_leak) try stdout.print("FAIL: the swap leaked a stack's worth of VRAM (missing device eviction)\n", .{});
+        try stdout.flush();
+        std.process.exit(1);
+    }
+    try stdout.print("ok\n", .{});
 }
 
 /// `lora-cuda-test`: the device LoRA sidecar against its host twin, at the real

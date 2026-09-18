@@ -42,11 +42,43 @@ pub const CUDA_ERROR_NO_BINARY_FOR_GPU: CUresult = 209;
 pub const CUDA_ERROR_INVALID_PTX: CUresult = 218;
 pub const CUDA_ERROR_INVALID_HANDLE: CUresult = 400;
 pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
+pub const CUDA_ERROR_ECC_UNCORRECTABLE: CUresult = 214;
+pub const CUDA_ERROR_NVLINK_UNCORRECTABLE: CUresult = 220;
+pub const CUDA_ERROR_ILLEGAL_ADDRESS: CUresult = 700;
 pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: CUresult = 701;
 pub const CUDA_ERROR_LAUNCH_TIMEOUT: CUresult = 702;
+pub const CUDA_ERROR_ASSERT: CUresult = 710;
+pub const CUDA_ERROR_HARDWARE_STACK_ERROR: CUresult = 714;
+pub const CUDA_ERROR_ILLEGAL_INSTRUCTION: CUresult = 715;
+pub const CUDA_ERROR_MISALIGNED_ADDRESS: CUresult = 716;
+pub const CUDA_ERROR_INVALID_ADDRESS_SPACE: CUresult = 717;
+pub const CUDA_ERROR_INVALID_PC: CUresult = 718;
 pub const CUDA_ERROR_LAUNCH_FAILED: CUresult = 719;
 pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 801;
 pub const CUDA_ERROR_UNKNOWN: CUresult = 999;
+
+/// Codes the driver documents as leaving the context unusable: every later call
+/// in it returns the same error, so the process must be restarted. Anything that
+/// reads a query result as a number (free VRAM, most of all) gets a lie from here
+/// on, which is why `Context.check` latches these instead of letting each caller
+/// meet them one at a time.
+pub fn isContextFatal(r: CUresult) bool {
+    return switch (r) {
+        CUDA_ERROR_ECC_UNCORRECTABLE,
+        CUDA_ERROR_NVLINK_UNCORRECTABLE,
+        CUDA_ERROR_ILLEGAL_ADDRESS,
+        CUDA_ERROR_LAUNCH_TIMEOUT,
+        CUDA_ERROR_ASSERT,
+        CUDA_ERROR_HARDWARE_STACK_ERROR,
+        CUDA_ERROR_ILLEGAL_INSTRUCTION,
+        CUDA_ERROR_MISALIGNED_ADDRESS,
+        CUDA_ERROR_INVALID_ADDRESS_SPACE,
+        CUDA_ERROR_INVALID_PC,
+        CUDA_ERROR_LAUNCH_FAILED,
+        => true,
+        else => false,
+    };
+}
 
 // ---- CUjit_option ------------------------------------------------------------
 pub const CU_JIT_MAX_REGISTERS: c_int = 0;

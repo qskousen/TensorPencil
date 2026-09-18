@@ -28,9 +28,14 @@ pub const Tab = enum { chat, studio };
 pub const Bands = struct {
     body: f32,
 
-    pub fn from(root: *dvui.BoxWidget) Bands {
+    /// `status_px` is what the status bars at the bottom occupy in total: one
+    /// per engine host, each its own card's meter. The caller measures them
+    /// (`status_bar.bar_outer_height`) rather than this assuming a height,
+    /// since a bar costs its padding too and the last one gets clipped when
+    /// that is left out.
+    pub fn from(root: *dvui.BoxWidget, status_px: f32) Bands {
         const h = root.data().contentRect().h;
-        return .{ .body = @max(120, h - L.title_h - L.status_h) };
+        return .{ .body = @max(120, h - L.title_h - status_px) };
     }
 };
 
@@ -50,6 +55,7 @@ pub const TitleActions = struct {
     on_tab: *const fn (Tab) void,
     on_llm_pick: *const fn (model_menu.Pick) void,
     on_image_pick: *const fn (model_menu.Pick) void,
+    on_settings: *const fn () void,
 };
 
 pub fn titleBar(m: Title, cb: TitleActions) void {
@@ -86,7 +92,32 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
         defer grp.deinit();
         if (model_menu.chip(@src(), m.llm, m.llm_menu, 0)) |p| cb.on_llm_pick(p);
         if (model_menu.chip(@src(), m.image, m.image_menu, 1)) |p| cb.on_image_pick(p);
+        // The gear lives here rather than in either workspace because Settings
+        // is reachable from both and the title bar is the one strip they share.
+        // The chat sidebar keeps its own Settings row; the studio has no
+        // sidebar footer to put one in, and used to have no route at all.
+        if (gearButton(@src())) cb.on_settings();
     }
+}
+
+fn gearButton(src: std.builtin.SourceLocation) bool {
+    var bw: dvui.ButtonWidget = undefined;
+    bw.init(src, .{}, .{
+        .background = false,
+        .color_fill_hover = style.hover_wash,
+        .color_fill_press = style.hover_wash,
+        .corner_radius = R.button,
+        .padding = dvui.Rect.all(6),
+        .margin = .{ .x = 8 },
+        .gravity_y = 0.5,
+    });
+    bw.processEvents();
+    bw.drawBackground();
+    style.mark(@src(), .gear, 15, C.text_dim, .{});
+    const clicked = bw.clicked();
+    bw.drawFocus();
+    bw.deinit();
+    return clicked;
 }
 
 // ------------------------------------------------------------------ sidebar
@@ -106,12 +137,24 @@ pub const ConvGroup = struct {
     rows: []const ConvRow,
 };
 
+/// The left rail, over whatever dated list the workspace keeps: conversations in
+/// chat, prompts in the studio. Parameterized rather than copied, because
+/// `convRow` carries two event-ordering traps (see its own comment) and a second
+/// copy of it would carry them too, differently.
 pub const Sidebar = struct {
     groups: []const ConvGroup,
     selected: ?u64 = null,
     /// Download progress for the Models row, 0..1, or null when idle. Amber:
     /// this is the machine working.
     models_pct: ?f32 = null,
+    /// The button at the top.
+    new_label: []const u8 = "New chat",
+    /// Shown in place of the list when there is nothing in it.
+    empty: []const u8 = "No conversations yet.",
+    /// Draw the pinned Models/Settings footer. The studio's rail does not: the
+    /// gear in the title bar is its route, and a second one here would be two
+    /// answers to the same question a hand's width apart.
+    footer: bool = true,
 };
 
 pub const SidebarActions = struct {
@@ -144,12 +187,12 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
     // rect at init, so this is the real inner height of the rail.
     const inner = col.data().contentRect().h;
 
-    if (newChatButton(@src())) cb.on_new_chat();
+    if (newChatButton(@src(), m.new_label)) cb.on_new_chat();
 
     // The list scrolls; the footer below is pinned. Cap the scroll area's
     // height to what is left, or its content min-height pushes the footer out.
     const new_chat_h: f32 = 34;
-    const footer_h: f32 = 62;
+    const footer_h: f32 = if (m.footer) 62 else 0;
     const list_h = @max(40, inner - new_chat_h - 16 - footer_h);
     {
         var sc = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{
@@ -172,7 +215,7 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
             }
         }
         if (m.groups.len == 0) {
-            dvui.labelNoFmt(@src(), "No conversations yet.", .{}, .{
+            dvui.labelNoFmt(@src(), m.empty, .{}, .{
                 .font = F.row,
                 .color_text = C.text_ghost,
                 .padding = .{ .x = 8, .y = 6 },
@@ -180,10 +223,10 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
         }
     }
 
-    footer(@src(), m.models_pct, cb);
+    if (m.footer) footer(@src(), m.models_pct, cb);
 }
 
-fn newChatButton(src: std.builtin.SourceLocation) bool {
+fn newChatButton(src: std.builtin.SourceLocation, label: []const u8) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .expand = .horizontal,
@@ -203,7 +246,7 @@ fn newChatButton(src: std.builtin.SourceLocation) bool {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
         defer row.deinit();
         style.mark(@src(), .plus, 11, C.text_hi, .{ .margin = .{ .w = 5 } });
-        dvui.labelNoFmt(@src(), "New chat", .{}, .{
+        dvui.labelNoFmt(@src(), label, .{}, .{
             .font = F.row_hi,
             .color_text = C.text_hi,
             .padding = .{},

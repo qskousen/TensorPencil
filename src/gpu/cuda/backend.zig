@@ -1099,7 +1099,12 @@ pub const Backend = struct {
         // at the floor, skip the prefetch: cachedWeight sync-loads the weight on
         // demand once the block's scratch has freed, and prefetch resumes as room
         // opens.
-        if (self.pin_floor != 0 and self.ctx.memGetInfo().free < bytes.len + self.pin_floor) return;
+        // Unknown reading: skip too. Prefetch is an optimization and cachedWeight
+        // sync-loads on miss, so declining costs speed where guessing costs an OOM.
+        if (self.pin_floor != 0) {
+            const mi = self.ctx.memGetInfo();
+            if (mi == null or mi.?.free < bytes.len + self.pin_floor) return;
+        }
         self.reserveForWeights(bytes.len);
         const pin = self.pinNew(bytes.len);
         const db = self.weightBufAcquire(bytes.len, pin) catch {
@@ -1161,7 +1166,7 @@ pub const Backend = struct {
                 if (self.foreignReclaim(size)) continue; // finally: another context on this card
                 const es = self.evict_skip;
                 std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
-                    size >> 20, self.ctx.memGetInfo().free >> 20, self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
+                    size >> 20, self.ctx.freeMiB(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
                     es.pin,     es.awaiting,                      es.mru,                  es.pf,                     es.small,
                 });
                 return error.DeviceOutOfMemory;
@@ -1195,7 +1200,7 @@ pub const Backend = struct {
         self.bindThread();
         if (got == 0) return 0;
         std.log.info("[vram] cross-context reclaim: needed {d} MiB, another context freed {d} MiB ({d} MiB now free)", .{
-            needed >> 20, got >> 20, self.ctx.memGetInfo().free >> 20,
+            needed >> 20, got >> 20, self.ctx.freeMiB(),
         });
         return got;
     }
@@ -1220,8 +1225,20 @@ pub const Backend = struct {
     pub fn headroom(self: *Backend) u64 {
         return self.budgetHeadroom();
     }
+    /// Stands in for the live reading when the card cannot be asked. Large enough
+    /// that `@min(budget, used + headroom())` collapses to the budget, small
+    /// enough that the additions its callers do cannot overflow.
+    const headroom_unknown: u64 = 1 << 60;
+
     fn budgetHeadroom(self: *Backend) u64 {
-        const live = (self.ctx.memGetInfo().free) * 9 / 10; // 10% margin (frag/overhead)
+        // A failed query is not zero headroom. Every caller sheds residency when
+        // this is small, so returning 0 for "could not ask" offloads the model to
+        // the host to free memory that was never short.
+        const mi = self.ctx.memGetInfo() orelse {
+            if (self.budget_override != 0) return self.budget_override -| self.ctx.device_used;
+            return headroom_unknown;
+        };
+        const live = mi.free * 9 / 10; // 10% margin (frag/overhead)
         if (self.budget_override != 0) {
             return @min(self.budget_override -| self.ctx.device_used, live);
         }
@@ -1406,7 +1423,31 @@ pub const Backend = struct {
     /// again. Refunds the pin claim (LLM weights are always pinned), so a
     /// migrated-back layer can pin again. No-op if not resident.
     pub fn evictWeightBytes(self: *Backend, bytes: []const u8) void {
-        const e = self.weights.fetchRemove(@intFromPtr(bytes.ptr)) orelse return;
+        self.evictWeightKey(@intFromPtr(bytes.ptr));
+    }
+
+    /// Free the device copy of every weight uploaded from anywhere inside
+    /// `bytes`. A caller that hands a GEMM a SUB-SLICE of a buffer keys the
+    /// cache on that inner pointer (a fused linear's rows out of one LoRA B
+    /// factor, `lora_cuda.applyRange`), so evicting the buffer's own address
+    /// alone leaves those entries behind to be served to whatever the allocator
+    /// hands the address to next.
+    pub fn evictWeightRange(self: *Backend, bytes: []const u8) void {
+        const lo = @intFromPtr(bytes.ptr);
+        const hi = lo + bytes.len;
+        // Re-scanned per removal rather than collected: a range holds a couple
+        // of entries, and removing during iteration is not allowed.
+        while (true) {
+            var it = self.weights.keyIterator();
+            const key = while (it.next()) |k| {
+                if (k.* >= lo and k.* < hi) break k.*;
+            } else return;
+            self.evictWeightKey(key);
+        }
+    }
+
+    fn evictWeightKey(self: *Backend, key: usize) void {
+        const e = self.weights.fetchRemove(key) orelse return;
         if (e.value.upload_ev) |ev| {
             self.ctx.computeWaitEvent(ev) catch {};
             self.ctx.eventDestroy(ev);
@@ -1561,9 +1602,8 @@ pub const Backend = struct {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
         self.drainPending(); // realize any already-deferred frees first
-        const before_free = self.ctx.memGetInfo().free;
         std.log.info("[evict] evictToFree want={d}MB: cache={d} entries pinned={d}MB streamed={d}MB free={d}MB", .{
-            want >> 20, self.weights.count(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, before_free >> 20,
+            want >> 20, self.weights.count(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.ctx.freeMiB(),
         });
         var freed: u64 = 0;
         var n: usize = 0;
@@ -1608,7 +1648,7 @@ pub const Backend = struct {
             self.tensorDestroy(&db);
         }
         std.log.info("[evict] evictToFree freed={d}MB in {d} weights ({d} protected, cache now {d}, free={d}MB)", .{
-            freed >> 20, n, skipped_protected, self.weights.count(), self.ctx.memGetInfo().free >> 20,
+            freed >> 20, n, skipped_protected, self.weights.count(), self.ctx.freeMiB(),
         });
         return freed;
     }
@@ -2191,7 +2231,11 @@ pub const Backend = struct {
         // the not-yet-allocated working set and to other processes) is not a
         // safe ceiling. Off (pin_floor 0, the LLM path) -> pure pin_budget, no
         // query. On (diffusion) the query is cheap and runs only on first touch.
-        if (self.pin_floor != 0 and self.ctx.memGetInfo().free < size + self.pin_floor) return false;
+        // Unknown reading: stream it rather than pin it. A pin cannot be reclaimed.
+        if (self.pin_floor != 0) {
+            const mi = self.ctx.memGetInfo();
+            if (mi == null or mi.?.free < size + self.pin_floor) return false;
+        }
         self.pinned_bytes += size;
         return true;
     }

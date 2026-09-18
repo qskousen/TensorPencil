@@ -19,14 +19,19 @@ const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const shell = @import("shell.zig");
 const model_menu = @import("model_menu.zig");
-const model_lib = @import("model_lib.zig");
-const catalog = @import("catalog.zig");
-const selection = @import("selection.zig");
-const config = @import("config.zig");
+const catalog = @import("shared").catalog;
+const selection = @import("client").selection;
+const models = @import("client").models;
+const config = @import("shared").config;
 const config_view = @import("config_view.zig");
 const bubbles = @import("bubbles.zig");
 const queue_rail = @import("queue_rail.zig");
 const meter = @import("meter.zig");
+const status_bar = @import("status_bar.zig");
+const mirror = @import("client").mirror;
+const wire = @import("serve").wire;
+const image_view = @import("image_view.zig");
+const toast = @import("toast.zig");
 
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
@@ -51,12 +56,35 @@ const noise_names = [_][]const u8{ "flat", "front", "front steep", "first 40%", 
 const noise_shape = [_]f32{ 1.00, 0.90, 0.81, 0.72, 0.64, 0.56, 0.49, 0.42, 0.36, 0.30, 0.25, 0.20, 0.16, 0.12, 0.09, 0.06, 0.04, 0.02, 0.01, 0.00 };
 
 fn noopPick(_: model_menu.Pick) void {}
+fn noHostStatus(name: []const u8, _: *const config.HostEntry) config_view.HostState {
+    if (std.mem.eql(u8, name, "lydia")) return .{ .text = "token refused: re-pair this host", .tone = .bad };
+    if (std.mem.eql(u8, name, "cellar")) return .{ .text = "reached it, token accepted: Apply & Reload to use it", .tone = .pending };
+    return .{ .text = "up", .tone = .ok };
+}
+fn noHostSync(name: []const u8) config_view.HostSync {
+    // One file just landed and two more are still short: the state a host is
+    // in halfway through being fed a model, and the one that used to read as
+    // "done" with nothing left to do.
+    if (std.mem.eql(u8, name, "lydia")) return .{
+        .sending = "qwen3_06b_instruct",
+        .status = "done",
+        .missing = "krea2RealVae_v10",
+        .missing_count = 2,
+    };
+    if (!std.mem.eql(u8, name, "attic")) return .{};
+    return .{ .missing = "krea2CenterSemiraw_v10Int8", .missing_count = 1 };
+}
+fn noSendModel(_: []const u8) void {}
+fn noSendPath(_: []const u8, _: []const u8) void {}
+fn noPullPath(_: []const u8, _: []const u8, _: []const u8) void {}
+fn noTryHost(_: *const config.HostEntry) void {}
+fn noReconnectHost(_: []const u8) void {}
 
 // The two title-bar menus, as the catalog would build them: a supported class
 // with the current file checked, and a greyed class with its reason.
 const probe_llm_items = [_]model_menu.Item{
-    .{ .label = "Gemma-4-31B-it-Q4_K_M", .path = "/m/a.gguf", .selected = true },
-    .{ .label = "Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S", .path = "/m/b.gguf" },
+    .{ .label = "Gemma-4-31B-it-Q4_K_M", .path = "/m/a.gguf", .selected = true, .note = "2 of 3" },
+    .{ .label = "Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S", .path = "/m/b.gguf", .note = "lydia" },
 };
 const probe_llm_grey = [_]model_menu.Item{
     .{ .label = "nomic-embed-text-v1.5.Q8_0", .path = "/m/c.gguf", .greyed = true, .note = "architecture 'nomic-bert' is not supported" },
@@ -67,8 +95,10 @@ const probe_llm_groups = [_]model_menu.Group{
 };
 const probe_llm_menu: model_menu.Menu = .{ .groups = &probe_llm_groups, .none_label = "no chat model" };
 const probe_image_items = [_]model_menu.Item{
-    .{ .label = "sdxl-turbo-fp16", .path = "/m/x.safetensors", .selected = true },
-    .{ .label = "dreamshaperXL10_alpha2Xl10", .path = "/m/y.safetensors" },
+    .{ .label = "sdxl-turbo-fp16", .path = "/m/x.safetensors", .selected = true, .note = "rtxpro6k" },
+    .{ .label = "dreamshaperXL10_alpha2Xl10", .path = "/m/y.safetensors", .note = "attic · missing files" },
+    // Only a host that is down has it: still listed, greyed, and named.
+    .{ .label = "kWALUAN_v08INT8_fp16", .path = "/m/z.safetensors", .greyed = true, .note = "only on cellar (down)" },
 };
 const probe_image_groups = [_]model_menu.Group{.{ .label = "SDXL", .items = &probe_image_items }};
 const probe_image_menu: model_menu.Menu = .{ .groups = &probe_image_groups, .none_label = "no image model" };
@@ -88,31 +118,78 @@ const groups = [_]shell.ConvGroup{
     .{ .head = "EARLIER", .rows = &conv_earlier },
 };
 
-// Mid-handoff: two have landed, two are still in the queue. This is the state
-// worth having in the picture, because it is the one where the card and the
-// rail have to agree about where each image lives.
-const tiles = [_]bubbles.Tile{ .pending, .pending, .pending, .pending };
+// Mid-run: one landed, one rendering with a preview, one rendering with none
+// yet, one still waiting for a host. Every tile state in one card, which is the
+// picture worth having: the card is where a render is watched now, and the four
+// look nothing alike.
+var tiles = [_]bubbles.Tile{ .pending, .pending, .pending, .pending };
 
 const jobs = [_]queue_rail.Job{
     .{
-        .id = 1,
-        .title = "Lighthouse · 4.2 cfg",
-        .thumb = .loading,
-        .state = .{ .running = .{ .step = 18, .steps = 34, .it_s = 4.2 } },
-    },
-    .{
         .id = 2,
         .title = "Lighthouse · taller crop",
-        .thumb = .dashed,
         .state = .{ .queued = .{ .eta_s = 11 } },
         .from_studio = true,
     },
+    // A job that will not render keeps its row and says why; vanishing is what
+    // this state exists to stop.
+    .{
+        .id = 3,
+        .title = "Lighthouse · wide",
+        .state = .{ .failed = .{ .why = "the checkpoint is missing a component (VAE or text encoder)" } },
+        .host = "lydia",
+    },
+    // Still in the client's own queue, and stuck there: no host names it
+    // because no host can run it, which is not the same as waiting a turn.
+    .{
+        .id = 4,
+        .title = "Ceramic mug · turntable",
+        .state = .{ .queued = .{ .note = "no host can run this yet" } },
+    },
 };
 
-const library = [_]queue_rail.LibraryItem{
-    .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 },
-    .{ .id = 13 }, .{ .id = 14 }, .{ .id = 15 },
+var library = [_]queue_rail.LibraryItem{
+    .{ .id = 10, .host = "workshop" }, .{ .id = 11, .host = "lydia" }, .{ .id = 12, .host = "workshop" },
+    .{ .id = 13, .host = "lydia" },    .{ .id = 14, .host = "workshop" }, .{ .id = 15, .host = "lydia" },
 };
+
+/// A gradient `w` x `h`, bright at the bottom where the tile's own strip and the
+/// library's host tag sit: neither is worth having if it does not survive that.
+fn cannedPixels(gpa: std.mem.Allocator, w: u32, h: u32) ![]u8 {
+    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    for (0..h) |y| for (0..w) |x| {
+        const i = (y * w + x) * 4;
+        rgba[i + 0] = @intCast(150 + (y * 105) / h);
+        rgba[i + 1] = @intCast(120 + (x * 130) / w);
+        rgba[i + 2] = @intCast(90 + ((x + y) * 60) / (w + h));
+        rgba[i + 3] = 255;
+    };
+    return rgba;
+}
+
+/// The tool card's four tiles: landed, rendering with a preview, rendering with
+/// none yet, and waiting. The preview is a fraction of the finished size and a
+/// different shape from the tile, which is what the fit has to survive.
+fn cannedTiles(gpa: std.mem.Allocator) !void {
+    tiles[0] = .{ .rgba = .{ .px = try cannedPixels(gpa, 304, 208), .w = 304, .h = 208 } };
+    tiles[1] = .{ .rendering = .{
+        .px = .{ .px = try cannedPixels(gpa, 152, 104), .w = 152, .h = 104 },
+        .step = 18,
+        .steps = 34,
+        .label = "step 18 / 34",
+    } };
+    tiles[2] = .{ .rendering = .{ .step = 0, .steps = 34, .label = "step 0 / 34 · lydia" } };
+}
+
+/// Real pixels under half the library tiles.
+fn cannedLibrary(gpa: std.mem.Allocator) !void {
+    const w: u32 = 96;
+    const h: u32 = 96;
+    for (&library, 0..) |*item, k| {
+        if (k % 2 == 1) continue;
+        item.thumb = .{ .rgba = .{ .px = try cannedPixels(gpa, w, h), .w = w, .h = h } };
+    }
+}
 
 const quick = [_]bubbles.QuickSetting{
     .{ .label = "3:2" },
@@ -138,13 +215,15 @@ fn onToggle(_: *anyopaque) void {
 fn onSelectTile(_: *anyopaque, i: usize) void {
     g_selected_tile = i;
 }
-fn onReorder(_: usize, _: usize) void {}
+fn noopCtxId(_: *anyopaque, _: usize) void {}
+fn onReorder(_: u64, _: ?u64) void {}
 
 var g_ctx: u8 = 0;
 
 // -------------------------------------------------------------------- frame
 
 fn frame() void {
+    toast.pump();
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
@@ -152,15 +231,15 @@ fn frame() void {
     });
     defer root.deinit();
 
-    const bands = shell.Bands.from(root);
+    const bands = shell.Bands.from(root, status_bar.bar_outer_height);
 
     shell.titleBar(.{
         .tab = g_tab,
-        .llm = .{ .label = "Gemma-4-31B-it-Q4_K_M", .resident = true },
+        .llm = .{ .label = "Gemma-4-31B-it-Q4_K_M", .note = "2 of 3", .resident = true },
         .llm_menu = probe_llm_menu,
-        .image = .{ .label = "sdxl-turbo-fp16", .warn = true },
+        .image = .{ .label = "sdxl-turbo-fp16", .note = "rtxpro6k", .warn = true },
         .image_menu = probe_image_menu,
-    }, .{ .on_tab = onTab, .on_llm_pick = noopPick, .on_image_pick = noopPick });
+    }, .{ .on_tab = onTab, .on_llm_pick = noopPick, .on_image_pick = noopPick, .on_settings = noop });
 
     {
         var body = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -191,8 +270,9 @@ fn frame() void {
         }, .{
             .on_tab = onRailTab,
             .on_pause_all = noop,
-            .on_open = noopId,
+            .on_open_library = noopId,
             .on_cancel = noopId,
+            .on_retry = noopId,
             .on_reorder = onReorder,
         });
     }
@@ -258,16 +338,18 @@ fn chatColumn(h: f32) void {
         bubbles.toolCard(@src(), .{
             .meta = "×4 · 1216×832 · seed 8812",
             .tiles = &tiles,
+            .aspect = 1216.0 / 832.0,
             .selected = g_selected_tile,
             .prompt = "a lighthouse in heavy fog at dawn, desaturated, backlit beam, melancholy",
             .expanded = g_expanded,
             .busy = true,
-            .status = "rendering 1 of 4 · in queue",
+            .status = "rendering 2 of 4",
         }, .{
             .ctx = @ptrCast(&g_ctx),
             .on_toggle = onToggle,
             .on_select = onSelectTile,
             .on_open_studio = noopCtx,
+            .on_cancel = noopCtxId,
         });
         gap(@src(), 2, 18);
 
@@ -526,6 +608,76 @@ fn statusBar(st: VramState, id: usize) void {
 /// The status-bar state sheet: the same bar under three different loads,
 /// stacked, so the unloaded case and the pressure thresholds can be compared
 /// side by side rather than reasoned about.
+/// Three hosts' bars, through the REAL `status_bar.render` rather than the
+/// canned drawing above: one bar per host, each with its own name, its own
+/// sampling history and its own draggable handles. This is the path the app
+/// takes, so it is the one worth a picture; what it checks is that two bars do
+/// not share a ring, a widget id or a handle.
+var host_views: [4]status_bar.View = @splat(.{});
+var host_mirrors: [4]mirror.Mirror = undefined;
+var host_meters: [4]struct { split: f32, limit: f32 } = .{
+    .{ .split = 0.60, .limit = 0.95 },
+    .{ .split = 0.35, .limit = 0.80 },
+    .{ .split = 0.50, .limit = 0.98 },
+    .{ .split = 0.50, .limit = 0.95 },
+};
+const host_names = [_][]const u8{ "local", "lydia", "basement", "attic" };
+/// The fourth bar is a host that is not answering: its row says why, in place
+/// of numbers that would be stale.
+const host_trouble = [_][]const u8{ "", "", "", "token refused: re-pair this host" };
+/// Four reasons a bar is not taking work, one per row: held back on purpose,
+/// short of a file, not yet describing itself, and not answering at all.
+/// Without the note the first three are indistinguishable from an idle host.
+const host_note = [_][]const u8{ "paused", "missing files", "starting up", "" };
+
+fn cannedHosts(gpa: std.mem.Allocator) void {
+    // A 24 GB card mid-chat, a small 4 GB card rendering, and one idle.
+    const t = [_]wire.Telemetry{
+        .{ .have_gpu = true, .gpu_util = 71, .cpu = 22, .vram_total = 24 * gb, .vram_used = 17 * gb, .vram_proc = 15 * gb, .llm_used = 12 * gb, .ctx_kv = 2 * gb, .ctx_tokens = 8192, .layers_gpu = 36, .limit = 22 * gb },
+        .{ .have_gpu = true, .gpu_util = 96, .cpu = 8, .vram_total = 4 * gb, .vram_used = 3 * gb, .vram_proc = 3 * gb, .diff_dit = 1800 * 1024 * 1024, .diff_te = 172 * 1024 * 1024, .diff_latent = 120 * 1024 * 1024, .limit = 3 * gb },
+        // A host that has not said what card it has: the bar must say so
+        // rather than draw an invented one.
+        .{ .cpu = 5 },
+        .{},
+    };
+    const st = [_]wire.State{
+        .{ .llm_resident = true, .llm_busy = true, .diff_present = true },
+        .{ .diff_present = true, .diff_busy = true, .diff_family = "krea2", .pending_images = 2 },
+        .{},
+        .{},
+    };
+    for (&host_mirrors, 0..) |*m, i| {
+        m.* = mirror.Mirror.init(gpa);
+        m.telemetry = t[i];
+        m.state = st[i];
+        // Two samples so the sparklines have a slope rather than a dot.
+        m.telemetry_seq = 1;
+    }
+}
+
+fn hostsFrame() void {
+    var root = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = C.canvas,
+    });
+    defer root.deinit();
+
+    style.sectionHead(@src(), "one bar per engine host", .{ .padding = .{ .x = 14, .y = 14, .h = 8 } });
+    for (&host_views, 0..) |*v, i| {
+        // Feed each bar a few samples so its history is not one flat dot.
+        host_mirrors[i].telemetry_seq = @intCast(i + 1);
+        status_bar.render(v, &host_mirrors[i], host_names[i], host_trouble[i], host_note[i], i, &host_meters[i].split, &host_meters[i].limit, .{
+            .on_change = noop,
+            .on_commit = noop,
+            .on_eject_llm = noop,
+            .on_eject_diff = noop,
+            .on_toggle_pause_llm = noop,
+            .on_toggle_pause_diff = noop,
+        });
+    }
+}
+
 fn statesFrame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
@@ -551,6 +703,12 @@ var probe_cfg: config.Config = blk: {
     // edit away — a malformed expression goes amber, and a gated curve
     // (`max(0, 0.6*(1-t/0.4))`) adds the cutoff clause to the readout.
     c.weight_noise = true;
+    // Two hosts, so the Hosts section draws its rows and not just the add form:
+    // one healthy and one in trouble, which are the two colors that row has.
+    _ = c.addHost("attic", "/run/user/1000/tensorpencil-qt/attic.sock", true);
+    _ = c.addHost("lydia", "tp://10.0.0.130:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ ("3c" ** 32), false);
+    // Just pasted and answered, not applied: the one row whose news is good.
+    _ = c.addHost("cellar", "tp://10.0.0.9:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ ("7a" ** 32), false);
     break :blk c;
 };
 
@@ -601,17 +759,353 @@ fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
 /// The dial is set to something other than 1, since a slider parked at its
 /// default says nothing about whether the row renders the value it holds.
 fn cannedLoraSelection(cfg: *config.Config) void {
-    selection.selectCheckpoint(cfg, &model_lib.cat, "/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors");
+    selection.selectCheckpoint(cfg, &probe_mirror.catalog, "/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors");
     if (cfg.addFamilyLora("sensenova", "/models/loras/sensenovaU158BMot_8StepTurboLora.safetensors")) |l| {
         l.strength = 0.85;
     }
+}
+
+// ------------------------------------------------------------------- studio
+
+/// Canned prompt library for the studio's left rail. Deliberately awkward for
+/// the same reason the conversation titles are: a long prompt that must
+/// ellipsize by WIDTH, and a CJK one where a character budget would cut early.
+const prompt_today = [_]shell.ConvRow{
+    .{ .id = 1, .title = "a lighthouse in heavy fog, long exposure, muted palette" },
+    .{ .id = 2, .title = "ceramic mug on oak, soft window light" },
+    .{ .id = 3, .title = "霧の中の灯台、長時間露光" },
+};
+const prompt_earlier = [_]shell.ConvRow{
+    .{ .id = 4, .title = "isometric shop fronts, pastel" },
+};
+const prompt_groups = [_]shell.ConvGroup{
+    .{ .head = "TODAY", .rows = &prompt_today },
+    .{ .head = "EARLIER", .rows = &prompt_earlier },
+};
+
+/// The studio draws from a mirror, so the probe fills one by hand: no host, no
+/// engine, and nothing touches the GPU.
+var probe_mirror: mirror.Mirror = undefined;
+
+fn noopPost(_: wire.Request) void {}
+
+/// The canvas source, over the one canned mirror. Two hosts would draw the
+/// same, so the probe names one to show the caption carrying it.
+fn probeImages() image_view.Images {
+    return .{ .live = probeLive, .newest = probeNewest, .hostOf = probeHostOf };
+}
+
+fn probeLive(_: *anyopaque, out: []*const mirror.Image) []const *const mirror.Image {
+    var n: usize = 0;
+    for (probe_mirror.images.items) |*im| {
+        if (n >= out.len) break;
+        switch (im.status()) {
+            .generating, .suspended => {},
+            else => continue,
+        }
+        out[n] = im;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn probeNewest(_: *anyopaque) ?*const mirror.Image {
+    const imgs = probe_mirror.images.items;
+    var i = imgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (imgs[i].status() == .done) return &imgs[i];
+    }
+    return null;
+}
+
+fn probeHostOf(_: *anyopaque, _: wire.ImageId) []const u8 {
+    return "workshop";
+}
+
+/// The catalog a host would have sent.
+fn setCannedCatalog(c: catalog.Catalog) void {
+    probe_mirror.catalog.deinit();
+    probe_mirror.catalog = c;
+}
+
+/// The four hosts of `probe_cfg` with a catalog each, merged as the app merges
+/// them. Every state the overview grid and the menu markers can draw is in
+/// here, because each is a different wrong-looking thing when it breaks:
+///
+///   - a file on this machine and one other: the grid has two filled dots;
+///   - a file two of three hosts can run: the marker reads "2 of 3";
+///   - a checkpoint a host holds without the VAE it needs: a faint dot, and
+///     the marker says missing files;
+///   - a file only a host that is DOWN has: greyed, named, still listed;
+///   - a file no host but a remote one has: it is in the menu at all, which is
+///     the whole point.
+var probe_models: models.Union = undefined;
+/// The id text of the chat model only the remote host has, for the selection.
+var probe_remote_llm_buf: [catalog.id_text_len]u8 = undefined;
+var probe_remote_llm: []const u8 = "";
+
+/// A file only a remote host has, named the way a remote catalog names one: the
+/// id text as its path, the stem beside it. The id text is COMPUTED, because a
+/// host computes it the same way and a fixture whose two disagree tests nothing
+/// that can happen.
+fn remoteEntry(buf: *[catalog.id_text_len]u8, name: []const u8, size: u64) catalog.Entry {
+    return .{
+        .path = catalog.idText(catalog.modelId(name, size, 0), buf),
+        .name = name,
+        .size = size,
+        .mtime_ns = 1,
+    };
+}
+
+/// One host's catalog: the entries of `full` whose path contains any of `keep`,
+/// plus `extra` (files this machine does not have).
+fn hostCatalog(gpa: std.mem.Allocator, full: *const catalog.Catalog, keep: []const []const u8, extra: []const catalog.Entry) !catalog.Catalog {
+    var list: std.ArrayList(catalog.Entry) = .empty;
+    defer list.deinit(gpa);
+    for (full.entries) |*e| {
+        for (keep) |k| if (std.mem.indexOf(u8, e.path, k) != null) {
+            try list.append(gpa, e.*);
+            break;
+        };
+    }
+    try list.appendSlice(gpa, extra);
+    return catalog.Catalog.fromEntries(gpa, list.items);
+}
+
+fn buildProbeModels(gpa: std.mem.Allocator) !void {
+    const full = &probe_mirror.catalog;
+
+    // A remote host names its files by id, never by path, and carries the stem
+    // beside it. Drawing them any other way would hide the case that matters.
+    const zimg: catalog.Entry = .{ .path = "id:00000000000000a1", .name = "zImageTurbo_v10", .size = 41, .mtime_ns = 1, .ckpt = .{ .family = .zimage, .contents = .{ .denoiser = true } } };
+    var zimg_te: catalog.Entry = .{ .path = "id:00000000000000a2", .name = "qwen3_4b_instruct", .size = 42, .mtime_ns = 1 };
+    zimg_te.side.set(.zimage, .conditioner);
+    var zimg_vae: catalog.Entry = .{ .path = "id:00000000000000a3", .name = "fluxVae", .size = 43, .mtime_ns = 1 };
+    zimg_vae.side.set(.zimage, .decoder);
+    // A chat model only the remote host has, named the way a remote catalog
+    // names one. The settings probe SELECTS it: a reference is an id there, and
+    // a label built from the reference rather than the catalog reads as
+    // "id:7da8e81dfa8c1632" to the user.
+    var b6: [catalog.id_text_len]u8 = undefined;
+    var remote_llm = remoteEntry(&b6, "Qwen3-4B-Instruct-2507-Q4_K_M", 46);
+    remote_llm.llm = .{ .arch = "qwen3", .size_label = "4B", .width = 2560, .blocks = 36, .supported = true, .vision = false, .class = "Qwen 3 4B" };
+    probe_remote_llm = catalog.idText(catalog.modelId("Qwen3-4B-Instruct-2507-Q4_K_M", 46, 0), &probe_remote_llm_buf);
+    // An Anima checkpoint with nothing on that host to pair it with.
+    var b4: [catalog.id_text_len]u8 = undefined;
+    var orphan = remoteEntry(&b4, "pastelkaAnima_v7", 44);
+    orphan.ckpt = .{ .family = .anima, .contents = .{ .denoiser = true } };
+    // A checkpoint only the host that is down has.
+    var b5: [catalog.id_text_len]u8 = undefined;
+    var stranded = remoteEntry(&b5, "kWALUAN_v08INT8", 45);
+    stranded.ckpt = .{ .family = .krea2, .contents = .{ .denoiser = true } };
+
+    var attic = try hostCatalog(gpa, full, &.{ "Gemma-4-31B", "dreamshaperXL" }, &.{orphan});
+    defer attic.deinit();
+    // Holds the Krea 2 checkpoint and its encoder, but no VAE: it has the file
+    // and still cannot render with it.
+    var lydia = try hostCatalog(gpa, full, &.{ "krea2CenterSemiraw", "qwen3VLInstruct4b", "Gemma-4-31B" }, &.{ zimg, zimg_te, zimg_vae, remote_llm });
+    defer lydia.deinit();
+    var cellar = try hostCatalog(gpa, full, &.{}, &.{stranded});
+    defer cellar.deinit();
+
+    probe_models.deinit();
+    probe_models = try models.build(gpa, &.{
+        .{ .name = "local", .cat = full },
+        .{ .name = "attic", .cat = &attic },
+        .{ .name = "lydia", .cat = &lydia },
+        .{ .name = "cellar", .up = false, .cat = &cellar },
+    });
+}
+
+/// One finished render for the canvas, as a synthetic gradient. Real pixels
+/// rather than a placeholder because the canvas's whole job is sizing an image
+/// into the column, and a flat block would not show that going wrong.
+fn cannedStudio(gpa: std.mem.Allocator) !void {
+    probe_mirror.state.diff_present = true;
+
+    const w: u32 = 1216;
+    const h: u32 = 832;
+    const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    for (0..h) |y| for (0..w) |x| {
+        const i = (y * w + x) * 4;
+        rgba[i + 0] = @intCast(40 + (x * 120) / w);
+        rgba[i + 1] = @intCast(60 + (y * 90) / h);
+        rgba[i + 2] = @intCast(90 + ((x + y) * 100) / (w + h));
+        rgba[i + 3] = 255;
+    };
+    _ = probe_mirror.addLocal(.{
+        .prompt = "a lighthouse in heavy fog",
+        .status = .done,
+        .req_width = w,
+        .req_height = h,
+        .req_steps = 28,
+        .req_seed = 8812,
+        .width = w,
+        .height = h,
+        .pixels_rev = 1,
+        .from_studio = true,
+    }, rgba, null);
+
+    // One still queued, so the rail has a row and the composer shows its count.
+    _ = probe_mirror.addLocal(.{
+        .prompt = "a lighthouse, taller crop",
+        .status = .pending,
+        .req_width = 832,
+        .req_height = 1216,
+        .req_steps = 28,
+        .total = 28,
+        .from_studio = true,
+    }, null, null);
+
+    // Three renders in motion, which is what two or three hosts produce all the
+    // time and what the canvas grid exists for. Different aspect ratios and one
+    // with no preview yet: the tile sizing and the empty slot are the two things
+    // that go wrong here, and neither shows with a single square render.
+    try cannedLive(gpa, "ceramic mug on oak, soft window light", 1216, 832, 7, 28, .generating, true);
+    try cannedLive(gpa, "isometric shop fronts, pastel", 832, 1216, 19, 28, .generating, true);
+    try cannedLive(gpa, "霧の中の灯台、長時間露光", 1024, 1024, 2, 28, .generating, false);
+}
+
+/// One render in flight, with a coarse preview standing in for the sampler's.
+fn cannedLive(
+    gpa: std.mem.Allocator,
+    prompt: []const u8,
+    w: u32,
+    h: u32,
+    step: u32,
+    total: u32,
+    status: wire.ImageStatus,
+    with_preview: bool,
+) !void {
+    const id = probe_mirror.addLocal(.{
+        .prompt = prompt,
+        .status = status,
+        .req_width = w,
+        .req_height = h,
+        .req_steps = total,
+        .req_seed = 4410 + step,
+        .step = step,
+        .total = total,
+        .width = w,
+        .height = h,
+        .from_studio = true,
+    }, null, null);
+    if (!with_preview) return;
+
+    // A preview arrives at a fraction of the final size, so the probe's is one
+    // too: a tile that sizes off the preview rather than the request is a bug
+    // only a non-matching size shows.
+    const pw = w / 8;
+    const ph = h / 8;
+    const px = try gpa.alloc(u8, @as(usize, pw) * ph * 4);
+    for (0..ph) |y| for (0..pw) |x| {
+        const i = (y * pw + x) * 4;
+        px[i + 0] = @intCast(30 + (y * 150) / ph);
+        px[i + 1] = @intCast(70 + (x * 80) / pw);
+        px[i + 2] = @intCast(120 - (x * 90) / pw);
+        px[i + 3] = 255;
+    };
+    const im = probe_mirror.byId(id) orelse return;
+    im.preview = px;
+    im.preview_w = pw;
+    im.preview_h = ph;
+    im.preview_rev = 1;
+}
+
+fn studioFrame() void {
+    var root = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = C.canvas,
+    });
+    defer root.deinit();
+
+    const bands = shell.Bands.from(root, status_bar.bar_outer_height);
+
+    shell.titleBar(.{
+        .tab = .studio,
+        .llm = .{ .label = "Gemma-4-31B-it-Q4_K_M", .resident = true },
+        .llm_menu = probe_llm_menu,
+        .image = .{ .label = "sensenovaU158BMot_sft", .resident = true },
+        .image_menu = probe_image_menu,
+    }, .{ .on_tab = onTab, .on_llm_pick = noopPick, .on_image_pick = noopPick, .on_settings = noop });
+
+    {
+        var body = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = bands.body },
+            .max_size_content = .height(bands.body),
+        });
+        defer body.deinit();
+
+        shell.sidebar(.{
+            .groups = &prompt_groups,
+            .new_label = "New prompt",
+            .empty = "Prompts you generate from are kept here.",
+            .footer = false,
+        }, .{
+            .on_new_chat = noop,
+            .on_select = noopId,
+            .on_delete = noopId,
+            .on_models = noop,
+            .on_settings = noop,
+        });
+
+        {
+            const band_w = dvui.parentGet().data().contentRect().w;
+            const col_w = @max(320, band_w - style.Layout.sidebar_w - style.Layout.rail_w);
+            var col = dvui.box(@src(), .{ .dir = .vertical }, .{
+                .expand = .vertical,
+                .min_size_content = .{ .w = col_w },
+                .max_size_content = .width(col_w),
+            });
+            defer col.deinit();
+            image_view.render(&probe_cfg, &probe_mirror, &probe_models, probeImages(), noopPost, true, .{ .settings = noop, .save_defaults = noop, .cancel = noopId });
+        }
+
+        // The same rail as chat: work in motion is on the canvas here and in the
+        // tool card there, so neither lists it.
+        queue_rail.render(.{
+            .tab = g_rail_tab,
+            .jobs = &jobs,
+            .library = &library,
+        }, .{
+            .on_tab = onRailTab,
+            .on_pause_all = noop,
+            .on_open_library = noopId,
+            .on_cancel = noopId,
+            .on_retry = noopId,
+            .on_reorder = onReorder,
+        });
+    }
+
+    statusBar(states[0], 0);
 }
 
 fn settingsFrame() void {
     // The app pushes this from a live capability probe; the probe has no model, so
     // it asserts the supported case, which is the one with a section to look at.
     config_view.g_noise_supported = true;
-    config_view.render(&probe_cfg, .{ .apply = noop, .cancel = noop });
+    // The add form as it looks having refused: pressing Add with no name is
+    // what a pasted pairing string alone does, and it used to say nothing.
+    config_view.g_add_host = .no_name;
+    // Two library sections open and the rest closed: the grid and the header
+    // are different drawings and both are worth seeing in one frame.
+    config_view.g_lib_open[0] = true; // chat models
+    config_view.g_lib_open[2] = true; // image checkpoints
+    config_view.render(&probe_cfg, &probe_mirror, &probe_models, .{
+        .apply = noop,
+        .cancel = noop,
+        .rescan = noop,
+        .hostStatus = noHostStatus,
+        .hostSync = noHostSync,
+        .sendModel = noSendModel,
+        .sendPath = noSendPath,
+        .pullPath = noPullPath,
+        .tryHost = noTryHost,
+        .reconnectHost = noReconnectHost,
+    });
 }
 
 // --------------------------------------------------------------------- main
@@ -622,10 +1116,14 @@ pub fn main(init: std.process.Init) !void {
     Backend.c.SDL_SetMainReady();
 
     const args = try init.minimal.args.toSlice(arena);
+    probe_mirror = mirror.Mirror.init(std.heap.smp_allocator);
+    probe_models = models.empty(std.heap.smp_allocator);
     var out_path: []const u8 = "ui_probe.png";
     var states_mode = false;
     var settings_mode = false;
+    var studio_mode = false;
     var lora_mode = false;
+    var hosts_mode = false;
     var dims: [2]?u32 = .{ null, null };
     var seen_out = false;
     for (args[1..]) |arg| {
@@ -634,12 +1132,26 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--settings")) {
             settings_mode = true;
             // The form reads the catalog and the config's selection; give it both.
-            model_lib.setCanned(try cannedCatalog(std.heap.smp_allocator));
+            setCannedCatalog(try cannedCatalog(std.heap.smp_allocator));
+            try buildProbeModels(std.heap.smp_allocator);
             _ = probe_cfg.addModelDir("/models");
-            selection.selectLlm(&probe_cfg, &model_lib.cat, "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf");
-            selection.selectCheckpoint(&probe_cfg, &model_lib.cat, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
+            // A model only the remote host has, referenced by id: the row must
+            // read as its name.
+            selection.selectLlm(&probe_cfg, &probe_models.cat, probe_remote_llm);
+            selection.selectCheckpoint(&probe_cfg, &probe_mirror.catalog, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
+        } else if (std.mem.eql(u8, arg, "--studio")) {
+            studio_mode = true;
+            setCannedCatalog(try cannedCatalog(std.heap.smp_allocator));
+            try buildProbeModels(std.heap.smp_allocator);
+            _ = probe_cfg.addModelDir("/models");
         } else if (std.mem.eql(u8, arg, "--lora")) {
             lora_mode = true;
+        } else if (std.mem.eql(u8, arg, "--library")) {
+            g_rail_tab = .library;
+            try cannedLibrary(std.heap.smp_allocator);
+        } else if (std.mem.eql(u8, arg, "--hosts")) {
+            hosts_mode = true;
+            cannedHosts(std.heap.smp_allocator);
         } else if (std.fmt.parseInt(u32, arg, 10)) |n| {
             if (dims[0] == null) dims[0] = n else dims[1] = n;
         } else |_| {
@@ -655,11 +1167,31 @@ pub fn main(init: std.process.Init) !void {
     // The flag may arrive after `--settings`, so the swap happens once the whole
     // command line has been read.
     if (settings_mode and lora_mode) cannedLoraSelection(&probe_cfg);
+    if (!settings_mode and !states_mode and !studio_mode and !hosts_mode) try cannedTiles(std.heap.smp_allocator);
+    // The studio needs a checkpoint selected for its architecture-dependent
+    // rows; `--lora` puts it on SenseNova, which is the only family here with a
+    // LoRA section to draw (see Family.supportsLora).
+    if (studio_mode) {
+        if (lora_mode) {
+            cannedLoraSelection(&probe_cfg);
+            // The studio reads the family from the checkpoint FILE, and the
+            // probe's paths are canned, so it is told directly.
+            image_view.forced_family = .sensenova;
+            // Every section open: a probe of a collapsible form that shows only
+            // the folded heads is a probe of four words.
+            probe_cfg.studio_open_loras = true;
+            probe_cfg.studio_open_advanced = true;
+        } else {
+            selection.selectCheckpoint(&probe_cfg, &probe_mirror.catalog, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
+            image_view.forced_family = .krea2;
+        }
+        try cannedStudio(std.heap.smp_allocator);
+    }
 
     // Settings is a tall scrolled form; give it a canvas the whole thing fits on
     // so a capture shows every section rather than whatever the scroll happens to
     // be resting on.
-    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else if (settings_mode) @as(u32, 2600) else 705);
+    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else if (settings_mode) @as(u32, 2600) else if (studio_mode) @as(u32, 900) else if (hosts_mode) @as(u32, 60 + 4 * @as(u32, @intFromFloat(status_bar.bar_outer_height))) else 705);
 
     const win_opts: Backend.InitOptions = .{
         .io = init.io,
@@ -691,6 +1223,12 @@ pub fn main(init: std.process.Init) !void {
     style.install();
     _ = try win.end(.{});
 
+    // One notice, posted from OUTSIDE any frame, which is where the app learns
+    // of a failed render (pumping the hosts happens between frames). Handing
+    // that straight to dvui panics; `toast.pump` inside the frame is why this
+    // reaches the screen at all.
+    toast.post(.warn, "Image failed on lydia: the checkpoint is missing a component (VAE or text encoder). Trying local instead.", .{});
+
     // Text layouts report their min size a frame late, so an early capture
     // catches the screen mid-settle.
     // A synthetic pointer parked on the second conversation row, so the hover
@@ -702,7 +1240,7 @@ pub fn main(init: std.process.Init) !void {
         try win.begin(win.frame_time_ns + @as(i128, @intCast(i + 1)) * 16 * std.time.ns_per_ms);
         _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
         style.install();
-        if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else frame();
+        if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
         _ = try win.end(.{});
     }
 
@@ -710,7 +1248,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
     style.install();
     var pic = dvui.Picture.start(dvui.windowRectPixels()) orelse return error.CaptureUnsupported;
-    if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else frame();
+    if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
     _ = dvui.currentWindow().endRendering(.{});
     pic.stop();
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 1 << 20);

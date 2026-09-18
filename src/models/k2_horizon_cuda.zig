@@ -75,9 +75,13 @@ fn kvFmt(dt: kvmod.KvDtype) cuda.backend.KvFmt {
 
 /// Planning cap on device-resident routed experts (`TP_K2_EXPERT_CACHE_GIB`).
 fn expertCacheLimit(be: *Backend) u64 {
-    const total = be.ctx.memGetInfo().total;
     const reserve: u64 = 2 << 30;
     const max_cache: u64 = 21 << 30;
+    // Unknown card size: cap at `max_cache` and let the allocator's eviction
+    // ladder find the real ceiling. Sizing from a zero would cache no experts at
+    // all and run the whole MoE off the host, which looks like a slow model
+    // rather than a failed query.
+    const total = if (be.ctx.memGetInfo()) |mi| mi.total else max_cache + reserve;
     const default_limit = if (total > reserve) @min(max_cache, total - reserve) else total / 4;
     const raw = std.c.getenv("TP_K2_EXPERT_CACHE_GIB") orelse return default_limit;
     const gib = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return default_limit;
@@ -655,7 +659,7 @@ pub const CudaLM = struct {
             self.be.pinnedWeightBytes() >> 20,
             self.kvDeviceBytes() >> 20,
             self.be.deviceUsed() >> 20,
-            self.be.ctx.memGetInfo().free >> 20,
+            self.be.ctx.freeMiB(),
         });
     }
 
@@ -1360,11 +1364,14 @@ pub const CudaLM = struct {
         }
         var keep: u64 = 0;
         for (self.lm.layers) |layer| keep += routedBytes(layer);
-        const free = self.be.ctx.memGetInfo().free;
         const reserve: u64 = 1 << 30;
         const cap = expertCacheLimit(self.be);
-        if (keep <= @min(cap, free -| reserve)) return 0;
-        const budget = @min(cap, free -| reserve -| stage_bytes);
+        // Unknown free VRAM: plan against the cache cap alone. Read as zero it
+        // would push every MoE layer to the host to relieve a shortage that was
+        // never measured.
+        const avail = if (self.be.ctx.memGetInfo()) |mi| mi.free -| reserve else cap;
+        if (keep <= @min(cap, avail)) return 0;
+        const budget = @min(cap, avail -| stage_bytes);
         var cpu_layers: usize = 0;
         for (self.lm.layers, 0..) |layer, l| {
             if (keep <= budget) break;
@@ -1416,8 +1423,12 @@ pub const CudaLM = struct {
             }
         }
         // Always dynamic, so KV growth migrates layers instead of failing; the
-        // card is the ceiling until an arbiter hands down a budget.
-        if (self.split == null) self.enableCpuSplit(.tail, be.ctx.memGetInfo().total, true) catch {};
+        // card is the ceiling until an arbiter hands down a budget. A card that
+        // cannot be asked has no ceiling to enforce, and 0 is NOT how to say
+        // that: `ensureCapacity` reads it as nothing fitting and migrates every
+        // routed-expert layer to the host on the first KV growth.
+        const card = if (be.ctx.memGetInfo()) |mi| mi.total else std.math.maxInt(u64);
+        if (self.split == null) self.enableCpuSplit(.tail, card, true) catch {};
         self.dumpPlacement("warm");
     }
 
@@ -1602,7 +1613,8 @@ test "K2 Horizon CUDA produces the expected first token" {
     try gpu.offloadToBudget(be.deviceUsed() -| (10 << 30));
     errdefer std.debug.print("after big offload: host layers {d}\n", .{gpu.hostLayers()});
     try std.testing.expect(gpu.hostLayers() >= before + 15);
-    _ = try gpu.promoteLayers(be.ctx.memGetInfo().total);
+    const card = be.ctx.memGetInfo() orelse return error.NoDeviceMemInfo;
+    _ = try gpu.promoteLayers(card.total);
     try gpu.resetCache();
     try std.testing.expectEqual(id, try gpu.stepArgmax(io, ids.items));
     try gpu.resetCache();

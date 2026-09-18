@@ -31,6 +31,14 @@ pub const Buffer = struct {
     }
 };
 
+/// One resolved kernel name, copied rather than borrowed: a couple of callers
+/// build the name in a stack buffer (`mmq_pipe_q2_0_<geom>`).
+const FnName = struct {
+    f: cu.CUfunction = null,
+    buf: [48]u8 = undefined,
+    len: u8 = 0,
+};
+
 /// A JIT-compiled PTX module.
 pub const Module = struct {
     mod: cu.CUmodule,
@@ -38,6 +46,7 @@ pub const Module = struct {
     pub fn getFunction(self: Module, ctx: *Context, name: [:0]const u8) Error!cu.CUfunction {
         var f: cu.CUfunction = null;
         try ctx.check(ctx.api.cuModuleGetFunction(&f, self.mod, name.ptr), "cuModuleGetFunction");
+        ctx.noteFunction(f, name);
         return f;
     }
 
@@ -114,6 +123,22 @@ pub const Context = struct {
     /// Last JIT log (error or info) from loadModule; valid until the next call.
     jit_log: [16384]u8 = undefined,
     jit_log_len: usize = 0,
+
+    /// Latched by `check` on the first error the driver documents as leaving the
+    /// context unusable (`cu.isContextFatal`). Every later call in this context
+    /// returns that same code, `cuMemGetInfo` included, so a reading taken after
+    /// this point is not a small number, it is no number at all.
+    fatal: ?cu.CUresult = null,
+    /// The last kernels launched here, newest at `launch_seq - 1`. A fault is
+    /// reported by the next SYNCHRONIZING call, not by the launch that caused it,
+    /// so the culprit is in this ring rather than in whatever call returned the
+    /// error. CUDA_LAUNCH_BLOCKING=1 collapses the two.
+    launch_ring: [8]cu.CUfunction = @splat(null),
+    launch_seq: u64 = 0,
+    /// Names for the functions resolved through `Module.getFunction`, so the ring
+    /// prints as kernels instead of pointers. Inline and fixed: Context has no
+    /// allocator, and a full table costs names, not correctness.
+    fn_names: [128]FnName = @splat(.{}),
 
     pub fn init(gpa: std.mem.Allocator) Error!Context {
         // Integration tests are gated behind `-Dintegration`: fail init in test
@@ -437,8 +462,81 @@ const FillPool = struct {
 
     pub fn check(self: *Context, r: cu.CUresult, comptime what: []const u8) Error!void {
         if (r == cu.CUDA_SUCCESS) return;
+        if (cu.isContextFatal(r)) {
+            if (self.fatal == null) {
+                self.fatal = r;
+                self.reportFatal(r, what);
+            }
+            // Past the first one every call in the context reports the same thing;
+            // printing each would bury the one line that says what happened.
+            return error.CudaError;
+        }
         std.debug.print("CUDA {s} failed: {s} ({s})\n", .{ what, self.api.errName(r), self.api.errString(r) });
         return error.CudaError;
+    }
+
+    /// Has this context taken an unrecoverable fault? Everything it reports
+    /// afterwards is that fault, so callers that shed resources on a low reading
+    /// must not act on one taken after this turns true.
+    pub fn isLost(self: *const Context) bool {
+        return self.fatal != null;
+    }
+
+    /// The whole story, once, at the point it is still attributable.
+    fn reportFatal(self: *Context, r: cu.CUresult, what: []const u8) void {
+        std.debug.print(
+            \\
+            \\CUDA CONTEXT LOST: {s} ({s})
+            \\  reported by: {s}
+            \\  device: {s}
+            \\
+        , .{ self.api.errName(r), self.api.errString(r), what, self.deviceName() });
+        // Newest first: the reporting call is a synchronization point, so the
+        // fault belongs to a kernel already queued behind it.
+        if (self.launch_seq == 0) {
+            std.debug.print("  no kernel has been launched on this context (the fault is in a copy or an allocation)\n", .{});
+        } else {
+            std.debug.print("  kernels last launched here, newest first:\n", .{});
+            var i: u64 = 0;
+            while (self.recentLaunch(i)) |f| : (i += 1) {
+                std.debug.print("    {s}\n", .{self.functionName(f)});
+            }
+        }
+        std.debug.print(
+            \\  Every later call in this context returns the same error, cuMemGetInfo
+            \\  included, so VRAM readings from here on are meaningless. The process
+            \\  must be restarted to use the GPU again.
+            \\  Re-run with CUDA_LAUNCH_BLOCKING=1 to pin the fault to one launch.
+            \\
+            \\
+        , .{});
+    }
+
+    /// The `i`th most recently launched kernel, 0 being the newest; null once `i`
+    /// runs past what the ring still holds.
+    fn recentLaunch(self: *const Context, i: u64) ?cu.CUfunction {
+        if (i >= @min(self.launch_seq, self.launch_ring.len)) return null;
+        return self.launch_ring[(self.launch_seq - 1 - i) % self.launch_ring.len];
+    }
+
+    fn noteFunction(self: *Context, f: cu.CUfunction, name: []const u8) void {
+        for (&self.fn_names) |*e| {
+            if (e.f == f) return; // re-resolved: one entry, not one per lookup
+            if (e.f != null) continue;
+            e.f = f;
+            const n = @min(e.buf.len, name.len);
+            @memcpy(e.buf[0..n], name[0..n]);
+            e.len = @intCast(n);
+            return;
+        }
+    }
+
+    fn functionName(self: *const Context, f: cu.CUfunction) []const u8 {
+        if (f == null) return "(none)";
+        for (&self.fn_names) |*e| {
+            if (e.f == f) return e.buf[0..e.len];
+        }
+        return "(unnamed)";
     }
 
     // ---- Modules ------------------------------------------------------------
@@ -556,11 +654,28 @@ const FillPool = struct {
     /// Live device free/total bytes (cuMemGetInfo), sees OTHER processes'
     /// usage, the CUDA analog of VK_EXT_memory_budget. Used for weight-stream
     /// budgeting; returns free=0 on query failure (forces conservative eviction).
-    pub fn memGetInfo(self: *Context) struct { free: usize, total: usize } {
+    pub const MemInfo = struct { free: usize, total: usize };
+
+    /// Null when the card could not be asked: no context bound on the CALLING
+    /// thread (cuMemGetInfo reads the current one), or a context that has taken a
+    /// fatal fault. This is deliberately not a zero. Every consumer here sheds
+    /// something when free VRAM is low, so a failed query returned as `free = 0`
+    /// reads as "card full" and evicts weights, offloads layers to the host and
+    /// unloads the resident image pipeline, none of which gives back a byte,
+    /// because nothing was ever short.
+    pub fn memGetInfo(self: *Context) ?MemInfo {
+        if (self.fatal != null) return null;
         var free_b: usize = 0;
         var total_b: usize = 0;
-        if (self.api.cuMemGetInfo(&free_b, &total_b) != cu.CUDA_SUCCESS) return .{ .free = 0, .total = 0 };
+        if (self.api.cuMemGetInfo(&free_b, &total_b) != cu.CUDA_SUCCESS) return null;
         return .{ .free = free_b, .total = total_b };
+    }
+
+    /// Free VRAM in MiB for a LOG LINE, where an unknown reads as 0 and costs
+    /// nothing. Never decide anything with this; take the null from `memGetInfo`.
+    pub fn freeMiB(self: *Context) u64 {
+        const mi = self.memGetInfo() orelse return 0;
+        return mi.free >> 20;
     }
 
     // ---- VMM growable buffers (reserve VA once, commit physical chunks) ------
@@ -682,6 +797,8 @@ const FillPool = struct {
         shared_bytes: u32,
         params: []?*anyopaque,
     ) Error!void {
+        self.launch_ring[self.launch_seq % self.launch_ring.len] = func;
+        self.launch_seq += 1;
         try self.check(self.api.cuLaunchKernel(
             func,
             grid[0],
@@ -737,4 +854,76 @@ const FillPool = struct {
 
 test {
     _ = Context;
+}
+
+/// A Context with only the fault-report fields set: everything below runs on the
+/// host, so these tests need no driver and no device.
+fn testContext() Context {
+    var c: Context = undefined;
+    c.fatal = null;
+    c.launch_ring = @splat(null);
+    c.launch_seq = 0;
+    c.fn_names = @splat(.{});
+    return c;
+}
+
+fn fakeFn(i: usize) cu.CUfunction {
+    return @ptrFromInt(0x1000 + i * 0x10);
+}
+
+test "the launch ring reports the newest kernel first" {
+    var c = testContext();
+    for (0..3) |i| {
+        c.launch_ring[c.launch_seq % c.launch_ring.len] = fakeFn(i);
+        c.launch_seq += 1;
+    }
+    try std.testing.expectEqual(fakeFn(2), c.recentLaunch(0).?);
+    try std.testing.expectEqual(fakeFn(1), c.recentLaunch(1).?);
+    try std.testing.expectEqual(fakeFn(0), c.recentLaunch(2).?);
+    try std.testing.expectEqual(@as(?cu.CUfunction, null), c.recentLaunch(3));
+}
+
+test "a wrapped ring reports the last ring_len launches, still newest first" {
+    var c = testContext();
+    const n = c.launch_ring.len * 3 + 1;
+    for (0..n) |i| {
+        c.launch_ring[c.launch_seq % c.launch_ring.len] = fakeFn(i);
+        c.launch_seq += 1;
+    }
+    for (0..c.launch_ring.len) |i| {
+        errdefer std.debug.print("ring slot {d} of {d}\n", .{ i, c.launch_ring.len });
+        try std.testing.expectEqual(fakeFn(n - 1 - i), c.recentLaunch(i).?);
+    }
+    try std.testing.expectEqual(@as(?cu.CUfunction, null), c.recentLaunch(c.launch_ring.len));
+}
+
+test "kernel names survive a caller's stack buffer, and an unknown one is labelled" {
+    var c = testContext();
+    {
+        var buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "mmq_pipe_q2_0_{s}", .{"g64"}) catch unreachable;
+        c.noteFunction(fakeFn(0), name);
+        @memset(&buf, 0xaa); // the caller's buffer is gone by the time we print
+    }
+    try std.testing.expectEqualStrings("mmq_pipe_q2_0_g64", c.functionName(fakeFn(0)));
+    try std.testing.expectEqualStrings("(unnamed)", c.functionName(fakeFn(1)));
+    try std.testing.expectEqualStrings("(none)", c.functionName(null));
+}
+
+test "a name longer than the table's slot is truncated, not written past" {
+    var c = testContext();
+    const long = "k" ** 200;
+    c.noteFunction(fakeFn(0), long);
+    try std.testing.expectEqual(c.fn_names[0].buf.len, c.functionName(fakeFn(0)).len);
+}
+
+test "only the driver's context-fatal codes latch" {
+    try std.testing.expect(cu.isContextFatal(cu.CUDA_ERROR_ILLEGAL_ADDRESS));
+    try std.testing.expect(cu.isContextFatal(cu.CUDA_ERROR_LAUNCH_FAILED));
+    try std.testing.expect(cu.isContextFatal(cu.CUDA_ERROR_MISALIGNED_ADDRESS));
+    // Recoverable: the allocator's eviction ladder runs on these, and latching
+    // one would turn an ordinary OOM into a lost context.
+    try std.testing.expect(!cu.isContextFatal(cu.CUDA_ERROR_OUT_OF_MEMORY));
+    try std.testing.expect(!cu.isContextFatal(cu.CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES));
+    try std.testing.expect(!cu.isContextFatal(cu.CUDA_SUCCESS));
 }

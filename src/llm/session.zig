@@ -156,7 +156,7 @@ pub var weight_noise_seed: u32 = 0;
 /// (so `transformer_gpu.decoderLayer*` can tell it which layer is launching) AND
 /// ticks the stream in its forward. Extend this list in the same commit that adds
 /// a stepper, or the GUI will offer the knob for a model that ignores it.
-/// `weight noise arch list matches the steppers` in `gui/chat.zig` fails if the two
+/// `weight noise arch list matches the steppers` in `engine/chat.zig` fails if the two
 /// drift. `llama` runs on the qwen3 stepper.
 pub fn archSupportsWeightNoise(arch: []const u8) bool {
     for ([_][]const u8{ "gemma4", "gemma3", "qwen3", "qwen35", "llama" }) |a| if (std.mem.eql(u8, arch, a)) return true;

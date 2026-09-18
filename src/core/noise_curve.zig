@@ -240,7 +240,7 @@ const Parser = struct {
 
 /// The shapes this repo recommends, and the only place they are checked to be
 /// well-formed. They also appear in tp-llm's `--weight-noise` help and as tp-gui's
-/// shipped curve library (`gui/config.zig` `builtin_curves`, which cannot check
+/// shipped curve library (`shared/config.zig` `builtin_curves`, which cannot check
 /// them: it imports no evaluator). Keep the three in step.
 pub const documented_shapes = [_][]const u8{
     "a", // flat

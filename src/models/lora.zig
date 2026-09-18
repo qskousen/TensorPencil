@@ -528,6 +528,26 @@ pub const Stack = struct {
         for (self.files.items) |f| n += f.side.bytes();
         return n;
     }
+
+    /// Visit every factor's raw bytes.
+    ///
+    /// ⚠️ The device backends key their weight cache on the HOST POINTER they
+    /// were handed, and for a fused linear that is a SUB-SLICE of the B factor
+    /// (`lora_cuda.applyRange` takes `f.b.bytes[b_off..]`), not the address
+    /// yielded here. A stack about to be freed must have the whole RANGE of each
+    /// of these evicted from that cache FIRST (`evictWeightRange`): the
+    /// allocator hands the same addresses to the next stack, and the cache would
+    /// then serve the OLD factors under the new file's name -- a finite,
+    /// plausible, wrong image with no error anywhere.
+    pub fn forEachFactorBytes(self: *const Stack, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) void) void {
+        for (self.files.items) |f| {
+            var it = f.side.index.valueIterator();
+            while (it.next()) |t| for (t.factors) |fa| {
+                visit(ctx, fa.a.bytes);
+                visit(ctx, fa.b.bytes);
+            };
+        }
+    }
 };
 
 /// Files one stack can hold. A dial per file is a GUI row, so the cap is what

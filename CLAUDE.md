@@ -25,7 +25,7 @@ When working on code, if you notice a problem or a comment that is extraneous or
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
 - There's no risk to trying big complicated work. We want to try unusual things. Be bold and adventerous.
 - However, bold is not the same as sprawling: keep it structured and organized, and generalize where generalizing is cheap.
-- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out. `zig build test -Dtarget=x86_64-windows` compiles the whole tree for Windows (it cannot run the binaries); the only expected failures are the system C libraries. `core/filemap.zig` (whole-file mapping) and `core/dynlib.zig` (runtime library loading, which `std.DynLib` has no Windows arm for) are where the per-platform branches live; a new one belongs there rather than at a call site.
+- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out. `zig build test -Dtarget=x86_64-windows` compiles the whole tree for Windows (it cannot run the binaries); the only expected failures are the system C libraries. `core/filemap.zig` (whole-file mapping), `core/dynlib.zig` (runtime library loading, which `std.DynLib` has no Windows arm for) and `core/diskspace.zig` (free space, which std wraps nowhere) are where the per-platform branches live; a new one belongs there rather than at a call site.
 - After adding a new kernel feature like relo, supporting a new dtype like bf16 or qk_6 for a backend, or anything similar, check BACKEND.md and update it to reflect the current state.
 - Performance is CRITICAL, and we need to do what it takes to get there - don't skip out and do something easier if the hard work is what is needed.
 - **A negative/limiting conclusion requires a receipt.** Before claiming an optimization "isn't worth it," "won't help," "can't be done cleanly," or "is too fragile/expensive," you must have an ISOLATION measurement that removes exactly the component in question (e.g. disable the op and re-time) — not a proxy and not an assumption. State whether each claim is measured or assumed.
@@ -56,7 +56,6 @@ from a checkpoint, match what ComfyUI does.
 | `LIBRARY.md` | the layered module split, for external consumers |
 | `VIDEO_PLAN.md` | the video/audio roadmap, MiniMax H3 first. Its "silent wrong answers" list is the reason to read it before touching any of that code |
 | `DIFFKEEP.md`, `DIFFKEEP_INTEGRATION.md` | the embedding encoders for the DiffKeep consumer |
-| `UI.md` | the tp-gui design spec; §13 records what shipped and where it diverges |
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
 | `TODO.md` | open work |
 
@@ -83,15 +82,46 @@ each has caught.
   `tools/test_timing_runner.zig`, which reports per-test wall time, slowest first. Reach
   for it before "the tests are slow": the gated suite's cost is ~9 real-model GPU tests,
   not the other 600.
-- `zig build gui-test` — tp-gui unit tests (config, fonts, style, history, framing,
-  markdown, meter math; not part of `test`)
-- `zig build ui-probe -- out.png [w h] [--states|--settings]` — render the whole chat
-  workspace (or the status bar under three loads, or the settings form) to a PNG from
-  canned data, with no model, GPU or engine. The GUI's failure modes are visual; this
-  is how you see them.
+- `zig build gui-test` — tp-gui unit tests: the three app layers (`shared`, `engine`,
+  `client`) plus the gui files with arithmetic in them (markdown, viewmath, fonts, style,
+  meter, status bar, image studio). Not part of `test`. **A file's tests only run if a
+  step compiles it**: three of those had tests that nothing built, so they never ran.
+- `zig build ui-probe -- out.png [w h] [--states|--settings|--studio|--hosts|--library]` — render
+  the whole chat workspace (or the status bar under three loads, the settings form, the
+  image studio, or one status bar per engine host) to a PNG from canned data, with no
+  model, GPU or engine. `--hosts` goes through the REAL `status_bar.render`, which is
+  what shows that two bars do not share a history ring, a widget id or a handle. The GUI's
+  failure modes are visual; this is how you see them. `--studio --lora` draws the
+  studio over a SenseNova selection, the only family with a LoRA section.
 - `zig build catalog-probe -- <folder>...` — scan model folders as tp-gui does and print
   what each file was taken for. The answer to "why is my model not in the menu".
+- `zig build serve` — `tp-serve`, the engine host daemon tp-gui spawns beside itself
+  (`gui` installs it too). `tp-serve --remote <bind>:<port> --models <dir> --backend
+  vulkan` serves another machine: it mints its certificate and token into a state
+  directory and prints the pairing string once (`pair tp://…`), which is what a client
+  pastes into its Hosts list, and takes model files into `--incoming` (default: the
+  first `--models` folder). `zig build driver-probe -- --config <copy> --message <text>`
+  drives the host in-process and prints its events; `zig build serve-probe -- ...` does the
+  same through a spawned tp-serve over its socket (`--kill-mid-turn` is the reconnect
+  gate); `zig build hosts-probe -- --config <copy> --llm <small gguf> --message <text>
+  --image <prompt> [--kill-b | --remote <pairing string> --size 256 --steps 4]
+  [--send-model <file>]` runs two hosts as tp-gui's `client/hosts.zig` does, chat on one
+  and the image on the other, the second a local child or the remote daemon named;
+  `--send-model` pushes a file the host lacks and waits for it to come back in that
+  host's catalog under the id this machine computed. `zig build tls-spike` is the remote
+  link's gate with no engine: right token, wrong token, wrong pin, a big frame each way.
+  All take `--image <prompt>`; the config is always a scratch copy, never the user's, and
+  every probe hands that copy to the child it spawns so the daemon reads it too.
 - `zig build -Doptimize=ReleaseFast` — optimized; required for any timing measurement.
+- **The daemon keeps none of what the user types, and `serve/privacy_test.zig` is the
+  check**: a canary prompt driven through the protocol must reach no file the host wrote,
+  and the walk is proven to have teeth in the same test. What a stub cannot see is covered
+  by the receipt in `src/serve_main.zig`'s module doc, which lists every path tp-serve may
+  open for writing and is diffed against `zig build serve-probe` under
+  `strace -ff -e trace=openat,creat,rename,unlinkat`. The paths that print a prompt or a
+  reply (`TP_DUMP_CTX`, `TP_DUMP_REPLY`) are COMPILED OUT of the engine layer under
+  `-Dprivacy`, on by default; `-Dprivacy=false` builds them back for `chat-probe`, which
+  is where template work happens. A flag is a promise; a missing code path is a fact.
 
 The gate lives in `src/test_gate.zig` (`build_options.integration`): GPU `init` fails in
 test builds when it is off, and heavy tests call `test_gate.requireModelFile` /
@@ -112,7 +142,9 @@ CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda
 `zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
 `minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `sensenova-cuda-test`
 (and `sensenova-vk-test`, the same checks over the Vulkan arm), `lora-cuda-test` (needs no
-checkpoint), plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
+checkpoint), `lora-restack-test` (a LoRA stack swapped on a live session: the
+image must come back bit-identical AND the factors' VRAM must be handed back),
+plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
 
 **A quantized checkpoint that renders is not a quantized checkpoint that works.** A
 conditioning that is gone renders a clean picture that ignores the prompt, so a
@@ -128,7 +160,7 @@ depend on one tier. `LIBRARY.md` has the detail.
 
 | module | root | holds |
 |---|---|---|
-| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the two per-platform shims (`filemap`, `dynlib`) |
+| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the three per-platform shims (`filemap`, `dynlib`, `diskspace`) |
 | `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
 | `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
 | `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
@@ -136,7 +168,146 @@ depend on one tier. `LIBRARY.md` has the detail.
 | `TensorPencil` | `src/root.zig` | the umbrella module; anything public must be re-exported here |
 
 Executables are thin drivers: `src/main.zig` (diffusion CLI), `src/llm_main.zig`,
-`src/gui_main.zig` (`src/gui/`).
+`src/gui_main.zig` (`src/gui/`), `src/serve_main.zig` (`tp-serve`, the engine host).
+
+**The app above the library is four layers, each a build module** (`build.zig` `layers`):
+`src/shared/` (settings, catalog, model spec, tool calls, the settings-to-pipeline enum
+maps in `pipeline_map.zig`: what tp-gui and tp-serve both hold), `src/engine/` (the chat session, the diffusion engine, the scanner, `driver.zig`,
+which owns all three plus the VRAM arbiter and the loader thread, and `host.zig`, which
+runs the Driver on its own thread behind an inbox and outbox of wire frames: what owns a
+GPU), `src/client/` (selection memory, history, and `mirror.zig`, the client's copy of the
+host's state rebuilt from events, and `remote.zig`, the socket end of a host) and
+`src/gui/` (dvui views only). **tp-gui runs no engine and links no `engine` module.**
+`client/hosts.zig` holds its hosts: the local `tp-serve` at
+`$XDG_RUNTIME_DIR/tensorpencil-<user>/local.sock`, spawned beside the binary when none
+listens (`--autospawn`: the child holds the client's stdin and leaves when it closes or
+the events client disconnects), plus every host the settings list (`Config.hosts`: a
+socket the client spawns a daemon at or connects to, or a remote host under TLS from
+its pairing string, `link.Endpoint`'s text form). Each host has a `Remote` and a
+`Mirror`; chat is pinned to one (`Config.chat_host`, re-pinning cancels the turn on both
+and re-adopts the transcript), a new image joins the CLIENT's queue and is handed to a
+host only as one frees up (`Hosts.dispatch`, one outstanding job per host, counting
+what was handed over and not yet listed), and a request naming an image goes to the
+host that minted it (a host mints ids under a prefix hashed from its generation, so ids
+never collide). **Placement is a pure function** (`client/sched.zig`) over facts each
+host already sends (its catalog, its state block, its telemetry) plus what its own
+finished images cost (`ImageInfo`'s timestamps, per family, seconds per step per
+megapixel, in memory only): seconds until done there, counting the load, the steps, the
+render running there and what waits behind it. A busy host can win, and the job is then
+HELD for it and counts as ahead of the next job there, so the rest of the queue spreads.
+A job no host can take is SKIPPED rather than blocking the queue behind it, and a host
+must hold every file the render needs (checkpoint, both text encoders, VAE), not just the
+checkpoint. ⚠️ **A card too small for the model is a COST, never a veto** — the engine
+streams what it cannot keep resident (measured: a 5.6 GB checkpoint renders on a 3.1 GB
+Arc holding 1.8 GB of it), so `sched` charges the streamed fraction and still schedules
+there; the room it charges against is the card less what the chat model holds. Only
+four things disqualify a host: down, paused, no image engine, or it does not hold the
+model. When nobody holds the model it says which host could run it, which is what the
+settings row offers to send. `chat_contention` and the cold-start figures are ASSUMED,
+labelled so, and replaced by a host's own numbers after one image. **Connects run on
+their own threads** (`hosts.Connecting`; the frame thread never waits on a socket, and
+`Remote` sends requests from a sender thread). A host that cannot be reached, at start
+or later, is retried on a widening backoff (a second out to half a minute, forever);
+only an entry that cannot name an endpoint is given up on, and a Settings row offers to
+reach a down host at once. A reconnect compares the host's generation: a restarted
+daemon gets the mirror's transcript and every image it minted becomes a local one
+(`Mirror.hostRestarted`); the SAME daemon back after a dropped link keeps its ids, its
+snapshot overwrites the mirror by id, and it is told to cancel any render this client
+already put elsewhere while it was gone. Every view reads a `Mirror`
+and posts a `wire.Request`; pixels are pulled by revision, never pushed; the engine
+writes no files, the client saves what it fetched (`client/save_image.zig`).
+**A render the model asks for is placed by the client, exactly like one the user
+asks for.** The chat host parses its own `<image>` tool calls and queues NONE of
+them: it reports each as an `img_requested` event, the client turns it into an
+ordinary job with an `Asked` record, and placement, holding for a faster host,
+replay on failure and retry all apply. So the model's pictures can render on a
+machine other than the one carrying the conversation. The client then tells that
+conversation's host which image the call became (`chat_image`, so the transcript
+carries it wherever it ran, and names the new one in place of the old when a
+failure moves it) and how it turned out (`chat_note`, the synthetic
+turn the model reads next). Nothing about a finished render is the host's to
+remember, which is why the outcome cannot be reported from there. **The report is
+idempotent, and has to be**: a reply parsed while no client was listening reaches
+nobody and the host keeps none of it, so a snapshot re-parses and says it again;
+the client refuses a call it already placed, matching on host, message, variant
+and the call's index within that reply. Whether the model is TOLD the tool exists
+is `config.image_tool`, which the client sets per host from whether ANY host can
+render (`Hosts.canRenderAnywhere`) and re-pushes when that answer moves: a host
+carrying the chat may hold no checkpoint and still have somewhere to send a
+render. A `chat_note` that arrives with nothing resident waits on the Driver
+(`Driver.pending_notes`) and is handed over when a session comes up, so a render
+that finished during an eject or a reload is still reported.
+**The host is an execution engine with no memory of finished work.** When the
+client holds an image's final state and its pixels (or the host had none), it
+sends `img_ack` and the host frees the image outright: a daemon runs for days and
+a finished render is 4 MiB it will never read again. So anything that wants a
+finished image is the CLIENT's job, not the host's. Retry is a fresh
+`img_enqueue` the client builds from the request it kept (`Hosts.retry`), which
+is why it can go to a host other than the one that failed it; a snapshot after an
+ack no longer lists the image, and the client keeps it because `Image.acked` is
+what survives the snapshot merge.
+**A picture is not tied to the host that made it.** `Hosts.finished` / `.running`
+gather every host's renders in ONE list ordered by when each was made, which is
+what the rail, the library and the viewer draw, and each carries the host's name
+(`Hosts.hostOf`, empty for a picture this client restored from a file). The
+studio gates on `Hosts.renderTarget`, the host that would take the NEXT render,
+not the chat host, so its model notice and queue count describe the machine that
+will do the work. Previews are fetched at what a view actually draws
+(`Hosts.setPreviewMaxEdge`): on a remote host a 4 MiB frame every half second is
+what the finished picture queues behind. Full pixels past the newest few are
+dropped to their thumbnails (`Mirror.evictPixels`, saved files only) and read
+back from disk when a view shows one at full size; a finished render whose pixels
+have not arrived draws as receiving rather than as missing or failed. The host scans the
+model folders (`scan` request, `catalog` event carrying the index document) and caches
+the index beside the settings file it was given. Only `config.HostSettings` crosses the
+wire: the `Config` fields named in `config.host_fields`, which is exactly the set the
+engine reads, so a new field the engine needs goes on that list or it never arrives.
+**A model crosses the wire by path only to a host on the same disk.** A remote host
+(`tp-serve --remote`, `host.Options.folders`) scans its own folders, sends its catalog
+with each path replaced by `catalog.ModelId` text (`id:<hex>`, hashed from stem and
+size, so the same file on two machines has one id) and the stem in `Entry.name`, keeps
+its own `config.machine_fields` (the backends) whatever a client pushes, and every host
+resolves an id in a `config.model_ref_fields` setting against its own catalog before
+the engine sees it; a remote one drops a plain path outright. The client stores
+whatever `path` the catalog entry carries, so selection code never knows which it holds,
+and `hosts.postSettingsTo` rewrites paths to ids on the way to a remote host.
+**A model moves between machines only because the CLIENT moves it**; a host never
+reaches for one. `serve/blob.zig` is content-addressed by BLAKE3 in fixed chunks, each
+chunk checked as it lands, the whole file at commit, and `openHeader` before the file is
+offered at all; the RECEIVER is authoritative about what it already holds (it re-hashes
+the partial), so a sender remembers nothing across a crash, and after setup neither side
+allocates per chunk. Both directions share that: a push drives the host's `Store`
+(`/v1/blob`), a pull drives a LOCAL `Store` off the host's `Offer` (`/v1/pull/<id>`,
+`blob.Fetcher`), so a fetched file gets every check a sent one does. A pull names the
+file by the host's catalog id, because a machine that lacks a file has no path for it;
+`Host.offerPath` answers from a table republished per scan, since a connection thread
+must not touch the live catalog, and only a file in the scanned folders is nameable.
+`client/sync.zig` runs one transfer per host on its own thread with its own links, and
+the Settings model library offers both (`Hosts.missingModel` covers every
+`config.model_ref_fields` entry, not just the render's). The host rescans when a file
+lands and the client rescans the local host after a pull; the client re-pushes settings
+whenever a host's catalog moves, which is what makes the just-moved model resolve.
+Every queue row cancels on its own: a render still waiting here is dropped from
+the client queue, one a host took is cancelled there, and a row that only records
+a failure is cleared away locally (`Hosts.forget`), which is final because the
+host freed that image when the client acknowledged it.
+Cancel and pause skip the request queue (`Driver.Urgent`), and `Driver.assertEngineThread`
+names the one thread that touches the engines. `engine/driver.zig`'s module doc is where
+the lock order lives.
+Cross-layer references are `@import("shared").config`, never a relative path: a test or
+probe rooted in one directory cannot `@import` a file above it. `src/serve/` is the
+protocol layer, pure std: `wire.zig` (the types), `link.zig` (a reader and writer pair
+behind a small vtable: a unix socket, the loopback fallback, or std's TLS client pinned
+to one certificate; `Through` is the writer whose flush reaches the socket, which the
+TLS layers' own writers do not), `httpc.zig` (the client half), `server.zig` (the
+engine-free routing: `GET /v1/hello`, `POST /v1/req`, `PUT /v1/upload`, the
+`GET /v1/events` WebSocket; any link that is not a unix socket must carry a bearer
+secret whose BLAKE3 hash the listener holds: the loopback cookie from the `ready`
+line, or the remote token, and a refused one waits a second before its 401). The TLS
+server end is tls.zig, kept in `src/serve_tls.zig` with the daemon so no test binary
+links it. Its tests run a fake backend over a loopback link in the fast suite.
+`catalog-probe`, `chat-probe` and `driver-probe` link `engine` and `shared` with no
+dvui, which is what enforces that those layers stay free of it.
 
 **The GUI has one design system, `src/gui/style.zig`**: palette, type scale, radii,
 the dvui theme, and every shared primitive. A view never names a color, a font face
@@ -146,14 +317,21 @@ user- or model-visible string must go through its run splitter (`addStyled` /
 `bubbles.zig` and `queue_rail.zig` render from plain data through callbacks, which
 is what lets `ui-probe` draw the real screen without an engine.
 
-**tp-gui picks models from a catalog, never from typed paths.** `gui/catalog.zig` scans
+**tp-gui picks models from a catalog, never from typed paths.** `shared/catalog.zig` scans
 the configured folders header-only (`Container.openHeader`, so a scan never maps a
 weight) and classifies each file by what the ENGINE says it is: `detectFamily` for a
 checkpoint, GGUF metadata plus `chat.familyForArch` for an LLM, and
 `model_spec.storeFits` (the pipeline's probe table plus a width and depth check) for a
-side file. `gui/selection.zig` is the one writer of the effective path fields, from a
+side file. `client/selection.zig` is the one writer of the effective path fields, from a
 pick and the per-family / per-class memories; everything downstream still reads only
-those fields.
+those fields. **Every menu, picker and the selection read EVERY host's catalog merged
+into one** (`client/models.zig`, rebuilt on `Hosts.modelSeq`): one row per file, joined
+on `Entry.id()`, so the same file on two machines is one choice and a model only a
+remote host holds is still pickable. The local host is source 0, which keeps a file on
+this machine represented by its real path. A row also carries which hosts could RUN it,
+not merely hold it: a checkpoint needs a file for every component it does not bundle,
+on the SAME machine, so counting hosts that hold the checkpoint would count machines
+that render nothing.
 
 A model architecture is normally three files: `foo.zig` (CPU reference and the loader),
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path
@@ -302,7 +480,12 @@ they support** — a new reader belongs in that shared module the day it is writ
 - **A LoRA is a runtime sidecar, never a merge**: `models/lora.zig` (loader + host apply)
   and `models/lora_cuda.zig` (device), keyed on `Weight.tag`, so it is
   architecture-independent. `y = W x + s B (A x)` leaves an int8 base untouched and
-  `strength` a runtime dial. Same call-site hazard as above, and `minimax_h3.Lin` is the
+  `strength` a runtime dial. The stack is swappable on a LIVE session
+  (`Session.setLoras`, between forwards only), since nothing about a sidecar reads
+  the checkpoint; ⚠️ it must evict each outgoing factor from the pointer-keyed
+  device weight cache BEFORE freeing it, or the next stack is served the old
+  copies and the swap leaks a whole stack. `Family.supportsLora` is the list of
+  architectures with a sidecar arm at all, and a UI asks it before offering one. Same call-site hazard as above, and `minimax_h3.Lin` is the
   answer to it: the weight is reachable only as `.w`, so the sidecar is in every grep.
 - ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met four times here
   (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk

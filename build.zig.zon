@@ -70,9 +70,10 @@
         //    // actually used.
         //    .lazy = false,
         //},
-        // Platform config-dir resolution for the tp-gui settings file. Lazy +
-        // gui-only, same policy as dvui — keeps `zig build` / `zig build test`
-        // free of GUI deps and the library module pure Zig.
+        // Platform config-dir resolution for the settings file. Same policy as
+        // dvui: only the app layers build against it, and the library module
+        // stays pure Zig. (Lazy does not keep `zig build test` from FETCHING
+        // it; see the note in build.zig.)
         .known_folders = .{
             .url = "git+https://github.com/ziglibs/known-folders#207c34a16e4365edc20d92c7892f962b3bed46e8",
             .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
@@ -87,6 +88,14 @@
         .ggml = .{
             .url = "git+https://github.com/ggml-org/ggml.git#af97976c7810cdabb1863172f31c432dab767de7",
             .hash = "N-V-__8AAP4dRgGvA0F-sJT6AoKQXCawEOODVEYKAU_KWzym",
+            .lazy = true,
+        },
+        // TLS 1.3 server for tp-serve's remote links (std has only a client).
+        // Pinned to the tip of the maintained zig-0.16.x branch. Only the serve
+        // exes and the tls-spike step link it, so no test binary carries it.
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig#e04ae448ce7ee70c136d4d48b059314543203809",
+            .hash = "tls-0.1.0-ER2e0jGpBgCkVC-Yp12NgSdHNUtZr52MleJ8roHlUa54",
             .lazy = true,
         },
     },

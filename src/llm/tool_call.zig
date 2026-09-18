@@ -45,7 +45,7 @@
 const std = @import("std");
 
 // --- where a reply's ANSWER starts ------------------------------------------
-// Lives here rather than in `gui/toolcall.zig` (where it grew up) because BOTH
+// Lives here rather than in `shared/toolcall.zig` (where it grew up) because BOTH
 // tool scanners need it and two definitions of "the answer" is exactly the drift
 // that lets one caller fire a tool the other hides. `chat.Reasoning` aliases the
 // type below, so a family's markers pass straight through with no conversion.

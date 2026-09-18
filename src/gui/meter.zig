@@ -27,7 +27,7 @@ const dvui = @import("dvui");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
-const vram_split = @import("vram_split.zig");
+const vram_split = @import("shared").vram_split;
 
 const C = dvui.Color;
 const P = style.C;

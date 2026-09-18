@@ -167,14 +167,54 @@ pub const Config = struct {
     /// metadata build it from the `qwen3.*` keys; everything else matches a
     /// preset by its embedding tensor name and shape (rope_theta is not
     /// recoverable from weights, so only known configurations load).
+    /// The vision tower, at this name wherever the language tower sits. It is
+    /// what tells VL-4B from plain Qwen3-4B, which share vocab, width and depth
+    /// and differ in rope, a thing no weight records. A VL file carrying the
+    /// language tower alone reads as the plain model.
+    ///
+    /// `container` is what the whole encoder sits under in a bundled
+    /// checkpoint ("" once a `Prefixed` store has taken it off): asking without
+    /// it answers no for a file that does carry the tower.
+    pub fn hasVisionTower(store: WeightStore, container: []const u8) bool {
+        var buf: [160]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "{s}model.visual.patch_embed.proj.weight", .{container}) catch return false;
+        return store.get(name) != null;
+    }
+
+    /// The prefix this store spells the language tower with: this config's own,
+    /// or flat on `model.`. Everything the loader reads hangs off it, so it is
+    /// resolved once against the file rather than taken from the variant.
+    pub fn resolvePrefix(self: Config, store: WeightStore) []const u8 {
+        var buf: [96]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{self.prefix})) |name| {
+            if (store.get(name) != null) return self.prefix;
+        } else |_| {}
+        // The same rule `detect` and `model_spec.storeFits` apply: only the
+        // vision tower separates a FLATTENED VL language tower from plain
+        // Qwen3-4B, which shares its vocab, width and depth. Taking the plain
+        // file as krea2's encoder would run it at 1e6 instead of 5e6 -- finite,
+        // wrong conditioning with nothing to see. Left on its own prefix, the
+        // load fails by tensor name instead.
+        if (std.mem.eql(u8, self.prefix, vl_4b.prefix) and !hasVisionTower(store, "")) return self.prefix;
+        return if (store.get("model.embed_tokens.weight") != null) "model." else self.prefix;
+    }
+
     pub fn detect(store: WeightStore) !Config {
         if (store == .gguf) return detectGguf(store.gguf);
-        inline for (.{ vl_4b, qwen3_0_6b, qwen3_4b }) |cfg| {
-            var buf: [96]u8 = undefined;
-            const name = try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix});
-            if (store.get(name)) |view| {
+        const vl = hasVisionTower(store, "");
+        inline for (.{ vl_4b, qwen3_0_6b, qwen3_4b }) |preset| {
+            // A VL language tower answers on `model.language_model.` or, flat,
+            // on `model.`; the vision tower says which model it belongs to.
+            for ([2][]const u8{ preset.prefix, "model." }) |pfx| {
+                var buf: [96]u8 = undefined;
+                const name = std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{pfx}) catch continue;
+                const view = store.get(name) orelse continue;
                 const shape = view.info.shape.slice();
-                if (shape.len == 2 and shape[0] == vocab_size and shape[1] == cfg.hidden) return cfg;
+                if (shape.len != 2 or shape[0] != vocab_size or shape[1] != preset.hidden) continue;
+                if (std.mem.eql(u8, preset.prefix, vl_4b.prefix) != vl) continue;
+                var cfg = preset;
+                cfg.prefix = pfx;
+                return cfg;
             }
         }
         return error.UnknownModelConfig;
@@ -440,7 +480,7 @@ pub const TextEncoder = struct {
         // recoverable and has to come from the Variant's constant. What stays with
         // the Variant is the TAP LIST, because which hidden states to keep is a
         // property of how the *diffusion* model was trained, not of the encoder.
-        const cfg = if (store == .gguf) blk: {
+        var cfg = if (store == .gguf) blk: {
             var c = try Config.detect(store);
             c.vocab = @max(c.vocab, 1);
             // A checkpoint that states nothing must not win. ComfyUI-style
@@ -455,6 +495,9 @@ pub const TextEncoder = struct {
             if (!statesRopeTheta(store.gguf)) c.rope_theta = variant.config().rope_theta;
             break :blk c;
         } else if (override) |o| o.cfg else variant.config();
+        // Qwen3-VL ships with its language tower nested or flattened onto
+        // `model.`; the rest of the file is spelled the same either way.
+        cfg.prefix = cfg.resolvePrefix(store);
         var nbuf: [96]u8 = undefined;
         const embed_name = try std.fmt.bufPrint(&nbuf, "{s}embed_tokens.weight", .{cfg.prefix});
         const embed_view = try store.require(embed_name);

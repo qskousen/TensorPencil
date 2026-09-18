@@ -299,6 +299,22 @@ pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
     return .{ .pixels = pixels, .width = width, .height = height };
 }
 
+/// Interleaved [h][w][3] to [h][w][4] with an opaque alpha, gpa-owned.
+pub fn rgbToRgba(gpa: std.mem.Allocator, rgb: []const u8, w: usize, h: usize) ![]u8 {
+    const rgba = try gpa.alloc(u8, w * h * 4);
+    for (0..w * h) |i| {
+        rgba[i * 4 ..][0..3].* = rgb[i * 3 ..][0..3].*;
+        rgba[i * 4 + 3] = 255;
+    }
+    return rgba;
+}
+
+test "rgbToRgba interleaves an opaque alpha" {
+    const rgba = try rgbToRgba(std.testing.allocator, &.{ 1, 2, 3, 4, 5, 6 }, 2, 1);
+    defer std.testing.allocator.free(rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 255, 4, 5, 6, 255 }, rgba);
+}
+
 /// Convert decoder output in [-1, 1] (planar [3][h][w], torch layout) to
 /// interleaved [h][w][3] u8, matching ComfyUI's (x/2 + 0.5).clamp(0,1) * 255.
 pub fn planarF32ToRgb8(gpa: std.mem.Allocator, planar: []const f32, width: usize, height: usize) ![]u8 {

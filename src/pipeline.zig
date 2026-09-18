@@ -1925,7 +1925,9 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
     return switch (fam) {
         .krea2 => switch (comp) {
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"blocks.0.attn.wq.weight"} },
-            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "embed_tokens.weight" } },
+            // Qwen3-VL's language tower sits under `language_model.` or flat on
+            // `model.`; `storeFits` tells it from plain Qwen3-4B by the tower.
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
             .conditioner2, .decoder2 => error.NoSuchComponent,
         },
@@ -1943,11 +1945,10 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
         // resolver is the same: each component is looked for in the primary
         // checkpoint first and in a side file second.
         //
-        // The conditioner probe is `model.embed_tokens.weight`, NOT krea2's
-        // `model.language_model.embed_tokens.weight`: krea2 uses the Qwen3-VL
-        // checkpoint, whose language model is nested a level deeper. Feeding either
-        // encoder to the other family resolves to nothing and reports it, which is
-        // the point of probing rather than assuming.
+        // Z-Image's encoder is a plain Qwen3-4B at `model.`, krea2's a
+        // Qwen3-VL-4B that may sit there too; they share vocab, width and depth
+        // and differ in rope, so `model_spec.storeFits` separates them by the
+        // vision tower only the VL one carries.
         .zimage => switch (comp) {
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"cap_embedder.1.weight"} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
@@ -2201,6 +2202,19 @@ pub const Family = enum {
     /// and in SDXL's second text tower, so nearly every stage is shared.
     pub fn isSd(self: Family) bool {
         return self == .sd15 or self == .sdxl;
+    }
+
+    /// Whether this architecture has a LoRA sidecar path in THIS build.
+    ///
+    /// The families without one refuse a sidecar at load rather than ignoring
+    /// it (see `Session.attachLoras`, which must stay the same list), so a UI
+    /// that offers the control for them is offering a render that cannot run.
+    /// Ask before drawing it, not after.
+    pub fn supportsLora(self: Family) bool {
+        return switch (self) {
+            .minimax_h3, .sensenova => true,
+            .krea2, .zimage, .anima, .sd15, .sdxl => false,
+        };
     }
 
     /// The patch-2 denoisers (krea2, Z-Image, Anima, H3) fold 2x2 latent cells into
@@ -2648,26 +2662,48 @@ pub const Session = struct {
     /// `lora_path` is the single-file shorthand and is applied on top of
     /// `loras`, so a caller may use either.
     fn loadLoras(self: *Session, io: std.Io, opts: Options, progress: ?*std.Io.Writer) !void {
-        const gpa = self.gpa;
         const extra: usize = if (opts.lora_path.len > 0) 1 else 0;
         const n = opts.loras.len + extra;
         if (n == 0) return;
         if (n > lora_mod.max_files) return error.TooManyLoras;
 
-        try note(progress, "loading {d} lora(s)...\n", .{n});
-        const sts = try gpa.alloc(Container, n);
-        errdefer gpa.free(sts);
+        var buf: [lora_mod.max_files]LoraSpec = undefined;
+        for (0..n) |i| buf[i] = if (i < opts.loras.len)
+            opts.loras[i]
+        else
+            .{ .path = opts.lora_path, .strength = opts.lora_strength };
+        try self.installLoras(io, buf[0..n], progress);
+    }
+
+    /// Open `specs`, merge them into one stack and attach it. Assumes nothing is
+    /// installed: `setLoras` calls `dropLoras` first.
+    fn installLoras(self: *Session, io: std.Io, specs: []const LoraSpec, progress: ?*std.Io.Writer) !void {
+        const gpa = self.gpa;
+        if (specs.len == 0) return;
+        if (specs.len > lora_mod.max_files) return error.TooManyLoras;
+
+        try note(progress, "loading {d} lora(s)...\n", .{specs.len});
+        const sts = try gpa.alloc(Container, specs.len);
         var opened: usize = 0;
-        errdefer for (sts[0..opened]) |*st| st.deinit();
-
         var stack: lora_mod.Stack = .{};
-        errdefer stack.deinit(gpa);
+        // ONE teardown for every failure below, the failed attach included --
+        // and that one happens after the stack is already on the session, so it
+        // is the session's copy that has to be freed, never the local one as
+        // well, or the same allocations go back twice.
+        errdefer {
+            // `attachLoras` publishes each pointer as it goes, so a failure part
+            // way through leaves attached models pointing into the stack this is
+            // about to free. Detaching first is what keeps that from being a
+            // live session left holding dangling factors (`Session.setLoras`).
+            self.detachLoras();
+            if (self.lora) |*s| s.deinit(gpa) else stack.deinit(gpa);
+            self.lora = null;
+            self.lora_sts = &.{};
+            for (sts[0..opened]) |*st| st.deinit();
+            gpa.free(sts);
+        }
 
-        for (0..n) |i| {
-            const spec: LoraSpec = if (i < opts.loras.len)
-                opts.loras[i]
-            else
-                .{ .path = opts.lora_path, .strength = opts.lora_strength };
+        for (specs, 0..) |spec, i| {
             sts[i] = try Container.openNamed(gpa, io, spec.path);
             opened += 1;
             _ = try stack.add(gpa, sts[i].store(), spec.strength, spec.path);
@@ -2679,8 +2715,54 @@ pub const Session = struct {
         self.lora = stack;
         const applied = try self.attachLoras();
         try note(progress, "  lora: {d} sidecars over {d} file(s), {d} MB\n", .{
-            applied, n, self.lora.?.bytes() >> 20,
+            applied, specs.len, self.lora.?.bytes() >> 20,
         });
+    }
+
+    /// Give back the pointers the models borrowed from the stack.
+    fn detachLoras(self: *Session) void {
+        switch (self.models) {
+            .minimax_h3 => |*m| m.dit.detachLora(),
+            .sensenova => |*m| m.dit.lora = null,
+            .krea2, .zimage, .anima, .sd15, .sdxl => {},
+        }
+    }
+
+    /// Detach and free the installed stack, if any.
+    fn dropLoras(self: *Session) void {
+        self.detachLoras();
+        if (self.lora) |*stack| {
+            // BEFORE the bytes go back to the allocator. The device weight cache
+            // is keyed on these exact host pointers, so a recycled address would
+            // serve the OLD factors to the next stack (see
+            // `lora.Stack.forEachFactorBytes`).
+            if (self.cu_be) |be| stack.forEachFactorBytes(be, evictFactorBytes);
+            stack.deinit(self.gpa);
+            self.lora = null;
+        }
+        for (self.lora_sts) |*st| st.deinit();
+        if (self.lora_sts.len > 0) self.gpa.free(self.lora_sts);
+        self.lora_sts = &.{};
+    }
+
+    fn evictFactorBytes(be: *cuda.Backend, bytes: []const u8) void {
+        // By RANGE: a fused linear's apply uploads a sub-slice of the B factor,
+        // and the cache keys on that inner pointer, not on `bytes.ptr`.
+        be.evictWeightRange(bytes);
+    }
+
+    /// Swap the whole LoRA stack on a live session. Nothing about a sidecar
+    /// reads the checkpoint, so this costs the LoRA files, not a model reload.
+    ///
+    /// ⚠️ Call it BETWEEN forwards, never beside one: the attach stores pointers
+    /// into the stack, so a swap under a running denoise is a use-after-free.
+    /// An empty `specs` just removes what is there, which works on every family;
+    /// a non-empty one on a family with no sidecar arm reports
+    /// `UnsupportedCheckpoint`, exactly as loading with it would have.
+    pub fn setLoras(self: *Session, io: std.Io, specs: []const LoraSpec) !void {
+        if (specs.len > lora_mod.max_files) return error.TooManyLoras;
+        self.dropLoras();
+        try self.installLoras(io, specs, null);
     }
 
     /// Resolve the installed stack against the family's linears, refusing a file
@@ -2707,11 +2789,19 @@ pub const Session = struct {
             // a `lora` field plus the plan hook; nothing has done it, and the
             // Vulkan and host arms would still need their own funnels. Refusing
             // beats a render that ignores the file on three of four backends.
+            // `familySupportsLora` is the same list, and a UI asks it first.
             .krea2, .zimage, .anima, .sd15, .sdxl => {
                 std.log.err("lora: the {t} family has no sidecar path in this build", .{self.family()});
                 return error.UnsupportedCheckpoint;
             },
         }
+    }
+
+    /// Resident factor bytes of the installed stack, 0 when there is none.
+    /// What a restack has to hand back to the device.
+    pub fn loraBytes(self: *const Session) usize {
+        const stack = self.lora orelse return 0;
+        return stack.bytes();
     }
 
     /// Move one file's dial on a live session. Nothing is reloaded: the strength
@@ -3267,12 +3357,28 @@ pub const Session = struct {
         return 0;
     }
 
-    /// Free VRAM (bytes) on the card, for the GUI's offload telemetry. 0 on
-    /// backends without a mem-info query (Vulkan) or no device. Reads the current
-    /// context, so the caller must be on a thread that bound this backend.
+    /// What the card holds, whichever backend this session runs on: CUDA
+    /// through `cuMemGetInfo`, Vulkan through `VK_EXT_memory_budget`. Null with
+    /// no device, or when the query failed. Reads the current context, so the
+    /// caller must be on a thread that bound this backend.
+    pub const VramInfo = struct { free: u64, total: u64, proc: u64 };
+
+    pub fn vramInfo(self: *const Session) ?VramInfo {
+        if (self.cu_be) |b| {
+            const mi = b.ctx.memGetInfo() orelse return null;
+            return .{ .free = mi.free, .total = mi.total, .proc = b.deviceUsed() };
+        }
+        if (self.gpu_ctx) |c| {
+            const mi = c.memGetInfo() orelse return null;
+            return .{ .free = mi.free, .total = mi.total, .proc = mi.proc };
+        }
+        return null;
+    }
+
+    /// Free VRAM (bytes) on the card, for the GUI's offload telemetry. 0 with
+    /// no device or no answer.
     pub fn freeVram(self: *const Session) u64 {
-        if (self.cu_be) |b| return b.ctx.memGetInfo().free;
-        return 0;
+        return if (self.vramInfo()) |v| v.free else 0;
     }
 
     /// MEASURED per-component VRAM breakdown for the GUI meter. Reads the live
@@ -3351,9 +3457,7 @@ pub const Session = struct {
         // the checkpoints go after it: the stack's factors are views into the
         // LoRA containers' mappings, and the device weight cache is keyed on
         // those host pointers.
-        if (self.lora) |*s| s.deinit(gpa);
-        for (self.lora_sts) |*st| st.deinit();
-        if (self.lora_sts.len > 0) gpa.free(self.lora_sts);
+        self.dropLoras();
         // Tear the compute backend down FIRST, before unmapping the checkpoint
         // safetensors below. The CUDA backend's prefetch thread streams weights
         // straight from those mmaps and DRAINS its queued requests as it joins
@@ -6321,7 +6425,7 @@ pub const Session = struct {
             // as a post-OOM stream fault (see recoverableDecodeErr).
             // (skip_whole jumps straight to tiling.)
             try note(progress, "vae decode: mode={s} pinned={d}MB streamed={d}MB free={d}MB\n", .{
-                @tagName(o.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.memGetInfo().free >> 20,
+                @tagName(o.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.freeMiB(),
             });
             var want: u64 = reclaim_chunk;
             // Free ~`wnt` bytes across this backend's own cache (LRU incl. the
@@ -6355,9 +6459,15 @@ pub const Session = struct {
                 // fused SDPA under `.libs`, `be.attn`'s online softmax otherwise.
                 const est = if (skip_whole) v.estimate(tp.tile, tp.tile, false) else v.estimate(lat_h, lat_w, false);
                 const target = est + est / 10; // 110%
-                const free_now = b.ctx.memGetInfo().free;
-                try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
-                if (free_now < target) _ = try freeSome(b, o.reclaim, progress, io, target - free_now);
+                // Unknown free VRAM: skip the proactive reclaim rather than read it
+                // as zero and evict the whole cache. The reactive loops below still
+                // catch a real shortfall, at the cost of one failed decode.
+                if (b.ctx.memGetInfo()) |mi| {
+                    try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, mi.free >> 20 });
+                    if (mi.free < target) _ = try freeSome(b, o.reclaim, progress, io, target - mi.free);
+                } else {
+                    try note(progress, "vae decode: est peak {d}MB, free VRAM unknown → no pre-reclaim\n", .{est >> 20});
+                }
             }
             // Phase 1: whole-image with incremental eviction.
             if (!skip_whole) {
@@ -6587,7 +6697,13 @@ pub const Session = struct {
             // evicted to recover. Physical room = live free VRAM + our own unpinned
             // weights (the text encoder), which evict + re-stream as the DiT pins.
             // Reserve the live activation scratch + a small margin on top.
-            const free_now = b.ctx.memGetInfo().free;
+            // Unknown free VRAM leaves only our own evictable weights as provable
+            // room, which is a near-total loss of pinning: say so, a silent one
+            // reads as a mysterious slowdown on every image.
+            const free_now = if (b.ctx.memGetInfo()) |mi| mi.free else blk: {
+                std.log.warn("[vram] free VRAM unknown: pinning only what our own evictable weights cover", .{});
+                break :blk 0;
+            };
             const evictable = b.evictableWeightBytes();
             const room = free_now + evictable;
             const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
@@ -6674,7 +6790,7 @@ pub const Session = struct {
                 if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve, free {d} -> {d}MB", .{
                     freed >> 20,        dit_to_place >> 20, dit_bytes >> 20,
                     dit_resident >> 20, pin_reserve >> 20,  free_now >> 20,
-                    b.ctx.memGetInfo().free >> 20,
+                    b.ctx.freeMiB(),
                 });
             }
         }
