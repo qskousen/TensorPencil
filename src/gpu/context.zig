@@ -30,6 +30,7 @@ const dp4a_spv = @embedFile("dp4a_spv");
 const subgroup_spv = @embedFile("subgroup_spv");
 const dual_spv = @embedFile("dual_spv");
 const dual_table = @import("kernels/dual_table.zig");
+const iq_grid = @import("kernels/iq_grid.zig");
 
 /// Push constants for the standalone `attn_batched` kernel (matches the Push
 /// struct in kernels/attn_batched.zig: u0=total, u1=n_heads, u2=n_kv, u3=hd,
@@ -384,7 +385,7 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr };
+pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q2_k_f32, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_q3_k_f32, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xxs_f32, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq2_xs_f32, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_xxs_f32, dequant_iq3_s_f16, dequant_iq3_s_bf16, dequant_iq3_s_f32, gemv_q2_k, gemv_q2_k_q8, gemv_q3_k, gemv_q3_k_q8, gemv_iq2_xxs, gemv_iq2_xxs_q8, gemv_iq2_xs, gemv_iq2_xs_q8, gemv_iq3_xxs, gemv_iq3_xxs_q8, gemv_iq3_s, gemv_iq3_s_q8 };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("rmsnorm"),
     dualEntry("rms_apply_w"),
@@ -575,6 +576,36 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("win_scatter"),
     dualEntry("modulate_pr"),
     dualEntry("gated_add_pr"),
+    dualEntry("dequant_q2_k_f16"),
+    dualEntry("dequant_q2_k_bf16"),
+    dualEntry("dequant_q2_k_f32"),
+    dualEntry("dequant_q3_k_f16"),
+    dualEntry("dequant_q3_k_bf16"),
+    dualEntry("dequant_q3_k_f32"),
+    dualEntry("dequant_iq2_xxs_f16"),
+    dualEntry("dequant_iq2_xxs_bf16"),
+    dualEntry("dequant_iq2_xxs_f32"),
+    dualEntry("dequant_iq2_xs_f16"),
+    dualEntry("dequant_iq2_xs_bf16"),
+    dualEntry("dequant_iq2_xs_f32"),
+    dualEntry("dequant_iq3_xxs_f16"),
+    dualEntry("dequant_iq3_xxs_bf16"),
+    dualEntry("dequant_iq3_xxs_f32"),
+    dualEntry("dequant_iq3_s_f16"),
+    dualEntry("dequant_iq3_s_bf16"),
+    dualEntry("dequant_iq3_s_f32"),
+    dualEntry("gemv_q2_k"),
+    dualEntry("gemv_q2_k_q8"),
+    dualEntry("gemv_q3_k"),
+    dualEntry("gemv_q3_k_q8"),
+    dualEntry("gemv_iq2_xxs"),
+    dualEntry("gemv_iq2_xxs_q8"),
+    dualEntry("gemv_iq2_xs"),
+    dualEntry("gemv_iq2_xs_q8"),
+    dualEntry("gemv_iq3_xxs"),
+    dualEntry("gemv_iq3_xxs_q8"),
+    dualEntry("gemv_iq3_s"),
+    dualEntry("gemv_iq3_s_q8"),
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -4649,8 +4680,61 @@ pub const Context = struct {
     pub fn dequantOnly(dt: @import("tp_core").dtype.DType) bool {
         return switch (dt) {
             .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
             else => false,
         };
+    }
+
+    /// Whether this format's decode is the DUAL row GEMV (kernels/dual/quant.zig),
+    /// the body the CUDA arm runs too. These formats have no per-backend kernel at
+    /// all, so it is not an opt-in A/B: without it a token would dequantize every
+    /// weight through the prefill GEMM.
+    pub fn dualGemv(dt: @import("tp_core").dtype.DType) bool {
+        return switch (dt) {
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
+            else => false,
+        };
+    }
+
+    /// The codebook blob the four IQ formats decode through, as a raw weight
+    /// buffer (`iq_grid.blob` is a stable comptime address, so the pointer-keyed
+    /// weight cache holds it like any other). Null for every format whose decode
+    /// is arithmetic, whose kernels leave the table slot unread.
+    fn iqTable(self: *Context, dt: @import("tp_core").dtype.DType) Error!?DeviceBuffer {
+        switch (dt) {
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => {},
+            else => return null,
+        }
+        return .{ .buf = try self.weightBufferRaw(&iq_grid.blob), .mem = .null_handle, .size = 0 };
+    }
+
+    /// The dual decode GEMV: `y[y_off + row] = scale * (dequant(W) @ x)`, one
+    /// subgroup per row over the RAW row-major weight, which is the same resident
+    /// copy the prefill GEMM dequantizes from.
+    pub fn opGemvQuantDual(
+        self: *Context,
+        dt: @import("tp_core").dtype.DType,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        w_bytes: []const u8,
+        scale: f32,
+        rows: usize,
+        cols: usize,
+    ) Error!void {
+        std.debug.assert(cols % dt.blockElems() == 0);
+        const entry: Elt = switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| @field(Elt, "gemv_" ++ @tagName(t)),
+            else => return error.UnsupportedDType,
+        };
+        const tbl = try self.iqTable(dt);
+        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        try self.opElt(entry, w_db, x, y, tbl, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .f0 = scale,
+        }, rows, 1, 1);
     }
 
     fn quantRowBytes(dt: @import("tp_core").dtype.DType, cols: usize) usize {
@@ -4693,15 +4777,22 @@ pub const Context = struct {
             const w_raw = try self.weightBufferRaw(w_bytes);
             const w_db: DeviceBuffer = .{ .buf = w_raw, .mem = .null_handle, .size = 0 };
             const entry: Elt = switch (dt) {
-                .q4_0 => .dequant_q4_0_f32,
-                .iq4_xs => .dequant_iq4_xs_f32,
-                .q1_0 => .dequant_q1_0_f32,
-                .q2_0_g64 => .dequant_q2_0_g64_f32,
-                .q2_0_g128 => .dequant_q2_0_g128_f32,
+                inline .q4_0,
+                .iq4_xs,
+                .q1_0,
+                .q2_0_g64,
+                .q2_0_g128,
+                .q2_k,
+                .q3_k,
+                .iq2_xxs,
+                .iq2_xs,
+                .iq3_xxs,
+                .iq3_s,
+                => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ "_f32"),
                 else => unreachable,
             };
             const elems = rows * cols;
-            try self.opElt(entry, w_db, self.deq_f32, null, null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
+            try self.opElt(entry, w_db, self.deq_f32, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
         } else {
             const row_bytes = quantRowBytes(dt, cols);
             const w_t = try self.weightBufferRawT(w_bytes, row_bytes);
@@ -6082,6 +6173,79 @@ test "gpu cooperative gemv covers the formats with no transposed kernel" {
             for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
             std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
                 std.debug.print("dtype {s} (subgroup) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
+                return e;
+            };
+        }
+    }
+}
+
+// The dual row GEMV (`opGemvQuantDual`), this arm of the body the CUDA backend
+// also runs, over the six formats whose ONLY decode it is. Same reference as the
+// cooperative test above, and needed separately from the CUDA one because the two
+// targets compile the body through different compilers and bind its table to a
+// different slot: an unbound or misaligned table decodes to plausible small
+// numbers here and to the right ones there.
+test "gpu dual gemv covers the codebook and low-bit k-quant formats" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const dtypes = @import("tp_core").dtype;
+    const quants = @import("tp_core").quants;
+
+    const rows = 64;
+    const cols = 512;
+    var prng = std.Random.DefaultPrng.init(0xC0DE);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    var x_d = try ctx.tensorCreate(cols * 4);
+    var y_d = try ctx.tensorCreate(rows * 4);
+    defer {
+        ctx.tensorDestroy(&x_d);
+        ctx.tensorDestroy(&y_d);
+    }
+    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    const y = try gpa.alloc(f32, rows);
+    defer gpa.free(y);
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+
+    const dts = [_]dtypes.DType{ .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s };
+    const d16: u16 = 0x2A66; // ~0.05
+    const min16: u16 = 0x251F; // ~0.02
+    // Every buffer stays alive to the end: the device weight cache keys on the
+    // host pointer, so a free and a realloc at the same address would alias.
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| {
+        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
+        rand.bytes(ws[i]);
+        var off: usize = 0;
+        // Only the f16 scales need pinning; every quant, grid index and sign index
+        // below them is legal whatever the random bytes say.
+        while (off < ws[i].len) : (off += dt.blockBytes()) switch (dt) {
+            .q2_k => {
+                std.mem.writeInt(u16, ws[i][off + 80 ..][0..2], d16, .little);
+                std.mem.writeInt(u16, ws[i][off + 82 ..][0..2], min16, .little);
+            },
+            .q3_k => std.mem.writeInt(u16, ws[i][off + 108 ..][0..2], d16, .little),
+            else => std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little),
+        };
+    }
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        try ctx.opGemvQuantDual(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            var acc: f64 = 0;
+            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
+            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
+                std.debug.print("dtype {s} (dual) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
                 return e;
             };
         }

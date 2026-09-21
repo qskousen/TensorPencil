@@ -31,6 +31,9 @@ pub const Route = enum {
     gemv_sg_dp4a,
     /// Cooperative subgroup scalar GEMV over the raw weight. `TP_VK_SG_GEMV`.
     gemv_sg,
+    /// The dual row GEMV over the raw weight, the same body the CUDA arm runs.
+    /// The only decode the formats it covers have.
+    gemv_dual,
     /// Weight dequantized to f16 once, then the cooperative-matrix GEMM.
     gemm_quant,
     /// Dense bf16/fp8/f32 k-split GEMV.
@@ -101,7 +104,9 @@ pub const Knobs = struct {
                 // raw layout, which is the same buffer the prefill GEMM dequantizes
                 // from, so both run off one resident copy.
                 if (gpu.Context.dequantOnly(w.dtype)) {
-                    if (m == 1 and k.sg_raw and w.cols % w.dtype.blockElems() == 0) return .gemv_sg;
+                    const whole = w.cols % w.dtype.blockElems() == 0;
+                    if (m == 1 and whole and gpu.Context.dualGemv(w.dtype)) return .gemv_dual;
+                    if (m == 1 and k.sg_raw and whole) return .gemv_sg;
                     return if (k.gemm_prefill) .gemm_quant else null;
                 }
                 if (!quantKernel(w.dtype)) return null;
@@ -243,6 +248,7 @@ pub const Lin = struct {
             .gemv_dp4a => try ctx.opGemvDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, self.nchunk, self.partials[0]),
             .gemv_t_dp4a => try ctx.opGemvQuantTDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, self.nchunk, self.partials[0]),
             .gemv_sg_dp4a => try ctx.opGemvQuantSgDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
+            .gemv_dual => try ctx.opGemvQuantDual(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
             .gemv_sg => try ctx.opGemvQuantSg(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
             .gemv_dense => try ctx.opGemv(y, y_off, x, self.partials[0], w.bytes, wcode(w.dtype), w.rows, w.cols, w.scale, self.nchunk),
         }
@@ -274,7 +280,11 @@ pub const Lin = struct {
     pub fn plan(self: *const Lin, lins: []const Weight, prefill_rows: usize, who: []const u8) error{UnsupportedCheckpoint}!void {
         switch (self.check(lins, prefill_rows)) {
             .ok => {
-                for (lins) |w| if (gpu.Context.dequantOnly(w.dtype)) {
+                // The notice is about what this checkpoint will actually RUN, so it
+                // asks the route, not the layout: a dequant-only format with a raw
+                // GEMV (the dual one, or the cooperative one where it built) has a
+                // decode kernel and is not what this warns about.
+                for (lins) |w| if (self.routeOf(w, 1) == .gemm_quant) {
                     std.log.info("{s}: {t} has no Vulkan decode GEMV; every GEMM dequantizes the weight (slow, but it runs)", .{ who, w.dtype });
                     break;
                 };
@@ -292,10 +302,20 @@ pub const Lin = struct {
 
 // --- tests -----------------------------------------------------------------
 
-test "quantKernel names the five formats the Vulkan decode GEMV has; the rest of the dequantizers are dequant-only" {
+test "quantKernel names the transposed formats; the rest are raw, and only the dual ones have a raw GEMV of their own" {
     for ([_]DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| try std.testing.expect(quantKernel(dt) and !gpu.Context.dequantOnly(dt));
-    for ([_]DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 }) |dt| try std.testing.expect(!quantKernel(dt) and gpu.Context.dequantOnly(dt));
-    for ([_]DType{ .q2_k, .bf16 }) |dt| try std.testing.expect(!quantKernel(dt) and !gpu.Context.dequantOnly(dt));
+    // Raw layout, decoded by the shared dequantizer. The first group's decode GEMV
+    // is the cooperative one (device permitting), the second's is the dual kernel.
+    for ([_]DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 }) |dt|
+        try std.testing.expect(!quantKernel(dt) and gpu.Context.dequantOnly(dt) and !gpu.Context.dualGemv(dt));
+    for ([_]DType{ .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s }) |dt|
+        try std.testing.expect(!quantKernel(dt) and gpu.Context.dequantOnly(dt) and gpu.Context.dualGemv(dt));
+    try std.testing.expect(!quantKernel(.bf16) and !gpu.Context.dequantOnly(.bf16));
+
+    // A dual format decodes without the cooperative pipelines, and is not left to
+    // the prefill GEMM the way the rest are when those are absent.
+    try std.testing.expectEqual(@as(?Route, .gemv_dual), Knobs.plain.routeOf(fake(.iq3_s, 4096, 4096), 1));
+    try std.testing.expectEqual(@as(?Route, null), Knobs.plain.routeOf(fake(.iq4_xs, 4096, 4096), 1));
 }
 
 fn fake(dt: DType, rows: usize, cols: usize) Weight {

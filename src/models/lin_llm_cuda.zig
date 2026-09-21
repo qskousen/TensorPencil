@@ -38,6 +38,10 @@ pub const Route = enum {
     gemv_q8n,
     /// Batched dp4a GEMV, every row in one launch (q1_0, q2_0).
     gemv_q8batch,
+    /// The dual row GEMV over the q8 activation, the body the Vulkan arm runs too.
+    gemv_dual_q8,
+    /// The same body over the f32 activation, for a shape the q8 one cannot take.
+    gemv_dual,
     /// Packed weight on the s8 tensor cores against the q8 activation.
     gemm_mmq,
     /// Weight expanded to f16 once, then the f16 tensor-core GEMM.
@@ -55,7 +59,7 @@ pub const Route = enum {
 
     pub fn prepOf(r: Route) Prep {
         return switch (r) {
-            .gemv_q8, .gemv_q8n, .gemv_q8batch => .q8,
+            .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8 => .q8,
             .gemm_mmq => .mmq,
             else => .none,
         };
@@ -139,6 +143,14 @@ fn blockQRoute(w: Weight, m: usize) ?Route {
     // The f32 GEMV and the dequant GEMM switch on dtype with `else => unreachable`.
     if (!Backend.quantKernelSupported(dt)) return null;
     const dp4a = dp4aShape(w);
+    if (Backend.dualGemvSupported(dt)) {
+        // The dual GEMV is the only decode these six have, on either backend. It
+        // reads whole codebook and quant WORDS, so a row must be whole
+        // super-blocks; the q8 twin additionally needs the staged activation,
+        // which only a single-row group has.
+        if (w.cols % 256 != 0) return null;
+        return if (m == 1 and decode_dp4a) .gemv_dual_q8 else if (m == 1) .gemv_dual else .gemm_q16;
+    }
     if (m == 1) {
         if (decode_dp4a and dp4a) {
             if (q8Single(dt)) return .gemv_q8;
@@ -236,6 +248,8 @@ pub fn gemm(be: *Backend, g: Group, y: Buf, w: Weight) !void {
                 try be.opGemvQuant(w.dtype, rowsOf(y, w.rows, t, 1), rowsOf(x, w.cols, t, 1), w.bytes, w.scale, w.rows, w.cols);
             }
         },
+        .gemv_dual_q8 => try be.opGemvQuantDualQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols),
+        .gemv_dual => try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols),
         .gemv_q8 => try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols),
         .gemv_q8n => {
             var off: usize = 0;

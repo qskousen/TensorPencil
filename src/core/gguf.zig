@@ -54,9 +54,14 @@ fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
         2 => .q4_0,
         8 => .q8_0,
         10 => .q2_k,
+        11 => .q3_k,
         12 => .q4_k,
         13 => .q5_k,
         14 => .q6_k,
+        16 => .iq2_xxs, // GGML_TYPE_IQ2_XXS (256-entry 8-value grid)
+        17 => .iq2_xs, // GGML_TYPE_IQ2_XS (512-entry 8-value grid)
+        18 => .iq3_xxs, // GGML_TYPE_IQ3_XXS (256-entry 4-value grid)
+        21 => .iq3_s, // GGML_TYPE_IQ3_S (512-entry 4-value grid)
         20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
         23 => .iq4_xs, // GGML_TYPE_IQ4_XS (256-elem super-block over the same LUT)
         41 => .q1_0, // GGML_TYPE_Q1_0 (128-elem block, 1 sign bit per weight)

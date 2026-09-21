@@ -53,6 +53,7 @@ pub const DType = enum {
     q4_0, // 32 elems / 18 B: f16 d + 16 B nibbles; v = (nibble - 8) * d
     q8_0, // 32 elems / 34 B: f16 scale + 32 x i8
     q2_k, // 256 elems / 84 B: 16 B 4-bit scales/mins + 64 B 2-bit quants + f16 d + f16 dmin
+    q3_k, // 256 elems / 110 B: 32 B high bits + 64 B 2-bit quants + 12 B 6-bit scales + f16 d
     q4_k, // 256 elems / 144 B: f16 d + f16 dmin + 12 B 6-bit scales/mins + 128 B nibbles
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
@@ -64,6 +65,31 @@ pub const DType = enum {
     /// 0..15 and their HIGH nibbles are 16..31, which is not the interleave q4_0
     /// and iq4_nl use.
     iq4_xs,
+    /// The four CODEBOOK formats, where a stored index selects a whole GROUP of
+    /// values from a fixed table rather than one value from a scale. All four are
+    /// 256-element super-blocks of eight 32-element sub-blocks, and all four take
+    /// their sign bits separately from their magnitudes, so the table entry is
+    /// unsigned and a sign byte flips it. The tables are the ggml ones
+    /// (`gpu/kernels/iq_grid.zig`); nothing about them is derivable, so a decoder
+    /// that does not read them is wrong however plausible its output.
+    ///
+    /// 256 elems / 66 B: f16 d + 32 u16. Each group of 8 elements takes one grid
+    /// byte-octet; every 4 groups share a u32 carrying their 7-bit sign indices and
+    /// a 4-bit scale.
+    iq2_xxs,
+    /// 256 elems / 74 B: iq2_xxs with the scale moved into 8 explicit bytes (one
+    /// nibble per sub-block) and the 9-bit grid index and 7-bit sign index packed
+    /// into each u16, so its grid is 512 entries where iq2_xxs's is 256.
+    iq2_xs,
+    /// 256 elems / 98 B: f16 d + 64 index bytes + 32 B of packed scales and signs.
+    /// A grid entry is FOUR values here, not eight, so a group of 8 elements takes
+    /// two indices.
+    iq3_xxs,
+    /// 256 elems / 110 B: f16 d + 64 index bytes + 8 B of index high bits + 32 B of
+    /// sign bytes + 4 B of scales. iq3_xxs's 4-value grid widened to 512 entries by
+    /// a 9th index bit, with the signs stored plainly instead of through the sign
+    /// codebook.
+    iq3_s,
     /// 128 elems / 18 B: f16 d + 16 B of sign bits; v = bit ? d : -d. One bit per
     /// weight (1.125 bpw including the scale), the *sign* of the weight times the
     /// block's mean absolute value. Note the two ways this differs from every other
@@ -145,11 +171,16 @@ pub const DType = enum {
             .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },
             .q2_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 84 },
+            .q3_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 110 },
             .q4_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 144 },
             .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
             .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },
             .iq4_nl => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .iq4_xs => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 136 },
+            .iq2_xxs => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 66 },
+            .iq2_xs => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 74 },
+            .iq3_xxs => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 98 },
+            .iq3_s => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 110 },
             .q1_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 18 },
             .q2_0_g64 => .{ .byte_size = null, .bit_size = null, .block_elems = 64, .block_bytes = 18 },
             .q2_0_g128 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 34 },

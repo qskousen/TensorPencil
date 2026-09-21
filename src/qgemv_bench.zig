@@ -18,6 +18,7 @@ const c = @import("ggml").c;
 const Backend = tp.gpu.cuda.Backend;
 const DeviceBuffer = tp.gpu.cuda.backend.DeviceBuffer;
 const Cat = Backend.ProfCat;
+const lin_llm = tp.models.lin_llm_cuda;
 
 const p = std.debug.print;
 var rnd_state = std.Random.DefaultPrng.init(0x0B0A710C);
@@ -82,6 +83,82 @@ fn grouped(be: *Backend, dt: tp.DType, x_d: DeviceBuffer, y_d: DeviceBuffer, q: 
     }
 }
 
+/// Every block-quant dtype with a decode route, at the two MLP shapes, through the
+/// DISPATCHER rather than one named kernel, so what is timed is what a token runs.
+///
+/// GB/s against the card's peak says whether a format is at the bandwidth the
+/// machine can give it; Gelem/s says whether it is instead bound by how many
+/// elements one instruction covers, which is where the scalar decoders sit and
+/// the dp4a ones do not. A rate per format is also the only way to attribute an
+/// end-to-end tok/s, since a mixed checkpoint reads several formats per token.
+///
+/// All dtypes are timed in ONE process, alternating shape by shape, because this
+/// box's clock drifts several percent between invocations.
+fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
+    const dts = [_]tp.DType{ .q4_k, .q5_k, .q6_k, .q8_0, .iq4_xs, .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s };
+    const warmup = 10;
+    const iters = 50;
+    p("decode GEMV (opGemvQuant, m=1): ms and effective GB/s over the weight\n", .{});
+    for (shapes[2..4]) |sh| {
+        const rows = sh.rows;
+        const cols = sh.cols;
+        p("\n=== {s} ===\n  {s:<9} {s:<12} {s:>9} {s:>9} {s:>9} {s:>9} {s:>8}\n", .{ sh.name, "dt", "route", "ms", "GB/s", "Gelem/s", "no-dp4a", "speedup" });
+        const wf = try gpa.alloc(f32, rows * cols);
+        defer gpa.free(wf);
+        for (wf) |*v| v.* = rnd.floatNorm(f32) * 0.1;
+        const x_d = try be.tensorCreate(cols * 4);
+        const y_d = try be.tensorCreate(rows * 4);
+        defer {
+            var xd = x_d;
+            var yd = y_d;
+            be.tensorDestroy(&xd);
+            be.tensorDestroy(&yd);
+        }
+        const xh = try gpa.alloc(f32, cols);
+        defer gpa.free(xh);
+        for (xh) |*v| v.* = rnd.floatNorm(f32);
+        try be.tensorUpload(x_d, std.mem.sliceAsBytes(xh));
+
+        // The IQ quantizers refuse a null importance matrix; a flat one means
+        // "every column equally important", which is what no imatrix would be.
+        const imat = try gpa.alloc(f32, cols);
+        defer gpa.free(imat);
+        @memset(imat, 1.0);
+
+        for (dts) |dt| {
+            const q = try gpa.alloc(u8, dt.storageBytes(rows * cols));
+            defer gpa.free(q);
+            const gt = tp.quants.ggmlType(dt) orelse continue;
+            _ = c.ggml_quantize_chunk(gt, wf.ptr, q.ptr, 0, @intCast(rows), @intCast(cols), imat.ptr);
+            // Through the dispatcher, so this is the kernel a decode really runs:
+            // several of these formats take the dp4a GEMV at m=1, not opGemvQuant.
+            var w = lin_llm.Weight.init(q, dt, rows, cols);
+            w.tag = @tagName(dt);
+            const route = lin_llm.routeOf(w, 1) orelse {
+                p("  {s:<9} {s:>9}\n", .{ @tagName(dt), "no route" });
+                continue;
+            };
+            // Both arms ALTERNATING in one process: this box's clock drifts several
+            // percent between invocations, so two runs cannot be compared.
+            // `decode_dp4a` off sends a dual format to the f32 twin of the same
+            // body, which is the isolation for "is the int8 dot worth it".
+            var ms: [2]f64 = .{ 0, 0 };
+            for (0..2) |pass| {
+                lin_llm.decode_dp4a = pass == 0;
+                for (0..warmup) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("gemv");
+                be.prof.reset();
+                for (0..iters) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("gemv");
+                ms[pass] = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+            }
+            lin_llm.decode_dp4a = true;
+            const gbs = @as(f64, @floatFromInt(q.len)) / (ms[0] * 1e-3) / 1e9;
+            const gels = @as(f64, @floatFromInt(rows * cols)) / (ms[0] * 1e-3) / 1e9;
+            p("  {s:<9} {s:<12} {d:>9.4} {d:>9.1} {d:>9.1} {d:>9.4} {d:>7.2}x\n", .{ @tagName(dt), @tagName(route), ms[0], gbs, gels, ms[1], ms[1] / ms[0] });
+        }
+    }
+    p("\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
     c.ggml_cpu_init();
@@ -95,6 +172,8 @@ pub fn main(init: std.process.Init) !void {
 
     const warmup = 10; // settle clocks + JIT PTX + upload weight (cachedWeight)
     const iters = 40;
+
+    try decodeGemv(gpa, be);
 
     p("grouped-N dp4a GEMV vs dequant->f16 GEMM   (speedup = gemm/grouped; >1 => grouped wins)\n", .{});
 

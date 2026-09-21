@@ -15,6 +15,7 @@ const kernels = @import("kernels.zig");
 const elt = @import("elt.zig");
 const dual_ptx = @embedFile("dual_ptx");
 const dual_table = @import("../kernels/dual_table.zig");
+const iq_grid = @import("../kernels/iq_grid.zig");
 const cublaslt = @import("cublaslt.zig");
 const cudnn = @import("cudnn.zig");
 const dtypes = @import("tp_core").dtype;
@@ -523,6 +524,9 @@ pub const Backend = struct {
     // Weights stay fp8 in the cache (streaming-friendly); decoded per GEMM into
     // w16 scratch, activations converted into a16, then the validated f16 buildHgemm.
     fp8_lut: DeviceBuffer = .{},
+    /// `iq_grid.blob`, the IQ codebook tables, uploaded once on first use. The
+    /// four codebook formats decode nothing without it.
+    iq_tbl: DeviceBuffer = .{},
     fp8_w16: DeviceBuffer = .{},
     fp8_a16: DeviceBuffer = .{},
     /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
@@ -963,6 +967,7 @@ pub const Backend = struct {
         if (self.dual_mod) |m| m.unload(self.ctx);
         self.dual_fns.deinit(self.gpa);
         self.tensorDestroy(&self.fp8_lut);
+        self.tensorDestroy(&self.iq_tbl);
         self.tensorDestroy(&self.fp8_w16);
         self.tensorDestroy(&self.fp8_a16);
         self.tensorDestroy(&self.q8_act);
@@ -2697,8 +2702,24 @@ pub const Backend = struct {
     pub fn quantKernelSupported(dt: dtypes.DType) bool {
         return switch (dt) {
             .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
             else => false,
         };
+    }
+
+    /// The codebook blob `iq_grid` the four IQ formats decode through, uploaded on
+    /// first use. Null for every other format: their decode is arithmetic and the
+    /// kernels leave the table slot unread.
+    fn iqTable(self: *Backend, dt: dtypes.DType) Error!?DeviceBuffer {
+        switch (dt) {
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => {},
+            else => return null,
+        }
+        if (self.iq_tbl.buf == .null_handle) {
+            self.iq_tbl = try self.tensorCreate(iq_grid.blob.len);
+            try self.tensorUpload(self.iq_tbl, &iq_grid.blob);
+        }
+        return self.iq_tbl;
     }
 
     /// Fused ggml block-quant GEMV for m=1 decode: y[rows] f32 =
@@ -2709,8 +2730,19 @@ pub const Backend = struct {
     pub fn opGemvQuant(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(cols % dt.blockElems() == 0 and cols <= 32768);
+        std.debug.assert(cols % dt.blockElems() == 0);
         const w_db = try self.cachedWeight(w_bytes);
+        // The formats with no hand-written PTX take the dual row kernel, the same
+        // body the Vulkan arm runs (kernels/dual/quant.zig). It stages no scales in
+        // shared, so the `cols` cap below is not its to obey.
+        switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| {
+                const tbl = try self.iqTable(dt);
+                return self.dualRows("gemv_" ++ @tagName(t), w_db, x, y, tbl, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+            },
+            else => {},
+        }
+        std.debug.assert(cols <= 32768);
         const f = switch (dt) {
             .q4_0 => try self.eltFn(elt.gemv_q4_0_ptx, "gemv_q4_0"),
             .q8_0 => try self.eltFn(elt.gemv_q8_0_ptx, "gemv_q8_0"),
@@ -2827,6 +2859,41 @@ pub const Backend = struct {
 
     pub fn routedExpertGemvEnabled(self: *const Backend) bool {
         return !self.weight_noise.on();
+    }
+
+    /// Whether this format's decode is the DUAL row GEMV, the body the Vulkan arm
+    /// also runs, and whether it has the q8_1-activation twin of it. The six
+    /// formats with no hand-written kernel of their own.
+    pub fn dualGemvSupported(dt: dtypes.DType) bool {
+        return switch (dt) {
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
+            else => false,
+        };
+    }
+
+    /// The dual row GEMV against the q8_1 activation `opGemvQuantizeX` staged.
+    /// Four int8 products per instruction instead of eight scalar ones; the
+    /// weight decode is the same.
+    pub fn opGemvQuantDualQ8(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(dualGemvSupported(dt) and cols % dt.blockElems() == 0);
+        std.debug.assert(self.q8_act.size >= cols / 32 * 4 + cols);
+        const w_db = try self.cachedWeight(w_bytes);
+        const tbl = try self.iqTable(dt);
+        switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| try self.dualRows(
+                "gemv_" ++ @tagName(t) ++ "_q8",
+                w_db,
+                self.q8_act,
+                y,
+                tbl,
+                .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 },
+                .{ scale, 0 },
+                rows,
+            ),
+            else => unreachable,
+        }
     }
 
     /// Whether `opGemvQuantQ8N` has a kernel for this dtype. Wider coverage than
@@ -3225,8 +3292,11 @@ pub const Backend = struct {
         defer self.ptoc(.dequant);
         try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
         const u = [7]u32{ @intCast(elems), 0, 0, 0, 0, 0, 0 };
+        const tbl = try self.iqTable(dt);
         switch (dt) {
-            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_f16", w_db, self.fp8_w16, null, null, u, .{ 0, 0 }, elems),
+            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128,
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s,
+            => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_f16", w_db, self.fp8_w16, tbl, null, u, .{ 0, 0 }, elems),
             else => return error.UnsupportedDtype,
         }
         return self.fp8_w16;
@@ -3239,8 +3309,11 @@ pub const Backend = struct {
         defer self.ptoc(.dequant);
         try self.ensureDeviceBuffer(&self.fp8_w16, elems * 2);
         const u = [7]u32{ @intCast(elems), 0, 0, 0, 0, 0, 0 };
+        const tbl = try self.iqTable(dt);
         switch (dt) {
-            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_bf16", w_db, self.fp8_w16, null, null, u, .{ 0, 0 }, elems),
+            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128,
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s,
+            => |t| try self.dualPairs("dequant_" ++ @tagName(t) ++ "_bf16", w_db, self.fp8_w16, tbl, null, u, .{ 0, 0 }, elems),
             else => return error.UnsupportedDtype,
         }
         return self.fp8_w16;
@@ -6362,10 +6435,91 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
             // 16-6*2 bits are padding ggml never reads, so leave the random
             // bytes as they are and only pin d.
             .iq4_xs => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
+            .q2_k => {
+                std.mem.writeInt(u16, wbytes[off + 80 ..][0..2], d16, .little);
+                std.mem.writeInt(u16, wbytes[off + 82 ..][0..2], min16, .little);
+            },
+            .q3_k => std.mem.writeInt(u16, wbytes[off + 108 ..][0..2], d16, .little),
+            // The codebook formats carry d at +0 and nothing else a random byte can
+            // make illegal: every grid index is masked to its table's size and every
+            // sign index to 7 bits, so the whole rest of the block is fair game.
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
             else => unreachable,
         }
     }
     return wbytes;
+}
+
+// Gated on a CUDA device: the six formats whose only device decode is the dual
+// kernel (kernels/dual/quant.zig), against ggml. Both entry points are checked,
+// because they read `value` through different paths: the dequantizer walks the
+// tensor as one stream from byte 0, the GEMV points it at a row base, and a
+// row-base slip is invisible on a one-row weight.
+//
+// The four IQ formats decode through a table with nothing in the block to check
+// it against, so a table that failed to upload, or landed at the wrong offset,
+// yields plausible small numbers rather than a fault. ggml is the only reference
+// that catches it.
+test "q2_k/q3_k/iq2_xxs/iq2_xs/iq3_xxs/iq3_s device decode matches ggml" {
+    const quants = @import("tp_core").quants;
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 8;
+    const cols = 512; // two super-blocks per row
+    const dts = [_]dtypes.DType{ .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s };
+
+    // ⚠️ Every weight stays alive to the end: the device weight cache keys on the
+    // HOST POINTER, so a freed one's address serves the next dtype's upload.
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, .{ 11, 22, 33, 44, 55, 66 }, 0..) |dt, seed, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, seed);
+    defer for (ws) |w| gpa.free(w);
+
+    var prng = std.Random.DefaultPrng.init(9001);
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = prng.random().float(f32) * 2.0 - 1.0;
+
+    const x_d = try be.tensorCreate(cols * 4);
+    const y_d = try be.tensorCreate(rows * 4);
+    const w16_host = try gpa.alloc(u16, rows * cols);
+    defer gpa.free(w16_host);
+    const y = try gpa.alloc(f32, rows);
+    defer gpa.free(y);
+    const want = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(want);
+    defer {
+        var xd = x_d;
+        var yd = y_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+
+    inline for (dts, 0..) |dt, i| {
+        const w = ws[i];
+        quants.dequantSlice(dt, w, 0, rows * cols, want);
+
+        const w_db = try be.cachedWeight(w);
+        const w16 = try be.opDequantF16(dt, w_db, rows * cols);
+        try be.tensorDownload(w16, std.mem.sliceAsBytes(w16_host));
+        for (want, w16_host, 0..) |ref, got16, e| {
+            const got: f32 = @floatCast(@as(f16, @bitCast(got16)));
+            errdefer std.debug.print("{s} dequant element {d}: got {d}, want {d}\n", .{ @tagName(dt), e, got, ref });
+            // f16 storage: the tolerance is the output width, not the decode.
+            try std.testing.expectApproxEqAbs(ref, got, @max(1e-4, @abs(ref) * 1e-3));
+        }
+
+        try be.opGemvQuant(dt, y_d, x_d, w, 1.0, rows, cols);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        for (0..rows) |r| {
+            var acc: f64 = 0;
+            for (want[r * cols ..][0..cols], x) |wv, xv| acc += @as(f64, wv) * xv;
+            errdefer std.debug.print("{s} gemv row {d}: got {d}, want {d}\n", .{ @tagName(dt), r, y[r], acc });
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-3);
+        }
+    }
 }
 
 // Gated on a CUDA device with VMM support: a growable tensor keeps its base

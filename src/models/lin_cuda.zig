@@ -471,10 +471,14 @@ test "the block-quant route policy sends each format to the GEMM that suits it" 
     }
     for ([_]DType{ .q4_k, .q8_0 }) |dt|
         try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(dt, .bf16));
-    // q2_k has the convrot decode and no dequant kernel, so the bf16 route is a
-    // refusal by name, not a silent fall-through to the int8 one. Same for f16.
-    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.q2_k, .bf16));
-    try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.q2_k, .f16));
+    // q2_k has the convrot decode AND, now, a dequant kernel, so bf16 and f16 are
+    // real routes for it rather than the refusal they once were. What still
+    // refuses is a dtype with no decode at all, and the point of the check is that
+    // it comes back null rather than falling through to the int8 route.
+    try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOfDtype(.q2_k, .bf16));
+    try std.testing.expectEqual(@as(?Route, .blockq_f16), routeOfDtype(.q2_k, .f16));
+    for ([_]BlockQGemm{ .bf16, .f16, .int8, .auto }) |g|
+        try std.testing.expectEqual(@as(?Route, null), routeOfDtype(.u8, g));
 
     // Asking for int8 or int4 on a format with no convrot decode must NOT reach
     // `opI8GemmBlockQ`, which would refuse mid-forward; it falls back to bf16.

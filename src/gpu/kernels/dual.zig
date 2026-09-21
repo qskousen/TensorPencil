@@ -117,6 +117,24 @@ pub const Env = if (is_ptx) struct {
             .d => e.d[i] = v,
         }
     }
+    /// Four consecutive f32 from a 4-ALIGNED index, as one 16-byte load. A body
+    /// that reads a whole group of activations or quant words takes this rather
+    /// than four `ld`s: these kernels are bound by load instructions, not by
+    /// bandwidth, so the count is what the time follows.
+    ///
+    /// Every slot is a device allocation (256-byte aligned) offset by whole rows,
+    /// which is what makes the 16-byte cast sound; `i % 4 == 0` is the caller's.
+    pub inline fn ld4(e: Env, comptime s: Slot, i: u32) [4]f32 {
+        const V = @Vector(4, f32);
+        const base: [*]addrspace(.global) f32 = switch (s) {
+            .a => e.a,
+            .b => e.b,
+            .c => e.c,
+            .d => e.d,
+        };
+        const v: [*]align(16) addrspace(.global) const V = @ptrCast(@alignCast(base));
+        return v[i >> 2];
+    }
     pub inline fn ldW(e: Env, comptime s: Slot, i: u32) u32 {
         return @bitCast(e.ld(s, i));
     }
@@ -190,6 +208,11 @@ pub const Env = if (is_ptx) struct {
             .c => c.data[i] = v,
             .d => d.data[i] = v,
         }
+    }
+    /// `ld4` on SPIR-V: logical addressing has no pointer to re-cast, so this is
+    /// four loads the driver is free to merge.
+    pub inline fn ld4(e: Env, comptime s: Slot, i: u32) [4]f32 {
+        return .{ e.ld(s, i), e.ld(s, i + 1), e.ld(s, i + 2), e.ld(s, i + 3) };
     }
     pub inline fn ldW(e: Env, comptime s: Slot, i: u32) u32 {
         return @bitCast(e.ld(s, i));
@@ -358,6 +381,63 @@ pub inline fn bf16Bits(v: f32) u16 {
     const bits: u32 = @bitCast(v);
     const rne: u32 = ((bits >> 16) & 1) +% 0x7FFF;
     return @truncate((bits +% rne) >> 16);
+}
+
+/// Sign-extend byte 0 of `v`.
+pub inline fn sext8(v: u32) i32 {
+    return @as(i32, @bitCast(v << 24)) >> 24;
+}
+
+/// Four int8 multiply-accumulates in one go: `acc + dot(w4, x4)` over the packed
+/// signed bytes. The hardware instruction on PTX; on SPIR-V the arithmetic, since
+/// `OpSDot` needs a capability the shared module must not carry (it would refuse
+/// to build on a device without the integer dot, taking all 160 kernels with it).
+pub inline fn dp4a(w4: u32, x4: u32, acc: i32) i32 {
+    if (is_ptx) {
+        return asm ("dp4a.s32.s32 %[r], %[w], %[x], %[c];"
+            : [r] "=r" (-> i32),
+            : [w] "r" (w4),
+              [x] "r" (x4),
+              [c] "r" (acc),
+        );
+    }
+    var s = acc;
+    inline for (0..4) |i| s += sext8(w4 >> @intCast(i * 8)) * sext8(x4 >> @intCast(i * 8));
+    return s;
+}
+
+/// Per-byte `a - b`, no borrow between bytes. One instruction on PTX; on SPIR-V
+/// the two byte lanes are done apart so an add cannot carry out of its byte (the
+/// naive `(a ^ m) + 1` form is wrong for a zero byte, which the codebooks do not
+/// hold today and a future one might).
+pub inline fn subBytes(x: u32, y: u32) u32 {
+    if (is_ptx) {
+        // The addend is an operand, not a literal: ptxas reads a bare `0` there
+        // as a video selector and refuses it.
+        return asm ("vsub4.u32.u32.u32 %[r], %[x], %[y], %[z];"
+            : [r] "=r" (-> u32),
+            : [x] "r" (x),
+              [y] "r" (y),
+              [z] "r" (@as(u32, 0)),
+        );
+    }
+    // The guard bit above each byte absorbs its borrow. Without it the borrow
+    // ripples through the zeroed gap into the NEXT lane of the same word, which
+    // is right for three bytes in four and silently wrong for the rest.
+    const lo = ((x & 0x00FF00FF) | 0x01000100) -% (y & 0x00FF00FF);
+    const hi = (((x >> 8) & 0x00FF00FF) | 0x01000100) -% ((y >> 8) & 0x00FF00FF);
+    return (lo & 0x00FF00FF) | ((hi & 0x00FF00FF) << 8);
+}
+
+/// The four low bits of `bits` as a per-byte mask of 0x00 / 0xFF.
+///
+/// The multiply lays four copies of the nibble at bits 0, 7, 14 and 21, whose
+/// 4-bit fields do not overlap, so bit `i` lands at bit `8i` and the mask picks
+/// it out. Three instructions where shifting each bit into place takes eleven,
+/// which is a fifth of these GEMVs' time (measured: isolating the sign
+/// application entirely moved iq2_xxs 32%).
+pub inline fn byteMask(bits: u32) u32 {
+    return ((bits *% 0x00204081) & 0x01010101) *% 255;
 }
 
 /// Sum of `v` over the subgroup, in every lane. Every lane of the subgroup must
@@ -574,6 +654,24 @@ const bodies = .{
     .{ "dequant_q6_k_f16", quant.q6_kF16 },
     .{ "dequant_q6_k_bf16", quant.q6_kBf16 },
     .{ "dequant_q6_k_f32", quant.q6_kF32 },
+    .{ "dequant_q2_k_f16", quant.q2_kF16 },
+    .{ "dequant_q2_k_bf16", quant.q2_kBf16 },
+    .{ "dequant_q2_k_f32", quant.q2_kF32 },
+    .{ "dequant_q3_k_f16", quant.q3_kF16 },
+    .{ "dequant_q3_k_bf16", quant.q3_kBf16 },
+    .{ "dequant_q3_k_f32", quant.q3_kF32 },
+    .{ "dequant_iq2_xxs_f16", quant.iq2XxsF16 },
+    .{ "dequant_iq2_xxs_bf16", quant.iq2XxsBf16 },
+    .{ "dequant_iq2_xxs_f32", quant.iq2XxsF32 },
+    .{ "dequant_iq2_xs_f16", quant.iq2XsF16 },
+    .{ "dequant_iq2_xs_bf16", quant.iq2XsBf16 },
+    .{ "dequant_iq2_xs_f32", quant.iq2XsF32 },
+    .{ "dequant_iq3_xxs_f16", quant.iq3XxsF16 },
+    .{ "dequant_iq3_xxs_bf16", quant.iq3XxsBf16 },
+    .{ "dequant_iq3_xxs_f32", quant.iq3XxsF32 },
+    .{ "dequant_iq3_s_f16", quant.iq3SF16 },
+    .{ "dequant_iq3_s_bf16", quant.iq3SBf16 },
+    .{ "dequant_iq3_s_f32", quant.iq3SF32 },
     .{ "gn_combine", elt.gnCombine },
     .{ "softmax_partial", elt.softmaxPartial },
     .{ "softmax_combine", elt.softmaxCombine },
@@ -592,6 +690,18 @@ const bodies = .{
     .{ "gn_stats", rows.gnStats },
     .{ "gn_stats_h16", rows.gnStatsH16 },
     .{ "rowmax_i8", rows.rowmaxI8 },
+    .{ "gemv_q2_k", quant.gemvQ2_k },
+    .{ "gemv_q2_k_q8", quant.gemvQ2_kQ8 },
+    .{ "gemv_q3_k", quant.gemvQ3_k },
+    .{ "gemv_q3_k_q8", quant.gemvQ3_kQ8 },
+    .{ "gemv_iq2_xxs", quant.gemvIq2Xxs },
+    .{ "gemv_iq2_xxs_q8", quant.gemvIq2XxsQ8 },
+    .{ "gemv_iq2_xs", quant.gemvIq2Xs },
+    .{ "gemv_iq2_xs_q8", quant.gemvIq2XsQ8 },
+    .{ "gemv_iq3_xxs", quant.gemvIq3Xxs },
+    .{ "gemv_iq3_xxs_q8", quant.gemvIq3XxsQ8 },
+    .{ "gemv_iq3_s", quant.gemvIq3S },
+    .{ "gemv_iq3_s_q8", quant.gemvIq3SQ8 },
 };
 
 comptime {

@@ -399,7 +399,7 @@ pub fn main(init: std.process.Init) !void {
         if (!llm.session.archSupportsWeightNoise(arch))
             try stdout.print("[warn] --weight-noise is ignored: no {s} stepper publishes a per-layer sigma (k2-horizon does not)\n", .{arch})
         else
-            try stdout.print("[warn] --weight-noise is ignored: this {s} checkpoint's linears are in a dtype with no noised kernels (q4_0/q4_k/q5_k/q6_k/iq4_xs are wired; q8_0/q1_0/q2_0 are not)\n", .{arch});
+            try stdout.print("[warn] --weight-noise is ignored: this {s} checkpoint's linears are in a dtype with no noised kernels (q4_0/q4_k/q5_k/q6_k/iq4_xs are wired; q8_0/q1_0/q2_0 and the k-quant and codebook formats that decode through the dual GEMV are not)\n", .{arch});
         try stdout.flush();
     }
 
