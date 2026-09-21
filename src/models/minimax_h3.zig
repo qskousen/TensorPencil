@@ -31,10 +31,9 @@
 //!   frame's `w` grid and `h` fixed at 0. See `audioGrid`.
 //!
 //! Reference is ComfyUI: comfy/ldm/minimax/model.py plus the layout half of
-//! comfy_extras/nodes_minimax_h3.py. See VIDEO_PLAN.md for the whole list and
-//! for how the rest of the family is staged. The VAEs are minimax_h3_vae.zig
-//! (video) and minimax_h3_audio.zig (audio); the GPU twins are
-//! minimax_h3_cuda.zig and minimax_h3_gpu.zig.
+//! comfy_extras/nodes_minimax_h3.py. The VAEs are minimax_h3_vae.zig (video) and
+//! minimax_h3_audio.zig (audio); the GPU twins are minimax_h3_cuda.zig and
+//! minimax_h3_gpu.zig.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -907,8 +906,8 @@ fn appendAudioGrid(
 ///
 /// The pairing is structural on purpose. A sidecar that is applied at some GEMM
 /// call sites and not others renders a finite, plausible, wrong image with no
-/// error anywhere, which is the hazard CLAUDE.md names for weight storage. The
-/// weight is reachable only as `.w`, so every site that consumes one has the
+/// error anywhere. The weight is reachable only as `.w`, so every site that
+/// consumes one has the
 /// sidecar in the same expression, and `matLin` below is the only host path.
 pub const Lin = struct {
     w: Weight,
@@ -3263,8 +3262,8 @@ test "packed layout matches the reference at render scale" {
         try std.testing.expectApproxEqRel(c.pos_checksum, got, 1e-12);
     }
 
-    // the default render: ~38k packed rows is the shape every cost estimate in
-    // VIDEO_PLAN.md is quoted against, so pin it here rather than in prose
+    // the default render: ~38k packed rows is the shape every cost estimate is
+    // quoted against, so pin it here rather than in prose
     const big = parsed.value.big_cases[0];
     try std.testing.expectEqual(@as(usize, 64 + 207 * 2 + 37 * 24 * 42), big.seq_len);
 }
@@ -3516,6 +3515,54 @@ test "workspace memory is reported before it is allocated" {
         ws.t_emb.len + ws.mod.len + ws.video_rows.len + ws.audio_rows.len) * @sizeOf(f32);
     try std.testing.expectEqual(dev_bytes, actual);
 }
+
+/// Build every block's modulation on the host, folded for the `rms_mod` kernel:
+/// it applies no norm weight and no `1 +`, so `norm.weight * (1 + scale)` is folded
+/// into `premul` here. Shared by both device arms, which read the same table.
+///
+/// Cheap: the adaLN projection is `[6 * hidden * 3, time_embed_dim]` against at
+/// most a handful of timestep rows, so this is a few million MACs against the
+/// trunk's trillions.
+pub fn buildModTable(
+    dit: *const DiT,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: []f32,
+    t_emb: []const f32,
+    n_labels: usize,
+) !void {
+    const cfg = dit.cfg;
+    const h = cfg.hidden;
+    const per_block = n_labels * 3 * 6 * h;
+    std.debug.assert(out.len == dit.blocks.len * per_block);
+
+    const raw = try gpa.alloc(f32, n_labels * 3 * 6 * h);
+    defer gpa.free(raw);
+
+    for (dit.blocks, 0..) |*b, bi| {
+        try ops.matmul.matmul(io, gpa, raw, t_emb, n_labels, b.adaln, b.adaln_bias);
+        // `raw` is [n_labels][tag][slot][hidden] with slots
+        // (shift, scale, gate) x2, which is the reference's chunk order.
+        for (0..n_labels) |t_row| {
+            for (0..3) |tag| {
+                const src = raw[((t_row * 3) + tag) * 6 * h ..][0 .. 6 * h];
+                const dst = out[bi * per_block + ((t_row * 3) + tag) * 6 * h ..][0 .. 6 * h];
+                inline for (.{ .{ 0, b.norm1 }, .{ 3, b.norm2 } }) |pair| {
+                    const base = pair[0];
+                    const nw = pair[1];
+                    const shift = src[base * h ..][0..h];
+                    const scale = src[(base + 1) * h ..][0..h];
+                    const gate = src[(base + 2) * h ..][0..h];
+                    // premul = norm_weight * (1 + scale): the kernel has neither.
+                    for (dst[base * h ..][0..h], nw, scale) |*d, w, sc| d.* = w * (1.0 + sc);
+                    @memcpy(dst[(base + 1) * h ..][0..h], shift);
+                    @memcpy(dst[(base + 2) * h ..][0..h], gate);
+                }
+            }
+        }
+    }
+}
+
 
 test "modality tags are the adaLN row indices, not names" {
     // a modulation row is t_row * 3 + tag, so the numeric values are load bearing

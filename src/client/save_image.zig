@@ -14,7 +14,7 @@ pub const Error = error{ OutOfMemory, WriteFailed, EncodeFailed };
 pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize, h: usize) ![]u8 {
     var opts: tp.pipeline.Options = .{ .prompt = "" };
     info.params.applyTo(&opts);
-    return tp.pipeline.buildA1111Params(
+    const base = try tp.pipeline.buildA1111Params(
         gpa,
         info.prompt,
         info.negative,
@@ -32,6 +32,21 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
         opts.compat,
         opts.compatConfig(),
     );
+    // Everything the host reported about what it actually loaded. The engine
+    // knows it, the client writes the file, so it rides on `ImageInfo`.
+    var loras: std.ArrayList(tp.pipeline.LoraRecord) = .empty;
+    defer loras.deinit(gpa);
+    for (info.loras) |l| try loras.append(gpa, .{ .name = l.name, .hash = l.hash, .strength = l.strength });
+    return tp.pipeline.appendExtraParams(gpa, base, .{
+        .clip1 = info.clip1_stem,
+        .clip2 = info.clip2_stem,
+        .vae = info.vae_stem,
+        .model_hash = info.model_hash,
+        .vae_hash = info.vae_hash,
+        .weight_dtype = info.weight_dtype,
+        .shift = if (info.shift > 0) info.shift else null,
+        .loras = loras.items,
+    });
 }
 
 /// PNG bytes for `rgba` with the metadata block. `rgba` is `w*h*4`.
@@ -88,6 +103,11 @@ pub const A1111Params = struct {
     seed: ?u64 = null,
     width: ?usize = null,
     height: ?usize = null,
+    /// Flow shift. A request field, not a resource one: a reader that falls back
+    /// to the family default re-renders a DIFFERENT image when this was set.
+    shift: ?f32 = null,
+    /// img2img strength.
+    denoise: ?f32 = null,
 };
 
 /// Parse what `buildA1111Params` wrote. The saved PNG is the record of how an
@@ -135,6 +155,10 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
             out.steps = std.fmt.parseInt(usize, val, 10) catch null;
         } else if (std.mem.eql(u8, key, "CFG scale")) {
             out.cfg = std.fmt.parseFloat(f32, val) catch null;
+        } else if (std.mem.eql(u8, key, "Shift")) {
+            out.shift = std.fmt.parseFloat(f32, val) catch null;
+        } else if (std.mem.eql(u8, key, "Denoise")) {
+            out.denoise = std.fmt.parseFloat(f32, val) catch null;
         } else if (std.mem.eql(u8, key, "Seed")) {
             out.seed = std.fmt.parseInt(u64, val, 10) catch null;
         } else if (std.mem.eql(u8, key, "Size")) {
@@ -272,6 +296,154 @@ test "buildA1111Params formats prompt, settings, and optional negative" {
     );
 }
 
+test "appendExtraParams writes the A1111/Civitai field names" {
+    const gpa = std.testing.allocator;
+    const base = try gpa.dupe(u8, "p\nSteps: 30, Sampler: Euler, CFG scale: 5.0, Seed: 1, Size: 8x8, Model: m, Prompt syntax: ComfyUI");
+    const out = try tp.pipeline.appendExtraParams(gpa, base, .{
+        .clip1 = "qwen3vl_4b",
+        .vae = "mage_flow_vae",
+        .model_hash = "0123456789",
+        .vae_hash = "abcdef0123",
+        .weight_dtype = "bf16",
+        .shift = 6.0,
+        .loras = &.{.{ .name = "style", .hash = "9999888877", .strength = 0.8 }},
+    });
+    defer gpa.free(out);
+    errdefer std.debug.print("{s}\n", .{out});
+    for ([_][]const u8{
+        ", Model hash: 0123456789",
+        ", Clip 1: qwen3vl_4b",
+        ", VAE: mage_flow_vae",
+        ", VAE hash: abcdef0123",
+        ", Weight dtype: bf16",
+        ", Shift: 6.0000",
+        ", Lora hashes: \"style: 9999888877\"",
+        ", Lora strengths: \"style: 0.80\"",
+    }) |want| try std.testing.expect(std.mem.indexOf(u8, out, want) != null);
+    // The Civitai map is built from the same values, so it cannot disagree.
+    try std.testing.expect(std.mem.indexOf(u8, out,
+        ", Hashes: {\"model\":\"0123456789\",\"vae\":\"abcdef0123\",\"lora:style\":\"9999888877\"}") != null);
+    // Absent fields are absent, not empty: `Clip 2` was never set.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Clip 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Denoise") == null);
+}
+
+test "an empty Resources leaves the block byte-identical" {
+    const gpa = std.testing.allocator;
+    const text = "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 1, Size: 512x512, Model: m, Prompt syntax: ComfyUI";
+    const base = try gpa.dupe(u8, text);
+    const out = try tp.pipeline.appendExtraParams(gpa, base, .{});
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings(text, out);
+}
+
+test "autoV2 is the file's own sha256, sidecar or not" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // sha256("hello\n"), which is what `sha256sum` prints for this file.
+    const want = "5891b5b522";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
+    const file = try std.fmt.allocPrint(gpa, "{s}/f.bin", .{dir_path});
+    defer gpa.free(file);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
+
+    // Hashed here: the streaming read is the part that silently returned the
+    // wrong digest when its buffer aliased the reader's own.
+    {
+        var h: tp.pipeline.HashCache = .{};
+        defer h.deinit(gpa);
+        try std.testing.expectEqualStrings(want, h.autoV2(gpa, io, file));
+    }
+    // And read from a sidecar, which must agree rather than merely be accepted.
+    {
+        const side = try std.fmt.allocPrint(gpa, "{s}/f.sha256", .{dir_path});
+        defer gpa.free(side);
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = side,
+            .data = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\n",
+        });
+        var h: tp.pipeline.HashCache = .{};
+        defer h.deinit(gpa);
+        try std.testing.expectEqualStrings(want, h.autoV2(gpa, io, file));
+    }
+    // A file that is not there is "", not an error: the field is then omitted.
+    {
+        var h: tp.pipeline.HashCache = .{};
+        defer h.deinit(gpa);
+        try std.testing.expectEqualStrings("", h.autoV2(gpa, io, "no/such/file.bin"));
+    }
+}
+
+test "a computed hash is SAVED, in the sidecar format the other tools read" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
+    const file = try std.fmt.allocPrint(gpa, "{s}/f.bin", .{dir_path});
+    defer gpa.free(file);
+    const side = try std.fmt.allocPrint(gpa, "{s}/f.sha256", .{dir_path});
+    defer gpa.free(side);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
+
+    {
+        var h: tp.pipeline.HashCache = .{};
+        defer h.deinit(gpa);
+        try std.testing.expectEqualStrings("5891b5b522", h.autoV2(gpa, io, file));
+    }
+    // ⚠️ 64 bytes, bare hex, NO trailing newline: byte-for-byte what the
+    // sidecars already beside these checkpoints hold.
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, side, gpa, .limited(4096));
+    defer gpa.free(written);
+    try std.testing.expectEqualStrings(
+        "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        written,
+    );
+    // And the second reader takes the sidecar rather than the file.
+    var h2: tp.pipeline.HashCache = .{ .compute = false };
+    defer h2.deinit(gpa);
+    try std.testing.expectEqualStrings("5891b5b522", h2.autoV2(gpa, io, file));
+}
+
+test "compute = false neither hashes nor writes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
+    const file = try std.fmt.allocPrint(gpa, "{s}/g.bin", .{dir_path});
+    defer gpa.free(file);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
+
+    var h: tp.pipeline.HashCache = .{ .compute = false };
+    defer h.deinit(gpa);
+    try std.testing.expectEqualStrings("", h.autoV2(gpa, io, file));
+
+    const side = try std.fmt.allocPrint(gpa, "{s}/g.sha256", .{dir_path});
+    defer gpa.free(side);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, side, .{}));
+}
+
+test "Shift and Denoise round-trip through the parser" {
+    const gpa = std.testing.allocator;
+    const base = try gpa.dupe(u8, "p\nSteps: 30, Sampler: Euler, CFG scale: 5.0, Seed: 1, Size: 8x8, Model: m, Prompt syntax: ComfyUI");
+    const out = try tp.pipeline.appendExtraParams(gpa, base, .{ .shift = 6.0, .denoise = 0.75 });
+    defer gpa.free(out);
+    const got = parseA1111Params(out);
+    try std.testing.expect(got.shift != null and @abs(got.shift.? - 6.0) < 1e-4);
+    try std.testing.expect(got.denoise != null and @abs(got.denoise.? - 0.75) < 1e-4);
+    // The fields the block already carried still parse with the tail appended.
+    try std.testing.expectEqual(@as(?usize, 30), got.steps);
+    try std.testing.expectEqual(@as(?u64, 1), got.seed);
+    try std.testing.expectEqualStrings("p", got.prompt);
+}
+
 test "buildA1111Params records the sampler actually used" {
     // A saved PNG is the record a user (or ComfyUI's metadata importer) re-renders
     // from, so a hardcoded sampler name is a wrong answer nothing else would catch,
@@ -279,7 +451,14 @@ test "buildA1111Params records the sampler actually used" {
     const gpa = std.testing.allocator;
     for ([_]struct { k: tp.sampler.Kind, want: []const u8 }{
         .{ .k = .euler, .want = "Sampler: Euler," },
+        .{ .k = .euler_ancestral, .want = "Sampler: Euler a," },
+        .{ .k = .heun, .want = "Sampler: Heun," },
+        .{ .k = .dpm_2_ancestral, .want = "Sampler: DPM2 a," },
+        .{ .k = .dpmpp_2s_ancestral, .want = "Sampler: DPM++ 2S a," },
+        .{ .k = .dpmpp_sde, .want = "Sampler: DPM++ SDE," },
+        .{ .k = .dpmpp_2m, .want = "Sampler: DPM++ 2M," },
         .{ .k = .dpmpp_2m_sde, .want = "Sampler: DPM++ 2M SDE," },
+        .{ .k = .dpmpp_3m_sde, .want = "Sampler: DPM++ 3M SDE," },
         .{ .k = .dpmpp_2m_sde_heun, .want = "Sampler: DPM++ 2M SDE Heun," },
     }) |c| {
         const s = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, c.k, null, .comfy, .original, .comfy, .{});

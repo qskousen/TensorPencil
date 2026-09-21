@@ -190,6 +190,12 @@ fn i8GemmW(io: std.Io, prof: *Prof, t_mark: *std.Io.Timestamp, ctx: *gpu.Context
         lapNs(io, t_mark, &prof.w4a8_ns);
         return ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, c_h16);
     }
+    // No `sint4` cooperative matrix, so int4 reaches the same int8 GEMM. Unpacked per
+    // GEMM into scratch, which keeps the 4-bit weight resident.
+    if (w.dtype == .i4) {
+        const wbuf = try ctx.i4Decode(w.bytes, w.rows, w.cols);
+        return ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, c_h16);
+    }
     return ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, c_h16);
 }
 
@@ -551,12 +557,13 @@ pub fn forward(
         // one rotate+quantize of the modulated-norm input feeds all four
         // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g, so it takes the
         // f32-output branches below (which still run tensor-core attention).
-        // `.w4a8` belongs on the int8 side of every branch below, not merely "not
-        // fp8": the `else` arms feed the weight to the fp8 GEMM, which would read the
-        // packed nibbles as e4m3 bytes and render a blank image with no error, the same
-        // failure this file already records for a GGUF block quant. Its activation prep
-        // and GEMM are int8's; only the weight's storage differs (`opI8GemmW4A8`).
-        const is_i8 = blk.attn.wq.dtype == .i8 or blk.attn.wq.dtype == .w4a8;
+        // Every packed form that runs the int8 GEMM, asked through `lin.kindOf` so a new
+        // storage form must be classified rather than falling into the `else` arms below:
+        // those hand the weight to the fp8 GEMM, which reads its nibbles as e4m3 bytes.
+        const is_i8 = switch (lin.kindOf(blk.attn.wq.dtype)) {
+            .i8, .i4, .w4a8 => true,
+            else => false,
+        };
         // Dense bf16 weights take the f32-operand fallback branch (Gemm.go
         // routes them to the f16-weight coop GEMM); they must be kept out of the
         // fp8-coop shared/att16 fast paths, which assume 1-byte e4m3 weights.

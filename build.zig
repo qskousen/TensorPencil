@@ -378,8 +378,8 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // tp-llm: LLM inference CLI (see LLM_PLAN.md), a second thin driver over
-    // the same TensorPencil library module.
+    // tp-llm: the LLM inference CLI, a second thin driver over the same
+    // TensorPencil library module.
     const llm_exe = b.addExecutable(.{
         .name = "tp-llm",
         .use_llvm = use_llvm,
@@ -929,7 +929,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // embed-bench: throughput profiler for the tp.embed encoders (per-item vs
-    // batched forwards, DIFFKEEP.md M8). Only needs the TensorPencil module +
+    // batched forwards). Only needs the TensorPencil module +
     // a device for the GPU backends. `zig build embed-bench -- [opts]`.
     {
         const eb_step = b.step("embed-bench", "Build+run the tp.embed encoder throughput profiler");

@@ -17,7 +17,9 @@
 //! Scanning opens headers only (`Container.openHeader`). A folder of forty 15 GB
 //! files must not be mapped, let alone prefetched, to draw a menu. Results are kept
 //! in a JSON index keyed on path, size and mtime, so a rescan re-reads only what
-//! changed. `scan` is synchronous; the app runs it on a worker thread.
+//! changed, and stamped with the fingerprint of the rules that classified it, so
+//! a build that sorts files differently re-reads them all rather than serving an
+//! older build's answers. `scan` is synchronous; the app runs it on a worker thread.
 //!
 //! A `ModelId` says two hosts hold a file with the same name, size and header; it
 //! is not a proof of content, and a host receiving a sent file checks the bytes
@@ -486,15 +488,25 @@ pub const Catalog = struct {
     /// nothing" on every cached entry and no rescan would fix it.
     const index_version: u32 = 2;
 
+    /// What `load` demands of a cached entry beyond the format version: the
+    /// fingerprint of the rules that produced it, so a new probe or a widened
+    /// width check re-reads every file instead of leaving each one answering
+    /// with the roles the previous build knew (`model_spec.rules_fingerprint`).
+    ///
+    /// Not checked on the wire: a host classified its own files with its own
+    /// build, and there its answer is the one that counts.
+    const rules_version: u32 = model_spec.rules_fingerprint;
+
     const Index = struct {
         version: u32 = 0,
+        rules: u32 = 0,
         entries: []const Entry = &.{},
     };
 
     /// The index document as one JSON text: what `save` writes and what a host
     /// sends its client. gpa-owned.
     pub fn toJsonAlloc(self: *const Catalog, gpa: std.mem.Allocator) ![]u8 {
-        const doc: Index = .{ .version = index_version, .entries = self.entries };
+        const doc: Index = .{ .version = index_version, .rules = rules_version, .entries = self.entries };
         return std.json.Stringify.valueAlloc(gpa, doc, .{});
     }
 
@@ -513,12 +525,16 @@ pub const Catalog = struct {
             const buf = try a.alloc(u8, id_text_len);
             o.path = idText(e.id(), buf[0..id_text_len]);
         }
-        const doc: Index = .{ .version = index_version, .entries = out };
+        const doc: Index = .{ .version = index_version, .rules = rules_version, .entries = out };
         return std.json.Stringify.valueAlloc(gpa, doc, .{});
     }
 
     /// A catalog from `toJsonAlloc`'s text. A stale version is an empty catalog.
     pub fn fromJson(gpa: std.mem.Allocator, bytes: []const u8) !Catalog {
+        return parseIndex(gpa, bytes, null);
+    }
+
+    fn parseIndex(gpa: std.mem.Allocator, bytes: []const u8, want_rules: ?u32) !Catalog {
         var cat = Catalog.init(gpa);
         errdefer cat.deinit();
         const a = cat.arena.allocator();
@@ -529,12 +545,13 @@ pub const Catalog = struct {
             .allocate = .alloc_always,
         });
         if (doc.version != index_version) return cat;
+        if (want_rules) |w| if (doc.rules != w) return cat;
         cat.entries = @constCast(doc.entries);
         return cat;
     }
 
     pub fn save(self: *const Catalog, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-        const doc: Index = .{ .version = index_version, .entries = self.entries };
+        const doc: Index = .{ .version = index_version, .rules = rules_version, .entries = self.entries };
         const json = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
         defer gpa.free(json);
         if (std.fs.path.dirname(path)) |dir| {
@@ -547,11 +564,12 @@ pub const Catalog = struct {
     }
 
     /// A missing, unreadable or stale index is an empty catalog, not an error:
-    /// the next scan rebuilds it.
+    /// the next scan rebuilds it. Stale is either the format version or the
+    /// classification rules the entries were written with.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Catalog {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch return Catalog.init(gpa);
         defer gpa.free(bytes);
-        return fromJson(gpa, bytes) catch Catalog.init(gpa);
+        return parseIndex(gpa, bytes, rules_version) catch Catalog.init(gpa);
     }
 };
 
@@ -1169,6 +1187,28 @@ test "index round trip, and a rescan reuses unchanged files" {
     defer v0.deinit();
     try testing.expectEqual(@as(usize, 0), v0.entries.len);
 
+    // An index written by a build whose classification rules differ is dropped
+    // for the same reason, and that one no hand bump announces: the entries are
+    // shaped right and every one of them answers with the roles that build knew.
+    // The version is the live one, so this keeps testing the rules stamp after a
+    // hand bump instead of quietly retesting the version check.
+    const other_rules = try std.fmt.allocPrint(
+        gpa,
+        "{{\"version\":{d},\"rules\":{d},\"entries\":[{{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}}]}}",
+        .{ Catalog.index_version, Catalog.rules_version +% 1 },
+    );
+    defer gpa.free(other_rules);
+    try tree.put(io, "index/rules.json", other_rules);
+    const rules_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "rules.json" });
+    defer gpa.free(rules_idx);
+    var rules = Catalog.load(gpa, io, rules_idx);
+    defer rules.deinit();
+    try testing.expectEqual(@as(usize, 0), rules.entries.len);
+    // The wire does not ask: a host classifies with its own build.
+    var wired = try Catalog.fromJson(gpa, other_rules);
+    defer wired.deinit();
+    try testing.expectEqual(@as(usize, 1), wired.entries.len);
+
     // ...and the CURRENT version is of course read, or the check above would
     // pass by rejecting everything.
     var good = Catalog.load(gpa, io, idx);
@@ -1280,3 +1320,4 @@ test "an id and the path it resolves to name the same file" {
     try testing.expect(cat.resolve(as_id) == cat.resolve("/models/loras/ink.safetensors"));
     try testing.expect(cat.resolve(as_id) != null);
 }
+

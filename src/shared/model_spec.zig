@@ -133,7 +133,8 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
     return switch (comp) {
         // Embedding tables are [vocab][hidden]; CLIP's probe is a norm, [hidden].
         .conditioner => switch (fam) {
-            .krea2 => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
+            // Mage-Flow reads krea2's Qwen3-VL-4B file, at a different tap.
+            .krea2, .mageflow => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
             .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
             .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
             .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
@@ -151,6 +152,13 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             .sd15 => dims.len == 4 and dims[1] == models.sd_vae.sd15.z_channels,
             .sdxl => dims.len == 4 and dims[1] == models.sd_vae.sdxl.z_channels,
             .zimage => dims.len == 4 and dims[1] == models.sd_vae.flux.z_channels,
+            // Mage-Flow takes either codec for its latent space, so this accepts
+            // either probe: the Mage-VAE's encoder output projection,
+            // `[2 * latent_channels][hidden][1][1]` (mean and logvar stacked), or
+            // the Flux2 anchor's fold BatchNorm, a bare `[latent_channels]` whose
+            // width is what separates it from any other `AutoencoderKL`.
+            .mageflow => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
+                (dims.len == 1 and dims[0] == models.mage_vae.latent_channels),
             .krea2, .anima, .minimax_h3, .sensenova => true,
         },
         .decoder2, .denoiser => true,
@@ -173,12 +181,19 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     // the plain model as far as anything here can see.
     // A GGUF keeps its vision tower in a separate mmproj file, so it never
     // carries one and the question cannot be asked of it.
-    if ((fam == .krea2 or fam == .zimage) and store != .gguf) {
+    //
+    // Nor is its RoPE base grounds to refuse it. A plain Qwen3-4B GGUF on
+    // Mage-Flow is off-distribution, not broken: measured, it follows the prompt
+    // and renders in a different style, missing an attribute here and there, and
+    // it wants more steps to converge (garbage at 8, fine at 30). That is a
+    // choice to offer, not one to take away; `pipeline` warns instead.
+    if ((fam == .krea2 or fam == .zimage or fam == .mageflow) and store != .gguf) {
         // Under whatever the probe answered under: a bundled checkpoint keeps
         // its encoder beneath a prefix, and the tower sits beneath the same one.
         // Asked flat, such a file answers "no tower" and is then offered to the
         // one family it is wrong for.
-        if ((fam == .krea2) != tp.models.qwen3.Config.hasVisionTower(store, containerPrefix(v.info.name))) return false;
+        const wants_tower = fam == .krea2 or fam == .mageflow;
+        if (wants_tower != tp.models.qwen3.Config.hasVisionTower(store, containerPrefix(v.info.name))) return false;
     }
     const cfg = encoderConfig(fam) orelse return true;
     // The probe is `<root>embed_tokens.weight`; layers sit beside it.
@@ -206,7 +221,7 @@ fn layerNormExists(store: tp.weights.WeightStore, root: []const u8, layer: usize
 fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
     const C = tp.models.qwen3.Config;
     return switch (fam) {
-        .krea2 => C.vl_4b,
+        .krea2, .mageflow => C.vl_4b,
         .zimage => C.qwen3_4b,
         .anima => C.qwen3_0_6b,
         .minimax_h3 => C.qwen3vl_32b_h3,
@@ -228,6 +243,31 @@ pub fn previewFits(store: tp.weights.WeightStore, fam: Family) bool {
     if (!(dims.len == 4 and dims[1] == tp.models.taehv.latent_channels)) return false;
     return fam == .krea2 or fam == .anima;
 }
+
+/// A fingerprint of the rules above, for a cache that stores what a file was
+/// taken for. `catalog` reuses a cached entry whenever the file's size and mtime
+/// still match, so a probe added to the table or a width check widened reaches
+/// no file that did not move: after Mage-Flow learned to decode with Flux 2's
+/// VAE, that file went on reading as "fits nothing" in every existing index.
+/// Mixed into the index version, a rule change empties the cache instead.
+///
+/// Covers this file, which holds the width and depth checks, and the pipeline's
+/// probe table. NOT `pipeline.detectFamily` or the GGUF metadata `catalog.probe`
+/// reads for a chat model; `catalog.index_version` is the hand bump for those.
+pub const rules_fingerprint: u32 = blk: {
+    @setEvalBranchQuota(1 << 22);
+    var h = std.hash.Wyhash.init(0);
+    h.update(@embedFile("model_spec.zig"));
+    for (std.enums.values(Family)) |fam| {
+        h.update(@tagName(fam));
+        for (std.enums.values(Component)) |comp| {
+            const s = pipeline.componentSpec(fam, comp) catch continue;
+            for (s.prefixes) |p| h.update(p);
+            for (s.probes) |p| h.update(p);
+        }
+    }
+    break :blk @truncate(h.final());
+};
 
 // ── LoRA sidecars ─────────────────────────────────────────────────────────────
 
@@ -335,7 +375,7 @@ fn loraSpec(fam: Family) ?LoraSpec {
                 .layers = @intCast(cfg.n_layers),
             };
         },
-        .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3 => null,
+        .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3, .mageflow => null,
     };
 }
 
@@ -483,12 +523,23 @@ pub fn traits(fam: Family) Traits {
             .no_decoder = true,
             .width = 1024,
             .height = 1024,
-            // 8 steps at cfg 1, which is what this model is run at and what
-            // BACKEND.md 2G measures. 50 steps at cfg 4 is 12x the forwards for
-            // a worse picture: the schedule is short and the model wants no
-            // negative pass.
+            // 8 steps at cfg 1 is what this model is run at. 50 steps at cfg 4
+            // is 12x the forwards for a worse picture: the schedule is short and
+            // the model wants no negative pass.
             .steps = 8,
             .cfg = 1.0,
+        },
+        // ComfyUI's own `image_mage_flow_t2i_int8` template: 1024x1024, 30 steps,
+        // cfg 5, euler + `simple`. The 4-step turbo variant is a separate LoRA
+        // file, not a checkpoint of its own.
+        .mageflow => .{
+            .label = "Mage-Flow (double-stream MMDiT)",
+            .short = "Mage-Flow",
+            .backends = &.{ .cpu, .vulkan, .zig_cuda, .cuda },
+            .width = 1024,
+            .height = 1024,
+            .steps = 30,
+            .cfg = 5.0,
         },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
@@ -668,28 +719,27 @@ pub fn inspectSide(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: Fa
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "traits: every family runs on the CPU, and the GPU list is per family" {
-    // Narrowed when Z-Image landed, which is exactly what the previous version of
-    // this test said should happen if an architecture ever arrived CPU-first. The
-    // mechanism is unchanged: the GUI hides backends a family has no kernels for, so
-    // a too-generous list here is an offered backend that then fails at render time.
-    //
-    // A CPU-first arrival gets NARROWED here rather than having its traits entry
-    // over-promise, that is what the note on `backends` prescribes, and the
-    // opposite of what makes the GUI offer a backend that then fails at render
-    // time. Add to this set, do not edit the loop.
-    //
-    // MiniMax H3 is the current CPU-first arrival, and for a stronger reason than
-    // Anima and Z-Image were: it has no trunk at all yet, on any backend. Remove
-    // it here when `minimax_h3_cuda` / `minimax_h3_gpu` land.
-    var cpu_only = std.EnumSet(Family).initEmpty();
-    cpu_only.insert(.minimax_h3);
+    // A family with fewer than all three device backends names EXACTLY the ones it
+    // has kernels for: the GUI hides the rest, so a too-generous entry is a backend
+    // it offers and the render then fails on. Add a row, do not edit the loop.
+    const Narrowed = struct { fam: Family, devices: []const Backend };
+    const narrowed = [_]Narrowed{
+        .{ .fam = .minimax_h3, .devices = &.{} },
+    };
     inline for (@typeInfo(Family).@"enum".fields) |f| {
         const fam: Family = @enumFromInt(f.value);
         const t = traits(fam);
         // Every family runs on the CPU, without exception, that is the floor.
         try std.testing.expect(t.supports(.cpu));
+        var devices: []const Backend = &.{ .vulkan, .zig_cuda, .cuda };
+        for (narrowed) |n| {
+            if (n.fam == fam) devices = n.devices;
+        }
         for ([_]Backend{ .vulkan, .zig_cuda, .cuda }) |b| {
-            const want = !cpu_only.contains(fam);
+            var want = false;
+            for (devices) |d| {
+                if (d == b) want = true;
+            }
             errdefer std.debug.print("{t} supports({t}) = {}\n", .{ fam, b, t.supports(b) });
             try std.testing.expectEqual(want, t.supports(b));
         }

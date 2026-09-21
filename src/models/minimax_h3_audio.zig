@@ -24,7 +24,7 @@
 //! - Latents are denormalized per channel before `dec_in_proj`.
 //!
 //! Reference is ComfyUI `comfy/ldm/minimax/audio_vae.py`, whose lineage is
-//! descript-audio-codec (MIT) and NVIDIA BigVGAN (MIT). See VIDEO_PLAN.md.
+//! descript-audio-codec (MIT) and NVIDIA BigVGAN (MIT).
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -791,6 +791,312 @@ test "the audio decode matches the reference at a toy width" {
 
 const test_gate = @import("../test_gate.zig");
 const real_audio_vae = "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+
+// ── Device preparation ────────────────────────────────────────────────────────
+// Every weight permuted, exponentiated and converted once, plus the shape walk
+// that sizes a device workspace. Backend-agnostic on purpose: `minimax_h3_audio_cuda`
+// and `minimax_h3_audio_gpu` build the same `DevSession` and differ only in which
+// kernels consume it.
+
+/// Whether this decoder's shapes are ones the kernels here cover.
+///
+/// Refuse by name rather than at a launch: every failure mode below would
+/// otherwise surface as a bad device read several stages deep, or worse, as
+/// audio that is merely shifted.
+pub fn deviceSupported(dec: *const AudioDecoder) bool {
+    // Grouped ungrouped-conv paths do not exist here. The only grouped
+    // convolutions in this decoder are the per-channel kaiser filters, which
+    // `aa_up_snake`/`aa_down` handle directly rather than as convolutions.
+    if (dec.dec_in.groups != 1 or dec.conv_pre.groups != 1 or dec.conv_post.groups != 1) return false;
+    if (dec.dec_in.stride != 1 or dec.conv_pre.stride != 1 or dec.conv_post.stride != 1) return false;
+    for (dec.ups) |u| if (u.groups != 1) return false;
+    for (dec.resblocks) |rb| {
+        for (rb.convs1) |c| if (c.groups != 1 or c.stride != 1) return false;
+        for (rb.convs2) |c| if (c.groups != 1 or c.stride != 1) return false;
+        for (rb.activations) |a| if (!actSupported(a)) return false;
+    }
+    if (!actSupported(dec.activation_post)) return false;
+    return true;
+}
+
+fn actSupported(a: Activation) bool {
+    const k = a.kernel();
+    // `aa_down`'s asymmetric left pad is `k/2 - 1`, which is the even-kernel
+    // case; an odd filter would need `k/2` and the round trip would stop being
+    // length-preserving. Every kaiser filter in this family is 12 taps.
+    if (k % 2 != 0 or k < 2) return false;
+    if (a.down_filter.len != k) return false;
+    return true;
+}
+
+// --- session --------------------------------------------------------------
+
+/// A conv ready for the device: the permuted f16 weight plus the shape the
+/// im2col and the GEMM need. Host memory, uploaded on first use through the
+/// backend's pointer-keyed weight cache.
+pub const DevConv = struct {
+    /// `[out_ch][k * in_ch]` f16.
+    w16: []const u8,
+    /// The same weight in f32, for the `f32_gemm` diagnostic only.
+    w32: []const f32,
+    bias: ?[]const f32,
+    out_ch: usize,
+    in_ch: usize,
+    k: usize,
+    dilation: usize,
+    padding: usize,
+    /// 1 for every conv in the vocoder; the ENCODER's downsampling convs are the
+    /// only strided ones, and they share this type through `minimax_h3_audio_encode`.
+    stride: usize = 1,
+
+    pub fn plen(self: DevConv) usize {
+        return self.k * self.in_ch;
+    }
+};
+
+/// A transposed conv ready for the device: `[k][in_ch][out_ch]` f32, plus a bias
+/// that is always present here (the reference's `ups` all carry one).
+pub const DevConvT = struct {
+    w: []const f32,
+    bias: []const f32,
+    in_ch: usize,
+    out_ch: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+};
+
+/// An activation ready for the device: the two filters and the EXPONENTIATED
+/// snake parameters, interleaved `(exp(alpha), 1/(exp(beta) + 1e-9))` per
+/// channel. The checkpoint stores them in log scale; exponentiating on the host
+/// keeps it out of the inner loop.
+pub const DevAct = struct {
+    up_filter: []const f32,
+    down_filter: []const f32,
+    /// `[2 * channels]`.
+    snake: []const f32,
+    channels: usize,
+    k: usize,
+
+    /// The reference's upsample constants, derived from the filter length: pad
+    /// `k/2 - 1` before a stride-2 transposed conv, then slice `pad*2 + (k-2)/2`
+    /// off the left. Getting these wrong shifts the signal by a sample or two,
+    /// which is inaudible in a spectrum and wrong everywhere.
+    pub fn upPad(self: DevAct) usize {
+        return self.k / 2 - 1;
+    }
+    pub fn upSlice(self: DevAct) usize {
+        return self.upPad() * 2 + (self.k - 2) / 2;
+    }
+    /// The downsample's ASYMMETRIC left pad.
+    pub fn downPad(self: DevAct) usize {
+        return self.k / 2 - 1;
+    }
+};
+
+/// Per-decoder device state: every weight permuted and converted once.
+///
+/// Built once per session rather than per decode: the permute reads ~250 MB of
+/// f32 conv weights, which is far more than a decode's own traffic.
+pub const DevSession = struct {
+    arena: std.heap.ArenaAllocator,
+    dec_in: DevConv,
+    conv_pre: DevConv,
+    conv_post: DevConv,
+    ups: []DevConvT,
+    /// `n_stages * n_kernels` blocks, stage-major, matching `dec.resblocks`.
+    blocks: []DevBlock,
+    act_post: DevAct,
+
+    pub const DevBlock = struct {
+        convs1: []DevConv,
+        convs2: []DevConv,
+        acts: []DevAct,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, dec: *const AudioDecoder) !DevSession {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const ups = try a.alloc(DevConvT, dec.ups.len);
+        for (ups, dec.ups) |*d, u| d.* = try devConvT(a, u);
+
+        const blocks = try a.alloc(DevBlock, dec.resblocks.len);
+        for (blocks, dec.resblocks) |*b, rb| {
+            b.convs1 = try a.alloc(DevConv, rb.convs1.len);
+            b.convs2 = try a.alloc(DevConv, rb.convs2.len);
+            b.acts = try a.alloc(DevAct, rb.activations.len);
+            for (b.convs1, rb.convs1) |*d, c| d.* = try devConv(a, c);
+            for (b.convs2, rb.convs2) |*d, c| d.* = try devConv(a, c);
+            for (b.acts, rb.activations) |*d, act| d.* = try devAct(a, act);
+        }
+
+        const dec_in = try devConv(a, dec.dec_in);
+        const conv_pre = try devConv(a, dec.conv_pre);
+        const conv_post = try devConv(a, dec.conv_post);
+        const act_post = try devAct(a, dec.activation_post);
+
+        return .{
+            .arena = arena,
+            .dec_in = dec_in,
+            .conv_pre = conv_pre,
+            .conv_post = conv_post,
+            .ups = ups,
+            .blocks = blocks,
+            .act_post = act_post,
+        };
+    }
+
+    pub fn deinit(self: *DevSession) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Host bytes the permuted weights hold, which is also what they cost
+    /// resident on the device (f16 for the convs, f32 for the transposed ones).
+    pub fn bytes(self: *const DevSession) usize {
+        var n: usize = self.dec_in.w16.len + self.conv_pre.w16.len + self.conv_post.w16.len;
+        for (self.ups) |u| n += u.w.len * 4;
+        for (self.blocks) |b| {
+            for (b.convs1) |c| n += c.w16.len;
+            for (b.convs2) |c| n += c.w16.len;
+        }
+        return n;
+    }
+};
+
+fn f32ToF16(v: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(v)));
+}
+
+/// `[out_ch][in_ch][k]` f32 -> `[out_ch][k][in_ch]` f16.
+///
+/// The permutation is what lets the im2col write its columns in the coalesced
+/// `(tap, in_ch)` order. Pairing the two the other way is finite and wrong: every
+/// tap convolves against the wrong channel.
+pub fn devConv(a: std.mem.Allocator, c: Conv1d) !DevConv {
+    std.debug.assert(c.groups == 1 and c.stride == 1);
+    const n = c.out_ch * c.in_ch * c.k;
+    std.debug.assert(c.w.len == n);
+    const w16 = try a.alloc(u16, n);
+    const w32 = try a.alloc(f32, n);
+    for (0..c.out_ch) |oc| {
+        const src = c.w[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
+        const d16 = w16[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
+        const d32 = w32[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
+        for (0..c.in_ch) |ic| {
+            for (0..c.k) |j| {
+                const v = src[ic * c.k + j];
+                d16[j * c.in_ch + ic] = f32ToF16(v);
+                d32[j * c.in_ch + ic] = v;
+            }
+        }
+    }
+    return .{
+        .w16 = std.mem.sliceAsBytes(w16),
+        .w32 = w32,
+        .bias = c.b,
+        .out_ch = c.out_ch,
+        .in_ch = c.in_ch,
+        .k = c.k,
+        .dilation = c.dilation,
+        .padding = c.padding,
+    };
+}
+
+/// `[in_ch][out_ch][k]` f32 -> `[k][in_ch][out_ch]` f32.
+///
+/// Note the source is IN-channel major; that is PyTorch's transposed-conv
+/// convention and reading it the other way is a shape mismatch only when the two
+/// channel counts differ, which for this vocoder's halving stages they always do.
+pub fn devConvT(a: std.mem.Allocator, c: ConvT1d) !DevConvT {
+    std.debug.assert(c.groups == 1);
+    const n = c.in_ch * c.out_ch * c.k;
+    std.debug.assert(c.w.len == n);
+    const w = try a.alloc(f32, n);
+    for (0..c.in_ch) |ic| {
+        for (0..c.out_ch) |oc| {
+            for (0..c.k) |j| w[(j * c.in_ch + ic) * c.out_ch + oc] = c.w[(ic * c.out_ch + oc) * c.k + j];
+        }
+    }
+    return .{
+        .w = w,
+        .bias = c.b orelse return error.MissingTensor,
+        .in_ch = c.in_ch,
+        .out_ch = c.out_ch,
+        .k = c.k,
+        .stride = c.stride,
+        .padding = c.padding,
+    };
+}
+
+pub fn devAct(a: std.mem.Allocator, act: Activation) !DevAct {
+    const snake = try a.alloc(f32, 2 * act.channels);
+    for (0..act.channels) |c| {
+        snake[2 * c] = @exp(act.log_alpha[c]);
+        // The reference's `+ 1e-9` guard, folded into the reciprocal.
+        snake[2 * c + 1] = 1.0 / (@exp(act.log_beta[c]) + 1e-9);
+    }
+    return .{
+        .up_filter = act.up_filter,
+        .down_filter = act.down_filter,
+        .snake = snake,
+        .channels = act.channels,
+        .k = act.kernel(),
+    };
+}
+
+// --- workspace ------------------------------------------------------------
+
+/// The (channels, length) the signal has at each point in the pipeline.
+///
+/// Walked rather than assumed: the lengths multiply by the stage rates and the
+/// channels halve, and the workspace has to be sized from the maximum of the
+/// PRODUCT, which is neither the first nor the last stage.
+pub const Shapes = struct {
+    /// Largest `ch * len` any signal buffer holds.
+    sig: usize,
+    /// Largest `ch * len` inside an AMPBlock, i.e. what the `2 * len`
+    /// anti-aliased intermediate is sized from.
+    aa: usize,
+    /// Largest `out_len * k * in_ch` im2col patch.
+    patch: usize,
+    /// Output samples per stereo channel.
+    samples: usize,
+
+    pub fn of(dec: *const AudioDecoder, t: usize) Shapes {
+        var s: Shapes = .{ .sig = 0, .aa = 0, .patch = 0, .samples = t * dec.upsampleFactor() };
+        const bump = struct {
+            fn go(cur: *usize, v: usize) void {
+                if (v > cur.*) cur.* = v;
+            }
+        }.go;
+
+        bump(&s.sig, dec.dec_in.in_ch * t);
+        bump(&s.sig, dec.dec_in.out_ch * t);
+        bump(&s.patch, t * dec.dec_in.k * dec.dec_in.in_ch);
+        bump(&s.sig, dec.conv_pre.out_ch * t);
+        bump(&s.patch, t * dec.conv_pre.k * dec.conv_pre.in_ch);
+
+        var len = t;
+        for (dec.ups, 0..) |u, i| {
+            len = u.outLen(len);
+            const ch = u.out_ch;
+            bump(&s.sig, ch * len);
+            bump(&s.aa, ch * len);
+            for (0..dec.n_kernels) |j| {
+                const rb = &dec.resblocks[i * dec.n_kernels + j];
+                for (rb.convs1) |c| bump(&s.patch, len * c.k * c.in_ch);
+                for (rb.convs2) |c| bump(&s.patch, len * c.k * c.in_ch);
+            }
+        }
+        bump(&s.sig, dec.conv_post.out_ch * len);
+        bump(&s.patch, len * dec.conv_post.k * dec.conv_post.in_ch);
+        return s;
+    }
+};
+
 
 test "the real audio VAE loads and its rates multiply to 800" {
     // Pins the values that are NOT stored -- the upsample rates recovered from

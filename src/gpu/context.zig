@@ -384,7 +384,7 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride };
+pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("rmsnorm"),
     dualEntry("rms_apply_w"),
@@ -520,6 +520,7 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("rope_vision"),
     dualEntry("rope_vision_gemma4"),
     dualEntry("im2col1d"),
+    dualEntry("im2col3d"),
     dualEntry("aa_up_snake"),
     dualEntry("aa_down"),
     dualEntry("convt1d_ca"),
@@ -563,6 +564,17 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("rope_inter_span_pos"),
     dualEntry("pixel_shuffle"),
     dualEntry("im2col_stride"),
+    // Mage-VAE's own kernels. Written in `dual/` rather than per backend, so the
+    // CUDA arm and this one launch the same bodies.
+    dualEntry("dw_conv3"),
+    dualEntry("col_mean"),
+    dualEntry("mul_cols_sigmoid"),
+    dualEntry("nerf_feat"),
+    dualEntry("patch_scatter"),
+    dualEntry("win_gather"),
+    dualEntry("win_scatter"),
+    dualEntry("modulate_pr"),
+    dualEntry("gated_add_pr"),
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -895,6 +907,9 @@ pub const Context = struct {
     /// Test hook: when nonzero, caps the budget headroom calculation so
     /// weight streaming can be forced without exhausting real VRAM.
     budget_override: u64 = 0,
+    /// `--vram-budget min`: keep no weight resident past the in-flight set.
+    /// Independent of `budget_override`, which is a byte ceiling.
+    min_weights: bool = false,
     /// First-touch weight pinning: newly cached weights are pinned (immune to
     /// eviction) until their total reaches this cap; later weights stream.
     /// For a fixed repeating walk (LLM decode) this turns the LRU cliff,
@@ -2424,6 +2439,21 @@ pub const Context = struct {
 
     fn createBuffer(self: *Context, size: u64, usage: u32, mem_flags: u32) Error!DeviceBuffer {
         while (true) {
+            // An explicit --vram-budget is a CEILING, not a hint: refuse to go past
+            // it and shed cached weights instead, the same degradation a physical
+            // OOM gets below. Inert when no budget is set.
+            if (self.budgetOvershoot(size) != 0) {
+                if (self.evictOneWeight()) continue;
+                // The card is not full; the budget is what said no. Only weights
+                // stream, so a budget under the activation working set cannot be
+                // met at any streaming level.
+                std.log.err(
+                    "[vram] --vram-budget {d}MB refused a {d}MB allocation with {d}MB already held. " ++
+                        "Activations cannot stream, so raise the budget or render smaller.",
+                    .{ self.budget_override >> 20, size >> 20, self.device_used >> 20 },
+                );
+                return error.DeviceOutOfMemory;
+            }
             if (self.createBufferRaw(size, usage, mem_flags)) |db_raw| {
                 var db = db_raw;
                 db.tag = self.mem_tag;
@@ -5340,6 +5370,14 @@ pub const Context = struct {
         return live;
     }
 
+    /// Bytes our own footprint would be past an explicit `--vram-budget` once an
+    /// `incoming`-byte allocation lands (pass 0 to ask about what we hold now).
+    /// Always 0 when no budget is set, which is the driver-managed default.
+    fn budgetOvershoot(self: *Context, incoming: u64) u64 {
+        if (self.budget_override == 0) return 0;
+        return (self.device_used + incoming) -| self.budget_override;
+    }
+
     /// Same shape as the CUDA context's, so a caller can ask either backend
     /// what the card holds without knowing which it has.
     pub const MemInfo = struct {
@@ -5425,6 +5463,14 @@ pub const Context = struct {
     /// this still can't free enough, createBuffer's OOM retry is the
     /// reactive backstop.
     fn reserveForWeights(self: *Context, need: u64) void {
+        // `--vram-budget min`: hold nothing but the set this forward is using.
+        // `evictOneWeight` keeps the pinned prefix, so shedding everything it
+        // will give up leaves exactly the in-flight weights, at any resolution
+        // and without a byte figure to get wrong.
+        if (self.min_weights) {
+            while (self.evictOneWeight()) {}
+            return;
+        }
         while (self.budgetHeadroom() < need) {
             if (!self.evictOneWeight()) return;
         }
@@ -7375,5 +7421,249 @@ test "gpu penalize matches cpu applyPenalties" {
                 try std.testing.expectEqual(w, g); // untouched: bit-identical
             }
         }
+    }
+}
+
+test "gpu Mage-VAE kernels match their CPU references" {
+    // The codec's nine `dual/` bodies. One source serves both backends, but
+    // compiling to SPIR-V is no evidence that it RUNS, which is what this checks.
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x9a3e);
+    const rand = prng.random();
+
+    const up = struct {
+        fn f(c: *Context, v: []const f32) !DeviceBuffer {
+            const b = try c.tensorCreate(v.len * 4);
+            try c.tensorUpload(b, std.mem.sliceAsBytes(v));
+            return b;
+        }
+    }.f;
+    const close = struct {
+        fn f(want: []const f32, got: []const f32, tol: f32, what: []const u8) !void {
+            var worst: f32 = 0;
+            for (want, got) |e, a| worst = @max(worst, @abs(e - a));
+            errdefer std.debug.print("{s}: max abs {d}\n", .{ what, worst });
+            try std.testing.expect(worst < tol);
+        }
+    }.f;
+
+    // --- dw_conv3: a depthwise 3x3 against ops.conv.depthwiseConv2d -----------
+    {
+        const h = 5;
+        const w = 7;
+        const ch = 8;
+        const src = try gpa.alloc(f32, h * w * ch);
+        defer gpa.free(src);
+        const wt = try gpa.alloc(f32, ch * 9);
+        defer gpa.free(wt);
+        const bias = try gpa.alloc(f32, ch);
+        defer gpa.free(bias);
+        for (src) |*v| v.* = rand.floatNorm(f32);
+        for (wt) |*v| v.* = rand.floatNorm(f32) * 0.3;
+        for (bias) |*v| v.* = rand.floatNorm(f32) * 0.1;
+
+        var s_d = try up(ctx, src);
+        defer ctx.tensorDestroy(&s_d);
+        var w_d = try up(ctx, wt);
+        defer ctx.tensorDestroy(&w_d);
+        var b_d = try up(ctx, bias);
+        defer ctx.tensorDestroy(&b_d);
+        var o_d = try ctx.tensorCreate(src.len * 4);
+        defer ctx.tensorDestroy(&o_d);
+        try ctx.opElt(.dw_conv3, o_d, s_d, w_d, b_d, .{ .u0 = h * w * ch, .u1 = h, .u2 = w, .u3 = ch }, h * w * ch, 1, 1);
+
+        const got = try gpa.alloc(f32, src.len);
+        defer gpa.free(got);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+        const want = try gpa.alloc(f32, src.len);
+        defer gpa.free(want);
+        ops.conv.depthwiseConv2d(want, src, h, w, ch, 3, 1, wt, bias);
+        try close(want, got, 1e-5, "dw_conv3");
+    }
+
+    // --- col_mean + mul_cols_sigmoid: the channel-attention gate --------------
+    {
+        const rows = 37;
+        const dim = 16;
+        const src = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(src);
+        for (src) |*v| v.* = rand.floatNorm(f32);
+
+        var s_d = try up(ctx, src);
+        defer ctx.tensorDestroy(&s_d);
+        var m_d = try ctx.tensorCreate(dim * 4);
+        defer ctx.tensorDestroy(&m_d);
+        try ctx.opElt(.col_mean, m_d, s_d, null, null, .{ .u0 = dim, .u1 = rows }, dim, 1, 1);
+        const mean = try gpa.alloc(f32, dim);
+        defer gpa.free(mean);
+        try ctx.tensorDownload(m_d, std.mem.sliceAsBytes(mean));
+        for (0..dim) |c| {
+            var acc: f32 = 0;
+            for (0..rows) |r| acc += src[r * dim + c];
+            try std.testing.expectApproxEqAbs(acc / @as(f32, rows), mean[c], 1e-4);
+        }
+
+        try ctx.opElt(.mul_cols_sigmoid, s_d, m_d, null, null, .{ .u0 = rows * dim, .u1 = dim }, rows * dim, 1, 1);
+        const got = try gpa.alloc(f32, src.len);
+        defer gpa.free(got);
+        try ctx.tensorDownload(s_d, std.mem.sliceAsBytes(got));
+        for (0..rows) |r| {
+            for (0..dim) |c| {
+                const want = src[r * dim + c] * (1.0 / (1.0 + @exp(-mean[c])));
+                try std.testing.expectApproxEqAbs(want, got[r * dim + c], 1e-5);
+            }
+        }
+    }
+
+    // --- win_gather / win_scatter: 32x32 windows with REPLICATE padding -------
+    // A latent SMALLER than the window on one axis and larger on the other, so
+    // both the pad-up and the split are exercised in one shape.
+    {
+        const h = 20;
+        const w = 40;
+        const ch = 4;
+        const side = 32;
+        const nph = (h + side - 1) / side;
+        const npw = (w + side - 1) / side;
+        const n_win = nph * npw;
+        const src = try gpa.alloc(f32, h * w * ch);
+        defer gpa.free(src);
+        for (src, 0..) |*v, i| v.* = @floatFromInt(i % 251);
+
+        var s_d = try up(ctx, src);
+        defer ctx.tensorDestroy(&s_d);
+        var g_d = try ctx.tensorCreate(side * side * n_win * ch * 4);
+        defer ctx.tensorDestroy(&g_d);
+        const push: EltPush = .{ .u0 = side * side * n_win * ch, .u1 = h, .u2 = w, .u3 = ch, .u4 = npw, .u5 = side, .u6 = n_win };
+        try ctx.opElt(.win_gather, g_d, s_d, null, null, push, push.u0, 1, 1);
+        const got = try gpa.alloc(f32, side * side * n_win * ch);
+        defer gpa.free(got);
+        try ctx.tensorDownload(g_d, std.mem.sliceAsBytes(got));
+        for (0..side * side) |t| {
+            for (0..n_win) |win| {
+                // `: usize` is load-bearing: without it `@min` narrows `sy * w`
+                // to u5 arithmetic.
+                const sy: usize = @min((win / npw) * side + t / side, h - 1);
+                const sx: usize = @min((win % npw) * side + t % side, w - 1);
+                for (0..ch) |c| {
+                    const want = src[(sy * w + sx) * ch + c];
+                    try std.testing.expectEqual(want, got[(t * n_win + win) * ch + c]);
+                }
+            }
+        }
+
+        // The round trip drops the pad and restores the image exactly.
+        var o_d = try ctx.tensorCreate(src.len * 4);
+        defer ctx.tensorDestroy(&o_d);
+        try ctx.opElt(.win_scatter, o_d, g_d, null, null, push, push.u0, 1, 1);
+        const back = try gpa.alloc(f32, src.len);
+        defer gpa.free(back);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(back));
+        try std.testing.expectEqualSlices(f32, src, back);
+    }
+
+    // --- nerf_feat: zero pixel, the patch's channels, the position table ------
+    {
+        const tiles = 3;
+        const pa = 4;
+        const hx = 5;
+        const dd = 6;
+        const wide = 3 + hx + dd;
+        const y = try gpa.alloc(f32, tiles * hx * pa);
+        defer gpa.free(y);
+        const dct = try gpa.alloc(f32, pa * dd);
+        defer gpa.free(dct);
+        for (y, 0..) |*v, i| v.* = @floatFromInt(i);
+        for (dct, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * -1.0;
+
+        var y_d = try up(ctx, y);
+        defer ctx.tensorDestroy(&y_d);
+        var d_d = try up(ctx, dct);
+        defer ctx.tensorDestroy(&d_d);
+        var f_d = try ctx.tensorCreate(tiles * pa * wide * 4);
+        defer ctx.tensorDestroy(&f_d);
+        try ctx.opElt(.nerf_feat, f_d, y_d, d_d, null, .{ .u0 = tiles * pa * wide, .u1 = wide, .u2 = pa, .u3 = hx, .u4 = dd }, tiles * pa * wide, 1, 1);
+        const got = try gpa.alloc(f32, tiles * pa * wide);
+        defer gpa.free(got);
+        try ctx.tensorDownload(f_d, std.mem.sliceAsBytes(got));
+        for (0..tiles) |t| {
+            for (0..pa) |p| {
+                const row = got[(t * pa + p) * wide ..][0..wide];
+                for (row[0..3]) |v| try std.testing.expectEqual(@as(f32, 0), v);
+                for (0..hx) |j| try std.testing.expectEqual(y[t * hx * pa + j * pa + p], row[3 + j]);
+                for (0..dd) |j| try std.testing.expectEqual(dct[p * dd + j], row[3 + hx + j]);
+            }
+        }
+    }
+
+    // --- patch_scatter: the fold back to the image ----------------------------
+    {
+        const lat_w = 3;
+        const lat_h = 2;
+        const side = 4;
+        const tiles = lat_h * lat_w;
+        const pix = try gpa.alloc(f32, tiles * side * side * 3);
+        defer gpa.free(pix);
+        for (pix, 0..) |*v, i| v.* = @floatFromInt(i);
+
+        var p_d = try up(ctx, pix);
+        defer ctx.tensorDestroy(&p_d);
+        var r_d = try ctx.tensorCreate(lat_h * side * lat_w * side * 3 * 4);
+        defer ctx.tensorDestroy(&r_d);
+        try ctx.opElt(.patch_scatter, r_d, p_d, null, null, .{ .u0 = tiles * side * side * 3, .u1 = lat_w, .u2 = side, .u3 = 0 }, tiles * side * side * 3, 1, 1);
+        const got = try gpa.alloc(f32, lat_h * side * lat_w * side * 3);
+        defer gpa.free(got);
+        try ctx.tensorDownload(r_d, std.mem.sliceAsBytes(got));
+        const img_w = lat_w * side;
+        for (0..tiles) |t| {
+            for (0..side * side) |p| {
+                const yy = (t / lat_w) * side + p / side;
+                const xx = (t % lat_w) * side + p % side;
+                for (0..3) |c| {
+                    try std.testing.expectEqual(pix[(t * side * side + p) * 3 + c], got[(yy * img_w + xx) * 3 + c]);
+                }
+            }
+        }
+    }
+
+    // --- modulate_pr / gated_add_pr: per-ROW AdaLN ----------------------------
+    {
+        const rows = 11;
+        const dim = 8;
+        const x = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(x);
+        const mod = try gpa.alloc(f32, rows * 3 * dim);
+        defer gpa.free(mod);
+        const delta = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(delta);
+        for (x) |*v| v.* = rand.floatNorm(f32);
+        for (mod) |*v| v.* = rand.floatNorm(f32) * 0.5;
+        for (delta) |*v| v.* = rand.floatNorm(f32);
+
+        var x_d = try up(ctx, x);
+        defer ctx.tensorDestroy(&x_d);
+        var m_d = try up(ctx, mod);
+        defer ctx.tensorDestroy(&m_d);
+        var d_d = try up(ctx, delta);
+        defer ctx.tensorDestroy(&d_d);
+        try ctx.opElt(.modulate_pr, x_d, null, m_d, null, .{ .u0 = rows * dim, .u1 = dim }, rows * dim, 1, 1);
+        try ctx.opElt(.gated_add_pr, x_d, d_d, m_d, null, .{ .u0 = rows * dim, .u1 = dim }, rows * dim, 1, 1);
+        const got = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(got);
+        try ctx.tensorDownload(x_d, std.mem.sliceAsBytes(got));
+        const want = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(want);
+        for (0..rows) |r| {
+            for (0..dim) |j| {
+                const m = mod[r * 3 * dim ..];
+                const v = x[r * dim + j] * (1.0 + m[dim + j]) + m[j];
+                want[r * dim + j] = v + m[2 * dim + j] * delta[r * dim + j];
+            }
+        }
+        try close(want, got, 1e-5, "modulate_pr + gated_add_pr");
     }
 }

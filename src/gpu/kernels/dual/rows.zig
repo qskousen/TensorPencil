@@ -34,9 +34,9 @@ inline fn stridedSum(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: b
 
 // The apply loops below are NOT unrolled the way `stridedSum` is: eight strided
 // loads followed by eight stores in one loop body, in any form tried, crashes the
-// NVIDIA SPIR-V compiler at pipeline creation (ZIG.md). The one shape that pays for
-// it, a single wide row, is the LLM decode norm the CUDA wrapper keeps on its hand
-// block-per-row kernel.
+// NVIDIA SPIR-V compiler at pipeline creation. The one shape that would pay for it,
+// a single wide row, is the LLM decode norm, which the CUDA wrapper keeps on its
+// hand block-per-row kernel anyway.
 
 inline fn sq(v: f32) f32 {
     return v * v;
@@ -112,19 +112,26 @@ pub inline fn groupRmsnorm(e: Env) void {
 pub inline fn rmsMod(e: Env) void {
     const r = Rows(e);
     const dim = e.u(1);
+    // Row offsets into a, b and the index buffer, so a caller can drive a row RANGE
+    // without an offset view of the buffer: a Vulkan `DeviceBuffer` is a handle with
+    // nowhere to put one. Zero for a caller that passes whole buffers.
+    const a_off = e.u(5) * dim;
+    const b_off = e.u(6) * dim;
+    const d_off: u32 = @intFromFloat(e.f(1));
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
-        const base = row * dim;
+        const src = a_off + row * dim;
+        const dst = b_off + row * dim;
         var pre = e.u(2);
         var sh = e.u(3);
         if (e.u(4) != 0) {
-            const lab = e.ldW(.d, row) * e.u(4);
+            const lab = e.ldW(.d, d_off + row) * e.u(4);
             pre += lab;
             sh += lab;
         }
-        const inv = rmsInv(e, r, base, dim);
+        const inv = rmsInv(e, r, src, dim);
         var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.b, base + i, e.ld(.a, base + i) * inv * e.ld(.c, pre + i) + e.ld(.c, sh + i));
+        while (i < dim) : (i += r.lanes) e.st(.b, dst + i, e.ld(.a, src + i) * inv * e.ld(.c, pre + i) + e.ld(.c, sh + i));
     }
 }
 

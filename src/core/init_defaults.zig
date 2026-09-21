@@ -1,13 +1,11 @@
-//! `var x: T = undefined` skips every `field: T = default` — the defaults only
-//! run for struct-literal initialization. A stepper `init` that fills fields one
-//! by one therefore leaves any field it forgets holding garbage, which reads as
-//! a wrong flag rather than a crash (see ZIG.md).
+//! `var x: T = undefined` and `gpa.create(T)` both skip every `field: T =
+//! default`: the defaults run only for struct-literal initialization, so an
+//! init that fills fields one by one leaves whatever it forgets as garbage,
+//! which reads as a wrong flag rather than a crash.
 //!
 //! `of(T)` applies the declared defaults and leaves the rest undefined, so an
-//! init keeps its field-by-field shape without the class of bug.
-//!
-//! `gpa.create(T)` is the same hazard on the heap; use `applyTo` on the fresh
-//! pointer, which also avoids pushing a big struct through a stack temporary.
+//! init keeps its field-by-field shape. `applyTo` is the same for a fresh
+//! pointer, and avoids pushing a big struct through a stack temporary.
 
 const std = @import("std");
 

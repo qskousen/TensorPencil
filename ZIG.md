@@ -474,6 +474,45 @@ The result is then usize and all downstream arithmetic is full-width.
 Audit hint: any `@min(comptime_const, runtime)` (or `@max`) whose result
 feeds arithmetic or slice bounds needs the annotation.
 
+## `@min`'s narrowing fires on a comptime-KNOWN const, not just a literal
+
+ZIG.md already records `@min(65, x)` giving a `u7`. The same narrowing happens
+when the bound is a named `usize` const whose value the compiler knows, which
+looks nothing like a literal at the use site:
+
+```zig
+const band: usize = @max(1, some_comptime_expr);  // 661, comptime-known
+...
+const nb = @min(band, n - l0);   // nb is u10, NOT usize
+const span = nb * hidden;        // u10 math: 48 * 384 = 18432 overflows
+```
+
+Both operands are declared `usize`, so nothing reads as narrow; the value of
+`band` is what narrows it. In ReleaseSafe the panic pointed at
+`Allocator.free`, and even in Debug it pointed at the multiply while the
+printed operands (48 and 384) looked impossible.
+
+The rule is the same as before and the audit needs widening: annotate the
+result type on any `@min`/`@max` whose result feeds arithmetic or a slice
+bound, whenever EITHER operand has a comptime-known value -- not only when one
+is written as a literal.
+
+It bit a second time in the same week, on a DEVICE buffer size:
+
+```zig
+const nerf_band: usize = 704;              // comptime-known
+const band = @min(nerf_band, n);           // u10
+try be.ensureDeviceBuffer(&bufs.y, band * 32 * 256 * 4);   // truncates
+```
+
+There the symptom was neither a panic nor a wrong number: the size came out
+tiny, the allocation "succeeded", and the kernel wrote to a device pointer of
+exactly 0 -- `CUDA_ERROR_ILLEGAL_ADDRESS`, reported at whatever launched NEXT
+because a CUDA fault is sticky. `compute-sanitizer --tool memcheck` names the
+real launch and the faulting address in one run and is the first thing to
+reach for; `/usr/local/cuda/bin/compute-sanitizer` is the working one on this
+box (the `/usr/bin` wrapper cannot find its injection library).
+
 ## Passing tests must be silent on stderr — else `zig build test` prints a spurious red "failed command:" line
 
 Any test that writes to stderr **while passing** (e.g. a `std.debug.print`
@@ -845,3 +884,19 @@ Two transferable mistakes:
 
 Before calling a generative model's output level, colour, or sharpness a defect,
 vary the conditioning first, and measure the output rather than an intermediate.
+
+## A failing `std.debug.assert` in ReleaseSafe is attributed to a NEARBY line
+
+`std.debug.assert(cond)` is `if (!cond) unreachable`, so a failure prints
+`reached unreachable code` with a trace whose innermost frame is wherever the
+optimizer put it, not the assert. In one case the frame named a `std.log.err`
+call several lines later, inside a switch prong that never ran, which reads as
+"that prong was taken" and sends you hunting the wrong dispatch.
+
+Two things that keep it cheap:
+
+- Read the frame as "somewhere in this function", not as the line.
+- `std.debug.print` and `std.log` both lock stderr and can themselves panic
+  under a redirected or wrapped stderr, so a diagnostic added to find the
+  problem can become the reported frame. A print that survives is one the
+  caller already has (a return value, a field on a struct the test prints).

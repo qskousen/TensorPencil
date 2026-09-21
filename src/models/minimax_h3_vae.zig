@@ -28,7 +28,7 @@
 //! - Latent normalization is per-channel `(mean, std)` from the checkpoint's own
 //!   metadata, and the output undoes an IMAGENET normalization and clamps.
 //!
-//! Reference is ComfyUI `comfy/ldm/minimax/vae.py`. See VIDEO_PLAN.md.
+//! Reference is ComfyUI `comfy/ldm/minimax/vae.py`.
 
 const std = @import("std");
 const tp_core = @import("tp_core");

@@ -87,8 +87,18 @@ pub const zimage_cuda = @import("models/zimage_cuda.zig");
 pub const anima = @import("models/anima.zig");
 pub const anima_gpu = @import("models/anima_gpu.zig");
 pub const anima_cuda = @import("models/anima_cuda.zig");
+/// Mage-Flow, a 12-block double-stream MMDiT at one token per latent pixel.
+pub const mageflow = @import("models/mageflow.zig");
+pub const mageflow_text = @import("models/mageflow_text.zig");
+pub const mageflow_gpu = @import("models/mageflow_gpu.zig");
+pub const mageflow_cuda = @import("models/mageflow_cuda.zig");
+/// Mage-Flow's VAE: a one-step diffusion codec, 128 channels at 16x, not an
+/// `AutoencoderKL`.
+pub const mage_vae = @import("models/mage_vae.zig");
+pub const mage_vae_gpu = @import("models/mage_vae_gpu.zig");
+pub const mage_vae_cuda = @import("models/mage_vae_cuda.zig");
 /// MiniMax H3, a joint audio-video DiT: video and stereo audio denoised in one
-/// packed token sequence, on two different sigma schedules. See VIDEO_PLAN.md.
+/// packed token sequence, on two different sigma schedules.
 pub const minimax_h3 = @import("models/minimax_h3.zig");
 /// H3's video VAE decode side: a ViT3D over the latent grid, not a CNN.
 pub const minimax_h3_vae = @import("models/minimax_h3_vae.zig");
@@ -109,6 +119,12 @@ pub const minimax_h3_audio = @import("models/minimax_h3_audio.zig");
 pub const minimax_h3_audio_encode = @import("models/minimax_h3_audio_encode.zig");
 pub const minimax_h3_audio_encode_cuda = @import("models/minimax_h3_audio_encode_cuda.zig");
 pub const minimax_h3_cuda = @import("models/minimax_h3_cuda.zig");
+/// H3's trunk on Vulkan, the twin of `minimax_h3_cuda`.
+pub const minimax_h3_gpu = @import("models/minimax_h3_gpu.zig");
+/// H3's video VAE decode on Vulkan.
+pub const minimax_h3_vae_gpu = @import("models/minimax_h3_vae_gpu.zig");
+/// H3's audio VAE decode on Vulkan.
+pub const minimax_h3_audio_gpu = @import("models/minimax_h3_audio_gpu.zig");
 pub const minimax_h3_vae_cuda = @import("models/minimax_h3_vae_cuda.zig");
 pub const minimax_h3_audio_cuda = @import("models/minimax_h3_audio_cuda.zig");
 /// Runtime low-rank sidecars (LoRA), applied beside a GEMM rather than merged
@@ -194,11 +210,21 @@ test {
     _ = anima;
     _ = anima_gpu;
     _ = anima_cuda;
+    _ = mageflow;
+    _ = mageflow_text;
+    _ = mageflow_gpu;
+    _ = mageflow_cuda;
+    _ = mage_vae;
+    _ = mage_vae_gpu;
+    _ = mage_vae_cuda;
     _ = minimax_h3;
     _ = minimax_h3_vae;
     _ = minimax_h3_audio;
     _ = minimax_h3_audio_encode;
     _ = minimax_h3_cuda;
+    _ = minimax_h3_gpu;
+    _ = minimax_h3_vae_gpu;
+    _ = minimax_h3_audio_gpu;
     _ = minimax_h3_vae_cuda;
     // Device test relocated out of the gpu backend (it needs both tp_gpu and a
     // model CPU reference); lives here in the model tier.

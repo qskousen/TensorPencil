@@ -168,25 +168,41 @@ fn fill16(data: *[16]f32) void {
     }
 }
 
-/// Fill `out` with standard-normal samples, bit-identical to
-/// torch.manual_seed(seed) + torch.randn(out.len) on the CPU. Requires
-/// out.len >= 16 (below that torch switches to a cached element-wise
-/// Box-Muller this doesn't implement; latents are always >= 16).
+/// A generator whose state survives a draw, i.e. `torch.Generator(device="cpu")`
+/// held across several `torch.randn` calls. A sampler that draws once per step needs
+/// this: the second draw continues the MT stream rather than restarting it.
+pub const Generator = struct {
+    mt: Mt19937,
+
+    pub fn init(seed: u64) Generator {
+        return .{ .mt = .init(seed) };
+    }
+
+    /// Fill `out` with standard-normal samples and advance the engine. Requires
+    /// out.len >= 16 (below that torch switches to a cached element-wise
+    /// Box-Muller this doesn't implement; latents are always >= 16).
+    pub fn randn(self: *Generator, out: []f32) void {
+        std.debug.assert(out.len >= 16);
+        for (out) |*v| v.* = uniform(&self.mt);
+        var i: usize = 0;
+        while (i + 16 <= out.len) : (i += 16) {
+            fill16(out[i..][0..16]);
+        }
+        if (out.len % 16 != 0) {
+            // Torch redraws fresh uniforms for the final 16, overlapping the
+            // already-transformed region.
+            const tail = out[out.len - 16 ..][0..16];
+            for (tail) |*v| v.* = uniform(&self.mt);
+            fill16(tail);
+        }
+    }
+};
+
+/// One draw from a fresh generator: `torch.manual_seed(seed)` + `torch.randn(out.len)`
+/// on the CPU, bit-identically.
 pub fn randn(out: []f32, seed: u64) void {
-    std.debug.assert(out.len >= 16);
-    var g = Mt19937.init(seed);
-    for (out) |*v| v.* = uniform(&g);
-    var i: usize = 0;
-    while (i + 16 <= out.len) : (i += 16) {
-        fill16(out[i..][0..16]);
-    }
-    if (out.len % 16 != 0) {
-        // Torch redraws fresh uniforms for the final 16, overlapping the
-        // already-transformed region.
-        const tail = out[out.len - 16 ..][0..16];
-        for (tail) |*v| v.* = uniform(&g);
-        fill16(tail);
-    }
+    var g: Generator = .init(seed);
+    g.randn(out);
 }
 
 test "randn matches torch fixtures bit-for-bit" {

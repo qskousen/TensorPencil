@@ -455,11 +455,16 @@ pub const Hosts = struct {
     /// top to bottom. What survives a full buffer is ranked, not taken in slot
     /// order: failures are never cleared on their own, and enough of them would
     /// otherwise crowd out every render actually running.
+    ///
+    /// A picture whose file is gone is not work and never appears here: the
+    /// queue is what a machine is doing, and reopening a conversation asks for
+    /// nothing.
     pub fn running(self: *Hosts, out: []Shot) []Shot {
         var n: usize = 0;
         const name_them = self.several();
         for (self.slots.items) |s| {
             for (s.mirror.images.items) |*im| {
+                if (im.missing) continue;
                 switch (im.status()) {
                     .pending, .generating, .suspended, .failed => {},
                     else => continue,
@@ -518,6 +523,10 @@ pub const Hosts = struct {
     /// just failed it.
     pub fn retry(self: *Hosts, cfg: *const config.Config, id: wire.ImageId) void {
         const im = self.imageById(id) orelse return;
+        // Nothing to ask for: what made this picture was in the file, and the
+        // file is what went away. Rendering its empty request would put an
+        // unrelated image where the old one was.
+        if (im.missing) return;
         // Built into an arena first: enqueueing trims the oldest remembered
         // requests, which can free the very strings being read here.
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -569,6 +578,12 @@ pub const Hosts = struct {
     /// transcript that refers to these ids.
     pub fn addLocal(self: *Hosts, info: wire.ImageInfo, pixels: ?[]u8, saved_path: ?[]u8) wire.ImageId {
         return self.local().mirror.addLocal(info, pixels, saved_path);
+    }
+
+    /// This picture's file will not open, wherever it is held.
+    pub fn markLost(self: *Hosts, id: wire.ImageId, why: []const u8) void {
+        const s = self.imageOwner(id) orelse return;
+        s.mirror.markLost(id, why);
     }
 
     /// Longest side previews are fetched at. A view sets it to what it draws:
@@ -1622,10 +1637,13 @@ pub const Hosts = struct {
 
     /// The next failed render nobody has been told about, marked as told, and
     /// put to another host where one can take it. Call until it returns null.
+    ///
+    /// A picture whose file is gone is not one of them: no host was asked and
+    /// none failed, so the card that shows it is the whole of the news.
     pub fn takeFailure(self: *Hosts, cfg: *const config.Config) ?Failure {
         for (self.slots.items) |s| {
             for (s.mirror.images.items) |*im| {
-                if (im.info.status != .failed or im.failure_told) continue;
+                if (im.missing or im.info.status != .failed or im.failure_told) continue;
                 im.failure_told = true;
                 var f: Failure = .{ .host = s.name, .why = mirror.failureText(im.info.failure) };
                 if (self.replay(cfg, im.info.client_ref, s.id)) |to| {
@@ -2502,6 +2520,46 @@ test "a picture the client built itself lives with the local host and is found b
     try testing.expect(h.bySavedPath("/out/other.png") == null);
     // A client's own picture is nobody's render.
     try testing.expectEqualStrings("", h.hostOf(id));
+}
+
+test "a reopened picture whose file is gone is missing, not a failed render" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    const a = h.local();
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    a.remote = &ra;
+    defer a.remote = null;
+    ready(a);
+
+    const path = try testing.allocator.dupe(u8, "/out/gone.png");
+    const id = h.addLocal(.{ .status = .done, .width = 8, .height = 8 }, null, path);
+    h.markLost(id, "SavedImageMissing");
+    try testing.expect(h.imageById(id).?.missing);
+
+    // It is not work: nothing for the queue rail to draw...
+    var shots: [4]Hosts.Shot = undefined;
+    try testing.expectEqual(@as(usize, 0), h.running(&shots).len);
+    // ...nothing to tell the user a host failed...
+    try testing.expect(h.takeFailure(&cfg) == null);
+    // ...and nothing to ask for again. The request lived in the file, so a
+    // retry here would render an EMPTY prompt at whatever is selected now.
+    h.retry(&cfg, id);
+    try testing.expectEqual(@as(usize, 0), h.asked.items.len);
+    var waiting: [4]*const Hosts.Asked = undefined;
+    try testing.expectEqual(@as(usize, 0), h.waiting(&waiting).len);
+
+    // A real render that failed still does all three.
+    try a.mirror.images.append(testing.allocator, .{ .info = .{
+        .id = 3,
+        .status = .failed,
+        .failure = try testing.allocator.dupe(u8, "DeviceOutOfMemory"),
+    } });
+    try testing.expectEqual(@as(usize, 1), h.running(&shots).len);
+    try testing.expectEqualStrings("out of VRAM", h.takeFailure(&cfg).?.why);
 }
 
 test "a render is cancelled where it is, and a row that only records a failure is cleared away" {

@@ -846,6 +846,10 @@ pub const Host = struct {
         self.emitImages();
         self.emitTelemetry();
         if (self.drv.takePeakUpdate()) |u| self.emit(.{ .diff_peak = .{ .peak = u.peak, .key = u.key } });
+        if (self.drv.takeDiffNotice()) |text| {
+            defer self.gpa.free(text);
+            self.emit(.{ .notice = .{ .tone = .info, .text = text } });
+        }
     }
 
     fn emitState(self: *Host) void {
@@ -1036,6 +1040,14 @@ pub const Host = struct {
             .done_ns = gi.done_ns.load(.acquire),
             .family = if (d) |dd| (if (dd.loadedFamily()) |f| @tagName(f) else "") else "",
             .model_stem = if (gi.model) |m| diffuser.modelStem(m.dit_path) else "",
+            .clip1_stem = gi.meta.clip1,
+            .clip2_stem = gi.meta.clip2,
+            .vae_stem = gi.meta.vae,
+            .model_hash = gi.meta.model_hash,
+            .vae_hash = gi.meta.vae_hash,
+            .weight_dtype = gi.meta.weight_dtype,
+            .shift = gi.meta.shift,
+            .loras = gi.meta.loras,
         };
     }
 

@@ -233,7 +233,6 @@ pub const CudaLM = struct {
         try lin_cuda.plan(try lm.deviceLins(alloc), max_batch, "gemma3 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
-        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;

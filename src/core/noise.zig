@@ -40,6 +40,31 @@ pub fn randn(out: []f32, seed: u64, src: Source) void {
     }
 }
 
+/// A generator whose state survives a draw, for a sampler that draws once per step.
+///
+/// `randn` above is the one-shot form (a fresh generator per call, which is what the
+/// initial latent and every Brownian-tree node want). The ancestral samplers want the
+/// other thing: ComfyUI seeds ONE generator per render and calls it every step, so
+/// step 2's noise depends on step 1 having drawn. Restarting it per step would give
+/// every step the same noise field, which looks like noise and renders like a bug.
+pub const Generator = union(Source) {
+    torch_cpu: torch_rng.Generator,
+    nv_philox: philox_rng.Generator,
+
+    pub fn init(seed: u64, src: Source) Generator {
+        return switch (src) {
+            .torch_cpu => .{ .torch_cpu = .init(seed) },
+            .nv_philox => .{ .nv_philox = .init(seed) },
+        };
+    }
+
+    pub fn randn(self: *Generator, out: []f32) void {
+        switch (self.*) {
+            inline else => |*g| g.randn(out),
+        }
+    }
+};
+
 test "the two sources are unrelated, not perturbed" {
     // The point of the option: this is not a precision difference. If a future refactor
     // made one silently fall through to the other, correlation is what would catch it.
@@ -66,5 +91,23 @@ test "the two sources are unrelated, not perturbed" {
         const rms = @sqrt(ss / @as(f64, @floatFromInt(a.len)));
         errdefer std.debug.print("rms {d}\n", .{rms});
         try std.testing.expectApproxEqAbs(@as(f64, 1.0), rms, 0.05);
+    }
+}
+
+test "a persistent generator's first draw is the one-shot draw, and its second is not" {
+    // The failure this pins is a sampler that re-seeds every step: every step would
+    // then get the SAME noise field, which still looks like noise.
+    for ([_]Source{ .torch_cpu, .nv_philox }) |src| {
+        var one: [64]f32 = undefined;
+        randn(&one, 7, src);
+
+        var g: Generator = .init(7, src);
+        var first: [64]f32 = undefined;
+        var second: [64]f32 = undefined;
+        g.randn(&first);
+        g.randn(&second);
+
+        try std.testing.expectEqualSlices(f32, &one, &first);
+        try std.testing.expect(!std.mem.eql(f32, &first, &second));
     }
 }

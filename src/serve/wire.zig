@@ -255,6 +255,25 @@ pub const ImageInfo = struct {
     /// Family tag and model stem, for the metadata a client writes into its PNG.
     family: []const u8 = "",
     model_stem: []const u8 = "",
+    /// The rest of that metadata: which encoders, VAE and LoRAs a render used,
+    /// how the weights were stored, and the shift. The CLIENT writes the file, so
+    /// anything the block records has to cross the wire; the host is the only side
+    /// that knows what was actually loaded.
+    clip1_stem: []const u8 = "",
+    clip2_stem: []const u8 = "",
+    vae_stem: []const u8 = "",
+    model_hash: []const u8 = "",
+    vae_hash: []const u8 = "",
+    weight_dtype: []const u8 = "",
+    shift: f32 = 0,
+    /// Name, AutoV2 hash and strength per LoRA, in the order they were applied.
+    loras: []const LoraInfo = &.{},
+};
+
+pub const LoraInfo = struct {
+    name: []const u8 = "",
+    hash: []const u8 = "",
+    strength: f32 = 1.0,
 };
 
 pub const Telemetry = struct {
@@ -330,7 +349,13 @@ pub const Event = union(enum) {
     /// The client persists it against the model key; the host keeps no disk.
     diff_peak: struct { peak: u64 = 0, key: u64 = 0 },
     err: struct { code: ErrCode = .internal, text: []const u8 = "" },
+    /// Something worth saying that is not a failure: a host-side wait the user
+    /// would otherwise read as a hang. The client shows it and keeps nothing.
+    notice: struct { tone: Tone = .info, text: []const u8 = "" },
 };
+
+/// How loud a `notice` is. Matches the GUI's own toast tones.
+pub const Tone = enum { info, warn, err };
 
 /// Header of a binary payload on the bulk connection. Native byte order on both
 /// ends; every target we build is little-endian, and the magic is the check.

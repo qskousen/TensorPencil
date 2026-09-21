@@ -935,6 +935,13 @@ pub const Driver = struct {
     }
 
     /// A grown diffusion peak since the last call, with its model key, or null.
+    /// A notice the diffusion worker left for the host to put on screen. Caller
+    /// frees. See `diffuser.Diffuser.takeNotice`.
+    pub fn takeDiffNotice(self: *Driver) ?[]u8 {
+        if (self.diffuser) |*d| return d.takeNotice();
+        return null;
+    }
+
     pub fn takePeakUpdate(self: *Driver) ?struct { peak: u64, key: u64 } {
         const p = self.peak_update orelse return null;
         self.peak_update = null;
@@ -1173,6 +1180,7 @@ pub const Driver = struct {
             .preview_enabled = c.preview != .none,
             .taew_path = if (c.preview == .taesd) c.taesd.opt() else null,
             .preview_ds = c.taesd_size.divisor(),
+            .hash_models = c.hash_models,
         };
     }
 

@@ -7,7 +7,7 @@
 //! pixel statistics and the per-channel latent statistics.
 //!
 //! This is what a reference image, a keyframe or a reference video becomes before
-//! the DiT sees it, so it is the gate on fl2va and ref2va. See VIDEO_PLAN.md.
+//! the DiT sees it, so it is the gate on fl2va and ref2va.
 //!
 //! Conventions that are silent wrong answers when got wrong, all pinned by
 //! `tools/gen_minimax_h3_vae_encode.py`:

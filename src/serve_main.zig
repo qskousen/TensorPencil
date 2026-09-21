@@ -46,6 +46,10 @@
 //! - the directory its unix socket sits in (`$XDG_RUNTIME_DIR/tensorpencil-<user>`,
 //!   created 0700 by `link.defaultLocalPath`), and the socket itself,
 //!   unlinked at shutdown;
+//! - a `<model>.sha256` beside a model file that has none, written once so the
+//!   AutoV2 hash in a saved PNG's metadata is not recomputed per render (a
+//!   digest of the weights: no prompt, no reply, no pixel). `hash_models = false`
+//!   turns it off;
 //! - thread names (`/proc/self/task/*/comm`) and the GPU device nodes;
 //! - `~/.nv/ComputeCache/*`, which the NVIDIA driver writes on its own account
 //!   (compiled kernels, no user content) and which no unit test would find.

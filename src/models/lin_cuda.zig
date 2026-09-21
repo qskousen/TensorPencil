@@ -314,6 +314,26 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
 /// tile. The weight-only routes write exactly `m`. `plan` cannot check this, since it
 /// never sees a buffer, so a family whose sequence padding is coarser than 128 either
 /// pads its GEMM outputs or takes only weight-only routes.
+/// `gemm` with a per-column bias, folded into the GEMM where the route's kernel
+/// takes a bias vector and added in a second pass where it does not.
+///
+/// The fold is not a micro-optimization at DiT widths: the separate pass is a
+/// read-modify-write of the whole `[m][co]` output plane, which for a family
+/// whose every block linear carries a bias is a plane of traffic per GEMM.
+pub fn gemmBias(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, out_f16: bool, bias: []const f32) !void {
+    const r = routeOf(w, p.blockq) orelse return error.UnsupportedDType;
+    if (r == .bf16 and be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0) {
+        try probe(be, r, x, m, w);
+        std.debug.assert(bias.len >= w.rows);
+        try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias);
+        if (p.lora) |stack| try sidecar(be, stack, y, x, m, w, out_f16);
+        return;
+    }
+    try gemm(be, p, y, x, m, w, out_f16);
+    const b: Buf = .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(bias)), .size = bias.len * 4 };
+    try be.opAddBiasRows(y, b, m, w.rows, 0, out_f16);
+}
+
 pub fn gemm(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, out_f16: bool) !void {
     const r = routeOf(w, p.blockq) orelse return error.UnsupportedDType;
     std.debug.assert(!out_f16 or prepOf(r) == .i8);

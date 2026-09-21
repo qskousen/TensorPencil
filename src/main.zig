@@ -5,10 +5,6 @@ const Io = std.Io;
 
 const TensorPencil = @import("TensorPencil");
 
-/// `--vram-budget min`: hold only the in-flight weights (~2 at a time). 256 MiB
-/// comfortably fits the two largest int8 linears (~100 MiB each) plus scales, so
-/// no single op sync-thrashes, while every other weight streams per step.
-const min_vram_budget: u64 = 256 << 20;
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -215,6 +211,121 @@ pub fn main(init: std.process.Init) !void {
             } else ckpt = args[i];
         }
         try zimageCudaTest(arena, io, stdout, ckpt, vae, libs, layers, lat_arg, cap_arg, sigma_arg);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mage-vae-vk-test")) {
+        var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/mage_flow_vae_bf16.safetensors";
+        var lat_h: usize = 6;
+        var lat_w: usize = 8;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--lat") and i + 2 < args.len) {
+                lat_h = std.fmt.parseInt(usize, args[i + 1], 10) catch lat_h;
+                lat_w = std.fmt.parseInt(usize, args[i + 2], 10) catch lat_w;
+                i += 2;
+            } else vae = args[i];
+        }
+        try mageVaeVkTest(arena, io, stdout, vae, lat_h, lat_w);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mage-vae-cuda-test")) {
+        var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/mage_flow_vae_bf16.safetensors";
+        var libs = false;
+        var lat_h: usize = 6;
+        var lat_w: usize = 8;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) libs = true //
+            else if (std.mem.eql(u8, args[i], "--lat") and i + 2 < args.len) {
+                lat_h = std.fmt.parseInt(usize, args[i + 1], 10) catch lat_h;
+                lat_w = std.fmt.parseInt(usize, args[i + 2], 10) catch lat_w;
+                i += 2;
+            } else vae = args[i];
+        }
+        try mageVaeCudaTest(arena, io, stdout, vae, libs, lat_h, lat_w);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mageflow-bench")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/mageflow/mageFlow_mageFlow4B.safetensors";
+        var backend: []const u8 = "cuda";
+        var lat_arg: usize = 64;
+        var cap_arg: usize = 64;
+        var reps: usize = 5;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
+                i += 1;
+                backend = args[i];
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--reps") and i + 1 < args.len) {
+                i += 1;
+                reps = std.fmt.parseInt(usize, args[i], 10) catch reps;
+            } else ckpt = args[i];
+        }
+        try mageflowBench(arena, io, stdout, ckpt, backend, lat_arg, cap_arg, reps);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mageflow-vk-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/mageflow/mageFlow_mageFlow4B.safetensors";
+        var layers: usize = 0; // 0 = the full trunk
+        var lat_arg: usize = 16;
+        var cap_arg: usize = 20;
+        var refs_arg: usize = 0;
+        var sigma_arg: f32 = 0.75;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch 0;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch sigma_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--refs") and i + 1 < args.len) {
+                i += 1;
+                refs_arg = std.fmt.parseInt(usize, args[i], 10) catch refs_arg;
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--unbatched")) {
+                TensorPencil.models.mageflow_gpu.force_unbatched = true;
+            } else ckpt = args[i];
+        }
+        try mageflowVkTest(arena, io, stdout, ckpt, layers, lat_arg, cap_arg, refs_arg, sigma_arg);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mageflow-cuda-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/mageflow/mageFlow_mageFlow4B.safetensors";
+        var libs = false;
+        var layers: usize = 0; // 0 = the full trunk
+        var lat_arg: usize = 16;
+        var cap_arg: usize = 20;
+        var refs_arg: usize = 0;
+        var sigma_arg: f32 = 0.75;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) libs = true //
+            else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch 0;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch sigma_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--refs") and i + 1 < args.len) {
+                i += 1;
+                refs_arg = std.fmt.parseInt(usize, args[i], 10) catch refs_arg;
+            } else if (std.mem.eql(u8, args[i], "--dequant-at-load") and i + 1 < args.len) {
+                i += 1;
+                TensorPencil.models.lin.dequant_at_load = std.meta.stringToEnum(@TypeOf(TensorPencil.models.lin.dequant_at_load), args[i]) orelse return error.InvalidArgs;
+            } else if (std.mem.eql(u8, args[i], "--gguf-gemm") and i + 1 < args.len) {
+                i += 1;
+                TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, args[i]) orelse return error.InvalidArgs;
+            } else ckpt = args[i];
+        }
+        try mageflowCudaTest(arena, io, stdout, ckpt, libs, layers, lat_arg, cap_arg, refs_arg, sigma_arg);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-cuda-test")) {
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
         var libs = false;
@@ -301,6 +412,9 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "libs")) break true;
         } else false;
         try minimaxH3AudioEncodeCudaTest(arena, io, stdout, ck, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-audio-vk-test")) {
+        const ck = if (args.len >= 3) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+        try minimaxH3AudioVkTest(arena, io, stdout, ck);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-audio-cuda-test")) {
         const ck = if (args.len >= 3 and !std.mem.eql(u8, args[2], "libs")) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
         var libs = false;
@@ -314,8 +428,13 @@ pub fn main(init: std.process.Init) !void {
         try loraRestackTest(arena, io, stdout, args[2], args[3]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "dual-cuda-test")) {
         try dualCudaTest(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-vk-test")) {
+        try minimaxH3VaeVkTest(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-cuda-test")) {
         try minimaxH3VaeCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vk-test")) {
+        const ck = if (args.len >= 3) args[2] else "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
+        try minimaxH3VkTest(arena, io, stdout, ck);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-cuda-test")) {
         const ck = if (args.len >= 3) args[2] else "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
         const libs = args.len >= 4 and std.mem.eql(u8, args[3], "libs");
@@ -361,14 +480,21 @@ pub fn main(init: std.process.Init) !void {
             \\      --cfg 1.0          guidance scale (1.0 = no negative pass)
             \\      --seed 0           noise seed
             \\      --shift 1.15       flow-matching sigma shift
-            \\      --sampler euler    sampler: euler | dpmpp_2m_sde
-            \\                         | dpmpp_2m_sde_heun. The two SDE variants are
-            \\                         DPM-Solver++(2M) SDE with ComfyUI's midpoint
-            \\                         and heun corrections; both inject noise from a
-            \\                         seed-determined Brownian tree, so the same
-            \\                         --seed reproduces ComfyUI's render
-            \\      --sde-eta 1.0      SDE noise level (0 = deterministic DPM++(2M))
-            \\      --sde-s-noise 1.0  SDE noise multiplier
+            \\      --sampler euler    sampler, each ComfyUI's of that name:
+            \\                         euler | euler_ancestral | heun | dpm_2
+            \\                         | dpm_2_ancestral | dpmpp_2s_ancestral
+            \\                         | dpmpp_sde | dpmpp_2m | dpmpp_2m_sde
+            \\                         | dpmpp_2m_sde_heun | dpmpp_3m_sde.
+            \\                         The ancestral ones step short of the next sigma
+            \\                         and add the gap back as noise; the SDE ones
+            \\                         take their noise from a seed-determined
+            \\                         Brownian tree instead. heun, dpm_2 and the two
+            \\                         2S/2-ancestral ones plus dpmpp_sde run the
+            \\                         model TWICE per step, so the same --steps is
+            \\                         twice the time
+            \\      --eta 1.0          noise level for a stochastic sampler
+            \\                         (0 = deterministic DPM++(2M), or plain euler)
+            \\      --s-noise 1.0      multiplier on that noise
             \\      --scheduler        where the steps go: normal | karras
             \\                         | exponential | sgm_uniform | simple
             \\                         | ddim_uniform | beta | linear_quadratic
@@ -403,10 +529,15 @@ pub fn main(init: std.process.Init) !void {
             \\                         / w4a8 / dense bf16 --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
-            \\                         "min" holds only the in-flight weights
-            \\                         (~2 at a time) — lowest VRAM, but streams
-            \\                         every weight each step (slow; pair w/ a
-            \\                         small image for sub-GiB total)
+            \\                         A HARD ceiling: allocations past it are
+            \\                         refused, not merely discouraged. Only
+            \\                         weights stream, so a budget under what the
+            \\                         activations alone need is refused (~4 GiB
+            \\                         at 1.8MP) — render smaller to go lower.
+            \\                         "min" is not a number but the floor: keep
+            \\                         no weight resident past the set in use, so
+            \\                         the footprint is the activations plus that
+            \\                         set. Streams every weight every step
             \\      --encoder-f16 off  run the text encoder GEMMs on tensor
             \\                         cores (f16): ~0.4s faster, slightly less
             \\                         exact conditioning (on/off)
@@ -464,10 +595,13 @@ pub fn main(init: std.process.Init) !void {
             \\                         buffered = read the whole file into RAM up
             \\                         front. Use buffered on ZFS (mmap faulting
             \\                         can deadlock there under memory pressure).
-            \\      --ref-image <png>  SenseNova reference picture for image editing;
-            \\                         repeat for more than one. The pictures are
-            \\                         presented at the size given (32 px per
-            \\                         token), so resize before passing them.
+            \\      --ref-image <png>  reference picture for image editing (SenseNova
+            \\                         and Mage-Flow-Edit); repeat for more than one.
+            \\                         SenseNova presents them at the size given
+            \\                         (32 px per token), so resize those before
+            \\                         passing them; Mage-Flow resizes each twice
+            \\                         itself, to 384 px for the vision tower and to
+            \\                         the RENDER's size for the denoiser.
             \\                         Ignored by every other family
             \\      --out out.png      output file
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
@@ -492,6 +626,26 @@ pub fn main(init: std.process.Init) !void {
             \\  TensorPencil lora-restack-test <ckpt> <lora>
             \\      swap a LoRA stack on a live session: the image must come back
             \\      bit-identical and the factors' VRAM be handed back
+            \\  TensorPencil mage-vae-cuda-test [<mage vae>] [libs] [--lat H W]
+            \\  TensorPencil mage-vae-vk-test [<mage vae>] [--lat H W]
+            \\        Mage-VAE's CUDA decode against its CPU decode, stage by
+            \\        stage. --lat takes BOTH extents: the 32x32 attention window
+            \\        pads a smaller latent UP and splits a larger one, so one
+            \\        size answers about one of those
+            \\  TensorPencil mageflow-bench [<mage ckpt>] [--backend cuda|zig-cuda|vulkan]
+            \\                 [--lat N] [--cap N] [--reps N]
+            \\      one Mage-Flow forward at real shapes: batched s/step best-of-N,
+            \\      then one sync-per-op pass for the per-category split
+            \\  TensorPencil mageflow-vk-test [<mage ckpt>]
+            \\  TensorPencil mageflow-cuda-test [<mage ckpt>] [libs]
+            \\        [--layers N] [--lat N] [--cap N] [--refs N] [--sigma S]
+            \\        Mage-Flow's CUDA forward against its CPU forward. The axes
+            \\        are separate because a defect rides one: --layers is depth
+            \\        (a per-block error accumulates), --lat the canvas token
+            \\        count, --cap the TEXT half's length (the other half of the
+            \\        joint sequence, and the one with its own projections),
+            \\        --refs how many reference images the edit path appends, and
+            \\        --sigma the activation magnitude
             \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
             \\      check zimage_cuda's device forward against the CPU forward on
             \\      real weights, on both attention paths; non-zero if any fails
@@ -1997,7 +2151,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova => &.{},
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -2657,6 +2811,586 @@ fn relL2f(want: []const f32, got: []const f32) f64 {
 /// Truncated to a few trunk layers so it loads in seconds. The loop bound is not
 /// what a kernel port gets wrong; the block's shape is. Exits non-zero on failure
 /// so it works as a gate.
+/// Mage-VAE's CUDA decode against its CPU decode, staged.
+///
+/// Staged rather than end to end because the halves fail for different reasons:
+/// the CoD decoder is convolutions, GroupNorm and a WINDOWED attention with
+/// replicate padding, while the per-pixel MLP is a gather, a per-ROW AdaLN and a
+/// fold. One final comparison would say only "wrong".
+fn mageVaeCudaTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    vae_path: []const u8,
+    libs: bool,
+    lat_h: usize,
+    lat_w: usize,
+) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const mage_vae = TensorPencil.models.mage_vae;
+    const mage_vae_cuda = TensorPencil.models.mage_vae_cuda;
+
+    std.Io.Dir.cwd().access(io, vae_path, .{}) catch {
+        try stdout.print("mage-vae-cuda-test needs a Mage-VAE ({s})\n", .{vae_path});
+        return;
+    };
+    var vt = try TensorPencil.SafeTensors.open(arena, io, vae_path);
+    defer vt.deinit();
+    var model = try mage_vae.MageVae.load(arena, .{ .safetensors = &vt }, "");
+    defer model.deinit();
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== mage-vae-cuda-test ==\ncuda device: {s} (kernels: {t})\nlatent {d}x{d} -> {d}x{d} px\n", .{
+        be.deviceName(), be.kernels, lat_h, lat_w, lat_h * 16, lat_w * 16,
+    });
+
+    var prng = std.Random.DefaultPrng.init(91);
+    const rnd = prng.random();
+    const n = lat_h * lat_w;
+    const z = try arena.alloc(f32, n * mage_vae.latent_channels);
+    for (z) |*v| v.* = rnd.floatNorm(f32);
+
+    var failures: usize = 0;
+    const check = struct {
+        fn f(out: *Io.Writer, fails: *usize, what: []const u8, want: []const f32, got: []const f32, tol: f64) !void {
+            var num: f64 = 0;
+            var den: f64 = 0;
+            var nonfinite: usize = 0;
+            for (want, got) |e, a| {
+                if (!std.math.isFinite(a)) nonfinite += 1;
+                num += (@as(f64, e) - a) * (@as(f64, e) - a);
+                den += @as(f64, e) * e;
+            }
+            const rel = if (den == 0) 0 else @sqrt(num / den);
+            const ok = nonfinite == 0 and rel < tol;
+            if (!ok) fails.* += 1;
+            try out.print("{s:<22} rel L2 {e:.4}  {s}{s}\n", .{
+                what, rel, if (ok) "ok" else "FAILED",
+                if (nonfinite != 0) " (non-finite output)" else "",
+            });
+        }
+    }.f;
+
+    // The CoD conditioning first: a windowing or padding mistake shows here,
+    // where the final RGB would only say "wrong".
+    {
+        const want = try model.codForward(io, arena, z, lat_h, lat_w);
+        const got = try mage_vae_cuda.codForward(&model, be, arena, z, lat_h, lat_w);
+        // Measured 2.4e-4: the f16 the convolution GEMM narrows its operands to,
+        // which is the floor every VAE arm here sits at, not this codec's.
+        try check(stdout, &failures, "cod conditioning", want, got, 1e-3);
+    }
+
+    const want = try model.decode(io, arena, z, lat_h, lat_w);
+    const got = try mage_vae_cuda.decode(&model, be, io, arena, z, lat_h, lat_w, null);
+    // Measured 2.5e-4, i.e. the CoD figure and almost nothing on top: the
+    // per-pixel MLP after it is f32 throughout.
+    try check(stdout, &failures, "decode (whole)", want, got, 1e-3);
+    try summarize(stdout, failures);
+}
+
+/// One Mage-Flow forward's device work at real shapes, on whichever backend is
+/// named, so the two arms are measured by the same harness.
+///
+/// Two numbers, and they answer different questions. The BATCHED best-of-N is the
+/// steady-state s/step a render actually pays. The sync-per-op pass that follows
+/// serializes every op to attribute the time, so its total is an upper bound and
+/// only the RATIOS between its rows mean anything.
+/// The AUTOMATIC1111 `parameters` block for a CLI render, resources and all.
+///
+/// The paths come straight off `opts`, which is what the render used; the weight
+/// dtype is not asked for here because this runs after `generate` has returned
+/// and the session is gone. A file hash is read from a `<path>.sha256` sidecar
+/// when one exists and computed once otherwise.
+fn renderParams(
+    arena: std.mem.Allocator,
+    io: Io,
+    opts: *const TensorPencil.pipeline.Options,
+    /// What the render resolved that `opts` does not hold: the shift (unless
+    /// `--shift` was given, the family default ran) and the weight dtype (a
+    /// property of what loaded).
+    img: *const TensorPencil.pipeline.Image,
+    w: usize,
+    h: usize,
+) ![]u8 {
+    const base = try TensorPencil.pipeline.buildA1111Params(
+        arena,
+        opts.prompt,
+        opts.negative,
+        opts.steps,
+        opts.cfg,
+        opts.seed,
+        w,
+        h,
+        std.fs.path.stem(opts.dit_path),
+        null,
+        opts.sampler,
+        opts.scheduler,
+        opts.prompt_syntax,
+        opts.emphasis,
+        opts.compat,
+        opts.compatConfig(),
+    );
+    var hashes: TensorPencil.pipeline.HashCache = .{ .compute = opts.hash_models };
+    defer hashes.deinit(arena);
+    var loras: std.ArrayList(TensorPencil.pipeline.LoraRecord) = .empty;
+    defer loras.deinit(arena);
+    for (opts.loras) |l| try loras.append(arena, .{
+        .name = std.fs.path.stem(l.path),
+        .hash = hashes.autoV2(arena, io, l.path),
+        .strength = l.strength,
+    });
+    return TensorPencil.pipeline.appendExtraParams(arena, base, .{
+        .clip1 = std.fs.path.stem(opts.text_encoder_path),
+        .clip2 = std.fs.path.stem(opts.text_encoder_2_path),
+        .vae = std.fs.path.stem(opts.vae_path),
+        .model_hash = hashes.autoV2(arena, io, opts.dit_path),
+        .vae_hash = hashes.autoV2(arena, io, opts.vae_path),
+        .shift = img.shift,
+        .weight_dtype = img.weight_dtype,
+        // Only when moved off ComfyUI's defaults, so an ordinary block is
+        // unchanged and an overridden one re-renders.
+        .eta = if (opts.eta != 1.0) opts.eta else null,
+        .s_noise = if (opts.s_noise != 1.0) opts.s_noise else null,
+        .loras = loras.items,
+    });
+}
+
+fn mageflowBench(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    backend: []const u8,
+    lat: usize,
+    seq_txt: usize,
+    reps: usize,
+) !void {
+    const mageflow = TensorPencil.models.mageflow;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("mageflow-bench needs a Mage-Flow checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    const store = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    var model = try mageflow.DiT.load(arena, store);
+    defer model.deinit();
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const cond = try arena.alloc(f32, seq_txt * mageflow.txt_dim);
+    for (cond) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, mageflow.channels * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+    const out = try arena.alloc(f32, x_lat.len);
+    const sigma: f32 = 0.75;
+
+    try stdout.print("== mageflow-bench ==\nbackend {s}  latent {d}x{d} ({d}x{d} px)  text {d} rows\n", .{
+        backend, lat, lat, lat * 16, lat * 16, seq_txt,
+    });
+
+    if (std.mem.eql(u8, backend, "vulkan")) {
+        const gpu_mod = TensorPencil.gpu.context;
+        const arm = TensorPencil.models.mageflow_gpu;
+        const ctx = gpu_mod.Context.init(arena, io) catch |err| {
+            try stdout.print("vulkan unavailable: {t}\n", .{err});
+            return;
+        };
+        defer ctx.deinit();
+        try stdout.print("vulkan device: {s}\n", .{ctx.deviceName()});
+        if (!arm.supported(ctx, &model)) {
+            try stdout.print("checkpoint dtype unsupported on this device\n", .{});
+            return;
+        }
+        var sess = try arm.Session.init(arena, io, ctx, &model, lat, lat, cond, seq_txt, &.{}, &.{ sigma, 0 });
+        defer sess.deinit(arena, ctx);
+        var ws = try arm.Workspace.init(ctx, &model, seq_txt, sess.n_tok);
+        defer ws.deinit(ctx);
+
+        try arm.forward(&model, ctx, &sess, &ws, io, arena, out, x_lat, sigma, null);
+        // Interleaved over the heads-per-batch knob, for the same clock-drift
+        // reason the CUDA arm interleaves its bias A/B.
+        var best: f64 = std.math.inf(f64);
+        var best_unbatched: f64 = std.math.inf(f64);
+        for (0..reps) |_| {
+            for ([_]bool{ false, true }) |unb| {
+                arm.force_unbatched = unb;
+                const ta = std.Io.Clock.real.now(io);
+                try arm.forward(&model, ctx, &sess, &ws, io, arena, out, x_lat, sigma, null);
+                const tb = std.Io.Clock.real.now(io);
+                const ms = @as(f64, @floatFromInt(tb.nanoseconds - ta.nanoseconds)) / 1e6;
+                if (unb) best_unbatched = @min(best_unbatched, ms) else best = @min(best, ms);
+            }
+        }
+        arm.force_unbatched = false;
+        try stdout.print("batched forward: {d:.1} ms (best of {d}, one submission)\n", .{ best, reps });
+        try stdout.print("                 {d:.1} ms (best of {d}, submit per op)  batching saves {d:.1}%\n", .{
+            best_unbatched, reps, 100 * (best_unbatched - best) / best_unbatched,
+        });
+
+        arm.profile = true;
+        arm.prof.reset();
+        try arm.forward(&model, ctx, &sess, &ws, io, arena, out, x_lat, sigma, null);
+        arm.profile = false;
+        const p = arm.prof;
+        const rows = [_]struct { name: []const u8, ns: i128 }{
+            .{ .name = "gemm", .ns = p.gemm_ns },
+            .{ .name = "gemm/txt", .ns = p.gemm_txt_ns },
+            .{ .name = "attn", .ns = p.attn_ns },
+            .{ .name = "norm", .ns = p.norm_ns },
+            .{ .name = "elt", .ns = p.elt_ns },
+            .{ .name = "copy", .ns = p.copy_ns },
+            .{ .name = "xfer", .ns = p.xfer_ns },
+            .{ .name = "cpu", .ns = p.cpu_ns },
+        };
+        const tot = p.totalNs();
+        for (rows) |r| try printRow(stdout, r.name, r.ns, tot);
+        try stdout.print("  {s:<7} {d:>8.1} ms  (sync-per-op sum, upper bound)\n", .{ "total", nsMs(tot) });
+        return;
+    }
+
+    const cuda = TensorPencil.gpu.cuda;
+    const arm = TensorPencil.models.mageflow_cuda;
+    const libs = std.mem.eql(u8, backend, "cuda");
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+    if (!arm.supported(&model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+    var sess = try arm.Session.init(arena, io, be, &model, lat, lat, cond, seq_txt, &.{}, &.{ sigma, 0 });
+    defer sess.deinit(arena, be);
+    var ws = try arm.Workspace.init(be, &model, seq_txt, sess.n_tok);
+    defer ws.deinit(be);
+
+    try arm.forward(&model, be, &sess, &ws, io, arena, out, x_lat, sigma, null);
+    // INTERLEAVED A/B in one process. This card's clock drifts ~3% between runs,
+    // which is larger than most of the changes worth making, so two separate
+    // invocations cannot tell a 4% win from noise; alternating inside one run
+    // makes the drift common-mode.
+    var best: f64 = std.math.inf(f64);
+    var best_split: f64 = std.math.inf(f64);
+    for (0..reps) |_| {
+        for ([_]bool{ false, true }) |split| {
+            arm.split_bias = split;
+            const ta = std.Io.Clock.real.now(io);
+            try arm.forward(&model, be, &sess, &ws, io, arena, out, x_lat, sigma, null);
+            const tb = std.Io.Clock.real.now(io);
+            const ms = @as(f64, @floatFromInt(tb.nanoseconds - ta.nanoseconds)) / 1e6;
+            if (split) best_split = @min(best_split, ms) else best = @min(best, ms);
+        }
+    }
+    arm.split_bias = false;
+    try stdout.print("batched forward: {d:.1} ms (best of {d}, bias folded)\n", .{ best, reps });
+    try stdout.print("                 {d:.1} ms (best of {d}, bias in a separate pass)  fold saves {d:.1}%\n", .{
+        best_split, reps, 100 * (best_split - best) / best_split,
+    });
+
+    be.profile = true;
+    be.prof.reset();
+    try arm.forward(&model, be, &sess, &ws, io, arena, out, x_lat, sigma, null);
+    be.profile = false;
+    var tot: f64 = 0;
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@intFromEnum(cat)];
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
+        const i = @intFromEnum(cat);
+        const ms = be.prof.ms[i];
+        try stdout.print("  {s:<7} {d:>8.1} ms  {d:>5.1}%  ({d} launches)\n", .{
+            @tagName(cat), ms, if (tot == 0) 0 else 100 * ms / tot, be.prof.n[i],
+        });
+    }
+    try stdout.print("  {s:<7} {d:>8.1} ms  (sync-per-op sum, upper bound)\n", .{ "total", tot });
+}
+
+fn nsMs(ns: i128) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+fn printRow(out: *Io.Writer, name: []const u8, ns: i128, tot: i128) !void {
+    const pct = if (tot == 0) 0 else 100 * nsMs(ns) / nsMs(tot);
+    try out.print("  {s:<9} {d:>8.1} ms  {d:>5.1}%\n", .{ name, nsMs(ns), pct });
+}
+
+/// Mage-VAE's Vulkan decode against its CPU decode, staged like its CUDA twin
+/// and for the same reason: the CoD decoder and the per-pixel MLP fail for
+/// different reasons, and one final comparison would say only "wrong".
+fn mageVaeVkTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    vae_path: []const u8,
+    lat_h: usize,
+    lat_w: usize,
+) !void {
+    const gpu_mod = TensorPencil.gpu.context;
+    const mage_vae = TensorPencil.models.mage_vae;
+    const mage_vae_gpu = TensorPencil.models.mage_vae_gpu;
+
+    std.Io.Dir.cwd().access(io, vae_path, .{}) catch {
+        try stdout.print("mage-vae-vk-test needs a Mage-VAE ({s})\n", .{vae_path});
+        return;
+    };
+    var vt = try TensorPencil.SafeTensors.open(arena, io, vae_path);
+    defer vt.deinit();
+    var model = try mage_vae.MageVae.load(arena, .{ .safetensors = &vt }, "");
+    defer model.deinit();
+
+    const ctx = gpu_mod.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== mage-vae-vk-test ==\nvulkan device: {s}\nlatent {d}x{d} -> {d}x{d} px\n", .{
+        ctx.deviceName(), lat_h, lat_w, lat_h * 16, lat_w * 16,
+    });
+
+    var prng = std.Random.DefaultPrng.init(91);
+    const rnd = prng.random();
+    const z = try arena.alloc(f32, lat_h * lat_w * mage_vae.latent_channels);
+    for (z) |*v| v.* = rnd.floatNorm(f32);
+
+    var failures: usize = 0;
+    {
+        const want = try model.codForward(io, arena, z, lat_h, lat_w);
+        const got = try mage_vae_gpu.codForward(&model, ctx, arena, z, lat_h, lat_w);
+        try checkRel(stdout, &failures, "cod conditioning", want, got, 1e-3);
+    }
+    const want = try model.decode(io, arena, z, lat_h, lat_w);
+    const got = try mage_vae_gpu.decode(&model, ctx, io, arena, z, lat_h, lat_w, null);
+    try checkRel(stdout, &failures, "decode (whole)", want, got, 1e-3);
+    try summarize(stdout, failures);
+}
+
+/// Mage-Flow's Vulkan forward against its CPU forward, on the real checkpoint.
+/// Same five axes as `mageflow-cuda-test`, for the same reason.
+fn mageflowVkTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    layers: usize,
+    lat_arg: usize,
+    cap_arg: usize,
+    refs_arg: usize,
+    sigma_arg: f32,
+) !void {
+    const gpu_mod = TensorPencil.gpu.context;
+    const mageflow = TensorPencil.models.mageflow;
+    const mageflow_gpu = TensorPencil.models.mageflow_gpu;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("mageflow-vk-test needs a Mage-Flow checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    const store = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    const depth = if (layers != 0) layers else mageflow.DiT.depthIn(store);
+    var model = try mageflow.DiT.loadDepth(arena, store, depth);
+    defer model.deinit();
+
+    const ctx = gpu_mod.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== mageflow-vk-test ==\nvulkan device: {s}\ntrunk depth {d}\n", .{ ctx.deviceName(), depth });
+    if (!mageflow_gpu.supported(ctx, &model)) {
+        try stdout.print("checkpoint dtype unsupported on this device\n", .{});
+        return;
+    }
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const lat = lat_arg;
+    const seq_txt = cap_arg;
+    const ctxv = try arena.alloc(f32, seq_txt * mageflow.txt_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, mageflow.channels * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+
+    // References at a DIFFERENT extent from the canvas: a reference is resized to
+    // the render's size upstream, but the forward must not assume it.
+    const refs = try arena.alloc(mageflow.Ref, refs_arg);
+    for (refs, 0..) |*r, i| {
+        const rh = lat - 1 + i % 2;
+        const rw = lat + 1 - i % 2;
+        const buf = try arena.alloc(f32, mageflow.channels * rh * rw);
+        for (buf) |*v| v.* = rnd.floatNorm(f32);
+        r.* = .{ .lat = buf, .h = rh, .w = rw };
+    }
+    if (refs_arg != 0) try stdout.print("edit path: {d} reference image(s)\n", .{refs_arg});
+
+    const sigma: f32 = sigma_arg;
+    const want = try arena.alloc(f32, x_lat.len);
+    try model.forward(io, arena, want, x_lat, lat, lat, sigma, ctxv, seq_txt, refs, null);
+
+    var failures: usize = 0;
+    // BOTH attention paths, so the `attn_full` fallback cannot rot behind the
+    // tensor-core one that actually runs.
+    const saved = mageflow_gpu.force_attn_full;
+    defer mageflow_gpu.force_attn_full = saved;
+    for ([_]bool{ false, true }) |full| {
+        mageflow_gpu.force_attn_full = full;
+        var sess = try mageflow_gpu.Session.init(arena, io, ctx, &model, lat, lat, ctxv, seq_txt, refs, &.{ sigma, 0 });
+        defer sess.deinit(arena, ctx);
+        var ws = try mageflow_gpu.Workspace.init(ctx, &model, seq_txt, sess.n_tok);
+        defer ws.deinit(ctx);
+        const got = try arena.alloc(f32, x_lat.len);
+        try mageflow_gpu.forward(&model, ctx, &sess, &ws, io, arena, got, x_lat, sigma, null);
+        // As `mageflow-cuda-test`: the shallow bound covers the whole --sigma
+        // range, where the f16 GEMM's error against f32 accumulation is 4x what
+        // it is at the default sigma.
+        const tol: f64 = if (depth <= 4) 1e-2 else 3e-2;
+        const label = if (full) "forward (attn_full)" else "forward (tensor core)";
+        try checkRel(stdout, &failures, label, want, got, tol);
+    }
+    try summarize(stdout, failures);
+}
+
+/// Relative L2 of `got` against `want`, printed with a pass/fail and a non-finite
+/// count, for the device commands that stage several comparisons.
+fn checkRel(out: *Io.Writer, fails: *usize, what: []const u8, want: []const f32, got: []const f32, tol: f64) !void {
+    var num: f64 = 0;
+    var den: f64 = 0;
+    var nonfinite: usize = 0;
+    for (want, got) |e, a| {
+        if (!std.math.isFinite(a)) nonfinite += 1;
+        num += (@as(f64, e) - a) * (@as(f64, e) - a);
+        den += @as(f64, e) * e;
+    }
+    const rel = if (den == 0) 0 else @sqrt(num / den);
+    const ok = nonfinite == 0 and rel < tol;
+    if (!ok) fails.* += 1;
+    try out.print("{s:<22} rel L2 {e:.4}  {s}{s}\n", .{
+        what, rel, if (ok) "ok" else "FAILED",
+        if (nonfinite != 0) " (non-finite output)" else "",
+    });
+}
+
+/// Mage-Flow's CUDA forward against its CPU forward, on the real checkpoint.
+///
+/// Five axes, because a defect rides one of them and a check pinned to one shape
+/// answers about one shape: depth (an error that accumulates reads healthy at 2
+/// blocks and garbage at 12), the canvas token count, the TEXT half's length
+/// (which is the other half of the joint sequence and has its own projections,
+/// its own modulation and its own QK-norms), how many reference images the edit
+/// path appends, and the sigma the activations scale with.
+fn mageflowCudaTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    libs: bool,
+    layers: usize,
+    lat_arg: usize,
+    cap_arg: usize,
+    refs_arg: usize,
+    sigma_arg: f32,
+) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const mageflow = TensorPencil.models.mageflow;
+    const mageflow_cuda = TensorPencil.models.mageflow_cuda;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("mageflow-cuda-test needs a Mage-Flow checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    const store = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    const depth = if (layers != 0) layers else mageflow.DiT.depthIn(store);
+    var model = try mageflow.DiT.loadDepth(arena, store, depth);
+    defer model.deinit();
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== mageflow-cuda-test ==\ncuda device: {s} (kernels: {t})\ntrunk depth {d}\n", .{ be.deviceName(), be.kernels, depth });
+    if (!mageflow_cuda.supported(&model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const lat = lat_arg;
+    const seq_txt = cap_arg;
+    const ctxv = try arena.alloc(f32, seq_txt * mageflow.txt_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, mageflow.channels * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+
+    // References at a DIFFERENT extent from the canvas, because a reference is
+    // resized to the render's size upstream but the forward must not assume it:
+    // its own grid is what its RoPE positions are centered on.
+    const refs = try arena.alloc(mageflow.Ref, refs_arg);
+    for (refs, 0..) |*r, i| {
+        const rh = lat - 1 + i % 2;
+        const rw = lat + 1 - i % 2;
+        const buf = try arena.alloc(f32, mageflow.channels * rh * rw);
+        for (buf) |*v| v.* = rnd.floatNorm(f32);
+        r.* = .{ .lat = buf, .h = rh, .w = rw };
+    }
+    if (refs_arg != 0) try stdout.print("edit path: {d} reference image(s)\n", .{refs_arg});
+
+    const sigma: f32 = sigma_arg;
+    const want = try arena.alloc(f32, x_lat.len);
+    try model.forward(io, arena, want, x_lat, lat, lat, sigma, ctxv, seq_txt, refs, null);
+
+    var failures: usize = 0;
+    // BOTH attention paths: `opAttnTC` is what runs, and the naive one is the
+    // fallback the fast path was validated against. Checking only one leaves the
+    // other free to rot.
+    const saved = mageflow_cuda.force_naive_attn;
+    defer mageflow_cuda.force_naive_attn = saved;
+    for ([_]bool{ false, true }) |naive| {
+        mageflow_cuda.force_naive_attn = naive;
+        var sess = try mageflow_cuda.Session.init(arena, io, be, &model, lat, lat, ctxv, seq_txt, refs, &.{ sigma, 0 });
+        defer sess.deinit(arena, be);
+        var ws = try mageflow_cuda.Workspace.init(be, &model, seq_txt, sess.n_tok);
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, x_lat.len);
+        try mageflow_cuda.forward(&model, be, &sess, &ws, io, arena, got, x_lat, sigma, null);
+
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var nonfinite: usize = 0;
+        for (want, got) |e, a| {
+            if (!std.math.isFinite(a)) nonfinite += 1;
+            num += (@as(f64, e) - a) * (@as(f64, e) - a);
+            den += @as(f64, e) * e;
+        }
+        const rel = if (den == 0) 0 else @sqrt(num / den);
+        // Tensor cores against the CPU's f32 accumulation, the regime every other
+        // family's CUDA check sits in, and the residual carries each block's
+        // rounding into the next so the bound grows with depth. The shallow bound
+        // covers the whole --sigma range, not just the middle of it: both device
+        // arms read 1.6e-3 at sigma 0.75 and 7.3e-3 at sigma 1.0, agreeing with
+        // each other to four digits at every point.
+        const tol: f64 = if (depth <= 4) 1e-2 else 3e-2;
+        const ok = nonfinite == 0 and rel < tol;
+        if (!ok) failures += 1;
+        try stdout.print("forward vs CPU ({s:<11})  rel L2 {e:.4}  {s}{s}\n", .{
+            if (naive) "naive attn" else "opAttnTC", rel,
+            if (ok) "ok" else "FAILED",              if (nonfinite != 0) " (non-finite output)" else "",
+        });
+    }
+    try summarize(stdout, failures);
+}
+
 fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, vae_path: []const u8, libs: bool, layers: usize, lat_arg: usize, cap_arg: usize, sigma_arg: f32) !void {
     const cuda = TensorPencil.gpu.cuda;
     const zimage = TensorPencil.models.zimage;
@@ -4817,23 +5551,16 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         // int8 activations put q4_k at 0.044 and q2_k at 0.094, int4's at 0.15-0.20.
         // Keyed on the ROUTE, not the storage, since a GGUF can take either GEMM.
         //
-        // These bounds are wide because the metric's spread is wide, and both causes
-        // are properties of the harness rather than of the kernels:
-        //
-        //   - `x` and `cond` are random normals, so the forward runs far OFF the data
-        //     manifold, where reduced-precision activations diverge much more than on
-        //     a real latent. A checkpoint measuring 0.13 here renders cleanly.
-        //   - the spread across CHECKPOINTS of one architecture and format is ~2x
-        //     (int8-convrot: 0.068 animosity, 0.108 gonzalomo, 0.131 center-semiraw),
-        //     and a checkpoint that is a requantization of an already-quantized model
-        //     sits at the top of it whatever format it was requantized INTO: that one
-        //     base measures 0.117 (nvfp4), 0.125 (fp8), 0.129 (w4a8), 0.131 (int8),
-        //     five unrelated weight paths inside one narrow band, which is the tell
-        //     that the weights, not the route, set the level.
+        // The bounds are wide because the harness is, not because the kernels are:
+        // `x` and `cond` are random normals, so the forward runs far OFF the data
+        // manifold where reduced-precision activations diverge much more than on a
+        // real latent, and the spread across checkpoints of one architecture and
+        // format is ~2x on its own, set by the weights rather than by the route (a
+        // requantized base measures the same level through five unrelated formats).
         //
         // So this gate catches a wiring break (which lands near 1.0, not 0.13) and
-        // deliberately does not try to bound quantization quality; `--dit` renders and
-        // the PSNR tables in BACKEND.md are what measure that.
+        // deliberately does not try to bound quantization quality; that is what a
+        // whole `--dit` render and its PSNR measure.
         const tol: f32 = if (TensorPencil.models.lin_cuda.activationIs4Bit(TensorPencil.models.lin_cuda.blockq_gemm, wqt))
             0.25
         else if (wqt == .q2_k)
@@ -4894,6 +5621,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         } else if (std.mem.eql(u8, flag, "--shift")) {
             opts.shift = try std.fmt.parseFloat(f32, val);
             opts.explicit_shift = true;
+        } else if (std.mem.eql(u8, flag, "--model-hash")) {
+            opts.hash_models = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0"));
         } else if (std.mem.eql(u8, flag, "--profile")) {
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
         } else if (std.mem.eql(u8, flag, "--prompt-syntax")) {
@@ -4942,16 +5671,21 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.quantize_timestep = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--sampler")) {
             opts.sampler = TensorPencil.sampler.Kind.parse(val) orelse {
-                try stdout.print(
-                    "unknown sampler '{s}' (expected: euler, dpmpp_2m_sde, dpmpp_2m_sde_heun)\n",
-                    .{val},
-                );
+                // Listed off the enum, so a sampler cannot be missing from the message
+                // the day it is added.
+                try stdout.print("unknown sampler '{s}' (expected one of:", .{val});
+                inline for (comptime std.enums.values(TensorPencil.sampler.Kind)) |k| {
+                    try stdout.print(" {s}", .{k.label()});
+                }
+                try stdout.print(")\n", .{});
                 return error.InvalidArgs;
             };
-        } else if (std.mem.eql(u8, flag, "--sde-eta")) {
-            opts.sde_eta = try std.fmt.parseFloat(f64, val);
-        } else if (std.mem.eql(u8, flag, "--sde-s-noise")) {
-            opts.sde_s_noise = try std.fmt.parseFloat(f64, val);
+            // `--sde-*` are the spellings from when the SDE samplers were the only
+            // stochastic ones; they mean the same thing to every sampler that draws.
+        } else if (std.mem.eql(u8, flag, "--eta") or std.mem.eql(u8, flag, "--sde-eta")) {
+            opts.eta = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, flag, "--s-noise") or std.mem.eql(u8, flag, "--sde-s-noise")) {
+            opts.s_noise = try std.fmt.parseFloat(f64, val);
         } else if (std.mem.eql(u8, flag, "--scheduler")) {
             opts.scheduler = TensorPencil.sampler.Scheduler.parse(val) orelse {
                 try stdout.print("unknown scheduler '{s}' (expected: normal, karras, " ++
@@ -4970,12 +5704,13 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, flag, "--vram-budget")) {
-            // "min" = bare-minimum weight residency: hold only the in-flight
-            // weights (~2 at a time) and stream everything else. Activations
-            // aren't streamable, so total VRAM is still weight-min + activations
-            // (resolution-bound); use a small image to get well under 1 GiB.
+            // "min" = bare-minimum weight residency: hold only the weights a
+            // forward is using and stream everything else. Not a byte ceiling:
+            // activations aren't streamable, so the smallest workable figure is
+            // resolution-bound, and a fixed one is either above the floor (not
+            // minimal) or below it (refuses every render).
             if (std.mem.eql(u8, val, "min")) {
-                opts.vram_budget = min_vram_budget;
+                opts.vram_min_weights = true;
             } else {
                 const gib = try std.fmt.parseFloat(f64, val);
                 opts.vram_budget = @intFromFloat(gib * (1 << 30));
@@ -5059,8 +5794,12 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     // is the workflow's call upstream too.
     opts.loras = loras.items;
     if (ref_paths.items.len != 0) {
+        // Both families' arrays from one decode: each ignores the other's field,
+        // so the CLI does not have to know the architecture before the session
+        // that detects it exists.
         const refs = try arena.alloc(TensorPencil.models.sensenova.RefImage, ref_paths.items.len);
-        for (ref_paths.items, refs, 0..) |path, *out, ri| {
+        const mf_refs = try arena.alloc(TensorPencil.pipeline.Session.RefImage, ref_paths.items.len);
+        for (ref_paths.items, refs, mf_refs, 0..) |path, *out, *mf_out, ri| {
             const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 << 20));
             defer arena.free(bytes);
             const png = TensorPencil.image.decodePngRgb(arena, bytes) catch |err| {
@@ -5074,9 +5813,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 for (0..3) |c| rgb[c * plane + pix] = @as(f32, @floatFromInt(png.pixels[pix * 3 + c])) / 255.0;
             }
             out.* = .{ .rgb = rgb, .h = png.height, .w = png.width };
+            mf_out.* = .{ .rgb = rgb, .height = png.height, .width = png.width };
             try stdout.print("reference {d}: {s} ({d}x{d})\n", .{ ri + 1, path, png.width, png.height });
         }
         opts.sn_ref_images = refs;
+        opts.mf_ref_images = mf_refs;
         try stdout.flush();
     }
 
@@ -5109,9 +5850,15 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     var img = try TensorPencil.pipeline.generate(io, arena, opts, stdout);
     defer img.deinit(arena);
 
+    // The `parameters` block, the same builder the GUI writes: a saved PNG is the
+    // record of how it was made, and a CLI render that carries none is a render
+    // nobody can reproduce.
+    const params = try renderParams(arena, io, &opts, &img, img.width, img.height);
     var png: std.ArrayList(u8) = .empty;
     defer png.deinit(arena);
-    try TensorPencil.image.encodePngRgb(arena, &png, img.rgb, img.width, img.height);
+    try TensorPencil.image.encodePngRgbText(arena, &png, img.rgb, img.width, img.height, &.{
+        .{ .keyword = "parameters", .text = params },
+    });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = png.items });
     try stdout.print("wrote {s} ({d}x{d})\n", .{ out_path, img.width, img.height });
 
@@ -5986,6 +6733,124 @@ fn minimaxH3AudioEncodeCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
     if (!ok) return error.GpuMismatch;
 }
 
+fn minimaxH3AudioVkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8) !void {
+    const av = TensorPencil.models.minimax_h3_audio;
+    const av_cuda = TensorPencil.models.minimax_h3_audio_gpu;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== minimax-h3-audio-vk-test ==\nvulkan device: {s}\n", .{ctx.deviceName()});
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var dec = try av.AudioDecoder.load(arena, .{ .safetensors = &st });
+    defer dec.deinit();
+    try stdout.print("vocoder: {d} stages, {d} kernels, x{d}, latent {d} -> {d} ch\n", .{
+        dec.nStages(), dec.n_kernels, dec.upsampleFactor(), dec.dec_in.in_ch, dec.dec_in.out_ch,
+    });
+    if (!av_cuda.supported(&dec)) {
+        try stdout.print("FAIL: this decoder's shapes have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    // Latent frames. Small by default: the CPU reference is the slow side, and
+    // every code path (all seven stages, both kernel/rate pairings, the temporal
+    // extent of the kaiser filters) runs at any length.
+    const t: usize = if (std.c.getenv("TP_H3_AUDIO_T")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4) else 4;
+    const samples = t * dec.upsampleFactor();
+    try stdout.print("t = {d} latent frames -> {d} samples per channel\n", .{ t, samples });
+
+    var prng = std.Random.DefaultPrng.init(0xa0d10);
+    const rnd = prng.random();
+    const z = try arena.alloc(f32, av.latent_channels * av.stereo * t);
+    for (z) |*v| v.* = rnd.floatNorm(f32);
+
+    var sess = try av_cuda.Session.init(arena, &dec);
+    defer sess.deinit();
+    try stdout.print("session: {d} MB of permuted weights\n", .{sess.bytes() >> 20});
+    var ws = try av_cuda.Workspace.init(ctx, &dec, t);
+    defer ws.deinit(ctx);
+
+    const want = try arena.alloc(f32, samples * av.stereo);
+    const got = try arena.alloc(f32, samples * av.stereo);
+
+    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try av.decode(&dec, io, arena, want, z, t);
+    const t1 = std.Io.Clock.real.now(io).nanoseconds;
+    try av_cuda.decode(&dec, &sess, ctx, &ws, arena, got, z, t, null);
+    const t2 = std.Io.Clock.real.now(io).nanoseconds;
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    var max_at: usize = 0;
+    for (want, got, 0..) |e, a, i| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+        const d = @abs(@as(f64, e - a));
+        if (d > max_abs) {
+            max_abs = d;
+            max_at = i;
+        }
+    }
+    const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+    var peak: f64 = 0;
+    for (want) |e| peak = @max(peak, @abs(@as(f64, e)));
+
+    const cpu_ns: u64 = @intCast(t1 - t0);
+    const dev_ns: u64 = @intCast(t2 - t1);
+    try stdout.print("cpu {d} ms, device {d} ms ({d:.1}x)\n", .{
+        cpu_ns / std.time.ns_per_ms,
+        dev_ns / std.time.ns_per_ms,
+        @as(f64, @floatFromInt(cpu_ns)) / @as(f64, @floatFromInt(@max(dev_ns, 1))),
+    });
+    try stdout.print("rel L2 {e}  max |dv| {e} at sample {d}  (reference peak {e})\n", .{ rel, max_abs, max_at, peak });
+    // The two stereo channels must genuinely differ, or a device path that
+    // decoded one and copied it would pass everything above.
+    var ch_l2_ref: f64 = 0;
+    var ch_l2_err: f64 = 0;
+    for (0..samples) |i| {
+        const l = @as(f64, got[i * av.stereo]);
+        const r = @as(f64, got[i * av.stereo + 1]);
+        ch_l2_ref += l * l;
+        ch_l2_err += (l - r) * (l - r);
+    }
+    const ch_rel = if (ch_l2_ref > 0) @sqrt(ch_l2_err / ch_l2_ref) else 0;
+    try stdout.print("stereo channels differ by rel {d:.4}\n", .{ch_rel});
+
+    // Concentrated or spread? A single spike is a boundary bug; a broad tail is
+    // precision. A max alone cannot tell them apart.
+    for ([_]f64{ 1e-4, 3e-4, 1e-3, 3e-3 }) |thr| {
+        var n: usize = 0;
+        for (want, got) |e, a| if (@abs(@as(f64, e - a)) > thr) {
+            n += 1;
+        };
+        try stdout.print("  |dv| > {e}: {d} of {d} ({d:.2}%)\n", .{
+            thr, n, want.len, 100.0 * @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(want.len)),
+        });
+    }
+
+    // A vocoder's error budget is per sample, not per norm: 16-bit PCM's own
+    // quantum is 3e-5, so anything under ~1e-3 absolute is inaudible.
+    if (rel > 5e-3 or max_abs > 2e-3 or ch_rel < 0.05) {
+        try stdout.print("FAIL\n", .{});
+        // Flush before unwinding: returning an error skips main's own flush, and
+        // a failure whose numbers never reach the terminal is not a diagnostic.
+        stdout.flush() catch {};
+        return error.Unsupported;
+    }
+    try stdout.print("OK\n", .{});
+}
+
+
 fn minimaxH3AudioCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const av = TensorPencil.models.minimax_h3_audio;
@@ -6537,9 +7402,190 @@ fn f32ToBf16(v: f32) u16 {
 /// on real weights. Non-zero exit if it disagrees.
 ///
 /// A CLI command rather than a unit test because the test binary brings up no
-/// CUDA context (see CLAUDE.md). It runs at the DEVELOPMENT shape: 147 packed
+/// CUDA context. It runs at the DEVELOPMENT shape: 147 packed
 /// rows, which exercises every code path the full render does and costs seconds
 /// rather than the ~20 minutes a full-resolution CPU reference would.
+/// `minimax-h3-vk-test`: the H3 trunk on Vulkan against its CPU reference, on
+/// real weights. The twin of `minimax-h3-cuda-test` and deliberately the same
+/// shapes, seeds and tolerance, so the two arms' figures sit side by side.
+///
+/// Takes the same `TP_H3_*` knobs: `BLOCKS`/`BLOCK_OFF` to narrow, `MASK` for the
+/// per-row modulation index, `NAIVE` for the reference attention, `LH`/`LW`/`TEXT`
+/// for the shape. Exits non-zero on a mismatch so it works as a gate.
+fn minimaxH3VkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8) !void {
+    const h3 = TensorPencil.models.minimax_h3;
+    const h3_gpu = TensorPencil.models.minimax_h3_gpu;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== minimax-h3-vk-test ==\nvulkan device: {s}\n", .{ctx.deviceName()});
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var dit = try h3.DiT.load(arena, .{ .safetensors = &st });
+    defer dit.deinit();
+    if (std.c.getenv("TP_H3_NAIVE") != null) {
+        h3_gpu.force_naive_attn = true;
+        try stdout.print("(naive attention)\n", .{});
+    }
+    {
+        const off = if (std.c.getenv("TP_H3_BLOCK_OFF")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0) else 0;
+        const n = if (std.c.getenv("TP_H3_BLOCKS")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch dit.blocks.len) else dit.blocks.len;
+        if (off != 0 or n != dit.blocks.len) {
+            const lo = @min(off, dit.blocks.len);
+            dit.blocks = dit.blocks[lo..@min(lo + n, dit.blocks.len)];
+            try stdout.print("(blocks [{d},{d}))\n", .{ lo, lo + dit.blocks.len });
+        }
+    }
+    try stdout.print("dit: {d} blocks, hidden {d}, {d}x{d} heads\n", .{
+        dit.cfg.n_layers, dit.cfg.hidden, dit.cfg.n_heads, dit.cfg.head_dim,
+    });
+    if (!h3_gpu.supported(&dit)) {
+        try stdout.print("FAIL: this checkpoint's weights have no Vulkan path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    const text_len: usize = if (std.c.getenv("TP_H3_TEXT")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 6) else 6;
+    const lat_t: usize = 2;
+    const lat_h: usize = if (std.c.getenv("TP_H3_LH")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 16) else 16;
+    const lat_w: usize = if (std.c.getenv("TP_H3_LW")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 16) else 16;
+    const audio_t: usize = 8;
+    const sigma: f32 = if (std.c.getenv("TP_H3_SIGMA")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0.7) else 0.7;
+
+    var layout = try h3.PackedLayout.build(arena, .{
+        .text_len = text_len,
+        .latent_t = lat_t,
+        .latent_h = lat_h,
+        .latent_w = lat_w,
+        .audio_t = audio_t,
+    }, &.{}, &.{}, &.{});
+    defer layout.deinit();
+    try stdout.print("packed sequence: {d} rows\n", .{layout.seq_len});
+
+    // The same seed the CUDA test uses, so the two arms' figures compare directly.
+    var prng = std.Random.DefaultPrng.init(0x431a);
+    const rnd = prng.random();
+    const video = try arena.alloc(f32, h3.latent_channels * lat_t * lat_h * lat_w);
+    for (video) |*v| v.* = rnd.floatNorm(f32);
+    const audio = try arena.alloc(f32, h3.audio_latent_channels * h3.audio_channels * audio_t);
+    for (audio) |*v| v.* = rnd.floatNorm(f32);
+    const text = try arena.alloc(f32, text_len * dit.cfg.hidden);
+    for (text) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+
+    const frame_rows = (lat_h / h3.patch_h) * (lat_w / h3.patch_w);
+    var video_mask: []f32 = &.{};
+    var audio_mask: []f32 = &.{};
+    if (std.c.getenv("TP_H3_MASK")) |v| {
+        const mode = std.mem.span(v);
+        video_mask = try arena.alloc(f32, lat_t * frame_rows);
+        audio_mask = try arena.alloc(f32, h3.audio_channels * audio_t);
+        for (video_mask, 0..) |*m, i| m.* = if (std.mem.eql(u8, mode, "binary"))
+            (if (i < frame_rows) 0.0 else 1.0)
+        else if (std.mem.eql(u8, mode, "spatial"))
+            (if (i % 2 == 0) 0.0 else 1.0)
+        else
+            @as(f32, @floatFromInt(i % 5)) / 4.0;
+        for (audio_mask, 0..) |*m, i| m.* = if (i < audio_t) 0.0 else 1.0;
+        try stdout.print("denoise mask: {s} ({d} video rows, {d} audio rows)\n", .{
+            mode, video_mask.len, audio_mask.len,
+        });
+    }
+
+    const in: h3.Inputs = .{
+        .video = video,
+        .audio = audio,
+        .text = text,
+        .sigma = sigma,
+        .video_mask = video_mask,
+        .audio_mask = audio_mask,
+    };
+
+    var ws = try h3.Workspace.init(arena, dit.cfg, &layout);
+    defer ws.deinit(arena);
+    const cpu_v = try arena.alloc(f32, video.len);
+    const cpu_a = try arena.alloc(f32, audio.len);
+    var t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try h3.forward(&dit, io, arena, &ws, &layout, cpu_v, cpu_a, in);
+    const cpu_ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+
+    var sess = try h3_gpu.Session.init(ctx, arena, &dit, &layout);
+    defer sess.deinit(ctx);
+    var dws = try h3_gpu.Workspace.init(ctx, &dit, layout.seq_len);
+    defer dws.deinit(ctx);
+    const gpu_v = try arena.alloc(f32, video.len);
+    const gpu_a = try arena.alloc(f32, audio.len);
+    t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try h3_gpu.forward(&dit, ctx, &sess, &dws, io, arena, &layout, gpu_v, gpu_a, in, null);
+    const gpu_ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+
+    // Per segment, because one output figure cannot say which rows diverged.
+    {
+        const dev_trunk = try arena.alloc(f32, layout.seq_len * dit.cfg.hidden);
+        try ctx.tensorDownload(dws.x_d, std.mem.sliceAsBytes(dev_trunk));
+        try stdout.print("\n-- trunk, per segment --\n", .{});
+        for (layout.segments) |sg| {
+            const n = sg.len() * dit.cfg.hidden;
+            const off = sg.start * dit.cfg.hidden;
+            var l2_ref: f64 = 0;
+            var l2_err: f64 = 0;
+            for (ws.h[off..][0..n], dev_trunk[off..][0..n]) |e, a| {
+                l2_ref += @as(f64, e) * e;
+                l2_err += @as(f64, e - a) * (e - a);
+            }
+            const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+            try stdout.print("  {s:<10} rows [{d:>5},{d:>5})  rel L2 {d:.5}\n", .{ @tagName(sg.kind), sg.start, sg.stop, rel });
+        }
+    }
+
+    var failures: usize = 0;
+    for ([_]struct { name: []const u8, want: []const f32, got: []const f32 }{
+        .{ .name = "video", .want = cpu_v, .got = gpu_v },
+        .{ .name = "audio", .want = cpu_a, .got = gpu_a },
+    }) |c| {
+        var l2_ref: f64 = 0;
+        var l2_err: f64 = 0;
+        var max_abs: f64 = 0;
+        for (c.want, c.got) |e, a| {
+            l2_ref += @as(f64, e) * e;
+            l2_err += @as(f64, e - a) * (e - a);
+            max_abs = @max(max_abs, @abs(@as(f64, e - a)));
+        }
+        const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+        // Same FORM as the CUDA arm's and for the same reason (W8A8 against a
+        // W8A32 host reference diverges with depth by design), but a 2e-2 base
+        // rather than 1.5e-2. That is Vulkan's own int8 rounding in the last
+        // block, and it is measured, not a fudge: the two arms agree to 3% of
+        // each other through 25 blocks (audio 0.00206 here against 0.00213 on
+        // CUDA) and both then jump at 50, where this DiT's final `fc2` scales
+        // average 3x smaller than every other block's, so a fixed absolute
+        // quantization error reads as a large RELATIVE one. At that depth the
+        // trunk agrees between the arms (video 0.0616 against 0.0606, text
+        // 0.431 against 0.448) while only the amplified output differs, and
+        // swapping the tensor-core attention for `attn_full` moves the figure
+        // by 1% -- so the divergence is the quantization, not this port.
+        //
+        // Like the CUDA bound this says "no defect", not "matches the reference
+        // render". The acceptance test is the two device arms compared on a
+        // whole render, which is owed.
+        const tol = 2.0e-2 * (1.0 + @as(f64, @floatFromInt(dit.blocks.len)) / 8.0);
+        const ok = rel < tol and std.math.isFinite(rel);
+        if (!ok) failures += 1;
+        try stdout.print("{s:<8} rel L2 {d:.5}  max |dv| {d:.5}  (tol {d:.4})  {s}\n", .{
+            c.name, rel, max_abs, tol, if (ok) "ok" else "FAIL",
+        });
+    }
+    try stdout.print("\ncpu {d:.0} ms, device {d:.0} ms ({d:.1}x)\n", .{ cpu_ms, gpu_ms, cpu_ms / gpu_ms });
+    if (failures != 0) return error.GpuMismatch;
+}
+
 fn minimaxH3CudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const h3 = TensorPencil.models.minimax_h3;
@@ -6899,6 +7945,87 @@ fn minimaxH3CudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt:
 /// VAE: the fixture is f32 with the real head_dim and patch geometry, so it
 /// exercises every device path at a size where the CPU side is instant. A real
 /// checkpoint arm would add a 7-minute CPU reference for no extra coverage.
+/// `minimax-h3-vae-vk-test`: H3's video VAE decode on Vulkan against its CPU
+/// decoder, on real weights. The twin of `minimax-h3-vae-cuda-test`, same fixture
+/// shape, same tolerance. `TP_VAE_T`/`_H`/`_W` override the grid.
+fn minimaxH3VaeVkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const h3vae = TensorPencil.models.minimax_h3_vae;
+    const h3vae_gpu = TensorPencil.models.minimax_h3_vae_gpu;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== minimax-h3-vae-vk-test ==\nvulkan device: {s}\n", .{ctx.deviceName()});
+
+    // The same embedded fixture the CUDA arm checks against, weights and `in.z`
+    // in one file, so neither arm needs a checkpoint on disk.
+    const fixture = @embedFile("models/assets/minimax_h3_vae.safetensors");
+    var st = try safetensors.initFromSlice(arena, fixture);
+    var dec = try h3vae.VideoDecoder.load(arena, .{ .safetensors = &st });
+    defer dec.deinit();
+    try stdout.print("decoder: {d} blocks, dim {d}, {d}x{d} heads, patch {d}x{d}\n", .{
+        dec.cfg.n_layers, dec.cfg.dim, dec.cfg.heads, dec.cfg.head_dim, dec.cfg.patch_t, dec.cfg.patch,
+    });
+    if (!h3vae_gpu.supported(&dec)) {
+        try stdout.print("FAIL: this decoder's weights have no Vulkan path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+    if (std.c.getenv("TP_VAE_NAIVE") != null) {
+        h3vae_gpu.force_naive_attn = true;
+        try stdout.print("(naive attention)\n", .{});
+    }
+
+    const t: usize = if (std.c.getenv("TP_VAE_T")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2) else 2;
+    const h: usize = if (std.c.getenv("TP_VAE_H")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 3) else 3;
+    const w: usize = if (std.c.getenv("TP_VAE_W")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4) else 4;
+    const z = if (t == 2 and h == 3 and w == 4)
+        try (try st.require("in.z")).toF32Alloc(arena)
+    else blk: {
+        var prng = std.Random.DefaultPrng.init(0x5ae);
+        const rr = prng.random();
+        const zz = try arena.alloc(f32, dec.cfg.in_channels * t * h * w);
+        for (zz) |*v| v.* = rr.floatNorm(f32);
+        break :blk zz;
+    };
+    try stdout.print("shape t={d} h={d} w={d} -> {d} grid tokens, seq {d}\n", .{
+        t, h, w, t * h * w, t * h * w + dec.cfg.n_register + 1,
+    });
+
+    const sh = h3vae.outputShape(dec.cfg, t, h, w);
+    const n = dec.cfg.out_channels * sh.frames * sh.height * sh.width;
+    const want = try arena.alloc(f32, n);
+    const got = try arena.alloc(f32, n);
+
+    try h3vae.decodeVolume(&dec, io, arena, want, z, t, h, w);
+
+    var sess = try h3vae_gpu.Session.init(ctx, arena, &dec, t, h, w);
+    defer sess.deinit(ctx);
+    var ws = try h3vae_gpu.Workspace.init(ctx, &dec, sess.seq, sess.grid);
+    defer ws.deinit(ctx);
+    try h3vae_gpu.decodeVolume(&dec, ctx, &sess, &ws, io, arena, got, z, t, h, w);
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    var nonfinite: usize = 0;
+    for (want, got) |e, aa| {
+        if (!std.math.isFinite(aa)) nonfinite += 1;
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - aa) * (e - aa);
+        max_abs = @max(max_abs, @abs(@as(f64, e - aa)));
+    }
+    const rel = @sqrt(l2_err / l2_ref);
+    // The CUDA arm's bound: dense f16/f32 GEMMs and an approximated softmax, no
+    // activation quantization, so this is far tighter than the int8 trunk.
+    const ok = nonfinite == 0 and rel < 2e-3;
+    try stdout.print("volume decode  rel L2 {d:.6}  max |dv| {d:.6}  {s}\n", .{ rel, max_abs, if (ok) "ok" else "FAIL" });
+    try stdout.flush();
+    if (!ok) return error.DeviceMismatch;
+}
+
 fn minimaxH3VaeCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const h3vae = TensorPencil.models.minimax_h3_vae;

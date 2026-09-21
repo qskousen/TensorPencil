@@ -1,20 +1,69 @@
 ## TensorPencil
 
-**This is an experimental work in progress.**
+**This is an early Alpha-level program. Expect warts, crashes, frequent large changes, and bugs.**
 
-TensorPencil is about running inference backed by Zig so we have better control over memory.
+TensorPencil is about running local token generation and diffusion models with having to faff about
+with virtual environments or Python versions or Tensorflow or any of that stuff.
 
-On the diffusion side it runs six model families — Krea 2, SD 1.5, SDXL, Z-Image, Anima and
-SenseNova U1.5 — in safetensors or GGUF. The family is detected from the checkpoint's own
-tensor names, so there is no flag to get wrong. Weights can be fp8, bf16, int8/int4 ConvRot,
-W4A8, NVFP4 or GGUF block quants; not every format runs on every backend (see `BACKEND.md`).
+TensorPencil consists of several parts:
 
-For LLM side, it works with Qwen 3/3.5/3.6/3.8, K2 Horizon, Gemma 3 and Gemma 4, Bonsai, and
-Mistral/llama-architecture models, with vision where the model has it. LLMs are only tested
-in GGUF (the exception is the Krea 2 text encoder, which is safetensors).
+* The code itself is organized as a library so it can be easily included in other Zig programs,
+or compiled into a C compatible ABI for use in other languages.
+* The `TensorPencil` executable is a command-line interface for running diffusion models.
+* The `tp-llm` executable is a command-line interface for running LLM models.
+* The `tp-gui` executable is a desktop application that provides a graphical user interface for
+running both diffusion and LLM models, giving the ability to converse with an LLM and iterate
+with it on a prompt or image.
 
-There are three executables: `TensorPencil` (the diffusion CLI), `tp-llm` (the LLM CLI) and
-`tp-gui` (a desktop app that does both).
+<p align="center">
+  <a href="resources/gui-2026-09-18.png.png"><img src="resources/gui-2026-09-18.png" width="96%" alt="tp-gui"></a>
+</p>
+
+TensorPencil is written in [Zig](https://ziglang.org), a young C-like language with low-level
+control over memory and execution.
+
+This enables the GUI to do some interesting things, such as pausing and resuming inference
+in the middle of a run; even pausing, unloading from VRAM, and resuming later while picking up
+right where it left off.
+
+It also tries to handle smoothly the sharing of a card between an LLM and a diffusion model,
+offloading weights to disk when needed. It can switch between LLM and diffusion, or run both
+at once on the same card (with a speed penalty, of course).
+
+TensorPencil handles gracefully the loading of models that do not fit in VRAM, using the
+offloading mechanism mentioned above. It relies on mmap to load even large models that won't
+fit in available VRAM or RAM combined.
+
+Supported diffusion models:
+
+| Model | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
+|:-----------------------------------|:--:|:--:|:--:|:--:|
+| Krea 2                             | ✅ | ✅ | ✅ | ✅ |
+| Z-Image                            | ✅ | ✅ | ✅ | ✅ |
+| Anima (Cosmos-Predict2)            | ✅ | ✅ | ✅ | ✅ |
+| Mage-Flow (+ Edit)                 | ✅ | ✅ | ✅ | ✅ |
+| SenseNova U1.5                     | ✅ | ✅ | ✅ | ✅ |
+| SD 1.5                             | ✅ | ✅ | ✅ | ✅ |
+| SDXL                               | ✅ | ✅ | ✅ | ✅ |
+| MiniMax H3 (video+audio, CLI only) | ✅ | ✅ | ✅ | ✅ |
+
+A checkpoint may ship bundled (text encoder and VAE inside the one file) or split; either
+works, and `--text-encoder` / `--vae` are only needed for what the checkpoint doesn't carry.
+Weights load in bf16, fp8, int8, int4, NVFP4, W4A8 and GGUF block quants (q4_k, q8_0 and
+friends), mixed freely within one file — quantization is per weight, not per model.
+
+Supported LLMs:
+
+| Architecture | Also covers | Vision | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
+|:-----------------|:------------------------------|:------:|:--:|:--:|:--:|:--:|
+| Qwen 3           | Llama, Mistral-Nemo           | —      | ✅ | ✅ | ✅ | ✅ |
+| Qwen 3.5-class   | Qwen 3.6, 3.8, Bonsai         | ✅     | ✅ | ✅ | ✅ | ✅ |
+| Gemma 3          |                               | ✅     | ✅ | ✅ | ✅ | ✅ |
+| Gemma 4          |                               | ✅     | ✅ | — | ✅ | ✅ |
+| K2 Horizon       | MoE + MoVA, reasoning effort  | —      | ✅ | — | ✅ | ✅ |
+
+GGUF block quants throughout, plus safetensors for the Qwen 3 VL 4B encoder. Vision towers
+run on CPU and the CUDA backends; only Gemma 3's also runs on Vulkan.
 
 ### AI Disclaimer
 TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
@@ -31,42 +80,30 @@ Backends supported so far:
 Would like to eventually support:
 - Metal - Apple MLX (`--backend metal`) (I don't have a Mac)
 - ROCm libraries - AMD ROCm equivilant to cuBLASLt etc. if there is one (`--backend rocm`)
-- Intel libraries - Intel oneAPI equivilant to cuBLASLt etc. if there is one (`--backend intel`) (I don't have an Intel GPU)
+- Intel libraries - Intel oneAPI equivilant to cuBLASLt etc. if there is one (`--backend intel`)
 
 The backends all make images nearly pixel-identical to ComfyUI; here is a comparison image across the three GPU
 backends vs. a ComfyUI reference.
 
 ![Backend image delta comparison](testdata/int8_backend_comparison.png)
 
-This has been tested on Linux with an RTX 3090 and RTX 4090, and the Vulkan backend on an
-Intel Arc A310. Other operating systems and GPUs will hit problems or run less efficiently.
-Two known limits: the PTX is built for one CUDA compute capability at a time (`-Dcuda-sm`,
-default 86, so pre-Ampere cards will not JIT it), and the AMD paths are written but untested.
-
-Not all backends support all model formats yet. The full grid is in `BACKEND.md`; the short
-version for diffusion weights:
-
-| Model format      | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
-|:------------------|:-----:|:--------:|:----------:|:------:|
-| FP8               |   ✅   |    ✅     |     ✅      |   ✅    |
-| BF16              |   ✅   |    ✅     |     ✅      |   ✅    |
-| INT8 ConvRot      |   ✅   |    ✅     |     ✅      |   ✅    |
-| INT4 ConvRot      |   ✅   |    ✅     |     ✅      |   ✅    |
-| W4A8 / NVFP4      |   ✅   |    ✅     |     ✅      |   ✅    |
-| GGUF block quants |   ✅   |    ❌     |     ✅      |   ✅    |
+This has been tested on Linux with multiple RTX cards, and the Vulkan backend on an
+Intel Arc A310. Other operating systems and GPUs may hit problems or run less efficiently.
 
 Speeds vary widely depending on the model format and backend used. This table is from an RTX
-3090 / Ryzen 7 9800X3D generating a 1024x1024 cfg 1 image with full VRAM availability,
+3090 / Ryzen 7 9800X3D generating a 1024x1024 cfg 1 Krea2 image with full VRAM availability,
 across the different formats and backends. Numbers are seconds per step.
 
 | Model format | `cpu` | `vulkan` | `zig-cuda` | `cuda` | ComfyUI w/CUDA |
 |:-------------|:-----:|:--------:|:----------:|:------:|:--------------:|
-| FP8          |  288  |   2.89   |     —      |   —    |      2.22      |
-| INT8 ConvRot |  289  |   2.39   |    1.90    |  1.24  |      1.04      |
-| INT4 ConvRot |  287  |    —     |    1.38    |  1.11  |      0.74      |
+| FP8          |  273  |   2.73   |    3.53    |  2.55  |      2.22      |
+| INT8 ConvRot |  275  |   2.34   |    1.88    |  1.12  |      1.04      |
+| INT4 ConvRot |  279  |   2.64   |    1.33    |  1.03  |      0.74      |
 
 Plans for the future:
-- Unclear, but I keep finding more things to add
+- More model families on diffusion and LLM side.
+- Edit image functionality for models that support it.
+- Video generation in the GUI (already works in CLI for H3)
 
 ## Running it
 
@@ -75,9 +112,8 @@ Requires Zig 0.16.0 and a few system C libraries. `zig build` (the two CLIs) nee
 - **libvips** — image decode for `tp-llm`'s `--image` / `@mentions`
 - **libavformat / libavcodec / libavutil / libswscale / libswresample** (ffmpeg) — clip
   muxing in the diffusion CLI
-- **pkg-config**, which is how the build finds both
 
-`zig build gui` additionally needs **X11, Xcursor, Xi and wayland-client** for SDL3.
+`zig build gui` additionally needs X11, Xcursor, Xi, and wayland-client for SDL3 on Linux.
 
 On Debian/Ubuntu:
 
@@ -90,29 +126,27 @@ sudo apt install libx11-dev libxcursor-dev libxi-dev libwayland-dev   # for tp-g
 On Arch: `pacman -S pkgconf libvips ffmpeg` (plus `libx11 libxcursor libxi wayland` for the
 GUI).
 
-ggml, dvui/SDL3 and known-folders are Zig package dependencies and are fetched automatically
-on compile. ggml can be turned off with `-Dggml=false`, which costs the GGUF block-quant
-dtypes.
+ggml can be turned off with `-Dggml=false`, but then it won't be able to use gguf files at all.
 
 If your distro is new enough to ship gcc 16 / recent binutils (Arch, CachyOS), Zig 0.16's ELF
 linker cannot process the `.sframe` relocations in its crt startup objects and every
 libc-linked build fails. Run `tools/patch-crt.sh` once; the build picks up the patched crt
 automatically after that.
 
-Backends other than `cpu` require additional runtime libraries:
+Backends other than `cpu` require additional *runtime* libraries (DLOpen'd, you don't need them when compiling):
 
 - `--backend vulkan` → `libvulkan.so.1` (Vulkan loader)
 - `--backend zig-cuda` → `libcuda.so.1` (CUDA driver — for the hand-emitted PTX)
 - `--backend cuda` → `libcuda.so.1` + `libcublasLt.so` + `libcudnn.so.9` (NVIDIA's
   math libraries; install cuDNN 9 + the CUDA 12/13 toolkit runtime)
 
-You'll also need a Vulkan driver for your GPU for the Vulkan backend. On Ubuntu:
+For the Vulkan loader, on Ubuntu:
 
 ```
 sudo apt install libvulkan1
 ```
 
-plus a driver: the NVIDIA proprietary driver (e.g. `sudo apt install nvidia-driver-580`)
+Plus a driver: the NVIDIA proprietary driver (e.g. `sudo apt install nvidia-driver-580`)
 already includes its Vulkan ICD.
 
 Build with optimizations on (Debug is painfully slow for numeric code):
@@ -121,73 +155,46 @@ Build with optimizations on (Debug is painfully slow for numeric code):
 zig build -Doptimize=ReleaseFast
 ```
 
-Model weights are not included. What you need depends on the family: a bundled SD1.5 or SDXL
-checkpoint carries its text encoder and VAE inside it, while Krea 2 wants a separate Qwen 3
-VL 4b text encoder and a Wan 2.1 VAE. Anything the primary checkpoint doesn't carry is given
-with `--text-encoder` / `--vae`. For example:
+This will give you the four binaries mentioned above.
 
-```
-zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --dit /path/to/krea2.safetensors --text-encoder /path/to/qwen3VL.safetensors --vae /path/to/vae.safetensors --backend vulkan --out cat.png
-```
-
-Run with no command to see the available options and defaults.
-
-### GUI
-
-`zig build gui` builds `tp-gui`, a desktop app (dvui + SDL3) that runs chat and image
-generation together: models are picked from folders you point it at rather than typed as
-paths, and the two sides share one VRAM budget. `zig build run-gui` builds and runs it.
+For the CLI programs, run with no command to see the available options and defaults.
+For `tp-gui`, run with `--config` to specify a config file location, otherwise it will
+use `~/.config/tensorpencil/config.json`.
 
 ### VRAM offloading
 
 When running on GPU, if other processes are using vram or the `--vram-budget` option is set,
-weights past the available budget are streamed from the mmapped file. Assuming sufficient RAM for cache,
-this streaming costs only ~20% per step and stays roughly flat across cap sizes — below full residency
-effectively every weight re-uploads each step, so a smaller cap is barely slower (see the chart below).
-You can pass `min` as the budget size to load only 2 weights at a time, ~150MiB (~40% performance loss per step).
+weights past the available budget are streamed from the mmapped file. Assuming sufficient RAM for
+cache, below full residency effectively every weight re-uploads each step, so a smaller cap is
+only a little slower than a large one.
 
-** Note that the VRAM budget is only for the weights, the scores and activations are still in VRAM.**
-The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will 
-be roughly 3.1GiB; this also varies by backend and prompt.
+Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot.
 
-Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
+| VRAM cap                    | `cuda` s/step | peak     | `vulkan` s/step | peak     |
+|:----------------------------|:--------------|:---------|:----------------|:---------|
+| 0 (driver-managed, default) | 1.95          | 19.0 GiB | 4.56            | 19.2 GiB |
+| 16 GiB                      | 1.97          | 16.6 GiB | —               |          |
+| 12 GiB                      | 2.05          | 12.5 GiB | —               |          |
+| 8 GiB                       | 2.32          | 8.5 GiB  | 5.66            | 8.0 GiB  |
+| 6 GiB                       | 2.47          | 6.4 GiB  | —               |          |
+| 4 GiB                       | 2.60          | 4.4 GiB  | 5.77            | 4.1 GiB  |
+| 2 GiB and below             | refused (activations do not stream)      |||
+| `min` (no weights held)     | 2.26          | 4.3 GiB  | 5.60            | 4.7 GiB  |
 
-| VRAM cap                    | s/step | total  |
-|:----------------------------|:-------|:-------|
-| 0 (driver-managed, default) | 5.25   | 26.4 s |
-| 16 GiB                      | 6.39   | 31.0 s |
-| 12 GiB                      | 6.45   | 31.1 s |
-| 8 GiB                       | 6.46   | 31.1 s |
-| 6 GiB                       | 6.42   | 30.9 s |
-| 4 GiB                       | 6.33   | 30.5 s |
-| 2 GiB                       | 6.47   | 31.2 s |
-| 1 GiB                       | 6.53   | 31.3 s |
-| min (150MiB)                | 7.21   | 34.2 s |
+### Acknowledgements
 
-NOTE: this has changed quite a bit since I wrote this, the speed numbers need to be updated and the minimum size may be different.
+TensorPencil uses:
 
-### LLM
+* [ggml](https://github.com/ggml-org/ggml) for gguf handling.
+* [vips](https://github.com/libvips/libvips) for image handling.
+* [ianic-tls](https://github.com/ianic/tls.zig) for server TLS support.
+* [known-folders](https://github.com/ziglibs/known-folders) for cross-platform known folders paths.
+* [DVUI](https://github.com/david-vanderson/dvui) for cross-platform GUI.
+* [FFmpeg](https://ffmpeg.org) for video handling.
 
-Added another executable that processes LLM models, for fun: `tp-llm`. It started with the
-already-used Qwen 3 VL 4b text encoder model (embedded tables) and now covers GGUF models
-across the Qwen 3.x, Gemma 3/4, llama/Mistral and K2 Horizon architectures, with vision.
+And thanks to:
 
-Can run in single-response mode if you specify `--prompt <prompt>`, or runs in REPL (conversation) mode if you skip
-the prompt. In REPL mode, type `/exit` to exit. Most models run on all four backends; K2 Horizon runs on CPU and CUDA. Qwen 3 VL 4b:
-
-| Backend  | tok/s |
-|:---------|:------|
-| cpu      | 2.9   |
-| vulkan   | 26.5  |
-| zig-cuda | 67    |
-| cuda     | 69    |
-
-Run the command without arguments to see the usage. Example usage:
-
-`tp-llm --model qwen-3-vl-4b.safetensors --prompt "why is the sky blue" --backend zig-cuda`
-
-K2 Horizon supports `--reasoning-effort high|medium|low`. Its CUDA path keeps fixed weights resident and streams the routed MoE/MoVA experts:
-
-`tp-llm --model K2-Horizon-MoVA-36B-A4B-Q6_K.gguf --prompt "why is the sky blue" --backend zig-cuda --reasoning-effort medium`
-
-LLM mode also has some types of speculative decoding and VRAM offloading.
+* [llama.cpp](https://github.com/ggml-org/llama.cpp) for ways to implement many things relating to LLMs.
+* [ComfyUI](https://github.com/Comfy-Org/ComfyUI) for ways to implement many things relating to diffusion.
+* All the people who support and encourage continued effort on this project.
+* The generative AI community for continuing to create interesting models and finetunes!

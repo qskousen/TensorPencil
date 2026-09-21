@@ -182,10 +182,9 @@ fn attnHd(be: *const Backend, hd: usize) usize {
 
 /// Force the f32 online-softmax attention instead of the tensor-core path.
 ///
-/// The tensor-core path stores its scores in **f16** whichever of its two
-/// variants runs, and this VAE attends over thousands of keys at a 2048-wide
-/// dim, which is exactly the regime CLAUDE.md flags for f16's 65504 ceiling. This
-/// is the A/B for that.
+/// The tensor-core path stores its scores in f16 whichever of its two variants
+/// runs, and this VAE attends over thousands of keys at a 2048-wide dim, which is
+/// where f16's 65504 ceiling starts to bite. This is the A/B for that.
 pub var force_naive_attn: bool = false;
 
 /// Report the residual stream's magnitude per block (`TP_VAE_MAG`).

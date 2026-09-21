@@ -97,7 +97,8 @@ const usage =
     \\mentions `a` simply ignores the amount.
     \\Pushed too far the failure mode is structural, not lexical: fluent
     \\sentences with a broken plan (0.8*(1-t)^3 loops). 0 or "" = off, and off
-    \\is bit-identical. CUDA backends only, on the kernels BACKEND.md lists.
+    \\is bit-identical. CUDA backends only, and only where the weight's dtype
+    \\has a noise path.
     \\--weight-noise-seed bases the stream: the same seed, curve and prompt
     \\reproduce a generation exactly, which is what makes a sweep readable.
     \\--llm-gemm forces the kernel every batched (prefill / verify) block-quant
@@ -390,7 +391,7 @@ pub fn main(init: std.process.Init) !void {
     // --weight-noise on a checkpoint nothing will read it from is a silent no-op,
     // which for a knob whose whole purpose is measuring an effect is the worst
     // failure. Warn rather than refuse: it costs nothing to run without it, and the
-    // reason is worth saying out loud (see BACKEND.md 6).
+    // reason is worth saying out loud.
     if (llm.session.weight_noise_curve.len != 0 and st == .gguf and
         !llm.session.weightNoiseSupported(&st.gguf))
     {

@@ -193,6 +193,51 @@ pub fn maxPool2d(out: []f32, in: []const f32, h: usize, w: usize, c: usize, k: u
     }
 }
 
+/// Depthwise convolution (`groups == channels`), stride 1, zero-padded:
+/// `out[y][x][c] = Σ in[y+ky-pad][x+kx-pad][c] * w[c][ky][kx] + b[c]`.
+///
+/// Not an im2col GEMM: each output channel reads only its own input channel, so
+/// the patch matrix a GEMM needs would be block-diagonal and almost all zero.
+/// Written as a direct gather instead, which keeps the innermost loop over
+/// CHANNELS and therefore contiguous in this file's channel-last layout.
+///
+/// The weight stays in PyTorch's `[c][1][kh][kw]` order (that is already
+/// channel-outermost), so there is no `packWeight` step for it.
+pub fn depthwiseConv2d(
+    out: []f32,
+    in: []const f32,
+    h: usize,
+    w: usize,
+    c: usize,
+    k: usize,
+    pad: usize,
+    weight: []const f32,
+    bias: ?[]const f32,
+) void {
+    std.debug.assert(in.len == h * w * c);
+    std.debug.assert(weight.len == c * k * k);
+    const oh = outDim(h, k, 1, pad);
+    const ow = outDim(w, k, 1, pad);
+    std.debug.assert(out.len == oh * ow * c);
+
+    for (0..oh) |oy| {
+        for (0..ow) |ox| {
+            const dst = out[(oy * ow + ox) * c ..][0..c];
+            if (bias) |b| @memcpy(dst, b) else @memset(dst, 0);
+            for (0..k) |ky| {
+                const iy = oy + ky;
+                if (iy < pad or iy - pad >= h) continue;
+                for (0..k) |kx| {
+                    const ix = ox + kx;
+                    if (ix < pad or ix - pad >= w) continue;
+                    const src = in[(((iy - pad) * w) + ix - pad) * c ..][0..c];
+                    for (dst, src, 0..) |*d, s, ci| d.* += s * weight[(ci * k + ky) * k + kx];
+                }
+            }
+        }
+    }
+}
+
 /// In-place ReLU.
 pub fn relu(x: []f32) void {
     for (x) |*v| v.* = @max(v.*, 0);
@@ -343,4 +388,53 @@ test "the patch band cap changes the result only in the last bits" {
             return e;
         };
     }
+}
+
+test "depthwise conv equals a dense conv with a block-diagonal weight" {
+    // Cross-check rather than a fixture: a depthwise conv IS the dense conv whose
+    // off-diagonal input channels are zero, so `conv2d` (already pinned against
+    // torch) is the reference. Anything the gather gets wrong -- a transposed
+    // weight, a padding sign, the wrong channel stride -- differs from it.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const h = 5;
+    const w = 7;
+    const c = 6;
+    const k = 3;
+    const pad = 1;
+
+    var prng = std.Random.DefaultPrng.init(0xd0f9);
+    const rand = prng.random();
+    const in = try gpa.alloc(f32, h * w * c);
+    defer gpa.free(in);
+    for (in) |*v| v.* = rand.float(f32) * 2 - 1;
+    const dw = try gpa.alloc(f32, c * k * k);
+    defer gpa.free(dw);
+    for (dw) |*v| v.* = rand.float(f32) * 2 - 1;
+    const bias = try gpa.alloc(f32, c);
+    defer gpa.free(bias);
+    for (bias) |*v| v.* = rand.float(f32);
+
+    // [co][ci][kh][kw] with ci != co zeroed, then packed like any other conv.
+    const dense = try gpa.alloc(f32, c * c * k * k);
+    defer gpa.free(dense);
+    @memset(dense, 0);
+    for (0..c) |ci| {
+        for (0..k * k) |kk| dense[(ci * c + ci) * k * k + kk] = dw[ci * k * k + kk];
+    }
+    const packed_w = try packWeight(gpa, dense, c, c, k);
+    defer gpa.free(packed_w);
+
+    const want = try gpa.alloc(f32, h * w * c);
+    defer gpa.free(want);
+    try conv2d(io, gpa, want, in, h, w, .{ .w = packed_w, .b = bias, .co = c, .ci = c, .k = k, .pad = pad });
+
+    const got = try gpa.alloc(f32, h * w * c);
+    defer gpa.free(got);
+    depthwiseConv2d(got, in, h, w, c, k, pad, dw, bias);
+
+    var maxd: f64 = 0;
+    for (want, got) |a, b| maxd = @max(maxd, @abs(@as(f64, a) - b));
+    errdefer std.debug.print("depthwise vs dense: max abs {d}\n", .{maxd});
+    try std.testing.expect(maxd < 1e-6);
 }

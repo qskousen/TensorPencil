@@ -86,13 +86,14 @@ each has caught.
   `client`) plus the gui files with arithmetic in them (markdown, viewmath, fonts, style,
   meter, status bar, image studio). Not part of `test`. **A file's tests only run if a
   step compiles it**: three of those had tests that nothing built, so they never ran.
-- `zig build ui-probe -- out.png [w h] [--states|--settings|--studio|--hosts|--library]` — render
+- `zig build ui-probe -- out.png [w h] [--states|--settings|--studio|--hosts|--library|--reopened]` — render
   the whole chat workspace (or the status bar under three loads, the settings form, the
   image studio, or one status bar per engine host) to a PNG from canned data, with no
   model, GPU or engine. `--hosts` goes through the REAL `status_bar.render`, which is
   what shows that two bars do not share a history ring, a widget id or a handle. The GUI's
   failure modes are visual; this is how you see them. `--studio --lora` draws the
-  studio over a SenseNova selection, the only family with a LoRA section.
+  studio over a SenseNova selection, the only family with a LoRA section. `--reopened`
+  draws a run whose files have since gone: ghost slots, no toast and no retry anywhere.
 - `zig build catalog-probe -- <folder>...` — scan model folders as tp-gui does and print
   what each file was taken for. The answer to "why is my model not in the menu".
 - `zig build serve` — `tp-serve`, the engine host daemon tp-gui spawns beside itself
@@ -138,13 +139,18 @@ no rows for).
 **Device validation is CLI commands, not unit tests**, because the test binary brings up no
 CUDA context. Each checks kernels against their CPU ops and then a whole forward against the
 CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
-(each block-quant weight decode against its CPU replica), `cuda-vae-test`,
+(each block-quant weight decode against its CPU replica), `cuda-vae-test`, `mageflow-cuda-test`, `mage-vae-cuda-test`,
+`mageflow-vk-test`, `mage-vae-vk-test`,
 `zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
 `minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `sensenova-cuda-test`
 (and `sensenova-vk-test`, the same checks over the Vulkan arm), `lora-cuda-test` (needs no
 checkpoint), `lora-restack-test` (a LoRA stack swapped on a live session: the
 image must come back bit-identical AND the factors' VRAM must be handed back),
-plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
+plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`,
+`zimage-cuda-bench`, `mageflow-bench`). ⚠️ **This box's GPU is shared with the desktop
+and its clock drifts ~3% between runs**, so a speed change is measured by an
+INTERLEAVED same-binary A/B (both variants alternating in one process), never by
+comparing two invocations; check `nvidia-smi` for other users first.
 
 **A quantized checkpoint that renders is not a quantized checkpoint that works.** A
 conditioning that is gone renders a clean picture that ignores the prompt, so a
@@ -390,6 +396,7 @@ of the stage API works on every family.
 | `zimage` | `models/zimage.zig` (NextDiT) | Qwen3-4B | AutoencoderKL (Flux) | 16 |
 | `anima` | `models/anima.zig` (Cosmos-Predict2 + LLM adapter) | Qwen3-0.6B + T5 | Wan 2.1 | 16 |
 | `sensenova` | `models/sensenova.zig` (Qwen3-shaped MoT trunk) | the trunk's own base copy | none (pixel space) | 3 |
+| `mageflow` | `models/mageflow.zig` (double-stream MMDiT) | Qwen3-VL 4B | Mage-VAE (16x) | 128 |
 
 - **SenseNova is not a DiT and has no side components.** One 8B trunk carries TWO
   weight copies per layer: the prompt runs the base copy causally and leaves a KV
@@ -402,6 +409,37 @@ of the stage API works on every family.
   [0, 1] where the generation tower takes raw [-1, 1] behind identical convolution
   shapes, and the initial noise is scaled by `min(sqrt(tokens/64), 16)`, without
   which the render is noise.
+- **Mage-Flow is double-stream and patch-1.** Text and image tokens keep their own
+  modulation, norms and MLP and meet only inside the attention, as `[text | image]`;
+  a token is ONE latent pixel, so there is no patch order. Text tokens are not
+  rotated, positions are centered on `[-ceil(n/2), floor(n/2))` (which differs from
+  Qwen-Image only at odd sizes), and the timestep AND its frequency table are
+  bf16-rounded on every device. Its VAE is a one-step diffusion codec, not an
+  `AutoencoderKL`: a per-pixel MLP inside each 16x16 patch, depthwise 3x3 blocks,
+  and a 32x32 WINDOWED attention that pads a smaller latent up rather than
+  shrinking. The latent format is the identity. Every backend: CPU, Vulkan
+  (`mageflow_gpu.zig`, `mage_vae_gpu.zig`) and both CUDA arms.
+  ⚠️ **That codec is DISTILLED against Flux 2's VAE, so either file decodes this
+  latent** (`pipeline.MageFlowVae`, picked from what the file holds): Flux 2's is a
+  plain `AutoencoderKL` at 32 ch and 8x that folds each 2x2 block into the channel
+  axis to present 128 ch at 16x, with a BatchNorm for a latent format
+  (`sd_vae.PackedLatent`, eps 1e-4, not torch's default). Sharing a latent space is
+  a fact about TRAINING: the two files have zero tensor names in common, so a
+  header diff says nothing about interchangeability. Only the distilled codec
+  ENCODES, so reference images need it. ⚠️ Its V is the one unnormed attention operand and
+  outgrows f16 on a REAL conditioning (509538 at 1024²) while a random one stays
+  green, so the device check alone cannot see it; `v_div` is the prescale.
+  Mage-Flow-EDIT is a SEPARATE checkpoint, same architecture, and so is
+  COMPRESSED Mage-Flow, which swaps each block's modulation linear for a head on
+  a shared low-rank bottleneck: `DiT.rankIn` detects it, `DiT.blockModInput` is
+  the only place it differs, and the device arms never see it because the
+  modulation table they read is identical. ⚠️ Its SiLU applies ONCE, before the
+  projection, not per block.
+  ⚠️ **An edit reference is resized TWICE, to different sizes**: capped at a
+  384 px long edge for the Qwen3-VL-4B tower, and taken to the RENDER's
+  resolution for the VAE, because Mage's RoPE aligns reference and target by
+  POSITION. Feeding both one extent, which is what MiniMax H3 deliberately does,
+  misaligns the edit. The same references go on both CFG branches.
 - **The family is detected from the denoiser's own tensor names** (`detectFamily`), never
   from a flag. SDXL must be tested before SD1.5 (both are LDM UNets; `label_emb` is what
   distinguishes them), and Anima is identified by its LLM adapter, not its trunk, which it
@@ -501,12 +539,18 @@ they support** — a new reader belongs in that shared module the day it is writ
 
 Four orthogonal axes, each selectable on the CLI and in the GUI, and each recorded in the
 saved PNG's AUTOMATIC1111 `parameters` block (a reader re-renders from that block, so a
-hardcoded field there is a wrong answer).
+hardcoded field there is a wrong answer). `pipeline.appendExtraParams` adds what the render
+USED on top of what it was asked for -- `Clip 1`/`Clip 2`, `VAE`, `Model hash`/`VAE hash`
+(AutoV2: sha256[:10], from a `<path>.sha256` sidecar, which is WRITTEN when missing so it is paid once ever; `--model-hash off` skips it), `Weight
+dtype`, the resolved `Shift`, `Eta`/`Sigma noise` when overridden, and the LoRA stack --
+under A1111's and Civitai's own field names, never invented ones. ⚠️ **Which text encoder
+ran is not a detail**: Qwen3-VL-4B and plain Qwen3-4B share vocab, width and depth, load
+interchangeably, and render differently.
 
 | axis | file | surface |
 |---|---|---|
 | where the steps go | `core/schedule.zig` — all 9 ComfyUI schedulers plus the family sigma tables | `--scheduler` |
-| how to step | `core/sampler.zig` — euler, dpmpp_2m_sde, dpmpp_2m_sde_heun | `--sampler`, `--sde-eta`, `--sde-s-noise` |
+| how to step | `core/sampler.zig` — 11 of ComfyUI's samplers over four steppers | `--sampler`, `--eta`, `--s-noise` |
 | prompt syntax | `core/clip_tokenizer.zig` (comfy), `core/prompt_a1111.zig`, shared parser `core/prompt_weights.zig` | `--prompt-syntax`, `--emphasis` |
 | sampling compat | `core/noise.zig` selects `torch_rng.zig` or `philox_rng.zig` | `--compat`, `--rng`, `--sgm-noise-mult`, `--quantize-t` |
 
@@ -518,6 +562,31 @@ hardcoded field there is a wrong answer).
   a noise generator. It keys on the sigma **quantized to 1e-6**, so a schedule value one
   ulp out draws unrelated noise — which is why `schedule.zig` reproduces torch's f32
   rounding exactly rather than being more accurate than it.
+- ⚠️ **A blown-out DPM++ render on the SD `normal` schedule is the SAMPLER, not a bug.**
+  That schedule's last rung before zero is the ladder's minimum (0.44 -> 0.029 at 8
+  steps), so the multistep extrapolation coefficient explodes and the latent decodes as
+  saturated colour. ComfyUI does the same, worse (`tools/render_sd_ref.py` renders one
+  through ComfyUI's own `comfy.sample.sample` for a whole-render A/B). Karras or
+  exponential is the fix; the toy-denoiser fixtures cannot see it, because a toy
+  denoiser is a contraction and a real one is not.
+- **A sampler may evaluate the model TWICE per step** (`Kind.evalsPerStep`): heun,
+  dpm_2, the two second-order ancestral ones and dpmpp_sde place a probe at a sigma
+  that is not on the schedule and evaluate there (`sampler.Model`, which the loop
+  hands them). That is safe because every device session COMPUTES the timestep for a
+  sigma it has no cached entry for rather than matching the nearest; it also means the
+  same step count is twice the render time, which is what a time estimate has to ask
+  rather than assume.
+- **Not every sampler dispatches on the family.** `dpmpp_2m`, `heun` and `dpm_2` have
+  no `CONST` arm in ComfyUI at all, so one body runs over flow and eps alike (dpmpp_2m
+  takes `t = -log(sigma)` even on krea2); the ancestral ones and the SDE ones each ship
+  two bodies. Matching ComfyUI means matching that split, not the principled choice.
+- **The two stochastic sampler families do not draw from the same generator**, and neither
+  choice is derivable: ComfyUI builds the SDE samplers' Brownian tree with `cpu=True`
+  but leaves `default_noise_sampler` (the ancestral ones) on the latent's own device,
+  so one ComfyUI render mixes a CPU latent with Philox ancestral noise from one seed.
+  `sampler.stepNoiseSource` is that rule, and the ancestral noise is a SEQUENCE from one
+  generator rather than a path addressed by sigma, so a resumed render winds it forward
+  (`Stepper.resumeFrom`) instead of restoring a history.
 - A compat/dialect choice must reach **every** consumer of it. Wiring the initial latent
   but not the Brownian tree makes euler reproduce perfectly while every SDE render is wrong.
 - Prompt weights are a CLIP-only feature. The capability is declared on the encoder

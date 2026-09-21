@@ -1,3 +1,41 @@
+- mageflow: the Vulkan bf16 GEMM runs at 38 TFLOP/s against cuBLASLt's 52, and it
+  is at its OWN ceiling, not being called badly (`anima-vk-bench` reports 36.8-40.2
+  at every shape). Kernel work: tiling, double-buffering, swizzle. The same bench
+  shows int8 at 72-75 TFLOP/s on the same card, so a `mage_flow_t2i_int8`
+  checkpoint is the bigger practical win and needs no new code, just the file
+- mageflow: Vulkan attention materializes an 856 MB scores plane at 1024x1024 and
+  reads it twice (softmax table, then PV), ~31 GB a forward, which is why it is 25%
+  of the step against the CUDA arm's 15% on cuDNN's fused kernel. Query banding
+  would keep a tile in L2; the blocker is that the coopmat scores shader comes out
+  of a SPIR-V builder with no query offset, unlike the f32 `attn_scores` elt kernel
+  which already bands
+- mageflow: the 64-row TEXT stream is 8% of the Vulkan GEMM time for 1.5% of the
+  FLOPs, because m=64 leaves 24 workgroups on 82 SMs. Fusing q/k/v into one GEMM
+  per stream triples the occupancy and reads the activation once instead of three
+  times; the cost is concatenated weights, ~1.4 GB more VRAM, and dropping the
+  zero-copy mapping
+- mageflow: the DiT step is 1.22x slower than ComfyUI's (0.755 vs 0.621 s/step at
+  1024x1024 cfg 5, interleaved on the same 3090). WHERE is not measured. Ruled out:
+  the GEMM arm, since `--backend cuda` and `zig-cuda` time identically because
+  `lin_cuda`'s `.bf16` route takes hand-PTX `opGemmBf16` on both. Two candidates for
+  an isolation: the separate `opAddBiasRows` pass after every block GEMM, which
+  ComfyUI folds into cuBLASLt's epilogue (an `opGemmBf16` that takes a real bias
+  would remove ~10 GB/step of traffic, ESTIMATED not measured), and the per-block
+  text q/k/v copies. Our VAE is 1.69x FASTER than ComfyUI's on CUDA and another
+  3.7x faster again on Vulkan (0.3 s against 1.1 s at 1024x1024, unexplained and
+  worth a look from the other direction: what the CUDA VAE is doing that the
+  Vulkan one is not), so the codec is not where to look
+- mageflow: the VAE ENCODE side is still host-only (`mage_vae.encode`), which costs
+  a fixed second or so per reference image on the edit path rather than per step.
+  It shares the DiCo block and the 2 head blocks with decode, so the device arm is
+  mostly assembled already; what it needs new is the `[3][h][w]` patch embed at
+  stride 16 and the affine `LayerNorm2d` the head blocks use. Host on Vulkan too,
+  for the same reason
+- mageflow: the edit path is wired and pinned, but Mage-Flow-EDIT is a SEPARATE
+  checkpoint (`mage_flow_edit_bf16` / `mage_flow_edit_int8_convrot`) that is not
+  on this box. The T2I checkpoint runs the edit path correctly and ignores the
+  instruction, which is what ComfyUI does with the same file. Nothing to write;
+  the file is the gap
 - gpu: still per backend, and candidates for `kernels/dual.zig`: the block-quant GEMVs
   (CUDA warp-per-row dp4a/f16, Vulkan `_t`/`_sg`), attention, GEMMs. A shared
   subgroup-per-row GEMV over the RAW ggml layout would replace both arms' scalar
@@ -153,4 +191,17 @@
   (`placeExcluding` with a skip list, the `Asked` bookkeeping); what is not is that the
   replayed enqueue reaches the wire. A `Remote` that can be stood up with a link that
   answers nothing would close it, and `hosts-probe` is where it would run
-
+- sampler: eleven of ComfyUI's are in (`core/sampler.zig`), over four steppers plus a
+  mid-step model callback, each pinned against ComfyUI's own body on both families.
+  What is left, roughly by how often anyone picks it: `uni_pc` / `uni_pc_bh2` (its own
+  multistep predictor-corrector, the biggest single addition left), `ddim` (needs its
+  own eta and an alpha-bar walk rather than a sigma one), `lms` (Adams-Bashforth, whose
+  coefficients the reference gets from `scipy.integrate.quad` over a polynomial, so the
+  port integrates it in closed form), `res_multistep`, `ipndm` / `ipndm_v`, `deis`,
+  `heunpp2`, and the `_cfg_pp` family (which needs the UNCONDITIONAL prediction as well
+  as the guided one, i.e. a second output from the denoiser rather than a second call).
+  `dpm_fast` / `dpm_adaptive` do not fit at all: they pick their own step count.
+  A new one is a `Kind`, an arm on whichever stepper machine it belongs to, and a
+  fixture in `tools/gen_sampler_fixtures.py`; the trap is that ComfyUI ships a SEPARATE
+  `_RF` body for several of them and dispatches on `CONST`, which a port that reads
+  only the eps form gets plausibly wrong on krea2 and Z-Image

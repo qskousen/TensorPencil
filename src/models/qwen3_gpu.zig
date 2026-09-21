@@ -49,6 +49,15 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
+    if (getenv("TP_TE_DTYPES") != null) {
+        for ([_]usize{ 0, enc.layers.len - 1 }) |li| {
+            const l = enc.layers[li];
+            std.log.warn("layer {d}: q#{d} k#{d} v#{d} o#{d} gate#{d} up#{d} down#{d}", .{
+                li, @intFromEnum(l.q.dtype), @intFromEnum(l.k.dtype), @intFromEnum(l.v.dtype),
+                @intFromEnum(l.o.dtype), @intFromEnum(l.gate.dtype), @intFromEnum(l.up.dtype), @intFromEnum(l.down.dtype),
+            });
+        }
+    }
     const tap_count = enc.tapCount();
     if (!supportsWeights(ctx, enc)) return error.UnsupportedDType;
 
@@ -140,6 +149,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
 
         // --- Attention ---
         try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.input_norm), seq, hidden, eps);
+        try prepFor(ctx, layer.q, nd, seq, c.hidden);
         try gemm(ctx, coop, q_d, nd, seq, seq_pad, layer.q);
         try gemm(ctx, coop, k_d, nd, seq, seq_pad, layer.k);
         try gemm(ctx, coop, v_d, nd, seq, seq_pad, layer.v);
@@ -190,14 +200,17 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
             .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
             .f1 = @bitCast(@as(u32, 1)), // causal
         }, hd / 8, dc8, n_heads);
+        try prepFor(ctx, layer.o, attn_d, seq, c.qDim());
         try gemm(ctx, coop, t_d, attn_d, seq, seq_pad, layer.o);
         try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
 
         // --- MLP (SwiGLU) ---
         try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.post_norm), seq, hidden, eps);
+        try prepFor(ctx, layer.gate, nd, seq, c.hidden);
         try gemm(ctx, coop, g_d, nd, seq, seq_pad, layer.gate);
         try gemm(ctx, coop, u_d, nd, seq, seq_pad, layer.up);
         try ctx.opElt(.silu_mul, g_d, u_d, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
+        try prepFor(ctx, layer.down, g_d, seq, intermediate);
         try gemm(ctx, coop, t_d, g_d, seq, seq_pad, layer.down);
         try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
     }
@@ -237,7 +250,12 @@ fn wcode(dt: @import("tp_core").dtype.DType) gpu.WCode {
 /// bias in and these linears have none. One full-width buffer for every width,
 /// `smallBuffer` caches by host POINTER, so a per-width slice would hand a later,
 /// wider GEMM whichever length was uploaded first.
-const zero_bias: [qwen3.intermediate]f32 = @splat(0);
+/// Widest zero bias any encoder GEMM folds. Sized for the LARGEST `intermediate`
+/// any variant here loads, not the module constant: Qwen3-4B is 9728 where
+/// MiniMax H3's encoder is 25600, and a short one fails the length check in
+/// `gemm` on the gate/up projection. Passed WHOLE, never sliced: `smallBuffer`
+/// caches by host POINTER, so a slice would map every width to the first length.
+const zero_bias: [25600]f32 = @splat(0);
 
 /// Whether this context can run the encoder's weights at all.
 ///
@@ -250,8 +268,28 @@ const zero_bias: [qwen3.intermediate]f32 = @splat(0);
 /// are easy to conflate and one comment does not cover the other.
 pub fn supportsWeights(ctx: *gpu.Context, enc: *const qwen3.TextEncoder) bool {
     if (enc.layers.len == 0) return false;
+    // EVERY linear, not just the first layer's q: quantization is per weight, so a
+    // checkpoint may mix formats layer by layer, and a dtype this file has no arm
+    // for would otherwise reach the dense `else` below and be read as raw f32.
+    for (enc.layers) |l| {
+        inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
+            if (w.dtype != enc.layers[0].q.dtype) {
+                std.log.warn("qwen3_gpu: a block linear is dtype #{d} where the first is #{d}; mixed dtypes have no arm here", .{
+                    @intFromEnum(w.dtype), @intFromEnum(enc.layers[0].q.dtype),
+                });
+                return false;
+            }
+        }
+    }
     return switch (enc.layers[0].q.dtype) {
         .f8_e4m3, .f32 => true,
+        // int8-convrot (MiniMax H3's encoder). Needs the per-row scale the GEMM
+        // multiplies back in, and the rotation is the checkpoint's answer, not a
+        // choice: `prepFor` asks the weight, and both sides rotate or neither.
+        // 128 rows because `opI8Gemm` launches over the row count rounded up to
+        // its tile and writes whole tiles.
+        .i8 => (ctx.pipe_coop_i8 != .null_handle or ctx.pipe_coop_i8_sh != .null_handle) and
+            enc.layers[0].q.row_scale != null and enc.layers[0].q.rows % 128 == 0,
         .bf16, .f16 => ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle,
         // A GGUF encoder. `hasQuantPrefillGemm` IS the f16-weight coop pipeline the
         // dequant path feeds, so ask it rather than restating the condition.
@@ -261,7 +299,6 @@ pub fn supportsWeights(ctx: *gpu.Context, enc: *const qwen3.TextEncoder) bool {
 
 fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w: ops.matmul.Weight) !void {
     const zeros: []const f32 = &zero_bias;
-    std.debug.assert(w.rows <= zeros.len);
     if (w.dtype.isBlockQuant()) {
         // GGUF text encoder (`--text-encoder foo.gguf`): dequant the weight to f16
         // k-major once, then the same coop GEMM every other arm below uses. This is
@@ -274,20 +311,47 @@ fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w
         return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows], false);
     }
     switch (w.dtype) {
+        // int8-convrot: the activation is already quantized and rotated by the
+        // `prepFor` that ran before this GEMM's group, so this is the same
+        // `opI8Gemm` the H3 trunk drives.
+        .i8 => try ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false),
         // Dense bf16/f16 weights go through the f16-weight tensor-core GEMM, the same
         // route `dit_gpu` and `zimage_gpu` take for their dense blocks. Native bf16
         // tensor cores where the device has that config, else bf16 -> f16 at upload.
+        // Only the dense arms fold a bias; int8 above rescales per row instead.
         .bf16 => if (ctx.pipe_coop_bf16w != .null_handle)
             try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, zeros)
         else
             try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
         .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
-        else => if (coop) {
+        // f32 and fp8 only: every other storage form has an arm above, and this one
+        // reads the bytes as f32. Refuse by name rather than render noise.
+        .f32, .f8_e4m3 => if (coop) {
             try ctx.opMatmulCoop(y, x, m, m_pad, w.bytes, w.rows, w.cols, w.scale);
         } else {
             try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null);
         },
+        else => {
+            std.log.err("qwen3_gpu: a block linear has dtype #{d} ({d}x{d}, {d} bytes, row_scale {}), which has no GEMM arm here", .{
+                @intFromEnum(w.dtype), w.rows, w.cols, w.bytes.len, w.row_scale != null,
+            });
+            return error.UnsupportedDType;
+        },
     }
+}
+
+/// Quantize (and rotate) the activation an int8 GEMM group is about to read.
+///
+/// One call per distinct activation, not per GEMM: q/k/v share a normed hidden and
+/// gate/up share the next one, exactly as the H3 trunk does it. A no-op for every
+/// dense dtype, so the dense arms below are untouched.
+///
+/// Whether the prep ROTATES is a property of the checkpoint (`Weight.convrot`), and
+/// both sides must agree: an unrotated activation against rotated weights renders
+/// uncorrelated noise with nothing to say so.
+fn prepFor(ctx: *gpu.Context, w: ops.matmul.Weight, x: Buf, m: usize, cols: usize) !void {
+    if (w.dtype != .i8) return;
+    try ctx.opI8PrepR(x, m, cols, w.convrot != 0);
 }
 
 fn rmsnorm(ctx: *gpu.Context, in: Buf, out: Buf, weight: Buf, rows: usize, dim: usize, eps: f32) !void {

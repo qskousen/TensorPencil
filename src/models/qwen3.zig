@@ -286,6 +286,28 @@ pub const Config = struct {
     pub const max_layers = 64;
 };
 
+/// The RoPE base a GGUF will actually be RUN at, or null for anything else.
+///
+/// Informational, not a gate: running Mage-Flow's conditioner at plain Qwen3's
+/// 1e6 degrades style and convergence rather than destroying the conditioning.
+///
+/// This is the one thing separating Qwen3-VL-4B from plain Qwen3-4B: they share
+/// vocab, width, depth and head counts, and no weight records the difference. A
+/// safetensors file is told apart by its `model.language_model.` prefix
+/// (`Config.resolvePrefix`); a GGUF cannot be, because its tensor names are bare
+/// AND its vision tower lives in a separate mmproj, so the tower answers "no" for
+/// the VL file too.
+///
+/// A conversion that carries no hyperparameters at all is not "unknown": it is
+/// loaded as plain Qwen3 (`detect`, which warns), so that is the theta it runs
+/// at and the answer here.
+pub fn runRopeTheta(store: WeightStore) ?f64 {
+    if (store != .gguf) return null;
+    return store.gguf.getFloat("qwen3.rope.freq_base") orelse
+        store.gguf.getFloat("llama.rope.freq_base") orelse
+        Config.qwen3_4b.rope_theta;
+}
+
 /// Whether a GGUF actually declares its RoPE base, as opposed to `detectGguf`
 /// having guessed one. Checked under both metadata prefixes this stack accepts.
 fn statesRopeTheta(g: *const gguf_mod.Gguf) bool {
@@ -318,6 +340,14 @@ pub const anima_taps = [_]usize{Config.qwen3_0_6b.n_layers};
 /// `appliesFinalNorm` from being derivable from the tap list. See `Variant`.
 pub const minimax_h3_taps = [_]usize{Config.qwen3vl_32b_h3.n_layers};
 
+/// Mage-Flow conditions on the final hidden state of the SAME Qwen3-VL-4B body
+/// krea2 uses, with `model.norm` applied. ComfyUI spells it `layer_idx = -1`
+/// plus `layer_norm_hidden_state = True`, which resolves to a capture after
+/// layer 35, i.e. one past the last layer in this file's convention, and then
+/// norms it. So Mage-Flow and krea2 share a checkpoint and a template and agree
+/// on nothing else about how the states are read.
+pub const mageflow_taps = [_]usize{Config.vl_4b.n_layers};
+
 /// Which conditioning stack a `TextEncoder` produces.
 ///
 /// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
@@ -342,10 +372,13 @@ pub const Variant = enum {
     /// MiniMax H3: Qwen3-VL-32B truncated to 50 layers, the UNNORMALIZED final
     /// hidden state. See `models/minimax_h3.zig`.
     minimax_h3,
+    /// Mage-Flow: krea2's Qwen3-VL-4B checkpoint, but ONE normalized final
+    /// hidden state rather than krea2's 12-layer tap stack.
+    mageflow,
 
     pub fn config(self: Variant) Config {
         return switch (self) {
-            .krea2 => Config.vl_4b,
+            .krea2, .mageflow => Config.vl_4b,
             .zimage => Config.qwen3_4b,
             .anima => Config.qwen3_0_6b,
             .minimax_h3 => Config.qwen3vl_32b_h3,
@@ -358,6 +391,7 @@ pub const Variant = enum {
             .zimage => &zimage_taps,
             .anima => &anima_taps,
             .minimax_h3 => &minimax_h3_taps,
+            .mageflow => &mageflow_taps,
         };
     }
 
@@ -379,7 +413,7 @@ pub const Variant = enum {
     pub fn appliesFinalNorm(self: Variant) bool {
         return switch (self) {
             .krea2, .zimage, .minimax_h3 => false,
-            .anima => true,
+            .anima, .mageflow => true,
         };
     }
 };
@@ -1335,8 +1369,7 @@ test "the MiniMax H3 encoder loads from the real checkpoint" {
     try std.testing.expect(enc.layers[0].q.row_scale != null);
 
     // And it ENCODES: 50 int8 layers over a short prompt, producing one
-    // hidden state per token. This is the shape/finiteness pin, not a numeric
-    // one -- see VIDEO_PLAN.md for the parity that is still owed.
+    // hidden state per token. Shape and finiteness only; no numeric parity yet.
     var tok = try @import("tp_core").tokenizer.Tokenizer.init(gpa);
     defer tok.deinit();
     var ids: std.ArrayList(u32) = .empty;

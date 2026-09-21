@@ -383,27 +383,21 @@ fn conv(
     const band = @max(1, @min(rows, patch_band / cols));
     std.debug.assert(band * cols <= ws.shapes.patch);
 
-    // ⚠️ The staging array must outlive the batch, not the loop iteration: uploads
-    // inside a batch are queued on the stream. One slot per band, so every queued
-    // copy still has its source when it runs.
-    const n_bands = (rows + band - 1) / band;
-    const stage = try ws.stage(be, n_bands);
+    // The shape is the same for every band, so it is uploaded ONCE and only the
+    // band's first row moves, as a launch scalar. The staging slot must still
+    // outlive the batch: an upload inside one is queued on the stream.
+    const stage = try ws.stage(be, 1);
+    stage[0] = [16]u32{
+        @intCast(cols),        @intCast(c.in_ch),   @intCast(c.kt),       @intCast(c.kh),
+        @intCast(c.kw),        @intCast(out_h),     @intCast(out_w),      @intCast(src.t),
+        @intCast(src.h),       @intCast(src.w),     @intCast(c.stride_t), @intCast(c.stride_s),
+        @intCast(front),       @intCast(pad_h[0]),  @intCast(pad_w[0]),   0,
+    };
+    try be.tensorUpload(ws.prm, std.mem.sliceAsBytes(stage[0..1]));
     var t0: usize = 0;
-    var bi: usize = 0;
-    while (t0 < rows) : ({
-        t0 += band;
-        bi += 1;
-    }) {
+    while (t0 < rows) : (t0 += band) {
         const nb = @min(band, rows - t0);
-        stage[bi] = [16]u32{
-            @intCast(cols),        @intCast(c.in_ch),   @intCast(c.kt),       @intCast(c.kh),
-            @intCast(c.kw),        @intCast(out_h),     @intCast(out_w),      @intCast(src.t),
-            @intCast(src.h),       @intCast(src.w),     @intCast(c.stride_t), @intCast(c.stride_s),
-            @intCast(front),       @intCast(pad_h[0]),  @intCast(pad_w[0]),   @intCast(t0),
-        };
-        const pslot = offsetBuf(ws.prm, bi * 64);
-        try be.tensorUpload(pslot, std.mem.sliceAsBytes(stage[bi .. bi + 1]));
-        try be.opIm2col3d(src.buf, ws.patch, pslot, nb, cols);
+        try be.opIm2col3d(src.buf, ws.patch, ws.prm, t0, nb, cols);
         const wb = std.mem.sliceAsBytes(c.w);
         const gout = offsetBuf(dst, t0 * c.out_ch * 4);
         be.opMatmulF32Lt(gout, ws.patch, nb, wb, c.out_ch, cols, c.bias) catch |err| switch (err) {

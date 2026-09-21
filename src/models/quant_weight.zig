@@ -214,6 +214,22 @@ pub fn int8Scale(
     return .{ .row_scale = row_scale, .convrot = rot };
 }
 
+/// The per-tensor dequant scale of an fp8 weight, or 1 when it has no sidecar.
+///
+/// ComfyUI's scaled fp8 writes ONE rank-0 scale per weight; any other element count is a
+/// different format under the same name, so it is refused rather than guessed at.
+fn fp8Scale(store: WeightStore, name: []const u8, who: []const u8) !f32 {
+    var buf: [256]u8 = undefined;
+    const s_name = std.fmt.bufPrint(&buf, "{s}_scale", .{name}) catch return 1.0;
+    const sv = store.get(s_name) orelse return 1.0;
+    const n = sv.info.elemCount();
+    if (n != 1) {
+        std.log.err("{s}: {s} is fp8 with a {d}-entry {s}; only one scale per tensor is a format this reads", .{ who, name, n, s_name });
+        return error.UnsupportedCheckpoint;
+    }
+    return sv.asScalarF32();
+}
+
 /// Build a `Weight` for a ComfyUI int8 or int4 layer, or null when `view` is neither.
 ///
 /// Runs AFTER `nvfp4` and `w4a8`: those store `[rows, cols/2]` integer nibbles too, so
@@ -478,6 +494,14 @@ pub fn load(
     // A shape-fixed block quant tiles its blocks over the flat element sequence rather
     // than each row, so no GEMM here can read it; it is small by construction.
     if (view.info.flat_blocks) return flatBlocksF32(alloc, view, name, rows, cols);
+
+    // ComfyUI's scaled fp8 is these same bytes plus one `weight_scale` for the tensor.
+    // Every GEMM multiplies `Weight.scale` in, so reading it here is the whole of it.
+    if (view.info.dtype == .f8_e4m3) {
+        var w = try tag(alloc, Weight.init(view.bytes, .f8_e4m3, rows, cols), name);
+        w.scale = try fp8Scale(store, name, opts.who);
+        return w;
+    }
     if (!ops.matmul.supportsDType(view.info.dtype)) switch (opts.unsupported) {
         .refuse => {
             std.log.err("{s}: {s} has unsupported dtype {t}", .{ opts.who, name, view.info.dtype });
@@ -724,6 +748,58 @@ test "int8Scale reads both int8_tensorwise variants" {
         defer st.deinit();
         const m = try int8Scale(alloc, .{ .safetensors = &st }, "w.weight", 4, 256);
         try std.testing.expectEqual(@as(u32, 0), m.convrot);
+    }
+}
+
+/// `w.weight` F8_E4M3 [rows, cols], optionally with a rank-0 `weight_scale`.
+fn fp8Store(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), rows: usize, cols: usize, scale: ?f32) !void {
+    const wbytes = rows * cols;
+    var hdr: std.Io.Writer.Allocating = .init(gpa);
+    defer hdr.deinit();
+    const w = &hdr.writer;
+    try w.print(
+        \\{{"w.weight":{{"dtype":"F8_E4M3","shape":[{d},{d}],"data_offsets":[0,{d}]}}
+    , .{ rows, cols, wbytes });
+    if (scale != null) try w.print(
+        \\,"w.weight_scale":{{"dtype":"F32","shape":[],"data_offsets":[{d},{d}]}}
+    , .{ wbytes, wbytes + 4 });
+    try w.writeAll("}");
+
+    const hb = hdr.written();
+    try buf.appendSlice(gpa, &std.mem.toBytes(@as(u64, hb.len)));
+    try buf.appendSlice(gpa, hb);
+    try buf.appendNTimes(gpa, 0x38, wbytes); // fp8 e4m3 0.5
+    if (scale) |sc| try buf.appendSlice(gpa, std.mem.asBytes(&sc));
+}
+
+test "a scaled fp8 weight carries its scale, and a plain one carries 1" {
+    const gpa = std.testing.allocator;
+    const safetensors = @import("tp_core").safetensors;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // ComfyUI's scaled fp8: the factor has to reach `Weight.scale`.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try fp8Store(gpa, &buf, 4, 8, 0.0078125);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const w = try load(alloc, .{ .safetensors = &st }, "w.weight", 4, 8, .{ .who = "test" });
+        try std.testing.expectEqual(@import("tp_core").dtype.DType.f8_e4m3, w.dtype);
+        try std.testing.expectEqual(@as(f32, 0.0078125), w.scale);
+    }
+
+    // A plain fp8 checkpoint has no sidecar at all and must not be refused for it.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try fp8Store(gpa, &buf, 4, 8, null);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const w = try load(alloc, .{ .safetensors = &st }, "w.weight", 4, 8, .{ .who = "test" });
+        try std.testing.expectEqual(@as(f32, 1.0), w.scale);
     }
 }
 

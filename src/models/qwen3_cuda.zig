@@ -444,7 +444,6 @@ pub const CudaLM = struct {
         }
         const c = lm.cfg;
         var self: CudaLM = init_defaults.of(CudaLM);
-        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;

@@ -1,4 +1,8 @@
-//! MiniMax H3's vision tower: Qwen3-VL-32B's ViT with DeepStack.
+//! The Qwen3-VL vision tower with DeepStack, in the HF lineage ComfyUI ships.
+//!
+//! Named for MiniMax H3 because that is what it was written for, and it now
+//! serves Mage-Flow-Edit's 4B tower too: the two differ only in `Config`
+//! (`qwen3vl_32b` and `qwen3vl_4b`), never in the forward.
 //!
 //! A separate file from `vit35.zig`, which implements the same tower on paper (27
 //! blocks, 1152 wide, fused qkv, 4304 FFN, 48x48 learned position table, and even
@@ -90,6 +94,26 @@ pub const Config = struct {
     pub fn freqsPerAxis(self: Config) usize {
         return self.headDim() / 4;
     }
+
+    /// The 4B tower, which Mage-Flow-Edit conditions on. Narrower and DEEPER
+    /// than the 32B's (1024 over 24 blocks against 1152 over 27), its deepstack
+    /// taps sit at different blocks, and `head_dim` is 64 rather than 72 -- so
+    /// `freqsPerAxis` is 16, not 18, and the rope table is a different shape.
+    /// Everything else, including the 48x48 position grid, is shared.
+    pub const qwen3vl_4b: Config = .{
+        .dim = 1024,
+        .n_heads = 16,
+        .ffn = 4096,
+        .n_blocks = 24,
+        .patch = 16,
+        .temporal_patch = 2,
+        .merge = 2,
+        .in_channels = 3,
+        .pos_grid = 48,
+        .out_dim = 2560,
+        .n_deepstack = 3,
+        .deepstack_indexes = .{ 5, 11, 17, 0 },
+    };
 
     /// The 32B (and 8B) tower. 4B differs in width, depth and indexes.
     pub const qwen3vl_32b: Config = .{
@@ -369,7 +393,7 @@ pub fn resizeTarget(cfg: Config, h: usize, w: usize, min_pixels: usize, max_pixe
 /// Python's `round`, which is banker's rounding (half to EVEN), not half-up.
 /// `round(2.5)` is 2 there and 3 in most other languages, and an axis exactly
 /// half a factor over the grid is the case that differs.
-fn pyRound(v: f64) f64 {
+pub fn pyRound(v: f64) f64 {
     const r = @round(v);
     if (@abs(v - @trunc(v)) == 0.5) {
         // `@round` goes away from zero on a tie; Python goes to even.

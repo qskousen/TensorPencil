@@ -263,6 +263,29 @@ pub fn seedImageIds(base: ImageId) void {
 /// published before `status` flips to done (acquire/release), so a done image
 /// always has its pixels. Also used (status pre-set to `.done`) for images the
 /// user attaches for the model to see.
+/// What a render used, for the metadata block the CLIENT writes into the PNG.
+///
+/// Filled once per image when the worker starts it, because that is the first
+/// moment both the image and a LOADED session exist: the weight dtype is a
+/// property of what was loaded, not of what was requested. Owned strings, freed
+/// with the image.
+pub const ImageMeta = struct {
+    clip1: []const u8 = "",
+    clip2: []const u8 = "",
+    vae: []const u8 = "",
+    model_hash: []const u8 = "",
+    vae_hash: []const u8 = "",
+    weight_dtype: []const u8 = "",
+    shift: f32 = 0,
+    loras: []wire.LoraInfo = &.{},
+
+    fn deinit(self: *ImageMeta, gpa: std.mem.Allocator) void {
+        for (self.loras) |l| gpa.free(l.name);
+        if (self.loras.len > 0) gpa.free(self.loras);
+        self.* = .{};
+    }
+};
+
 pub const GenImage = struct {
     /// Stamped by `enqueue`; resolved through `Diffuser.byId`. Holders keep
     /// the id, never the pointer, past the frame they got it in.
@@ -271,6 +294,8 @@ pub const GenImage = struct {
     /// engine minted to the row it already drew. 0 = none.
     client_ref: u64 = 0,
     prompt: []u8, // owned (gpa)
+    /// See `ImageMeta`. Empty until the worker starts this image.
+    meta: ImageMeta = .{},
     status: std.atomic.Value(u8) = .init(@intFromEnum(GenStatus.pending)),
     step: std.atomic.Value(u32) = .init(0),
     total: std.atomic.Value(u32) = .init(0),
@@ -364,6 +389,7 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
     if (gi.preview) |p| gpa.free(p);
     if (gi.model) |m| m.deinit(gpa);
     if (gi.resume_snapshot) |*s| s.deinit(gpa);
+    gi.meta.deinit(gpa);
     gpa.destroy(gi);
 }
 
@@ -420,6 +446,8 @@ pub const DiffConfig = struct {
     /// Latent-resolution divisor for the TAESD preview (see pipeline.Options.
     /// preview_ds). 0 = adaptive default.
     preview_ds: usize = 0,
+    /// See `pipeline.Options.hash_models`.
+    hash_models: bool = true,
     /// Show a live preview while sampling. When false, no per-step preview is
     /// computed (the "None" preview method). When true, `taew_path` selects
     /// TAESD vs. the built-in latent2rgb fallback.
@@ -511,6 +539,15 @@ pub const Diffuser = struct {
 
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// AutoV2 hashes for the files a render used, so a checkpoint is read once
+    /// per process rather than once per image.
+    hashes: pipeline.HashCache = .{},
+    /// A notice the WORKER produced for the host to emit. The worker cannot
+    /// touch the wire, and the host thread is free while the worker blocks, so
+    /// a slot plus `wake` is what gets a "this is going to take a moment" out
+    /// BEFORE the moment rather than after it.
+    notice_mu: std.Io.Mutex = .init,
+    notice: ?[]u8 = null,
     wake: *const fn () void,
 
     /// Base sampling options (paths / backend / preview / default dims); the
@@ -632,6 +669,7 @@ pub const Diffuser = struct {
             .preview = cfg.preview_enabled,
             .taew_path = cfg.taew_path,
             .preview_ds = cfg.preview_ds,
+            .hash_models = cfg.hash_models,
         };
         // Paths + backend + the explicit-override flags, in one place. Note this
         // OVERWRITES `Options`' defaulted krea2 side paths with "" when nothing is
@@ -900,6 +938,75 @@ pub const Diffuser = struct {
     /// Worker-thread only, like the `self.loaded` write after a load: the UI
     /// thread reads it in `pump`/`dropStaleSession`, both of which return early
     /// while a worker is running.
+    /// Record what this render is actually using. Best-effort: a hash that cannot be
+    /// computed is left empty and simply not written into the block, which is the
+    /// same thing every other optional field there does.
+    /// The pending notice, if any. Caller frees. Called on the host thread.
+    pub fn takeNotice(self: *Diffuser) ?[]u8 {
+        self.notice_mu.lockUncancelable(self.io);
+        defer self.notice_mu.unlock(self.io);
+        const n = self.notice;
+        self.notice = null;
+        return n;
+    }
+
+    fn putNotice(self: *Diffuser, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        self.notice_mu.lockUncancelable(self.io);
+        if (self.notice) |old| self.gpa.free(old);
+        self.notice = text;
+        self.notice_mu.unlock(self.io);
+        self.wake();
+    }
+
+    /// `HashCache.notify`: turn a one-off file read into something on screen.
+    fn onHashNotice(ctx: ?*anyopaque, n: pipeline.HashNotice) void {
+        const self: *Diffuser = @ptrCast(@alignCast(ctx orelse return));
+        const stem = modelStem(n.path);
+        if (n.took_ns) |ns| {
+            self.putNotice("Model hash sidecar for {s} written in {d:.0} s.", .{ stem, @as(f64, @floatFromInt(ns)) / 1e9 });
+        } else {
+            self.putNotice("Generating missing model hash sidecar for {s}, please wait...", .{stem});
+        }
+    }
+
+    fn fillMeta(self: *Diffuser, gi: *GenImage, sess: *pipeline.Session, shift: f32) void {
+        const m = gi.model orelse return;
+        // Armed per image: `cancel` is this image's flag, and the settings that
+        // decide whether to hash at all can move between renders.
+        self.hashes.compute = self.opts.hash_models;
+        self.hashes.notify = onHashNotice;
+        self.hashes.notify_ctx = self;
+        self.hashes.cancel = &gi.cancel;
+        gi.meta.deinit(self.gpa);
+        gi.meta = .{
+            .clip1 = modelStem(m.text_encoder_path),
+            .clip2 = modelStem(m.text_encoder_2_path),
+            .vae = modelStem(m.vae_path),
+            .model_hash = self.hashes.autoV2(self.gpa, self.io, m.dit_path),
+            .vae_hash = self.hashes.autoV2(self.gpa, self.io, m.vae_path),
+            .weight_dtype = sess.weightDtype(),
+            .shift = shift,
+        };
+        if (m.loras.len == 0) return;
+        const out = self.gpa.alloc(wire.LoraInfo, m.loras.len) catch return;
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |l| self.gpa.free(l.name);
+            self.gpa.free(out);
+        }
+        for (m.loras, out) |spec, *l| {
+            const name = self.gpa.dupe(u8, modelStem(spec.path)) catch return;
+            l.* = .{
+                .name = name,
+                .hash = self.hashes.autoV2(self.gpa, self.io, spec.path),
+                .strength = spec.strength,
+            };
+            made += 1;
+        }
+        gi.meta.loras = out;
+    }
+
     fn setResidentLoras(self: *Diffuser, loras: []const pipeline.LoraSpec) void {
         if (self.loaded) |*l| {
             const owned = dupeLoras(self.gpa, loras) catch return;
@@ -1604,6 +1711,7 @@ pub const Diffuser = struct {
         // and returns error.Paused. The worker stores it on the image (status
         // .suspended) and exits; the UI frees the weights, and the next dispatch
         // resumes bit-identically via opts.resume_from.
+        self.fillMeta(gi, sess.?, sess.?.resolvedShift(opts));
         var suspend_snap: ?pipeline.Snapshot = null;
         opts.suspend_out = &suspend_snap;
         var img = sess.?.generate(opts, progress) catch |err| {

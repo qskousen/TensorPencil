@@ -254,7 +254,7 @@ const BqScaleKey = struct { ptr: usize, bits: u8 };
 
 /// Weight noise: the two values every block-quant GEMM/GEMV kernel reads out of
 /// the parameter slots the ABI already carried unused. See `cuda/wnoise.zig` for
-/// what the kernels do with them, and BACKEND.md for which kernels honor them.
+/// what the kernels do with them; `dtypeHonorsWeightNoise` is which ones do.
 ///
 /// Sigma is a FUNCTION OF DEPTH, not a constant: `core/noise_curve.zig` evaluates
 /// the user's expression once per layer into `table`, and a launch reads the slot
@@ -419,6 +419,9 @@ pub const Backend = struct {
     /// --vram-budget ceiling on our own device footprint (bytes); 0 = no cap
     /// (only the live cuMemGetInfo headroom bounds the weight cache).
     budget_override: u64 = 0,
+    /// `--vram-budget min`: keep no weight resident past the in-flight set.
+    /// Independent of `budget_override`, which is a byte ceiling.
+    min_weights: bool = false,
     /// Total weights evicted over the backend's lifetime. Nonzero means weight
     /// streaming is (or has been) active, device weight pointers are not
     /// stable, so anything that bakes them in (the CudaLM decode graph) must
@@ -1149,29 +1152,56 @@ pub const Backend = struct {
         // that OOM'd still teaches the planner how much room to leave next time.
         if (size > self.max_alloc_bytes) self.max_alloc_bytes = size;
         while (true) {
+            // An explicit --vram-budget is a CEILING, not a hint. Refuse to go past
+            // it and run the same reclaim ladder a physical OOM runs, so the budget
+            // reaches everything device memory goes to (the recycle pool, deferred
+            // frees, activations), not just the weight cache the reserve loop steers.
+            // Inert when no budget is set.
+            if (self.budgetOvershoot(size) != 0) {
+                // Unlike a physical OOM, this fires while the stream is still busy:
+                // the rungs below free buffers outright (the pool, an unconsumed
+                // prefetch) and queued kernels may still be reading them. Drain
+                // first so nothing is in flight when they go.
+                _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+                if (self.reclaimRung(size)) continue;
+                return self.allocFailed(size, true);
+            }
             if (self.ctx.alloc(@intCast(size))) |b| {
                 var db = dbFromPtr(b.ptr, size);
                 db.tag = b.tag; // carry the component tag for accurate free-time accounting
                 return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
-                // Reactive backstop: reclaim deferred-frees (blocking the oldest if
-                // needed), else evict a resident weight, then retry. Degrades to
-                // streaming instead of failing.
-                self.reclaimPending();
-                if (self.blockOldestPending()) continue;
-                if (self.evictOneWeight(true)) continue;
-                if (self.drainPoolForOom() > 0) continue; // sacrifice the recycle pool
-                if (self.evictNewestPrefetch()) continue; // last resort: drop the farthest-out prefetch
-                if (self.foreignReclaim(size)) continue; // finally: another context on this card
+                if (self.reclaimRung(size)) continue;
                 const es = self.evict_skip;
                 std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
                     size >> 20, self.ctx.freeMiB(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
                     es.pin,     es.awaiting,                      es.mru,                  es.pf,                     es.small,
                 });
-                return error.DeviceOutOfMemory;
+                return self.allocFailed(size, false);
             }
         }
+    }
+
+    /// Give up on an allocation. Drains the stream first: the caller unwinds
+    /// through `errdefer`s that free buffers, and kernels queued against them
+    /// are still in flight, which surfaces as CUDA_ERROR_ILLEGAL_ADDRESS at the
+    /// next synchronize, losing the context. A failure has nothing left to be
+    /// fast about, so pay the stall and let the error be the error.
+    ///
+    /// `budget_bound` separates the two ways to run out: the card is full, or
+    /// the card has room and `--vram-budget` is what said no. Only weights
+    /// stream, so a budget under the activation working set cannot be met at
+    /// any streaming level, and "DeviceOutOfMemory" on a card with 20 GB free
+    /// sends the reader hunting the wrong thing.
+    fn allocFailed(self: *Backend, size: u64, budget_bound: bool) Error {
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        if (budget_bound) std.log.err(
+            "[vram] --vram-budget {d}MB refused a {d}MB allocation with {d}MB already held. " ++
+                "Activations cannot stream, so raise the budget or render smaller.",
+            .{ self.budget_override >> 20, size >> 20, self.ctx.device_used >> 20 },
+        );
+        return error.DeviceOutOfMemory;
     }
 
     /// Final OOM-ladder rung: ask the coordinator to free `needed` bytes held by
@@ -1677,8 +1707,13 @@ pub const Backend = struct {
     }
 
     /// Return a buffer to the recycling pool (real-freed only if bookkeeping
-    /// allocation fails).
+    /// allocation fails, or when the budget has no room to hold it).
     fn poolPut(self: *Backend, db: DeviceBuffer) void {
+        // Pooled bytes are still ours: they count in `device_used` and the card
+        // cannot hand them to anyone else. Recycling them is worth it only while
+        // there is room under the budget to hold them, so above it the pool
+        // dissolves rather than parking the model's whole working set off-books.
+        if (self.min_weights or self.budgetOvershoot(0) != 0) return self.poolPutFailed(db);
         const g = self.weight_pool.getOrPut(self.gpa, db.size) catch return self.poolPutFailed(db);
         if (!g.found_existing) g.value_ptr.* = .empty;
         g.value_ptr.append(self.gpa, db) catch return self.poolPutFailed(db);
@@ -1731,12 +1766,55 @@ pub const Backend = struct {
     /// the reactive backstop if this can't free enough.
     fn reserveForWeights(self: *Backend, need: u64) void {
         self.reclaimPending();
+        // `--vram-budget min`: hold nothing but the set this forward is using.
+        // The policy below already refuses to evict the MRU, an unconsumed
+        // prefetch and an in-flight one, so "shed everything evictable" leaves
+        // exactly the in-flight weights and nothing else, at any resolution and
+        // without a byte figure to get wrong.
+        if (self.min_weights) {
+            while (self.evictOneWeight(false) or self.evictOneWeight(true)) {}
+            return;
+        }
         // pending_free_bytes: deferred frees WILL come back without another
         // eviction; counting them stops the loop from over-evicting while
         // their events are still in flight.
-        while (self.budgetHeadroom() + self.pending_free_bytes < need) {
+        while (self.budgetHeadroom() + self.pending_free_bytes < need + self.budgetOvershoot(0)) {
             if (!self.evictOneWeight(false) and !self.evictOneWeight(true)) return;
         }
+    }
+
+    /// Bytes our own footprint would be past an explicit `--vram-budget` once an
+    /// `incoming`-byte allocation lands (pass 0 to ask about what we hold now).
+    /// Always 0 when no budget is set: that is the driver-managed default, where
+    /// `budgetHeadroom`'s live reading is the whole story.
+    ///
+    /// `budgetHeadroom` saturates at 0, so "exactly at the budget" and "13 GB
+    /// past it" read the same. The reserve loop then compares that 0 against
+    /// one upload's `need` and the deferred-free credit covers it, so the first
+    /// eviction's own pending bytes authorize the next upload, and the next,
+    /// without bound: the cache grew to the whole model under a 256 MB budget.
+    /// Adding the overshoot back makes the loop free what the budget is short
+    /// by, not merely what one upload asks for.
+    fn budgetOvershoot(self: *Backend, incoming: u64) u64 {
+        if (self.budget_override == 0) return 0;
+        return (self.ctx.device_used + incoming) -| self.budget_override;
+    }
+
+    /// One rung of the reclaim ladder, cheapest first; true when it freed
+    /// something and the caller should retry. Shared by the physical-OOM retry
+    /// and the budget ceiling so both degrade the same way: to weight streaming,
+    /// then to sacrificing the recycle pool, rather than to a failure.
+    ///
+    /// Ordered so it converges under a budget: an async eviction only DEFERS its
+    /// free, leaving `device_used` untouched, and the bytes come back through
+    /// the two pending rungs above it on the next pass.
+    fn reclaimRung(self: *Backend, size: u64) bool {
+        self.reclaimPending();
+        if (self.blockOldestPending()) return true;
+        if (self.evictOneWeight(true)) return true;
+        if (self.drainPoolForOom() > 0) return true; // sacrifice the recycle pool
+        if (self.evictNewestPrefetch()) return true; // last resort: drop the farthest-out prefetch
+        return self.foreignReclaim(size); // finally: another context on this card
     }
 
     pub fn tensorDestroy(self: *Backend, db: *DeviceBuffer) void {
@@ -2734,8 +2812,8 @@ pub const Backend = struct {
     }
 
     /// Whether this dtype's GEMM/GEMV kernels honor `weight_noise`. The authority
-    /// for it, because it is a property of which kernels were actually wired (see
-    /// BACKEND.md 6): a weight in any other dtype passes through untouched, so a UI
+    /// for it, because it is a property of which kernels were actually wired: a
+    /// weight in any other dtype passes through untouched, so a UI
     /// offering the knob for such a checkpoint would be lying. Notably NOT here: the
     /// fp8/bf16/int8-convrot GEMMs, and the dequant-to-f16 fallback, which is the
     /// batched route for q4_0 and iq4_nl (they have no MMQ pipe), so those two are
@@ -3863,7 +3941,11 @@ pub const Backend = struct {
     pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
-        if (bias == null and self.kernels == .libs) {
+        // cuBLASLt writes straight into `dst`, bias in the epilogue. The
+        // alternative below stages an m-padded f32 plane and re-reads it to add
+        // the bias, which at Mage-Flow's widths is ~10 GB a forward of traffic
+        // for an add cuBLASLt does for free.
+        if (self.kernels == .libs) {
             std.debug.assert(w_bytes.len == co * k * 2);
             std.debug.assert(co % 128 == 0 and k % 32 == 0);
             const w_direct = try self.cachedWeight(w_bytes);
@@ -3871,7 +3953,12 @@ pub const Backend = struct {
             if (!bench_gemm_only) {
                 try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
             }
-            try self.ltMatmulBf16(dst, w_direct, self.conv_a16, co, m, k);
+            var bias_ptr: u64 = 0;
+            if (bias) |bv| {
+                std.debug.assert(bv.len >= co);
+                bias_ptr = (try self.cachedWeight(std.mem.sliceAsBytes(bv))).ptr();
+            }
+            try self.ltMatmulBf16Bias(dst, w_direct, self.conv_a16, co, m, k, bias_ptr);
             return;
         }
         // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
@@ -4307,6 +4394,15 @@ pub const Backend = struct {
     /// raw bf16, D is f32.
     pub fn ltMatmulBf16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
         try self.ltMatmulBf16Scaled(d, w, a, n, m, k, 1, 0);
+    }
+
+    /// `ltMatmulBf16` with a per-column bias added in the GEMM epilogue.
+    /// `bias_ptr` 0 means none, which is the plain call.
+    pub fn ltMatmulBf16Bias(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize, bias_ptr: u64) Error!void {
+        const plan = try self.ltPlan(.bf16, n, m, k, bias_ptr, false);
+        var alpha: f32 = 1;
+        var beta: f32 = 0;
+        try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), bias_ptr);
     }
 
     /// `dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias`, W f32 `[co][k]`, on cuBLASLt
@@ -4939,14 +5035,13 @@ pub const Backend = struct {
     }
 
     /// Channel-last 3-D im2col with reflect spatial and causal temporal padding.
-    /// `params` is a device u32[16]; see `elt.im2col3d_ptx` for the layout, which
-    /// the caller builds with `im2col3dParams`.
-    pub fn opIm2col3d(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, params: DeviceBuffer, rows: usize, cols: usize) Error!void {
+    /// `params` is a device u32[15] of the volume's shape, the same for every band;
+    /// `t0` is the band's first output row. See `dual/elt.zig` `im2col3d`.
+    pub fn opIm2col3d(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, params: DeviceBuffer, t0: usize, rows: usize, cols: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.im2col3d_ptx, "im2col3d");
         const total = rows * cols;
-        try self.eltLaunch(f, src, patch, params, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElems("im2col3d", src, patch, params, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ @floatFromInt(t0), 0 }, total);
     }
 
     /// The audio ENCODER's `Snake1d`, channel-last and in place: `x += sin(a*x)^2 /
@@ -5129,9 +5224,21 @@ pub const Backend = struct {
     /// `idx == null` is the ordinary uniform-segment path and costs one predicated
     /// branch per block.
     pub fn rmsModRows(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
+        return self.rmsModRowsAt(x, 0, out, 0, mod, rows, dim, premul_off, shift_off, eps, idx, 0, idx_stride);
+    }
+
+    /// `rmsModRows` over a row RANGE: `x_row`/`out_row`/`idx_row` are row offsets
+    /// into their buffers. A CUDA caller could offset the pointer instead, but a
+    /// Vulkan `DeviceBuffer` is a handle with nowhere to put one, so the offsets are
+    /// kernel arguments and both backends drive the same launch.
+    pub fn rmsModRowsAt(self: *Backend, x: DeviceBuffer, x_row: usize, out: DeviceBuffer, out_row: usize, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, idx: ?DeviceBuffer, idx_row: usize, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualRows("rms_mod", x, out, mod, idx, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), @intCast(idx_stride), 0, 0 }, .{ eps, 0 }, rows);
+        // The kernel reads `idx` exactly when the stride is non-zero, so the two
+        // must agree here: a stride with no buffer dereferences a null pointer on
+        // the device, which is an illegal access and not a wrong number.
+        const stride: u32 = if (idx == null) 0 else @intCast(idx_stride);
+        try self.dualRows("rms_mod", x, out, mod, idx, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), stride, @intCast(x_row), @intCast(out_row) }, .{ eps, @floatFromInt(idx_row) }, rows);
     }
 
     /// out = (x - mean)*inv*mod[premul+c] + mod[shift+c], inv = 1/sqrt(var+eps).
@@ -5402,6 +5509,83 @@ pub const Backend = struct {
     }
 
     /// dst[p][c] += bias[off + c], broadcast over positions.
+    /// Per-ROW AdaLN: `x[r][j] = x[r][j] * (1 + mod[r][D+j]) + mod[r][j]`, with
+    /// `mod` `[rows][3 * D]` as shift, scale, gate.
+    pub fn opModulatePerRow(self: *Backend, x: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * dim;
+        try self.dualElems("modulate_pr", x, null, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// `x[r][j] += mod[r][2D+j] * delta[r][j]`, the gated half of the above.
+    pub fn opGatedAddPerRow(self: *Backend, x: DeviceBuffer, delta: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * dim;
+        try self.dualElems("gated_add_pr", x, delta, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Depthwise 3x3, stride 1, pad 1, over a channel-last `[h][w][ch]`
+    /// activation. `weight` is `[ch][3][3]` in torch order and `bias` `[ch]`.
+    pub fn opDepthwise3(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, weight: DeviceBuffer, bias: DeviceBuffer, h: usize, w: usize, ch: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = h * w * ch;
+        try self.dualElems("dw_conv3", dst, src, weight, bias, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Column means of a `[rows][dim]` activation, one thread per column.
+    pub fn opColMean(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, rows: usize, dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        try self.dualElems("col_mean", dst, src, null, null, .{ @intCast(dim), @intCast(rows), 0, 0, 0, 0, 0 }, .{ 0, 0 }, dim);
+    }
+
+    /// `x[i] *= sigmoid(gate[i % dim])`: a per-column gate broadcast over rows.
+    pub fn opMulColsSigmoid(self: *Backend, x: DeviceBuffer, gate: DeviceBuffer, rows: usize, dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * dim;
+        try self.dualElems("mul_cols_sigmoid", x, gate, null, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Mage-VAE's per-pixel MLP input: zero pixel, the patch's own channels for
+    /// that pixel, then the fixed cosine position table.
+    pub fn opNerfFeat(self: *Backend, dst: DeviceBuffer, y: DeviceBuffer, dct: DeviceBuffer, tiles: usize, patch_area: usize, hidden_x: usize, dct_dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const wide = 3 + hidden_x + dct_dim;
+        const total = tiles * patch_area * wide;
+        try self.dualElems("nerf_feat", dst, y, dct, null, .{ @intCast(total), @intCast(wide), @intCast(patch_area), @intCast(hidden_x), @intCast(dct_dim), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Scatter per-patch pixels back into a `[h][w][3]` image.
+    pub fn opPatchScatter(self: *Backend, rgb: DeviceBuffer, pix: DeviceBuffer, tiles: usize, lat_w: usize, side: usize, first_tile: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = tiles * side * side * 3;
+        try self.dualElems("patch_scatter", rgb, pix, null, null, .{ @intCast(total), @intCast(lat_w), @intCast(side), @intCast(first_tile), 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Gather a `[h][w][ch]` activation into `side x side` windows laid out as
+    /// `[win_area][n_win][ch]`, the window acting as an attention head.
+    /// Out-of-range samples REPLICATE the edge.
+    pub fn opWinGather(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, h: usize, w: usize, ch: usize, npw: usize, side: usize, n_win: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = side * side * n_win * ch;
+        try self.dualElems("win_gather", dst, src, null, null, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), @intCast(npw), @intCast(side), @intCast(n_win) }, .{ 0, 0 }, total);
+    }
+
+    /// The inverse, dropping the replicated pad.
+    pub fn opWinScatter(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, h: usize, w: usize, ch: usize, npw: usize, side: usize, n_win: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = side * side * n_win * ch;
+        try self.dualElems("win_scatter", dst, src, null, null, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), @intCast(npw), @intCast(side), @intCast(n_win) }, .{ 0, 0 }, total);
+    }
+
     pub fn opAddBiasRows(self: *Backend, dst: DeviceBuffer, bias: DeviceBuffer, n: usize, ch: usize, off: usize, h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -6135,9 +6319,17 @@ pub const Backend = struct {
     /// `gatedAdd` with a per-ROW modulation row; see `rmsModRows`. `idx` is one u32
     /// per row, i.e. `total / dim` entries.
     pub fn gatedAddRows(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
+        return self.gatedAddRowsAt(a, 0, b, 0, mod, total, dim, gate_off, idx, 0, idx_stride);
+    }
+
+    /// `gatedAddRows` over a row RANGE; see `rmsModRowsAt` for why the offsets are
+    /// kernel arguments. `a_row`/`b_row` are ROW offsets, converted here.
+    pub fn gatedAddRowsAt(self: *Backend, a: DeviceBuffer, a_row: usize, b: DeviceBuffer, b_row: usize, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize, idx: ?DeviceBuffer, idx_row: usize, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("gated_add", a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), @intCast(idx_stride), 0, 0, 0 }, .{ 0, 0 }, total);
+        // Same pairing as `rmsModRows`: no index buffer means no index stride.
+        const stride: u32 = if (idx == null) 0 else @intCast(idx_stride);
+        try self.dualElems("gated_add", a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), stride, @intCast(a_row * dim), @intCast(b_row * dim), @intCast(idx_row) }, .{ 0, 0 }, total);
     }
 };
 

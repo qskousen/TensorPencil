@@ -145,6 +145,97 @@ pub const flux: Config = .{
     .act_f16 = true,
 };
 
+/// Flux 2's `AutoencoderKL`: the `flux` graph at twice the latent width, plus the
+/// 2x2 fold below. Every other tensor is shaped identically to the 16-channel file
+/// (244 of them match exactly), so `decoder.conv_in` is the only thing the loader
+/// sees differently.
+///
+/// `scaling_factor` 1 and `shift_factor` 0 are deliberate, not placeholders: this
+/// latent's format is `PackedLatent`'s BatchNorm, and `latent_formats.Flux2.process_out`
+/// is the identity. Mage-Flow decodes through this file as well as through its own
+/// distilled codec, because Mage-VAE was trained against exactly this latent space.
+///
+/// `act_f16` stays off because nobody has measured this decoder's residual peak;
+/// the 16-channel file's ~489 says nothing about a separately trained one, and
+/// f16 here is a range bet, not a precision one.
+pub const flux2: Config = .{
+    .z_channels = 32,
+    .base_channels = 128,
+    .block_out_channels = &.{ 128, 256, 512, 512 },
+    .layers_per_block = 3,
+    .norm_groups = 32,
+    .norm_eps = 1e-6,
+    .scaling_factor = 1.0,
+};
+
+/// What identifies a folded-latent VAE in a store. `decoder.conv_in.weight` cannot:
+/// every `AutoencoderKL` has one, and only its width separates this from the
+/// 16-channel file.
+pub const packed_latent_probe = "bn.running_mean";
+
+/// A 32-channel 8x latent PRESENTED as a 128-channel 16x one, by folding each 2x2
+/// pixel block into the channel axis, with a BatchNorm over the folded channels
+/// standing in for a scale/shift latent format. A DiT trained against it (Mage-Flow)
+/// sees 128 channels at 16x; the decoder underneath is the ordinary `AutoencoderKL`
+/// at 32 channels and 8x.
+///
+/// Present exactly when the file carries `bn.running_mean`, which is how ComfyUI
+/// decides it too: the fold is a property of the FILE, not of the config.
+pub const PackedLatent = struct {
+    /// `bn.running_mean` / `bn.running_var`, `fold * fold * z_channels` long.
+    mean: []const f32,
+    variance: []const f32,
+
+    /// `AutoencodingEngineLegacy.bn_eps`, which is NOT torch's 1e-5 default.
+    /// Using the default shifts every decoded value by a hair, which no norm shows.
+    pub const eps: f32 = 1e-4;
+    /// Pixels per side folded into the channel axis.
+    pub const fold: usize = 2;
+
+    /// Planar packed `[fold*fold*z][lat_h*lat_w]` -> planar `[z][fold*lat_h * fold*lat_w]`,
+    /// undoing the BatchNorm on the way. Planar both ends because that is the layout
+    /// the sampler hands over and the one `Session.decodePlanar` consumes.
+    ///
+    /// Packed channel `k` carries `z` channel `k / (fold*fold)` at the sub-pixel
+    /// `((k / fold) % fold, k % fold)` within the cell: einops
+    /// `(c pi pj) i j -> c (i pi) (j pj)`. Any other reading of `k` decodes an
+    /// image with the right colours, the right magnitudes and a scrambled 2x2
+    /// texture, so pin this direction rather than eyeballing it.
+    pub fn unpack(
+        self: PackedLatent,
+        gpa: std.mem.Allocator,
+        z: []const f32,
+        lat_h: usize,
+        lat_w: usize,
+        z_ch: usize,
+    ) ![]f32 {
+        const packed_ch = fold * fold * z_ch;
+        const cells = lat_h * lat_w;
+        std.debug.assert(z.len == cells * packed_ch);
+        std.debug.assert(self.mean.len == packed_ch and self.variance.len == packed_ch);
+        const oh = lat_h * fold;
+        const ow = lat_w * fold;
+        const out = try gpa.alloc(f32, z_ch * oh * ow);
+        errdefer gpa.free(out);
+        for (0..packed_ch) |k| {
+            const c = k / (fold * fold);
+            const pi = (k / fold) % fold;
+            const pj = k % fold;
+            const scale = @sqrt(self.variance[k] + eps);
+            const mean = self.mean[k];
+            const src = z[k * cells ..][0..cells];
+            const dst = out[c * oh * ow ..][0 .. oh * ow];
+            for (0..lat_h) |i| {
+                const row = (i * fold + pi) * ow + pj;
+                for (0..lat_w) |j| {
+                    dst[row + j * fold] = src[i * lat_w + j] * scale + mean;
+                }
+            }
+        }
+        return out;
+    }
+};
+
 pub const latent_channels = 4;
 pub const spatial_scale = 8;
 
@@ -289,6 +380,9 @@ pub const Decoder = struct {
     /// BFL dropped both `quant_conv` and `post_quant_conv`, so requiring it would
     /// fail the load of every Flux/Z-Image VAE in existence.
     post_quant: ?Conv2d,
+    /// Set for a Flux2-anchored file, whose latent arrives folded 2x2 into the
+    /// channel axis. Null everywhere else. See `PackedLatent`.
+    packed_latent: ?PackedLatent,
     conv_in: Conv2d,
     mid1: Resnet,
     mid_attn: AttnBlock,
@@ -297,6 +391,20 @@ pub const Decoder = struct {
     levels: []Level,
     norm_out: GroupNormW,
     conv_out: Conv2d,
+
+    /// Latent cells per side the CALLER supplies for each cell `decode` consumes:
+    /// 2 for a folded latent, 1 otherwise. A caller sizing buffers or reporting a
+    /// resolution multiplies by this and by `spatial_scale`.
+    pub fn latentFold(self: *const Decoder) usize {
+        return if (self.packed_latent != null) PackedLatent.fold else 1;
+    }
+
+    /// Channels the CALLER's latent carries per cell, which is `cfg.z_channels`
+    /// times the fold's area.
+    pub fn inputChannels(self: *const Decoder) usize {
+        const f = self.latentFold();
+        return self.cfg.z_channels * f * f;
+    }
 
     /// Which naming scheme this store uses, from a tensor only one of them has.
     ///
@@ -328,6 +436,13 @@ pub const Decoder = struct {
             try l.conv("post_quant_conv", .{}, cfg.z_channels, cfg.z_channels, 1, 1, 0)
         else
             null;
+        const packed_latent: ?PackedLatent = if (l.has(packed_latent_probe)) blk: {
+            const n = PackedLatent.fold * PackedLatent.fold * cfg.z_channels;
+            break :blk .{
+                .mean = try l.vec("bn.running_mean", .{}, "", n),
+                .variance = try l.vec("bn.running_var", .{}, "", n),
+            };
+        } else null;
         const conv_in = try l.conv("decoder.conv_in", .{}, inner, cfg.z_channels, 3, 1, 1);
         const mid1 = if (ldm)
             try l.resnet("decoder.mid.block_1", .{}, inner, inner)
@@ -383,6 +498,7 @@ pub const Decoder = struct {
             .cfg = cfg,
             .naming = naming,
             .post_quant = post_quant,
+            .packed_latent = packed_latent,
             .conv_in = conv_in,
             .mid1 = mid1,
             .mid_attn = mid_attn,
@@ -1057,4 +1173,122 @@ test "VAE naming is detected from the store, and the same VAE ships both ways" {
         seen += 1;
     }
     if (seen == 0) return error.SkipZigTest;
+}
+
+const fold_fixture = @embedFile("assets/mage_anchor_fold_ref.safetensors");
+
+test "the Flux2 latent fold matches ComfyUI's AutoencodingEngineLegacy.decode" {
+    // From tools/gen_mage_anchor_fold_fixtures.py, which drives the REAL
+    // `decode` with the nets stubbed out, so the einops pattern and the 1e-4 eps
+    // come from the reference rather than from a transcription here. The
+    // generator also proves the cases have teeth: an axis-swapped fold, a
+    // channel-fastest fold, a dropped BatchNorm and torch's default eps each
+    // have to move the answer or it refuses to write the fixture.
+    const gpa = testing.allocator;
+
+    var st = try safetensors.SafeTensors.initFromSlice(gpa, fold_fixture);
+    defer st.deinit();
+
+    const mean_v = try st.require("bn_mean");
+    const mean = try mean_v.toF32Alloc(gpa);
+    defer gpa.free(mean);
+    const var_v = try st.require("bn_var");
+    const variance = try var_v.toF32Alloc(gpa);
+    defer gpa.free(variance);
+    const pl: PackedLatent = .{ .mean = mean, .variance = variance };
+
+    const z_ch = flux2.z_channels;
+    try testing.expectEqual(z_ch * PackedLatent.fold * PackedLatent.fold, mean.len);
+
+    // Odd extents are the case that separates a transposed fold from the right
+    // one; even extents alone let a symmetric mistake through.
+    const cases = [_]struct { name: []const u8, h: usize, w: usize }{
+        .{ .name = "even", .h = 4, .w = 6 },
+        .{ .name = "odd", .h = 3, .w = 5 },
+    };
+    var buf: [32]u8 = undefined;
+    for (cases) |c| {
+        const zv = try st.require(try std.fmt.bufPrint(&buf, "{s}.z", .{c.name}));
+        const z = try zv.toF32Alloc(gpa);
+        defer gpa.free(z);
+        const wv = try st.require(try std.fmt.bufPrint(&buf, "{s}.out", .{c.name}));
+        const want = try wv.toF32Alloc(gpa);
+        defer gpa.free(want);
+
+        const got = try pl.unpack(gpa, z, c.h, c.w, z_ch);
+        defer gpa.free(got);
+        try testing.expectEqual(want.len, got.len);
+        try testing.expectEqual(z_ch * c.h * 2 * c.w * 2, got.len);
+        for (want, got, 0..) |e, a, i| {
+            errdefer std.debug.print("{s}[{d}]: want {d:.6} got {d:.6}\n", .{ c.name, i, e, a });
+            try testing.expectApproxEqAbs(e, a, 1e-5);
+        }
+    }
+}
+
+test "the Flux2 VAE config is the Flux one at twice the latent width" {
+    // The graph really is shared: 244 of the two files' tensors are shape-identical
+    // and only `decoder.conv_in` differs, so a divergence here would be a mistake
+    // rather than a fact about the checkpoints.
+    try testing.expectEqualSlices(usize, flux.block_out_channels, flux2.block_out_channels);
+    try testing.expectEqual(flux.layers_per_block, flux2.layers_per_block);
+    try testing.expectEqual(flux.norm_groups, flux2.norm_groups);
+    try testing.expectEqual(flux.norm_eps, flux2.norm_eps);
+    try testing.expectEqual(flux.z_channels * 2, flux2.z_channels);
+
+    // This latent's format is the fold's BatchNorm, so the scalar pair must be
+    // inert: a stray scale here would denormalize a latent that is already right.
+    try testing.expectEqual(@as(f32, 1.0), flux2.scaling_factor);
+    try testing.expectEqual(@as(f32, 0), flux2.shift_factor);
+
+    // And the folded latent a DiT sees is Mage-Flow's 128 channels at 16x.
+    try testing.expectEqual(@as(usize, 128), flux2.z_channels * PackedLatent.fold * PackedLatent.fold);
+    try testing.expectEqual(@as(usize, 16), spatial_scale * PackedLatent.fold);
+}
+
+const flux2_vae_ckpt = "/home/qt/genai/comfyui/models/vae/flux2-vae.safetensors";
+
+test "the real Flux2 VAE loads as a folded-latent AutoencoderKL" {
+    // What the fixture cannot say: that a shipped file actually has these shapes
+    // and that the fold is discovered rather than configured. Mage-Flow renders
+    // through this file, so a regression here is a family losing a decoder.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try test_gate.requireIntegration();
+    try test_gate.requireModelFile(io, flux2_vae_ckpt);
+
+    var st = try safetensors.SafeTensors.open(gpa, io, flux2_vae_ckpt);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+
+    var dec = try Decoder.load(gpa, store, flux2, "");
+    defer dec.deinit();
+
+    try testing.expectEqual(Naming.diffusers, dec.naming);
+    try testing.expectEqual(@as(usize, 4), dec.levels.len);
+    // Unlike the 16-channel Flux file, this one kept its quant convolutions.
+    try testing.expect(dec.post_quant != null);
+
+    const pl = dec.packed_latent orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 128), pl.mean.len);
+    try testing.expectEqual(@as(usize, 128), pl.variance.len);
+    // A BatchNorm's variance is positive by construction; a zero here would mean
+    // the file carried a reset placeholder and every decode would be unscaled.
+    for (pl.variance) |v| try testing.expect(v > 0);
+
+    // The folded view is what Mage-Flow's DiT emits: 128 channels at 16x.
+    try testing.expectEqual(@as(usize, 2), dec.latentFold());
+    try testing.expectEqual(@as(usize, 128), dec.inputChannels());
+
+    // And the 16-channel config must NOT be mistaken for this one: the Flux file
+    // has no fold at all, so the two cannot be swapped by a defaulted path.
+    if (test_gate.requireModelFile(io, zimage_vae_ckpt)) |_| {
+        var st16 = try safetensors.SafeTensors.open(gpa, io, zimage_vae_ckpt);
+        defer st16.deinit();
+        var d16 = try Decoder.load(gpa, .{ .safetensors = &st16 }, flux, "");
+        defer d16.deinit();
+        try testing.expect(d16.packed_latent == null);
+        try testing.expectEqual(@as(usize, 1), d16.latentFold());
+        try testing.expectEqual(@as(usize, 16), d16.inputChannels());
+    } else |_| {}
 }

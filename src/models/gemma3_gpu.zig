@@ -124,7 +124,6 @@ pub const VulkanLM = struct {
         const alloc = arena.allocator();
 
         var self: VulkanLM = init_defaults.of(VulkanLM);
-        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.ctx = ctx;
         self.lm = lm;
         self.cfg = cfg;

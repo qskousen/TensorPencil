@@ -181,6 +181,19 @@ fn cannedTiles(gpa: std.mem.Allocator) !void {
     tiles[2] = .{ .rendering = .{ .step = 0, .steps = 34, .label = "step 0 / 34 · lydia" } };
 }
 
+/// The same run after the conversation was reopened and two of the files have
+/// gone: nothing is running, the gone ones are ghost slots that say so, and the
+/// two that are left can be handed to a model that sees images. Nothing on this
+/// screen may read as a failure or offer to render anything.
+var g_reopened = false;
+
+fn cannedReopened(gpa: std.mem.Allocator) !void {
+    tiles[0] = .{ .rgba = .{ .px = try cannedPixels(gpa, 304, 208), .w = 304, .h = 208 } };
+    tiles[1] = .{ .rgba = .{ .px = try cannedPixels(gpa, 304, 208), .w = 304, .h = 208 } };
+    tiles[2] = .missing;
+    tiles[3] = .missing;
+}
+
 /// Real pixels under half the library tiles.
 fn cannedLibrary(gpa: std.mem.Allocator) !void {
     const w: u32 = 96;
@@ -342,18 +355,24 @@ fn chatColumn(h: f32) void {
             .selected = g_selected_tile,
             .prompt = "a lighthouse in heavy fog at dawn, desaturated, backlit beam, melancholy",
             .expanded = g_expanded,
-            .busy = true,
+            .busy = !g_reopened,
             .status = "rendering 2 of 4",
+            .gone = if (g_reopened) 2 else 0,
+            .can_send = g_reopened,
         }, .{
             .ctx = @ptrCast(&g_ctx),
             .on_toggle = onToggle,
             .on_select = onSelectTile,
             .on_open_studio = noopCtx,
+            .on_send_to_chat = noopCtx,
             .on_cancel = noopCtxId,
         });
         gap(@src(), 2, 18);
 
-        bubbles.agentProse(@src(), "They are rendering now — you will see them fill in here as each one lands.");
+        bubbles.agentProse(@src(), if (g_reopened)
+            "Two of those are still here. The other two were only ever on disk, and that copy is gone."
+        else
+            "They are rendering now — you will see them fill in here as each one lands.");
     }
 
     composer(composer_h);
@@ -1149,6 +1168,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--library")) {
             g_rail_tab = .library;
             try cannedLibrary(std.heap.smp_allocator);
+        } else if (std.mem.eql(u8, arg, "--reopened")) {
+            g_reopened = true;
         } else if (std.mem.eql(u8, arg, "--hosts")) {
             hosts_mode = true;
             cannedHosts(std.heap.smp_allocator);
@@ -1167,7 +1188,9 @@ pub fn main(init: std.process.Init) !void {
     // The flag may arrive after `--settings`, so the swap happens once the whole
     // command line has been read.
     if (settings_mode and lora_mode) cannedLoraSelection(&probe_cfg);
-    if (!settings_mode and !states_mode and !studio_mode and !hosts_mode) try cannedTiles(std.heap.smp_allocator);
+    if (!settings_mode and !states_mode and !studio_mode and !hosts_mode) {
+        if (g_reopened) try cannedReopened(std.heap.smp_allocator) else try cannedTiles(std.heap.smp_allocator);
+    }
     // The studio needs a checkpoint selected for its architecture-dependent
     // rows; `--lora` puts it on SenseNova, which is the only family here with a
     // LoRA section to draw (see Family.supportsLora).
@@ -1226,8 +1249,10 @@ pub fn main(init: std.process.Init) !void {
     // One notice, posted from OUTSIDE any frame, which is where the app learns
     // of a failed render (pumping the hosts happens between frames). Handing
     // that straight to dvui panics; `toast.pump` inside the frame is why this
-    // reaches the screen at all.
-    toast.post(.warn, "Image failed on lydia: the checkpoint is missing a component (VAE or text encoder). Trying local instead.", .{});
+    // reaches the screen at all. Reopening a conversation raises none: pictures
+    // whose files are gone are drawn, never announced.
+    if (!g_reopened)
+        toast.post(.warn, "Image failed on lydia: the checkpoint is missing a component (VAE or text encoder). Trying local instead.", .{});
 
     // Text layouts report their min size a frame late, so an early capture
     // catches the screen mid-settle.

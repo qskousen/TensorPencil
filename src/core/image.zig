@@ -315,6 +315,132 @@ test "rgbToRgba interleaves an opaque alpha" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 255, 4, 5, 6, 255 }, rgba);
 }
 
+/// `torch.nn.functional.interpolate(mode="bicubic")` at its defaults, which is
+/// what ComfyUI's `common_upscale(..., "bicubic", "disabled")` performs.
+///
+/// `src` is planar `[3][sh][sw]`, `dst` planar `[3][dh][dw]`. Three things here
+/// are the reference's and not a choice:
+///
+/// - the cubic coefficient is -0.75, not Catmull-Rom's -0.5;
+/// - `align_corners = false` puts the sample at `(i + 0.5) * scale - 0.5`, and
+///   torch does NOT clamp that to zero for cubic the way it does for bilinear.
+///   A negative source coordinate is real here; its weights handle the edge.
+/// - taps are gathered with the source index CLAMPED to the image, so the border
+///   replicates.
+///
+/// Pinned by tools/gen_bicubic_fixtures.py.
+pub fn resizeBicubic(dst: []f32, src: []const f32, sh: usize, sw: usize, dh: usize, dw: usize) void {
+    std.debug.assert(src.len == 3 * sh * sw and dst.len == 3 * dh * dw);
+    const ys: f64 = @as(f64, @floatFromInt(sh)) / @as(f64, @floatFromInt(dh));
+    const xs: f64 = @as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(dw));
+
+    for (0..dh) |i| {
+        const fy = (@as(f64, @floatFromInt(i)) + 0.5) * ys - 0.5;
+        const iy = @floor(fy);
+        var wy: [4]f64 = undefined;
+        cubicWeights(&wy, fy - iy);
+        for (0..dw) |j| {
+            const fx = (@as(f64, @floatFromInt(j)) + 0.5) * xs - 0.5;
+            const ix = @floor(fx);
+            var wx: [4]f64 = undefined;
+            cubicWeights(&wx, fx - ix);
+            for (0..3) |c| {
+                const plane = src[c * sh * sw ..][0 .. sh * sw];
+                var acc: f64 = 0;
+                for (0..4) |ky| {
+                    const sy = clampIndex(iy + @as(f64, @floatFromInt(ky)) - 1.0, sh);
+                    var row: f64 = 0;
+                    for (0..4) |kx| {
+                        const sx = clampIndex(ix + @as(f64, @floatFromInt(kx)) - 1.0, sw);
+                        row += wx[kx] * plane[sy * sw + sx];
+                    }
+                    acc += wy[ky] * row;
+                }
+                dst[c * dh * dw + i * dw + j] = @floatCast(acc);
+            }
+        }
+    }
+}
+
+/// torch's `get_cubic_upsample_coefficients` at A = -0.75, for the four taps
+/// around a sample whose fractional part is `t`.
+fn cubicWeights(out: *[4]f64, t: f64) void {
+    const a: f64 = -0.75;
+    // |x| in (1, 2): ((A x - 5A) x + 8A) x - 4A.
+    const conv2 = struct {
+        fn f(x: f64, aa: f64) f64 {
+            return ((aa * x - 5.0 * aa) * x + 8.0 * aa) * x - 4.0 * aa;
+        }
+    }.f;
+    // |x| <= 1: ((A + 2) x - (A + 3)) x^2 + 1.
+    const conv1 = struct {
+        fn f(x: f64, aa: f64) f64 {
+            return ((aa + 2.0) * x - (aa + 3.0)) * x * x + 1.0;
+        }
+    }.f;
+    out[0] = conv2(t + 1.0, a);
+    out[1] = conv1(t, a);
+    out[2] = conv1(1.0 - t, a);
+    out[3] = conv2(2.0 - t, a);
+}
+
+fn clampIndex(v: f64, n: usize) usize {
+    if (v <= 0) return 0;
+    const iv: usize = @intFromFloat(v);
+    return @min(iv, n - 1);
+}
+
+test "resizeBicubic matches torch's interpolate" {
+    const gpa = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        sh: usize,
+        sw: usize,
+        dh: usize,
+        dw: usize,
+        src: []const f32,
+        dst: []const f32,
+    };
+    var parsed = try std.json.parseFromSlice(
+        struct { cases: []const Case },
+        gpa,
+        bicubic_fixtures_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    for (parsed.value.cases) |c| {
+        const got = try gpa.alloc(f32, c.dst.len);
+        defer gpa.free(got);
+        resizeBicubic(got, c.src, c.sh, c.sw, c.dh, c.dw);
+        var maxd: f64 = 0;
+        for (c.dst, got) |w, g| maxd = @max(maxd, @abs(@as(f64, w) - g));
+        errdefer std.debug.print("bicubic {s}: max abs {d}\n", .{ c.name, maxd });
+        try std.testing.expect(maxd < 2e-6);
+    }
+}
+
+const bicubic_fixtures_json = @embedFile("assets/bicubic_fixtures.json");
+
+/// `planarF32ToRgb8` for a decoder that already works channel-last, i.e. whose
+/// output is `[h][w][3]` f32 in [-1, 1] (`mage_vae`). Same mapping, no transpose.
+pub fn interleavedF32ToRgb8(gpa: std.mem.Allocator, rgb: []const f32, width: usize, height: usize) ![]u8 {
+    std.debug.assert(rgb.len == 3 * width * height);
+    const px = try gpa.alloc(u8, rgb.len);
+    for (px, rgb) |*p, v| {
+        const s = std.math.clamp(v * 0.5 + 0.5, 0.0, 1.0);
+        p.* = @intFromFloat(@round(s * 255.0));
+    }
+    return px;
+}
+
+test "interleavedF32ToRgb8 maps [-1, 1] onto the byte range" {
+    const gpa = std.testing.allocator;
+    const px = try interleavedF32ToRgb8(gpa, &.{ -1, 0, 1, -2, 0.5, 2 }, 2, 1);
+    defer gpa.free(px);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 0, 191, 255 }, px);
+}
+
 /// Convert decoder output in [-1, 1] (planar [3][h][w], torch layout) to
 /// interleaved [h][w][3] u8, matching ComfyUI's (x/2 + 0.5).clamp(0,1) * 255.
 pub fn planarF32ToRgb8(gpa: std.mem.Allocator, planar: []const f32, width: usize, height: usize) ![]u8 {

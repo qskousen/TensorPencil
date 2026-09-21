@@ -216,7 +216,7 @@ pub const Variant = struct {
     /// fine-tune can emit markers its base family does not.
     ///
     /// NOTE the markers we record are themselves only as good as
-    /// `chat.reasoningFor`, which guesses per family; see TODO.md.
+    /// `chat.reasoningFor`, which guesses per family.
     reason_open: []u8 = "",
     reason_close: []u8 = "",
     gen_model: []u8 = "",

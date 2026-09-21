@@ -259,6 +259,14 @@ fn pumpHost() void {
             if (e.text.len > 0) toast.post(.err, "{s}: {s}", .{ slot.name, e.text });
             g_gpa.free(e.text);
         }
+        if (slot.mirror.takeNotice()) |n| {
+            if (n.text.len > 0) toast.post(switch (n.tone) {
+                .info => .info,
+                .warn => .warn,
+                .err => .err,
+            }, "{s}", .{n.text});
+            g_gpa.free(n.text);
+        }
     }
     reportFailures();
     // The host has the message, or the load that will take it: drop the
@@ -1413,6 +1421,7 @@ fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usiz
     var step_bufs: [12][32]u8 = undefined;
     const n = @min(slots, tiles_buf.len);
     var n_done: usize = 0;
+    var gone: usize = 0;
     var busy = false;
     var first: ?*mirror.Image = null;
     for (tiles_buf[0..n], 0..) |*tile, i| {
@@ -1428,6 +1437,13 @@ fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usiz
             continue;
         };
         if (first == null) first = im;
+        // A picture that was made and whose file went away, which is what a
+        // reopened conversation is full of. Not a failure: see mirror.Image.
+        if (im.missing) {
+            tile.* = .missing;
+            gone += 1;
+            continue;
+        }
         switch (im.status()) {
             .done => {
                 n_done += 1;
@@ -1480,14 +1496,44 @@ fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usiz
         .expanded = g_card_open == key,
         .busy = busy,
         .status = status,
+        .gone = gone,
+        .can_open = cardPick(key) != null,
+        .can_send = canSendToChat(cardPick(key)),
         .id_extra = id,
     }, .{
         .ctx = @ptrFromInt(key),
         .on_toggle = cardToggle,
         .on_select = cardSelect,
         .on_open_studio = cardOpenStudio,
+        .on_send_to_chat = cardSendToChat,
         .on_cancel = cardCancel,
     });
+}
+
+/// The tile a card's actions act on: the user's pick, else the first one still
+/// backed by a picture. Null when none is: a render that has not landed yet,
+/// or a run whose files are all gone, neither of which the studio or the chat
+/// can be handed.
+fn cardPick(key: usize) ?*mirror.Image {
+    if (g_card_imgs.len == 0) return null;
+    if (g_card_sel_key == key and g_card_sel_tile < g_card_imgs.len) {
+        const sel = imageById(g_card_imgs[g_card_sel_tile]) orelse return null;
+        return if (sel.missing) null else sel;
+    }
+    for (g_card_imgs) |id| {
+        const im = imageById(id) orelse continue;
+        if (!im.missing) return im;
+    }
+    return null;
+}
+
+/// Whether "Send to chat" can be offered for this picture: the model has to be
+/// able to see images, and the pixels have to be here or readable again. Same
+/// gate a drop or a paste passes, so the three ways in agree.
+fn canSendToChat(im: ?*const mirror.Image) bool {
+    if (g_m.state.loading or !g_m.state.vision) return false;
+    const p = im orelse return false;
+    return p.pixels != null or p.restorable();
 }
 
 /// The × on a tile that is rendering.
@@ -1538,11 +1584,16 @@ fn cardSelect(ctx: *anyopaque, i: usize) void {
 
 /// Carry this render's parameters into the studio form and switch to it.
 fn cardOpenStudio(ctx: *anyopaque) void {
-    const key = @intFromPtr(ctx);
-    if (g_card_imgs.len == 0) return;
-    const idx = if (g_card_sel_key == key and g_card_sel_tile < g_card_imgs.len) g_card_sel_tile else 0;
-    image_view.loadFrom(imageById(g_card_imgs[idx]) orelse return);
+    image_view.loadFrom(cardPick(@intFromPtr(ctx)) orelse return);
     enterImageMode();
+}
+
+/// Attach this render to the next message, exactly as dropping or pasting the
+/// file would. The pixels travel, so it works for a picture another host made
+/// and for one reopened from disk.
+fn cardSendToChat(ctx: *anyopaque) void {
+    const im = cardPick(@intFromPtr(ctx)) orelse return;
+    if (canSendToChat(im)) attachFromMirror(im);
 }
 
 // ------------------------------------------------------------------- sidebar
@@ -1774,10 +1825,11 @@ fn applyPendingConversationLoad() void {
 /// Rebuild a turn's finished renders from disk so its card shows the images
 /// instead of the model's request being run again.
 ///
-/// A file that has since moved or been deleted becomes a FAILED image carrying
-/// `error.SavedImageMissing`, not a fresh generation: the user asked for that
-/// picture once, and silently spending VRAM to remake it is the behaviour this
-/// whole path exists to remove.
+/// A file that has since moved or been deleted becomes a MISSING image, not a
+/// fresh generation: the user asked for that picture once, and silently
+/// spending VRAM to remake it is the behaviour this whole path exists to
+/// remove. It is not offered as a retry either, since the request that made it
+/// was in the PNG's own metadata and went with it.
 ///
 /// These are the client's own images (the host never sees them): they live in
 /// the mirror beside the host's, so they show up in Library and the viewer,
@@ -1804,6 +1856,7 @@ fn restoreImages(a: std.mem.Allocator, recs: []const history.ImageRec) []const w
             .height = @intCast(rec.height),
         };
         var pixels: ?[]u8 = null;
+        var gone = false;
         if (vips.loadRgb(g_gpa, rec.path)) |dec| {
             defer g_gpa.free(dec.pixels);
             if (tp.image.rgbToRgba(g_gpa, dec.pixels, dec.width, dec.height)) |rgba| {
@@ -1816,13 +1869,11 @@ fn restoreImages(a: std.mem.Allocator, recs: []const history.ImageRec) []const w
                 info.status = .failed;
                 info.failure = "OutOfMemory";
             }
-        } else |_| {
-            // Moved or deleted since: a FAILED image, not a fresh generation.
-            info.status = .failed;
-            info.failure = "SavedImageMissing";
-        }
+        } else |_| gone = true;
         const id = g_hosts.addLocal(info, pixels, g_gpa.dupe(u8, rec.path) catch null);
-        if (id != 0) ids.append(a, id) catch return ids.items;
+        if (id == 0) continue;
+        if (gone) g_hosts.markLost(id, "SavedImageMissing");
+        ids.append(a, id) catch return ids.items;
     }
     return ids.items;
 }
@@ -2962,6 +3013,14 @@ fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
             }
         },
         .failed => {
+            // The picture was made; its file is not there any more. Nothing
+            // failed and nothing can be asked for again, so it says so and
+            // offers nothing.
+            if (im.missing) {
+                fonts.richLabel(@src(), "this image is no longer on disk", .{});
+                genInfo(im);
+                return;
+            }
             // Name the cause. "failed" alone is unactionable, and the most
             // common cause here, VRAM, is one the user can actually fix
             // (unload the LLM, drop the resolution) and then retry into.

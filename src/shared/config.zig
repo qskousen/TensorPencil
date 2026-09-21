@@ -105,16 +105,6 @@ pub const TaesdSize = enum(u8) {
     }
 };
 
-/// Sampler for image generation. Mirrors `sampler.Kind`; kept here (like `Backend`)
-/// so the config data model stays free of an engine dependency, with `diffuser.zig`
-/// mapping it across.
-///
-/// The two SDE variants are DPM-Solver++(2M) SDE, differing only in how the
-/// multistep correction is applied, ComfyUI ships both under these names and they
-/// give visibly different images. Both draw their noise from a seed-determined
-/// Brownian tree, so a seed reproduces ComfyUI's render rather than merely being
-/// repeatable here. `eta`/`s_noise` are left at ComfyUI's defaults (1.0); the CLI's
-/// `--sde-eta` / `--sde-s-noise` can override them.
 /// Which prompt dialect the prompt boxes are written in. Load-neutral: it changes how
 /// the next image's prompt is parsed, not what is loaded.
 ///
@@ -190,16 +180,44 @@ pub const Compat = enum(u8) {
     }
 };
 
+/// Sampler for image generation. Mirrors `sampler.Kind`; kept here (like `Backend`)
+/// so the config data model stays free of an engine dependency, with `pipeline_map.zig`
+/// mapping it across.
+///
+/// Each is ComfyUI's sampler of that name, reproduced rather than merely repeatable
+/// here, so the same seed gives the same image only through the same one. Two axes the
+/// label spells out because they cost the user something:
+///
+///  - the ancestral and SDE ones draw noise as they go, so `eta` / `s_noise` mean
+///    something (left at ComfyUI's 1.0; the CLI's `--eta` / `--s-noise` can override);
+///  - the ones marked 2 evals/step run the model TWICE per step, so the same step
+///    count is twice the render time.
 pub const Sampler = enum(u8) {
     euler,
+    euler_ancestral,
+    heun,
+    dpm_2,
+    dpm_2_ancestral,
+    dpmpp_2s_ancestral,
+    dpmpp_sde,
+    dpmpp_2m,
     dpmpp_2m_sde,
     dpmpp_2m_sde_heun,
+    dpmpp_3m_sde,
 
     pub fn label(self: Sampler) []const u8 {
         return switch (self) {
             .euler => "Euler (default)",
+            .euler_ancestral => "Euler ancestral",
+            .heun => "Heun (2 evals/step)",
+            .dpm_2 => "DPM2 (2 evals/step)",
+            .dpm_2_ancestral => "DPM2 ancestral (2 evals/step)",
+            .dpmpp_2s_ancestral => "DPM++ 2S ancestral (2 evals/step)",
+            .dpmpp_sde => "DPM++ SDE (2 evals/step)",
+            .dpmpp_2m => "DPM++ 2M",
             .dpmpp_2m_sde => "DPM++ 2M SDE",
             .dpmpp_2m_sde_heun => "DPM++ 2M SDE Heun",
+            .dpmpp_3m_sde => "DPM++ 3M SDE",
         };
     }
 
@@ -441,8 +459,8 @@ pub const NoiseCurve = struct {
 /// to be "front" and "front-hard" into one shape at two amounts.
 ///
 /// `late (corrupts)` is here on purpose: it is the counter-example that makes the
-/// measured result (BACKEND.md 6) legible — at a matched amount it corrupts tokens
-/// where the front-loaded shapes stay fluent.
+/// measured result legible: at a matched amount it corrupts tokens where the
+/// front-loaded shapes stay fluent.
 ///
 /// The same five strings are `noise_curve.documented_shapes` (which is where they
 /// are checked to parse, this file having no evaluator) and appear in tp-llm's
@@ -832,6 +850,11 @@ pub const Config = struct {
     diff_backend: Backend = .zig_cuda,
     /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
     vae_decode: VaeDecode = .auto,
+    /// Compute a model's AutoV2 hash for the saved PNG when it has no
+    /// `<path>.sha256` sidecar, writing one so it is paid once. Off omits the
+    /// `Model hash` / `VAE hash` / `Hashes` fields; a sidecar that already exists
+    /// is read either way.
+    hash_models: bool = true,
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
     /// Saved named system prompts the user can load into `system_prompt` and
     /// switch between (see the settings view). Pure data, like `presets`; the
@@ -1649,7 +1672,8 @@ pub const host_fields = [_][]const u8{
     "prompt_syntax",             "emphasis",                  "compat",
     "preview",                   "taesd_size",                "vram_split",
     "vram_limit_frac",           "llm_backend",               "diff_backend",
-    "vae_decode",                "system_prompt",             "reasoning",
+    "vae_decode",                "hash_models",               "system_prompt",
+    "reasoning",
     "reasoning_effort",          "image_tool_result",         "image_tool",
     "gemma4_canonical_template",
     "qwen35_fixed_template",     "weight_noise",              "weight_noise_curve",
@@ -1772,7 +1796,10 @@ test "apply parses the sampler and leaves it alone on junk" {
     try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
     // A stale/unknown name must not silently reset the sampler to Euler, that would
     // change what a saved config renders.
-    cfg.apply("sampler", "dpmpp_3m_sde");
+    // `dpm_adaptive` is a real ComfyUI sampler this engine does not have (it picks
+    // its own step count, so it does not fit a fixed schedule), which keeps this an
+    // honest stale-name case rather than a typo.
+    cfg.apply("sampler", "dpm_adaptive");
     try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
 }
 
@@ -2638,6 +2665,7 @@ test "HostSettings carries every host field and none of the client's" {
     cfg.llm_backend = .cpu;
     cfg.diff_backend = .vulkan;
     cfg.vae_decode = .cpu_tiled;
+    cfg.hash_models = false;
     cfg.system_prompt.set("be brief");
     cfg.reasoning = false;
     cfg.reasoning_effort = .low;

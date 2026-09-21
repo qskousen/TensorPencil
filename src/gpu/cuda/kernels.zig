@@ -326,8 +326,8 @@ const wnoise = @import("wnoise.zig");
 
 /// The one parameter list every MMQ entry declares, so `opMatmulQuantMmq*` can
 /// launch any of them with one param array. `p_nsig`/`p_nseq` are the weight-noise
-/// sigma and stream index; only the kernels listed in BACKEND.md read them, the
-/// rest declare them so the ABI stays one shape.
+/// sigma and stream index; only some kernels read them (see
+/// `Backend.dtypeHonorsWeightNoise`), the rest declare them so the ABI stays one shape.
 const mmq_params = "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale,\n    .param .f32 p_nsig,\n    .param .u32 p_nseq";
 const mmq_expert_params = "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u64 p_groups,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale,\n    .param .f32 p_nsig,\n    .param .u32 p_nseq";
 

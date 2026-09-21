@@ -198,8 +198,10 @@ pub inline fn gatedAdd(e: Env) void {
     const dim = e.u(1);
     const col = i % dim;
     var off = e.u(2);
-    if (e.u(3) != 0) off += e.ldW(.d, i / dim) * e.u(3);
-    e.st(.a, i, e.ld(.a, i) + e.ld(.c, off + col) * e.ld(.b, i));
+    if (e.u(3) != 0) off += e.ldW(.d, e.u(6) + i / dim) * e.u(3);
+    // u4/u5 are ELEMENT offsets into a and b, u6 a ROW offset into the index buffer,
+    // for the same reason `rmsMod` takes them. Zero for a whole-buffer caller.
+    e.st(.a, e.u(4) + i, e.ld(.a, e.u(4) + i) + e.ld(.c, off + col) * e.ld(.b, e.u(5) + i));
 }
 
 /// `gatedAdd` with an f16 delta. a = x (f32), b = delta words, c = vectors.
@@ -1245,6 +1247,66 @@ pub inline fn im2colStride(e: Env) void {
     e.st(.b, i, e.ld(.a, (((tok / ow) * kk + tap / kk) * w + (tok % ow) * kk + tap % kk) * ci + col % ci));
 }
 
+/// Patch matrix of a 3-D conv over a channel-last `[t][h][w][ci]` volume, columns
+/// ordered (kt, kh, kw, ci). Temporal padding is CAUSAL (front only, zero); spatial
+/// padding REFLECTS, and a width of 1 collapses to index 0 rather than reflecting.
+///
+/// a = src, b = patch, c = shape params as u32:
+/// 0 cols, 1 in_ch, 2 kt, 3 kh, 4 kw, 5 out_h, 6 out_w, 7 x_t, 8 x_h, 9 x_w,
+/// 10 stride_t, 11 stride_s, 12 front, 13 pad_h_lo, 14 pad_w_lo.
+/// u0 = rows*cols of this band, f0 = the band's first output row.
+///
+/// Those params are the same for every band of a volume, so `c` is uploaded once and
+/// only `f0` moves; a per-band params slot would need a buffer offset, which a Vulkan
+/// `DeviceBuffer` has no room for.
+pub inline fn im2col3d(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const cols = e.ldW(.c, 0);
+    const ci = e.ldW(.c, 1);
+    const x_h: i32 = @intCast(e.ldW(.c, 8));
+    const x_w: i32 = @intCast(e.ldW(.c, 9));
+
+    // Output row of the whole volume, unpacked to (ot, oh, ow).
+    const row = i / cols + @as(u32, @intFromFloat(e.f(0)));
+    const out_w = e.ldW(.c, 6);
+    const out_h = e.ldW(.c, 5);
+    const ow = row % out_w;
+    const oh = (row / out_w) % out_h;
+    const ot = (row / out_w) / out_h;
+
+    // Column, unpacked to (kt, kh, kw, ic).
+    const col = i % cols;
+    const ic = col % ci;
+    const kw = e.ldW(.c, 4);
+    const kh = e.ldW(.c, 3);
+    const w_i = (col / ci) % kw;
+    const h_i = ((col / ci) / kw) % kh;
+    const t_i = ((col / ci) / kw) / kh;
+
+    var v: f32 = 0;
+    const p_t = @as(i32, @intCast(ot * e.ldW(.c, 10) + t_i)) - @as(i32, @intCast(e.ldW(.c, 12)));
+    if (p_t >= 0 and p_t < @as(i32, @intCast(e.ldW(.c, 7)))) {
+        const stride_s = e.ldW(.c, 11);
+        const sh = reflect(@as(i32, @intCast(oh * stride_s + h_i)) - @as(i32, @intCast(e.ldW(.c, 13))), x_h);
+        const sw = reflect(@as(i32, @intCast(ow * stride_s + w_i)) - @as(i32, @intCast(e.ldW(.c, 14))), x_w);
+        v = e.ld(.a, @intCast(((p_t * x_h + sh) * x_w + sw) * @as(i32, @intCast(ci)) + @as(i32, @intCast(ic))));
+    }
+    e.st(.b, i, v);
+}
+
+/// `torch` reflect padding: fold about 0 and about `n - 1` until inside. Bounded
+/// rather than `while (true)`: a pad smaller than the extent converges in two folds
+/// and SPIR-V would rather not be handed an unbounded loop.
+inline fn reflect(v0: i32, n: i32) i32 {
+    if (n == 1) return 0;
+    var v = v0;
+    for (0..8) |_| {
+        if (v < 0) v = -v;
+        if (v >= n) v = 2 * (n - 1) - v else break;
+    }
+    return v;
+}
+
 // ---- MiniMax H3 audio (channel-last 1-D) ---------------------------------------
 
 /// Patch matrix of a 1-D conv over channel-last [len][ci], columns ordered
@@ -1512,4 +1574,171 @@ pub inline fn qknormRopeF32(e: Env) void {
         e.st(.a, base + w * 2, (x0 * cos_v - x1 * sin_v) * e.f(0));
         e.st(.a, base + w * 2 + 1, (x0 * sin_v + x1 * cos_v) * e.f(0));
     }
+}
+
+// ---- Mage-VAE ----------------------------------------------------------------
+
+/// Depthwise 3x3, stride 1, pad 1, over a channel-last `[h][w][ch]` activation:
+/// `a[y][x][c] = Σ b[y+ky-1][x+kx-1][c] * c_[c][ky][kx] + d[c]`, zero outside.
+///
+/// Not an im2col GEMM, because each output channel reads only its own input
+/// channel: the patch matrix a GEMM needs would be block-diagonal and almost all
+/// zero. The innermost index is the CHANNEL, so a warp covers consecutive memory.
+/// u0 = h*w*ch, u1 = h, u2 = w, u3 = ch.
+pub inline fn dwConv3(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const ch = e.u(3);
+    const w = e.u(2);
+    const h = e.u(1);
+    const c = i % ch;
+    const x = (i / ch) % w;
+    const y = i / (ch * w);
+    var acc = e.ld(.d, c);
+    var ky: u32 = 0;
+    while (ky < 3) : (ky += 1) {
+        if (y + ky < 1 or y + ky - 1 >= h) continue;
+        const sy = y + ky - 1;
+        var kx: u32 = 0;
+        while (kx < 3) : (kx += 1) {
+            if (x + kx < 1 or x + kx - 1 >= w) continue;
+            const sx = x + kx - 1;
+            acc += e.ld(.b, (sy * w + sx) * ch + c) * e.ld(.c, (c * 3 + ky) * 3 + kx);
+        }
+    }
+    e.st(.a, i, acc);
+}
+
+/// Column means of a `[rows][dim]` activation: `a[c] = mean over rows of b[r][c]`.
+/// One thread per COLUMN, striding the rows, which is the shape Mage-VAE's
+/// channel attention wants (`AdaptiveAvgPool2d(1)` over the spatial grid).
+/// u0 = dim, u1 = rows.
+pub inline fn colMean(e: Env) void {
+    const c = k.elem(e) orelse return;
+    const dim = e.u(0);
+    const rows = e.u(1);
+    var acc: f32 = 0;
+    var r: u32 = 0;
+    while (r < rows) : (r += 1) acc += e.ld(.b, r * dim + c);
+    e.st(.a, c, acc / @as(f32, @floatFromInt(rows)));
+}
+
+/// `a[i] *= sigmoid(b[i % u1])`: a per-column gate broadcast over rows, which is
+/// the second half of the channel attention. u0 = total, u1 = dim.
+pub inline fn mulColsSigmoid(e: Env) void {
+    const i = k.elem(e) orelse return;
+    e.st(.a, i, e.ld(.a, i) * k.sigmoid(e.ld(.b, i % e.u(1))));
+}
+
+/// Build the per-pixel MLP's input rows for Mage-VAE's decode:
+///
+///     a[(t * P + p) * W + f] = 0                        f < 3
+///                            = b[t * H * P + (f-3) * P + p]   3 <= f < 3 + H
+///                            = c[p * D + (f - 3 - H)]         otherwise
+///
+/// The first three are the image pixel, which decode's zero noise makes zero; the
+/// next `H` are that patch's own channels for this pixel; the rest are the fixed
+/// cosine position table. u0 = total, u1 = W (3+H+D), u2 = P, u3 = H, u4 = D.
+pub inline fn nerfFeat(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const wide = e.u(1);
+    const p_area = e.u(2);
+    const hx = e.u(3);
+    const dct = e.u(4);
+    const f = i % wide;
+    const row = i / wide;
+    const p = row % p_area;
+    const t = row / p_area;
+    if (f < 3) {
+        e.st(.a, i, 0);
+    } else if (f < 3 + hx) {
+        e.st(.a, i, e.ld(.b, t * hx * p_area + (f - 3) * p_area + p));
+    } else {
+        e.st(.a, i, e.ld(.c, p * dct + (f - 3 - hx)));
+    }
+}
+
+/// Scatter per-patch pixels back to the image: patch `t` of a `u1`-wide latent
+/// grid covers a `u2 x u2` tile, and its pixel `p` is `(p / u2, p % u2)` inside
+/// it. `a` is `[h][w][3]`, `b` is `[tiles][u2 * u2][3]`.
+/// u0 = total, u1 = latent width, u2 = patch side, u3 = first tile index.
+pub inline fn patchScatter(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const side = e.u(2);
+    const area = side * side;
+    const c = i % 3;
+    const p = (i / 3) % area;
+    const tile = e.u(3) + i / (3 * area);
+    const img_w = e.u(1) * side;
+    const y = (tile / e.u(1)) * side + p / side;
+    const x = (tile % e.u(1)) * side + p % side;
+    e.st(.a, (y * img_w + x) * 3 + c, e.ld(.b, i));
+}
+
+/// Gather a `[h][w][ch]` activation into 32x32 attention windows laid out as
+/// `[win_area][n_win][ch]`, i.e. with the WINDOW as an attention head, so one
+/// batched call attends each window against itself alone.
+///
+/// Out-of-range samples REPLICATE the edge rather than reading zero, which is the
+/// reference's `F.pad(mode="replicate")` and is not interchangeable with it: a
+/// latent smaller than the window is padded up and its edge cells attend to
+/// duplicates of themselves.
+/// u0 = total, u1 = h, u2 = w, u3 = ch, u4 = windows across, u5 = window side,
+/// u6 = window count.
+pub inline fn winGather(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const ch = e.u(3);
+    const npw = e.u(4);
+    const side = e.u(5);
+    const n_win = e.u(6);
+    const c = i % ch;
+    const win = (i / ch) % n_win;
+    const t = i / (ch * n_win);
+    const sy0 = (win / npw) * side + t / side;
+    const sx0 = (win % npw) * side + t % side;
+    const sy = if (sy0 >= e.u(1)) e.u(1) - 1 else sy0;
+    const sx = if (sx0 >= e.u(2)) e.u(2) - 1 else sx0;
+    e.st(.a, i, e.ld(.b, (sy * e.u(2) + sx) * ch + c));
+}
+
+/// The inverse of `winGather`, dropping the replicated pad: one thread per
+/// SOURCE element, so a padded position is simply never written.
+/// Same scalars as `winGather`; `a` is the image, `b` the windows.
+pub inline fn winScatter(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const ch = e.u(3);
+    const npw = e.u(4);
+    const side = e.u(5);
+    const n_win = e.u(6);
+    const c = i % ch;
+    const win = (i / ch) % n_win;
+    const t = i / (ch * n_win);
+    const sy = (win / npw) * side + t / side;
+    const sx = (win % npw) * side + t % side;
+    if (sy >= e.u(1) or sx >= e.u(2)) return;
+    e.st(.a, (sy * e.u(2) + sx) * ch + c, e.ld(.b, i));
+}
+
+/// Per-ROW AdaLN, where every row carries its own shift/scale rather than
+/// sharing a per-column vector: `a[r][j] = a[r][j] * (1 + c[r][D+j]) + c[r][j]`,
+/// `c` being `[rows][3 * D]` as `shift, scale, gate`.
+///
+/// Mage-VAE's per-pixel MLP conditions each PIXEL on its own patch vector, which
+/// is what makes this per-row where every transformer's AdaLN here is per-column.
+/// u0 = rows*D, u1 = D.
+pub inline fn modulatePerRow(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const d = e.u(1);
+    const r = i / d;
+    const j = i % d;
+    e.st(.a, i, e.ld(.a, i) * (1.0 + e.ld(.c, r * 3 * d + d + j)) + e.ld(.c, r * 3 * d + j));
+}
+
+/// The gated residual half of `modulatePerRow`: `a[r][j] += c[r][2D+j] * b[r][j]`.
+/// u0 = rows*D, u1 = D.
+pub inline fn gatedAddPerRow(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const d = e.u(1);
+    const r = i / d;
+    const j = i % d;
+    e.st(.a, i, e.ld(.a, i) + e.ld(.c, r * 3 * d + 2 * d + j) * e.ld(.b, i));
 }

@@ -95,8 +95,8 @@ CASES = [
     ("mid-word split, no space anywhere", "under(water:1.2)fall"),
     ("bare parens multiply", "a (cat) on a mat"),
     ("nested bare parens", "a ((cat)) on a mat"),
-    # ⚠️ inner explicit weight inside an outer one — the only shape that tells
-    # ComfyUI's "replace" apart from A1111's "multiply". See CLAUDE.md.
+    # inner explicit weight inside an outer one: the only shape that tells
+    # ComfyUI's "replace" apart from A1111's "multiply".
     ("explicit inside explicit", "((a:1.2):1.5) landscape"),
     ("weight at the very start", "(masterpiece:1.4) a cat"),
     ("weight at the very end", "a cat (masterpiece:1.4)"),

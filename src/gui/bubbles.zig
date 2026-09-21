@@ -40,6 +40,10 @@ pub const Tile = union(enum) {
     rendering: Rendering,
     /// Failed or canceled: the slot stays, so the grid does not reflow.
     failed,
+    /// The picture was made and its file is no longer there. Drawn in the dim
+    /// hairline rather than the danger colour: nothing went wrong here, and a
+    /// red slot in a reopened conversation reads as a bug.
+    missing,
     rgba: Px,
 };
 
@@ -81,6 +85,16 @@ pub const ToolCall = struct {
     busy: bool = false,
     /// Shown under the tiles while `busy`, e.g. "rendering 2 of 4".
     status: []const u8 = "",
+    /// How many tiles are `.missing`, so the card can say so in words once it
+    /// is no longer busy. A ghost slot on its own does not explain itself.
+    gone: usize = 0,
+    /// The picked tile still has a render behind it. False when every tile is
+    /// `.missing`: what those were made with was in the file, so the studio
+    /// would open on an empty form claiming to be that picture.
+    can_open: bool = true,
+    /// Offer "Send to chat": the model can see images and the picked tile has
+    /// one to send.
+    can_send: bool = false,
     /// Distinguishes several cards in one reply, which now happens whenever the
     /// model talks between generations.
     id_extra: usize = 0,
@@ -91,6 +105,9 @@ pub const ToolActions = struct {
     on_toggle: *const fn (*anyopaque) void,
     on_select: *const fn (*anyopaque, usize) void,
     on_open_studio: *const fn (*anyopaque) void,
+    /// Attach the picked tile's picture to the next message, exactly as a drop
+    /// or a paste does. Acts on the same tile `on_open_studio` does.
+    on_send_to_chat: *const fn (*anyopaque) void,
     /// Stop the render in that tile. The rail lists nothing under way, so this
     /// is the only place in chat that can ask.
     on_cancel: *const fn (*anyopaque, usize) void,
@@ -305,6 +322,16 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                     },
                     .pending => dashedSlot(crs.r, crs.s, style.hairline_hi),
                     .failed => dashedSlot(crs.r, crs.s, style.tint(C.danger, 90)),
+                    .missing => {
+                        dashedSlot(crs.r, crs.s, style.hairline_soft);
+                        dvui.labelNoFmt(@src(), "file gone", .{}, .{
+                            .font = F.mono_row,
+                            .color_text = C.text_ghost,
+                            .gravity_x = 0.5,
+                            .gravity_y = 0.5,
+                            .padding = .{},
+                        });
+                    },
                 }
                 const clicked = dvui.clicked(cellbox.data(), .{});
                 cellbox.deinit();
@@ -324,7 +351,13 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         });
         defer acts.deinit();
 
-        if (primaryButton(@src(), "Open in Studio", !tc.busy)) cb.on_open_studio(cb.ctx);
+        if (primaryButton(@src(), "Open in Studio", !tc.busy and tc.can_open)) cb.on_open_studio(cb.ctx);
+
+        // Only when the model can actually look at it: a button that silently
+        // does nothing is worse than no button.
+        if (tc.can_send) {
+            if (secondaryButton(@src(), 0, "Send to chat", true)) cb.on_send_to_chat(cb.ctx);
+        }
 
         // While rendering, the right-hand caption counts the run; each tile says
         // what its own render is doing.
@@ -332,6 +365,21 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
             dvui.labelNoFmt(@src(), tc.status, .{}, .{
                 .font = F.mono,
                 .color_text = C.amber, // the machine is working
+                .gravity_x = 1.0,
+                .gravity_y = 0.5,
+                .padding = .{},
+            });
+        } else if (tc.gone > 0) {
+            // What the ghost slots are. Said once for the card, since a caption
+            // per tile would not fit in one.
+            var buf: [48]u8 = undefined;
+            const line = if (tc.gone == 1)
+                "1 image is no longer on disk"
+            else
+                std.fmt.bufPrint(&buf, "{d} images are no longer on disk", .{tc.gone}) catch "images are no longer on disk";
+            dvui.labelNoFmt(@src(), line, .{}, .{
+                .font = F.mono,
+                .color_text = C.text_ghost,
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .padding = .{},

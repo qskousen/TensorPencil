@@ -257,51 +257,6 @@ fn modOff(cfg: minimax_h3.Config, n_labels: usize, block: usize, t_row: usize, t
     return (((block * n_labels + t_row) * 3 + @intFromEnum(tag)) * 6 + slot) * cfg.hidden;
 }
 
-/// Build every block's modulation on the host, folded for `rms_mod_par`.
-///
-/// Cheap: the adaLN projection is `[6 * hidden * 3, time_embed_dim]` against at
-/// most a handful of timestep rows, so this is a few million MACs against the
-/// trunk's trillions.
-fn buildMod(
-    dit: *const DiT,
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    out: []f32,
-    t_emb: []const f32,
-    n_labels: usize,
-) !void {
-    const cfg = dit.cfg;
-    const h = cfg.hidden;
-    const per_block = n_labels * 3 * 6 * h;
-    std.debug.assert(out.len == dit.blocks.len * per_block);
-
-    const raw = try gpa.alloc(f32, n_labels * 3 * 6 * h);
-    defer gpa.free(raw);
-
-    for (dit.blocks, 0..) |*b, bi| {
-        try ops.matmul.matmul(io, gpa, raw, t_emb, n_labels, b.adaln, b.adaln_bias);
-        // `raw` is [n_labels][tag][slot][hidden] with slots
-        // (shift, scale, gate) x2, which is the reference's chunk order.
-        for (0..n_labels) |t_row| {
-            for (0..3) |tag| {
-                const src = raw[((t_row * 3) + tag) * 6 * h ..][0 .. 6 * h];
-                const dst = out[bi * per_block + ((t_row * 3) + tag) * 6 * h ..][0 .. 6 * h];
-                inline for (.{ .{ 0, b.norm1 }, .{ 3, b.norm2 } }) |pair| {
-                    const base = pair[0];
-                    const nw = pair[1];
-                    const shift = src[base * h ..][0..h];
-                    const scale = src[(base + 1) * h ..][0..h];
-                    const gate = src[(base + 2) * h ..][0..h];
-                    // premul = norm_weight * (1 + scale): the kernel has neither.
-                    for (dst[base * h ..][0..h], nw, scale) |*d, w, sc| d.* = w * (1.0 + sc);
-                    @memcpy(dst[(base + 1) * h ..][0..h], shift);
-                    @memcpy(dst[(base + 2) * h ..][0..h], gate);
-                }
-            }
-        }
-    }
-}
-
 fn linPrep(be: *Backend, x: Buf, m: usize, cols: usize) !void {
     try be.opI8Prep(x, m, cols, false);
 }
@@ -385,7 +340,7 @@ pub fn forward(
 
     const mod_host = try gpa.alloc(f32, dit.blocks.len * n_labels * 3 * 6 * h);
     defer gpa.free(mod_host);
-    try buildMod(dit, io, gpa, mod_host, t_emb, n_labels);
+    try minimax_h3.buildModTable(dit, io, gpa, mod_host, t_emb, n_labels);
 
     // --- device: the trunk -------------------------------------------------
     try be.beginBatch();
@@ -423,15 +378,15 @@ pub fn forward(
         try be.tensorUpload(ws.amask_d, std.mem.sliceAsBytes(a_stage));
         amask = ws.amask_d;
     }
-    // The index buffer for a segment, offset to the launch's first row.
+    // The index buffer for a segment. The launch's first row is a kernel argument,
+    // so this is the whole buffer.
     const segIdx = struct {
-        fn go(kind: minimax_h3.Kind, vm: ?Buf, am: ?Buf, first: usize) ?Buf {
-            const b = switch (kind) {
+        fn go(kind: minimax_h3.Kind, vm: ?Buf, am: ?Buf) ?Buf {
+            return switch (kind) {
                 .video => vm,
                 .audio => am,
                 else => null,
-            } orelse return null;
-            return offsetBuf(b, first * 4);
+            };
         }
     }.go;
 
@@ -443,13 +398,15 @@ pub fn forward(
         for (layout.segments) |sg| {
             const t_row = ts.rowFor(sg.kind);
             const tag = sg.kind.tag();
-            const idx = segIdx(sg.kind, vmask, amask, 0);
+            const idx = segIdx(sg.kind, vmask, amask);
             // With an index buffer the scalar offsets are the LABEL-ZERO ones; the
             // kernel adds `idx[row] * label_stride`.
             const base = if (idx == null) t_row else 0;
-            try be.rmsModRows(
-                offsetBuf(ws.x_d, sg.start * h * 4),
-                offsetBuf(ws.t1_d, sg.start * h * 4),
+            try be.rmsModRowsAt(
+                ws.x_d,
+                sg.start,
+                ws.t1_d,
+                sg.start,
                 ws.mod_d,
                 sg.len(),
                 h,
@@ -457,6 +414,7 @@ pub fn forward(
                 modOff(cfg, n_labels, bi, base, tag, 1),
                 eps,
                 idx,
+                0,
                 label_stride,
             );
         }
@@ -490,16 +448,19 @@ pub fn forward(
         try lin(be, ws.t1_d, b.attn.out.w);
         try sidecar(be, ws, dit.lora, ws.t1_d, ws.attn_d, seq, b.attn.out, 0, h);
         for (layout.segments) |sg| {
-            const idx = segIdx(sg.kind, vmask, amask, 0);
+            const idx = segIdx(sg.kind, vmask, amask);
             const base = if (idx == null) ts.rowFor(sg.kind) else 0;
-            try be.gatedAddRows(
-                offsetBuf(ws.x_d, sg.start * h * 4),
-                offsetBuf(ws.t1_d, sg.start * h * 4),
+            try be.gatedAddRowsAt(
+                ws.x_d,
+                sg.start,
+                ws.t1_d,
+                sg.start,
                 ws.mod_d,
                 sg.len() * h,
                 h,
                 modOff(cfg, n_labels, bi, base, sg.kind.tag(), 2),
                 idx,
+                0,
                 label_stride,
             );
         }
@@ -516,11 +477,13 @@ pub fn forward(
                 if (lo >= hi) continue;
                 const tag = sg.kind.tag();
                 // A band starts mid-segment, so the index buffer starts there too.
-                const idx = segIdx(sg.kind, vmask, amask, lo - sg.start);
+                const idx = segIdx(sg.kind, vmask, amask);
                 const base = if (idx == null) ts.rowFor(sg.kind) else 0;
-                try be.rmsModRows(
-                    offsetBuf(ws.x_d, lo * h * 4),
-                    offsetBuf(ws.t1_d, (lo - c0) * h * 4),
+                try be.rmsModRowsAt(
+                    ws.x_d,
+                    lo,
+                    ws.t1_d,
+                    lo - c0,
                     ws.mod_d,
                     hi - lo,
                     h,
@@ -528,6 +491,7 @@ pub fn forward(
                     modOff(cfg, n_labels, bi, base, tag, 4),
                     eps,
                     idx,
+                    lo - sg.start,
                     label_stride,
                 );
             }
@@ -547,16 +511,19 @@ pub fn forward(
                 const lo = @max(sg.start, c0);
                 const hi = @min(sg.stop, c0 + tile);
                 if (lo >= hi) continue;
-                const idx = segIdx(sg.kind, vmask, amask, lo - sg.start);
+                const idx = segIdx(sg.kind, vmask, amask);
                 const base = if (idx == null) ts.rowFor(sg.kind) else 0;
-                try be.gatedAddRows(
-                    offsetBuf(ws.x_d, lo * h * 4),
-                    offsetBuf(ws.t1_d, (lo - c0) * h * 4),
+                try be.gatedAddRowsAt(
+                    ws.x_d,
+                    lo,
+                    ws.t1_d,
+                    lo - c0,
                     ws.mod_d,
                     (hi - lo) * h,
                     h,
                     modOff(cfg, n_labels, bi, base, sg.kind.tag(), 5),
                     idx,
+                    lo - sg.start,
                     label_stride,
                 );
             }

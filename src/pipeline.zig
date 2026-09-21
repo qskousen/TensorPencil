@@ -63,6 +63,13 @@ const zimage = @import("tp_models").models.zimage;
 const zimage_text = @import("tp_models").models.zimage_text;
 const zimage_gpu = @import("tp_models").models.zimage_gpu;
 const zimage_cuda = @import("tp_models").models.zimage_cuda;
+const mageflow = @import("tp_models").models.mageflow;
+const mageflow_text = @import("tp_models").models.mageflow_text;
+const mage_vae = @import("tp_models").models.mage_vae;
+const mageflow_cuda = @import("tp_models").models.mageflow_cuda;
+const mageflow_gpu = @import("tp_models").models.mageflow_gpu;
+const mage_vae_cuda = @import("tp_models").models.mage_vae_cuda;
+const mage_vae_gpu = @import("tp_models").models.mage_vae_gpu;
 const anima_gpu = @import("tp_models").models.anima_gpu;
 const anima_cuda = @import("tp_models").models.anima_cuda;
 const anima = @import("tp_models").models.anima;
@@ -77,6 +84,9 @@ const minimax_h3_vae_encode_cuda = @import("tp_models").models.minimax_h3_vae_en
 const minimax_h3_audio_encode = @import("tp_models").models.minimax_h3_audio_encode;
 const minimax_h3_audio_encode_cuda = @import("tp_models").models.minimax_h3_audio_encode_cuda;
 const minimax_h3_cuda = @import("tp_models").models.minimax_h3_cuda;
+const minimax_h3_gpu = @import("tp_models").models.minimax_h3_gpu;
+const minimax_h3_vae_gpu = @import("tp_models").models.minimax_h3_vae_gpu;
+const minimax_h3_audio_gpu = @import("tp_models").models.minimax_h3_audio_gpu;
 const lora_mod = @import("tp_models").models.lora;
 const minimax_h3_vae_cuda = @import("tp_models").models.minimax_h3_vae_cuda;
 const dit_gpu = @import("tp_models").models.dit_gpu;
@@ -193,20 +203,28 @@ pub const Snapshot = struct {
     latent: []f32,
     /// Sampling step to resume at.
     step: usize,
-    /// Multistep sampler state, gpa-owned, null for a first-order sampler.
+    /// Multistep sampler state, gpa-owned, null for a single-step sampler.
+    ///
+    /// Null does not mean there is nothing to restore: `euler_ancestral` keeps no
+    /// history but does have a position in its noise sequence, which `step` above
+    /// is enough to rebuild (`Stepper.resumeFrom`).
     ///
     /// A latent alone is not enough to resume a DPM++(2M) run bit-identically:
     /// the step after the resume applies a second-order correction built from the
     /// PREVIOUS step's denoised prediction. Dropping it is not a crash, the
     /// resumed step silently degrades to first order and the image differs from an
     /// uninterrupted render, which is exactly the promise `resume_from` makes.
-    sde_old_denoised: ?[]f32 = null,
-    /// The `h` of the step before the resume point, the other half of that state.
-    sde_h_last: f64 = 0,
+    /// DPM++(3M) SDE reaches one step further back, hence the second slot.
+    hist_denoised: ?[]f32 = null,
+    hist_denoised2: ?[]f32 = null,
+    /// The `h` of the two steps before the resume point, the other half of that state.
+    hist_h: f64 = 0,
+    hist_h2: f64 = 0,
 
     pub fn deinit(self: *Snapshot, gpa: std.mem.Allocator) void {
         gpa.free(self.latent);
-        if (self.sde_old_denoised) |o| gpa.free(o);
+        if (self.hist_denoised) |o| gpa.free(o);
+        if (self.hist_denoised2) |o| gpa.free(o);
         self.* = undefined;
     }
 };
@@ -226,6 +244,10 @@ pub const Options = struct {
     /// [0, 1], in request order. Empty is text-to-image. Ignored by every other
     /// family. See `EncodeOptions.sn_ref_images`.
     sn_ref_images: []const sensenova.RefImage = &.{},
+    /// Mage-Flow-Edit reference pictures, planar `[3][h][w]` in [0, 1], in
+    /// request order. Empty is text-to-image. Ignored by every other family.
+    /// See `EncodeOptions.mf_ref_images`.
+    mf_ref_images: []const Session.RefImage = &.{},
     /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax`,
     /// the two are not interchangeable spellings of the same thing.
     prompt_syntax: PromptSyntax = .comfy,
@@ -256,7 +278,7 @@ pub const Options = struct {
     /// one as such would silently render Z-Image on krea2's shift.
     explicit_shift: bool = false,
     /// Which sampler drives the loop. `euler` is the default and the only
-    /// first-order one; see `sampler.Kind`.
+    /// deterministic one; see `sampler.Kind`.
     sampler: sampler.Kind = .euler,
     /// Which scheduler places the steps. null = the family's default (`simple` for
     /// krea2, `normal` for the SD family), which is what every render used before
@@ -265,18 +287,34 @@ pub const Options = struct {
     /// `ddim_uniform` and `beta` can return a different number of steps than
     /// `steps` asks for; `generate` reports and drives off the real count.
     scheduler: ?sampler.Scheduler = null,
-    /// SDE noise level (`eta`) and noise multiplier (`s_noise`), ignored by `euler`.
-    /// ComfyUI's defaults; `sde_eta = 0` makes an SDE sampler deterministic and
-    /// equal to plain DPM++(2M).
-    sde_eta: f64 = 1.0,
-    sde_s_noise: f64 = 1.0,
+    /// Compute a model's AutoV2 hash for the metadata block when it has no
+    /// `<path>.sha256` sidecar, and save one. Off skips it: the `Model hash`,
+    /// `VAE hash` and `Hashes` fields are then simply absent. A sidecar that
+    /// already exists is always read, either way, because that costs nothing.
+    hash_models: bool = true,
+    /// Noise level (`eta`) and noise multiplier (`s_noise`) for a stochastic sampler,
+    /// ignored by `euler`. ComfyUI's defaults; `eta = 0` makes an SDE sampler
+    /// deterministic and equal to plain DPM++(2M), and makes `euler_ancestral`
+    /// bit-identical to `euler` on the SD family.
+    eta: f64 = 1.0,
+    s_noise: f64 = 1.0,
     /// Compute backend for the sampling loop (and encoder/VAE where supported).
     backend: Backend = .cpu,
     /// VAE decode-path override (see `VaeDecode`). Default `auto` (adaptive).
     vae_decode: VaeDecode = .auto,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
+    /// A hard ceiling: an allocation past it is refused, not merely discouraged.
     vram_budget: u64 = 0,
+    /// `--vram-budget min`: keep no weight resident beyond the ones a forward is
+    /// using right now, so the footprint is the activations plus that set and
+    /// nothing else. Not a byte figure, because the smallest workable number is a
+    /// property of the image size and the architecture, not something to type; the
+    /// eviction policy already protects exactly the in-flight set, so this asks it
+    /// to shed everything else. Streams every weight every step, so it is the slow
+    /// end of the trade, and it composes with `vram_budget` rather than replacing
+    /// it (a ceiling still applies if one is set).
+    vram_min_weights: bool = false,
     /// Run the GPU text encoder's GEMMs on tensor cores (f16). ~0.4s faster
     /// encode but ~doubles its image-delta contribution; default f32.
     encoder_f16: bool = false,
@@ -394,7 +432,7 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
         // SenseNova joins them by table rather than by template: its schedule is
         // the same `discrete_flow` shift, and ComfyUI's own workflow leaves the
         // KSampler on `normal`, which over a flow table IS `simple`.
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova => .simple,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => .simple,
         .sd15, .sdxl => .normal,
     };
 }
@@ -405,23 +443,22 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
 ///     Negative prompt: <negative>            (omitted when empty)
 ///     Steps: N, Sampler: Euler, Schedule type: S, CFG scale: C, Seed: S, Size: WxH, Model: <name>, Prompt syntax: X
 ///
+/// `appendExtraParams` extends that tail with what a render USED rather than what
+/// it was asked for: the encoders, the VAE, their hashes, the weight dtype, the
+/// resolved shift and any LoRAs. Which encoder ran is not a detail, since a Qwen3-VL
+/// and a plain Qwen3 load interchangeably here and render differently.
+///
 /// `model_name` is the diffusion checkpoint's file stem; `fam` names the schedule
 /// (the "Schedule type" field is dropped when it is null). Caller frees.
 ///
-/// `Prompt syntax` is not decoration, and the block is wrong without it. A reader
-/// (including ComfyUI's own metadata importer) re-renders from these fields, and the very
-/// same prompt text means a DIFFERENT image in the two dialects, `(x:1.2)` multiplies in
-/// one and replaces in the other, `[x]` is de-emphasis in one and literal text in the
-/// other. A1111's own format has no field for this because A1111 only ever has one
-/// dialect; here it has to be recorded, on the same reasoning that made `Sampler` and
-/// `Schedule type` stop being hardcoded. `Emphasis` rides along only when it can matter.
-///
-/// `Compat` is the same argument again, and for a bigger effect. It selects whose
-/// *sampling* conventions ran, including which RNG drew the noise, which decides whether
-/// a seed means the same starting latent at all. `RNG`/`SGM noise multiplier` appear only
-/// when they were overridden away from that compat's own defaults, so an ordinary ComfyUI
-/// render's block carries neither. `RNG` keeps A1111's
-/// own spelling of the field and its values, since that is what a reader will recognize.
+/// A reader re-renders from this block, so every field it would need is in it.
+/// `Prompt syntax` and `Compat` are here for that and nothing else: the same prompt
+/// text is a DIFFERENT image in the two dialects (`(x:1.2)` multiplies in one and
+/// replaces in the other, `[x]` is de-emphasis in one and literal in the other), and
+/// compat selects whose sampling conventions ran, including which RNG drew the noise.
+/// A1111's own format has neither field because A1111 has only one of each.
+/// `Emphasis`, `RNG` and `SGM noise multiplier` ride along only when they were
+/// overridden, and keep A1111's spellings so a reader recognizes them.
 pub fn buildA1111Params(
     gpa: std.mem.Allocator,
     prompt: []const u8,
@@ -520,11 +557,288 @@ pub fn appendClipParams(gpa: std.mem.Allocator, base: []u8, shifts: minimax_h3.S
     return std.fmt.allocPrint(gpa, "{s}, Shift: {d:.4}, Audio shift: {d:.4}", .{ base, shifts.video, shifts.audio });
 }
 
+/// One LoRA as the metadata block records it.
+pub const LoraRecord = struct {
+    /// File stem, the name a reader matches against its own library.
+    name: []const u8,
+    /// AutoV2, or empty when it could not be computed.
+    hash: []const u8 = "",
+    strength: f32 = 1.0,
+};
+
+/// Everything a render used that the settings line does not already name.
+///
+/// Separate from `buildA1111Params`' parameters for `appendClipParams`' reason:
+/// that builder already has sixteen. Every field is optional, and an empty one is
+/// simply not written, so a family that has no VAE or no second encoder produces
+/// the same block it always did.
+pub const Extras = struct {
+    /// Text encoder file stems. `Clip 1` / `Clip 2` are what A1111 and Civitai
+    /// call them, so a reader that already knows those names finds them.
+    clip1: []const u8 = "",
+    clip2: []const u8 = "",
+    vae: []const u8 = "",
+    /// AutoV2 hashes: the first 10 hex of the file's sha256, which is what
+    /// `Model hash` has meant since A1111.
+    model_hash: []const u8 = "",
+    vae_hash: []const u8 = "",
+    /// How the denoiser's weights are stored (`Session.weightDtype`).
+    weight_dtype: []const u8 = "",
+    /// The flow shift actually used. Recorded because `--shift` is settable and
+    /// a reader that falls back to the family default silently renders a
+    /// different image.
+    shift: ?f32 = null,
+    /// img2img strength; null for a text-to-image render.
+    denoise: ?f32 = null,
+    /// A stochastic sampler's noise level and noise multiplier, under A1111's own
+    /// spellings (`Eta`, `Sigma noise`). Null when they were left at the default,
+    /// on the same rule `RNG` and `SGM noise multiplier` follow: an ordinary
+    /// render's block is unchanged, and an overridden one re-renders.
+    eta: ?f64 = null,
+    s_noise: ?f64 = null,
+    loras: []const LoraRecord = &.{},
+};
+
+/// Append `r` to a `buildA1111Params` block, freeing `base`.
+///
+/// The field names are A1111's and Civitai's rather than ours: `Clip 1`,
+/// `VAE hash`, `Lora hashes`, `Hashes`. A reader that already parses those gets
+/// them for free, and inventing a second vocabulary would mean nothing outside
+/// this project could read the block.
+///
+/// `Hashes` is built here from the same values rather than passed in, so the
+/// JSON and the flat fields cannot disagree.
+pub fn appendExtraParams(gpa: std.mem.Allocator, base: []u8, r: Extras) ![]u8 {
+    defer gpa.free(base);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, base);
+
+    if (r.model_hash.len > 0) try out.print(gpa, ", Model hash: {s}", .{r.model_hash});
+    if (r.clip1.len > 0) try out.print(gpa, ", Clip 1: {s}", .{r.clip1});
+    if (r.clip2.len > 0) try out.print(gpa, ", Clip 2: {s}", .{r.clip2});
+    if (r.vae.len > 0) try out.print(gpa, ", VAE: {s}", .{r.vae});
+    if (r.vae_hash.len > 0) try out.print(gpa, ", VAE hash: {s}", .{r.vae_hash});
+    if (r.weight_dtype.len > 0) try out.print(gpa, ", Weight dtype: {s}", .{r.weight_dtype});
+    if (r.shift) |v| try out.print(gpa, ", Shift: {d:.4}", .{v});
+    if (r.denoise) |v| try out.print(gpa, ", Denoise: {d:.4}", .{v});
+    if (r.eta) |v| try out.print(gpa, ", Eta: {d:.4}", .{v});
+    if (r.s_noise) |v| try out.print(gpa, ", Sigma noise: {d:.4}", .{v});
+
+    if (r.loras.len > 0) {
+        // A1111 spells both of these as ONE quoted comma-separated list, which is
+        // why they are not one field per LoRA.
+        try out.appendSlice(gpa, ", Lora hashes: \"");
+        for (r.loras, 0..) |l, i| {
+            if (i > 0) try out.appendSlice(gpa, ", ");
+            try out.print(gpa, "{s}: {s}", .{ l.name, l.hash });
+        }
+        try out.appendSlice(gpa, "\", Lora strengths: \"");
+        for (r.loras, 0..) |l, i| {
+            if (i > 0) try out.appendSlice(gpa, ", ");
+            try out.print(gpa, "{s}: {d:.2}", .{ l.name, l.strength });
+        }
+        try out.appendSlice(gpa, "\"");
+    }
+
+    // Civitai's resource map. Keys are kind-prefixed (`lora:<name>`); the model
+    // and VAE use their bare kind.
+    var n: usize = 0;
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(gpa);
+    if (r.model_hash.len > 0) {
+        try j.print(gpa, "\"model\":\"{s}\"", .{r.model_hash});
+        n += 1;
+    }
+    if (r.vae_hash.len > 0) {
+        if (n > 0) try j.append(gpa, ',');
+        try j.print(gpa, "\"vae\":\"{s}\"", .{r.vae_hash});
+        n += 1;
+    }
+    for (r.loras) |l| {
+        if (l.hash.len == 0) continue;
+        if (n > 0) try j.append(gpa, ',');
+        try j.print(gpa, "\"lora:{s}\":\"{s}\"", .{ l.name, l.hash });
+        n += 1;
+    }
+    if (n > 0) try out.print(gpa, ", Hashes: {{{s}}}", .{j.items});
+
+    return out.toOwnedSlice(gpa);
+}
+
+/// AutoV2 hashes for the files a render used, computed at most once each.
+///
+/// Owned by the caller rather than a global: the CLI makes one per run, a daemon
+/// one per engine. Hashing a checkpoint is a read of the whole file, so doing it
+/// per image would cost more than the render.
+/// What `HashCache` reports while it works, so a UI can say a render is waiting
+/// on a one-off file read. Logging happens regardless; this is only the extra
+/// surface.
+pub const HashNotice = struct {
+    path: []const u8,
+    /// Null while it is starting; set when it finished, with how long it took.
+    took_ns: ?i128 = null,
+};
+
+/// AutoV2 hashes (`sha256(file)[:10]`) for the files a render used.
+///
+/// Reading a `<path>.sha256` sidecar is the fast path and the usual one: the
+/// tools that publish these checkpoints write one, and 64 bytes beats 8 GB. When
+/// none exists the file is read once, the digest is SAVED as a sidecar, and every
+/// later render on this machine, from any front end, takes the fast path. That
+/// saving is the whole point: hashing per render cost more than the render.
+///
+/// Owned by the caller (the CLI one per run, a daemon one per engine) so the
+/// in-process map also holds within a run.
+pub const HashCache = struct {
+    map: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// False: read a sidecar if there is one, otherwise report nothing. The
+    /// escape hatch for anyone who does not want to pay even once.
+    compute: bool = true,
+    /// Called just before a file is read and again when it is done. Both carry
+    /// the path; the second carries the elapsed time.
+    notify: ?*const fn (ctx: ?*anyopaque, n: HashNotice) void = null,
+    notify_ctx: ?*anyopaque = null,
+    /// Polled while reading, so cancelling a render does not leave a minute of
+    /// hashing behind it.
+    cancel: ?*std.atomic.Value(bool) = null,
+
+    pub fn deinit(self: *HashCache, gpa: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.*);
+        }
+        self.map.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// The first 10 hex of `path`'s sha256, or "" when it cannot be had. The
+    /// returned slice is owned by the cache and lives until `deinit`.
+    pub fn autoV2(self: *HashCache, gpa: std.mem.Allocator, io: std.Io, path: []const u8) []const u8 {
+        if (path.len == 0) return "";
+        if (self.map.get(path)) |h| return h;
+        const h = self.compute_(gpa, io, path) catch "";
+        if (h.len == 0) return "";
+        const key = gpa.dupe(u8, path) catch {
+            gpa.free(h);
+            return "";
+        };
+        self.map.put(gpa, key, h) catch {
+            gpa.free(key);
+            gpa.free(h);
+            return "";
+        };
+        return h;
+    }
+
+    fn compute_(self: *HashCache, gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+        var name_buf: [512]u8 = undefined;
+        const side = sidecarPath(&name_buf, path) catch return error.NameTooLong;
+        const cwd = std.Io.Dir.cwd();
+
+        if (cwd.readFileAlloc(io, side, gpa, .limited(4096))) |txt| {
+            defer gpa.free(txt);
+            // Lenient: a bare digest is what the files here hold, but a
+            // `sha256sum` line puts the name after it.
+            const hex = std.mem.trim(u8, txt, " \t\r\n");
+            if (hex.len >= 10 and isHex(hex[0..10])) return gpa.dupe(u8, hex[0..10]);
+        } else |_| {}
+
+        if (!self.compute) return "";
+
+        if (self.notify) |f| f(self.notify_ctx, .{ .path = path });
+        std.log.info("hashing {s} once, to write its .sha256 sidecar", .{path});
+        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+
+        const digest = try self.digestOf(io, path);
+        const took = std.Io.Clock.real.now(io).nanoseconds - t0;
+        var hex_buf: [64]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{digest[0..]}) catch unreachable;
+
+        writeSidecar(io, side, hex) catch |err| std.log.warn(
+            "could not write {s} ({t}); this file will be hashed again next time",
+            .{ side, err },
+        );
+        std.log.info("hashed {s} in {d:.1}s: {s}", .{ path, @as(f64, @floatFromInt(took)) / 1e9, hex[0..10] });
+        if (self.notify) |f| f(self.notify_ctx, .{ .path = path, .took_ns = took });
+        return gpa.dupe(u8, hex[0..10]);
+    }
+
+    fn digestOf(self: *HashCache, io: std.Io, path: []const u8) ![32]u8 {
+        var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        // Two buffers, deliberately: `reader` takes the first as its OWN storage,
+        // so reading into that same array aliases it and hashes leftovers.
+        var rbuf: [64 << 10]u8 = undefined;
+        var chunk: [64 << 10]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        while (true) {
+            if (self.cancel) |c| if (c.load(.acquire)) return error.Canceled;
+            const n = r.interface.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            sha.update(chunk[0..n]);
+        }
+        var digest: [32]u8 = undefined;
+        sha.final(&digest);
+        return digest;
+    }
+};
+
+/// Where a model's digest sits: its extension REPLACED by `.sha256`, so
+/// `foo/bar.safetensors` pairs with `foo/bar.sha256`.
+///
+/// ⚠️ Replaced, not appended. That is what the sidecars already beside these
+/// checkpoints are called, and appending instead silently matches none of them,
+/// which reads as "no sidecar anywhere" and hashes every file on every render.
+/// The only symptom of getting it wrong is slowness.
+///
+/// A file with no extension just gains one. Two models in one directory whose
+/// names differ only by extension would share a sidecar, which is a wrinkle in
+/// the convention itself, not something to fix here.
+fn sidecarPath(buf: []u8, path: []const u8) ![]const u8 {
+    const dir = std.fs.path.dirname(path);
+    const stem = std.fs.path.stem(path);
+    return if (dir) |d|
+        std.fmt.bufPrint(buf, "{s}{c}{s}.sha256", .{ d, std.fs.path.sep, stem })
+    else
+        std.fmt.bufPrint(buf, "{s}.sha256", .{stem});
+}
+
+/// Write `hex` to `path` through a temp file and a rename, so a reader never
+/// sees a partial digest.
+///
+/// ⚠️ 64 bytes, bare lowercase hex, NO trailing newline: that is byte-for-byte
+/// what the sidecars already beside these checkpoints hold, and other tools read
+/// them.
+fn writeSidecar(io: std.Io, path: []const u8, hex: []const u8) !void {
+    std.debug.assert(hex.len == 64);
+    var tmp_buf: [520]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = tmp, .data = hex });
+    errdefer cwd.deleteFile(io, tmp) catch {};
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+}
+
+fn isHex(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
 pub const Image = struct {
     /// Interleaved RGB, [height][width][3].
     rgb: []u8,
     width: usize,
     height: usize,
+    /// The flow shift this render RESOLVED, for the metadata block. Not
+    /// `Options.shift`: unless `explicit_shift` was set, the family's own default
+    /// is what ran and the option still holds the struct default.
+    shift: f32 = 0,
+    /// `Session.weightDtype`, captured here because the session is gone by the
+    /// time a caller writes the file. Static storage (`@tagName`).
+    weight_dtype: []const u8 = "",
 
     pub fn deinit(self: *Image, gpa: std.mem.Allocator) void {
         gpa.free(self.rgb);
@@ -815,6 +1129,17 @@ pub const EncodeOptions = struct {
     /// ComfyUI's node takes the picture as the workflow hands it over, and the
     /// token count follows its extent. A caller that wants a budget applies it.
     sn_ref_images: []const sensenova.RefImage = &.{},
+    /// Mage-Flow-Edit reference pictures, in REQUEST order, planar `[3][h][w]`
+    /// in [0, 1]. Empty is text-to-image. Ignored by every other family.
+    ///
+    /// These are the VL tower's copies. The DiT's copies of the same pictures
+    /// are VAE-encoded separately, at the RENDER's resolution, by
+    /// `Session.mageflowRefLatents` -- the two resizes differ on purpose, see
+    /// `encodeMageFlow`.
+    ///
+    /// ComfyUI puts the SAME references on the negative conditioning too: only
+    /// the instruction differs between the two branches.
+    mf_ref_images: []const Session.RefImage = &.{},
     /// Which conditioning branch this is. SenseNova's negative branch under
     /// EDITING is not the unconditional text prompt: it presents the reference
     /// pictures with no prompt at all.
@@ -1253,6 +1578,11 @@ pub const Denoiser = struct {
     /// `context_refiner` blocks are built with `modulation=False`, so the text half
     /// never sees the timestep. Recomputing it per step would add two full attention
     /// blocks over the caption to every step for an identical result.
+    /// Mage-Flow's reference latents (the edit path), borrowed from the caller
+    /// and shared by both CFG branches: ComfyUI puts the same references on the
+    /// negative conditioning too, so only the instruction differs between them.
+    /// Empty for text-to-image.
+    mf_refs: []const mageflow.Ref = &.{},
     zi_cap_pos: ?[]f32 = null,
     zi_cap_neg: ?[]f32 = null,
     /// Padded caption length, i.e. how many rows of the joint sequence the text half
@@ -1264,6 +1594,14 @@ pub const Denoiser = struct {
     zi_vk: ?zimage_gpu.Session = null,
     zi_vk_neg: ?zimage_gpu.Session = null,
     zi_vk_ws: ?zimage_gpu.Workspace = null,
+    /// Mage-Flow's device state, when the backend can run its GEMMs. Null means
+    /// the trunk runs on the CPU.
+    mf_cu: ?mageflow_cuda.Session = null,
+    mf_cu_neg: ?mageflow_cuda.Session = null,
+    mf_cu_ws: ?mageflow_cuda.Workspace = null,
+    mf_vk: ?mageflow_gpu.Session = null,
+    mf_vk_neg: ?mageflow_gpu.Session = null,
+    mf_vk_ws: ?mageflow_gpu.Workspace = null,
     zi_cu: ?zimage_cuda.Session = null,
     zi_cu_neg: ?zimage_cuda.Session = null,
     zi_cu_ws: ?zimage_cuda.Workspace = null,
@@ -1306,6 +1644,12 @@ pub const Denoiser = struct {
         if (self.zi_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.zi_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.zi_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.mf_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.mf_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.mf_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.mf_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.mf_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.mf_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
         if (self.zi_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.zi_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.zi_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
@@ -1371,6 +1715,7 @@ pub const Denoiser = struct {
         if (s.family() == .zimage) return self.predictZImage(gpa, v_out, latent, sigma, cancel);
         if (s.family() == .anima) return self.predictAnima(gpa, v_out, latent, sigma, step, cancel);
         if (s.family() == .sensenova) return self.predictSenseNova(gpa, v_out, latent, sigma, cancel);
+        if (s.family() == .mageflow) return self.predictMageFlow(gpa, v_out, latent, sigma, cancel);
         const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
@@ -1448,6 +1793,48 @@ pub const Denoiser = struct {
     /// krea2, so the sampler's sigma reaches the model directly (`NextDiT` turns it
     /// into `1 - sigma` itself). The output is the trajectory derivative, which is
     /// what makes CFG mixing valid here for the same reason it is for krea2.
+    /// Mage-Flow's forward: the device arm for whichever backend is up when the
+    /// checkpoint's weights have a GEMM there, the CPU otherwise.
+    fn predictMageFlow(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const dit = &s.models.mageflow.dit;
+        std.debug.assert(v_out.len == mageflow.channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+
+        if (self.mf_cu) |*cu| {
+            const b = s.cu_be.?;
+            try mageflow_cuda.forward(dit, b, cu, &self.mf_cu_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try mageflow_cuda.forward(dit, b, &self.mf_cu_neg.?, &self.mf_cu_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        if (self.mf_vk) |*vk| {
+            const c = s.gpu_ctx.?;
+            try mageflow_gpu.forward(dit, c, vk, &self.mf_vk_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try mageflow_gpu.forward(dit, c, &self.mf_vk_neg.?, &self.mf_vk_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+
+        try dit.forward(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, self.cond_pos.data, self.cond_pos.seq, self.mf_refs, cancel);
+        if (self.cfg == 1.0) return;
+
+        const v_neg = self.v_neg.?;
+        try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, self.mf_refs, cancel);
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
     fn predictZImage(
         self: *Denoiser,
         gpa: std.mem.Allocator,
@@ -1955,6 +2342,19 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv_in.weight"} },
             .conditioner2, .decoder2 => error.NoSuchComponent,
         },
+        // Mage-Flow ships as three separate files. Its conditioner probe is
+        // krea2's, since it IS krea2's Qwen3-VL-4B checkpoint; what separates
+        // the two families is the denoiser, never the encoder. The decoder takes
+        // TWO probes because two unrelated codecs read this latent (`MageFlowVae`):
+        // the Mage-VAE's own encoder tensor, which is also ComfyUI's test for that
+        // codec, and the Flux2 anchor's fold BatchNorm. Neither matches a Wan
+        // export, and the BatchNorm matches no other `AutoencoderKL`.
+        .mageflow => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{mageflow.probe} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "model.embed_tokens.weight", "embed_tokens.weight" } },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{ mage_vae.probe, sd_vae.packed_latent_probe } },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
+        },
         // Anima normally BUNDLES its VAE (a single-file checkpoint carrying
         // `first_stage_model.*` alongside `model.diffusion_model.*`) and ships its
         // encoder separately, the opposite split from Z-Image, and the reason
@@ -2144,12 +2544,47 @@ fn reportResolve(
     side_is_explicit: bool,
     side_path: []const u8,
 ) !Resolved {
-    return resolveComponent(gpa, fam, comp, primary, side, side_is_explicit) catch |err| {
+    const r = resolveComponent(gpa, fam, comp, primary, side, side_is_explicit) catch |err| {
         if (err == error.ComponentNotInCheckpoint) std.log.err(
             "{t} not found: the checkpoint has no '{s}' under any known prefix, and '{s}' does not supply one either",
             .{ comp, (try componentSpec(fam, comp)).probes[0], side_path },
         );
         return err;
+    };
+
+    // Qwen3-VL-4B and plain Qwen3-4B share vocab, width, depth and head counts,
+    // so no shape refuses the wrong one and the render comes back coherent and
+    // prompt-WRONG. `Config.resolvePrefix` catches it on a safetensors file by
+    // leaving the load to fail on `model.language_model.`, but a GGUF names its
+    // tensors bare, so that guard cannot fire and the file simply loads.
+    //
+    // A warning rather than an error: an explicit `--text-encoder` is documented
+    // to win, and the catalog already screens this out for anything picked from
+    // a menu (`model_spec.storeFits`).
+    if (comp == .conditioner) {
+        if (encoderConfigFor(fam)) |cfg| {
+            if (qwen3.runRopeTheta(r.store)) |got| {
+                if (got != cfg.rope_theta) std.log.warn(
+                    "text encoder runs at rope_theta {d} but {t} was trained against {d}: most " ++
+                        "likely a plain Qwen3 where a Qwen3-VL is wanted, which loads cleanly " ++
+                        "because they share width and depth. It still follows the prompt, in a " ++
+                        "different style and needing more steps to converge.",
+                    .{ got, fam, cfg.rope_theta },
+                );
+            }
+        }
+    }
+    return r;
+}
+
+/// The Qwen3 configuration a family's conditioner should be, or null for the
+/// families whose encoder is not a Qwen3.
+fn encoderConfigFor(fam: Family) ?qwen3.Config {
+    return switch (fam) {
+        .krea2, .mageflow => qwen3.Config.vl_4b,
+        .zimage => qwen3.Config.qwen3_4b,
+        .anima => qwen3.Config.qwen3_0_6b,
+        .sd15, .sdxl, .sensenova, .minimax_h3 => null,
     };
 }
 
@@ -2187,7 +2622,7 @@ pub const Family = enum {
     /// different sigma schedules. Its latent is a pair of streams, its text
     /// encoder is a Qwen3-VL-32B truncated to 50 layers, and it has two decoders
     /// (a ViT3D video VAE and a BigVGAN audio VAE) rather than one. See
-    /// `models/minimax_h3.zig` and VIDEO_PLAN.md.
+    /// `models/minimax_h3.zig`.
     minimax_h3,
     /// SenseNova U1.5, the first family with neither a VAE nor a separate text
     /// encoder. One Qwen3-shaped 8B trunk carries two weight copies per layer:
@@ -2196,6 +2631,15 @@ pub const Family = enum {
     /// matching like krea2, but the head predicts x0 and the initial noise is
     /// scaled by the token count. See `models/sensenova.zig`.
     sensenova,
+    /// Mage-Flow, a 12-block DOUBLE-stream MMDiT: text and image tokens keep
+    /// their own modulation and MLP and meet only inside the attention, which no
+    /// other family here does. It shares krea2's Qwen3-VL-4B checkpoint and even
+    /// its prompt template, but reads ONE normalized final hidden state where
+    /// krea2 reads a 12-layer stack. Its VAE is neither of the two in this tree:
+    /// a one-step diffusion codec at 128 channels and 16x, so a token is one
+    /// latent pixel and the latent format is the identity. See
+    /// `models/mageflow.zig` and `models/mage_vae.zig`.
+    mageflow,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -2213,7 +2657,7 @@ pub const Family = enum {
     pub fn supportsLora(self: Family) bool {
         return switch (self) {
             .minimax_h3, .sensenova => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => false,
         };
     }
 
@@ -2224,8 +2668,9 @@ pub const Family = enum {
             .krea2, .zimage, .anima, .minimax_h3 => true,
             // SenseNova's canvas is pixels, and it is padded to 32 px per axis by
             // the model itself, so "even" is not the constraint here; `latentShape`
-            // rounds to `tokenPx` instead.
-            .sd15, .sdxl, .sensenova => false,
+            // rounds to `tokenPx` instead. Mage-Flow is patch 1: a token IS a
+            // latent cell, so there is nothing to pack and no parity to keep.
+            .sd15, .sdxl, .sensenova, .mageflow => false,
         };
     }
 
@@ -2234,7 +2679,7 @@ pub const Family = enum {
     pub fn isVideo(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow => false,
         };
     }
 
@@ -2305,6 +2750,48 @@ pub const SdModels = struct {
 /// Z-Image: a denoiser-only checkpoint plus Qwen3-4B and the 16-channel Flux VAE,
 /// each normally in a file of its own, the shape the official ComfyUI template
 /// distributes it in. Structurally krea2's set with two of the three models swapped.
+/// Either codec Mage-Flow's 128-channel 16x latent can be read by.
+///
+/// Mage-VAE was DISTILLED against the Flux 2 VAE's latent space, so the two are
+/// interchangeable here: same space, unrelated architectures. Which one a file holds
+/// is read off the file, and a workflow is as likely to name one as the other.
+///
+/// Only the distilled codec can ENCODE. `sd_vae` is a decoder, so reference images
+/// (Mage-Flow-EDIT) need that arm; text-to-image works through either.
+pub const MageFlowVae = union(enum) {
+    /// `models/mage_vae.zig`: the one-step diffusion codec, natively 128ch at 16x.
+    distilled: mage_vae.MageVae,
+    /// Flux 2's `AutoencoderKL`, 32ch at 8x under `sd_vae.PackedLatent`'s 2x2 fold.
+    anchor: sd_vae.Decoder,
+
+    pub fn deinit(self: *MageFlowVae) void {
+        switch (self.*) {
+            inline else => |*v| v.deinit(),
+        }
+    }
+};
+
+/// Mage-Flow: three separate files, like Z-Image. The encoder is krea2's
+/// Qwen3-VL-4B checkpoint read at a different tap, and the decoder is either
+/// codec for its latent space (`MageFlowVae`).
+pub const MageFlowModels = struct {
+    tok: tokenizer_mod.Tokenizer,
+    /// Null when that component came out of the primary checkpoint.
+    enc_st: ?Container,
+    enc: qwen3.TextEncoder,
+    dit_st: Container,
+    dit: mageflow.DiT,
+    vae_st: ?Container,
+    vae: MageFlowVae,
+    /// Prefix views, when a component was nested inside its container.
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+    /// The Qwen3-VL-4B vision tower, loaded on first reference use (the edit
+    /// path) and null for text-to-image. It sits inside the TEXT ENCODER's own
+    /// file, beside the language model, so it costs nothing to skip.
+    vit: ?minimax_h3_vit.Vit = null,
+};
+
 pub const ZImageModels = struct {
     tok: tokenizer_mod.Tokenizer,
     /// Null when that component came out of the primary checkpoint.
@@ -2347,10 +2834,9 @@ pub const AnimaModels = struct {
 /// MiniMax H3: a 21 GB int8 DiT, a Qwen3-VL-32B encoder truncated to 50 layers,
 /// and TWO decoders, because the latent is a pair of streams.
 ///
-/// Being built out; see VIDEO_PLAN.md for the staging. Today this carries only
-/// what the denoiser checkpoint states about itself, which is what
-/// `Session.latentShape` needs to size a render. The trunk, the encoder and the
-/// two VAEs land on top of it.
+/// Being built out. Today this carries only what the denoiser checkpoint states
+/// about itself, which is what `Session.latentShape` needs to size a render. The
+/// trunk, the encoder and the two VAEs land on top of it.
 pub const MiniMaxH3Models = struct {
     /// Qwen2 BPE, the same vocabulary krea2 and Z-Image use. H3's presentation is
     /// NOT chat-templated: raw prompt text with vision blocks spliced in.
@@ -2409,6 +2895,7 @@ pub const Models = union(Family) {
     anima: AnimaModels,
     minimax_h3: MiniMaxH3Models,
     sensenova: SenseNovaModels,
+    mageflow: MageFlowModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -2485,6 +2972,23 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const gen = std.fmt.bufPrint(&b2, "{s}" ++ sensenova_gen_probe, .{pfx}) catch continue;
         if (store.get(vis) != null and store.get(gen) != null) return .sensenova;
     }
+    // Mage-Flow, and this is ComfyUI's own test, WIDTHS INCLUDED: `txt_norm` plus
+    // `proj_out` is the Qwen-Image family, and only the pair of widths separates
+    // Mage-Flow (2560 / 128) from Qwen-Image itself (3584 / 64). Probing the
+    // names alone would load a Qwen-Image checkpoint as Mage-Flow, which is not
+    // supported here, and report it as a missing tensor rather than as the
+    // architecture it is.
+    for ((componentSpec(.mageflow, .denoiser) catch unreachable).prefixes) |pfx| {
+        var b1: [96]u8 = undefined;
+        var b2: [96]u8 = undefined;
+        const tn = std.fmt.bufPrint(&b1, "{s}" ++ mageflow.probe, .{pfx}) catch continue;
+        const po = std.fmt.bufPrint(&b2, "{s}proj_out.weight", .{pfx}) catch continue;
+        const tv = store.get(tn) orelse continue;
+        const pv = store.get(po) orelse continue;
+        const ts = tv.info.shape.slice();
+        const ps = pv.info.shape.slice();
+        if (ts.len >= 1 and ts[0] == mageflow.txt_dim and ps.len >= 1 and ps[0] == mageflow.channels) return .mageflow;
+    }
     return error.UnknownArchitecture;
 }
 
@@ -2493,7 +2997,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => unreachable,
     };
 }
 
@@ -2534,9 +3038,43 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
             .conditioner => "models/text_encoders/qwen_3_06b_base.safetensors",
             else => "",
         },
+        // Mage-Flow's encoder is krea2's Qwen3-VL-4B file, and its decoder the
+        // Mage-VAE, which nothing else here reads.
+        .mageflow => switch (comp) {
+            .conditioner => "models/text_encoders/qwen3vl_4b_bf16.safetensors",
+            .decoder => "models/vae/mage_flow_vae_bf16.safetensors",
+            else => "",
+        },
         else => "",
     };
 }
+
+/// Mage-Flow's `sampling_settings.shift`, from ComfyUI's `MageFlow`.
+pub const mageflow_shift: f32 = 6.0;
+
+/// Planar `[c][n]` -> channel-last `[n][c]`, the layout `mage_vae` works in.
+/// The sampler is planar for every family; only this codec's grid is not.
+fn planarToInterleaved(gpa: std.mem.Allocator, planar: []const f32, c: usize, n: usize) ![]f32 {
+    std.debug.assert(planar.len == c * n);
+    const out = try gpa.alloc(f32, planar.len);
+    for (0..c) |ci| {
+        const plane = planar[ci * n ..][0..n];
+        for (plane, 0..) |v, i| out[i * c + ci] = v;
+    }
+    return out;
+}
+
+/// The inverse, for a latent coming back out of `mage_vae.encode`.
+fn interleavedToPlanar(gpa: std.mem.Allocator, inter: []const f32, c: usize, n: usize) ![]f32 {
+    std.debug.assert(inter.len == c * n);
+    const out = try gpa.alloc(f32, inter.len);
+    for (0..c) |ci| {
+        const plane = out[ci * n ..][0..n];
+        for (plane, 0..) |*v, i| v.* = inter[i * c + ci];
+    }
+    return out;
+}
+
 
 /// The sigma-schedule shift a family was trained with, for a caller that did not ask
 /// for one. The SD arm's value is unused, its ladder comes from the betas, and is
@@ -2555,6 +3093,9 @@ pub fn defaultShift(fam: Family) f32 {
         // the model (`minimax_h3.timeShiftSigma`), so it is not a schedule knob.
         .minimax_h3 => minimax_h3.shift_video,
         .sensenova => sensenova.default_shift,
+        // ComfyUI's `MageFlow.sampling_settings`, and far higher than any other
+        // family's here.
+        .mageflow => mageflow_shift,
         .sd15, .sdxl => sampler.default_shift,
     };
 }
@@ -2568,7 +3109,7 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // hidden state, so there is no fixed token window to interpolate a weight
         // in. Its presentation is not even chat-templated, it is raw prompt text
         // with vision blocks spliced in, so there is nothing to anchor against.
-        .krea2, .zimage, .minimax_h3 => qwen3.TextEncoder.supports_prompt_weights,
+        .krea2, .zimage, .minimax_h3, .mageflow => qwen3.TextEncoder.supports_prompt_weights,
         // True, where the other Qwen3-conditioned families are false, and the
         // difference is structural rather than a judgement call. krea2 and Z-Image
         // weight the *encoder's* tap states, which have no fixed token window to
@@ -2618,6 +3159,37 @@ pub const Session = struct {
     lora: ?lora_mod.Stack = null,
 
     /// The loaded family. Shorthand for `@as(Family, self.models)`.
+    /// How the denoiser's block linears are stored, for the block's `Weight dtype`.
+    ///
+    /// "Most of them", not "all": quantization here is per WEIGHT, so one checkpoint
+    /// can mix formats block by block. A reader wants one tag, and the
+    /// majority is a truer summary than whichever weight happened to be first.
+    /// Empty for the families with no device linear list (the SD UNets, H3).
+    pub fn weightDtype(self: *const Session) []const u8 {
+        const lins: []const ops.matmul.Weight = switch (self.models) {
+            .krea2 => |*m| m.dit.device_lins,
+            .zimage => |*m| m.dit.device_lins,
+            .anima => |*m| m.dit.device_lins,
+            .mageflow => |*m| m.dit.device_lins,
+            .sensenova => |*m| m.dit.device_lins,
+            .sd15, .sdxl, .minimax_h3 => &.{},
+        };
+        if (lins.len == 0) return "";
+        var best = lins[0].dtype;
+        var best_n: usize = 0;
+        for (std.enums.values(@TypeOf(best))) |dt| {
+            var n: usize = 0;
+            for (lins) |w| {
+                if (w.dtype == dt) n += 1;
+            }
+            if (n > best_n) {
+                best_n = n;
+                best = dt;
+            }
+        }
+        return @tagName(best);
+    }
+
     pub fn family(self: *const Session) Family {
         return self.models;
     }
@@ -2637,7 +3209,7 @@ pub const Session = struct {
     /// type, so every shared stage binds this once and needs no further family test.
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova => null,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -2653,6 +3225,7 @@ pub const Session = struct {
             .anima => |*m| m.dit_st.store(),
             .minimax_h3 => |*m| m.dit_st.store(),
             .sensenova => |*m| m.dit_st.store(),
+            .mageflow => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
@@ -2724,7 +3297,7 @@ pub const Session = struct {
         switch (self.models) {
             .minimax_h3 => |*m| m.dit.detachLora(),
             .sensenova => |*m| m.dit.lora = null,
-            .krea2, .zimage, .anima, .sd15, .sdxl => {},
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => {},
         }
     }
 
@@ -2790,7 +3363,7 @@ pub const Session = struct {
             // Vulkan and host arms would still need their own funnels. Refusing
             // beats a render that ignores the file on three of four backends.
             // `familySupportsLora` is the same list, and a UI asks it first.
-            .krea2, .zimage, .anima, .sd15, .sdxl => {
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => {
                 std.log.err("lora: the {t} family has no sidecar path in this build", .{self.family()});
                 return error.UnsupportedCheckpoint;
             },
@@ -2820,6 +3393,7 @@ pub const Session = struct {
             .anima => |*m| m.dit_st.payloadLen(),
             .minimax_h3 => |*m| m.dit_st.payloadLen(),
             .sensenova => |*m| m.dit_st.payloadLen(),
+            .mageflow => |*m| m.dit_st.payloadLen(),
             .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
@@ -2847,6 +3421,7 @@ pub const Session = struct {
             if (gpu_mod.Context.init(gpa, io)) |ctx| {
                 self.gpu_ctx = ctx;
                 ctx.budget_override = opts.vram_budget;
+                ctx.min_weights = opts.vram_min_weights;
                 ops.matmul.gpu_dispatch = .{ .ctx = ctx, .call = gpuMatmulThunk };
                 try note(progress, "gpu: {s}\n", .{ctx.deviceName()});
                 if (progress) |w| try ctx.writeCoopStatus(w);
@@ -2867,6 +3442,7 @@ pub const Session = struct {
             if (res) |b| {
                 self.cu_be = b;
                 b.budget_override = opts.vram_budget;
+                b.min_weights = opts.vram_min_weights;
                 if (opts.backend == .cuda) {
                     const L = b.libs.?;
                     try note(progress, "cuda ({s}): cublasLt {d}, cuDNN {d}\n", .{ b.deviceName(), L.lt.cublasLtGetVersion(), L.dnn.cudnnGetVersion() });
@@ -2987,6 +3563,55 @@ pub const Session = struct {
                 m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux, "");
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .zimage = m };
+            },
+            .mageflow => {
+                var m: MageFlowModels = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try mageflow.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                // The DiT loader detects its own prefix, so the resolver's view is
+                // not needed past this point.
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                // The same Qwen2 BPE vocabulary krea2 and Z-Image use.
+                m.tok = try tokenizer_mod.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+
+                const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
+                m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .mageflow);
+                errdefer m.enc.deinit();
+
+                const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
+                m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                m.vae_view = vae_r.view;
+                // Which codec the file holds, not which one the family prefers.
+                m.vae = if (vae_r.store.get(mage_vae.probe) != null)
+                    .{ .distilled = try mage_vae.MageVae.load(gpa, vae_r.store, "") }
+                else
+                    .{ .anchor = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux2, "") };
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .mageflow = m };
             },
             .anima => {
                 var m: AnimaModels = .{
@@ -3171,7 +3796,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima, .minimax_h3, .sensenova => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => unreachable,
                 };
             },
             // One file, one model: the prompt is encoded by the trunk's own
@@ -3316,6 +3941,13 @@ pub const Session = struct {
         if (self.family() == .sensenova) {
             const fresh = try sensenova.Model.load(self.gpa, store, sensenova.u15_8b);
             const m = &self.models.sensenova;
+            m.dit.deinit();
+            m.dit = fresh;
+            return;
+        }
+        if (self.family() == .mageflow) {
+            const fresh = try mageflow.DiT.load(self.gpa, store);
+            const m = &self.models.mageflow;
             m.dit.deinit();
             m.dit = fresh;
             return;
@@ -3499,6 +4131,20 @@ pub const Session = struct {
                 m.dit_st.deinit();
                 m.tok.deinit();
             },
+            .mageflow => |*m| {
+                if (m.vit) |*v| v.deinit();
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
             .anima => |*m| {
                 m.vae.deinit();
                 m.dit.deinit();
@@ -3586,6 +4232,9 @@ pub const Session = struct {
             // carries the audio latent scaled onto this schedule and the model
             // converts, so there is one table for the pack.
             .minimax_h3 => .{ .discrete_flow = shift },
+            // `ModelSamplingDiscreteFlow` at multiplier 1.0, like Z-Image's; only
+            // the shift differs, and it is large (6.0).
+            .mageflow => .{ .discrete_flow = shift },
             // `SenseNovaModelSampling` subclasses `ModelSamplingDiscreteFlow`, so
             // this is the same 1000-rung table again. Only the default shift
             // differs (3.0), and that is `defaultShift`'s answer, not this one's.
@@ -3650,7 +4299,7 @@ pub const Session = struct {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
-            .krea2, .zimage, .anima, .minimax_h3 => sampler.scaleInitialNoise(x, sigma0),
+            .krea2, .zimage, .anima, .minimax_h3, .mageflow => sampler.scaleInitialNoise(x, sigma0),
             // The one family whose initial noise is not unit variance. Leaving the
             // scale out does not soften the image, it renders noise.
             .sensenova => {
@@ -3675,7 +4324,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova => .flow,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -3694,6 +4343,7 @@ pub const Session = struct {
             .minimax_h3 => minimax_h3.latent_channels,
             // Not a latent: SenseNova's canvas is the RGB image itself.
             .sensenova => sensenova.latent_channels,
+            .mageflow => mageflow.channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -3716,6 +4366,8 @@ pub const Session = struct {
             // pads it to 32 px per axis itself and crops the velocity back, so any
             // extent renders.
             .sensenova => sensenova.spatial_scale,
+            // 16, and it is the VAE's patch: one latent cell is one 16x16 tile.
+            .mageflow => mage_vae.spatial_scale,
         };
     }
 
@@ -3786,6 +4438,7 @@ pub const Session = struct {
             // Not an approximation: the canvas IS the image, so the preview is the
             // decode.
             .sensenova => sensenova.canvasToRgb(rgb_out, z, h * w),
+            .mageflow => mage_vae.latentPreviewInto(rgb_out, z, h, w),
             .sd15 => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
             .sdxl => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
         }
@@ -4121,6 +4774,7 @@ pub const Session = struct {
                 @memcpy(data, full[offset * row ..][0 .. seq * row]);
                 return .{ .data = data, .seq = seq };
             },
+            .mageflow => |*m| return self.encodeMageFlow(gpa, m, text, o),
             .sd15 => |*m| {
                 var p = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
                 defer p.deinit(gpa);
@@ -4262,7 +4916,7 @@ pub const Session = struct {
         // Vulkan still has no deepstack or mrope path, so say so rather than
         // silently producing a conditioning with no vision in it.
         std.log.warn(
-            "minimax_h3: a vision-conditioned encode runs on the CPU ({d} blocks); " ++
+            "a vision-conditioned encode runs on the CPU ({d} blocks); " ++
                 "only the CUDA encoder has a deepstack/mrope path",
             .{vision.blocks.len},
         );
@@ -4524,9 +5178,28 @@ pub const Session = struct {
         lat_w: usize,
         sigmas: []const f32,
     ) !Denoiser {
+        return self.denoiserWithRefs(gpa, cond_pos, cond_neg, cfg, lat_h, lat_w, sigmas, &.{});
+    }
+
+    /// `denoiser` plus Mage-Flow-Edit's reference latents, which have to arrive
+    /// HERE rather than being assigned afterwards: they set the image token
+    /// count, so the RoPE table and every device buffer are sized from them.
+    /// Every other family ignores them. `mageflowRefLatents` builds them and the
+    /// caller owns them; they must outlive the denoiser.
+    pub fn denoiserWithRefs(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        cond_pos: Cond,
+        cond_neg: ?Cond,
+        cfg: f32,
+        lat_h: usize,
+        lat_w: usize,
+        sigmas: []const f32,
+        mf_refs: []const mageflow.Ref,
+    ) !Denoiser {
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
-        // Not built yet (VIDEO_PLAN.md): H3's sampler steps a TWO-STREAM latent
+        // Not built yet: H3's sampler steps a TWO-STREAM latent
         // (video and audio together, on schedules related by the audio carry),
         // and nothing allocates or steps one. Refuse by name here, because the
         // arms below end in a krea2 fallthrough that would otherwise reach
@@ -4540,6 +5213,7 @@ pub const Session = struct {
             .cfg = cfg,
             .cond_pos = cond_pos,
             .cond_neg = cond_neg,
+            .mf_refs = mf_refs,
         };
         errdefer d.deinit(gpa);
 
@@ -4612,6 +5286,53 @@ pub const Session = struct {
                 d.sd_vk_ws = try sd_unet_gpu.Workspace.init(gpa, gc, &m.unet, lat_h, lat_w, seq_cap_sd);
             } else {
                 d.sd_ws = try sd_unet.Workspace.init(gpa, &m.unet, lat_h, lat_w, seq_cap_sd);
+            }
+            return d;
+        }
+
+        if (self.family() == .mageflow) {
+            const m = &self.models.mageflow;
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, mageflow.channels * lat_h * lat_w);
+            // The reference latents have to be in place before the sessions are
+            // built: they set the token count, the RoPE table and every buffer
+            // size. `generate` assigns them before this call for that reason; a
+            // caller driving the stages does the same.
+            if (self.cu_be) |b| {
+                if (mageflow_cuda.supported(&m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    var n_tok = lat_h * lat_w;
+                    for (d.mf_refs) |r| n_tok += r.h * r.w;
+                    d.mf_cu = try mageflow_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, d.mf_refs, sigmas);
+                    if (cond_neg) |cn| {
+                        // Both branches must present the same image tokens, or
+                        // the two passes would attend over different sequences
+                        // and the guidance would mix two geometries. ComfyUI
+                        // puts the same references on both; only the
+                        // instruction differs, so only `seq_txt` may.
+                        d.mf_cu_neg = try mageflow_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cn.data, cn.seq, d.mf_refs, sigmas);
+                    }
+                    // Sized for the LONGER of the two text halves, since one
+                    // workspace serves both branches.
+                    const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.mf_cu_ws = try mageflow_cuda.Workspace.init(b, &m.dit, seq_txt_cap, n_tok);
+                } else {
+                    std.log.warn("Mage-Flow: this checkpoint's weight dtype has no CUDA GEMM path; " ++
+                        "the trunk runs on the CPU. Expect CPU sampling speed.", .{});
+                }
+            } else if (self.gpu_ctx) |gc| {
+                if (mageflow_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    var n_tok = lat_h * lat_w;
+                    for (d.mf_refs) |r| n_tok += r.h * r.w;
+                    d.mf_vk = try mageflow_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, d.mf_refs, sigmas);
+                    if (cond_neg) |cn| {
+                        d.mf_vk_neg = try mageflow_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn.data, cn.seq, d.mf_refs, sigmas);
+                    }
+                    const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.mf_vk_ws = try mageflow_gpu.Workspace.init(gc, &m.dit, seq_txt_cap, n_tok);
+                }
             }
             return d;
         }
@@ -5045,6 +5766,9 @@ pub const Session = struct {
         /// The CUDA trunk, when this checkpoint and backend support it.
         cu: ?minimax_h3_cuda.Session = null,
         cu_ws: ?minimax_h3_cuda.Workspace = null,
+        /// The Vulkan trunk, same condition on the other backend.
+        vk: ?minimax_h3_gpu.Session = null,
+        vk_ws: ?minimax_h3_gpu.Workspace = null,
         /// `[text_len][hidden]`, through `condition_proj` and the token refiner.
         text: []f32,
         /// Patchified reference condition rows, BORROWED from the conditioning
@@ -5067,6 +5791,10 @@ pub const Session = struct {
                 if (self.cu_ws) |*w| w.deinit(b);
                 if (self.cu) |*c| c.deinit(b);
             }
+            if (self.sess.gpu_ctx) |gc| {
+                if (self.vk_ws) |*w| w.deinit(gc);
+                if (self.vk) |*c| c.deinit(gc);
+            }
             // `.{}` until `refineText` runs, so an early failure frees nothing.
             if (self.text.len > 0) gpa.free(self.text);
             if (self.ws) |*w| w.deinit(gpa);
@@ -5076,7 +5804,7 @@ pub const Session = struct {
 
         /// Whether the trunk runs on the device for this render.
         pub fn onDevice(self: *const ClipDenoiser) bool {
-            return self.cu != null;
+            return self.cu != null or self.vk != null;
         }
 
         /// One denoiser step over the packed latent.
@@ -5122,6 +5850,20 @@ pub const Session = struct {
                     self.sess.cu_be.?,
                     cu,
                     &self.cu_ws.?,
+                    self.sess.io,
+                    gpa,
+                    &self.layout,
+                    v_out[0..n_v],
+                    v_out[n_v..],
+                    in,
+                    null,
+                );
+            } else if (self.vk) |*vk| {
+                try minimax_h3_gpu.forward(
+                    &m.dit,
+                    self.sess.gpu_ctx.?,
+                    vk,
+                    &self.vk_ws.?,
                     self.sess.io,
                     gpa,
                     &self.layout,
@@ -5186,7 +5928,19 @@ pub const Session = struct {
                     "(int8 convrot only); the trunk runs on the CPU. Expect CPU sampling speed.", .{});
             }
         }
-        if (d.cu == null) d.ws = try minimax_h3.Workspace.init(gpa, m.dit.cfg, &layout);
+        if (d.cu == null) {
+            if (self.gpu_ctx) |gc| {
+                if (minimax_h3_gpu.supported(&m.dit)) {
+                    self.setMemTag(.dit);
+                    d.vk = try minimax_h3_gpu.Session.init(gc, gpa, &m.dit, &layout);
+                    d.vk_ws = try minimax_h3_gpu.Workspace.init(gc, &m.dit, layout.seq_len);
+                } else {
+                    std.log.warn("MiniMax H3: this checkpoint's trunk weights have no Vulkan path " ++
+                        "(int8 convrot only); the trunk runs on the CPU. Expect CPU sampling speed.", .{});
+                }
+            }
+        }
+        if (d.cu == null and d.vk == null) d.ws = try minimax_h3.Workspace.init(gpa, m.dit.cfg, &layout);
 
         // `condition_proj` + the token refiner, once per render rather than per
         // step: the reference does the same in `extra_conds`.
@@ -5199,6 +5953,39 @@ pub const Session = struct {
     ///
     /// Its session and scratch are per WINDOW SHAPE, and the chunking decodes
     /// every window at one shape, so both are built once per clip.
+    /// The Vulkan twin of `DeviceVolume`, same per-window-shape lifetime and the
+    /// same short-window fallback.
+    const VkVolume = struct {
+        gc: *gpu_mod.Context,
+        dec: *const minimax_h3_vae.VideoDecoder,
+        sess: minimax_h3_vae_gpu.Session,
+        ws: minimax_h3_vae_gpu.Workspace,
+
+        fn init(gc: *gpu_mod.Context, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize) !VkVolume {
+            var sess = try minimax_h3_vae_gpu.Session.init(gc, gpa, dec, t, h, w);
+            errdefer sess.deinit(gc);
+            const ws = try minimax_h3_vae_gpu.Workspace.init(gc, dec, sess.seq, sess.grid);
+            return .{ .gc = gc, .dec = dec, .sess = sess, .ws = ws };
+        }
+
+        fn deinit(self: *VkVolume) void {
+            self.ws.deinit(self.gc);
+            self.sess.deinit(self.gc);
+        }
+
+        fn volume(self: *VkVolume) minimax_h3_vae.Volume {
+            return .{ .ctx = self, .call = call };
+        }
+
+        fn call(ctx: *anyopaque, io: std.Io, gpa: std.mem.Allocator, out: []f32, z: []const f32, t: usize, h: usize, w: usize) anyerror!void {
+            const self: *VkVolume = @ptrCast(@alignCast(ctx));
+            if (t * h * w + self.dec.cfg.n_register + 1 != self.sess.seq) {
+                return minimax_h3_vae.decodeVolume(self.dec, io, gpa, out, z, t, h, w);
+            }
+            return minimax_h3_vae_gpu.decodeVolume(self.dec, self.gc, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+        }
+    };
+
     const DeviceVolume = struct {
         be: *cuda.Backend,
         dec: *const minimax_h3_vae.VideoDecoder,
@@ -5964,6 +6751,125 @@ pub const Session = struct {
         return .{ .rows = rows, .audio_t = at };
     }
 
+    /// Load the Qwen3-VL-4B vision tower, once, on first reference use.
+    ///
+    /// Lazy because it is ~550 MB of host memory a text-to-image render never
+    /// reads. It comes out of the TEXT ENCODER's store under `model.visual.`,
+    /// not a file of its own: the VL export puts it beside the language model,
+    /// which sits at `model.language_model.` in the same file.
+    fn mfEnsureVit(self: *Session, gpa: std.mem.Allocator, m: *MageFlowModels) !void {
+        _ = self;
+        if (m.vit != null) return;
+        const enc_store = if (m.enc_st) |*st| st.store() else if (m.enc_view) |v| v.base else m.dit_st.store();
+        var pfx = try weights_mod.Prefixed.init(gpa, enc_store, "model.visual.");
+        defer pfx.deinit(gpa);
+        m.vit = minimax_h3_vit.Vit.load(gpa, pfx.store(), minimax_h3_vit.Config.qwen3vl_4b) catch |err| {
+            std.log.err("mageflow: this text encoder carries no usable `model.visual.` vision tower ({t}); reference images need one", .{err});
+            return error.ComponentNotInCheckpoint;
+        };
+    }
+
+    /// Mage-Flow's conditioning, text-only or with reference pictures.
+    /// `mageflow_text.prepare` owns the presentation; this adds the encode and
+    /// the prefix strip.
+    fn encodeMageFlow(self: *Session, gpa: std.mem.Allocator, m: *MageFlowModels, text: []const u8, o: EncodeOptions) !Cond {
+        const imgs = o.mf_ref_images;
+        var refs: []mageflow_text.RefImage = &.{};
+        defer if (refs.len > 0) gpa.free(refs);
+        if (imgs.len > 0) {
+            try self.mfEnsureVit(gpa, m);
+            refs = try gpa.alloc(mageflow_text.RefImage, imgs.len);
+            for (imgs, refs) |img, *r| r.* = .{ .rgb = img.rgb, .h = img.height, .w = img.width };
+        }
+
+        var cond = try mageflow_text.prepare(
+            gpa,
+            self.io,
+            &m.tok,
+            if (m.vit) |*v| v else null,
+            text,
+            refs,
+            m.enc.cfg.hidden,
+            m.enc.cfg.rope_dims,
+        );
+        defer cond.deinit();
+
+        const full = try self.runQwen3Vision(gpa, &m.enc, cond.ids, cond.vision, o);
+        defer gpa.free(full);
+        // krea2's strip, over krea2's checkpoint, and still a different
+        // conditioning: `Variant.mageflow` taps ONE state (the last, normalized)
+        // where krea2 taps twelve, so `row` is one hidden width rather than
+        // twelve. Read from the encoder so the two cannot disagree.
+        const offset = mageflow_text.stripOffset(cond.ids);
+        const seq_out = cond.ids.len - offset;
+        const row = m.enc.taps.len * m.enc.cfg.hidden;
+        const data = try gpa.alloc(f32, seq_out * row);
+        @memcpy(data, full[offset * row ..][0 .. seq_out * row]);
+        return .{ .data = data, .seq = seq_out };
+    }
+
+    /// VAE-encode each reference at the RENDER's resolution, which is what the
+    /// DiT's reference tokens are: Mage's RoPE aligns reference and target
+    /// content by position, so a reference at a different extent would be
+    /// describing different places. Caller frees with `freeMageFlowRefs`.
+    pub fn mageflowRefLatents(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        imgs: []const RefImage,
+        width: usize,
+        height: usize,
+    ) ![]mageflow.Ref {
+        if (self.family() != .mageflow) return error.FamilyNotImplemented;
+        const m = &self.models.mageflow;
+        const lat_h = height / mage_vae.spatial_scale;
+        const lat_w = width / mage_vae.spatial_scale;
+
+        const out = try gpa.alloc(mageflow.Ref, imgs.len);
+        var done: usize = 0;
+        errdefer {
+            for (out[0..done]) |r| gpa.free(r.lat);
+            gpa.free(out);
+        }
+        for (imgs, out) |img, *ref| {
+            const resized = try gpa.alloc(f32, 3 * height * width);
+            defer gpa.free(resized);
+            if (img.height == height and img.width == width) {
+                @memcpy(resized, img.rgb);
+            } else {
+                image.resizeBicubic(resized, img.rgb, img.height, img.width, height, width);
+            }
+            // `VAE.process_input`: the codec takes [-1, 1], the caller hands [0, 1].
+            for (resized) |*v| v.* = v.* * 2.0 - 1.0;
+            const cl = try planarToInterleaved(gpa, resized, 3, height * width);
+            defer gpa.free(cl);
+            // Only the distilled codec encodes: `sd_vae` is a decoder, so a render
+            // holding the anchor file has no way to turn a reference into a latent.
+            // Refuse by name rather than render an edit that silently ignores its
+            // reference, which is what an empty `Ref` list would do.
+            const vae = switch (m.vae) {
+                .distilled => |*v| v,
+                .anchor => {
+                    std.log.err("mageflow: reference images need the distilled Mage-VAE; the Flux2 anchor VAE ({s}) decodes but cannot encode", .{sd_vae.packed_latent_probe});
+                    return error.ComponentNotInCheckpoint;
+                },
+            };
+            const lat_cl = try vae.encode(self.io, gpa, cl, height, width);
+            defer gpa.free(lat_cl);
+            ref.* = .{
+                .lat = try interleavedToPlanar(gpa, lat_cl, mageflow.channels, lat_h * lat_w),
+                .h = lat_h,
+                .w = lat_w,
+            };
+            done += 1;
+        }
+        return out;
+    }
+
+    pub fn freeMageFlowRefs(gpa: std.mem.Allocator, refs: []const mageflow.Ref) void {
+        for (refs) |r| gpa.free(r.lat);
+        gpa.free(refs);
+    }
+
     /// Load the vision tower and the VAE encoder, once, on first reference use.
     ///
     /// Lazy because between them they are ~350 MB of host memory that a t2va
@@ -6083,9 +6989,9 @@ pub const Session = struct {
         z: []const f32,
         t: usize,
     ) !bool {
-        const be = self.cu_be orelse return false;
         if (std.c.getenv("TP_AUDIO_CPU") != null) return false;
         if (!minimax_h3_audio_cuda.supported(&m.audio)) return false;
+        const be = self.cu_be orelse return self.decodeAudioVk(m, gpa, out, z, t);
         if (m.audio_cu == null) {
             m.audio_cu = minimax_h3_audio_cuda.Session.init(gpa, &m.audio) catch |err| {
                 std.log.warn("minimax_h3_audio_cuda: session build failed ({t}), decoding on the CPU", .{err});
@@ -6105,6 +7011,36 @@ pub const Session = struct {
         minimax_h3_audio_cuda.decode(&m.audio, &m.audio_cu.?, be, &ws, gpa, out, z, t, null) catch |err| {
             if (err == error.Canceled) return err;
             std.log.warn("minimax_h3_audio_cuda: decode failed ({t}), decoding on the CPU", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// The Vulkan arm of `decodeAudioDevice`, same fall-back-to-CPU contract: the
+    /// session is host prep and shared, only the workspace and the kernels differ.
+    fn decodeAudioVk(
+        self: *Session,
+        m: *MiniMaxH3Models,
+        gpa: std.mem.Allocator,
+        out: []f32,
+        z: []const f32,
+        t: usize,
+    ) !bool {
+        const gc = self.gpu_ctx orelse return false;
+        if (m.audio_cu == null) {
+            m.audio_cu = minimax_h3_audio_gpu.Session.init(gpa, &m.audio) catch |err| {
+                std.log.warn("minimax_h3_audio_gpu: session build failed ({t}), decoding on the CPU", .{err});
+                return false;
+            };
+        }
+        var ws = minimax_h3_audio_gpu.Workspace.init(gc, &m.audio, t) catch |err| {
+            std.log.warn("minimax_h3_audio_gpu: workspace failed ({t}), decoding on the CPU", .{err});
+            return false;
+        };
+        defer ws.deinit(gc);
+        minimax_h3_audio_gpu.decode(&m.audio, &m.audio_cu.?, gc, &ws, gpa, out, z, t, null) catch |err| {
+            if (err == error.Canceled) return err;
+            std.log.warn("minimax_h3_audio_gpu: decode failed ({t}), decoding on the CPU", .{err});
             return false;
         };
         return true;
@@ -6160,6 +7096,19 @@ pub const Session = struct {
                 dev = try DeviceVolume.init(b, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells));
             }
         }
+        var vdev: ?VkVolume = null;
+        defer if (vdev) |*d| d.deinit();
+        if (dev == null) {
+            if (self.gpu_ctx) |gc| {
+                if (std.c.getenv("TP_VAE_NAIVE") != null) minimax_h3_vae_gpu.force_naive_attn = true;
+                if (minimax_h3_vae_gpu.supported(&m.vae)) {
+                    const sp: minimax_h3_vae.Spatial = .{ .ratio = vcfg.patch };
+                    const cells = sp.tile / sp.ratio;
+                    const win = @min(tp.chunkSize() + tp.tokenOverlap(), shape.t + tp.plan(shape.t).pad_tokens);
+                    vdev = try VkVolume.init(gc, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells));
+                }
+            }
+        }
         // The VAE and the DiT compute the clip length independently; if they ever
         // disagree the render has more or fewer frames than the model generated.
         std.debug.assert(frames == self.pixelFrames(shape));
@@ -6175,7 +7124,7 @@ pub const Session = struct {
             shape.t,
             shape.h,
             shape.w,
-            if (dev) |*d| d.volume() else null,
+            if (dev) |*d| d.volume() else if (vdev) |*d| d.volume() else null,
         );
 
         const t_vid = std.Io.Clock.real.now(io).nanoseconds;
@@ -6245,7 +7194,7 @@ pub const Session = struct {
         const gpa = self.gpa;
         const io = self.io;
 
-        // Not built yet (VIDEO_PLAN.md): H3 decodes through TWO VAEs, a ViT3D
+        // Not built yet: H3 decodes through TWO VAEs, a ViT3D
         // video one and a BigVGAN audio one, and returns a `Clip` rather than an
         // `Image`. Neither is loaded, so refuse by name rather than fall through
         // to a decoder that would read this latent as a still.
@@ -6298,6 +7247,66 @@ pub const Session = struct {
             errdefer gpa.free(rgb);
             sensenova.canvasToRgb(rgb, latent, lat_h * lat_w);
             return .{ .rgb = rgb, .width = lat_w, .height = lat_h };
+        }
+
+        // Mage-Flow. `latent_formats.Flux2.process_out` is the IDENTITY, so there
+        // is no denormalization at all, and the codec does not tile: its heavy
+        // half is per latent cell and is banded inside `mage_vae.decode`, so a
+        // whole-image decode is already bounded. `decodePlanar`'s ladder would
+        // have nothing to recover from and its tiles would cut the CoD decoder's
+        // 32x32 attention windows.
+        if (self.family() == .mageflow) {
+            const m = &self.models.mageflow;
+            if (latent.len != mageflow.channels * lat_h * lat_w) return error.LatentSizeMismatch;
+            self.setMemTag(.vae);
+            try note(progress, "decoding latent...\n", .{});
+            const dec_start = std.Io.Clock.real.now(io);
+            const width = lat_w * mage_vae.spatial_scale;
+            const height = lat_h * mage_vae.spatial_scale;
+            const out: Image = switch (m.vae) {
+                .distilled => |*v| blk: {
+                    const z = try planarToInterleaved(gpa, latent, mageflow.channels, lat_h * lat_w);
+                    defer gpa.free(z);
+                    const rgb_f32 = if (self.cu_be) |b|
+                        try mage_vae_cuda.decode(v, b, io, gpa, z, lat_h, lat_w, o.cancel)
+                    else if (self.gpu_ctx) |gc|
+                        try mage_vae_gpu.decode(v, gc, io, gpa, z, lat_h, lat_w, o.cancel)
+                    else
+                        try v.decode(io, gpa, z, lat_h, lat_w);
+                    defer gpa.free(rgb_f32);
+                    break :blk .{
+                        .rgb = try image.interleavedF32ToRgb8(gpa, rgb_f32, width, height),
+                        .width = width,
+                        .height = height,
+                    };
+                },
+                // The anchor is an ordinary `AutoencoderKL` once the 2x2 fold is
+                // undone, so it takes `decodePlanar`'s whole ladder (free VRAM and
+                // retry, GPU tiles, CPU tiles) rather than the distilled codec's
+                // single banded pass. The fold is host work on a latent-sized
+                // buffer, which is why no device arm needs to know about it.
+                .anchor => |*v| blk: {
+                    const pl = v.packed_latent orelse return error.LatentSizeMismatch;
+                    const x = try pl.unpack(gpa, latent, lat_h, lat_w, v.cfg.z_channels);
+                    defer gpa.free(x);
+                    const planar = try self.decodePlanar(
+                        SdVae{ .vae = v },
+                        x,
+                        lat_h * sd_vae.PackedLatent.fold,
+                        lat_w * sd_vae.PackedLatent.fold,
+                        o,
+                        progress,
+                    );
+                    defer gpa.free(planar);
+                    break :blk .{
+                        .rgb = try image.planarF32ToRgb8(gpa, planar, width, height),
+                        .width = width,
+                        .height = height,
+                    };
+                },
+            };
+            try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
+            return out;
         }
 
         if (self.family() == .zimage) {
@@ -6628,6 +7637,8 @@ pub const Session = struct {
         // sets it from what the resident LLM currently holds, which varies.
         if (gpu_ctx) |ctx| ctx.budget_override = opts.vram_budget;
         if (cu_be) |b| b.budget_override = opts.vram_budget;
+        if (gpu_ctx) |ctx| ctx.min_weights = opts.vram_min_weights;
+        if (cu_be) |b| b.min_weights = opts.vram_min_weights;
         // Don't pin the transient text encoder (Stage 1): its weights are only
         // needed for this image's encode, so they should cycle out. Pinning is
         // armed for the DiT below (after encode), so the DiT stays resident
@@ -6659,6 +7670,7 @@ pub const Session = struct {
             .steps = nsteps,
             .cancel = opts.cancel,
             .sn_ref_images = opts.sn_ref_images,
+            .mf_ref_images = opts.mf_ref_images,
         };
         var cond_pos = try self.encode(gpa, opts.prompt, enc_opts);
         defer cond_pos.deinit(gpa);
@@ -6706,7 +7718,13 @@ pub const Session = struct {
             };
             const evictable = b.evictableWeightBytes();
             const room = free_now + evictable;
-            const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
+            // `min` asks for no resident weights at all, and a pin is exactly the
+            // thing eviction cannot undo, so it pins nothing however much room the
+            // card has. Without this the DiT pins on a big card and `min` reports
+            // the whole model resident.
+            const budget = if (opts.vram_min_weights)
+                0
+            else if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
             // `pin_budget` is a TOTAL cap (`pinNew` tests
             // `pinned_bytes + size > pin_budget`), but `room` is what is ADDITIONALLY
@@ -6825,50 +7843,68 @@ pub const Session = struct {
             const v = try gpa.alloc(f32, lat_len);
             defer gpa.free(v);
 
-            // The higher-order sampler's per-render state (multistep history + the
-            // Brownian noise path). Built HERE, between the initial-noise scaling and
-            // the denoiser, because both orderings matter:
+            // The sampler's per-render state (a multistep history, a Brownian path, a
+            // noise generator, or nothing at all for euler). Built HERE, between the
+            // initial-noise scaling and the denoiser, because both orderings matter:
             //
             //  - After `scaleInitialNoise`: ComfyUI scales the starting latent by
             //    the *unoffset* first sigma (its `noise_scaling` runs before the
             //    sampler function, which offsets a clone), and `init` mutates
-            //    `sigmas[0]`.
+            //    `sigmas[0]` for the SDE samplers.
             //  - Before `self.denoiser(...)`: that precomputes a timestep vector
             //    per schedule entry, so it has to see the offset value or step 0 falls
             //    off its own cache.
-            var sde: ?sampler.SdeStepper = if (opts.sampler.isSde()) try .init(
+            var stepper = try sampler.Stepper.init(
                 gpa,
+                opts.sampler,
                 sigmas,
                 lat_len,
                 self.parameterization(),
                 .{
-                    .eta = opts.sde_eta,
-                    .s_noise = opts.sde_s_noise,
-                    .solver = if (opts.sampler == .dpmpp_2m_sde) .midpoint else .heun,
-                    // ComfyUI seeds the Brownian path from the render's own seed
+                    .eta = opts.eta,
+                    .s_noise = opts.s_noise,
+                    // ComfyUI seeds every sampler's noise from the render's own seed
                     // (`extra_args["seed"]`), the same one that drew the latent.
                     .seed = opts.seed,
-                    // And the same generator, which is the half that is easy to miss:
-                    // A1111's pinned k-diffusion builds the tree on the CUDA tensor's
-                    // device, so its per-node draws are Philox too. Wiring only the
-                    // initial latent would have made euler reproduce and left every SDE
+                    // The generator that drew the latent, which each sampler turns into
+                    // its own (`sampler.stepNoiseSource`) rather than using directly:
+                    // ComfyUI forces the SDE samplers' tree to the CPU and leaves the
+                    // ancestral draw on the latent's device. Wiring only the initial
+                    // latent would have made euler reproduce and left every stochastic
                     // render wrong, with nothing failing.
-                    .noise_src = self.compat.noise_src,
+                    .latent_noise_src = self.compat.noise_src,
                 },
                 shift,
-            ) else null;
-            defer if (sde) |*s| s.deinit();
-            // Restore the multistep history on a resume, or the first step after it is
-            // silently first-order (see `Snapshot.sde_old_denoised`).
-            if (sde) |*s| if (opts.resume_from) |r| if (r.sde_old_denoised) |old| {
-                if (old.len == lat_len) s.restore(old, r.sde_h_last);
-            };
+            );
+            defer stepper.deinit();
+            // Rebuild what a resume needs: the multistep history for an SDE stepper,
+            // the position in the noise sequence for the ancestral one. Both are
+            // silent when missed, see `Stepper.resumeFrom`.
+            if (opts.resume_from) |r| stepper.resumeFrom(@min(r.step, nsteps), blk: {
+                const prev = r.hist_denoised orelse break :blk null;
+                if (prev.len != lat_len) break :blk null;
+                break :blk .{
+                    .prev = prev,
+                    .prev2 = if (r.hist_denoised2) |p2| (if (p2.len == lat_len) p2 else null) else null,
+                    .h = r.hist_h,
+                    .h2 = r.hist_h2,
+                };
+            });
 
             // The per-image denoiser: text fusion, rope table, timestep vectors and
             // activation workspace, built once here (they depend on the prompt +
             // resolution) and reused every step. The DiT WEIGHTS stay cached in the
             // backend across images, independently of this.
-            var den = try self.denoiser(gpa, cond_pos, cond_neg, opts.cfg, lat_h, lat_w, sigmas);
+            // Mage-Flow-Edit's reference LATENTS, BEFORE the denoiser: they set
+            // the image token count, so every buffer and the RoPE table are
+            // sized from them. The same references go on both CFG branches.
+            const mf_refs: []const mageflow.Ref = if (self.family() == .mageflow and opts.mf_ref_images.len > 0)
+                try self.mageflowRefLatents(gpa, opts.mf_ref_images, lat_w * mage_vae.spatial_scale, lat_h * mage_vae.spatial_scale)
+            else
+                &.{};
+            defer if (mf_refs.len > 0) freeMageFlowRefs(gpa, mf_refs);
+
+            var den = try self.denoiserWithRefs(gpa, cond_pos, cond_neg, opts.cfg, lat_h, lat_w, sigmas, mf_refs);
             defer den.deinit(gpa);
 
             // A preview can be produced this run when there's a step hook AND
@@ -6938,6 +7974,24 @@ pub const Session = struct {
                 } else |err| try note(progress, "taew2_1 open failed ({t}); latent2rgb preview\n", .{err});
             };
 
+            // What a second-order sampler calls for its own mid-step forward, at a
+            // sigma that is not on the schedule. Every device session computes the
+            // timestep for a sigma it has no cached entry for, so this is exact and
+            // not merely accepted; `step` is the A1111 per-step prompt variant, which
+            // the probe shares with the step it belongs to.
+            const StepModel = struct {
+                den: *Denoiser,
+                gpa: std.mem.Allocator,
+                step: usize,
+                cancel: ?*std.atomic.Value(bool),
+
+                fn predict(ctx: *anyopaque, v_out: []f32, x_in: []const f32, sigma: f32) anyerror!void {
+                    const sm: *@This() = @ptrCast(@alignCast(ctx));
+                    return sm.den.predictAt(sm.gpa, v_out, x_in, sigma, sm.step, sm.cancel);
+                }
+            };
+            var step_model: StepModel = .{ .den = &den, .gpa = gpa, .step = 0, .cancel = opts.cancel };
+
             const sampling_start = std.Io.Clock.real.now(io);
             const start_step = if (opts.resume_from) |r| @min(r.step, nsteps) else 0;
             for (start_step..nsteps) |i| {
@@ -6951,16 +8005,20 @@ pub const Session = struct {
                     // input to step `i` (the checkpoint runs before the forward).
                     .unload => {
                         if (opts.suspend_out) |so| {
+                            // A multistep sampler's history is part of the state a
+                            // bit-identical resume needs; null for the others, whose
+                            // state `resumeFrom` rebuilds from the step index alone.
+                            const hist = stepper.history();
                             so.* = .{
                                 .latent = try gpa.dupe(f32, x),
                                 .step = i,
-                                // A multistep sampler's history is part of the state a
-                                // bit-identical resume needs; null for euler.
-                                .sde_old_denoised = if (sde) |*s|
-                                    (if (s.have_old) try gpa.dupe(f32, s.old_denoised) else null)
+                                .hist_denoised = if (hist) |h| try gpa.dupe(f32, h.prev) else null,
+                                .hist_denoised2 = if (hist) |h|
+                                    (if (h.prev2) |p2| try gpa.dupe(f32, p2) else null)
                                 else
                                     null,
-                                .sde_h_last = if (sde) |*s| s.h_last else 0,
+                                .hist_h = if (hist) |h| h.h else 0,
+                                .hist_h2 = if (hist) |h| h.h2 else 0,
                             };
                             return error.Paused;
                         }
@@ -6969,7 +8027,8 @@ pub const Session = struct {
                 };
                 const start = std.Io.Clock.real.now(io);
                 try den.predictAt(gpa, v, x, sigmas[i], i, opts.cancel);
-                if (sde) |*s| try s.step(x, v, i) else sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
+                step_model.step = i;
+                try stepper.step(x, v, sigmas, i, .{ .ctx = &step_model, .predictFn = StepModel.predict });
                 const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
                 try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.3}s)\n", .{ i + 1, nsteps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
                 // The magnitudes the step ran on, when asked. A render that comes out
@@ -7006,13 +8065,14 @@ pub const Session = struct {
                         // x - sigma_{i+1}*v (collapses to x on the final step where
                         // sigma_{i+1}==0).
                         //
-                        // That reconstruction is only valid for an Euler step. An SDE
-                        // stepper's latent is not `x_i + dt*v` (it has an exponential
-                        // drift term and injected noise), so reading the estimate back
-                        // out of it would preview a differently-scaled image that
-                        // *looks* plausible. It keeps the same quantity to hand.
-                        const x0: []const f32 = if (sde) |*s|
-                            s.denoised
+                        // That reconstruction is only valid for an Euler step. Every
+                        // other sampler's latent is not `x_i + dt*v` (it lands short of
+                        // the next sigma, or carries an exponential drift term, and
+                        // then has noise added), so reading the estimate back out of it
+                        // would preview a differently-scaled image that *looks*
+                        // plausible. Each keeps the same quantity to hand.
+                        const x0: []const f32 = if (stepper.denoised()) |d|
+                            d
                         else if (preview_x0) |px0| blk: {
                             const s_next = sigmas[i + 1];
                             for (px0, x, v) |*o, xi, vi| o.* = xi - s_next * vi;
@@ -7062,6 +8122,8 @@ pub const Session = struct {
             .reclaim = opts.reclaim,
         }, progress);
         errdefer img.deinit(gpa);
+        img.shift = self.resolvedShift(opts);
+        img.weight_dtype = self.weightDtype();
         try note(progress, "total time {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - total_start.nanoseconds)) / 1e9});
         return img;
     }
@@ -7155,8 +8217,8 @@ test "the live preview follows the family's own latent format" {
     defer gpa.free(rgb);
 
     var sess: Session = init_defaults.of(Session);
-    var prev: [7][]u8 = undefined;
-    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3, Family.sensenova }, 0..) |fam, fi| {
+    var prev: [8][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3, Family.sensenova, Family.mageflow }, 0..) |fam, fi| {
         sess.models = switch (fam) {
             .krea2 => .{ .krea2 = undefined },
             .sd15 => .{ .sd15 = undefined },
@@ -7165,6 +8227,7 @@ test "the live preview follows the family's own latent format" {
             .anima => .{ .anima = undefined },
             .minimax_h3 => .{ .minimax_h3 = undefined },
             .sensenova => .{ .sensenova = undefined },
+            .mageflow => .{ .mageflow = undefined },
         };
         const ch: usize = switch (fam) {
             .krea2 => wan_vae.latent_channels,
@@ -7172,6 +8235,7 @@ test "the live preview follows the family's own latent format" {
             .anima => anima.latent_channels,
             .minimax_h3 => minimax_h3.latent_channels,
             .sensenova => sensenova.latent_channels,
+            .mageflow => mageflow.channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };
         // Exactly the family's channel count, a read one plane past the end is an

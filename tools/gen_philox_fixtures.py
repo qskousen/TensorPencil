@@ -24,7 +24,7 @@ Two fixture groups:
 under NumPy's promotion rules, so `box_muller` runs in f64 with f32-rounded constants and
 narrows once at the end. curand's device code is f32 throughout and uses the `__sincosf`
 intrinsic. The two agree to ~1e-6 relative, which is far below the 1.3e-4 model-level
-disagreement CLAUDE.md already measures the render against — but it means this fixture
+disagreement the render is already measured against, but it means this fixture
 pins A1111's **NV** path bit-exactly and its **GPU** path only closely.
 
 Usage (any env with numpy):

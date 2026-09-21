@@ -418,7 +418,7 @@ export fn gemv_q1_0_sg() callconv(.spirv_kernel) void {
 }
 
 // q2_0: f16 d + 2 bits per weight, v = (code - 1) * d. Two block geometries
-// share one ggml type id and differ only in elements per block (see BACKEND.md);
+// share one ggml type id and differ only in elements per block;
 // `wide` is the 128-element one, so the block is 34 B rather than 18 B and a
 // lane takes four elements instead of two.
 inline fn q2_0Body(comptime wide: bool) void {

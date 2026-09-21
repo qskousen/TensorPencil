@@ -106,6 +106,12 @@ pub const Image = struct {
     /// True for an image this client built itself (a saved render reopened
     /// from disk); the host never had it.
     local: bool = false,
+    /// The file this picture lives in will not open. Carried alongside the
+    /// failed status rather than as one, because nothing about it is a render
+    /// that went wrong: there is nothing to report, nothing queued, and nothing
+    /// to try again. The request that made it lived in the PNG, so it cannot be
+    /// made a second time either.
+    missing: bool = false,
     /// This client has everything it will get for this image and has told the
     /// host so, which is when the host frees it. It stays here, and a later
     /// snapshot that does not list it must not take it away.
@@ -237,6 +243,7 @@ pub const Call = struct {
 };
 
 pub const HostErr = struct { code: wire.ErrCode, text: []u8 };
+pub const HostNotice = struct { tone: wire.Tone, text: []u8 };
 pub const PeakUpdate = struct { peak: u64, key: u64 };
 
 pub const Mirror = struct {
@@ -250,6 +257,9 @@ pub const Mirror = struct {
     turns_ended: u64 = 0,
     /// The last error the host reported, until the consumer takes it.
     last_err: ?HostErr = null,
+    /// The last informational notice, until the consumer takes it. One slot, as
+    /// for `last_err`: the notices this carries are seconds apart at least.
+    last_notice: ?HostNotice = null,
     /// A grown diffusion peak to persist, until the consumer takes it.
     diff_peak: ?PeakUpdate = null,
     /// Longest side a preview is fetched at (0 = full size). A view sets it to
@@ -334,6 +344,8 @@ pub const Mirror = struct {
         self.telemetry = .{};
         if (self.last_err) |e| self.gpa.free(e.text);
         self.last_err = null;
+        if (self.last_notice) |n| self.gpa.free(n.text);
+        self.last_notice = null;
         self.transcript_rev += 1;
     }
 
@@ -623,6 +635,11 @@ pub const Mirror = struct {
                 if (self.last_err) |old| gpa.free(old.text);
                 self.last_err = .{ .code = e.code, .text = gpa.dupe(u8, e.text) catch "" };
             },
+            .notice => |n| {
+                log.info("host: {s}", .{n.text});
+                if (self.last_notice) |old| gpa.free(old.text);
+                self.last_notice = .{ .tone = n.tone, .text = gpa.dupe(u8, n.text) catch "" };
+            },
         }
     }
 
@@ -739,6 +756,7 @@ pub const Mirror = struct {
     pub fn markLost(self: *Mirror, id: ImageId, why: []const u8) void {
         const im = self.byId(id) orelse return;
         im.info.status = .failed;
+        im.missing = true;
         freeStr(self.gpa, im.info.failure);
         im.info.failure = dupeStr(self.gpa, why);
         im.rev += 1;
@@ -758,6 +776,13 @@ pub const Mirror = struct {
         const e = self.last_err orelse return null;
         self.last_err = null;
         return e;
+    }
+
+    /// The consumer frees `text`, as for `takeErr`.
+    pub fn takeNotice(self: *Mirror) ?HostNotice {
+        const n = self.last_notice orelse return null;
+        self.last_notice = null;
+        return n;
     }
 
     pub fn takeDiffPeak(self: *Mirror) ?PeakUpdate {
@@ -1125,9 +1150,11 @@ test "the oldest pictures already on disk keep only their thumbnails" {
     m.restorePixels(ids[1], back, 2, 2);
     try testing.expect(!m.byId(ids[1]).?.restorable());
     try testing.expectEqual(@as(u32, 2), m.byId(ids[1]).?.info.width);
-    // A file that will not open takes its picture with it, once.
+    // A file that will not open takes its picture with it, once. It is MISSING,
+    // not failed-and-retryable: nothing was rendered and nothing can be.
     m.markLost(ids[2], "SavedImageMissing");
     try testing.expectEqual(wire.ImageStatus.failed, m.byId(ids[2]).?.status());
+    try testing.expect(m.byId(ids[2]).?.missing);
     try testing.expect(!m.byId(ids[2]).?.restorable());
 }
 

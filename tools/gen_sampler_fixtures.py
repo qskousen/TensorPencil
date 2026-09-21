@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Reference fixtures for DPM++ 2M SDE (Heun and midpoint) — the solver AND its
-Brownian-tree noise source.
+"""Reference fixtures for the stochastic samplers — DPM++ 2M SDE (Heun and midpoint)
+and Euler ancestral — each with its own noise source.
 
-Two tiers, because two very different things need pinning:
+Needs a CUDA device: the ancestral samplers draw on the latent's own device, so a
+CPU-only run would pin the wrong generator (see the `2b` section).
+
+Tiers, because very different things need pinning:
 
   1. **The Brownian tree** (`brownian` key). `torchsde.BrownianTree` as ComfyUI's
      `BrownianTreeNoiseSampler` constructs it, queried on a descending sigma sweep.
@@ -103,14 +106,21 @@ class ToyDenoiser:
 
     def __init__(self, c, model_sampling):
         self.c = c
-        # `sample_dpmpp_2m_sde` reaches for the model_sampling object through this
-        # exact attribute chain, so the stub has to present it.
+        # The samplers reach for the model_sampling object through two DIFFERENT
+        # attribute chains, so the stub has to present both: `sample_dpmpp_2m_sde`
+        # goes through `inner_model.model_patcher.get_model_object`, while
+        # `sample_euler_ancestral`'s CONST dispatch reads
+        # `inner_model.inner_model.model_sampling` directly.
         class _Patcher:
             def get_model_object(self_inner, name):
                 assert name == "model_sampling"
                 return model_sampling
+        class _Innermost:
+            pass
+        _Innermost.model_sampling = model_sampling
         class _Inner:
             model_patcher = _Patcher()
+            inner_model = _Innermost()
         self.inner_model = _Inner()
 
     def __call__(self, x, sigma, **kwargs):
@@ -125,13 +135,101 @@ def trajectory(name, model_sampling, sigmas, solver_type, eta, s_noise):
     sig = torch.tensor(sigmas, dtype=torch.float32)
 
     model = ToyDenoiser(c, model_sampling)
-    fn = kds.sample_dpmpp_2m_sde_heun if solver_type == "heun" else kds.sample_dpmpp_2m_sde
+    fn = {
+        "heun": kds.sample_dpmpp_2m_sde_heun,
+        "midpoint": kds.sample_dpmpp_2m_sde,
+        "3m": kds.sample_dpmpp_3m_sde,
+    }[solver_type]
     out = fn(model, x0.clone(), sig, extra_args={"seed": SEED},
              disable=True, eta=eta, s_noise=s_noise)
     return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
                 solver_type=solver_type, eta=eta, s_noise=s_noise, seed=SEED, n=N,
                 sigmas=[float(v) for v in sig], c=f32_list(c), x0=f32_list(x0),
                 x_out=f32_list(out))
+
+
+def plain_trajectory(name, fn, model_sampling, sigmas, **kw):
+    """A sampler that takes no eta and draws nothing: same shape as `trajectory`, on
+    the CPU, since there is no generator whose device could matter."""
+    torch.manual_seed(0)
+    c = torch.randn(1, 4, 4, 4, dtype=torch.float32)
+    x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32)
+    sig = torch.tensor(sigmas, dtype=torch.float32)
+    out = fn(ToyDenoiser(c, model_sampling), x0.clone(), sig,
+             extra_args={"seed": SEED}, disable=True, **kw)
+    return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
+                eta=0.0, s_noise=1.0, seed=SEED, n=N,
+                sigmas=[float(v) for v in sig], c=f32_list(c), x0=f32_list(x0),
+                x_out=f32_list(out))
+
+
+# --- 2b. The ancestral samplers, on the GPU ---------------------------------------
+#
+# ⚠️ These must run on CUDA. `default_noise_sampler` builds its generator on
+# `x.device`, so a CPU run would pin torch's MT19937 *and* the `seed + 1` the CPU
+# branch applies, neither of which is what a ComfyUI user renders with. The Brownian
+# tree above is the opposite case: ComfyUI forces it to the CPU with `cpu=True`.
+
+
+def ancestral_trajectory(name, model_sampling, sigmas, eta, s_noise):
+    torch.manual_seed(0)
+    c = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    sig = torch.tensor(sigmas, dtype=torch.float32).cuda()
+
+    model = ToyDenoiser(c, model_sampling)
+    # Called through the dispatching entry point, not the `_RF` one: which arm a
+    # family takes is part of what is under test.
+    out = kds.sample_euler_ancestral(model, x0.clone(), sig, extra_args={"seed": SEED},
+                                     disable=True, eta=eta, s_noise=s_noise)
+    return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
+                eta=eta, s_noise=s_noise, seed=SEED, n=N,
+                sigmas=[float(v) for v in sig.cpu()], c=f32_list(c.cpu()), x0=f32_list(x0.cpu()),
+                x_out=f32_list(out.cpu()))
+
+
+def trajectory_2s(name, model_sampling, sigmas, eta, s_noise):
+    """`dpmpp_sde`: two evaluations and a Brownian tree, which ComfyUI forces to the
+    CPU, so this one stays off the GPU like the other tree samplers."""
+    torch.manual_seed(0)
+    c = torch.randn(1, 4, 4, 4, dtype=torch.float32)
+    x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32)
+    sig = torch.tensor(sigmas, dtype=torch.float32)
+    out = kds.sample_dpmpp_sde(ToyDenoiser(c, model_sampling), x0.clone(), sig,
+                               extra_args={"seed": SEED}, disable=True, eta=eta, s_noise=s_noise)
+    return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
+                eta=eta, s_noise=s_noise, seed=SEED, n=N,
+                sigmas=[float(v) for v in sig], c=f32_list(c), x0=f32_list(x0),
+                x_out=f32_list(out))
+
+
+def ancestral2_trajectory(name, fn, model_sampling, sigmas, eta, s_noise):
+    """The two-evaluation ancestral samplers, on CUDA for the same reason as the
+    one-evaluation one: `default_noise_sampler` follows the latent's device."""
+    torch.manual_seed(0)
+    c = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    sig = torch.tensor(sigmas, dtype=torch.float32).cuda()
+    out = fn(ToyDenoiser(c, model_sampling), x0.clone(), sig, extra_args={"seed": SEED},
+             disable=True, eta=eta, s_noise=s_noise)
+    return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
+                eta=eta, s_noise=s_noise, seed=SEED, n=N,
+                sigmas=[float(v) for v in sig.cpu()], c=f32_list(c.cpu()), x0=f32_list(x0.cpu()),
+                x_out=f32_list(out.cpu()))
+
+
+def cuda_randn_seq(draws=4):
+    """Successive `torch.randn` from ONE `torch.Generator(device="cuda")`, which is
+    exactly what `default_noise_sampler` holds for a whole render.
+
+    Pins the *sequence*, not just the values: `philox_rng.zig`'s counter advances one
+    block per draw, and a generator that restarted per draw would give every step the
+    same field while still looking like noise."""
+    g = torch.Generator(device="cuda")
+    g.manual_seed(SEED)
+    return dict(seed=SEED, n=N,
+                draws=[f32_list(torch.randn(N, device="cuda", generator=g, dtype=torch.float32).cpu())
+                       for _ in range(draws)])
 
 
 def const_sampling(shift=1.15):
@@ -276,23 +374,89 @@ def main():
         trajectory("sd_heun_4", eps_ms, sd_sigmas(4), "heun", 1.0, 1.0),
         # A non-default eta/s_noise pair, so neither is accidentally hardcoded.
         trajectory("sd_heun_10_eta05", eps_ms, sd_sigmas(10), "heun", 0.5, 0.9),
+        # DPM++(3M) SDE. 10 steps at least, since its first two steps degrade to
+        # first and second order and only step 3 onward exercises the 3M correction.
+        trajectory("krea2_3m_10", const_ms, simple_schedule(10), "3m", 1.0, 1.0),
+        trajectory("sd_3m_10", eps_ms, sd_sigmas(10), "3m", 1.0, 1.0),
+        trajectory("sd_3m_10_eta05", eps_ms, sd_sigmas(10), "3m", 0.5, 0.9),
+        # eta = 0 leaves the 3M solver with no noise at all, which isolates the
+        # third-order correction from the Brownian tree.
+        trajectory("sd_3m_10_eta0", eps_ms, sd_sigmas(10), "3m", 0.0, 1.0),
+    ]
+
+    # heun / dpm_2: deterministic, two evaluations a step, one body for both families.
+    plain_extra = [
+        plain_trajectory("krea2_heun2_8", kds.sample_heun, const_ms, simple_schedule(8)),
+        plain_trajectory("sd_heun2_10", kds.sample_heun, eps_ms, sd_sigmas(10)),
+        plain_trajectory("krea2_dpm2_8", kds.sample_dpm_2, const_ms, simple_schedule(8)),
+        plain_trajectory("sd_dpm2_10", kds.sample_dpm_2, eps_ms, sd_sigmas(10)),
+    ]
+
+    # The two-evaluation ancestral samplers, both arms each. `dpmpp_2s_ancestral` on
+    # krea2 is the one that exercises the hardcoded 0.9999 probe the RF body falls back
+    # to when the schedule starts at exactly sigma 1.
+    ancestral2 = [
+        ancestral2_trajectory("krea2_dpm2a_8", kds.sample_dpm_2_ancestral, const_ms, simple_schedule(8), 1.0, 1.0),
+        ancestral2_trajectory("sd_dpm2a_10", kds.sample_dpm_2_ancestral, eps_ms, sd_sigmas(10), 1.0, 1.0),
+        ancestral2_trajectory("sd_dpm2a_10_eta05", kds.sample_dpm_2_ancestral, eps_ms, sd_sigmas(10), 0.5, 0.9),
+        ancestral2_trajectory("krea2_2sa_8", kds.sample_dpmpp_2s_ancestral, const_ms, simple_schedule(8), 1.0, 1.0),
+        ancestral2_trajectory("sd_2sa_10", kds.sample_dpmpp_2s_ancestral, eps_ms, sd_sigmas(10), 1.0, 1.0),
+        ancestral2_trajectory("sd_2sa_10_eta05", kds.sample_dpmpp_2s_ancestral, eps_ms, sd_sigmas(10), 0.5, 0.9),
+        # eta = 0 still DRAWS in both of these (the reference calls the noise sampler
+        # and scales it by zero), so it pins the draw count as much as the arithmetic.
+        ancestral2_trajectory("sd_2sa_10_eta0", kds.sample_dpmpp_2s_ancestral, eps_ms, sd_sigmas(10), 0.0, 1.0),
+    ]
+
+    # dpmpp_sde: Brownian tree, so CPU like the other tree samplers.
+    sde_2s = [
+        trajectory_2s("krea2_sde_8", const_ms, simple_schedule(8), 1.0, 1.0),
+        trajectory_2s("sd_sde_10", eps_ms, sd_sigmas(10), 1.0, 1.0),
+        trajectory_2s("sd_sde_10_eta05", eps_ms, sd_sigmas(10), 0.5, 0.9),
+    ]
+
+    # DPM++(2M): deterministic, and the one sampler with no CONST dispatch at all,
+    # so BOTH families run `t = -log(sigma)`. The krea2 entry is the one that would
+    # catch a port that reached for the model's own half-logSNR here.
+    plain = [
+        plain_trajectory("krea2_2m_8", kds.sample_dpmpp_2m, const_ms, simple_schedule(8)),
+        plain_trajectory("sd_2m_10", kds.sample_dpmpp_2m, eps_ms, sd_sigmas(10)),
+        plain_trajectory("sd_2m_4", kds.sample_dpmpp_2m, eps_ms, sd_sigmas(4)),
+    ] + plain_extra
+
+    ancestral = [
+        # krea2 (CONST), which takes the `_RF` arm: alpha moves with sigma, so the
+        # step is a lerp toward `denoised` plus a rescale, not a variance split.
+        ancestral_trajectory("krea2_ancestral_8", const_ms, simple_schedule(8), 1.0, 1.0),
+        ancestral_trajectory("krea2_ancestral_8_eta05", const_ms, simple_schedule(8), 0.5, 0.9),
+        # SD (EPS), the `get_ancestral_step` arm.
+        ancestral_trajectory("sd_ancestral_10", eps_ms, sd_sigmas(10), 1.0, 1.0),
+        ancestral_trajectory("sd_ancestral_4", eps_ms, sd_sigmas(4), 1.0, 1.0),
+        ancestral_trajectory("sd_ancestral_10_eta05", eps_ms, sd_sigmas(10), 0.5, 0.9),
+        # eta = 0 takes `get_ancestral_step`'s early out, which is what makes this
+        # arm bit-identical to plain Euler rather than merely equal to it.
+        ancestral_trajectory("sd_ancestral_10_eta0", eps_ms, sd_sigmas(10), 0.0, 1.0),
     ]
 
     doc = dict(
         _comment="Generated by tools/gen_sampler_fixtures.py against ComfyUI's own "
                  "k_diffusion.sampling and torchsde. Do not hand-edit.",
         brownian=brownian_fixture(),
+        cuda_randn_seq=cuda_randn_seq(),
         sd_schedules=schedules,
         sigma_tables=table_fixture(const_ms, eps_ms, zimg_ms),
         schedulers=scheduler_fixture(const_ms, eps_ms, zimg_ms),
         betaincinv=betaincinv_fixture(),
         trajectories=trajectories,
+        plain=plain,
+        ancestral=ancestral,
+        ancestral2=ancestral2,
+        sde_2s=sde_2s,
     )
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w") as f:
         json.dump(doc, f, indent=1)
     print(f"wrote {OUT} ({os.path.getsize(OUT)} bytes)")
-    for t in trajectories:
+    for t in trajectories + plain + ancestral + ancestral2 + sde_2s:
         print(f"  {t['name']:22s} family={t['family']:5s} eta={t['eta']} "
               f"|x_out| max={max(abs(v) for v in t['x_out']):.4f}")
     for fam in ("flux", "sd", "zimage"):
