@@ -882,21 +882,32 @@ prefill GEMM (4B bf16 137 → 294 tok/s), gemma3 gained MMQ prefill (Q4_K_M 610 
 (q4_0, 33-token prompt: 195 → 330 tok/s). k2's dense linears take dp4a too, which its
 expert-bound decode does not notice (34 tok/s either way).
 
-On Vulkan the routes are the transposed dequant GEMV (`opGemvQuantT`, the five formats it
-has), the dp4a repack for q8_0 (iq4_nl behind `TP_VK_DP4A`), the three opt-in decode kernels
-(`TP_VK_SG_GEMV`, `TP_VK_SG_DP4A`, `TP_VK_T_DP4A`, now on every arm), and the coop dequant
-GEMM for a batch where the device has the f16-weight pipeline. A Vulkan buffer is a handle,
-so a batch a GEMV would have to step through row by row is refused, not looped.
+**On Vulkan a block quant has ONE route.** Decode is the dual row GEMV over the raw weight
+(`opGemvQuantDual`, the body the CUDA arm runs too); a batch is the coop dequant GEMM
+(`opMatmulCoopQuant`) where the device has the f16-weight pipeline, since a Vulkan buffer is
+a handle and a GEMV cannot step through the rows of the activation. Both read the SAME raw
+resident copy, so there is no layout for them to disagree about, and a row that is not whole
+blocks has no lane mapping and goes to the GEMM.
 
-The formats with NO transposed GEMV are `Context.dequantOnly`. They split in two: q2_k, q3_k and
-the four codebook formats decode through the DUAL row GEMV (`Context.dualGemv`, the body the CUDA
-arm also runs), and q4_0, iq4_xs, q1_0 and q2_0 decode
-through the cooperative subgroup GEMV over the raw ggml layout — `gemv_{q4_0,iq4_xs,q1_0,
-q2_0_g64,q2_0_g128}_sg`, one subgroup per output row, no transpose and no repack. That is not
-an opt-in A/B like the other `_sg` kernels: for these it is the only alternative to
-dequantizing the whole weight per token, so it is on wherever the pipelines built. It reads
-the same RAW resident buffer the prefill GEMM dequantizes from, so decode and prefill still
-share one copy. Measured on a 3090, same greedy text before and after:
+That replaced five routes and three weight layouts: a 32-row-group TRANSPOSED GEMV with
+k-split partials, an int8-repack one, and three cooperative ones, four of them behind
+`TP_VK_*` knobs that defaulted off. The dual GEMV beat every one of them on every format
+(`TensorPencil vk-gemv-bench`, §7), so `opGemvQuantT`, `opGemvQuantSg`, `opGemvDp4a`,
+`opGemvQuantSgDp4a`, `opGemvQuantTDp4a`, `weightBufferRawT`, `weightBufferRepacked`, ten
+`gemv_*{,_t}` kernels, ten `gemv_*_sg` kernels, the whole `dp4a` SPIR-V module and the four
+knobs are gone. VRAM fell ~800 MB (9B q6_k) to ~1 GB (27B mixed) with them, mostly the raw
+staging scratch the transpose pass needed.
+
+⚠️ **Vulkan LLM decode is SUBMIT-bound, not kernel-bound.** Every op outside `beginBatch`
+ends in `submitAndWait`, and at ~500 launches per token that dominates: switching every
+format to a 1.5-1.8x faster GEMV moved a 9B q6_k model from 7.5 to 7.5 tok/s. `vk-gemv-bench`
+shows the same floor directly — every format lands at 0.18-0.25 ms whether it reads 12 MiB or
+90. So a kernel change is not where this backend's 10x gap to CUDA lives; batching the
+submissions is. The formats still differ by 1.7x among themselves, which is why the per-format
+rate is still worth watching.
+
+Historical measurement, when the raw-layout formats first got a decode kernel at all (before
+that they dequantized the whole weight per token). Same greedy text before and after:
 
 | model / format | decode before | decode after |
 |---|---|---|
@@ -904,8 +915,8 @@ share one copy. Measured on a 3090, same greedy text before and after:
 | Bonsai-27B Q1_0 | 0.3 tok/s | **3.4** |
 | Ternary-Bonsai-27B Q2_0 g128 | 0.3 tok/s | **3.2** |
 
-⚠️ q4_0's kernel is covered by `gpu cooperative gemv covers the formats with no transposed
-kernel` only: every q4_0 file here is a Gemma 4 QAT one, and gemma4 has no Vulkan stepper.
+⚠️ q4_0's kernel is covered by `gpu dual gemv covers the codebook and low-bit k-quant
+formats` only: every q4_0 file here is a Gemma 4 QAT one, and gemma4 has no Vulkan stepper.
 
 ¹ **qwen3 on vulkan** (`qwen3_gpu.zig VulkanLM`, config-driven) runs two regimes. **Dense**
 (fp8/bf16/f32, tied head): batched square-attention prefill + spec decode, with bf16 read
@@ -913,17 +924,17 @@ natively (2-byte `transpose_bf16`/`pipe_tr_bf16` plus a bf16 branch in `gemv_par
 weight code `context.WCode.bf16`) so weights are never widened; bf16 has no tiled GEMM, so
 prefill streams through grouped GEMV. Generation is coherent but not token-identical to CPU
 (GEMV reduction-order drift). **GGUF block-quant** (q8_0/q4_k/q5_k/q6_k/iq4_nl + untied
-block-quant head): decode is the per-row fused-dequant GEMV (`lin_llm_gpu`, `opGemvQuantT`);
+block-quant head): decode is the dual row GEMV (`lin_llm_gpu`, `opGemvQuantDual`);
 prefill runs the tensor-core GEMM via `opMatmulCoopQuant`, which dequants each weight to f16
 k-major on the GPU and reuses `coopF16WDispatch`, so the whole prompt prefills in one batched
 pass. The f16 form is 4× the block-quant size and is re-dequanted per prefill into one reused
 scratch. Falls back to per-token GEMV when the device lacks the f16 coopmat pipeline. QK-norm
 is skipped (`cfg.qk_norm = false`); the F16 embedding is host-gathered to f32.
-**Opt-in int8 dp4a decode** (`TP_VK_DP4A=1`, q8_0/iq4_nl, needs
-`VK_KHR_shader_integer_dot_product`) repacks the weight into an int8-interleaved layout so a
-warp reads 4 contiguous quants per `u32` and dots via `OpSDot` — ~2.2× decode, but the
-repacked weight roughly doubles VRAM, hence opt-in until VRAM-aware auto-sizing lands. The
-`OpSDot` capability is injected by `spv.zig withDotProduct` into a separate `dp4a` module.
+⚠️ There is no `OpSDot` path on this backend any more. The dual GEMV's int8 twin exists
+(`gemv_dual_<fmt>_q8`) but nothing routes to it here, because `dp4a` compiles to ARITHMETIC
+on SPIR-V: the capability would have to be injected into the shared dual module, which would
+make all ~180 kernels refuse to build on a device without the integer dot. Reaching it means a
+second, capability-gated module.
 
 ² No `gemma4_gpu.zig`; `Spec.Vulkan = void`.
 
@@ -1002,7 +1013,7 @@ half-computed state), while cancel unwinds between layers via `engine.publishCan
 | **Growable VMM KV context** (cuMemMap in place) | ⚠️ host arrays | ❌ (reserves window up front) | ✅ | ✅ |
 | RoPE (half/partial/interleaved/dual/factored) | ✅ | ✅ (no vision/M-RoPE) | ✅ (+M-RoPE, vision) | ↤ |
 | RMSNorm / LayerNorm / sandwich | ✅ | `rmsnorm`/`layernorm` | `qk_rmsnorm`/`ln_bias_par` | ↤ |
-| **Decode GEMV (dp4a int8)** | ggml `vec_dot` | q8_0 default, iq4_nl opt-in (`TP_VK_DP4A`) | ✅ every arch via `lin_llm_cuda` (`gemv_q*_q8`, `_q8n`) | ↤ |
+| **Decode GEMV (dp4a int8)** | ggml `vec_dot` | ❌ (`OpSDot` needs a module the shared one cannot be) | ✅ every arch via `lin_llm_cuda` (`gemv_q*_q8`, `_q8n`, `gemv_dual_*_q8`) | ↤ |
 | Prefill GEMM | `matmul.zig` microkernel | coopmat bf16/f16 + int8 s8→s32 | hand hgemm/igemm/i4gemm, MMQ pipes | **cuBLASLt** |
 | **GDN / gated DeltaNet** (qwen35) | ✅ | `gdn_gates`/`gdn_conv_step`/`gdn_delta_step` | + batched `gdn_conv_batch`, `opGdnDeltaChunk` | ↤ |
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
@@ -1216,24 +1227,24 @@ path; GGUF `q*` are the **LLM** path.
 | **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) | ✅ hand-PTX (no cuBLASLt s4) | nibble-packed 2/byte |
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; stays packed, decodes to int8 **per GEMM** then runs the ordinary int8 convrot GEMM. `ops/w4a8.zig` |
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | 4-bit E2M1 + fp8 per-16-block scale + per-tensor scale; stays packed, decodes to **bf16** per GEMM then the existing bf16 tensor-core GEMM. Weight-only; the native W4A4-fp4 GEMM is sm_100+. `ops/nvfp4.zig` |
-| **GGUF q4_0** | ✅ ggml | ✅ `gemv_q4_0_sg` (subgroup, raw) | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
-| **GGUF q8_0** | ✅ ggml | ✅ `gemv_q8_0{,_t}` (scalar) | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
-| **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | q6_k's MMQ is correct but loses to dequant+f16, so `mmqPipeFaster` routes only q4_k/q5_k on. `TP_NO_MMQ5` / `TP_NO_MMQ_IQ4` A/B the routing, `TP_MMQ_NOSTAGE` isolates A-staging cost (garbage output, valid timing) |
-| **GGUF q2_k** | ✅ ggml | ✅ `gemv_q2_k` (dual, f32) | ✅ decode→int8/int4 convrot (`buildPrep`); `gemv_q2_k_q8` (dual, int8 dot) + `dequant_q2_k_*` | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL |
-| **GGUF q3_k** | ✅ ggml | ✅ `gemv_q3_k` (dual, f32) | ✅ `gemv_q3_k_q8` (dual, int8 dot) + `dequant_q3_k_*` | ⤷ dequant→f16 | 256 elems / 110 B; 2-bit codes plus a 32-byte high-bit mask whose bit is INVERTED (clear subtracts 4), sixteen 6-bit scales shuffled across 12 bytes (`scaleK3`), f16 d at the TAIL. The 110-byte stride is only 2-aligned, so its quants come as `u16` pairs where q2_k's come as words |
-| **GGUF iq2_xxs / iq2_xs / iq3_xxs / iq3_s** | ✅ ggml | ✅ `gemv_<fmt>` (dual, f32 activation) | ✅ `gemv_<fmt>_q8` (dual, int8 dot) + `dequant_<fmt>_*` | ⤷ dequant→f16 | The four CODEBOOK formats: a stored index picks a whole GROUP of values out of a fixed table and a separate sign byte flips them. 256-element super-blocks of 66 / 74 / 98 / 110 B. Tables are `src/gpu/kernels/iq_grid.zig`, generated from ggml by `tools/gen_iq_grid.py` and uploaded as ONE blob both hosts bind to the kernels' table slot (CUDA `Backend.iqTable`, Vulkan `Context.iqTable`). An iq2 entry is eight values, an iq3 entry four |
-| **GGUF iq4_nl** | ✅ ggml | ✅ scalar (module-const LUT) | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
-| **GGUF iq4_xs** | ✅ ggml | ✅ `gemv_iq4_xs_sg` (subgroup, raw) | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs`, `mmq_pipe_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. The dp4a GEMV (`gemv_iq4_xs_q8n`) reads the codebook through `prmt` pairs rather than a shared table, since the index's bit 3 means sign-replicate to `prmt` and has to pick the table half instead. Its 136-byte block leaves odd super-blocks only 8-byte aligned, so staging loads are `v2` |
-| **GGUF q1_0** | ✅ ggml | ✅ `gemv_q1_0_sg` (subgroup, raw) | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
-| **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ✅ `gemv_q2_0_g128_sg` (subgroup, raw) | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
-| **GGUF q2_0 g64** | ✅ ggml | ✅ `gemv_q2_0_g64_sg`, ⚠️ device test only | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |
+| **GGUF q4_0** | ✅ ggml | ✅ `gemv_dual_q4_0` | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
+| **GGUF q8_0** | ✅ ggml | ✅ `gemv_dual_q8_0` | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
+| **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ `gemv_dual_*` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | q6_k's MMQ is correct but loses to dequant+f16, so `mmqPipeFaster` routes only q4_k/q5_k on. `TP_NO_MMQ5` / `TP_NO_MMQ_IQ4` A/B the routing, `TP_MMQ_NOSTAGE` isolates A-staging cost (garbage output, valid timing) |
+| **GGUF q2_k** | ✅ ggml | ✅ `gemv_dual_q2_k` | ✅ decode→int8/int4 convrot (`buildPrep`); `gemv_q2_k_q8` (dual, int8 dot) + `dequant_q2_k_*` | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL |
+| **GGUF q3_k** | ✅ ggml | ✅ `gemv_dual_q3_k` | ✅ `gemv_q3_k_q8` (dual, int8 dot) + `dequant_q3_k_*` | ⤷ dequant→f16 | 256 elems / 110 B; 2-bit codes plus a 32-byte high-bit mask whose bit is INVERTED (clear subtracts 4), sixteen 6-bit scales shuffled across 12 bytes (`scaleK3`), f16 d at the TAIL. The 110-byte stride is only 2-aligned, so its quants come as `u16` pairs where q2_k's come as words |
+| **GGUF iq2_xxs / iq2_xs / iq3_xxs / iq3_s** | ✅ ggml | ✅ `gemv_dual_<fmt>` | ✅ `gemv_<fmt>_q8` (dual, int8 dot) + `dequant_<fmt>_*` | ⤷ dequant→f16 | The four CODEBOOK formats: a stored index picks a whole GROUP of values out of a fixed table and a separate sign byte flips them. 256-element super-blocks of 66 / 74 / 98 / 110 B. Tables are `src/gpu/kernels/iq_grid.zig`, generated from ggml by `tools/gen_iq_grid.py` and uploaded as ONE blob both hosts bind to the kernels' table slot (CUDA `Backend.iqTable`, Vulkan `Context.iqTable`). An iq2 entry is eight values, an iq3 entry four |
+| **GGUF iq4_nl** | ✅ ggml | ✅ `gemv_dual_iq4_nl` | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
+| **GGUF iq4_xs** | ✅ ggml | ✅ `gemv_dual_iq4_xs` | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs`, `mmq_pipe_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. The dp4a GEMV (`gemv_iq4_xs_q8n`) reads the codebook through `prmt` pairs rather than a shared table, since the index's bit 3 means sign-replicate to `prmt` and has to pick the table half instead. Its 136-byte block leaves odd super-blocks only 8-byte aligned, so staging loads are `v2` |
+| **GGUF q1_0** | ✅ ggml | ✅ `gemv_dual_q1_0` | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
+| **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ✅ `gemv_dual_q2_0_g128` | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
+| **GGUF q2_0 g64** | ✅ ggml | ✅ `gemv_dual_q2_0_g64`, ⚠️ device test only | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |
 
 **Notes:**
 
 - **GGUF block-quant on GPU dequants on the fly inside the GEMV** — never expanded to VRAM.
-  Vulkan's GEMV is scalar f32 unless `TP_VK_DP4A` is set, and it lacks `q4_0`, `q1_0` and both
-  `q2_0`s. The `cuda` arm dequants GGUF to f16 for prefill GEMM but uses the shared hand-PTX GEMV
-  at decode; cuBLASLt/cuDNN never consume block quants directly.
+  Vulkan's decode is the dual GEMV over the f32 activation for every format; the `cuda` arm dequants
+  GGUF to f16 for the prefill GEMM but uses the hand-PTX GEMV at decode, and the dual one for the six
+  formats with no hand kernel. cuBLASLt/cuDNN never consume block quants directly.
 - **convrot** (`src/ops/convrot.zig`): size-256 Hadamard rotation applied at int8/int4 dequant.
   `cols` must be a multiple of 256 (i4 also even, from nibble packing).
 - ⚠️ **The packed 4-bit formats share ONE container loader** (`models/quant_weight.zig`), called
@@ -1341,21 +1352,47 @@ shared dual module must not carry, since injecting it would make all 160 kernels
 a device without the integer dot. Real `OpSDot` there means a second, capability-gated module, which
 is why `lin_llm_gpu` routes Vulkan to the f32 GEMV and not the q8 one.
 
-### Vulkan-only — `Elt` compute kernels (`src/gpu/kernels/eltwise.zig`, `subgroup.zig`, `dp4a.zig`)
+**Every block quant has a dual GEMV, and which arm should USE it is measured, not assumed.** The
+two backends came out opposite ways, and the harnesses are `zig build qgemv-bench` (CUDA, through
+the dispatcher, `dual_decode` alternating) and `TensorPencil vk-gemv-bench` (Vulkan, every route a
+format can take, one weight copy each).
 
-`subgroup.zig` holds the cooperative (one subgroup per output row) decode GEMVs:
-`gemv_{q8_0,q4_k,q5_k,q6_k,iq4_nl}_sg` are an opt-in A/B against the transposed kernels
-(`TP_VK_SG_GEMV`), while `gemv_{q4_0,iq4_xs,q1_0,q2_0_g64,q2_0_g128}_sg` are the only decode
-kernel those formats have and are always on. Plus `attn_decode_sg` and the `subgroup_sum`
-capability probe.
+- **CUDA keeps its hand kernels.** They beat the dual body by 1.24-1.75x (q4_k 1.31x, q5_k 1.24x,
+  q6_k 1.31x, iq4_xs 1.75x); q8_0 is a dead heat. So the dual arm there is for the six formats that
+  have no hand kernel, plus the A/B.
+- **Vulkan uses the dual body for everything.** It is the FASTEST route for all sixteen, by
+  1.06x (iq4_nl, over the int8 repack) to 2.88x (iq4_xs, over the cooperative kernel), and it needs
+  neither the load-time transpose, nor the `rows x nchunk` partials buffer, nor the bigger resident
+  weight the repack costs. The reason is historical, not architectural: those kernels were written
+  against a thread-per-row GEMV whose bad coalescing the 32-row-group transpose existed to fix, and
+  subgroup arithmetic (core Vulkan 1.1, no extension, no device feature) removed the need for it.
+- ⚠️ **The cooperative `gemv_*_sg` kernels lost to the dual one on every format**, by up to 2.88x.
+  They were an opt-in A/B (`TP_VK_SG_GEMV`) that was never resolved; the answer was no.
+
+**Done.** Every block quant is `dequantOnly` (raw) on Vulkan and routes to `.gemv_dual`; the
+transposed layout, the int8 repack, the five other routes, their kernels, the `dp4a` module and the
+four `TP_VK_*` knobs are deleted, and VRAM fell ~800 MB to ~1 GB with them. §5 has the shape of what
+is left. The comparison cannot be re-run from this tree, since the alternatives are gone; `git log`
+has them.
+
+⚠️ **A 16-entry codebook belongs in the TABLE, not in a switch.** `iq4Codes` reading
+`kvalues_iq4nl` out of `iq_grid.blob` instead of an inline switch was 2.2x on iq4_nl and iq4_xs,
+and it is what flipped iq4_nl from losing to the int8 repack to beating it. Sixteen bytes is one
+cache line every lane of a subgroup hits; a switch is eight branchy lookups per group.
+
+### Vulkan-only — `Elt` compute kernels (`src/gpu/kernels/eltwise.zig`, `subgroup.zig`)
+
+`subgroup.zig` is down to `attn_decode_sg` (folded flash-decode attention) and the
+`subgroup_sum` capability probe; its ten cooperative decode GEMVs went with the rest of the
+block-quant routes, as did `dp4a.zig` entirely.
 
 `attn_full` · `attn_causal_batched` · `attn_cross` · `attn_scores` · `attn_out` · `attn_dsplit` ·
 `attn_dmerge` · `attn_dsplit_gemma{,_f16,_q8}` · `kv_store_q8_0` · `gemv_partial{,4}` ·
-`gemv_{q8_0,q4_k,q5_k,q6_k,iq4_nl}{,_t}` · `dequant_{q8_0,q4_k,q5_k,q6_k,iq4_nl}_f32` (transposed
-layout) · `gdn_delta_step` · `rotate_fwht` · `w4a8_decode_t` · `i4_decode_t` · `nvfp4_decode_t`;
-subgroup module `subgroup_sum` · `gemv_*_sg` · `attn_decode_sg`; dp4a module (`OpSDot`).
+`gdn_delta_step` · `rotate_fwht` · `w4a8_decode_t` · `i4_decode_t` · `nvfp4_decode_t`;
+subgroup module `subgroup_sum` · `attn_decode_sg`.
 
-**Vulkan GEMM entry points** (`context.zig`): `opMatmul` (f32/fp8) · `opGemv{,Partial,Quant,QuantT}` ·
+**Vulkan GEMM entry points** (`context.zig`): `opMatmul` (f32/fp8) · `opGemv{,Partial}` ·
+`opGemvQuantDual` (every block quant's decode) ·
 `opMatmulCoop{,H16}` (fp8→f16) · `opMatmulCoopF16W{,b,h,Dev}` (f32/bf16/f16→f16; `Dev` takes a
 device-resident bias, for the SD UNet's per-forward folded ResBlock bias) · `opMatmulCoopBf16`
 (native bf16) · `opMatmulCoopQuant` (GGUF block quants, prefill) · `opMatmulCoopI8{,Fused}` /
@@ -1527,8 +1564,8 @@ Delete a row when it closes.
 | `warmWeights` is qwen35-only | qwen3, gemma3 and gemma4 charge the lazy weight upload to their prefill timer. ~30 lines each, mirroring their own `layerDeviceBytes`. |
 | No Vulkan ViT except gemma3 | `vit35`, `gemma4_vit`, `gemma4v_vit` are CPU/CUDA only. |
 | No Vulkan gemma4 | `Spec.Vulkan = void`; `--backend vulkan` is rejected for the arch. |
-| No dp4a decode GEMV for iq4_xs | `lin_llm_cuda` sends it through the f32 `gemv_iq4_xs`; gemma3 12B IQ4_XS decodes at 28 tok/s where Q4_K_M does 58. A `gemv_iq4_xs_q8n` twin is the fix, and `quantQ8NSupported` is the one place to declare it. |
-| Vulkan dp4a decode is opt-in | `TP_VK_DP4A=1`; the repacked int8 weight roughly doubles VRAM, so it stays opt-in until VRAM-aware auto-sizing lands. |
+| Vulkan has no int8 decode dot | The dual GEMV's `_q8` twin exists but `dp4a` compiles to arithmetic on SPIR-V, since `OpSDot`'s capability cannot go in the shared dual module. A second, capability-gated module is the fix. Low value while decode there is SUBMIT-bound. |
+| Vulkan LLM decode is submit-bound | ~500 `submitAndWait` round trips per token put every format at a ~0.2 ms floor regardless of the weight (`vk-gemv-bench`). Batching the submissions, not faster kernels, is where the 10x gap to CUDA is. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
 | `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |
 | q8_0 MMQ built and LOST | `mmq_pipe_q8_0` exists, is correct (device test against an exact f64 reference, teeth checked by mis-wiring the per-substep scale) and is opt-in via `--dit-gguf-gemm mmq`. It measures **566 ms** of GEMM per step against the dequant route's **440** and cuBLASLt int8's **141**. ⚠️ Do not retry it expecting the estimate that motivated it: the premise was that `igemm_pipe` runs ~1.68x cuBLASLt, but igemm_pipe chains the mma's s32 C operand across k and NO MMQ can, because the scale changes every 32 elements. Isolation: A staging is 225 of the 566 (`TP_MMQ8_NOSTAGE` gives 342), and even at 342 it loses, because q4_k's nibble packing feeds TWO substeps from one 32-byte A fragment where 8-bit weights need their own, doubling shared A-load traffic on the one axis this kernel family responds to. The only real lever left is a one-time repack to planar qs + a scale plane, worth ~5% end-to-end on this card. |

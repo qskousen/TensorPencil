@@ -968,7 +968,7 @@ fn gemm(
             // ggufy's quantized SD UNets, the whole reason the loader keeps
             // weights in their checkpoint dtype.
             if (!ctx.hasQuantPrefillGemm()) return error.UnsupportedDType;
-            return ctx.opMatmulCoopQuant(wt.dtype, y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, 1.0, b, false);
+            return ctx.opMatmulCoopQuant(wt.dtype, y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, 1.0, b);
         },
         else => return error.UnsupportedDType,
     }

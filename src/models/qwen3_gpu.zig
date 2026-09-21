@@ -308,7 +308,7 @@ fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w
         // NOT `wcode` below: that maps every non-f8/bf16 dtype to `.f32`, so a
         // block quant reaching it would be read as f32, the same silent-garbage
         // shape as the bf16 bug this file's `supportsWeights` comment describes.
-        return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows], false);
+        return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows]);
     }
     switch (w.dtype) {
         // int8-convrot: the activation is already quantized and rotated by the

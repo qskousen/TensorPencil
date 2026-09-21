@@ -2712,7 +2712,9 @@ pub const Backend = struct {
     /// kernels leave the table slot unread.
     fn iqTable(self: *Backend, dt: dtypes.DType) Error!?DeviceBuffer {
         switch (dt) {
-            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => {},
+            // The four grid formats, plus the two that index the 16-value
+            // iq4_nl codebook out of the same blob.
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs => {},
             else => return null,
         }
         if (self.iq_tbl.buf == .null_handle) {
@@ -2738,7 +2740,7 @@ pub const Backend = struct {
         switch (dt) {
             inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| {
                 const tbl = try self.iqTable(dt);
-                return self.dualRows("gemv_" ++ @tagName(t), w_db, x, y, tbl, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+                return self.dualRows("gemv_dual_" ++ @tagName(t), w_db, x, y, tbl, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows);
             },
             else => {},
         }
@@ -2861,14 +2863,53 @@ pub const Backend = struct {
         return !self.weight_noise.on();
     }
 
-    /// Whether this format's decode is the DUAL row GEMV, the body the Vulkan arm
-    /// also runs, and whether it has the q8_1-activation twin of it. The six
-    /// formats with no hand-written kernel of their own.
+    /// Whether a DUAL row GEMV exists for this format, the body the Vulkan arm
+    /// also runs, with its q8_1-activation twin.
+    ///
+    /// Every block quant has one. The formats that are not `dualGemvOnly` also
+    /// have a hand-written kernel, and the dual arm is the A/B against it, on one
+    /// weight in one process, which is the only way to ask whether the hand
+    /// kernels still earn their keep. Nothing routes there unless `dual_decode`
+    /// says so; on Vulkan, where the hand kernels lose, routing does.
     pub fn dualGemvSupported(dt: dtypes.DType) bool {
+        return switch (dt) {
+            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            else => false,
+        };
+    }
+
+    /// Whether the dual GEMV is this format's ONLY decode, so routing must take
+    /// it rather than treat it as a choice.
+    pub fn dualGemvOnly(dt: dtypes.DType) bool {
         return switch (dt) {
             .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
             else => false,
         };
+    }
+
+    /// The dual row GEMV against the f32 activation. `opGemvQuant` already takes
+    /// this path for the formats it is the only decode for; this is the explicit
+    /// form, which q4_k's A/B needs because for q4_k `opGemvQuant` means the
+    /// hand-written kernel.
+    pub fn opGemvQuantDualF32(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(dualGemvSupported(dt) and cols % dt.blockElems() == 0);
+        const w_db = try self.cachedWeight(w_bytes);
+        const tbl = try self.iqTable(dt);
+        switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualRows(
+                "gemv_dual_" ++ @tagName(t),
+                w_db,
+                x,
+                y,
+                tbl,
+                .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 },
+                .{ scale, 0 },
+                rows,
+            ),
+            else => unreachable,
+        }
     }
 
     /// The dual row GEMV against the q8_1 activation `opGemvQuantizeX` staged.
@@ -2882,8 +2923,8 @@ pub const Backend = struct {
         const w_db = try self.cachedWeight(w_bytes);
         const tbl = try self.iqTable(dt);
         switch (dt) {
-            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| try self.dualRows(
-                "gemv_" ++ @tagName(t) ++ "_q8",
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| try self.dualRows(
+                "gemv_dual_" ++ @tagName(t) ++ "_q8",
                 w_db,
                 self.q8_act,
                 y,
@@ -6444,6 +6485,8 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
             // make illegal: every grid index is masked to its table's size and every
             // sign index to 7 bits, so the whole rest of the block is fair game.
             .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
+            // Everything left carries a lone f16 scale at the block head.
+            .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
             else => unreachable,
         }
     }
@@ -6468,18 +6511,40 @@ test "q2_k/q3_k/iq2_xxs/iq2_xs/iq3_xxs/iq3_s device decode matches ggml" {
 
     const rows = 8;
     const cols = 512; // two super-blocks per row
-    const dts = [_]dtypes.DType{ .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s };
+    // EVERY block quant, not just the six whose only decode this is: the rest
+    // also have a hand-written kernel, and comparing the two (`TP_DUAL_DECODE`,
+    // `vk-gemv-bench`) is meaningless unless both compute the same thing.
+    const dts = [_]dtypes.DType{
+        .q2_k,   .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s,     .q8_0,
+        .q4_0,   .iq4_nl, .iq4_xs, .q4_k,  .q5_k,    .q6_k,      .q1_0,
+        .q2_0_g64, .q2_0_g128,
+    };
 
     // ⚠️ Every weight stays alive to the end: the device weight cache keys on the
     // HOST POINTER, so a freed one's address serves the next dtype's upload.
     var ws: [dts.len][]u8 = undefined;
-    inline for (dts, .{ 11, 22, 33, 44, 55, 66 }, 0..) |dt, seed, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, seed);
+    inline for (dts, 0..) |dt, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, 11 + i * 13);
     defer for (ws) |w| gpa.free(w);
 
     var prng = std.Random.DefaultPrng.init(9001);
     const x = try gpa.alloc(f32, cols);
     defer gpa.free(x);
     for (x) |*v| v.* = prng.random().float(f32) * 2.0 - 1.0;
+
+    // The q8_1 activation the int8 kernels see: x̂ = d * rni(x * 127/amax) per
+    // 32-block, the same rounding `quantize_q8_1` does.
+    const xq = try gpa.alloc(f32, cols);
+    defer gpa.free(xq);
+    {
+        var blk: usize = 0;
+        while (blk < cols / 32) : (blk += 1) {
+            var amax: f32 = 0;
+            for (x[blk * 32 ..][0..32]) |xi| amax = @max(amax, @abs(xi));
+            const d: f32 = amax / 127.0;
+            const inv: f32 = if (amax == 0) 0 else 127.0 / amax;
+            for (0..32) |j| xq[blk * 32 + j] = d * @round(x[blk * 32 + j] * inv);
+        }
+    }
 
     const x_d = try be.tensorCreate(cols * 4);
     const y_d = try be.tensorCreate(rows * 4);
@@ -6511,13 +6576,27 @@ test "q2_k/q3_k/iq2_xxs/iq2_xs/iq3_xxs/iq3_s device decode matches ggml" {
             try std.testing.expectApproxEqAbs(ref, got, @max(1e-4, @abs(ref) * 1e-3));
         }
 
-        try be.opGemvQuant(dt, y_d, x_d, w, 1.0, rows, cols);
+        // The f32 dual GEMV. `opGemvQuant` reaches it for the six; q4_k needs the
+        // explicit form, since for q4_k `opGemvQuant` means the hand kernel.
+        try be.opGemvQuantDualF32(dt, y_d, x_d, w, 1.0, rows, cols);
         try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
         for (0..rows) |r| {
             var acc: f64 = 0;
             for (want[r * cols ..][0..cols], x) |wv, xv| acc += @as(f64, wv) * xv;
             errdefer std.debug.print("{s} gemv row {d}: got {d}, want {d}\n", .{ @tagName(dt), r, y[r], acc });
             try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-3);
+        }
+
+        // The int8 twin, against the SAME activation quantized as the kernel sees
+        // it, so the only difference left is the weight decode.
+        try be.opGemvQuantizeX(x_d, cols);
+        try be.opGemvQuantDualQ8(dt, y_d, w, 1.0, rows, cols);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        for (0..rows) |r| {
+            var acc: f64 = 0;
+            for (want[r * cols ..][0..cols], xq) |wv, xv| acc += @as(f64, wv) * xv;
+            errdefer std.debug.print("{s} q8 gemv row {d}: got {d}, want {d}\n", .{ @tagName(dt), r, y[r], acc });
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 3e-3);
         }
     }
 }

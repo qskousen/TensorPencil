@@ -21,6 +21,11 @@ import tempfile
 # name, C element type, count, bytes per element
 TABLES = [
     ("ksigns_iq2xs", "uint8_t", 128, 1),
+    # iq4_nl's 16 signed levels, which iq4_nl and iq4_xs index with a nibble.
+    # A table rather than a switch because eight switch lookups per group cost
+    # those two kernels 2x (measured, `vk-gemv-bench`), while sixteen bytes are
+    # one cache line every lane of a subgroup hits.
+    ("kvalues_iq4nl", "int8_t", 16, 1),
     ("iq2xxs_grid", "uint64_t", 256, 8),
     ("iq2xs_grid", "uint64_t", 512, 8),
     ("iq3xxs_grid", "uint32_t", 256, 4),

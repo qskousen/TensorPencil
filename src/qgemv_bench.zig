@@ -151,9 +151,25 @@ fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
                 ms[pass] = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
             }
             lin_llm.decode_dp4a = true;
+
+            // A format with BOTH a hand kernel and a dual one (q4_k) gets the
+            // head-to-head that says whether the hand kernel still earns its
+            // maintenance. Same weight, same process, alternating.
+            var dual_ms: f64 = 0;
+            if (Backend.dualGemvSupported(dt) and !Backend.dualGemvOnly(dt)) {
+                lin_llm.dual_decode = true;
+                for (0..warmup) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("dual");
+                be.prof.reset();
+                for (0..iters) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("dual");
+                dual_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                lin_llm.dual_decode = false;
+            }
             const gbs = @as(f64, @floatFromInt(q.len)) / (ms[0] * 1e-3) / 1e9;
             const gels = @as(f64, @floatFromInt(rows * cols)) / (ms[0] * 1e-3) / 1e9;
-            p("  {s:<9} {s:<12} {d:>9.4} {d:>9.1} {d:>9.1} {d:>9.4} {d:>7.2}x\n", .{ @tagName(dt), @tagName(route), ms[0], gbs, gels, ms[1], ms[1] / ms[0] });
+            if (dual_ms > 0)
+                p("  {s:<9} {s:<12} {d:>9.4} {d:>9.1} {d:>9.1} {d:>9.4} {d:>7.2}x   dual {d:.4} ({d:.2}x vs hand)\n", .{ @tagName(dt), @tagName(route), ms[0], gbs, gels, ms[1], ms[1] / ms[0], dual_ms, ms[0] / dual_ms })
+            else
+                p("  {s:<9} {s:<12} {d:>9.4} {d:>9.1} {d:>9.1} {d:>9.4} {d:>7.2}x\n", .{ @tagName(dt), @tagName(route), ms[0], gbs, gels, ms[1], ms[1] / ms[0] });
         }
     }
     p("\n", .{});

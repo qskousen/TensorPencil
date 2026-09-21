@@ -78,13 +78,33 @@ inline fn blockElems(comptime fmt: Fmt) u32 {
 
 const kvalues_iq4nl = [16]i32{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
 
-inline fn iq4Value(nibble: u32) f32 {
+inline fn iq4Code(nibble: u32) i32 {
     // A switch, since a lookup into a comptime array by a runtime index lands in
     // private memory on both targets.
-    return @floatFromInt(switch (nibble) {
+    return switch (nibble) {
         inline 0...15 => |n| kvalues_iq4nl[n],
         else => unreachable,
-    });
+    };
+}
+
+inline fn iq4Value(nibble: u32) f32 {
+    return @floatFromInt(iq4Code(nibble));
+}
+
+/// The codebook value of each of four nibbles, one per byte of `nibs`, as packed
+/// signed bytes, READ FROM THE TABLE rather than switched on.
+///
+/// Sixteen bytes is one cache line every lane of a subgroup hits, where the
+/// switch `iq4Code` compiles to is eight branchy lookups per group: measured,
+/// that was 2x on iq4_nl and iq4_xs, the difference between the dual GEMV losing
+/// to the int8 repack and beating it.
+inline fn iq4Codes(e: Env, comptime tbl: Slot, nibs: u32) u32 {
+    var out: u32 = 0;
+    inline for (0..4) |b| {
+        const v = e.byte(tbl, grid.kvalues_iq4nl_off + ((nibs >> @intCast(b * 8)) & 15));
+        out |= v << @intCast(b * 8);
+    }
+    return out;
 }
 
 /// ggml get_scale_min_k4: the 6-bit scale and min of sub-block `is` of a q4_k/q5_k
@@ -332,7 +352,7 @@ const Group = struct {
 /// Whether a format's value has a subtracted term, so the dots have to carry the
 /// activation's own sum. Skipped entirely for the rest.
 inline fn hasMin(comptime fmt: Fmt) bool {
-    return fmt == .q2_k;
+    return fmt == .q2_k or fmt == .q4_k or fmt == .q5_k;
 }
 
 /// Word `half` of codebook entry `gi`. Every table is 4-aligned and its entries
@@ -363,9 +383,11 @@ inline fn signedPair(e: Env, comptime tbl: Slot, comptime off: u32, comptime wor
 /// Group `g` (elements `g * 8 ..`) of the weight whose bytes start at `base`.
 inline fn group(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, g: u32) Group {
     var r: Group = .{ .w = .{ 0, 0 }, .d = 0, .m = 0 };
-    // Every format here is a 256-element super-block, so 32 groups.
-    const sb = g >> 5;
-    const j = (g & 31) * 8; // first element within the super-block
+    // Block index and the group's first element within it. Every block size here
+    // is a power of two multiple of the group, so both are shifts.
+    const per_block = blockElems(fmt) / group_elems;
+    const sb = g / per_block;
+    const j = (g % per_block) * group_elems;
     switch (fmt) {
         // Sixteen sub-blocks of 16; a group sits inside one. The 84-byte stride is
         // 4-aligned, so its eight quant bytes are two whole words.
@@ -378,6 +400,23 @@ inline fn group(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, g: u32
             r.m = e.f16At(.a, blk + 82) * @as(f32, @floatFromInt(sc >> 4));
             const qw = (blk + 16 + half * 32 + (j & 31)) >> 2;
             inline for (0..2) |i| r.w[i] = (e.ldW(.a, qw + @as(u32, @intCast(i))) >> shift) & 0x03030303;
+        },
+        // Eight sub-blocks of 32, each with a 6-bit scale and min packed across
+        // twelve bytes. The 144-byte stride is 16-aligned, so a group's eight
+        // nibble bytes are two whole words.
+        //
+        // This format already has a hand-written kernel on both backends; the dual
+        // arm exists so the two approaches can be compared on ONE weight
+        // (`TP_DUAL_DECODE`, and `vk-gemv-bench`). Nothing routes here by default.
+        .q4_k => {
+            const blk = base + sb * 144;
+            const is = j >> 5;
+            const sm = scaleMinK4(e, blk + 4, is);
+            r.d = e.f16At(.a, blk) * @as(f32, @floatFromInt(sm[0]));
+            r.m = e.f16At(.a, blk + 2) * @as(f32, @floatFromInt(sm[1]));
+            const shift: u5 = @intCast((is & 1) * 4);
+            const qw = (blk + 16 + ((j >> 6) << 5) + (j & 31)) >> 2;
+            inline for (0..2) |i| r.w[i] = (e.ldW(.a, qw + @as(u32, @intCast(i))) >> shift) & 0x0F0F0F0F;
         },
         // Same mapping, but the code is 2 bits MINUS 4 unless the high-bit mask
         // says otherwise, which folds into a signed code and needs no `m`. The
@@ -454,6 +493,115 @@ inline fn group(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, g: u32
                 0,
                 signs,
             );
+        },
+        // --- the formats that ALSO have a hand-written kernel ------------------
+        //
+        // These exist so the dual body can be compared against, and on Vulkan
+        // replace, the per-backend kernels. `vk-gemv-bench` and `TP_DUAL_DECODE`
+        // are how; BACKEND.md carries the verdicts.
+
+        // 32 elements, already signed bytes: the only decode is the block scale.
+        // The 34-byte stride is 2-aligned, so the codes come as u16 pairs.
+        .q8_0 => {
+            const blk = base + sb * 34;
+            r.d = e.f16At(.a, blk);
+            inline for (0..2) |i| r.w[i] = u32At2(e, blk + 2 + j + @as(u32, @intCast(i)) * 4);
+        },
+        // 32 elements as 16 nibble bytes, the LOW nibbles first: elements 0..15
+        // are the low half of bytes 0..15 and 16..31 the high half, which is not
+        // the layout q4_k uses. Code is the nibble less 8.
+        .q4_0 => {
+            const blk = base + sb * 18;
+            r.d = e.f16At(.a, blk);
+            const shift: u5 = if (j < 16) 0 else 4;
+            inline for (0..2) |i| {
+                const w = u32At2(e, blk + 2 + (j & 15) + @as(u32, @intCast(i)) * 4);
+                r.w[i] = k.subBytes((w >> shift) & 0x0F0F0F0F, 0x08080808);
+            }
+        },
+        // q4_0's layout over a non-linear codebook, so the nibble is an INDEX and
+        // reading it as a signed value is finite, plausible and wrong.
+        .iq4_nl => {
+            const blk = base + sb * 18;
+            r.d = e.f16At(.a, blk);
+            const shift: u5 = if (j < 16) 0 else 4;
+            inline for (0..2) |i| {
+                const w = u32At2(e, blk + 2 + (j & 15) + @as(u32, @intCast(i)) * 4);
+                r.w[i] = iq4Codes(e, tbl, (w >> shift) & 0x0F0F0F0F);
+            }
+        },
+        // The same codebook over a k-quant super-block, with a 6-bit sub-block
+        // scale split across scales_h and scales_l and biased by -32. Its
+        // 136-byte stride IS 4-aligned, so the nibbles are whole words.
+        .iq4_xs => {
+            const blk = base + sb * 136;
+            const ib = j >> 5;
+            const ls_l = (e.byte(.a, blk + 4 + (ib >> 1)) >> @intCast((ib & 1) * 4)) & 15;
+            const ls_h = (e.u16At(.a, blk + 2) >> @intCast(2 * ib)) & 3;
+            r.d = e.f16At(.a, blk) * @as(f32, @floatFromInt(@as(i32, @intCast(ls_l | (ls_h << 4))) - 32));
+            const shift: u5 = if (j & 16 == 0) 0 else 4;
+            const qw = (blk + 8 + (ib << 4) + (j & 15)) >> 2;
+            inline for (0..2) |i| r.w[i] = iq4Codes(e, tbl, (e.ldW(.a, qw + @as(u32, @intCast(i))) >> shift) & 0x0F0F0F0F);
+        },
+        // q4_k plus a 5th bit per element out of qh, so the code is 0..31.
+        .q5_k => {
+            const blk = base + sb * 176;
+            const is = j >> 5;
+            const sm = scaleMinK4(e, blk + 4, is);
+            r.d = e.f16At(.a, blk) * @as(f32, @floatFromInt(sm[0]));
+            r.m = e.f16At(.a, blk + 2) * @as(f32, @floatFromInt(sm[1]));
+            const shift: u5 = @intCast((is & 1) * 4);
+            const hbit: u5 = @intCast(is & 7);
+            const qw = (blk + 48 + ((j >> 6) << 5) + (j & 31)) >> 2;
+            const hw = (blk + 16 + (j & 31)) >> 2;
+            inline for (0..2) |i| {
+                const lo = (e.ldW(.a, qw + @as(u32, @intCast(i))) >> shift) & 0x0F0F0F0F;
+                const hi = (e.ldW(.a, hw + @as(u32, @intCast(i))) >> hbit) & 0x01010101;
+                r.w[i] = lo | (hi << 4);
+            }
+        },
+        // Sixteen sub-blocks of 16 with a SIGNED 8-bit scale each; the code is a
+        // 4-bit low half plus a 2-bit high half, biased by -32. The 210-byte
+        // stride is 2-aligned, so both halves come as u16 pairs.
+        .q6_k => {
+            const blk = base + sb * 210;
+            const sc = k.sext8(e.byte(.a, blk + 192 + (j >> 4)));
+            r.d = e.f16At(.a, blk + 208) * @as(f32, @floatFromInt(sc));
+            const half = j >> 7;
+            const lshift: u5 = @intCast(((j >> 6) & 1) * 4);
+            const hshift: u5 = @intCast(((j >> 5) & 3) * 2);
+            const lbase = blk + half * 64 + ((j >> 5) & 1) * 32 + (j & 31);
+            const hbase = blk + 128 + half * 32 + (j & 31);
+            inline for (0..2) |i| {
+                const o: u32 = @as(u32, @intCast(i)) * 4;
+                const lo = (u32At2(e, lbase + o) >> lshift) & 0x0F0F0F0F;
+                const hi = (u32At2(e, hbase + o) >> hshift) & 0x03030303;
+                r.w[i] = k.subBytes(lo | (hi << 4), 0x20202020);
+            }
+        },
+        // One bit per weight: the code is the SIGN, and a group's eight bits are
+        // one byte. Two loads for eight elements, the cheapest decode here.
+        .q1_0 => {
+            const blk = base + sb * 18;
+            r.d = e.f16At(.a, blk);
+            const bits = e.byte(.a, blk + 2 + (j >> 3));
+            inline for (0..2) |i| {
+                const m = k.byteMask((bits >> @intCast(@as(u32, @intCast(i)) * 4)) & 15);
+                r.w[i] = k.subBytes((m & 0x01010101) << 1, 0x01010101);
+            }
+        },
+        // 2-bit codes, four per byte, LSB first; the set is {-1, 0, +1, +2} * d,
+        // NOT centred on zero. A group is exactly two bytes, and the shifts lay
+        // one byte's four codes into four byte lanes.
+        .q2_0_g64, .q2_0_g128 => {
+            const qk: u32 = if (fmt == .q2_0_g64) 64 else 128;
+            const blk = base + sb * (2 + qk / 4);
+            r.d = e.f16At(.a, blk);
+            inline for (0..2) |i| {
+                const b = e.byte(.a, blk + 2 + (j >> 2) + @as(u32, @intCast(i)));
+                const codes = (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303;
+                r.w[i] = k.subBytes(codes, 0x01010101);
+            }
         },
         else => @compileError("no grouped decode for " ++ @tagName(fmt)),
     }
@@ -691,6 +839,66 @@ pub inline fn gemvQ2_k(e: Env) void {
 }
 pub inline fn gemvQ2_kQ8(e: Env) void {
     gemvQ(e, .q2_k, true);
+}
+pub inline fn gemvQ8_0(e: Env) void {
+    gemvQ(e, .q8_0, false);
+}
+pub inline fn gemvQ8_0Q8(e: Env) void {
+    gemvQ(e, .q8_0, true);
+}
+pub inline fn gemvQ4_0(e: Env) void {
+    gemvQ(e, .q4_0, false);
+}
+pub inline fn gemvQ4_0Q8(e: Env) void {
+    gemvQ(e, .q4_0, true);
+}
+pub inline fn gemvIq4Nl(e: Env) void {
+    gemvQ(e, .iq4_nl, false);
+}
+pub inline fn gemvIq4NlQ8(e: Env) void {
+    gemvQ(e, .iq4_nl, true);
+}
+pub inline fn gemvIq4Xs(e: Env) void {
+    gemvQ(e, .iq4_xs, false);
+}
+pub inline fn gemvIq4XsQ8(e: Env) void {
+    gemvQ(e, .iq4_xs, true);
+}
+pub inline fn gemvQ5_k(e: Env) void {
+    gemvQ(e, .q5_k, false);
+}
+pub inline fn gemvQ5_kQ8(e: Env) void {
+    gemvQ(e, .q5_k, true);
+}
+pub inline fn gemvQ6_k(e: Env) void {
+    gemvQ(e, .q6_k, false);
+}
+pub inline fn gemvQ6_kQ8(e: Env) void {
+    gemvQ(e, .q6_k, true);
+}
+pub inline fn gemvQ1_0(e: Env) void {
+    gemvQ(e, .q1_0, false);
+}
+pub inline fn gemvQ1_0Q8(e: Env) void {
+    gemvQ(e, .q1_0, true);
+}
+pub inline fn gemvQ2_0G64(e: Env) void {
+    gemvQ(e, .q2_0_g64, false);
+}
+pub inline fn gemvQ2_0G64Q8(e: Env) void {
+    gemvQ(e, .q2_0_g64, true);
+}
+pub inline fn gemvQ2_0G128(e: Env) void {
+    gemvQ(e, .q2_0_g128, false);
+}
+pub inline fn gemvQ2_0G128Q8(e: Env) void {
+    gemvQ(e, .q2_0_g128, true);
+}
+pub inline fn gemvQ4_k(e: Env) void {
+    gemvQ(e, .q4_k, false);
+}
+pub inline fn gemvQ4_kQ8(e: Env) void {
+    gemvQ(e, .q4_k, true);
 }
 pub inline fn gemvQ3_k(e: Env) void {
     gemvQ(e, .q3_k, false);

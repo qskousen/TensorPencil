@@ -337,6 +337,8 @@ pub fn main(init: std.process.Init) !void {
         try tuneCoop(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "vk-norm-bench")) {
         try vkNormBench(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "vk-gemv-bench")) {
+        try vkGemvBench(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-vk-bench")) {
         var seq: usize = 6534;
         for (args[2..]) |a| seq = std.fmt.parseInt(usize, a, 10) catch seq;
@@ -661,6 +663,9 @@ pub fn main(init: std.process.Init) !void {
             \\  TensorPencil vk-norm-bench
             \\      thread-per-row vs subgroup weighted RMSNorm at every shape the
             \\      three Vulkan DiTs use, at the sizes they render at
+            \\  TensorPencil vk-gemv-bench
+            \\      the Vulkan block-quant decode GEMV per format, in GB/s and
+            \\      Gelem/s over the weight
             \\  TensorPencil anima-vk-bench [<seq>]
             \\      the Vulkan counterpart: bf16 vs int8 GEMMs at identical shapes,
             \\      the int8 prep, attention and elementwise, each against a
@@ -4041,6 +4046,110 @@ fn tuneCoop(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     }
     try stdout.print("\n", .{});
     writeCoopTileCache(io, stdout, ctx, best, i8_best);
+}
+
+/// The Vulkan block-quant decode GEMV, per format, in GB/s over the weight.
+///
+/// There used to be five routes here (a 32-row-group transposed GEMV with
+/// k-split partials, an int8-repack one, and three cooperative ones, four of
+/// them behind `TP_VK_*` knobs that defaulted off). This harness is what
+/// compared them, on one weight copy per route, and the dual body won every
+/// format by 1.06x to 2.88x, so the rest are gone and BACKEND.md carries the
+/// table. What is left is the per-format rate, which is what says whether a
+/// format is at the machine or leaving it on the table. `git log` has the
+/// comparison if it ever needs re-running.
+///
+/// ⚠️ Absolute times include Vulkan's per-submit cost, since every op here ends
+/// in `submitAndWait`, and an LLM decode on this backend is SUBMIT-bound rather
+/// than kernel-bound: switching every format to a 1.7x faster GEMV moved a 9B
+/// q6_k model's tok/s not at all. Compare rows to each other, not to CUDA.
+fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const gpu = TensorPencil.gpu.context;
+    const DType = TensorPencil.DType;
+
+    const ctx = gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== vk-gemv-bench ==\nvulkan device: {s}\n", .{ctx.device_name[0..ctx.device_name_len]});
+
+    const dts = [_]DType{
+        .q8_0,      .q4_0,   .iq4_nl,  .iq4_xs, .q2_k,    .q3_k,
+        .q4_k,      .q5_k,   .q6_k,    .q1_0,   .q2_0_g64, .q2_0_g128,
+        .iq2_xxs,   .iq2_xs, .iq3_xxs, .iq3_s,
+    };
+
+    const Shape = struct { rows: usize, cols: usize, who: []const u8 };
+    const shapes = [_]Shape{
+        .{ .rows = 17408, .cols = 5120, .who = "17408 x 5120 (mlp gate/up)" },
+        .{ .rows = 5120, .cols = 17408, .who = "5120 x 17408 (mlp down)" },
+    };
+
+    var prng = std.Random.DefaultPrng.init(0xB10C);
+    const rnd = prng.random();
+
+    const T = struct {
+        io: Io,
+        fn run(self: @This(), comptime f: anytype, args: anytype) !f64 {
+            for (0..20) |_| try @call(.auto, f, args);
+            var best: f64 = std.math.inf(f64);
+            for (0..5) |_| {
+                const t0 = std.Io.Clock.real.now(self.io);
+                for (0..20) |_| try @call(.auto, f, args);
+                const ns = std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds;
+                best = @min(best, @as(f64, @floatFromInt(ns)) / 1e6 / 20.0);
+            }
+            return best;
+        }
+    }{ .io = io };
+
+    for (shapes) |sh| {
+        var x_d = try ctx.tensorCreate(sh.cols * 4);
+        var y_d = try ctx.tensorCreate(sh.rows * 4);
+        defer {
+            ctx.tensorDestroy(&x_d);
+            ctx.tensorDestroy(&y_d);
+        }
+        const xh = try arena.alloc(f32, sh.cols);
+        for (xh) |*v| v.* = rnd.floatNorm(f32);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(xh));
+
+        try stdout.print("\n=== {s} ===\n{s:<11} {s:>10} {s:>10} {s:>11} {s:>8}\n", .{
+            sh.who, "dtype", "ms", "GB/s", "Gelem/s", "MiB",
+        });
+        for (dts) |dt| {
+            // Random block bytes with the scales pinned, not a real quantization:
+            // every kernel here is straight-line arithmetic over the block, so the
+            // VALUES cannot move the timing, and correctness is the device tests'
+            // job, not this one's.
+            const q = try arena.alloc(u8, dt.storageBytes(sh.rows * sh.cols));
+            rnd.bytes(q);
+            var off: usize = 0;
+            while (off < q.len) : (off += dt.blockBytes()) switch (dt) {
+                .q4_k, .q5_k => {
+                    std.mem.writeInt(u16, q[off..][0..2], 0x2A66, .little);
+                    std.mem.writeInt(u16, q[off + 2 ..][0..2], 0x251F, .little);
+                },
+                .q2_k => {
+                    std.mem.writeInt(u16, q[off + 80 ..][0..2], 0x2A66, .little);
+                    std.mem.writeInt(u16, q[off + 82 ..][0..2], 0x251F, .little);
+                },
+                .q3_k => std.mem.writeInt(u16, q[off + 108 ..][0..2], 0x2A66, .little),
+                .q6_k => std.mem.writeInt(u16, q[off + 208 ..][0..2], 0x2A66, .little),
+                else => std.mem.writeInt(u16, q[off..][0..2], 0x2A66, .little),
+            };
+
+            const ms = try T.run(gpu.Context.opGemvQuantDual, .{ ctx, dt, y_d, @as(usize, 0), x_d, @as([]const u8, q), @as(f32, 1.0), sh.rows, sh.cols });
+            try stdout.print("{s:<11} {d:7.3} ms {d:9.1} {d:11.1} {d:8.0}\n", .{
+                @tagName(dt),
+                ms,
+                @as(f64, @floatFromInt(q.len)) / (ms * 1e-3) / 1e9,
+                @as(f64, @floatFromInt(sh.rows * sh.cols)) / (ms * 1e-3) / 1e9,
+                @as(f64, @floatFromInt(q.len)) / (1 << 20),
+            });
+        }
+    }
 }
 
 fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {

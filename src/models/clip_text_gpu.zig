@@ -77,7 +77,7 @@ fn gemm(
         },
         .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {
             if (!ctx.hasQuantPrefillGemm()) return error.UnsupportedDType;
-            return ctx.opMatmulCoopQuant(wt.dtype, y, y_off_elems, x, m, wt.bytes, rows, cols, 1.0, bias, false);
+            return ctx.opMatmulCoopQuant(wt.dtype, y, y_off_elems, x, m, wt.bytes, rows, cols, 1.0, bias);
         },
         else => return error.UnsupportedDType,
     }

@@ -26,7 +26,6 @@ const matmul_f32_spv = @embedFile("matmul_f32_spv");
 const transpose_spv = @embedFile("transpose_spv");
 const eltwise_spv = @embedFile("eltwise_spv");
 const attn_batched_spv = @embedFile("attn_batched_spv");
-const dp4a_spv = @embedFile("dp4a_spv");
 const subgroup_spv = @embedFile("subgroup_spv");
 const dual_spv = @embedFile("dual_spv");
 const dual_table = @import("kernels/dual_table.zig");
@@ -385,7 +384,7 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q2_k_f32, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_q3_k_f32, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xxs_f32, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq2_xs_f32, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_xxs_f32, dequant_iq3_s_f16, dequant_iq3_s_bf16, dequant_iq3_s_f32, gemv_q2_k, gemv_q2_k_q8, gemv_q3_k, gemv_q3_k_q8, gemv_iq2_xxs, gemv_iq2_xxs_q8, gemv_iq2_xs, gemv_iq2_xs_q8, gemv_iq3_xxs, gemv_iq3_xxs_q8, gemv_iq3_s, gemv_iq3_s_q8 };
+pub const Elt = enum(usize) { rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q2_k_f32, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_q3_k_f32, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xxs_f32, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq2_xs_f32, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_xxs_f32, dequant_iq3_s_f16, dequant_iq3_s_bf16, dequant_iq3_s_f32, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8 };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("rmsnorm"),
     dualEntry("rms_apply_w"),
@@ -433,20 +432,12 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gemv_combine"),
     .{ .name = "gemv_partial4", .x = 256, .y = 1 },
     dualEntry("gemv_combine4"),
-    .{ .name = "gemv_q8_0", .x = 256, .y = 1 },
-    .{ .name = "gemv_q4_k", .x = 256, .y = 1 },
-    .{ .name = "gemv_q5_k", .x = 256, .y = 1 },
-    .{ .name = "gemv_q6_k", .x = 256, .y = 1 },
     dualEntry("l2norm_rows"),
     dualEntry("deinterleave2"),
     dualEntry("gdn_gates"),
     dualEntry("gdn_conv_step"),
     .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
     .{ .name = "attn_dsplit_gemma", .x = 256, .y = 1 },
-    .{ .name = "gemv_q6_k_t", .x = 256, .y = 1 },
-    .{ .name = "gemv_q8_0_t", .x = 256, .y = 1 },
-    .{ .name = "gemv_q4_k_t", .x = 256, .y = 1 },
-    .{ .name = "gemv_q5_k_t", .x = 256, .y = 1 },
     dualEntry("gelu_mul"),
     dualEntry("gelu"),
     dualEntry("layernorm"),
@@ -462,13 +453,11 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("penalize"),
     .{ .name = "attn_dsplit_gemma_q8", .x = 256, .y = 1 },
     .{ .name = "kv_store_q8_0", .x = 256, .y = 1 },
-    .{ .name = "gemv_iq4_nl", .x = 256, .y = 1 },
-    .{ .name = "gemv_iq4_nl_t", .x = 256, .y = 1 },
-    .{ .name = "dequant_q8_0_f32", .x = 256, .y = 1 },
-    .{ .name = "dequant_q4_k_f32", .x = 256, .y = 1 },
-    .{ .name = "dequant_q5_k_f32", .x = 256, .y = 1 },
-    .{ .name = "dequant_q6_k_f32", .x = 256, .y = 1 },
-    .{ .name = "dequant_iq4_nl_f32", .x = 256, .y = 1 },
+    dualEntry("dequant_q8_0_f32"),
+    dualEntry("dequant_q4_k_f32"),
+    dualEntry("dequant_q5_k_f32"),
+    dualEntry("dequant_q6_k_f32"),
+    dualEntry("dequant_iq4_nl_f32"),
     dualEntry("pack_h16_kmajor"),
     dualEntry("gn_stats"),
     dualEntry("gn_combine"),
@@ -594,18 +583,38 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("dequant_iq3_s_f16"),
     dualEntry("dequant_iq3_s_bf16"),
     dualEntry("dequant_iq3_s_f32"),
-    dualEntry("gemv_q2_k"),
-    dualEntry("gemv_q2_k_q8"),
-    dualEntry("gemv_q3_k"),
-    dualEntry("gemv_q3_k_q8"),
-    dualEntry("gemv_iq2_xxs"),
-    dualEntry("gemv_iq2_xxs_q8"),
-    dualEntry("gemv_iq2_xs"),
-    dualEntry("gemv_iq2_xs_q8"),
-    dualEntry("gemv_iq3_xxs"),
-    dualEntry("gemv_iq3_xxs_q8"),
-    dualEntry("gemv_iq3_s"),
-    dualEntry("gemv_iq3_s_q8"),
+    dualEntry("gemv_dual_q2_k"),
+    dualEntry("gemv_dual_q2_k_q8"),
+    dualEntry("gemv_dual_q3_k"),
+    dualEntry("gemv_dual_q3_k_q8"),
+    dualEntry("gemv_dual_q4_k"),
+    dualEntry("gemv_dual_q4_k_q8"),
+    dualEntry("gemv_dual_q8_0"),
+    dualEntry("gemv_dual_q8_0_q8"),
+    dualEntry("gemv_dual_q4_0"),
+    dualEntry("gemv_dual_q4_0_q8"),
+    dualEntry("gemv_dual_iq4_nl"),
+    dualEntry("gemv_dual_iq4_nl_q8"),
+    dualEntry("gemv_dual_iq4_xs"),
+    dualEntry("gemv_dual_iq4_xs_q8"),
+    dualEntry("gemv_dual_q5_k"),
+    dualEntry("gemv_dual_q5_k_q8"),
+    dualEntry("gemv_dual_q6_k"),
+    dualEntry("gemv_dual_q6_k_q8"),
+    dualEntry("gemv_dual_q1_0"),
+    dualEntry("gemv_dual_q1_0_q8"),
+    dualEntry("gemv_dual_q2_0_g64"),
+    dualEntry("gemv_dual_q2_0_g64_q8"),
+    dualEntry("gemv_dual_q2_0_g128"),
+    dualEntry("gemv_dual_q2_0_g128_q8"),
+    dualEntry("gemv_dual_iq2_xxs"),
+    dualEntry("gemv_dual_iq2_xxs_q8"),
+    dualEntry("gemv_dual_iq2_xs"),
+    dualEntry("gemv_dual_iq2_xs_q8"),
+    dualEntry("gemv_dual_iq3_xxs"),
+    dualEntry("gemv_dual_iq3_xxs_q8"),
+    dualEntry("gemv_dual_iq3_s"),
+    dualEntry("gemv_dual_iq3_s_q8"),
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -1031,7 +1040,6 @@ pub const Context = struct {
     pipe_tr_bf16: vk.Pipeline, // bf16 weight -> bf16 k-major dense-GEMV layout (2 cols/u32)
     pipe_tr_bf16w: vk.Pipeline, // bf16 weight -> f16 k-major coop layout (GPU convert, fallback)
     pipe_tr_bf16raw: vk.Pipeline, // bf16 weight -> bf16 k-major coop layout (native, no convert)
-    pipe_tr_grp32: vk.Pipeline, // raw block-quant -> 32-row-group byte-transposed layout (device weightBufferRawT)
     pipe_repack_q8_0: vk.Pipeline, // raw q8_0 -> int8-interleaved dp4a layout
     pipe_repack_iq4_nl: vk.Pipeline, // raw iq4_nl -> int8-interleaved dp4a layout (LUT pre-applied)
     pipeline_layout_e: vk.PipelineLayout,
@@ -1041,14 +1049,16 @@ pub const Context = struct {
     /// int8 dp4a block-quant decode GEMV, present iff the device supports
     /// VK_KHR_shader_integer_dot_product. Pipelines: [0] quant_act_i8,
     /// [1] gemv_q8_0_dp4a, [2] gemv_iq4_nl_dp4a.
+    /// The device advertises `VK_KHR_shader_integer_dot_product`. Nothing reads
+    /// this any more: the kernels that used it went with the dp4a module, and the
+    /// negotiation is left in place because unpicking a `p_next` chain risks every
+    /// Vulkan path for no gain.
     has_int_dot: bool = false,
-    shader_dp4a: vk.ShaderModule = .null_handle,
     /// [0] quant_act_i8, [1] gemv_repack_dp4a, [2] dequant_repack_f32,
     /// [3] gemv_q8_0_sg_dp4a, [4] gemv_iq4_nl_sg_dp4a (cooperative dp4a: raw
     /// weight + subgroup reduce, no repack, need GroupNonUniform caps too),
     /// [5] gemv_q8_0_t_dp4a, [6] gemv_iq4_nl_t_dp4a (dp4a over the _t layout +
     /// k-split, repack-dp4a speed, no int8 repack / no extra VRAM).
-    pipe_dp4a: [7]vk.Pipeline = @splat(.null_handle),
     /// Subgroup-cooperative kernels (kernels/subgroup.zig): reductions done
     /// within a subgroup, no workgroup storage (the NVIDIA-safe escape hatch).
     /// Built whenever subgroup arithmetic is available (core Vulkan 1.1); null
@@ -1058,7 +1068,7 @@ pub const Context = struct {
     /// [6] attn_decode_sg (folded flash-decode attention). The norms live in the
     /// dual-target module now.
     shader_sg: vk.ShaderModule = .null_handle,
-    pipe_sg: [12]vk.Pipeline = @splat(.null_handle),
+    pipe_sg: [2]vk.Pipeline = @splat(.null_handle),
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
     // module, which is at the SPIR-V backend's per-module entry-point limit.
@@ -1144,8 +1154,6 @@ pub const Context = struct {
     deq_f16k: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// dp4a decode scratch: the activation quantized to int8 (packed, 4/u32)
     /// and its per-32-block f32 scales.
-    dp4a_xi8: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
-    dp4a_xscale: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// int8-path scratch: rotated f32 activations, per-row act scale, packed
     /// int8 activations, s32 GEMM accumulator, and the resident Hadamard.
     i8_xr: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
@@ -1711,116 +1719,33 @@ pub const Context = struct {
         }
         errdefer for (pipes_e) |pp| d.DestroyPipeline(device, pp, null);
 
-        // dp4a int8 decode GEMV (block-quant): a SEPARATE module so the injected
-        // DotProduct capability never touches the shared eltwise module (which
-        // must stay valid where integer dot product is absent). Reuses the
-        // eltwise 4-buffer set layout + push range. Any failure, an invalid
-        // patched module, missing pipeline, degrades to the scalar GEMV rather
-        // than failing device bring-up.
-        var shader_dp4a: vk.ShaderModule = .null_handle;
-        var pipe_dp4a: [7]vk.Pipeline = @splat(vk.Pipeline.null_handle);
-        if (has_int_dot) dp4a: {
-            const dp4a_entries = [_]EntrySize{
-                .{ .name = "quant_act_i8", .x = 256, .y = 1 },
-                .{ .name = "gemv_repack_dp4a", .x = 256, .y = 1 },
-                .{ .name = "dequant_repack_f32", .x = 256, .y = 1 },
-                // raw dp4a + subgroup k-split (llama.cpp mul_mat_vecq mapping):
-                // 1 subgroup/wg (LocalSize 32), one output row per workgroup;
-                // many small workgroups keep the SMs full.
-                .{ .name = "gemv_q8_0_sg_dp4a", .x = 32, .y = 1 },
-                .{ .name = "gemv_iq4_nl_sg_dp4a", .x = 32, .y = 1 },
-                // dp4a over the _t layout + k-split (no repack, no extra VRAM).
-                .{ .name = "gemv_q8_0_t_dp4a", .x = 256, .y = 1 },
-                .{ .name = "gemv_iq4_nl_t_dp4a", .x = 256, .y = 1 },
-            };
-            // StorageBuffer16BitAccess only when supported, the aligned-u16 dp4a
-            // GEMV kernels use it; the module carries u16 storage regardless, so
-            // on a device without it the module build fails and block-quant
-            // decode falls back to the scalar GEMV (graceful, exotic devices only).
-            const caps_base = [_]u32{ spv.cap_dot_product, spv.cap_dot_product_input_4x8_packed, spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
-            const caps_16 = caps_base ++ [_]u32{spv.cap_storage_buffer_16bit};
-            const caps: []const u32 = if (has_16bit) &caps_16 else &caps_base;
-            createKernelModule(gpa, &d, device, dp4a_spv, &dp4a_entries, caps, "SPV_KHR_integer_dot_product", &shader_dp4a) catch |e| {
-                std.log.warn("dp4a module unavailable ({t}); block-quant decode uses the scalar GEMV", .{e});
-                has_int_dot = false;
-                break :dp4a;
-            };
-            const infos = [7]vk.ComputePipelineCreateInfo{
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "quant_act_i8" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "gemv_repack_dp4a" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "dequant_repack_f32" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "gemv_q8_0_sg_dp4a" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "gemv_iq4_nl_sg_dp4a" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "gemv_q8_0_t_dp4a" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_dp4a, .p_name = "gemv_iq4_nl_t_dp4a" }, .layout = pipeline_layout_e },
-            };
-            if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_dp4a) != .success) {
-                std.log.warn("dp4a pipelines unavailable; block-quant decode uses the scalar GEMV", .{});
-                for (pipe_dp4a) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
-                pipe_dp4a = @splat(vk.Pipeline.null_handle);
-                d.DestroyShaderModule(device, shader_dp4a, null);
-                shader_dp4a = .null_handle;
-                has_int_dot = false;
-            }
-        }
-        errdefer if (shader_dp4a != .null_handle) {
-            for (pipe_dp4a) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
-            d.DestroyShaderModule(device, shader_dp4a, null);
-        };
 
         // Subgroup-cooperative kernel module (kernels/subgroup.zig): reductions
         // WITHIN a subgroup via OpGroupNonUniform*, needing no workgroup storage
         // class, the verified escape hatch from the NVIDIA hang on Zig-emitted
-        // workgroup memory. Subgroup arithmetic is core
-        // Vulkan 1.1: only the module capabilities are injected, no extension
-        // and no device feature. Independent of has_int_dot. A failure here just
-        // leaves the subgroup pipelines null (the opt-in subgroup GEMVs stay off),
-        // never failing device bring-up.
+        // workgroup memory. Subgroup arithmetic is core Vulkan 1.1: only the
+        // module capabilities are injected, no extension and no device feature.
+        // A failure here just leaves the pipelines null, never failing bring-up.
         var shader_sg: vk.ShaderModule = .null_handle;
-        var pipe_sg: [12]vk.Pipeline = @splat(vk.Pipeline.null_handle);
+        var pipe_sg: [2]vk.Pipeline = @splat(vk.Pipeline.null_handle);
         sg: {
             const sg_entries = [_]EntrySize{
                 .{ .name = "subgroup_sum", .x = 32, .y = 1 },
-                // gemv_*_sg: 256-thread workgroups = 8 subgroups each (one row
-                // per subgroup, row = gid/32) so the SM stays occupied, a
-                // 32-thread (1-warp) workgroup runs at ~1/8 occupancy.
-                .{ .name = "gemv_q8_0_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q4_k_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q5_k_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q6_k_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_iq4_nl_sg", .x = 256, .y = 1 },
                 // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
                 // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
                 .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
-                // The formats with no other decode kernel; appended so the
-                // indices above keep their meaning.
-                .{ .name = "gemv_q4_0_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_iq4_xs_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q1_0_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q2_0_g64_sg", .x = 256, .y = 1 },
-                .{ .name = "gemv_q2_0_g128_sg", .x = 256, .y = 1 },
             };
             const caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
             createKernelModule(gpa, &d, device, subgroup_spv, &sg_entries, &caps, null, &shader_sg) catch |e| {
-                std.log.warn("subgroup module unavailable ({t}); the opt-in subgroup GEMVs are off", .{e});
+                std.log.warn("subgroup module unavailable ({t}); flash-decode attention is off", .{e});
                 break :sg;
             };
-            const infos = [12]vk.ComputePipelineCreateInfo{
+            const infos = [2]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_sg, .p_name = "subgroup_sum" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q8_0_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q4_k_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q5_k_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q6_k_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_nl_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "attn_decode_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q4_0_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_xs_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q1_0_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q2_0_g64_sg" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q2_0_g128_sg" }, .layout = pipeline_layout_e },
             };
             if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_sg) != .success) {
-                std.log.warn("subgroup pipelines unavailable; the opt-in subgroup GEMVs are off", .{});
+                std.log.warn("subgroup pipelines unavailable; flash-decode attention is off", .{});
                 for (pipe_sg) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
                 pipe_sg = @splat(vk.Pipeline.null_handle);
                 d.DestroyShaderModule(device, shader_sg, null);
@@ -2258,7 +2183,6 @@ pub const Context = struct {
             .pipe_tr_bf16 = pipes_tr[2],
             .pipe_tr_bf16w = pipes_tr[3],
             .pipe_tr_bf16raw = pipes_tr[4],
-            .pipe_tr_grp32 = pipes_tr[5],
             .pipe_repack_q8_0 = pipes_tr[6],
             .pipe_repack_iq4_nl = pipes_tr[7],
             .pipeline_layout_e = pipeline_layout_e,
@@ -2266,8 +2190,6 @@ pub const Context = struct {
             .shader_dual = shader_dual,
             .pipes_e = pipes_e,
             .has_int_dot = has_int_dot,
-            .shader_dp4a = shader_dp4a,
-            .pipe_dp4a = pipe_dp4a,
             .shader_sg = shader_sg,
             .pipe_sg = pipe_sg,
             .shader_ab = shader_ab,
@@ -2350,7 +2272,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dp4a_xi8, &self.dp4a_xscale, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -2366,7 +2288,6 @@ pub const Context = struct {
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16w, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16raw, null);
-        self.d.DestroyPipeline(self.device, self.pipe_tr_grp32, null);
         self.d.DestroyPipeline(self.device, self.pipe_repack_q8_0, null);
         self.d.DestroyPipeline(self.device, self.pipe_repack_iq4_nl, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f8, null);
@@ -2408,10 +2329,6 @@ pub const Context = struct {
         self.d.DestroyShaderModule(self.device, self.shader_f8, null);
         self.d.DestroyShaderModule(self.device, self.shader_f32, null);
         self.d.DestroyShaderModule(self.device, self.shader_tr, null);
-        if (self.shader_dp4a != .null_handle) {
-            for (self.pipe_dp4a) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
-            self.d.DestroyShaderModule(self.device, self.shader_dp4a, null);
-        }
         if (self.shader_sg != .null_handle) {
             for (self.pipe_sg) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
             self.d.DestroyShaderModule(self.device, self.shader_sg, null);
@@ -2720,204 +2637,12 @@ pub const Context = struct {
         return db.buf;
     }
 
-    /// Like weightBufferRaw, but byte-transposes the row-major block-quant
-    /// weight into 32-row groups so the `*_t` GEMV kernels read coalesced:
-    /// logical byte `j` of row `row` moves to grp_base + j*32 (grp_base =
-    /// (row/32)*row_bytes*32 + row%32). The bytes are unchanged (bit-identical
-    /// dequant); only their order changes. Cached by host pointer (one-time).
-    /// The transpose runs ON THE GPU (transpose_grp32): the raw weight streams
-    /// to a device scratch, then one compute pass writes the grouped layout,
-    /// replacing the single-thread ~8 GiB CPU byte-scatter (the cold-start
-    /// bottleneck). Rows are padded up to a multiple of 32; the pad slots are
-    /// zeroed by the kernel (out-of-range rows contribute 0) and never read.
-    fn weightBufferRawT(self: *Context, bytes: []const u8, row_bytes: usize) Error!vk.Buffer {
-        const key = @intFromPtr(bytes.ptr);
-        self.use_counter += 1;
-        if (self.weights.getPtr(key)) |e| {
-            e.last_use = self.use_counter;
-            return e.db.buf;
-        }
-        const G: usize = 32;
-        std.debug.assert(bytes.len % row_bytes == 0);
-        const rows = bytes.len / row_bytes;
-        const ngrp = (rows + G - 1) / G;
-        const packed_size = ngrp * G * row_bytes;
-        const total = std.mem.alignForward(u64, packed_size, 4);
-        self.reserveForWeights(total);
-        const db = try self.createBuffer(
-            total,
-            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
-            vk.MemoryProperty.device_local,
-        );
-        errdefer {
-            self.d.DestroyBuffer(self.device, db.buf, null);
-            self.d.FreeMemory(self.device, db.mem, null);
-        }
-
-        // Raw row-major weight -> device scratch (chunked staging upload).
-        const cb = self.nowCmd();
-        const raw_size = std.mem.alignForward(u64, bytes.len, 4);
-        try self.ensureDeviceBuffer(&self.raw_dev, raw_size);
-        const chunk: u64 = 256 << 20;
-        const mapped = try self.ensureHostBuffer(&self.staging, @min(raw_size, chunk));
-        var off: u64 = 0;
-        while (off < bytes.len) {
-            const n: u64 = @min(chunk, bytes.len - off);
-            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
-            try self.beginCmdBuf(cb);
-            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
-            self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
-            try self.submitAndWaitBuf(cb);
-            off += n;
-        }
-
-        // GPU byte-transpose raw_dev -> db (one output u32 per invocation).
-        {
-            const buf_infos = [2]vk.DescriptorBufferInfo{
-                .{ .buffer = self.raw_dev.buf },
-                .{ .buffer = db.buf },
-            };
-            var writes: [2]vk.WriteDescriptorSet = undefined;
-            for (&writes, 0..) |*wr, i| {
-                wr.* = .{
-                    .dst_set = self.desc_set_tr,
-                    .dst_binding = @intCast(i),
-                    .dst_array_element = 0,
-                    .descriptor_count = 1,
-                    .descriptor_type = .storage_buffer,
-                    .p_image_info = null,
-                    .p_buffer_info = @ptrCast(&buf_infos[i]),
-                    .p_texel_buffer_view = null,
-                };
-            }
-            self.d.UpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
-
-            const words: u32 = @intCast(total / 4);
-            const push: TransposePush = .{
-                .rows = @intCast(rows),
-                .cols = words, // dispatch/bound = output word count
-                .stride = @intCast(row_bytes),
-            };
-            try self.beginCmdBuf(cb);
-            self.d.CmdBindPipeline(cb, .compute, self.pipe_tr_grp32);
-            self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
-            self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
-            self.d.CmdDispatch(cb, @intCast(std.math.divCeil(u64, words, 256) catch unreachable), 1, 1);
-            const to_shader: vk.BufferMemoryBarrier = .{
-                .src_access_mask = vk.Access.shader_write,
-                .dst_access_mask = vk.Access.shader_read,
-                .buffer = db.buf,
-                .offset = 0,
-                .size = vk.WHOLE_SIZE,
-            };
-            self.d.CmdPipelineBarrier(cb, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
-            try self.submitAndWaitBuf(cb);
-        }
-
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
-        return db.buf;
-    }
-
     /// Bytes one repacked (int8-interleaved dp4a) weight occupies: per 32-row
     /// group, `nblk` blocks × (8 quad-u32 + 32 f32 scales) = nblk*288 u32.
     fn repackedBytes(rows: usize, cols: usize) usize {
         const ngrp = (rows + 31) / 32;
         const nblk = cols / 32;
         return ngrp * nblk * 288 * 4;
-    }
-
-    /// Repack a q8_0 / iq4_nl weight into the int8-interleaved layout the dp4a
-    /// decode GEMV + prefill dequant read (see dp4a.zig / repack_* kernels):
-    /// four consecutive quant int8 per u32, 32 rows interleaved, plus an f32
-    /// row-scale per block; the iq4_nl codebook is pre-applied. Uploads the raw
-    /// weight to a device scratch, then one GPU repack pass, like
-    /// weightBufferRawT. Cached by host pointer. Larger than the source (int8 vs
-    /// packed nibbles for iq4_nl), so only built when the dp4a path is active.
-    fn weightBufferRepacked(self: *Context, dt: @import("tp_core").dtype.DType, bytes: []const u8, rows: usize, cols: usize) Error!vk.Buffer {
-        const key = @intFromPtr(bytes.ptr);
-        self.use_counter += 1;
-        if (self.weights.getPtr(key)) |e| {
-            e.last_use = self.use_counter;
-            return e.db.buf;
-        }
-        const pipe = switch (dt) {
-            .q8_0 => self.pipe_repack_q8_0,
-            .iq4_nl => self.pipe_repack_iq4_nl,
-            else => return error.UnsupportedDType,
-        };
-        const nblk = cols / 32;
-        const total = repackedBytes(rows, cols);
-        self.reserveForWeights(total);
-        const db = try self.createBuffer(
-            total,
-            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
-            vk.MemoryProperty.device_local,
-        );
-        errdefer {
-            self.d.DestroyBuffer(self.device, db.buf, null);
-            self.d.FreeMemory(self.device, db.mem, null);
-        }
-
-        // Raw row-major weight -> device scratch (chunked staging upload).
-        const cb = self.nowCmd();
-        const raw_size = std.mem.alignForward(u64, bytes.len, 4);
-        try self.ensureDeviceBuffer(&self.raw_dev, raw_size);
-        const chunk: u64 = 256 << 20;
-        const mapped = try self.ensureHostBuffer(&self.staging, @min(raw_size, chunk));
-        var off: u64 = 0;
-        while (off < bytes.len) {
-            const n: u64 = @min(chunk, bytes.len - off);
-            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
-            try self.beginCmdBuf(cb);
-            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
-            self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
-            try self.submitAndWaitBuf(cb);
-            off += n;
-        }
-
-        // GPU repack: raw_dev -> db (one thread per (row, block)).
-        {
-            const buf_infos = [2]vk.DescriptorBufferInfo{
-                .{ .buffer = self.raw_dev.buf },
-                .{ .buffer = db.buf },
-            };
-            var writes: [2]vk.WriteDescriptorSet = undefined;
-            for (&writes, 0..) |*wr, i| {
-                wr.* = .{
-                    .dst_set = self.desc_set_tr,
-                    .dst_binding = @intCast(i),
-                    .dst_array_element = 0,
-                    .descriptor_count = 1,
-                    .descriptor_type = .storage_buffer,
-                    .p_image_info = null,
-                    .p_buffer_info = @ptrCast(&buf_infos[i]),
-                    .p_texel_buffer_view = null,
-                };
-            }
-            self.d.UpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
-            const push: TransposePush = .{
-                .rows = @intCast(rows),
-                .cols = @intCast(cols),
-                .stride = @intCast(quantRowBytes(dt, cols)),
-            };
-            try self.beginCmdBuf(cb);
-            self.d.CmdBindPipeline(cb, .compute, pipe);
-            self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
-            self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
-            self.d.CmdDispatch(cb, @intCast(std.math.divCeil(usize, rows * nblk, 256) catch unreachable), 1, 1);
-            const to_shader: vk.BufferMemoryBarrier = .{
-                .src_access_mask = vk.Access.shader_write,
-                .dst_access_mask = vk.Access.shader_read,
-                .buffer = db.buf,
-                .offset = 0,
-                .size = vk.WHOLE_SIZE,
-            };
-            self.d.CmdPipelineBarrier(cb, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
-            try self.submitAndWaitBuf(cb);
-        }
-
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
-        return db.buf;
     }
 
     /// Grow-on-demand device-local storage buffer.
@@ -3188,88 +2913,6 @@ pub const Context = struct {
         }, (rows / 4) * nchunk, 1, 1);
     }
 
-    /// Fused dequant GEMV for GGUF block-quant weights (decode, m=1): one
-    /// thread per output row dequants that row's blocks on the fly and dots
-    /// them with x. y[rows] = scale * (dequant(W) @ x). cols % 32 == 0. The
-    /// weight is uploaded raw (row-major blocks) via weightBufferRaw.
-    pub fn opGemvQuant(
-        self: *Context,
-        dt: @import("tp_core").dtype.DType,
-        y: DeviceBuffer,
-        y_off: usize,
-        x: DeviceBuffer,
-        w_bytes: []const u8,
-        scale: f32,
-        rows: usize,
-        cols: usize,
-    ) Error!void {
-        std.debug.assert(cols % 32 == 0);
-        const entry: Elt = switch (dt) {
-            .q8_0 => .gemv_q8_0,
-            .q4_k => .gemv_q4_k,
-            .q5_k => .gemv_q5_k,
-            .q6_k => .gemv_q6_k,
-            .iq4_nl => .gemv_iq4_nl,
-            else => return error.UnsupportedDType,
-        };
-        const w_buf = try self.weightBufferRaw(w_bytes);
-        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
-        try self.opElt(entry, w_db, x, null, y, .{
-            .u0 = @intCast(rows),
-            .u1 = @intCast(cols),
-            .u2 = @intCast(y_off),
-            .f0 = scale,
-        }, rows, 1, 1);
-    }
-
-    /// Coalesced + k-split block-quant GEMV: same math as opGemvQuant but
-    /// reads the 32-row-group transposed weight (weightBufferRawT + a `*_t`
-    /// kernel) so a warp touches consecutive bytes, and splits each row across
-    /// `nchunk` superblock chunks so the GPU has enough warps to hide memory
-    /// latency. `partials` holds rows*nchunk f32; gemv_combine reduces+scales.
-    /// Output is bit-close to opGemvQuant (only the reduction is chunked).
-    pub fn opGemvQuantT(
-        self: *Context,
-        dt: @import("tp_core").dtype.DType,
-        y: DeviceBuffer,
-        y_off: usize,
-        x: DeviceBuffer,
-        w_bytes: []const u8,
-        scale: f32,
-        rows: usize,
-        cols: usize,
-        nchunk: usize,
-        partials: DeviceBuffer,
-    ) Error!void {
-        std.debug.assert(cols % 32 == 0);
-        const row_bytes: usize = switch (dt) {
-            .q8_0 => (cols / 32) * 34,
-            .q4_k => (cols / 256) * 144,
-            .q5_k => (cols / 256) * 176,
-            .q6_k => (cols / 256) * 210,
-            .iq4_nl => (cols / 32) * 18,
-            else => return error.UnsupportedDType,
-        };
-        const entry: Elt = switch (dt) {
-            .q8_0 => .gemv_q8_0_t,
-            .q4_k => .gemv_q4_k_t,
-            .q5_k => .gemv_q5_k_t,
-            .q6_k => .gemv_q6_k_t,
-            .iq4_nl => .gemv_iq4_nl_t,
-            else => return error.UnsupportedDType,
-        };
-        if (dt != .q8_0 and dt != .iq4_nl) std.debug.assert(cols % 256 == 0);
-        const w_buf = try self.weightBufferRawT(w_bytes, row_bytes);
-        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
-        try self.opElt(entry, w_db, x, null, partials, .{
-            .u0 = @intCast(rows * nchunk),
-            .u1 = @intCast(cols),
-            .u2 = @intCast(nchunk),
-            .u3 = @intCast(rows),
-        }, rows * nchunk, 1, 1);
-        try self.opGemvCombine(y, y_off, partials, rows, scale, nchunk);
-    }
-
     // --- qwen35 hybrid (gated DeltaNet) ops ---
     pub fn opL2NormRows(self: *Context, x: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
         try self.opElt(.l2norm_rows, x, null, null, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
@@ -3332,7 +2975,7 @@ pub const Context = struct {
 
     /// Whether the folded flash-decode attention (attn_decode_sg) built.
     pub fn hasAttnDecodeSg(self: *const Context) bool {
-        return self.pipe_sg[6] != .null_handle;
+        return self.pipe_sg[1] != .null_handle;
     }
 
     /// Folded flash-decode GQA attention (f32 KV): one subgroup per head, the
@@ -3340,7 +2983,7 @@ pub const Context = struct {
     /// separate merge dispatch (vs opAttnDecodeQ35's dsplit+dmerge). Same
     /// semantics: window/ring/kv_end as there. Requires hasAttnDecodeSg().
     pub fn opAttnDecodeSg(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize) Error!void {
-        std.debug.assert(self.pipe_sg[6] != .null_handle);
+        std.debug.assert(self.pipe_sg[1] != .null_handle);
         try self.opBegin();
         var set = self.bind4(.{ q.buf, k_cache.buf, v_cache.buf, out.buf });
         const push: EltPush = .{
@@ -3353,7 +2996,7 @@ pub const Context = struct {
             .f1 = @bitCast(@as(u32, @intCast(ring))),
             .u6 = @intCast(kv_end),
         };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[6]);
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[1]);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
         // LocalSize 32 = one subgroup per workgroup, one head per subgroup.
@@ -4678,22 +4321,20 @@ pub const Context = struct {
     /// `opMatmulCoopQuant` at every row count, dequantized per call. Slow, but the
     /// checkpoint loads.
     pub fn dequantOnly(dt: @import("tp_core").dtype.DType) bool {
-        return switch (dt) {
-            .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
-            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
-            else => false,
-        };
+        return dt.isBlockQuant();
     }
 
-    /// Whether this format's decode is the DUAL row GEMV (kernels/dual/quant.zig),
-    /// the body the CUDA arm runs too. These formats have no per-backend kernel at
-    /// all, so it is not an opt-in A/B: without it a token would dequantize every
-    /// weight through the prefill GEMM.
+    /// Whether a DUAL row GEMV (kernels/dual/quant.zig) exists for this format,
+    /// the body the CUDA arm runs too. Every block quant has one.
+    ///
+    /// On this backend it is also the FASTEST decode for every one of them, by
+    /// 1.06x to 2.88x over whichever hand-written kernel the format otherwise
+    /// takes (`TensorPencil vk-gemv-bench`, and BACKEND.md carries the table).
+    /// That is the opposite of the CUDA arm, where the hand kernels win by
+    /// 1.24x to 1.75x, because these were written against the older
+    /// thread-per-row design and its 32-row-group transpose.
     pub fn dualGemv(dt: @import("tp_core").dtype.DType) bool {
-        return switch (dt) {
-            .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => true,
-            else => false,
-        };
+        return dt.isBlockQuant();
     }
 
     /// The codebook blob the four IQ formats decode through, as a raw weight
@@ -4702,7 +4343,9 @@ pub const Context = struct {
     /// is arithmetic, whose kernels leave the table slot unread.
     fn iqTable(self: *Context, dt: @import("tp_core").dtype.DType) Error!?DeviceBuffer {
         switch (dt) {
-            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => {},
+            // The four grid formats, plus the two that index the 16-value
+            // iq4_nl codebook out of the same blob.
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs => {},
             else => return null,
         }
         return .{ .buf = try self.weightBufferRaw(&iq_grid.blob), .mem = .null_handle, .size = 0 };
@@ -4724,7 +4367,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(cols % dt.blockElems() == 0);
         const entry: Elt = switch (dt) {
-            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| @field(Elt, "gemv_" ++ @tagName(t)),
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| @field(Elt, "gemv_dual_" ++ @tagName(t)),
             else => return error.UnsupportedDType,
         };
         const tbl = try self.iqTable(dt);
@@ -4737,81 +4380,43 @@ pub const Context = struct {
         }, rows, 1, 1);
     }
 
-    fn quantRowBytes(dt: @import("tp_core").dtype.DType, cols: usize) usize {
-        return switch (dt) {
-            .q8_0 => (cols / 32) * 34,
-            .q4_k => (cols / 256) * 144,
-            .q5_k => (cols / 256) * 176,
-            .q6_k => (cols / 256) * 210,
-            .iq4_nl => (cols / 32) * 18,
-            else => unreachable,
-        };
-    }
-
     /// Dequant a block-quant weight into the k-major padded f16 layout the coop
     /// GEMM consumes, returning its device buffer (`self.deq_f16k`). Reads the
-    /// resident 32-row-group transposed weight (weightBufferRawT, the same
-    /// buffer the decode GEMV uses, so no second copy), dequants it to f32
-    /// row-major (`self.deq_f32`), then repacks to f16 k-major. Both scratches
-    /// are reused across a batched prefill; the per-op barriers order each
-    /// weight's dequant->pack->GEMM->(next weight) so the reuse is race-free.
-    fn quantWeightF16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, repacked: bool) Error!vk.Buffer {
+    /// RAW row-major weight, the same resident buffer the decode GEMV reads, so
+    /// there is no second copy and no layout for the two to disagree about; it
+    /// dequants to f32 row-major (`self.deq_f32`) through the shared per-element
+    /// dequantizer, then repacks to f16 k-major. Both scratches are reused across
+    /// a batched prefill; the per-op barriers order each weight's
+    /// dequant->pack->GEMM->(next weight) so the reuse is race-free.
+    fn quantWeightF16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32) Error!vk.Buffer {
         std.debug.assert(cols % 32 == 0);
+        // GGUF weights carry no per-tensor scale, and the dequantizers take none.
+        std.debug.assert(scale == 1.0);
         try self.ensureDeviceBuffer(&self.deq_f32, rows * cols * 4);
-        if (repacked) {
-            // Dequant from the int8-interleaved dp4a layout (shared with decode
-            // so only one resident copy). scale is folded in at repack.
-            const w_buf = try self.weightBufferRepacked(dt, w_bytes, rows, cols);
-            const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
-            const units = rows * (cols / 32);
-            try self.dp4aDispatch(2, w_db, null, null, self.deq_f32, .{
-                .u0 = @intCast(units),
-                .u1 = @intCast(cols),
-                .u2 = @intCast(rows),
-            }, units);
-        } else if (dequantOnly(dt)) {
-            // No transposed decode GEMV for this format: the weight stays RAW row-major
-            // and the shared per-element dequantizer (dual.zig) reads it. GGUF weights
-            // carry no per-tensor scale.
-            std.debug.assert(scale == 1.0);
-            const w_raw = try self.weightBufferRaw(w_bytes);
-            const w_db: DeviceBuffer = .{ .buf = w_raw, .mem = .null_handle, .size = 0 };
-            const entry: Elt = switch (dt) {
-                inline .q4_0,
-                .iq4_xs,
-                .q1_0,
-                .q2_0_g64,
-                .q2_0_g128,
-                .q2_k,
-                .q3_k,
-                .iq2_xxs,
-                .iq2_xs,
-                .iq3_xxs,
-                .iq3_s,
-                => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ "_f32"),
-                else => unreachable,
-            };
-            const elems = rows * cols;
-            try self.opElt(entry, w_db, self.deq_f32, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
-        } else {
-            const row_bytes = quantRowBytes(dt, cols);
-            const w_t = try self.weightBufferRawT(w_bytes, row_bytes);
-            const w_db: DeviceBuffer = .{ .buf = w_t, .mem = .null_handle, .size = 0 };
-            const entry: Elt, const units: usize = switch (dt) {
-                .q8_0 => .{ .dequant_q8_0_f32, rows * (cols / 32) },
-                .q4_k => .{ .dequant_q4_k_f32, rows * (cols / 256) },
-                .q5_k => .{ .dequant_q5_k_f32, rows * (cols / 256) },
-                .q6_k => .{ .dequant_q6_k_f32, rows * (cols / 256) },
-                .iq4_nl => .{ .dequant_iq4_nl_f32, rows * (cols / 32) },
-                else => return error.UnsupportedDType,
-            };
-            try self.opElt(entry, w_db, null, null, self.deq_f32, .{
-                .u0 = @intCast(units),
-                .u1 = @intCast(cols),
-                .u2 = @intCast(rows),
-                .f0 = scale,
-            }, units, 1, 1);
-        }
+        const w_raw = try self.weightBufferRaw(w_bytes);
+        const w_db: DeviceBuffer = .{ .buf = w_raw, .mem = .null_handle, .size = 0 };
+        const entry: Elt = switch (dt) {
+            inline .q8_0,
+            .q4_0,
+            .iq4_nl,
+            .iq4_xs,
+            .q2_k,
+            .q3_k,
+            .q4_k,
+            .q5_k,
+            .q6_k,
+            .iq2_xxs,
+            .iq2_xs,
+            .iq3_xxs,
+            .iq3_s,
+            .q1_0,
+            .q2_0_g64,
+            .q2_0_g128,
+            => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ "_f32"),
+            else => return error.UnsupportedDType,
+        };
+        const elems = rows * cols;
+        try self.opElt(entry, w_db, self.deq_f32, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
 
         const n_pad = std.mem.alignForward(usize, rows, 128);
         const k_pad = std.mem.alignForward(usize, cols, 64);
@@ -4833,15 +4438,10 @@ pub const Context = struct {
     /// amortized across the whole prompt batch it's a rounding error next to the
     /// per-token GEMV prefill it replaces. `bias` is added per output row (pass
     /// zeros for the LLM projections, which carry no bias).
-    pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32, repacked: bool) Error!void {
+    pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
-        const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale, repacked);
+        const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale);
         return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
-    }
-
-    /// Whether the int8 dp4a decode GEMV is available (q8_0 / iq4_nl).
-    pub fn hasIntDot(self: *const Context) bool {
-        return self.has_int_dot;
     }
 
     /// Run the subgroup-reduce capability probe: dispatch one 32-lane subgroup
@@ -4940,197 +4540,6 @@ pub const Context = struct {
             .f0 = eps,
             .f1 = scale,
         }, rows, 1, 1);
-    }
-
-    /// Whether the cooperative block-quant decode GEMV (gemv_q*_sg) is available.
-    pub fn hasSubgroupGemv(self: *const Context) bool {
-        return self.pipe_sg[1] != .null_handle;
-    }
-
-    /// Whether the cooperative GEMV covers the formats with no other decode
-    /// kernel (q4_0 / iq4_xs / q1_0 / q2_0). The same pipelines, asked separately
-    /// because for those it is not an opt-in A/B but the only kernel: without it
-    /// a token dequantizes the whole weight.
-    pub fn hasRawSubgroupGemv(self: *const Context) bool {
-        return self.pipe_sg[7] != .null_handle;
-    }
-
-    /// Cooperative block-quant decode GEMV: `y[rows] = scale * (dequant(W) @ x)`,
-    /// ONE subgroup (32 lanes) per output row over the RAW row-major weight
-    /// (weightBufferRaw). Lane l owns element l of each block; a single subgroup
-    /// reduce yields the row dot, same math as opGemvQuant / opGemvQuantT but
-    /// with no 32-row-group transpose, no dp4a repack, and no partials/combine
-    /// pass. Requires hasSubgroupGemv(). a = W (raw), b = x, d = y.
-    pub fn opGemvQuantSg(
-        self: *Context,
-        dt: @import("tp_core").dtype.DType,
-        y: DeviceBuffer,
-        y_off: usize,
-        x: DeviceBuffer,
-        w_bytes: []const u8,
-        scale: f32,
-        rows: usize,
-        cols: usize,
-    ) Error!void {
-        const pipe_idx: usize = switch (dt) {
-            .q8_0 => 1,
-            .q4_k => 2,
-            .q5_k => 3,
-            .q6_k => 4,
-            .iq4_nl => 5,
-            .q4_0 => 7,
-            .iq4_xs => 8,
-            .q1_0 => 9,
-            .q2_0_g64 => 10,
-            .q2_0_g128 => 11,
-            else => return error.UnsupportedDType,
-        };
-        // A lane owns one element of a block, so a row must be whole blocks.
-        std.debug.assert(cols % dt.blockElems() == 0);
-        std.debug.assert(self.pipe_sg[pipe_idx] != .null_handle);
-        const w_buf = try self.weightBufferRaw(w_bytes);
-        const dummy = try self.dummyBuf();
-        try self.opBegin();
-        var set = self.bind4(.{ w_buf, x.buf, dummy, y.buf });
-        const push: EltPush = .{ .u0 = @intCast(rows), .u1 = @intCast(cols), .u2 = @intCast(y_off), .f0 = scale };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[pipe_idx]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        // LocalSize 256 = 8 subgroups/workgroup, one row (subgroup) per 32 lanes.
-        self.d.CmdDispatch(self.cmd, @intCast(std.math.divCeil(usize, rows * 32, 256) catch unreachable), 1, 1);
-        try self.opEnd();
-    }
-
-    /// Dispatch a dp4a-module kernel (separate module, same eltwise set layout /
-    /// push range). Mirrors opElt's bind + barrier bookkeeping.
-    fn dp4aDispatch(self: *Context, pipe_idx: usize, a: ?DeviceBuffer, b: ?DeviceBuffer, c: ?DeviceBuffer, dd: ?DeviceBuffer, push: EltPush, total_x: usize) Error!void {
-        const dummy = try self.dummyBuf();
-        try self.opBegin();
-        var set = self.bind4(.{
-            if (a) |t| t.buf else dummy,
-            if (b) |t| t.buf else dummy,
-            if (c) |t| t.buf else dummy,
-            if (dd) |t| t.buf else dummy,
-        });
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_dp4a[pipe_idx]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, @intCast(std.math.divCeil(usize, total_x, 256) catch unreachable), 1, 1);
-        try self.opEnd();
-    }
-
-    /// int8 dp4a decode GEMV for a block-quant weight (q8_0 / iq4_nl only):
-    /// `y[rows] = scale * dequant(W) @ x`. Quantizes the activation `x` [cols]
-    /// to int8 per 32-block, then dots 4 weight int8 × 4 activation int8 per
-    /// hardware dp4a (OpSDot) over the REPACKED int8-interleaved weight (4
-    /// contiguous quants per u32, warp-coalesced, no gather). The int8
-    /// activation quant is lossy (per-block scale, like q8_0 KV), so output is
-    /// bit-close but not identical to the scalar GEMV. Requires hasIntDot().
-    pub fn opGemvDp4a(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, nchunk: usize, partials: DeviceBuffer) Error!void {
-        std.debug.assert(self.has_int_dot and cols % 32 == 0);
-        const nblk = cols / 32;
-        try self.ensureDeviceBuffer(&self.dp4a_xi8, nblk * 8 * 4); // 8 packed u32 / block
-        try self.ensureDeviceBuffer(&self.dp4a_xscale, nblk * 4);
-        const xi8: DeviceBuffer = .{ .buf = self.dp4a_xi8.buf, .mem = .null_handle, .size = 0 };
-        const xsc: DeviceBuffer = .{ .buf = self.dp4a_xscale.buf, .mem = .null_handle, .size = 0 };
-        // Quantize the activation: a=x, c=xi8, d=xscale.
-        try self.dp4aDispatch(0, x, null, xi8, xsc, .{ .u0 = @intCast(nblk), .u1 = @intCast(cols) }, nblk);
-        // dp4a GEMV over the repacked weight: a=repacked, b=xi8, c=xscale,
-        // d=partials -> gemv_combine applies the weight scale.
-        const w_buf = try self.weightBufferRepacked(dt, w_bytes, rows, cols);
-        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
-        try self.dp4aDispatch(1, w_db, xi8, xsc, partials, .{
-            .u0 = @intCast(rows * nchunk),
-            .u1 = @intCast(cols),
-            .u2 = @intCast(nchunk),
-            .u3 = @intCast(rows),
-        }, rows * nchunk);
-        try self.opGemvCombine(y, y_off, partials, rows, scale, nchunk);
-    }
-
-    /// Whether the cooperative dp4a decode GEMV (gemv_q8_0/iq4_nl_sg_dp4a) built.
-    pub fn hasSubgroupDp4a(self: *const Context) bool {
-        return self.pipe_dp4a[3] != .null_handle;
-    }
-
-    /// Cooperative dp4a decode GEMV (q8_0 / iq4_nl): dp4a speed WITHOUT the
-    /// repack. Quantizes the activation to int8 per 32-block (quant_act_i8),
-    /// then one subgroup per row does OpSDot over the RAW weight quads and a
-    /// single subgroup reduce, no 32-row-group transpose, no repacked weight
-    /// (~2× VRAM), no partials/combine. `y[rows] = scale * (dequant(W) @ x)`,
-    /// output bit-close to opGemvDp4a. Requires hasSubgroupDp4a(). Writes y
-    /// directly (weight scale folded in via f0). a = raw W, b = xi8, c = xscale.
-    pub fn opGemvQuantSgDp4a(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
-        std.debug.assert(self.has_int_dot and cols % 32 == 0);
-        const pipe_idx: usize = switch (dt) {
-            .q8_0 => 3,
-            .iq4_nl => 4,
-            else => return error.UnsupportedDType,
-        };
-        std.debug.assert(self.pipe_dp4a[pipe_idx] != .null_handle);
-        const nblk = cols / 32;
-        try self.ensureDeviceBuffer(&self.dp4a_xi8, nblk * 8 * 4); // 8 packed u32 / block
-        try self.ensureDeviceBuffer(&self.dp4a_xscale, nblk * 4);
-        const xi8: DeviceBuffer = .{ .buf = self.dp4a_xi8.buf, .mem = .null_handle, .size = 0 };
-        const xsc: DeviceBuffer = .{ .buf = self.dp4a_xscale.buf, .mem = .null_handle, .size = 0 };
-        // Quantize the activation: a=x, c=xi8, d=xscale.
-        try self.dp4aDispatch(0, x, null, xi8, xsc, .{ .u0 = @intCast(nblk), .u1 = @intCast(cols) }, nblk);
-        // Cooperative dp4a GEMV: a=raw W, b=xi8, c=xscale, d=y. One subgroup per
-        // row (LocalSize 256 = 8 subgroups/wg), so rows*32 total lanes.
-        const w_buf = try self.weightBufferRaw(w_bytes);
-        try self.opBegin();
-        var set = self.bind4(.{ w_buf, xi8.buf, xsc.buf, y.buf });
-        const push: EltPush = .{ .u0 = @intCast(rows), .u1 = @intCast(cols), .u2 = @intCast(y_off), .f0 = scale };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_dp4a[pipe_idx]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        // LocalSize 32 = one subgroup/wg; each subgroup computes NR=4 rows.
-        self.d.CmdDispatch(self.cmd, @intCast(std.math.divCeil(usize, rows, 4) catch unreachable), 1, 1);
-        try self.opEnd();
-    }
-
-    /// Whether the dp4a-over-_t decode GEMV (gemv_q8_0/iq4_nl_t_dp4a) built.
-    pub fn hasTransposedDp4a(self: *const Context) bool {
-        return self.pipe_dp4a[5] != .null_handle;
-    }
-
-    /// dp4a decode GEMV over the 32-row-group TRANSPOSED weight (q8_0 / iq4_nl):
-    /// repack-dp4a's fast k-split shape, but reading the `_t` layout
-    /// (weightBufferRawT), so NO int8 repack, no extra VRAM (iq4_nl stays 4-bit,
-    /// half the repack footprint), and it shares the resident `_t` buffer with
-    /// the GEMM prefill (no cache collision). Quantizes the activation to int8
-    /// (quant_act_i8), dp4a's the weight quads, k-split partials -> gemv_combine.
-    /// Output bit-close to opGemvDp4a. Requires hasTransposedDp4a().
-    pub fn opGemvQuantTDp4a(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, nchunk: usize, partials: DeviceBuffer) Error!void {
-        std.debug.assert(self.has_int_dot and cols % 32 == 0);
-        const pipe_idx: usize = switch (dt) {
-            .q8_0 => 5,
-            .iq4_nl => 6,
-            else => return error.UnsupportedDType,
-        };
-        std.debug.assert(self.pipe_dp4a[pipe_idx] != .null_handle);
-        const row_bytes: usize = switch (dt) {
-            .q8_0 => (cols / 32) * 34,
-            .iq4_nl => (cols / 32) * 18,
-            else => unreachable,
-        };
-        const nblk = cols / 32;
-        try self.ensureDeviceBuffer(&self.dp4a_xi8, nblk * 8 * 4);
-        try self.ensureDeviceBuffer(&self.dp4a_xscale, nblk * 4);
-        const xi8: DeviceBuffer = .{ .buf = self.dp4a_xi8.buf, .mem = .null_handle, .size = 0 };
-        const xsc: DeviceBuffer = .{ .buf = self.dp4a_xscale.buf, .mem = .null_handle, .size = 0 };
-        // Quantize the activation: a=x, c=xi8, d=xscale.
-        try self.dp4aDispatch(0, x, null, xi8, xsc, .{ .u0 = @intCast(nblk), .u1 = @intCast(cols) }, nblk);
-        // dp4a over _t: a=W(_t), b=xi8, c=xscale, d=partials -> gemv_combine scales.
-        const w_buf = try self.weightBufferRawT(w_bytes, row_bytes);
-        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
-        try self.dp4aDispatch(pipe_idx, w_db, xi8, xsc, partials, .{
-            .u0 = @intCast(rows * nchunk),
-            .u1 = @intCast(cols),
-            .u2 = @intCast(nchunk),
-            .u3 = @intCast(rows),
-        }, rows * nchunk);
-        try self.opGemvCombine(y, y_off, partials, rows, scale, nchunk);
     }
 
     /// Attention-scores tensor-core GEMM (coopmat.buildGemmScores): grid is
@@ -5971,214 +5380,6 @@ test "gpu gdn kernels match cpu reference" {
     }
 }
 
-test "gpu block-quant gemv matches cpu reference" {
-    const gpa = std.testing.allocator;
-    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
-    defer ctx.deinit();
-    const dtypes = @import("tp_core").dtype;
-    const quants = @import("tp_core").quants;
-
-    const rows = 64;
-    const cols = 512; // two 256-elem super-blocks: exercises the shared scale table
-    var prng = std.Random.DefaultPrng.init(77);
-    const rand = prng.random();
-
-    const x = try gpa.alloc(f32, cols);
-    defer gpa.free(x);
-    for (x) |*v| v.* = rand.floatNorm(f32) * 2.0 - 1.0;
-    var x_d = try ctx.tensorCreate(cols * 4);
-    var y_d = try ctx.tensorCreate(rows * 4);
-    defer {
-        ctx.tensorDestroy(&x_d);
-        ctx.tensorDestroy(&y_d);
-    }
-    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-
-    const y = try gpa.alloc(f32, rows);
-    defer gpa.free(y);
-    const row_f32 = try gpa.alloc(f32, cols);
-    defer gpa.free(row_f32);
-
-    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k };
-    const d16: u16 = 0x2A66; // ~0.05
-    const min16: u16 = 0x251F; // ~0.02
-
-    // All weight buffers stay alive for the whole test: the device weight
-    // cache is keyed by host pointer, so free-then-realloc at the same address
-    // would alias a stale upload.
-    var ws: [dts.len][]u8 = undefined;
-    inline for (dts, 0..) |dt, i| {
-        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
-        rand.bytes(ws[i]);
-        const bb = dt.blockBytes();
-        var off: usize = 0;
-        while (off < ws[i].len) : (off += bb) {
-            switch (dt) {
-                .q8_0 => std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little),
-                .q4_k, .q5_k => {
-                    std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
-                    std.mem.writeInt(u16, ws[i][off + 2 ..][0..2], min16, .little);
-                },
-                .q6_k => std.mem.writeInt(u16, ws[i][off + 208 ..][0..2], d16, .little),
-                else => unreachable,
-            }
-        }
-    }
-    defer for (ws) |w| gpa.free(w);
-
-    inline for (dts, 0..) |dt, i| {
-        try ctx.opGemvQuant(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
-        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-
-        const row_bytes = dt.storageBytes(cols);
-        for (0..rows) |r| {
-            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
-            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
-                std.debug.print("dtype {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
-                return e;
-            };
-        }
-    }
-
-    // Transposed + k-split path (opGemvQuantT): same CPU reference. Uses
-    // SEPARATE weight buffers (the device cache is keyed by host pointer, and
-    // the raw vs transposed uploads must not alias).
-    const nchunk = 16;
-    var part_d = try ctx.tensorCreate(rows * nchunk * 4);
-    defer ctx.tensorDestroy(&part_d);
-    var wsT: [dts.len][]u8 = undefined;
-    inline for (dts, 0..) |_, i| wsT[i] = try gpa.dupe(u8, ws[i]);
-    defer for (wsT) |w| gpa.free(w);
-    inline for (dts, 0..) |dt, i| {
-        try ctx.opGemvQuantT(dt, y_d, 0, x_d, wsT[i], 1.0, rows, cols, nchunk, part_d);
-        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-
-        const row_bytes = dt.storageBytes(cols);
-        for (0..rows) |r| {
-            quants.dequantSlice(dt, wsT[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
-            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
-                std.debug.print("dtype {s} (transposed) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
-                return e;
-            };
-        }
-    }
-
-    // Cooperative subgroup path (opGemvQuantSg): raw row-major weight, one
-    // subgroup per row, subgroup-reduce, no transpose, no partials. Same CPU
-    // reference. Reuses the raw `ws` buffers (weightBufferRaw keys by host ptr,
-    // so it hits the same device upload as opGemvQuant above).
-    if (ctx.hasSubgroupGemv()) {
-        inline for (dts, 0..) |dt, i| {
-            try ctx.opGemvQuantSg(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
-            try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-            const row_bytes = dt.storageBytes(cols);
-            for (0..rows) |r| {
-                quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-                var acc: f64 = 0;
-                for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
-                std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
-                    std.debug.print("dtype {s} (subgroup) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
-                    return e;
-                };
-            }
-        }
-
-        // iq4_nl (18 B block, f16 d + 16 nibble bytes), not in `dts` above.
-        const nl = dtypes.DType.iq4_nl;
-        const w_nl = try gpa.alloc(u8, nl.storageBytes(rows * cols));
-        defer gpa.free(w_nl);
-        rand.bytes(w_nl);
-        {
-            const bb = nl.blockBytes();
-            var off: usize = 0;
-            while (off < w_nl.len) : (off += bb) std.mem.writeInt(u16, w_nl[off..][0..2], d16, .little);
-        }
-        try ctx.opGemvQuantSg(nl, y_d, 0, x_d, w_nl, 1.0, rows, cols);
-        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-        const row_bytes = nl.storageBytes(cols);
-        for (0..rows) |r| {
-            quants.dequantSlice(nl, w_nl[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
-            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
-                std.debug.print("dtype iq4_nl (subgroup) row {d}: gpu {d} cpu {d}\n", .{ r, y[r], acc });
-                return e;
-            };
-        }
-    }
-}
-
-// The cooperative GEMV over the formats that have no OTHER Vulkan decode kernel
-// (`Context.dequantOnly`): without these a decode dequantizes the whole weight
-// through the prefill GEMM. Each is scored against the shared CPU dequant, and
-// the two q2_0 geometries are checked separately because they share one ggml type
-// id and reading a row at the wrong stride passes every bounds check.
-test "gpu cooperative gemv covers the formats with no transposed kernel" {
-    const gpa = std.testing.allocator;
-    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
-    defer ctx.deinit();
-    if (!ctx.hasRawSubgroupGemv()) return error.SkipZigTest;
-    const dtypes = @import("tp_core").dtype;
-    const quants = @import("tp_core").quants;
-
-    const rows = 64;
-    const cols = 512;
-    var prng = std.Random.DefaultPrng.init(0x4d2);
-    const rand = prng.random();
-
-    const x = try gpa.alloc(f32, cols);
-    defer gpa.free(x);
-    for (x) |*v| v.* = rand.floatNorm(f32) * 0.5;
-    var x_d = try ctx.tensorCreate(cols * 4);
-    var y_d = try ctx.tensorCreate(rows * 4);
-    defer {
-        ctx.tensorDestroy(&x_d);
-        ctx.tensorDestroy(&y_d);
-    }
-    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-    const y = try gpa.alloc(f32, rows);
-    defer gpa.free(y);
-    const row_f32 = try gpa.alloc(f32, cols);
-    defer gpa.free(row_f32);
-
-    const dts = [_]dtypes.DType{ .q4_0, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 };
-    const d16: u16 = 0x2A66; // ~0.05
-    // Every buffer stays alive to the end: the device weight cache keys on the
-    // host pointer, so a free and a realloc at the same address would alias.
-    var ws: [dts.len][]u8 = undefined;
-    inline for (dts, 0..) |dt, i| {
-        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
-        rand.bytes(ws[i]);
-        const bb = dt.blockBytes();
-        var off: usize = 0;
-        // Every format here carries its f16 scale first; the quant bytes below it
-        // are legal whatever the random bytes say.
-        while (off < ws[i].len) : (off += bb) std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
-    }
-    defer for (ws) |w| gpa.free(w);
-
-    inline for (dts, 0..) |dt, i| {
-        try ctx.opGemvQuantSg(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
-        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-        const row_bytes = dt.storageBytes(cols);
-        for (0..rows) |r| {
-            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
-            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
-                std.debug.print("dtype {s} (subgroup) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
-                return e;
-            };
-        }
-    }
-}
-
 // The dual row GEMV (`opGemvQuantDual`), this arm of the body the CUDA backend
 // also runs, over the six formats whose ONLY decode it is. Same reference as the
 // cooperative test above, and needed separately from the CUDA one because the two
@@ -6213,7 +5414,14 @@ test "gpu dual gemv covers the codebook and low-bit k-quant formats" {
     const row_f32 = try gpa.alloc(f32, cols);
     defer gpa.free(row_f32);
 
-    const dts = [_]dtypes.DType{ .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s };
+    // q4_k is here for its dual arm only: it also has the transposed and the
+    // cooperative kernels, and `vk-gemv-bench` comparing the three is meaningless
+    // unless all three compute the same thing.
+    const dts = [_]dtypes.DType{
+        .q2_k,     .q3_k,      .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0,
+        .q4_0,     .iq4_nl,    .iq4_xs,  .q4_k,   .q5_k,    .q6_k,  .q1_0,
+        .q2_0_g64, .q2_0_g128,
+    };
     const d16: u16 = 0x2A66; // ~0.05
     const min16: u16 = 0x251F; // ~0.02
     // Every buffer stays alive to the end: the device weight cache keys on the
@@ -6231,6 +5439,11 @@ test "gpu dual gemv covers the codebook and low-bit k-quant formats" {
                 std.mem.writeInt(u16, ws[i][off + 82 ..][0..2], min16, .little);
             },
             .q3_k => std.mem.writeInt(u16, ws[i][off + 108 ..][0..2], d16, .little),
+            .q4_k, .q5_k => {
+                std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
+                std.mem.writeInt(u16, ws[i][off + 2 ..][0..2], min16, .little);
+            },
+            .q6_k => std.mem.writeInt(u16, ws[i][off + 208 ..][0..2], d16, .little),
             else => std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little),
         };
     }
@@ -6316,7 +5529,7 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
     defer for (ws) |w| gpa.free(w);
 
     inline for (dts, 0..) |dt, i| {
-        try ctx.opMatmulCoopQuant(dt, y_d, 0, x_d, m, ws[i], rows, cols, 1.0, bias, false);
+        try ctx.opMatmulCoopQuant(dt, y_d, 0, x_d, m, ws[i], rows, cols, 1.0, bias);
         try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
 
         const row_bytes = dt.storageBytes(cols);
@@ -6603,148 +5816,6 @@ test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
         );
         try std.testing.expect(g_rel < 1e-3);
         try std.testing.expect(g_rel <= @max(c_rel, 1e-6) * 1.5);
-    }
-}
-
-test "gpu dp4a decode GEMV matches cpu reference" {
-    const gpa = std.testing.allocator;
-    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
-    defer ctx.deinit();
-    if (!ctx.hasIntDot()) return error.SkipZigTest;
-    const dtypes = @import("tp_core").dtype;
-    const quants = @import("tp_core").quants;
-
-    const rows = 128;
-    const cols = 512;
-    const nchunk = 16;
-    var prng = std.Random.DefaultPrng.init(53);
-    const rand = prng.random();
-
-    const x = try gpa.alloc(f32, cols);
-    defer gpa.free(x);
-    for (x) |*v| v.* = rand.floatNorm(f32) * 2.0 - 1.0;
-    // Activation round-tripped through the kernel's per-32-block int8 quant.
-    const xq = try gpa.alloc(f32, cols);
-    defer gpa.free(xq);
-    {
-        var blk: usize = 0;
-        while (blk < cols / 32) : (blk += 1) {
-            var amax: f32 = 0;
-            for (x[blk * 32 ..][0..32]) |v| amax = @max(amax, @abs(v));
-            const sc = amax / 127.0;
-            const inv = if (amax > 0) 127.0 / amax else 0;
-            for (x[blk * 32 ..][0..32], xq[blk * 32 ..][0..32]) |v, *q| {
-                const qi: f32 = @round(@max(-127.0, @min(127.0, v * inv)));
-                q.* = qi * sc;
-            }
-        }
-    }
-    var x_d = try ctx.tensorCreate(cols * 4);
-    var y_d = try ctx.tensorCreate(rows * 4);
-    var part_d = try ctx.tensorCreate(rows * nchunk * 4);
-    defer {
-        ctx.tensorDestroy(&x_d);
-        ctx.tensorDestroy(&y_d);
-        ctx.tensorDestroy(&part_d);
-    }
-    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-
-    const y = try gpa.alloc(f32, rows);
-    defer gpa.free(y);
-    const row_f32 = try gpa.alloc(f32, cols);
-    defer gpa.free(row_f32);
-
-    const dts = [_]dtypes.DType{ .q8_0, .iq4_nl };
-    const d16: u16 = 0x2C00; // ~0.0625, keeps dequant*i8 small
-    var ws: [dts.len][]u8 = undefined;
-    inline for (dts, 0..) |dt, i| {
-        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
-        rand.bytes(ws[i]);
-        const bb = dt.blockBytes();
-        var off: usize = 0;
-        while (off < ws[i].len) : (off += bb) std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
-    }
-    defer for (ws) |w| gpa.free(w);
-
-    inline for (dts, 0..) |dt, i| {
-        try ctx.opGemvDp4a(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols, nchunk, part_d);
-        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-        const row_bytes = dt.storageBytes(cols);
-        for (0..rows) |r| {
-            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, xq) |wv, xv| acc += @as(f64, wv) * xv;
-            const want: f32 = @floatCast(acc);
-            std.testing.expect(@abs(y[r] - want) <= 2e-2 + 2e-3 * @abs(want)) catch |e| {
-                std.debug.print("dp4a {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], want });
-                return e;
-            };
-        }
-    }
-
-    // Cooperative dp4a (opGemvQuantSgDp4a): raw weight + subgroup reduce, no
-    // repack. Same int8-quantized-activation reference (xq). Uses SEPARATE
-    // weight buffers: opGemvDp4a above cached `ws[i]` as a REPACKED layout under
-    // its host ptr, and weightBufferRaw would return that stale repacked buffer.
-    // ⚠️ Both copies below live to the END of the test, not to the end of their
-    // `if`. The cache keys on the HOST POINTER, so a copy freed at the end of one
-    // block whose address the next block's allocation reuses is served the FIRST
-    // block's layout — raw where the reader wants the 32-row transpose, which
-    // reads as NaN. It depends on allocator luck, so it passes alone and fails in
-    // the full binary.
-    var wsg: [dts.len][]u8 = undefined;
-    var wsg_n: usize = 0;
-    defer for (wsg[0..wsg_n]) |w| gpa.free(w);
-    var wst: [dts.len][]u8 = undefined;
-    var wst_n: usize = 0;
-    defer for (wst[0..wst_n]) |w| gpa.free(w);
-
-    if (ctx.hasSubgroupDp4a()) {
-        inline for (dts, 0..) |_, i| {
-            wsg[i] = try gpa.dupe(u8, ws[i]);
-            wsg_n += 1;
-        }
-        inline for (dts, 0..) |dt, i| {
-            try ctx.opGemvQuantSgDp4a(dt, y_d, 0, x_d, wsg[i], 1.0, rows, cols);
-            try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-            const row_bytes = dt.storageBytes(cols);
-            for (0..rows) |r| {
-                quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-                var acc: f64 = 0;
-                for (row_f32, xq) |wv, xv| acc += @as(f64, wv) * xv;
-                const want: f32 = @floatCast(acc);
-                std.testing.expect(@abs(y[r] - want) <= 2e-2 + 2e-3 * @abs(want)) catch |e| {
-                    std.debug.print("sg-dp4a {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], want });
-                    return e;
-                };
-            }
-        }
-    }
-
-    // dp4a over the _t layout + k-split (opGemvQuantTDp4a): same int8-activation
-    // reference (xq). SEPARATE weight buffers (weightBufferRawT vs the repacked
-    // uploads above collide on the host-ptr cache key).
-    if (ctx.hasTransposedDp4a()) {
-        inline for (dts, 0..) |_, i| {
-            wst[i] = try gpa.dupe(u8, ws[i]);
-            wst_n += 1;
-        }
-        inline for (dts, 0..) |dt, i| {
-            try ctx.opGemvQuantTDp4a(dt, y_d, 0, x_d, wst[i], 1.0, rows, cols, nchunk, part_d);
-            try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-            const row_bytes = dt.storageBytes(cols);
-            for (0..rows) |r| {
-                quants.dequantSlice(dt, wst[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-                var acc: f64 = 0;
-                for (row_f32, xq) |wv, xv| acc += @as(f64, wv) * xv;
-                const want: f32 = @floatCast(acc);
-                std.testing.expect(@abs(y[r] - want) <= 2e-2 + 2e-3 * @abs(want)) catch |e| {
-                    std.debug.print("t-dp4a {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], want });
-                    return e;
-                };
-            }
-        }
     }
 }
 

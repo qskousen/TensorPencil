@@ -94,6 +94,11 @@ pub var decode_dp4a: bool = true;
 pub const Force = enum { auto, grouped, mmq, dequant };
 pub var force: Force = .auto;
 
+/// DIAGNOSTIC: route a format that has BOTH a hand-written decode kernel and a
+/// dual one (q4_k) through the dual one. The A/B that says whether the hand
+/// kernels are still worth their maintenance; `qgemv-bench` alternates it.
+pub var dual_decode: bool = false;
+
 /// Whether the dp4a kernels can tile this weight: 256-column groups, rows in warps of 8.
 fn dp4aShape(w: Weight) bool {
     return w.cols % 256 == 0 and w.rows % 8 == 0;
@@ -143,7 +148,7 @@ fn blockQRoute(w: Weight, m: usize) ?Route {
     // The f32 GEMV and the dequant GEMM switch on dtype with `else => unreachable`.
     if (!Backend.quantKernelSupported(dt)) return null;
     const dp4a = dp4aShape(w);
-    if (Backend.dualGemvSupported(dt)) {
+    if (Backend.dualGemvOnly(dt)) {
         // The dual GEMV is the only decode these six have, on either backend. It
         // reads whole codebook and quant WORDS, so a row must be whole
         // super-blocks; the q8 twin additionally needs the staged activation,
@@ -151,6 +156,11 @@ fn blockQRoute(w: Weight, m: usize) ?Route {
         if (w.cols % 256 != 0) return null;
         return if (m == 1 and decode_dp4a) .gemv_dual_q8 else if (m == 1) .gemv_dual else .gemm_q16;
     }
+    // A format that has BOTH a hand kernel and a dual one takes the dual only
+    // when asked, which is the A/B (`dual_decode`). Decode only: nothing about
+    // prefill changes.
+    if (m == 1 and dual_decode and Backend.dualGemvSupported(dt) and w.cols % 256 == 0)
+        return if (decode_dp4a) .gemv_dual_q8 else .gemv_dual;
     if (m == 1) {
         if (decode_dp4a and dp4a) {
             if (q8Single(dt)) return .gemv_q8;
@@ -249,7 +259,7 @@ pub fn gemm(be: *Backend, g: Group, y: Buf, w: Weight) !void {
             }
         },
         .gemv_dual_q8 => try be.opGemvQuantDualQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols),
-        .gemv_dual => try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols),
+        .gemv_dual => try be.opGemvQuantDualF32(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols),
         .gemv_q8 => try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols),
         .gemv_q8n => {
             var off: usize = 0;

@@ -147,6 +147,7 @@ CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda
 checkpoint), `lora-restack-test` (a LoRA stack swapped on a live session: the
 image must come back bit-identical AND the factors' VRAM must be handed back),
 plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`,
+`vk-gemv-bench` (every Vulkan block-quant decode GEMV per format, a weight copy per route),
 `zimage-cuda-bench`, `mageflow-bench`). ⚠️ **This box's GPU is shared with the desktop
 and its clock drifts ~3% between runs**, so a speed change is measured by an
 INTERLEAVED same-binary A/B (both variants alternating in one process), never by
