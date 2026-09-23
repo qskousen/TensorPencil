@@ -13,7 +13,9 @@ pub const Error = error{ OutOfMemory, WriteFailed, EncodeFailed };
 /// The `parameters` text for an image, exactly as the engine used to write it.
 pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize, h: usize) ![]u8 {
     var opts: tp.pipeline.Options = .{ .prompt = "" };
-    info.params.applyTo(&opts);
+    // Lives as long as `opts` is read below: `applyTo` points into both.
+    var steer_scratch: [wire.max_steers]tp.pipeline.CondNoise.Steer = @splat(.{});
+    info.params.applyTo(&opts, &steer_scratch);
     const base = try tp.pipeline.buildA1111Params(
         gpa,
         info.prompt,
@@ -45,6 +47,13 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
         .vae_hash = info.vae_hash,
         .weight_dtype = info.weight_dtype,
         .shift = if (info.shift > 0) info.shift else null,
+        // `opts` borrows the curve from `info.params`, which outlives this call.
+        .cond_noise = opts.cond_noise.curve,
+        .cond_noise_amount = if (opts.cond_noise.on()) opts.cond_noise.amount else null,
+        .cond_noise_seed = if (opts.cond_noise.on()) opts.cond_noise.seed orelse info.req_seed else null,
+        .cond_noise_negative = if (opts.cond_noise.on() and opts.cond_noise.neg_scale != 0) opts.cond_noise.neg_scale else null,
+        // Borrows `steer_scratch`, which outlives this call.
+        .cond_steers = opts.cond_noise.steers,
         .loras = loras.items,
     });
 }
@@ -108,7 +117,48 @@ pub const A1111Params = struct {
     shift: ?f32 = null,
     /// img2img strength.
     denoise: ?f32 = null,
+    /// Conditioning-noise curve and its knobs, as written by
+    /// `pipeline.appendExtraParams`. The curve is unquoted here.
+    cond_noise: []const u8 = "",
+    cond_noise_amount: ?f32 = null,
+    cond_noise_seed: ?u64 = null,
+    cond_noise_negative: ?f32 = null,
 };
+
+/// Split a settings line on commas that are OUTSIDE double quotes.
+///
+/// A1111 quotes any value that contains a comma -- `Lora hashes: "a: 1, b: 2"` has
+/// always done this, and a conditioning-noise curve does it too (`clamp(a,0,1)`).
+/// Splitting on every comma tears those into fragments that parse as nothing, which
+/// is silent: the field simply comes back null.
+const FieldIter = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn next(self: *FieldIter) ?[]const u8 {
+        if (self.i >= self.s.len) return null;
+        const start = self.i;
+        var in_q = false;
+        while (self.i < self.s.len) : (self.i += 1) {
+            switch (self.s[self.i]) {
+                '"' => in_q = !in_q,
+                ',' => if (!in_q) {
+                    const f = self.s[start..self.i];
+                    self.i += 1;
+                    return f;
+                },
+                else => {},
+            }
+        }
+        return self.s[start..self.i];
+    }
+};
+
+/// A value as written: quotes stripped when it carries them.
+fn unquote(v: []const u8) []const u8 {
+    if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') return v[1 .. v.len - 1];
+    return v;
+}
 
 /// Parse what `buildA1111Params` wrote. The saved PNG is the record of how an
 /// image was made, so reopening one reads it back rather than the transcript
@@ -146,7 +196,7 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
         out.prompt = std.mem.trim(u8, head, " \t\r\n");
     }
 
-    var f = std.mem.splitScalar(u8, settings, ',');
+    var f: FieldIter = .{ .s = settings };
     while (f.next()) |field| {
         const colon = std.mem.indexOfScalar(u8, field, ':') orelse continue;
         const key = std.mem.trim(u8, field[0..colon], " \t");
@@ -161,6 +211,14 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
             out.denoise = std.fmt.parseFloat(f32, val) catch null;
         } else if (std.mem.eql(u8, key, "Seed")) {
             out.seed = std.fmt.parseInt(u64, val, 10) catch null;
+        } else if (std.mem.eql(u8, key, "Cond noise")) {
+            out.cond_noise = unquote(val);
+        } else if (std.mem.eql(u8, key, "Cond noise amount")) {
+            out.cond_noise_amount = std.fmt.parseFloat(f32, val) catch null;
+        } else if (std.mem.eql(u8, key, "Cond noise seed")) {
+            out.cond_noise_seed = std.fmt.parseInt(u64, val, 10) catch null;
+        } else if (std.mem.eql(u8, key, "Cond noise negative")) {
+            out.cond_noise_negative = std.fmt.parseFloat(f32, val) catch null;
         } else if (std.mem.eql(u8, key, "Size")) {
             const x = std.mem.indexOfScalar(u8, val, 'x') orelse continue;
             out.width = std.fmt.parseInt(usize, val[0..x], 10) catch null;
@@ -326,6 +384,36 @@ test "appendExtraParams writes the A1111/Civitai field names" {
     // Absent fields are absent, not empty: `Clip 2` was never set.
     try std.testing.expect(std.mem.indexOf(u8, out, "Clip 2") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Denoise") == null);
+    // Conditioning noise was off, so it contributes nothing at all -- not even the
+    // amount, which has a non-null default of its own.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Cond noise") == null);
+}
+
+test "a conditioning-noise curve round-trips with its commas intact" {
+    // `clamp`/`min`/`max` are the curve language's only gating constructs and they
+    // all take commas, so a settings line that splits on every comma loses the half
+    // of the language worth writing. The value is quoted for exactly that reason.
+    const gpa = std.testing.allocator;
+    const base = try gpa.dupe(u8, "p\nSteps: 8, Sampler: Euler, CFG scale: 5.0, Seed: 77, Size: 8x8, Model: m, Prompt syntax: ComfyUI");
+    const out = try tp.pipeline.appendExtraParams(gpa, base, .{
+        .cond_noise = "clamp(a*(1-t),0,1)",
+        .cond_noise_amount = 0.25,
+        .cond_noise_seed = 4242,
+        .cond_noise_negative = 0.5,
+    });
+    defer gpa.free(out);
+    errdefer std.debug.print("{s}\n", .{out});
+    try std.testing.expect(std.mem.indexOf(u8, out, ", Cond noise: \"clamp(a*(1-t),0,1)\"") != null);
+
+    const got = parseA1111Params(out);
+    try std.testing.expectEqualStrings("clamp(a*(1-t),0,1)", got.cond_noise);
+    try std.testing.expectEqual(@as(?f32, 0.25), got.cond_noise_amount);
+    try std.testing.expectEqual(@as(?u64, 4242), got.cond_noise_seed);
+    try std.testing.expectEqual(@as(?f32, 0.5), got.cond_noise_negative);
+    // The fields AROUND it still parse: a quoted comma must not swallow the rest of
+    // the line either.
+    try std.testing.expectEqual(@as(?u64, 77), got.seed);
+    try std.testing.expectEqual(@as(?usize, 8), got.steps);
 }
 
 test "an empty Resources leaves the block byte-identical" {

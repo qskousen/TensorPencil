@@ -492,7 +492,11 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
         .border = .{},
         .padding = .{},
         .margin = .{},
-        .min_size_content = .{ .w = width },
+        // Height from the FONT, not from the content: an empty buffer gives a text
+        // entry zero content height, so the widget ends up with no rect at all
+        // while the chip around it still paints its border. It looks like a box,
+        // takes no hover and no click, and there is nothing on screen to say why.
+        .min_size_content = .{ .w = width, .h = o.font.lineHeight() },
         .max_size_content = .width(width),
         .font = o.font,
         .color_text = o.text_input orelse C.text_hi,

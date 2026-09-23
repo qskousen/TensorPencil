@@ -84,6 +84,36 @@
   CUDA-only and the CLI arms no cancel), but any CPU-backed frontend needs it
 - even a tiny bit of offloading of gemma4 31b is extremely slow
 - diffusion model weights are "bouncing" during steps, vram-wise
+- sdxl `perfectdeliberate_v10` renders SOLID WHITE at 1024^2 on the `cuda` backend and
+  correctly on `zig-cuda`; `blackMAGICXL_v145` is fine on both. One arm AND one file, so
+  an interaction, and white with no error is the f16 overflow signature. Next probe is
+  `sd_vae.Config.act_f16` off for this file, plus a non-finite check on the residual
+- cond noise: a trajectory axis (noise varying over the denoising steps; high sigma sets
+  composition, low sigma texture). Needs a per-step re-upload on each device session
+  (5 families x 2 backends), or `Cond.Schedule` with K buckets at K sessions' worth of
+  fused text
+- cond noise: multiplicative mode (`x *= 1 + sigma*u`). Stays nearer the manifold but
+  gives up the ray property
+- cond noise/steer are studio-only (per image), so a render the CHAT model asks for never
+  carries them: the knobs are not in `config.host_fields`. Putting them there needs
+  `Diffuser.opts` to own the curve and term text, since settings buffers are replaced
+  under it. Also unwired: a saved curve library and a shape sparkline
+- cond steer: terms whose directions overlap partly cancel where their signs oppose. The
+  engine logs the overlap; orthogonalizing terms against each other would fix the
+  magnitudes at the cost of order-dependence
+- gui: `ui-probe --click=X,Y` injects a press/release and prints what took keyboard
+  focus, but nothing runs it as a check. An `--expect-focus` arm plus a build step would
+  make it a regression guard; the probe already falls back to SDL's dummy driver
+- cond steer: a direction is re-derived on every encode, so a batch of N images pays N
+  text encodes per term. A cache on the Session keyed by (text, model) is the fix; the SD
+  arm's `empty_ref` is the precedent
+- cond noise: the krea2 tap sweep says the DiT leans on the DEEP encoder taps (2.6x the
+  effect of the shallow ones at a mirrored budget, BACKEND.md 2K). Turn that into a TE
+  quantization budget: quantize taps 0-3 harder than 8-11 and check the render against
+  the dense encoder on an INTERMEDIATE (the conditioning), not on an image
+- cond noise: text-encoder WEIGHT noise is the other half and a different feature -- it
+  would ride the existing block-quant kernels rather than a host buffer, and it answers
+  the encoder's quantization budget directly
 - there's no good visiblity of "how much of the model is in vram" for either side
 - llm weight noise (`--weight-noise`, BACKEND.md 6) is unwired on k2-horizon's stepper,
   the dequant-to-f16 fallback (the batched route for q4_0 and iq4_nl),

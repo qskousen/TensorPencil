@@ -1622,7 +1622,12 @@ pub const Diffuser = struct {
         var opts = self.opts;
         const want: ModelConfig = gi.model orelse self.liveConfig();
         want.applyTo(&opts);
-        (gi.params orelse RenderParams.from(&self.opts)).applyTo(&opts);
+        // Bound to a local, not applied off a temporary: `applyTo` points
+        // `opts.cond_noise.curve` INTO the params, so the params must outlive
+        // every use of `opts` below.
+        const recipe: RenderParams = gi.params orelse RenderParams.from(&self.opts);
+        var steer_scratch: [wire.max_steers]pipeline.CondNoise.Steer = @splat(.{});
+        recipe.applyTo(&opts, &steer_scratch);
         opts.prompt = gi.prompt;
         opts.negative = gi.req_negative;
         opts.cfg = gi.req_cfg;
@@ -2087,7 +2092,8 @@ test "the render recipe is snapshotted, so a later change cannot reach a queued 
     opts.compat = .a1111;
 
     var applied: pipeline.Options = .{ .prompt = "" };
-    stamped.applyTo(&applied);
+    var steer_scratch2: [wire.max_steers]pipeline.CondNoise.Steer = @splat(.{});
+    stamped.applyTo(&applied, &steer_scratch2);
     errdefer std.debug.print("applied sampler {t}, compat {t}\n", .{ applied.sampler, applied.compat });
     try std.testing.expectEqual(tp.sampler.Kind.euler, applied.sampler);
     try std.testing.expectEqual(@as(?tp.sampler.Scheduler, null), applied.scheduler);
@@ -2109,12 +2115,43 @@ test "every render-recipe field survives the round trip through Options" {
     src.emphasis = .no_norm;
     src.compat = .a1111;
 
+    src.cond_noise = .{
+        .steers = &.{
+            .{ .text = "more tentacles", .scale = 1.25 },
+            .{ .text = "less anime", .scale = -0.5 },
+        },
+        .curve = "max(0, a*(1-t))",
+        .amount = 0.37,
+        .shape = .shared,
+        .keep_norm = true,
+        .neg_scale = 0.25,
+    };
+
     var dst: pipeline.Options = .{ .prompt = "" };
-    RenderParams.from(&src).applyTo(&dst);
+    // Held in a local: `applyTo` points `dst.cond_noise.curve` into it.
+    const params = RenderParams.from(&src);
+    var steer_scratch: [wire.max_steers]pipeline.CondNoise.Steer = @splat(.{});
+    params.applyTo(&dst, &steer_scratch);
 
     inline for (@typeInfo(RenderParams).@"struct".fields) |f| {
+        // The conditioning-noise group lives under `Options.cond_noise` rather
+        // than at the top level, so it is walked separately just below.
+        if (comptime std.mem.startsWith(u8, f.name, "cond_noise")) continue;
+        if (comptime std.mem.startsWith(u8, f.name, "steer")) continue;
         errdefer std.debug.print("field {s} did not survive\n", .{f.name});
         try std.testing.expectEqual(@field(src, f.name), @field(dst, f.name));
+    }
+    // Walked off `CondNoise` itself, so a knob added THERE and forgotten in
+    // `RenderParams` fails here too, not just one added to `RenderParams`.
+    inline for (@typeInfo(pipeline.CondNoise).@"struct".fields) |f| {
+        errdefer std.debug.print("cond_noise.{s} did not survive\n", .{f.name});
+        try std.testing.expectEqualDeep(@field(src.cond_noise, f.name), @field(dst.cond_noise, f.name));
+    }
+    // Steering terms round-trip as a list, text and scale both.
+    try std.testing.expectEqual(src.cond_noise.steers.len, dst.cond_noise.steers.len);
+    for (src.cond_noise.steers, dst.cond_noise.steers) |a, b| {
+        try std.testing.expectEqualStrings(a.text, b.text);
+        try std.testing.expectEqual(a.scale, b.scale);
     }
 }
 

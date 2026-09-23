@@ -526,6 +526,59 @@ pub fn main(init: std.process.Init) !void {
             \\      --quantize-t       condition the UNet on the nearest TRAINED
             \\                         timestep (on, ComfyUI) or on the fractional
             \\                         one (off, a1111's default) (on/off)
+            \\      --cond-noise       perturb the text conditioning by a curve.
+            \\                         An expression in t (depth over the encoder
+            \\                         taps: krea2 stacks 12, SDXL is CLIP-L then
+            \\                         CLIP-G, SenseNova is its layers; families
+            \\                         with one tap read t = 0), l and n (token
+            \\                         index and count, so a*(1-l/n) fronts the
+            \\                         prompt) and a (--cond-noise-amount). A bare
+            \\                         number is a flat curve. Same expression
+            \\                         language as tp-llm's --weight-noise. Absent
+            \\                         is off, and off is bit-identical
+            \\      --cond-noise-amount  the curve's `a` (default 1). Noise is
+            \\                         scaled by the conditioning's own RMS, so one
+            \\                         amount means the same on every family
+            \\      --cond-noise-seed  pin the perturbation. Without it the field
+            \\                         follows --seed, so --repeat draws a fresh
+            \\                         one each image; set it to hold the damage
+            \\                         still while sweeping something else
+            \\      --cond-noise-negative  scale on the CFG negative branch
+            \\                         (default 0, leaving it alone: one field on
+            \\                         both branches partly cancels)
+            \\      --cond-noise-shape   independent | shared (default independent).
+            \\                         shared gives a token's encoder taps ONE draw
+            \\                         instead of one each. krea2's tap projector is a
+            \\                         signed contrast between layer groups, so it
+            \\                         amplifies noise that differs between taps and
+            \\                         passes noise they share: independent ERODES the
+            \\                         prompt, shared SHIFTS it
+            \\      --cond-noise-keep-norm  rescale each perturbed vector back to the
+            \\                         length it had (on/off, default off). Without it
+            \\                         sigma 1 also makes the conditioning 41% louder
+            \\      --cond-steer <text>  steer the conditioning TOWARD another
+            \\                         prompt's direction. The direction is that
+            \\                         text's conditioning minus the EMPTY prompt's,
+            \\                         per encoder tap, normalized -- the subtraction
+            \\                         is what makes it a direction rather than a
+            \\                         second prompt
+            \\      --cond-steer-scale   how far, in units of the conditioning's own
+            \\                         RMS (so it reads like --cond-noise-amount).
+            \\                         Negative steers AWAY. --cond-noise shapes it
+            \\                         per tap when both are set
+            \\      --cond-steer-mode    how the term reaches the conditioning:
+            \\                         prompt (default; the direction FROM this
+            \\                         render toward the phrase -- adds it and
+            \\                         gives up the prompt), empty (the phrase
+            \\                         against nothing, an attribute), orthogonal
+            \\                         (the phrase with the prompt's own direction
+            \\                         stripped out) or concat (APPEND the phrase's
+            \\                         tokens; the only one that adds without
+            \\                         trading the prompt away. Not on zimage,
+            \\                         anima or sensenova)
+            \\      --cond-noise-pooled  perturb SDXL's pooled vector too (on/off,
+            \\                         default on). Off leaves the UNet's global
+            \\                         style conditioning untouched
             \\      --backend cpu      compute backend: cpu | vulkan | zig-cuda
             \\                         | cuda. vulkan offloads encoder/DiT/VAE
             \\                         GEMMs to Vulkan; zig-cuda runs the whole
@@ -2966,6 +3019,13 @@ fn renderParams(
         // unchanged and an overridden one re-renders.
         .eta = if (opts.eta != 1.0) opts.eta else null,
         .s_noise = if (opts.s_noise != 1.0) opts.s_noise else null,
+        // The seed is recorded RESOLVED, because the field follows `--seed` when the
+        // knob carries none and a reader has no way to derive that.
+        .cond_noise = opts.cond_noise.curve,
+        .cond_noise_amount = if (opts.cond_noise.on()) opts.cond_noise.amount else null,
+        .cond_noise_seed = if (opts.cond_noise.on()) opts.cond_noise.seed orelse opts.seed else null,
+        .cond_noise_negative = if (opts.cond_noise.on() and opts.cond_noise.neg_scale != 0) opts.cond_noise.neg_scale else null,
+        .cond_steers = opts.cond_noise.steers,
         .loras = loras.items,
     });
 }
@@ -5714,6 +5774,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     // deltas add).
     var loras: std.ArrayList(TensorPencil.pipeline.LoraSpec) = .empty;
     defer loras.deinit(arena);
+    var steers: [8]TensorPencil.pipeline.CondNoise.Steer = @splat(.{});
+    var n_steers: usize = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         const flag = args[i];
@@ -5809,6 +5871,72 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.eta = try std.fmt.parseFloat(f64, val);
         } else if (std.mem.eql(u8, flag, "--s-noise") or std.mem.eql(u8, flag, "--sde-s-noise")) {
             opts.s_noise = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, flag, "--cond-noise")) {
+            // An empty curve is the off switch, not a malformed expression: a sweep
+            // wants a control row it can write as `--cond-noise ""` rather than by
+            // dropping the flag and everything that depends on it. Anything else is
+            // validated here rather than at encode time, with the message tp-llm
+            // gives for `--weight-noise`, so the two CLIs reject the same strings
+            // the same way.
+            if (val.len > 0) TensorPencil.noise_curve.validate(val) catch {
+                try stdout.print("--cond-noise '{s}' is not a valid curve. It is an " ++
+                    "expression in t (depth over the encoder taps), l and n (token index " ++
+                    "and count) and a (the amount), e.g. 'a*(1-t)^2' or a bare number.\n", .{val});
+                return error.InvalidArgs;
+            };
+            opts.cond_noise.curve = val;
+        } else if (std.mem.eql(u8, flag, "--cond-noise-amount")) {
+            opts.cond_noise.amount = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, flag, "--cond-noise-seed")) {
+            opts.cond_noise.seed = try std.fmt.parseInt(u64, val, 10);
+        } else if (std.mem.eql(u8, flag, "--cond-noise-negative")) {
+            opts.cond_noise.neg_scale = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, flag, "--cond-noise-shape")) {
+            opts.cond_noise.shape = if (std.mem.eql(u8, val, "shared"))
+                .shared
+            else if (std.mem.eql(u8, val, "independent"))
+                .independent
+            else {
+                try stdout.print("unknown --cond-noise-shape '{s}' (expected: independent, shared)\n", .{val});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, flag, "--cond-noise-keep-norm")) {
+            opts.cond_noise.keep_norm = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--cond-steer")) {
+            // Repeatable: each one opens a term, and the `--cond-steer-scale` after
+            // it sets that term's scale. Terms are independent, so "more tentacles"
+            // and "less anime" are two of these rather than one compromise.
+            if (n_steers == steers.len) {
+                try stdout.print("at most {d} --cond-steer terms\n", .{steers.len});
+                return error.InvalidArgs;
+            }
+            steers[n_steers] = .{ .text = val, .scale = 1 };
+            n_steers += 1;
+        } else if (std.mem.eql(u8, flag, "--cond-steer-mode")) {
+            if (n_steers == 0) {
+                try stdout.print("--cond-steer-mode needs a --cond-steer before it\n", .{});
+                return error.InvalidArgs;
+            }
+            steers[n_steers - 1].mode = if (std.mem.eql(u8, val, "prompt"))
+                .prompt
+            else if (std.mem.eql(u8, val, "empty"))
+                .empty
+            else if (std.mem.eql(u8, val, "orthogonal"))
+                .orthogonal
+            else if (std.mem.eql(u8, val, "concat"))
+                .concat
+            else {
+                try stdout.print("unknown --cond-steer-mode '{s}' (expected: prompt, empty, orthogonal, concat)\n", .{val});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, flag, "--cond-steer-scale")) {
+            if (n_steers == 0) {
+                try stdout.print("--cond-steer-scale needs a --cond-steer before it\n", .{});
+                return error.InvalidArgs;
+            }
+            steers[n_steers - 1].scale = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, flag, "--cond-noise-pooled")) {
+            opts.cond_noise.pooled = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--scheduler")) {
             opts.scheduler = TensorPencil.sampler.Scheduler.parse(val) orelse {
                 try stdout.print("unknown scheduler '{s}' (expected: normal, karras, " ++
@@ -5916,6 +6044,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     // reference. They are NOT resized: the token count follows the extent, which
     // is the workflow's call upstream too.
     opts.loras = loras.items;
+    opts.cond_noise.steers = steers[0..n_steers];
     if (ref_paths.items.len != 0) {
         // Both families' arrays from one decode: each ignores the other's field,
         // so the CLI does not have to know the architecture before the session

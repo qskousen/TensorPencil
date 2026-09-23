@@ -34,6 +34,80 @@ pub const ImageStatus = enum(u8) { pending, generating, done, failed, canceled, 
 /// The per-render recipe: the choices that decide what the image LOOKS like
 /// without deciding which session renders it. Travels on every enqueue, so a
 /// sampler picked after an image was queued cannot retro-apply to it.
+/// A conditioning-noise curve, inline so a `RenderParams` stays a plain value an
+/// enqueued image can hold by copy. `config.TextBuf` is the same idea one layer
+/// up and cannot be used here: `shared` imports `serve`, not the other way.
+pub const max_curve = 192;
+pub const CurveBuf = struct {
+    data: [max_curve]u8 = [_]u8{0} ** max_curve,
+
+    pub fn slice(self: *const CurveBuf) []const u8 {
+        return std.mem.sliceTo(&self.data, 0);
+    }
+
+    pub fn set(self: *CurveBuf, s: []const u8) void {
+        @memset(&self.data, 0);
+        const n = @min(s.len, self.data.len - 1);
+        @memcpy(self.data[0..n], s[0..n]);
+    }
+
+    /// A plain JSON string, not an array of `max_curve` bytes.
+    pub fn jsonStringify(self: CurveBuf, jws: anytype) !void {
+        try jws.write(self.slice());
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !CurveBuf {
+        const s = try std.json.innerParse([]const u8, allocator, source, options);
+        var b: CurveBuf = .{};
+        b.set(s);
+        return b;
+    }
+};
+
+pub const max_steers = 4;
+pub const max_steer_text = 96;
+
+/// One conditioning-steering term on the wire. Fixed storage for the same reason
+/// `CurveBuf` is: `RenderParams` is held BY VALUE on a queued image.
+pub const SteerSpec = struct {
+    text: [max_steer_text]u8 = [_]u8{0} ** max_steer_text,
+    scale: f32 = 0,
+    mode: pipeline.CondNoise.Mode = .prompt,
+
+    pub fn slice(self: *const SteerSpec) []const u8 {
+        return std.mem.sliceTo(&self.text, 0);
+    }
+
+    pub fn set(self: *SteerSpec, s: []const u8) void {
+        @memset(&self.text, 0);
+        const n = @min(s.len, self.text.len - 1);
+        @memcpy(self.text[0..n], s[0..n]);
+    }
+
+    pub fn jsonStringify(self: SteerSpec, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("text");
+        try jws.write(self.slice());
+        try jws.objectField("scale");
+        try jws.write(self.scale);
+        try jws.objectField("mode");
+        try jws.write(self.mode);
+        try jws.endObject();
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !SteerSpec {
+        const Flat = struct {
+            text: []const u8 = "",
+            scale: f32 = 0,
+            mode: pipeline.CondNoise.Mode = .prompt,
+        };
+        const f = try std.json.innerParse(Flat, allocator, source, options);
+        var out: SteerSpec = .{ .scale = f.scale, .mode = f.mode };
+        out.set(f.text);
+        return out;
+    }
+};
+
 pub const RenderParams = struct {
     sampler: core.sampler.Kind = .euler,
     /// null = the architecture's own default schedule.
@@ -41,24 +115,71 @@ pub const RenderParams = struct {
     prompt_syntax: pipeline.PromptSyntax = .comfy,
     emphasis: pipeline.Emphasis = .original,
     compat: pipeline.Compat = .comfy,
+    /// Conditioning noise. Empty curve is off, which is the default, so an
+    /// ordinary render is unaffected. See `pipeline.CondNoise`.
+    cond_noise: CurveBuf = .{},
+    cond_noise_amount: f32 = 1,
+    cond_noise_shape: pipeline.CondNoise.Shape = .independent,
+    cond_noise_keep_norm: bool = false,
+    cond_noise_negative: f32 = 0,
+    /// Steering terms, `steer_count` of them live. See `pipeline.CondNoise.Steer`.
+    steers: [max_steers]SteerSpec = @splat(.{}),
+    steer_count: u8 = 0,
 
     /// Read the live recipe back out of `opts`, the single store for it.
     pub fn from(opts: *const pipeline.Options) RenderParams {
-        return .{
+        var p: RenderParams = .{
             .sampler = opts.sampler,
             .scheduler = opts.scheduler,
             .prompt_syntax = opts.prompt_syntax,
             .emphasis = opts.emphasis,
             .compat = opts.compat,
+            .cond_noise_amount = opts.cond_noise.amount,
+            .cond_noise_shape = opts.cond_noise.shape,
+            .cond_noise_keep_norm = opts.cond_noise.keep_norm,
+            .cond_noise_negative = opts.cond_noise.neg_scale,
         };
+        p.cond_noise.set(opts.cond_noise.curve);
+        for (opts.cond_noise.steers) |t| {
+            if (p.steer_count == max_steers) break;
+            p.steers[p.steer_count].set(t.text);
+            p.steers[p.steer_count].scale = t.scale;
+            p.steers[p.steer_count].mode = t.mode;
+            p.steer_count += 1;
+        }
+        return p;
     }
 
-    pub fn applyTo(self: RenderParams, opts: *pipeline.Options) void {
+    /// ⚠️ `opts.cond_noise.curve` points INTO `self`, so an `opts` built here
+    /// must not outlive the `RenderParams` it came from. Every caller holds the
+    /// params for the whole render, which is why this is safe and why the
+    /// buffer is inline rather than a slice onto someone else's memory.
+    /// `scratch` receives the steering terms and `opts` points at it, so it must
+    /// live as long as `opts` is used -- same rule as the curve buffer above.
+    pub fn applyTo(
+        self: *const RenderParams,
+        opts: *pipeline.Options,
+        scratch: *[max_steers]pipeline.CondNoise.Steer,
+    ) void {
         opts.sampler = self.sampler;
         opts.scheduler = self.scheduler;
         opts.prompt_syntax = self.prompt_syntax;
         opts.emphasis = self.emphasis;
         opts.compat = self.compat;
+        opts.cond_noise = .{
+            .curve = self.cond_noise.slice(),
+            .amount = self.cond_noise_amount,
+            .shape = self.cond_noise_shape,
+            .keep_norm = self.cond_noise_keep_norm,
+            .neg_scale = self.cond_noise_negative,
+        };
+        const n = @min(self.steer_count, max_steers);
+        for (0..n) |i| scratch[i] = .{
+            .text = self.steers[i].slice(),
+            .scale = self.steers[i].scale,
+            .mode = self.steers[i].mode,
+        };
+        opts.cond_noise.steers = scratch[0..n];
     }
 };
 
@@ -477,4 +598,31 @@ test "BinHeader is 32 bytes with the fields where the other end expects them" {
     const h: BinHeader = .{ .kind = .image_rgba, .id = 1, .rev = 2, .w = 3, .h = 4, .len = 5 };
     const bytes: [32]u8 = @bitCast(h);
     try testing.expectEqualSlices(u8, "TPB1", bytes[0..4]);
+}
+
+test "a conditioning-noise curve survives the wire as a string" {
+    // `CurveBuf` is hand-written JSON glue, and the round-trip test above walks
+    // every variant at its DEFAULT, which for a curve is empty. A curve with the
+    // commas that `clamp`/`min`/`max` need is the case that would break.
+    const gpa = testing.allocator;
+    var p: RenderParams = .{ .cond_noise_amount = 0.42, .cond_noise_shape = .shared, .cond_noise_keep_norm = true };
+    p.cond_noise.set("clamp(a*(1-t),0,1)");
+
+    const json = try encodeAlloc(gpa, p);
+    defer gpa.free(json);
+    // A plain JSON string, not 192 numbers.
+    try testing.expect(std.mem.indexOf(u8, json, "\"clamp(a*(1-t),0,1)\"") != null);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const back = try decode(RenderParams, arena.allocator(), json);
+    try testing.expectEqualStrings("clamp(a*(1-t),0,1)", back.cond_noise.slice());
+    try testing.expectEqual(@as(f32, 0.42), back.cond_noise_amount);
+    try testing.expectEqual(pipeline.CondNoise.Shape.shared, back.cond_noise_shape);
+    try testing.expect(back.cond_noise_keep_norm);
+
+    // Over capacity truncates rather than overflowing, and stays nul-terminated.
+    var big: CurveBuf = .{};
+    big.set("x" ** (max_curve * 2));
+    try testing.expectEqual(max_curve - 1, big.slice().len);
 }

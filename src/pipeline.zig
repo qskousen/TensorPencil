@@ -46,6 +46,8 @@ const init_defaults = @import("tp_core").init_defaults;
 const tokenizer_mod = @import("tp_core").tokenizer;
 const t5_tokenizer = @import("tp_core").t5_tokenizer;
 const noise_mod = @import("tp_core").noise;
+const noise_curve = @import("tp_core").noise_curve;
+const philox_rng = @import("tp_core").philox_rng;
 const safetensors = @import("tp_core").safetensors;
 const audio_file = @import("tp_core").audio;
 const gguf_mod = @import("tp_core").gguf;
@@ -299,6 +301,9 @@ pub const Options = struct {
     /// bit-identical to `euler` on the SD family.
     eta: f64 = 1.0,
     s_noise: f64 = 1.0,
+    /// Seeded perturbation of the text conditioning (see `CondNoise`). Off by default;
+    /// `cond_noise.curve` empty is the switch.
+    cond_noise: CondNoise = .{},
     /// Compute backend for the sampling loop (and encoder/VAE where supported).
     backend: Backend = .cpu,
     /// VAE decode-path override (see `VaeDecode`). Default `auto` (adaptive).
@@ -411,6 +416,29 @@ pub const Options = struct {
         if (self.sgm_noise_multiplier) |v| c.sgm_noise_multiplier = v;
         if (self.quantize_timestep) |v| c.quantize_timestep = v;
         return c;
+    }
+
+    /// The `EncodeOptions` this render encodes with. One builder, so `generate` and
+    /// anyone driving the stages by hand cannot drift apart on a field: a new
+    /// `EncodeOptions` knob that changes the image has to reach both, and the gated
+    /// stages-equal-generate test only proves that if both read it from here.
+    ///
+    /// `steps` is the schedule's REAL step count, which a scheduler may move off
+    /// `self.steps` (`ddim_uniform`, `beta`), and an a1111 prompt schedule resolves
+    /// against it.
+    pub fn encodeOptions(self: *const Options, pt: PromptType, steps: usize) EncodeOptions {
+        return .{
+            .encoder_f16 = self.encoder_f16,
+            .prompt_syntax = self.prompt_syntax,
+            .emphasis = self.emphasis,
+            .steps = steps,
+            .cancel = self.cancel,
+            .sn_ref_images = self.sn_ref_images,
+            .mf_ref_images = self.mf_ref_images,
+            .prompt_type = pt,
+            .cond_noise = self.cond_noise,
+            .render_seed = self.seed,
+        };
     }
 };
 
@@ -597,6 +625,17 @@ pub const Extras = struct {
     /// render's block is unchanged, and an overridden one re-renders.
     eta: ?f64 = null,
     s_noise: ?f64 = null,
+    /// The conditioning-noise curve and its knobs, empty when it was off. Ours, not
+    /// A1111's: nothing upstream has this, so there is no existing spelling to
+    /// match. The curve is QUOTED because it may contain commas (`clamp(a,0,1)`),
+    /// and the settings line splits on those.
+    cond_noise: []const u8 = "",
+    cond_noise_amount: ?f32 = null,
+    cond_noise_seed: ?u64 = null,
+    cond_noise_negative: ?f32 = null,
+    /// Conditioning steering terms. Written as ONE quoted comma-separated list, the
+    /// shape A1111 already uses for `Lora hashes`, because the count varies.
+    cond_steers: []const CondNoise.Steer = &.{},
     loras: []const LoraRecord = &.{},
 };
 
@@ -625,6 +664,23 @@ pub fn appendExtraParams(gpa: std.mem.Allocator, base: []u8, r: Extras) ![]u8 {
     if (r.denoise) |v| try out.print(gpa, ", Denoise: {d:.4}", .{v});
     if (r.eta) |v| try out.print(gpa, ", Eta: {d:.4}", .{v});
     if (r.s_noise) |v| try out.print(gpa, ", Sigma noise: {d:.4}", .{v});
+    if (r.cond_noise.len > 0) {
+        try out.print(gpa, ", Cond noise: \"{s}\"", .{r.cond_noise});
+        if (r.cond_noise_amount) |v| try out.print(gpa, ", Cond noise amount: {d:.4}", .{v});
+        if (r.cond_noise_seed) |v| try out.print(gpa, ", Cond noise seed: {d}", .{v});
+        if (r.cond_noise_negative) |v| try out.print(gpa, ", Cond noise negative: {d:.4}", .{v});
+    }
+    if (r.cond_steers.len > 0) {
+        try out.appendSlice(gpa, ", Cond steer: \"");
+        var n: usize = 0;
+        for (r.cond_steers) |t| {
+            if (!t.on()) continue;
+            if (n > 0) try out.appendSlice(gpa, ", ");
+            try out.print(gpa, "{s}: {d:.2}", .{ t.text, t.scale });
+            n += 1;
+        }
+        try out.appendSlice(gpa, "\"");
+    }
 
     if (r.loras.len > 0) {
         // A1111 spells both of these as ONE quoted comma-separated list, which is
@@ -1082,6 +1138,158 @@ pub const Cond = struct {
     }
 };
 
+/// Seeded perturbation of the text conditioning, shaped by a `core/noise_curve.zig`
+/// expression. Where the noise goes matters more than how much of it there is.
+///
+/// The curve reads:
+///   `t`    normalized depth over the conditioning's SEGMENT axis -- krea2's 12 encoder
+///          taps, SDXL's CLIP-L then CLIP-G, SenseNova's layers. A family whose
+///          conditioning is one segment (sd15, zimage, anima, mageflow, h3) evaluates
+///          the curve at t = 0, so a curve written in `t` alone is flat there.
+///   `l`/`n` token index and token count, so `a*(1-l/n)` fronts the prompt and `a*l/n`
+///          backs it. A curve in `l/n` is a statement about where the REAL tokens sit,
+///          which is not the same question per encoder: a short CLIP prompt occupies
+///          the front of a 77-token window and the rest is padding, so backing the
+///          curve spends the budget on pad rows and barely moves the image.
+///   `a`    the amount knob (`amount` below), so a shape and its amplitude stay separate.
+///
+/// Applied during `Session.encode`, not after it: every device arm transforms and
+/// uploads the conditioning once, inside `Session.denoiser`, so a perturbation applied
+/// later would reach the CPU forward and nothing else.
+pub const CondNoise = struct {
+    /// Whether a token's taps get one draw or one each.
+    ///
+    /// krea2 collapses the 12 taps with a signed weight, so it amplifies noise that
+    /// differs between them and passes noise they share. Falls back to `independent`
+    /// where the segments are different encoders (SDXL's two CLIPs), not depths.
+    pub const Shape = enum {
+        /// An independent draw per tap. Destroys the layer contrast.
+        independent,
+        /// One draw per token, shared by every tap. Shifts the embedding.
+        shared,
+    };
+
+    /// Curve expression, and the feature's switch: empty is off.
+    curve: []const u8 = "",
+    /// Whether a token's taps share one draw. See `Shape`.
+    shape: Shape = .independent,
+    /// Rescale each perturbed vector to the length it had. Noise otherwise lengthens
+    /// it by `sqrt(1 + sigma^2)`, so the conditioning arrives louder as well as
+    /// noisier -- two things changing at once.
+    keep_norm: bool = false,
+    /// The curve's `a`.
+    amount: f32 = 1,
+    /// null derives the field from the render seed. Set it to hold the field fixed
+    /// while sweeping something else.
+    seed: ?u64 = null,
+    /// Multiplies `amount` on the CFG negative branch. 0 leaves it alone: the two
+    /// branches are subtracted, so one field on both partly cancels.
+    neg_scale: f32 = 0,
+    /// Whether SDXL's pooled CLIP-G vector takes the noise too. Off leaves the UNet's
+    /// `y` untouched, so SDXL looks far less sensitive than it is.
+    pooled: bool = true,
+    /// Steer the conditioning along the directions of OTHER prompts, instead of
+    /// (or as well as) a random one. Empty is off.
+    ///
+    /// Independent terms, applied in order and simply added, so "more tentacles"
+    /// and "less anime" are two entries with opposite signs rather than one
+    /// compromise. Only the POSITIVE branch is steered: under CFG the guidance
+    /// difference then amplifies the move instead of cancelling it.
+    steers: []const Steer = &.{},
+
+    /// What a steering term's direction is measured from.
+    ///
+    /// `empty` is `steer - encode("")`: what the phrase is relative to NOTHING. It
+    /// carries a large component that every phrase shares -- "this conditioning says
+    /// something" against "this one says nothing" -- so two unrelated terms overlap
+    /// heavily and a term reads partly as "more prompt", not as its own meaning.
+    ///
+    /// `prompt` is `steer - <the conditioning being steered>`: the direction FROM
+    /// where this render already is TOWARD the phrase. Both ends are real points, the
+    /// shared component cancels, and it costs no extra encode because the contrast is
+    /// the conditioning already in hand.
+    /// `concat` is not a direction at all: it APPENDS the phrase's own token rows to
+    /// the conditioning sequence, so the DiT can attend to them in one place instead
+    /// of every existing token being nudged. That is the only mode that can add an
+    /// object without trading away the prompt, and `scale` multiplies the appended
+    /// rows rather than moving anything.
+    ///
+    /// `orthogonal` is `steer` with everything PARALLEL to the current conditioning
+    /// projected out. Adding it cannot reduce the prompt's own component, because it
+    /// has none: it contributes only what the prompt does not already say. That is
+    /// the difference between putting a moon in your scene and trading your scene
+    /// for a moon.
+    ///
+    /// Note it needs no separate "minus the prompt" step: `proj_perp(a - b, b)` and
+    /// `proj_perp(a, b)` are the same vector, since `b` is entirely along `b`.
+    pub const Mode = enum { prompt, empty, orthogonal, concat };
+
+    /// Whether `concat` can run on a family. It grows `Cond.seq`, which Z-Image
+    /// refuses across its two CFG branches (their PADDED lengths must match), and it
+    /// reallocates `Cond.data`, which `predictAnima` reads as "this is a scheduled
+    /// conditioning" and drops to the host forward for. SenseNova's `data` is a KV
+    /// cache with its own rope index, not a token sequence to append to.
+    pub fn concatSupported(f: Family) bool {
+        return switch (f) {
+            .krea2, .sd15, .sdxl, .mageflow, .minimax_h3 => true,
+            .zimage, .anima, .sensenova => false,
+        };
+    }
+
+    /// One steering term: a direction named by text, and how far to go.
+    pub const Steer = struct {
+        /// The direction is this text's conditioning MINUS the empty prompt's, per
+        /// tap, normalized. The subtraction is what makes it a DIRECTION rather than
+        /// a second prompt: every short prompt's conditioning is dominated by what
+        /// all prompts share (template tokens, the mean embedding), and adding that
+        /// raw would shift every render the same way whatever word was typed.
+        text: []const u8 = "",
+        /// How far, in units of the conditioning's own RMS, so it reads on the same
+        /// scale as `amount`. Negative moves AWAY from the text.
+        scale: f32 = 0,
+        /// How the term reaches the conditioning. See `Mode`.
+        mode: Mode = .prompt,
+
+        pub fn on(self: Steer) bool {
+            return self.text.len > 0 and self.scale != 0;
+        }
+    };
+
+    pub fn steering(self: CondNoise) bool {
+        for (self.steers) |t| if (t.on()) return true;
+        return false;
+    }
+
+    /// Whether the NOISE half is on. Steering is independent (`steering`).
+    pub fn on(self: CondNoise) bool {
+        return self.curve.len > 0;
+    }
+
+    /// The render seed this branch's field is drawn from. Hashed rather than used
+    /// directly so the conditioning field cannot share values with the latent draw,
+    /// which reads `opts.seed` itself: turning noise on must move no bit of the
+    /// initial noise or of any sampler draw, or an amplitude sweep is not an
+    /// isolation. Keyed on the prompt TEXT rather than a schedule index so that
+    /// `[a|b]` and two separate renders of `a` and `b` agree, and so editing one
+    /// branch of a scheduled prompt does not reshuffle the other's noise.
+    pub fn seedFor(self: CondNoise, render_seed: u64, pt: PromptType, text: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0x436f_6e64_4e6f_6973); // "CondNois"
+        const base = self.seed orelse render_seed;
+        h.update(std.mem.asBytes(&base));
+        h.update(&[_]u8{@intFromEnum(pt)});
+        h.update(text);
+        return h.final();
+    }
+
+    /// The amount this branch perturbs at.
+    pub fn amountFor(self: CondNoise, pt: PromptType) f32 {
+        return switch (pt) {
+            .positive => self.amount,
+            .negative => self.amount * self.neg_scale,
+        };
+    }
+};
+
 /// Per-call knobs for `Session.encode`. Defaults match `Options`, so
 /// `encode(gpa, prompt, .{})` is what `generate` does.
 pub const EncodeOptions = struct {
@@ -1145,6 +1353,11 @@ pub const EncodeOptions = struct {
     /// EDITING is not the unconditional text prompt: it presents the reference
     /// pictures with no prompt at all.
     prompt_type: PromptType = .positive,
+    /// Perturb the conditioning this encode produces. See `CondNoise`.
+    cond_noise: CondNoise = .{},
+    /// The render's seed, which `cond_noise` derives its field from when it carries
+    /// no seed of its own. Read for nothing else.
+    render_seed: u64 = 0,
 };
 
 pub const PromptType = enum { positive, negative };
@@ -4345,6 +4558,462 @@ pub const Session = struct {
         };
     }
 
+    /// How this family's conditioning buffer is laid out, for anything that walks it
+    /// without knowing the family. Nothing else answers this: the row widths are
+    /// recomputed at each `encodeText` arm, and `Cond` carries only `seq`.
+    ///
+    /// `segs` is the DEPTH axis: krea2 stacks one hidden state per encoder tap,
+    /// SDXL concatenates CLIP-L then CLIP-G, SenseNova holds a K and a V per trunk
+    /// layer. A family with one segment has no depth to speak of, and says so with
+    /// `segs = 1` rather than by being absent.
+    pub const CondLayout = struct {
+        /// Tokens, or anima's adapter rows.
+        rows: usize,
+        /// Depth segments per row.
+        segs: usize,
+        /// Elements per segment.
+        w: usize,
+        /// SDXL only: the second segment's width, since CLIP-L and CLIP-G differ.
+        /// 0 means every segment is `w` wide.
+        w2: usize = 0,
+        /// SenseNova only: the buffer is `[seg][rows][w]`, depth outermost, where
+        /// every other family is `[rows][seg][w]`. Walking it the other way writes a
+        /// depth curve across the token axis and renders something plausible and
+        /// wrong.
+        segs_outer: bool = false,
+        /// Consecutive segments sharing one depth: 2 for SenseNova, whose K and V
+        /// belong to the same layer.
+        t_period: usize = 1,
+
+        pub fn segLen(self: CondLayout, s: usize) usize {
+            return if (s == 1 and self.w2 != 0) self.w2 else self.w;
+        }
+
+        /// Element offset of segment `s` of row `r`.
+        pub fn offset(self: CondLayout, s: usize, r: usize) usize {
+            if (self.segs_outer) return (s * self.rows + r) * self.w;
+            var base = r * self.rowWidth();
+            for (0..s) |i| base += self.segLen(i);
+            return base;
+        }
+
+        pub fn rowWidth(self: CondLayout) usize {
+            var n: usize = 0;
+            for (0..self.segs) |i| n += self.segLen(i);
+            return n;
+        }
+
+        pub fn len(self: CondLayout) usize {
+            return self.rows * self.rowWidth();
+        }
+
+        /// Normalized depth of segment `s`: 0 at the shallowest, exactly 1 at the
+        /// deepest, and 0 when there is only one.
+        pub fn depth(self: CondLayout, s: usize) f32 {
+            const steps = self.segs / self.t_period;
+            if (steps <= 1) return 0;
+            const i: f32 = @floatFromInt(s / self.t_period);
+            return i / @as(f32, @floatFromInt(steps - 1));
+        }
+    };
+
+    /// The conditioning's own sigma ceiling, where `noise_curve.sanitize` caps at 1.
+    ///
+    /// That cap suits the LLM, whose sigma multiplies a quantization scale, so past 1
+    /// the scale flips sign. Here sigma is additive and relative to the RMS, so 1.0 is
+    /// just "noise as loud as the signal" and renders fine. 8 leaves the signal an
+    /// eighth of the noise, which is as close to none as matters.
+    pub const max_cond_sigma: f32 = 8;
+
+    fn condSigma(v: f32) f32 {
+        if (!std.math.isFinite(v) or v <= 0) return 0;
+        return @min(v, max_cond_sigma);
+    }
+
+    /// Add a seeded, curve-shaped perturbation to a conditioning buffer.
+    ///
+    /// Two orderings matter. Scale by each segment's own RMS, or one `amount` means
+    /// different things per family (krea2's late taps are unnormalized, anima's
+    /// adapter output is not). And draw ONCE over the whole buffer before shaping, so
+    /// an amplitude sweep is a ray rather than a fresh direction at every amount.
+    ///
+    /// `amount` 0 adds exactly zero, so off is bit-identical with no special case.
+    pub fn perturbCondBuffer(
+        gpa: std.mem.Allocator,
+        data: []f32,
+        lay: CondLayout,
+        curve: []const u8,
+        amount: f32,
+        seed: u64,
+        shape: CondNoise.Shape,
+        keep_norm: bool,
+    ) !void {
+        if (curve.len == 0 or amount == 0 or data.len == 0) return;
+        std.debug.assert(lay.len() == data.len);
+
+        const g = try gpa.alloc(f32, data.len);
+        defer gpa.free(g);
+        philox_rng.randn(g, seed);
+
+        const n: f32 = @floatFromInt(lay.rows);
+        for (0..lay.segs) |s| {
+            const t = lay.depth(s);
+            const w = lay.segLen(s);
+
+            // The segment's RMS over every row, so a curve cannot make one token's
+            // noise depend on that token's own magnitude -- a near-zero pad row would
+            // otherwise receive near-zero noise and the pad region would be exempt.
+            var sum: f64 = 0;
+            for (0..lay.rows) |r| {
+                const off = lay.offset(s, r);
+                for (data[off..][0..w]) |v| sum += @as(f64, v) * v;
+            }
+            const rms: f32 = @floatCast(@sqrt(sum / @as(f64, @floatFromInt(lay.rows * w))));
+            if (rms == 0) continue;
+
+            for (0..lay.rows) |r| {
+                const sigma = condSigma(noise_curve.eval(curve, .{
+                    .t = t,
+                    .l = @floatFromInt(r),
+                    .n = n,
+                    .a = amount,
+                }) catch 0);
+                if (sigma == 0) continue;
+                const off = lay.offset(s, r);
+                // `.shared` reads the row's FIRST segment's draw for every segment, so
+                // the 12 taps of a token move together instead of independently.
+                // Unequal segment widths mean the segments are different ENCODERS
+                // (SDXL's CLIP-L and CLIP-G), not depths of one stream, so there is
+                // nothing for them to share and `.shared` falls back.
+                const goff = if (shape == .shared and lay.w2 == 0) lay.offset(0, r) else off;
+                const dst = data[off..][0..w];
+                const src = g[goff..][0..w];
+
+                var before: f64 = 0;
+                if (keep_norm) for (dst) |v| {
+                    before += @as(f64, v) * v;
+                };
+
+                const scale = sigma * rms;
+                for (dst, src) |*v, z| v.* += scale * z;
+
+                if (keep_norm and before > 0) {
+                    var after: f64 = 0;
+                    for (dst) |v| after += @as(f64, v) * v;
+                    if (after > 0) {
+                        const renorm: f32 = @floatCast(@sqrt(before / after));
+                        for (dst) |*v| v.* *= renorm;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One unit direction per segment: the mean of `text`'s conditioning over its
+    /// tokens, minus the empty prompt's, normalized. Caller owns the result.
+    ///
+    /// Per SEGMENT rather than one direction shared across them, and that matters on
+    /// krea2: its tap projector is a signed sum (mid taps positive, deep negative),
+    /// so one direction added uniformly to all 12 taps is multiplied by `sum(w)` =
+    /// -1.38 instead of `sum|w|` = 6.47 -- most of it cancels, and what survives is
+    /// inverted. A direction per tap is combined the way the projector was trained to.
+    /// Per-segment mean of a conditioning over its tokens: `[segs][lay.w]`.
+    fn condMeans(gpa: std.mem.Allocator, c: *const Cond, lay: CondLayout, out_w: usize) ![]f32 {
+        const out = try gpa.alloc(f32, lay.segs * out_w);
+        @memset(out, 0);
+        const n: f32 = @floatFromInt(@max(lay.rows, 1));
+        for (0..lay.segs) |seg| {
+            const w = lay.segLen(seg);
+            const d = out[seg * out_w ..][0..w];
+            for (0..lay.rows) |r| {
+                const off = lay.offset(seg, r);
+                for (d, c.data[off..][0..w]) |*x, v| x.* += v / n;
+            }
+        }
+        return out;
+    }
+
+    fn steerDirection(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        text: []const u8,
+        contrast: []const f32,
+        mode: CondNoise.Mode,
+        lay: CondLayout,
+        o: EncodeOptions,
+    ) ![]f32 {
+        // Through `encodeTextRaw`, never `encode`: the perturbation hook lives in
+        // `encodeText`, so encoding from inside it would recurse forever.
+        var plain = o;
+        plain.cond_noise = .{};
+        plain.steps = 0;
+
+        var want = try self.encodeTextRaw(gpa, text, plain);
+        defer want.deinit(gpa);
+
+        const want_lay = self.condLayout(&want) orelse return error.FamilyNotImplemented;
+        // Token counts differ (they are different prompts); the SHAPE of a row must
+        // not, or the two are not describing the same space.
+        if (want_lay.segs != lay.segs or want_lay.rowWidth() != lay.rowWidth()) return error.CondLengthMismatch;
+
+        const dir = try condMeans(gpa, &want, want_lay, lay.w);
+        errdefer gpa.free(dir);
+
+        for (0..lay.segs) |seg| {
+            const w = lay.segLen(seg);
+            const d = dir[seg * lay.w ..][0..w];
+            const con = contrast[seg * lay.w ..][0..w];
+            switch (mode) {
+                // Never reaches here: concat appends rows instead of a direction.
+                .concat => unreachable,
+                .prompt, .empty => for (d, con) |*x, v| {
+                    x.* -= v;
+                },
+                .orthogonal => {
+                    var cc: f64 = 0;
+                    for (con) |v| cc += @as(f64, v) * v;
+                    if (cc > 0) {
+                        var dc: f64 = 0;
+                        for (d, con) |x, v| dc += @as(f64, x) * v;
+                        const along: f32 = @floatCast(dc / cc);
+                        for (d, con) |*x, v| x.* -= along * v;
+                    }
+                },
+            }
+            var sum: f64 = 0;
+            for (d) |v| sum += @as(f64, v) * v;
+            const norm: f32 = @floatCast(@sqrt(sum));
+            if (norm > 0) for (d) |*x| {
+                x.* /= norm;
+            };
+        }
+        return dir;
+    }
+
+    /// Move `data` along `dir`, shaped by the curve exactly as the noise is.
+    fn steerCondBuffer(data: []f32, lay: CondLayout, dir: []const f32, curve: []const u8, scale: f32) void {
+        const n: f32 = @floatFromInt(lay.rows);
+        for (0..lay.segs) |seg| {
+            const w = lay.segLen(seg);
+            const d = dir[seg * lay.w ..][0..w];
+
+            var sum: f64 = 0;
+            for (0..lay.rows) |r| {
+                const off = lay.offset(seg, r);
+                for (data[off..][0..w]) |v| sum += @as(f64, v) * v;
+            }
+            const rms: f32 = @floatCast(@sqrt(sum / @as(f64, @floatFromInt(lay.rows * w))));
+            if (rms == 0) continue;
+            // The ROW's norm, not its per-element RMS. `dir` is a unit vector over
+            // the whole width, so scaling it by the RMS would move the row by
+            // `scale/sqrt(w)` of itself -- at w = 2560 that is 2% per unit of scale,
+            // and `--cond-steer-scale 2` lands where cond-noise sigma 0.04 does.
+            // Against the row norm, scale 1 means "a move as big as the conditioning",
+            // which is what the noise's `amount` already means.
+            const row_norm = rms * @sqrt(@as(f32, @floatFromInt(w)));
+
+            for (0..lay.rows) |r| {
+                // The curve is a SHAPE, so it is evaluated at amount 1 and the signed
+                // `scale` carries the amplitude: a curve is clamped positive, and a
+                // negative amount would otherwise read as zero and steer nowhere.
+                const g = condSigma(noise_curve.eval(curve, .{
+                    .t = lay.depth(seg),
+                    .l = @floatFromInt(r),
+                    .n = n,
+                    .a = 1,
+                }) catch 0);
+                if (g == 0) continue;
+                const step = scale * g * row_norm;
+                const off = lay.offset(seg, r);
+                for (data[off..][0..w], d) |*v, dv| v.* += step * dv;
+            }
+        }
+    }
+
+    /// Append a phrase's own token rows to `c`, growing `Cond.seq`.
+    ///
+    /// Unlike the directional modes this adds TOKENS rather than biasing the ones
+    /// already there, so the DiT can attend to the phrase in one place. `scale`
+    /// multiplies the appended rows: 1 is the phrase as encoded, smaller is a quieter
+    /// mention. It reallocates `c.data`, which is why `concatSupported` exists.
+    fn concatCond(self: *Session, gpa: std.mem.Allocator, c: *Cond, term: CondNoise.Steer, plain: EncodeOptions) !void {
+        var add = try self.encodeTextRaw(gpa, term.text, plain);
+        defer add.deinit(gpa);
+
+        const lay = self.condLayout(c) orelse return error.FamilyNotImplemented;
+        const add_lay = self.condLayout(&add) orelse return error.FamilyNotImplemented;
+        // Same row SHAPE or the two are not the same space; the row COUNT is what
+        // this is here to change.
+        if (add_lay.rowWidth() != lay.rowWidth() or add_lay.segs != lay.segs) return error.CondLengthMismatch;
+        if (add_lay.rows == 0) return;
+        if (lay.segs_outer) return error.ConcatNotSupported; // a KV cache, not a sequence
+
+        const row = lay.rowWidth();
+        const grown = try gpa.realloc(c.data, (lay.rows + add_lay.rows) * row);
+        c.data = grown;
+        @memcpy(grown[lay.rows * row ..], add.data[0 .. add_lay.rows * row]);
+        if (term.scale != 1) {
+            for (grown[lay.rows * row ..]) |*v| v.* *= term.scale;
+        }
+        c.seq += add_lay.rows;
+    }
+
+    /// Perturb a whole `Cond`, every scheduled entry and SDXL's pooled vector
+    /// included. Called by `encodeText`, so no caller has to remember it.
+    fn perturbCond(self: *Session, gpa: std.mem.Allocator, c: *Cond, text: []const u8, o: EncodeOptions) !void {
+        const lay_opt = self.condLayout(c);
+        // Positive branch only: see `CondNoise.steers`.
+        if (o.prompt_type == .positive and o.cond_noise.steering()) if (lay_opt) |lay| {
+            var plain = o;
+            plain.cond_noise = .{};
+            plain.steps = 0;
+
+            // Both contrasts come from the conditioning as it was BEFORE any term
+            // moved it, so terms compose rather than chaining off each other.
+            const from_prompt = try condMeans(gpa, c, lay, lay.w);
+            defer gpa.free(from_prompt);
+            var from_empty: ?[]f32 = null;
+            defer if (from_empty) |e| gpa.free(e);
+            for (o.cond_noise.steers) |t| {
+                if (t.on() and t.mode == .empty and from_empty == null) {
+                    var base = try self.encodeTextRaw(gpa, "", plain);
+                    defer base.deinit(gpa);
+                    const base_lay = self.condLayout(&base) orelse return error.FamilyNotImplemented;
+                    if (base_lay.segs != lay.segs or base_lay.rowWidth() != lay.rowWidth()) return error.CondLengthMismatch;
+                    from_empty = try condMeans(gpa, &base, base_lay, lay.w);
+                }
+            }
+
+            // A curve is optional for steering: with none, every tap moves equally.
+            const shape = if (o.cond_noise.curve.len > 0) o.cond_noise.curve else "a";
+            const before_steer = c.data.ptr;
+            var prev: ?[]f32 = null;
+            defer if (prev) |p| gpa.free(p);
+            for (o.cond_noise.steers) |term| {
+                if (!term.on() or term.mode == .concat) continue;
+                const contrast = switch (term.mode) {
+                    .prompt, .orthogonal => from_prompt,
+                    .empty => from_empty.?,
+                    .concat => unreachable,
+                };
+                const dir = try self.steerDirection(gpa, term.text, contrast, term.mode, lay, o);
+                // Two steer phrases share more than the empty prompt removes (both are
+                // short noun lists in the same template), so their directions overlap
+                // and opposite signs CANCEL that overlap. Reported rather than
+                // corrected: the cancellation is the honest differential, and someone
+                // whose two dials do less than one expects to be told why.
+                if (prev) |p| {
+                    var dot: f64 = 0;
+                    for (dir, p) |x, y| dot += @as(f64, x) * y;
+                    // Unit per segment, so the mean over segments is the cosine.
+                    const cos = dot / @as(f64, @floatFromInt(lay.segs));
+                    if (@abs(cos) > 0.25) std.log.info(
+                        "[cond-steer] '{s}' overlaps the previous term by {d:.2}; " ++
+                            "opposite signs cancel that much of both",
+                        .{ term.text, cos },
+                    );
+                    gpa.free(p);
+                }
+                prev = dir;
+                // Added, not blended: terms are independent moves, so two of them
+                // compose the way two of anything else would.
+                steerCondBuffer(c.data, lay, dir, shape, term.scale);
+            }
+            std.debug.assert(c.data.ptr == before_steer);
+
+            // Last, because it changes the row count that every step above walked.
+            // Positive branch only, like the rest: the families this runs on forward
+            // the two branches separately, so a longer positive is theirs alone.
+            for (o.cond_noise.steers) |term| {
+                if (!term.on() or term.mode != .concat) continue;
+                if (!CondNoise.concatSupported(self.family())) return error.ConcatNotSupported;
+                try self.concatCond(gpa, c, term, plain);
+            }
+        };
+
+        const amount = o.cond_noise.amountFor(o.prompt_type);
+        if (!o.cond_noise.on() or amount == 0) return;
+        const lay = lay_opt orelse return;
+        const seed = o.cond_noise.seedFor(o.render_seed, o.prompt_type, text);
+
+        const before = c.data.ptr;
+        try perturbCondBuffer(gpa, c.data, lay, o.cond_noise.curve, amount, seed, o.cond_noise.shape, o.cond_noise.keep_norm);
+        // `predictAnima` tells a scheduled conditioning from the base one by
+        // comparing this pointer, so reallocating here would silently force the host
+        // forward on that family.
+        std.debug.assert(c.data.ptr == before);
+
+        if (o.cond_noise.pooled) if (c.pooled) |p| {
+            // SDXL's pooled vector has neither depth nor position of its own: it is
+            // CLIP-G's final state at the last token, projected. So it takes the
+            // curve where that state sits, at the deep end of the last row -- a
+            // curve that protects the head protects this too.
+            const sigma = condSigma(noise_curve.eval(o.cond_noise.curve, .{
+                .t = 1,
+                .l = @floatFromInt(lay.rows -| 1),
+                .n = @floatFromInt(lay.rows),
+                .a = amount,
+            }) catch 0);
+            try perturbFlat(gpa, p, sigma, seed ^ 0x706f_6f6c, o.cond_noise.keep_norm);
+        };
+    }
+
+    /// Add `sigma` times the buffer's own RMS times a unit gaussian, elementwise.
+    fn perturbFlat(gpa: std.mem.Allocator, buf: []f32, sigma: f32, seed: u64, keep_norm: bool) !void {
+        if (sigma == 0 or buf.len == 0) return;
+        var sum: f64 = 0;
+        for (buf) |v| sum += @as(f64, v) * v;
+        const rms: f32 = @floatCast(@sqrt(sum / @as(f64, @floatFromInt(buf.len))));
+        if (rms == 0) return;
+        const g = try gpa.alloc(f32, buf.len);
+        defer gpa.free(g);
+        philox_rng.randn(g, seed);
+        const scale = sigma * rms;
+        for (buf, g) |*v, z| v.* += scale * z;
+        if (!keep_norm) return;
+        var after: f64 = 0;
+        for (buf) |v| after += @as(f64, v) * v;
+        if (after == 0) return;
+        const renorm: f32 = @floatCast(@sqrt(sum / after));
+        for (buf) |*v| v.* *= renorm;
+    }
+
+    /// `c`'s layout, or null for a conditioning with no walkable body (H3's
+    /// reference payload rides beside `data`, not in it).
+    pub fn condLayout(self: *const Session, c: *const Cond) ?CondLayout {
+        return switch (self.models) {
+            // Widths off the loaded encoder, never the module constants: the same
+            // reason `encodeTextRaw`'s krea2 arm reads `m.enc.taps.len`. krea2 taps
+            // twelve encoder layers, the other three tap one.
+            .krea2 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            .mageflow => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            .zimage => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            .minimax_h3 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            // The adapter's rows, pad rows included: they are attended to, so they
+            // are conditioning like any other row.
+            .anima => .{ .rows = c.seq, .segs = 1, .w = anima.anima_2b.context_dim },
+            .sd15 => |*m| .{ .rows = c.seq, .segs = 1, .w = m.clip.cfg.hidden },
+            // Interleaved per position, CLIP-L then CLIP-G, and the two have
+            // genuinely different scales -- which is why they are two segments and
+            // not one 2048-wide one.
+            .sdxl => |*m| .{
+                .rows = c.seq,
+                .segs = 2,
+                .w = m.clip.cfg.hidden,
+                .w2 = (m.clip_g orelse return null).cfg.hidden,
+            },
+            // Not hidden states: `[layer][k|v][seq][kv_dim]`, depth outermost. K and
+            // V share a layer, hence `t_period = 2`.
+            .sensenova => |*m| .{
+                .rows = c.seq,
+                .segs = m.dit.cfg.n_layers * 2,
+                .w = m.dit.cfg.kvDim(),
+                .segs_outer = true,
+                .t_period = 2,
+            },
+        };
+    }
+
     /// Fill `rgb_out` (`[lat_h*lat_w][3]` RGB8) with the cheap linear latent2rgb
     /// preview of a planar sampler latent, using THIS family's factors. Each family
     /// has its own matrix over its own channel count (16 for krea2's Wan latent, 4 for
@@ -4490,9 +5159,23 @@ pub const Session = struct {
         return first;
     }
 
-    /// One conditioning for one concrete prompt text, the whole of `encode` before
-    /// scheduling existed, plus the dialect switch in how the text is tokenized.
+    /// One conditioning for one concrete prompt text, with `CondNoise` applied.
+    ///
+    /// The perturbation lives here rather than at a call site because this is the one
+    /// place every conditioning passes through -- `encode`'s single prompt and each
+    /// deduped entry of a scheduled one -- so neither `generate` nor a caller driving
+    /// the public stages by hand can end up with a conditioning that missed it. It is
+    /// also the last point that still holds the resolved prompt text, which the seed
+    /// is keyed on.
     fn encodeText(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
+        var c = try self.encodeTextRaw(gpa, text, o);
+        errdefer c.deinit(gpa);
+        try self.perturbCond(gpa, &c, text, o);
+        return c;
+    }
+
+    /// The text encode itself, before any perturbation.
+    fn encodeTextRaw(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         // Weights the loaded encoder cannot honour are WARNED about and the prompt encoded
         // verbatim, not refused, and not silently dropped. Generic rather than a branch in
         // the family switch below, because it is a property of the encoder (see
@@ -5559,6 +6242,9 @@ pub const Session = struct {
         /// Continue a clip: hold the source's opening fixed and generate the rest.
         /// Not conditioning -- see `ContinueFrom`.
         continue_from: ?ContinueFrom = null,
+        /// Seeded perturbation of the text conditioning (see `CondNoise`). H3 has no
+        /// negative branch, so `neg_scale` is never read here.
+        cond_noise: CondNoise = .{},
     };
 
     /// Text prompt to a decoded clip, composed from the public stages.
@@ -5727,6 +6413,8 @@ pub const Session = struct {
             // Against the SNAPPED count: a reference video is cropped to the
             // target clip's real length, not the requested one.
             .h3_target_frames = self.pixelFrames(shape),
+            .cond_noise = o.cond_noise,
+            .render_seed = o.seed,
         });
         defer cond.deinit(gpa);
         // The encode is done, so its attention/conv scratch and its weights have no
@@ -7881,22 +8569,14 @@ pub const Session = struct {
 
         // Stage 1: text encoding (reusing the resident encoder).
         const enc_start = std.Io.Clock.real.now(io);
-        const enc_opts: EncodeOptions = .{
-            .encoder_f16 = opts.encoder_f16,
-            .prompt_syntax = opts.prompt_syntax,
-            .emphasis = opts.emphasis,
-            .steps = nsteps,
-            .cancel = opts.cancel,
-            .sn_ref_images = opts.sn_ref_images,
-            .mf_ref_images = opts.mf_ref_images,
-        };
-        var cond_pos = try self.encode(gpa, opts.prompt, enc_opts);
+        var cond_pos = try self.encode(gpa, opts.prompt, opts.encodeOptions(.positive, nsteps));
         defer cond_pos.deinit(gpa);
         // The negative branch says so, because SenseNova's negative under editing
         // is the reference pictures with no prompt rather than an empty prompt.
-        var neg_opts = enc_opts;
-        neg_opts.prompt_type = .negative;
-        var cond_neg: ?Cond = if (use_cfg) try self.encode(gpa, opts.negative, neg_opts) else null;
+        var cond_neg: ?Cond = if (use_cfg)
+            try self.encode(gpa, opts.negative, opts.encodeOptions(.negative, nsteps))
+        else
+            null;
         defer if (cond_neg) |*c| c.deinit(gpa);
         // The variant count is worth reporting: an A1111 `[a|b]` or `[a:b:0.5]` silently
         // becomes several conditionings, and "1 variant" is the difference between a
@@ -8514,10 +9194,21 @@ test "generate composed from the public stages is bit-identical to Session.gener
     //
     // Small and CPU: 128² is 64 DiT tokens, and the CPU path is the one the
     // measurement harnesses anchor on.
+    //
+    // Run once clean and once with conditioning noise on. The second pass is what
+    // says the perturbation lives INSIDE `encode` rather than at a call site: a hook
+    // that `generate` applies and the stage caller does not would reproduce exactly
+    // here on the first pass and disagree on the second.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     inline for (.{ test_paths.dit, test_paths.te, test_paths.vae }) |p| try test_gate.requireModelFile(io, p);
 
+    for ([_]CondNoise{ .{}, .{ .curve = "a*(1-t)", .amount = 0.05 } }) |cn| {
+        try stagesMatchGenerate(gpa, io, cn);
+    }
+}
+
+fn stagesMatchGenerate(gpa: std.mem.Allocator, io: std.Io, cn: CondNoise) !void {
     const opts: Options = .{
         .prompt = "a copper teapot on a windowsill",
         .width = 128,
@@ -8529,6 +9220,7 @@ test "generate composed from the public stages is bit-identical to Session.gener
         .dit_path = test_paths.dit,
         .text_encoder_path = test_paths.te,
         .vae_path = test_paths.vae,
+        .cond_noise = cn,
     };
     const lat_h = opts.height / 8;
     const lat_w = opts.width / 8;
@@ -8541,12 +9233,15 @@ test "generate composed from the public stages is bit-identical to Session.gener
     defer whole.deinit(gpa);
 
     // The same image, driven stage by stage, this is the reference usage.
-    var cond = try sess.encode(gpa, opts.prompt, .{ .encoder_f16 = opts.encoder_f16 });
-    defer cond.deinit(gpa);
-
     const sigmas = try schedule(gpa, opts.steps, opts.shift);
     defer gpa.free(sigmas);
     try std.testing.expectEqual(opts.steps + 1, sigmas.len);
+
+    // Through `Options.encodeOptions` for the same reason the noise below goes
+    // through `compatConfig`: a field this test spells out by hand is a field
+    // `generate` can start setting differently without the test noticing.
+    var cond = try sess.encode(gpa, opts.prompt, opts.encodeOptions(.positive, sigmas.len - 1));
+    defer cond.deinit(gpa);
 
     const x = try gpa.alloc(f32, lat_len);
     defer gpa.free(x);
@@ -9564,4 +10259,415 @@ test "the real H3 checkpoint detects and resolves as MiniMax H3" {
     // conditioner to ask for at all. A different error from the one above: this
     // is a programming error, not a missing file.
     try std.testing.expectError(error.NoSuchComponent, componentSpec(.minimax_h3, .conditioner2));
+}
+
+// ---------------------------------------------------------------------------
+// Conditioning noise
+// ---------------------------------------------------------------------------
+
+test "a conditioning layout addresses every element exactly once" {
+    // Three shapes that differ in the ways the families do: a plain one, SDXL's two
+    // unequal segments, and SenseNova's depth-outermost order. A layout that
+    // mis-addresses any of them writes a depth curve across the wrong axis and
+    // renders something plausible.
+    const cases = [_]Session.CondLayout{
+        .{ .rows = 5, .segs = 1, .w = 7 },
+        .{ .rows = 4, .segs = 12, .w = 3 },
+        .{ .rows = 6, .segs = 2, .w = 768, .w2 = 1280 },
+        .{ .rows = 3, .segs = 8, .w = 5, .segs_outer = true, .t_period = 2 },
+    };
+    for (cases) |lay| {
+        const seen = try std.testing.allocator.alloc(bool, lay.len());
+        defer std.testing.allocator.free(seen);
+        @memset(seen, false);
+        for (0..lay.segs) |s| {
+            for (0..lay.rows) |r| {
+                const off = lay.offset(s, r);
+                errdefer std.debug.print("seg {d} row {d} offset {d} of {d}\n", .{ s, r, off, lay.len() });
+                try std.testing.expect(off + lay.segLen(s) <= lay.len());
+                for (seen[off..][0..lay.segLen(s)]) |*b| {
+                    try std.testing.expect(!b.*);
+                    b.* = true;
+                }
+            }
+        }
+        for (seen) |b| try std.testing.expect(b);
+    }
+}
+
+test "a conditioning layout puts the segments where the family reads them" {
+    // Covering every element proves nothing about ORDER: a transposed walk is just
+    // as much a bijection, and it is the failure that renders something plausible.
+    // So pin both orders against what actually reads the buffer.
+
+    // Tokens outermost, segments within a row: row 1 starts a whole row on, and
+    // segment 1 of row 0 sits right after segment 0.
+    const rows: Session.CondLayout = .{ .rows = 4, .segs = 2, .w = 768, .w2 = 1280 };
+    try std.testing.expectEqual(@as(usize, 0), rows.offset(0, 0));
+    try std.testing.expectEqual(@as(usize, 768), rows.offset(1, 0));
+    try std.testing.expectEqual(@as(usize, 2048), rows.offset(0, 1));
+
+    // SenseNova is the other way round, and `sensenova.Prefix` is the definition:
+    // its own accessors are what the denoiser reads, so the layout agrees with them
+    // or the noise lands on the wrong layers.
+    const n_layers = 3;
+    const seq = 5;
+    const kv_dim = 4;
+    var kv: [n_layers * 2 * seq * kv_dim]f32 = undefined;
+    const pre: sensenova.Prefix = .{
+        .kv = &kv,
+        .seq = seq,
+        .kv_dim = kv_dim,
+        .n_layers = n_layers,
+        .time = seq,
+    };
+    const lay: Session.CondLayout = .{
+        .rows = seq,
+        .segs = n_layers * 2,
+        .w = kv_dim,
+        .segs_outer = true,
+        .t_period = 2,
+    };
+    try std.testing.expectEqual(kv.len, lay.len());
+    for (0..n_layers) |l| {
+        const k = pre.key(l);
+        const v = pre.value(l);
+        try std.testing.expectEqual((@intFromPtr(k.ptr) - @intFromPtr(&kv)) / @sizeOf(f32), lay.offset(l * 2, 0));
+        try std.testing.expectEqual((@intFromPtr(v.ptr) - @intFromPtr(&kv)) / @sizeOf(f32), lay.offset(l * 2 + 1, 0));
+        // And a token steps by one row WITHIN the layer's half, not by a whole row
+        // of every layer's state.
+        try std.testing.expectEqual(lay.offset(l * 2, 0) + kv_dim, lay.offset(l * 2, 1));
+    }
+}
+
+test "segment depth runs 0 to 1, and a K/V pair shares one" {
+    const flat: Session.CondLayout = .{ .rows = 1, .segs = 1, .w = 4 };
+    try std.testing.expectEqual(@as(f32, 0), flat.depth(0));
+
+    const taps: Session.CondLayout = .{ .rows = 1, .segs = 12, .w = 4 };
+    try std.testing.expectEqual(@as(f32, 0), taps.depth(0));
+    try std.testing.expectEqual(@as(f32, 1), taps.depth(11));
+
+    // SenseNova: 4 layers, K and V each. Both halves of a layer read one depth, and
+    // the last layer is still exactly 1.
+    const kv: Session.CondLayout = .{ .rows = 1, .segs = 8, .w = 4, .segs_outer = true, .t_period = 2 };
+    try std.testing.expectEqual(@as(f32, 0), kv.depth(0));
+    try std.testing.expectEqual(@as(f32, 0), kv.depth(1));
+    try std.testing.expectEqual(kv.depth(2), kv.depth(3));
+    try std.testing.expectEqual(@as(f32, 1), kv.depth(7));
+}
+
+test "conditioning noise: off is bit-identical, and the same seed repeats" {
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 8, .segs = 3, .w = 16 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37);
+
+    // An empty curve and a zero amount each have to leave the buffer ALONE, exactly.
+    // Not "close": off must be bit-identical or a sigma sweep has no control row.
+    for ([_][]const u8{ "", "a" }) |curve| {
+        const amount: f32 = if (curve.len == 0) 1 else 0;
+        const buf = try gpa.dupe(f32, base);
+        defer gpa.free(buf);
+        try Session.perturbCondBuffer(gpa, buf, lay, curve, amount, 99, .independent, false);
+        try std.testing.expectEqualSlices(f32, base, buf);
+    }
+
+    // The same seed reproduces, a different one does not. A knob whose output does
+    // not repeat cannot be swept: two amounts would differ by an unrelated draw
+    // rather than by the amount.
+    const a1 = try gpa.dupe(f32, base);
+    defer gpa.free(a1);
+    const a2 = try gpa.dupe(f32, base);
+    defer gpa.free(a2);
+    const b = try gpa.dupe(f32, base);
+    defer gpa.free(b);
+    try Session.perturbCondBuffer(gpa, a1, lay, "a", 0.1, 7, .independent, false);
+    try Session.perturbCondBuffer(gpa, a2, lay, "a", 0.1, 7, .independent, false);
+    try Session.perturbCondBuffer(gpa, b, lay, "a", 0.1, 8, .independent, false);
+    try std.testing.expectEqualSlices(f32, a1, a2);
+    try std.testing.expect(!std.mem.eql(f32, a1, b));
+}
+
+test "conditioning noise: doubling the amount doubles the delta exactly" {
+    // The draw happens once, before shaping, so an amplitude sweep is a RAY through
+    // conditioning space: every point is the same direction at a different distance.
+    // Without that, two amounts are two unrelated images and the sweep says nothing.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 6, .segs = 2, .w = 8, .w2 = 12 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.11) * 3;
+
+    const one = try gpa.dupe(f32, base);
+    defer gpa.free(one);
+    const two = try gpa.dupe(f32, base);
+    defer gpa.free(two);
+    try Session.perturbCondBuffer(gpa, one, lay, "a*(1-t)", 0.05, 3, .independent, false);
+    try Session.perturbCondBuffer(gpa, two, lay, "a*(1-t)", 0.10, 3, .independent, false);
+
+    for (base, one, two) |o, x, y| {
+        errdefer std.debug.print("base {d} one {d} two {d}\n", .{ o, x, y });
+        try std.testing.expectApproxEqAbs(2 * (x - o), y - o, 1e-6);
+    }
+}
+
+test "conditioning noise lands where the curve puts it" {
+    // The claim the whole feature rests on: a curve over the segment axis perturbs
+    // the taps it names and not the others. Measured as a per-segment delta, not
+    // read off the source.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 4, .segs = 4, .w = 32 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.21) + 1.5;
+
+    const buf = try gpa.dupe(f32, base);
+    defer gpa.free(buf);
+    // Nonzero only below t = 0.5, i.e. segments 0 and 1 of 4 (t = 0, 1/3, 2/3, 1).
+    try Session.perturbCondBuffer(gpa, buf, lay, "max(0, a*(1-t/0.5))", 0.3, 11, .independent, false);
+
+    for (0..lay.segs) |s| {
+        var moved: f64 = 0;
+        for (0..lay.rows) |r| {
+            const off = lay.offset(s, r);
+            for (base[off..][0..lay.w], buf[off..][0..lay.w]) |o, x| moved += @abs(x - o);
+        }
+        errdefer std.debug.print("segment {d} (t={d:.3}) moved {d}\n", .{ s, lay.depth(s), moved });
+        if (lay.depth(s) < 0.5) try std.testing.expect(moved > 0) else try std.testing.expectEqual(@as(f64, 0), moved);
+    }
+}
+
+test "conditioning noise scales with the conditioning's own magnitude" {
+    // One amount has to mean the same thing on a tap whose states are O(1) and one
+    // whose states are O(30), or a curve written for krea2's shallow taps silently
+    // erases its deep ones. Checked as the SAME buffer at two magnitudes rather than
+    // two segments of one buffer, so the two draws are the same numbers and the
+    // comparison is exact instead of being read through sampling noise. The factor
+    // is a power of two so that it, the RMS it produces and every sum along the way
+    // scale exactly in f32, and the check can expect equality rather than pick a
+    // tolerance that would also pass for a slightly wrong scaling.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 4, .segs = 2, .w = 64 };
+
+    const quiet = try gpa.alloc(f32, lay.len());
+    defer gpa.free(quiet);
+    for (quiet, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.3);
+    const loud = try gpa.alloc(f32, lay.len());
+    defer gpa.free(loud);
+    for (loud, quiet) |*v, q| v.* = q * 128;
+
+    const qn = try gpa.dupe(f32, quiet);
+    defer gpa.free(qn);
+    const ln = try gpa.dupe(f32, loud);
+    defer gpa.free(ln);
+    try Session.perturbCondBuffer(gpa, qn, lay, "a", 0.1, 5, .independent, false);
+    try Session.perturbCondBuffer(gpa, ln, lay, "a", 0.1, 5, .independent, false);
+
+    for (quiet, qn, loud, ln) |q, qx, l, lx| {
+        errdefer std.debug.print("quiet delta {d}, loud delta {d}\n", .{ qx - q, lx - l });
+        try std.testing.expectEqual(128 * (qx - q), lx - l);
+    }
+}
+
+test "conditioning noise seeds differ by branch, prompt and render seed" {
+    const cn: CondNoise = .{ .curve = "a", .amount = 0.1 };
+    const pos = cn.seedFor(42, .positive, "a cat");
+    try std.testing.expect(pos != cn.seedFor(42, .negative, "a cat"));
+    try std.testing.expect(pos != cn.seedFor(42, .positive, "a dog"));
+    try std.testing.expect(pos != cn.seedFor(43, .positive, "a cat"));
+    try std.testing.expectEqual(pos, cn.seedFor(42, .positive, "a cat"));
+
+    // An explicit seed pins the field: the render seed stops mattering, which is how
+    // you hold the damage still and sweep something else.
+    const pinned: CondNoise = .{ .curve = "a", .seed = 7 };
+    try std.testing.expectEqual(pinned.seedFor(1, .positive, "a cat"), pinned.seedFor(2, .positive, "a cat"));
+}
+
+test "a shared draw moves a token's taps in ONE direction, an independent one in twelve" {
+    // The property krea2's projector reacts to is DIRECTION, not equality: each tap
+    // still scales the shared draw by its own segment RMS, so the deltas come out
+    // parallel rather than identical. Cosine against tap 0 is the honest check.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 5, .segs = 12, .w = 256 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.19);
+
+    for ([_]CondNoise.Shape{ .shared, .independent }) |shape| {
+        const buf = try gpa.dupe(f32, base);
+        defer gpa.free(buf);
+        try Session.perturbCondBuffer(gpa, buf, lay, "a", 0.1, 4, shape, false);
+        for (0..lay.rows) |r| {
+            const o0 = lay.offset(0, r);
+            for (1..lay.segs) |seg| {
+                const os = lay.offset(seg, r);
+                var dot: f64 = 0;
+                var n0: f64 = 0;
+                var ns: f64 = 0;
+                for (0..lay.w) |i| {
+                    const d0: f64 = buf[o0 + i] - base[o0 + i];
+                    const ds: f64 = buf[os + i] - base[os + i];
+                    dot += d0 * ds;
+                    n0 += d0 * d0;
+                    ns += ds * ds;
+                }
+                const cos = dot / (@sqrt(n0) * @sqrt(ns));
+                errdefer std.debug.print("shape {t}, row {d}, tap {d}, cos {d:.4}\n", .{ shape, r, seg, cos });
+                switch (shape) {
+                    // Parallel to the bit, since it IS the same draw rescaled.
+                    .shared => try std.testing.expect(cos > 0.9999),
+                    // Two independent 256-dim draws: cosine ~ 1/sqrt(256) = 0.06.
+                    .independent => try std.testing.expect(@abs(cos) < 0.4),
+                }
+            }
+        }
+    }
+}
+
+test "keeping the norm leaves each vector the length it had" {
+    // Every row identical, so a row's own norm IS its segment's RMS and the inflation
+    // has a closed form: sqrt(1 + sigma^2) = 1.414 at sigma 1. That is the whole
+    // reason the knob exists -- without it sigma 1 also makes the conditioning 41%
+    // LOUDER, which is a second thing changing at once.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 4, .segs = 2, .w = 1024 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (0..lay.segs) |seg| for (0..lay.rows) |r| {
+        const off = lay.offset(seg, r);
+        for (base[off..][0..lay.w], 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.07);
+    };
+
+    const norm = struct {
+        fn of(b: []const f32) f64 {
+            var acc: f64 = 0;
+            for (b) |v| acc += @as(f64, v) * v;
+            return @sqrt(acc);
+        }
+    }.of;
+
+    const loud = try gpa.dupe(f32, base);
+    defer gpa.free(loud);
+    try Session.perturbCondBuffer(gpa, loud, lay, "a", 1.0, 2, .independent, false);
+    const held = try gpa.dupe(f32, base);
+    defer gpa.free(held);
+    try Session.perturbCondBuffer(gpa, held, lay, "a", 1.0, 2, .independent, true);
+
+    for (0..lay.segs) |seg| for (0..lay.rows) |r| {
+        const off = lay.offset(seg, r);
+        const n0 = norm(base[off..][0..lay.w]);
+        errdefer std.debug.print("seg {d} row {d}: base {d:.3} loud {d:.3} held {d:.3}\n", .{
+            seg, r, n0, norm(loud[off..][0..lay.w]), norm(held[off..][0..lay.w]),
+        });
+        try std.testing.expectApproxEqRel(@as(f64, 1.414), norm(loud[off..][0..lay.w]) / n0, 0.05);
+        try std.testing.expectApproxEqRel(n0, norm(held[off..][0..lay.w]), 1e-5);
+    };
+}
+
+test "the conditioning's sigma ceiling is its own, not the LLM's" {
+    // Same rejection of nonsense, a different ceiling, and the LLM's must not move:
+    // there sigma multiplies a quantization scale and past 1 the scale flips sign.
+    try std.testing.expectEqual(@as(f32, 0), Session.condSigma(-1));
+    try std.testing.expectEqual(@as(f32, 0), Session.condSigma(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 0), Session.condSigma(std.math.inf(f32) * 0));
+    try std.testing.expectEqual(@as(f32, 2.5), Session.condSigma(2.5));
+    try std.testing.expectEqual(Session.max_cond_sigma, Session.condSigma(1e9));
+    try std.testing.expect(Session.max_cond_sigma > 1);
+    try std.testing.expectEqual(@as(f32, 1), noise_curve.sanitize(1e9));
+}
+
+test "the negative branch is left alone unless asked for" {
+    const off: CondNoise = .{ .curve = "a", .amount = 0.2 };
+    try std.testing.expectEqual(@as(f32, 0.2), off.amountFor(.positive));
+    // Default 0: one field on both branches would partly cancel in `v_pos - v_neg`.
+    try std.testing.expectEqual(@as(f32, 0), off.amountFor(.negative));
+
+    const both: CondNoise = .{ .curve = "a", .amount = 0.2, .neg_scale = 0.5 };
+    try std.testing.expectEqual(@as(f32, 0.1), both.amountFor(.negative));
+}
+
+test "steering moves the conditioning along the direction, and sign reverses it" {
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 4, .segs = 3, .w = 32 };
+
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.23) * 2;
+
+    // A distinct unit direction per segment, which is the shape `steerDirection`
+    // returns: `[segs][w]`, each normalized.
+    const dir = try gpa.alloc(f32, lay.segs * lay.w);
+    defer gpa.free(dir);
+    for (0..lay.segs) |seg| {
+        const d = dir[seg * lay.w ..][0..lay.w];
+        for (d, 0..) |*v, i| v.* = if (i % lay.segs == seg) 1 else 0;
+        var sum: f64 = 0;
+        for (d) |v| sum += @as(f64, v) * v;
+        const n: f32 = @floatCast(@sqrt(sum));
+        for (d) |*v| v.* /= n;
+    }
+
+    const up = try gpa.dupe(f32, base);
+    defer gpa.free(up);
+    const down = try gpa.dupe(f32, base);
+    defer gpa.free(down);
+    Session.steerCondBuffer(up, lay, dir, "a", 0.2);
+    Session.steerCondBuffer(down, lay, dir, "a", -0.2);
+
+    for (0..lay.segs) |seg| {
+        const d = dir[seg * lay.w ..][0..lay.w];
+        for (0..lay.rows) |r| {
+            const off = lay.offset(seg, r);
+            for (0..lay.w) |i| {
+                const du = up[off + i] - base[off + i];
+                const dd = down[off + i] - base[off + i];
+                errdefer std.debug.print("seg {d} row {d} el {d}: up {d} down {d} dir {d}\n", .{ seg, r, i, du, dd, d[i] });
+                // The move is ALONG the direction: zero where the direction is zero.
+                if (d[i] == 0) try std.testing.expectEqual(@as(f32, 0), du);
+                // ...and the opposite sign for the opposite scale. Approx, not
+                // exact: `x + k` and `x - k` round independently in f32, so the two
+                // deltas can differ by an ulp without the operator being asymmetric.
+                try std.testing.expectApproxEqAbs(-du, dd, 1e-6);
+            }
+        }
+    }
+    // Zero scale is exactly a no-op, so off is bit-identical.
+    const none = try gpa.dupe(f32, base);
+    defer gpa.free(none);
+    Session.steerCondBuffer(none, lay, dir, "a", 0);
+    try std.testing.expectEqualSlices(f32, base, none);
+}
+
+test "a steering curve shapes the move per tap" {
+    // The curve is the same shape knob the noise uses; a tap it zeroes must not move.
+    const gpa = std.testing.allocator;
+    const lay: Session.CondLayout = .{ .rows = 2, .segs = 4, .w = 16 };
+    const base = try gpa.alloc(f32, lay.len());
+    defer gpa.free(base);
+    for (base, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.31) + 2;
+    const dir = try gpa.alloc(f32, lay.segs * lay.w);
+    defer gpa.free(dir);
+    for (dir) |*v| v.* = 1.0 / @sqrt(@as(f32, @floatFromInt(lay.w)));
+
+    const got = try gpa.dupe(f32, base);
+    defer gpa.free(got);
+    // Nonzero only below t = 0.5, i.e. segments 0 and 1 of 4.
+    Session.steerCondBuffer(got, lay, dir, "max(0, a*(1-t/0.5))", 0.3);
+
+    for (0..lay.segs) |seg| {
+        var moved: f64 = 0;
+        for (0..lay.rows) |r| {
+            const off = lay.offset(seg, r);
+            for (base[off..][0..lay.w], got[off..][0..lay.w]) |o, x| moved += @abs(x - o);
+        }
+        errdefer std.debug.print("segment {d} (t={d:.2}) moved {d}\n", .{ seg, lay.depth(seg), moved });
+        if (lay.depth(seg) < 0.5) try std.testing.expect(moved > 0) else try std.testing.expectEqual(@as(f64, 0), moved);
+    }
 }

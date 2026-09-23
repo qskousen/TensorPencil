@@ -66,10 +66,17 @@ pub fn validate(expr: []const u8) Error!void {
 /// its own amplitude is a legitimate thing to write; the UI dims the knob for it
 /// instead of letting it silently do nothing.
 pub fn respondsToAmount(expr: []const u8) bool {
+    // `l`/`n` are swept alongside `t`, not left at their defaults: `l` defaults to 0
+    // and `n` to 1, so a curve written in position alone (`a*l/n`) evaluates to 0 at
+    // every amount and would be reported inert, dimming an Amount field that does in
+    // fact do something.
     for ([_]f32{ 0, 0.25, 0.5, 0.75, 1 }) |t| {
-        const lo = eval(expr, .{ .t = t, .a = 0.1 }) catch return false;
-        const hi = eval(expr, .{ .t = t, .a = 0.9 }) catch return false;
-        if (lo != hi) return true;
+        for ([_]f32{ 0, 8, 16, 32 }) |l| {
+            const v: Vars = .{ .t = t, .l = l, .n = 32 };
+            const lo = eval(expr, .{ .t = v.t, .l = v.l, .n = v.n, .a = 0.1 }) catch return false;
+            const hi = eval(expr, .{ .t = v.t, .l = v.l, .n = v.n, .a = 0.9 }) catch return false;
+            if (lo != hi) return true;
+        }
     }
     return false;
 }
@@ -242,6 +249,24 @@ const Parser = struct {
 /// well-formed. They also appear in tp-llm's `--weight-noise` help and as tp-gui's
 /// shipped curve library (`shared/config.zig` `builtin_curves`, which cannot check
 /// them: it imports no evaluator). Keep the three in step.
+/// Named shapes for a CONDITIONING-noise curve, where `t` is depth over the text
+/// encoder's taps and `l`/`n` are the prompt's token index and count.
+///
+/// Separate from `documented_shapes`, whose `t` is the LLM's decoder depth: the ends
+/// mean opposite things, so those names would mislead here. The deep taps matter more
+/// than the shallow ones.
+///
+/// The UI reads this list directly, so a shape added here appears in the studio.
+pub const CondShape = struct { name: []const u8, expr: []const u8 };
+pub const cond_shapes = [_]CondShape{
+    .{ .name = "All taps", .expr = "a" },
+    .{ .name = "Deep taps only", .expr = "max(0, a*(t-0.65)/0.35)" },
+    .{ .name = "Deep-weighted", .expr = "a*t^2" },
+    .{ .name = "Shallow taps only", .expr = "max(0, a*(1-t/0.35))" },
+    .{ .name = "Prompt head", .expr = "a*(1-l/n)" },
+    .{ .name = "Prompt tail", .expr = "a*l/n" },
+};
+
 pub const documented_shapes = [_][]const u8{
     "a", // flat
     "a*(1-t)^2", // front-loaded
@@ -378,4 +403,39 @@ test "fill zeroes everything on a malformed curve, so a half-typed box is off" {
     var out: [5]f32 = @splat(0.5);
     fill("0.08*(1-t)^", 1, &out);
     for (out) |v| try std.testing.expectEqual(@as(f32, 0), v);
+}
+
+test "every conditioning shape parses, responds to the amount, and is distinct" {
+    var seen: [cond_shapes.len][8]f32 = undefined;
+    for (cond_shapes, 0..) |sh, i| {
+        errdefer std.debug.print("shape '{s}' = {s}\n", .{ sh.name, sh.expr });
+        try validate(sh.expr);
+        // A shape that ignores `a` would leave the studio's Amount field inert.
+        try std.testing.expect(respondsToAmount(sh.expr));
+        // Sampled over BOTH axes: two shapes that differ only in `l`/`n` are
+        // identical when probed at one token, which is how a duplicate would hide.
+        for (0..8) |k| {
+            const t: f32 = @floatFromInt(k % 4);
+            const l: f32 = @floatFromInt(k / 4);
+            seen[i][k] = sanitize(try eval(sh.expr, .{ .t = t / 3, .l = l * 7, .n = 8, .a = 0.5 }));
+        }
+    }
+    for (0..cond_shapes.len) |i| {
+        for (i + 1..cond_shapes.len) |j| {
+            errdefer std.debug.print("'{s}' and '{s}' sample identically\n", .{
+                cond_shapes[i].name, cond_shapes[j].name,
+            });
+            try std.testing.expect(!std.mem.eql(f32, &seen[i], &seen[j]));
+        }
+    }
+}
+
+test "a position-only curve responds to the amount" {
+    // A curve written in position alone must not read as inert: `l`/`n` default to
+    // 0 and 1, so probing at those makes `a*l/n` zero at every amount.
+    try std.testing.expect(respondsToAmount("a*l/n"));
+    try std.testing.expect(respondsToAmount("a*(1-l/n)"));
+    // Still false for one that genuinely ignores the knob, both axes included.
+    try std.testing.expect(!respondsToAmount("0.3*(1-t)^2"));
+    try std.testing.expect(!respondsToAmount("l/n"));
 }

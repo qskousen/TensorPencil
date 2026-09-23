@@ -41,6 +41,22 @@ pub fn toPipelineSyntax(s: config.PromptSyntax) pipeline.PromptSyntax {
     };
 }
 
+pub fn toPipelineCondShape(s: config.CondShape) pipeline.CondNoise.Shape {
+    return switch (s) {
+        .shared => .shared,
+        .independent => .independent,
+    };
+}
+
+pub fn toPipelineSteerMode(c: config.SteerMode) pipeline.CondNoise.Mode {
+    return switch (c) {
+        .prompt => .prompt,
+        .empty => .empty,
+        .orthogonal => .orthogonal,
+        .concat => .concat,
+    };
+}
+
 pub fn toPipelineCompat(c: config.Compat) pipeline.Compat {
     return switch (c) {
         .comfy => .comfy,

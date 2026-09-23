@@ -130,6 +130,31 @@ pub const PromptSyntax = enum(u8) {
     }
 };
 
+/// Whether a token's encoder taps each get their own noise draw or share one.
+///
+/// Decides whether the noise erodes the prompt or shifts it. krea2 collapses a
+/// token's 12 taps with a signed weight, so independent per-tap draws destroy that
+/// structure and the model falls back to its prior; one shared draw moves the
+/// embedding coherently and the content survives.
+pub const CondShape = enum(u8) {
+    shared,
+    independent,
+
+    pub fn label(self: CondShape) []const u8 {
+        return switch (self) {
+            .shared => "Shared (shifts)",
+            .independent => "Independent (erodes)",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?CondShape {
+        inline for (@typeInfo(CondShape).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// How an A1111 attention weight reaches the hidden states. Meaningless under the
 /// ComfyUI dialect, which has exactly one form.
 pub const Emphasis = enum(u8) {
@@ -614,6 +639,35 @@ pub fn TextBuf(comptime cap: usize) type {
 
 pub const PathBuf = TextBuf(max_path);
 
+/// One conditioning-steering term. Sized to match `wire.SteerSpec`, which is what
+/// actually crosses to the host.
+pub const max_steers = 4;
+pub const max_steer_text = 96;
+/// What a steering term's direction is measured from. See `pipeline.CondNoise.Contrast`.
+pub const SteerMode = enum(u8) {
+    prompt,
+    empty,
+    orthogonal,
+    concat,
+
+    /// Named for what it DOES, not for the arithmetic: the chip is two words wide and
+    /// the difference a user cares about is whether their subject survives.
+    pub fn label(self: SteerMode) []const u8 {
+        return switch (self) {
+            .prompt => "toward",
+            .empty => "trait",
+            .orthogonal => "add",
+            .concat => "append",
+        };
+    }
+};
+pub const CondSteer = struct {
+    text: TextBuf(max_steer_text) = .{},
+    scale: f32 = 0,
+    mode: SteerMode = .prompt,
+};
+pub const CondSteerList = FixedList(CondSteer, max_steers);
+
 /// Folders the model catalog scans (recursively). A struct wrapper so
 /// `FixedList`'s `T = .{}` default applies.
 pub const max_model_dirs = 16;
@@ -830,6 +884,24 @@ pub const Config = struct {
     /// Whose sampling conventions (RNG above all) to reproduce. Load-neutral, and
     /// independent of `prompt_syntax`: reproducing an A1111 render needs both.
     compat: Compat = .comfy,
+    /// Conditioning noise: a seeded perturbation of the text conditioning, shaped by
+    /// a `core/noise_curve.zig` curve. Per image like the three above, and carried to
+    /// the host on the render request rather than in the settings, so it applies to
+    /// what the studio queues and not to a render the chat model asks for.
+    cond_noise: bool = false,
+    cond_noise_curve: TextBuf(max_noise_curve) = .lit("a"),
+    cond_noise_amount: f32 = 0.3,
+    cond_noise_shape: CondShape = .shared,
+    /// Hold each perturbed vector's length, moving only its direction. Without it,
+    /// noise at sigma s also makes the conditioning sqrt(1 + s^2) louder.
+    cond_noise_keep_norm: bool = false,
+    /// Scale on the CFG negative branch. 0 leaves it alone, which is the default
+    /// because the branches are subtracted and one field on both partly cancels.
+    cond_noise_negative: f32 = 0,
+    /// Conditioning steering terms: each names a direction by text and how far to
+    /// move along it (negative moves away). Independent and added, so "more
+    /// tentacles" and "less anime" are two entries rather than one compromise.
+    cond_steers: CondSteerList = .{},
     preview: Preview = .taesd,
     /// Resolution of the live TAESD preview as a fraction of the latent grid.
     /// Applied live (no reload) like the preview method itself.
@@ -1456,13 +1528,13 @@ pub const Config = struct {
         };
         var ctx: Ctx = .{ .gpa = gpa, .bytes = bytes };
         // 64 MB, not 16: `std.json`'s recursive `innerParse` builds a frame per
-        // struct field and `Config` is ~150 KB BY VALUE, so the stack this needs
+        // struct field and `Config` is ~264 KB BY VALUE, so the stack this needs
         // scales with the FIELD COUNT, adding two scalar fields was enough to
         // blow a 16 MB stack and segfault every save/load test. A thread stack is
         // reserved address space, so the headroom costs nothing until touched;
         // sizing it tight here just means the next field added crashes config
         // loading, which is a nasty way to find out.
-        const t = std.Thread.spawn(.{ .stack_size = 64 << 20 }, Ctx.run, .{&ctx}) catch {
+        const t = std.Thread.spawn(.{ .stack_size = parse_stack_size }, Ctx.run, .{&ctx}) catch {
             // Spawn failed (very unlikely): parse in-line as a best effort.
             const parsed = std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return null;
             defer parsed.deinit();
@@ -1482,7 +1554,7 @@ pub const Config = struct {
         // JSON is the current format. `Config` is a plain value type (all
         // fixed-capacity buffers, no slices/pointers into the parse arena), so
         // we can copy the parsed value out and free the arena immediately.
-        // `Config` is ~150 KB and std.json builds it plus its nested per-field
+        // `Config` is ~264 KB and std.json builds it plus its nested per-field
         // temporaries on the stack; in a Debug build those frames, stacked on
         // top of `app.run`'s own frames, can overflow the 8 MB main-thread stack
         // (a nondeterministic SIGSEGV in a parse-frame prologue). Parse on a
@@ -2077,9 +2149,12 @@ test "load migrates a legacy key=value file to JSON in place" {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(64 * 1024));
     defer gpa.free(bytes);
     try std.testing.expect(bytes.len > 0 and bytes[0] == '{');
-    const parsed = try std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("/m.gguf", parsed.value.llm_model.opt().?);
+    // Through `parseJsonBigStack`, the same door `load` uses, not a bare
+    // `parseFromSlice`: `Config` is ~264 KB by value and std.json's recursive
+    // `innerParse` needs a stack that scales with the field count, so parsing it
+    // on the test runner's own stack segfaults the moment someone adds a field.
+    const parsed = Config.parseJsonBigStack(gpa, bytes) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/m.gguf", parsed.llm_model.opt().?);
 }
 
 test "default system prompt is populated on a fresh Config" {
@@ -2787,9 +2862,10 @@ test "a pairing string becomes a remote host entry whose endpoint carries the pi
     // The entry survives the settings file.
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, cfg, .{});
     defer std.testing.allocator.free(json);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const back = try std.json.parseFromSliceLeaky(Config, arena.allocator(), json, .{ .ignore_unknown_fields = true });
+    // Through the helper, not a bare parse: `Config` is ~264 KB by value and
+    // std.json's `innerParse` needs a stack that scales with the field count, so a
+    // bare parse segfaults once someone adds a field.
+    const back = Config.parseJsonBigStack(std.testing.allocator, json) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(token_hex, back.hostEntry("far").?.token.slice());
     try std.testing.expect(back.hostEntry("far").?.endpoint().? == .tls);
 }
@@ -2841,4 +2917,24 @@ test "re-pairing a host under the name it already has takes the new token" {
         const res: Config.AddHost = r;
         try std.testing.expectEqual(res.ok(), res.why().len == 0);
     }
+}
+
+
+test "nothing parses a Config without a big stack under it" {
+    // `Config` is ~264 KB by value and std.json's `innerParse` builds a frame that
+    // scales with the field count, so a bare parse segfaults once someone adds a
+    // field. Three occurrences are legitimate, all already on a 64 MB thread: two in
+    // `parseJsonBigStack`, one in the round-trip test's worker. A fourth means a
+    // parse on whatever stack the caller happened to be on -- route it through
+    // `Config.parseJsonBigStack` rather than raising this number.
+    const src = @embedFile("config.zig");
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "parseFromSlice")) |at| : (i = at + 1) {
+        // Only the ones whose type argument is `Config`; other types are small.
+        const tail = src[at..@min(at + 64, src.len)];
+        if (std.mem.indexOf(u8, tail, "(Config,") != null) n += 1;
+    }
+    errdefer std.debug.print("found {d} direct Config parses, expected 3\n", .{n});
+    try std.testing.expectEqual(@as(usize, 3), n);
 }

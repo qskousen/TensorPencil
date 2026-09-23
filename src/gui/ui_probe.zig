@@ -1141,6 +1141,7 @@ pub fn main(init: std.process.Init) !void {
     var states_mode = false;
     var settings_mode = false;
     var studio_mode = false;
+    var click_pt: ?dvui.Point.Physical = null;
     var lora_mode = false;
     var hosts_mode = false;
     var dims: [2]?u32 = .{ null, null };
@@ -1158,6 +1159,15 @@ pub fn main(init: std.process.Init) !void {
             // read as its name.
             selection.selectLlm(&probe_cfg, &probe_models.cat, probe_remote_llm);
             selection.selectCheckpoint(&probe_cfg, &probe_mirror.catalog, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
+        } else if (std.mem.startsWith(u8, arg, "--click=")) {
+            // `--click=X,Y`, in physical pixels, matching the captured PNG. One
+            // argument because this loop walks values, not indexes.
+            const v = arg["--click=".len..];
+            const comma = std.mem.indexOfScalar(u8, v, ',') orelse return error.InvalidArgs;
+            click_pt = .{
+                .x = try std.fmt.parseFloat(f32, v[0..comma]),
+                .y = try std.fmt.parseFloat(f32, v[comma + 1 ..]),
+            };
         } else if (std.mem.eql(u8, arg, "--studio")) {
             studio_mode = true;
             setCannedCatalog(try cannedCatalog(std.heap.smp_allocator));
@@ -1207,6 +1217,13 @@ pub fn main(init: std.process.Init) !void {
         } else {
             selection.selectCheckpoint(&probe_cfg, &probe_mirror.catalog, "/models/diffusion_models/krea2/krea2CenterSemiraw_v10Int8.safetensors");
             image_view.forced_family = .krea2;
+            // Advanced open with conditioning noise ON, because its rows only
+            // exist when the toggle is, and an unopened section probes nothing.
+            probe_cfg.studio_open_advanced = true;
+            probe_cfg.cond_noise = true;
+            probe_cfg.cond_steers.items[0] = .{ .text = .lit("tentacles, suckers"), .scale = 1.2 };
+            probe_cfg.cond_steers.items[1] = .{ .text = .lit("anime, cel shading"), .scale = -0.8 };
+            probe_cfg.cond_steers.count = 2;
         }
         try cannedStudio(std.heap.smp_allocator);
     }
@@ -1269,7 +1286,26 @@ pub fn main(init: std.process.Init) !void {
         _ = try win.end(.{});
     }
 
-    try win.begin(win.frame_time_ns + 6 * 16 * std.time.ns_per_ms);
+    // `--click X Y`: press and release at a point, then report what took keyboard
+    // focus. A GUI's "clicking does nothing" is otherwise only reproducible by
+    // driving someone's actual screen.
+    if (click_pt) |cp| {
+        for (0..4) |i| {
+            try win.begin(win.frame_time_ns + @as(i128, @intCast(6 + i)) * 16 * std.time.ns_per_ms);
+            _ = try win.addEventMouseMotion(.{ .pt = cp });
+            if (i == 1) _ = try win.addEventMouseButton(.left, .press);
+            if (i == 2) _ = try win.addEventMouseButton(.left, .release);
+            style.install();
+            if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
+            const foc = dvui.focusedWidgetId();
+            _ = try win.end(.{});
+            std.debug.print("ui-probe: after frame {d} at ({d},{d}) focus={?} steer_editing={any}\n", .{
+                i, cp.x, cp.y, foc, image_view.steer_editing,
+            });
+        }
+    }
+
+    try win.begin(win.frame_time_ns + 12 * 16 * std.time.ns_per_ms);
     _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
     style.install();
     var pic = dvui.Picture.start(dvui.windowRectPixels()) orelse return error.CaptureUnsupported;

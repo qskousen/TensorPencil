@@ -740,6 +740,78 @@ sensitive to the arm's own ~1e-3 divergence; use `sensenova-cuda-test --lora ...
 
 ---
 
+### 2K. Conditioning edits (`--cond-noise`, `--cond-steer`)
+
+Two operators on the text conditioning, applied inside `Session.encode` and so reaching
+every family and every backend with no device code: `Cond.data` is a host `[]f32` and the
+arms upload it once, inside `Session.denoiser`. Applying either later reaches the CPU
+forward and nothing else.
+
+`Session.condLayout` describes a family's buffer for both. `segs` is the depth axis:
+
+| family | rows | segments |
+|---|---|---|
+| krea2 | tokens | 12 encoder taps |
+| zimage / mageflow / h3 | tokens | 1 |
+| anima | adapter rows (pad rows included; they are attended) | 1 |
+| sd15 | tokens | 1 |
+| sdxl | tokens | 2, CLIP-L then CLIP-G, unequal widths |
+| sensenova | tokens | 2 per layer (K, V) |
+
+⚠️ SenseNova is the only one laid out `[seg][rows][w]`, depth outermost. Walking it like
+the others transposes the curve onto the token axis and renders something plausible and
+wrong; `CondLayout.segs_outer` is what prevents it. A coverage check cannot catch a
+transpose, so the test pins offsets against `sensenova.Prefix.key`/`.value`.
+
+**Noise** adds a seeded perturbation shaped by a `core/noise_curve.zig` curve over `t`
+(segment depth), `l`/`n` (token index and count) and `a` (`--cond-noise-amount`). Scaled
+by each segment's RMS so one amount means the same on every family; drawn once over the
+whole buffer before shaping, so an amplitude sweep is a ray rather than a fresh direction
+per amount. Amount 0 and an empty curve are bit-identical to off. `--cond-noise-shape
+shared` gives a token's taps one draw instead of one each, which shifts the picture where
+independent draws erode the prompt. `--cond-noise-keep-norm` holds each vector's length
+(noise otherwise lengthens it by `sqrt(1 + sigma^2)`). Sigma is capped at
+`Session.max_cond_sigma` = 8, separate from `noise_curve.sanitize`'s cap of 1, which is
+the LLM's.
+
+**Steering** moves the conditioning along a direction named by a text phrase, as a list of
+independent terms (`--cond-steer`, repeatable; the studio's Steer rows). `--cond-steer-mode`
+picks how a term reaches the conditioning:
+
+| mode | direction | effect |
+|---|---|---|
+| `concat` | none: APPENDS the phrase's token rows | adds an object, prompt untouched |
+| `prompt` | `steer - <this conditioning>` | moves at the phrase, gives up the prompt |
+| `empty` | `steer - encode("")` | adds the phrase as an attribute |
+| `orthogonal` | `steer` with the prompt's direction projected out | as `empty`, subject survives further |
+
+⚠️ `scale` multiplies the ROW NORM, not the per-element RMS: the direction is a unit
+vector over the whole width, so scaling by RMS moves the row by `scale/sqrt(w)` of itself
+and reads as "steering does nothing". Useful range is 0.1-0.3 to nudge and ~1 to replace
+the prompt outright. `concat` is the exception: its scale multiplies the appended rows,
+1 is the phrase as encoded, and larger pushes them off the manifold.
+
+⚠️ `concat` grows `Cond.seq` and reallocates `Cond.data`, so `CondNoise.concatSupported`
+refuses it on zimage (its two CFG branches must present the same padded length), anima
+(`predictAnima` reads a reallocated pointer as a scheduled conditioning) and sensenova (a
+KV cache, not a token sequence).
+
+Directions are per SEGMENT, never one shared across them: krea2's tap projector is a
+signed sum, so a uniform direction is mostly cancelled and what survives is inverted.
+Terms are added, so two whose directions overlap cancel where their signs oppose; the
+engine logs the overlap above 0.25. Only the positive branch is steered, so under CFG the
+guidance difference amplifies the move. A term at negative scale stands in for a negative
+prompt at cfg 1, which is worth having on a family that renders at cfg 1 and cannot use a
+real one.
+
+Both are per image on `wire.RenderParams`, not in the settings, so they apply to what the
+studio queues and not to a render the chat model asks for. The curve and each term's text
+ride as fixed buffers (`wire.CurveBuf`, `wire.SteerSpec`) because `Host.enqueue` stores
+`RenderParams` by value. ⚠️ `applyTo` points `opts.cond_noise.curve` and `.steers` into
+the params, so an `Options` built from them must not outlive them. Recorded in the PNG
+block as `Cond noise` and `Cond steer`, both quoted, since curves and term lists contain
+commas and the settings line splits on those.
+
 ## 3. Diffusion ops and kernels
 
 | Op | cpu | vulkan | zig-cuda | cuda | Formats |

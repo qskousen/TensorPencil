@@ -141,6 +141,21 @@ var f_scheduler: config.Scheduler = .default;
 var f_syntax: config.PromptSyntax = .comfy;
 var f_emphasis: config.Emphasis = .original;
 var f_compat: config.Compat = .comfy;
+var f_cond_on: bool = false;
+var f_cond_curve: config.TextBuf(config.max_noise_curve) = .{};
+var f_cond_shape: config.CondShape = .shared;
+var f_cond_keep_norm: bool = false;
+var f_cond_amount_buf: [16]u8 = @splat(0);
+var f_cond_negative_buf: [16]u8 = @splat(0);
+const max_steers = config.max_steers;
+var f_steer_text: [max_steers]config.TextBuf(config.max_steer_text) = @splat(.{});
+var f_steer_scale: [max_steers]f32 = @splat(0.25);
+var f_steer_mode: [max_steers]config.SteerMode = @splat(.prompt);
+var f_steer_n: usize = 0;
+/// Whether each term's text field had keyboard focus on the last frame. Read by
+/// `ui-probe --click`, which is how a click that never reaches a widget is told
+/// apart from one that reaches it and does nothing.
+pub var steer_editing: [max_steers]bool = @splat(false);
 
 /// The per-image LoRA set, seeded from the family's configured list. Held flat
 /// rather than as a list of `config.FamilyLora` so editing a row here cannot
@@ -248,6 +263,18 @@ fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
     f_syntax = cfg.prompt_syntax;
     f_emphasis = cfg.emphasis;
     f_compat = cfg.compat;
+    f_cond_on = cfg.cond_noise;
+    f_cond_curve = cfg.cond_noise_curve;
+    f_cond_shape = cfg.cond_noise_shape;
+    f_cond_keep_norm = cfg.cond_noise_keep_norm;
+    setNum(&f_cond_amount_buf, cfg.cond_noise_amount);
+    setNum(&f_cond_negative_buf, cfg.cond_noise_negative);
+    f_steer_n = cfg.cond_steers.count;
+    for (cfg.cond_steers.slice(), 0..) |t, i| {
+        f_steer_text[i] = t.text;
+        f_steer_scale[i] = t.scale;
+        f_steer_mode[i] = t.mode;
+    }
     seedLoras(cfg, fam);
 
     seeded = true;
@@ -283,6 +310,29 @@ fn parseNum(buf: []const u8, fallback: usize) usize {
 fn parseFloat(buf: []const u8, fallback: f32) f32 {
     const s = std.mem.trim(u8, std.mem.sliceTo(buf, 0), " \t\r");
     return std.fmt.parseFloat(f32, s) catch fallback;
+}
+
+fn setNum(buf: []u8, v: f32) void {
+    @memset(buf, 0);
+    _ = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{d}", .{v}) catch {};
+}
+
+/// Clamped at the pipeline's own ceiling so a typo cannot ask for something the
+/// engine will silently clamp anyway.
+fn condAmount() f32 {
+    return std.math.clamp(parseFloat(&f_cond_amount_buf, 0.3), 0, tp.pipeline.Session.max_cond_sigma);
+}
+
+/// The named shape the live expression matches, or "custom".
+fn condShapeName() []const u8 {
+    for (tp.noise_curve.cond_shapes) |sh| {
+        if (std.mem.eql(u8, sh.expr, f_cond_curve.slice())) return sh.name;
+    }
+    return "custom";
+}
+
+fn condNegative() f32 {
+    return std.math.clamp(parseFloat(&f_cond_negative_buf, 0), 0, 1);
 }
 
 /// The dimensions the form is currently asking for, however it is spelling them.
@@ -1093,7 +1143,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
     defer style.collapsibleEnd(&sec);
     if (!sec.open()) return;
 
-    help("Applied beside the model's weights, never merged in, so strength stays a dial. " ++
+    help(0, "Applied beside the model's weights, never merged in, so strength stays a dial. " ++
         "These ride on the image you queue: change them and the next render picks them up " ++
         "with no model reload.");
 
@@ -1139,7 +1189,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
     }
 
     if (f_lora_n >= max_loras) {
-        help("The LoRA list is full; remove one to add another.");
+        help(1, "The LoRA list is full; remove one to add another.");
         return;
     }
     // Only what is not already on, so the menu never offers a duplicate.
@@ -1179,9 +1229,17 @@ fn hasLora(path: []const u8) bool {
 
 
 fn renderAdvancedSection(cfg: *config.Config, cb: Callbacks) void {
-    var sum_buf: [64]u8 = undefined;
+    var sum_buf: [96]u8 = undefined;
+    // Conditioning noise named in the FOLDED summary: it changes every render and
+    // is otherwise invisible the moment the section is collapsed.
+    const summary = if (f_cond_on and f_cond_curve.slice().len > 0)
+        std.fmt.bufPrint(&sum_buf, "{s} · noise {s} {d}", .{
+            f_syntax.label(), condShapeName(), condAmount(),
+        }) catch ""
+    else
+        std.fmt.bufPrint(&sum_buf, "{s} · {s}", .{ f_syntax.label(), f_compat.label() }) catch "";
     var sec = style.collapsibleBegin(@src(), "ADVANCED", &cfg.studio_open_advanced, .{
-        .summary = std.fmt.bufPrint(&sum_buf, "{s} · {s}", .{ f_syntax.label(), f_compat.label() }) catch "",
+        .summary = summary,
     });
     defer style.collapsibleEnd(&sec);
     if (!sec.open()) return;
@@ -1208,7 +1266,10 @@ fn renderAdvancedSection(cfg: *config.Config, cb: Callbacks) void {
         _ = enumChip(@src(), config.Compat, &f_compat, 0);
     }
 
-    help("Everything above is per image: it is stamped on each render you queue, " ++
+    renderCondNoise();
+    renderCondSteer();
+
+    help(2, "Everything above is per image: it is stamped on each render you queue, " ++
         "and Settings keeps the defaults new renders start from. Live preview, the " ++
         "VAE decode path and the model set itself are Settings' to own.");
     {
@@ -1219,14 +1280,172 @@ fn renderAdvancedSection(cfg: *config.Config, cb: Callbacks) void {
     }
 }
 
+/// Conditioning noise: a seeded perturbation of the text conditioning, shaped by a
+/// curve over the encoder taps (`t`) and the prompt's tokens (`l`/`n`).
+///
+/// Rows appear only when the toggle is on. A curve that does not parse leaves the
+/// value showing but renders clean, which is the same reading the LLM's curve field
+/// takes: someone halfway through typing has not asked for anything yet.
+fn renderCondNoise() void {
+    {
+        var row = rowBegin(@src(), 3, "Cond noise");
+        defer row.deinit();
+        _ = dvui.checkbox(@src(), &f_cond_on, null, .{ .gravity_y = 0.5 });
+    }
+    if (!f_cond_on) return;
+
+    {
+        var row = rowBegin(@src(), 4, "Taps");
+        defer row.deinit();
+        _ = enumChip(@src(), config.CondShape, &f_cond_shape, 0);
+    }
+    {
+        var row = rowBegin(@src(), 5, "Amount");
+        defer row.deinit();
+        numChip(@src(), &f_cond_amount_buf, "", 70, 0);
+    }
+    // The named shapes come straight from `noise_curve.cond_shapes`, so adding one
+    // there adds it here. The selection is DERIVED by matching the live expression
+    // rather than stored: two fields for one fact desync, and this one would desync
+    // every time the expression is edited by hand.
+    const shapes = tp.noise_curve.cond_shapes;
+    var sel: usize = shapes.len; // past the end = Custom
+    for (shapes, 0..) |sh, i| {
+        if (std.mem.eql(u8, sh.expr, f_cond_curve.slice())) {
+            sel = i;
+            break;
+        }
+    }
+    {
+        var row = rowBegin(@src(), 6, "Curve");
+        defer row.deinit();
+        var labels: [shapes.len + 1][]const u8 = undefined;
+        inline for (shapes, 0..) |sh, i| labels[i] = sh.name;
+        labels[shapes.len] = "Custom…";
+        if (style.chipDropdown(@src(), &labels, &sel, .{ .id_extra = 0 })) {
+            // Custom leaves the expression alone; the field below edits it.
+            if (sel < shapes.len) f_cond_curve.set(shapes[sel].expr);
+        }
+    }
+    if (sel >= shapes.len) {
+        var row = rowBegin(@src(), 9, "Expression");
+        defer row.deinit();
+        numChip(@src(), &f_cond_curve.data, "", 300, 2);
+    }
+    {
+        var row = rowBegin(@src(), 7, "Keep length");
+        defer row.deinit();
+        _ = dvui.checkbox(@src(), &f_cond_keep_norm, null, .{ .gravity_y = 0.5 });
+    }
+    {
+        var row = rowBegin(@src(), 8, "On negative");
+        defer row.deinit();
+        numChip(@src(), &f_cond_negative_buf, "x", 70, 1);
+    }
+
+    const curve = f_cond_curve.slice();
+    const bad = curve.len > 0 and std.meta.isError(tp.noise_curve.validate(curve));
+    if (curve.len == 0) {
+        help(3, "No curve, so this render carries no noise. A bare number is a flat curve.");
+    } else if (bad) {
+        help(4, "That curve does not parse, so this render would carry no noise. It is an " ++
+            "expression in t, l, n and a.");
+    } else {
+        help(5, "Shared moves a token's encoder taps together and SHIFTS the picture; " ++
+            "independent moves them apart and ERODES the prompt. The deep taps carry " ++
+            "more than the shallow ones. Start at Shared · All taps · 0.3. Custom takes " ++
+            "an expression in t (tap depth), l and n (token index and count) and a.");
+    }
+}
+
+/// Conditioning steering: each row names a direction by text and dials it.
+///
+/// Independent of the noise toggle above: they are different operators on the same
+/// buffer (one moves along a named direction, the other along a random one) and
+/// either is useful without the other.
+fn renderCondSteer() void {
+    {
+        var row = rowBegin(@src(), 10, "Steer");
+        defer row.deinit();
+        if (f_steer_n < max_steers and bubbles.secondaryButton(@src(), 0, "+ term", true)) {
+            f_steer_text[f_steer_n] = .{};
+            // append at 1.0: the mode that adds a thing without trading the prompt
+            // away, at the scale that means "the phrase as written".
+            f_steer_scale[f_steer_n] = 1.0;
+            f_steer_mode[f_steer_n] = .concat;
+            f_steer_n += 1;
+        }
+        if (f_steer_n == 0) {
+            dvui.labelNoFmt(@src(), "none", .{}, .{
+                .font = F.ui,
+                .color_text = C.text_ghost,
+                .padding = .{},
+                .margin = .{ .x = 8 },
+                .gravity_y = 0.5,
+            });
+        }
+    }
+
+    var remove: ?usize = null;
+    for (0..f_steer_n) |i| {
+        // Two rows: the text entry alone, then the slider and the button. Keeps the
+        // entry wide enough for a phrase.
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .margin = .{ .h = 2 } });
+            defer row.deinit();
+            steer_editing[i] = style.chipInput(@src(), &f_steer_text[i].data, "", 250, .{ .id_extra = i }).editing;
+        }
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .margin = .{ .x = 8, .h = 6 } });
+            defer row.deinit();
+            _ = dvui.sliderEntry(@src(), "{d:0.2}", .{
+                .value = &f_steer_scale[i],
+                // Wide on purpose. ~1 is already total takeover (a term at 1.0
+                // renders ITSELF and discards the prompt), so the headroom past
+                // it is for terms fighting each other, and the negative side for
+                // suppressing something the prompt keeps re-asserting.
+                .min = -3.0,
+                .max = 3.0,
+                .interval = 0.01,
+            }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 110 } });
+            _ = enumChip(@src(), config.SteerMode, &f_steer_mode[i], i);
+            if (bubbles.secondaryButton(@src(), i, "Remove", true)) remove = i;
+        }
+    }
+    if (remove) |i| {
+        var j = i;
+        while (j + 1 < f_steer_n) : (j += 1) {
+            f_steer_text[j] = f_steer_text[j + 1];
+            f_steer_scale[j] = f_steer_scale[j + 1];
+        }
+        f_steer_n -= 1;
+    }
+    if (f_steer_n > 0) {
+        help(6, "Each term is a direction, measured as the chip says. Positive moves " ++
+            "toward the phrase, negative away. Scale is a fraction of " ++
+            "the conditioning itself, so it bites fast: 0.1-0.3 nudges, 0.5 changes the " ++
+            "look, and 1.0 renders the term INSTEAD of your prompt. Terms are added, so " ++
+            "two that mean similar things partly cancel when their signs oppose -- the " ++
+            "log says by how much. Each costs one text encode per render.\n\n" ++
+            "append adds the phrase's own tokens, so the model can put a new OBJECT in " ++
+            "the picture with your prompt untouched -- leave its scale at 1.0, which is " ++
+            "the phrase as written. The other three bias the tokens you already have: " ++
+            "toward moves your render AT the phrase and gives up your prompt as it goes, " ++
+            "trait adds what the phrase IS and leaves your subject alone (more tentacles, " ++
+            "less anime), and add is trait's stronger form, stripping out what the phrase " ++
+            "shares with your prompt so the subject survives further up the scale.");
+    }
+}
+
 /// A wrapped note under a section head.
 ///
 /// `F.row`, not `F.ui_sm`: the compact UI roles are single-spaced (line 1.0),
 /// which is right for a chip or a label and crushes the lines into each other
 /// the moment the text wraps. Anything that can reach a second line needs a role
 /// with real leading.
-fn help(text: []const u8) void {
+fn help(id: usize, text: []const u8) void {
     var tl = dvui.textLayout(@src(), .{}, .{
+        .id_extra = id,
         .expand = .horizontal,
         .background = false,
         .max_size_content = .width(style.Layout.prose_max),
@@ -1357,13 +1576,29 @@ fn generate(cfg: *const config.Config) void {
     const count = @max(1, parseNum(&count_buf, 1));
     const base_seed: u64 = if (random_seed) 0 else parseU64(&seed_buf);
 
-    const params: wire.RenderParams = .{
+    var params: wire.RenderParams = .{
         .sampler = pipeline_map.toPipelineSampler(f_sampler),
         .scheduler = pipeline_map.toPipelineScheduler(f_scheduler),
         .prompt_syntax = pipeline_map.toPipelineSyntax(f_syntax),
         .emphasis = pipeline_map.toPipelineEmphasis(f_emphasis),
         .compat = pipeline_map.toPipelineCompat(f_compat),
+        .cond_noise_amount = condAmount(),
+        .cond_noise_shape = pipeline_map.toPipelineCondShape(f_cond_shape),
+        .cond_noise_keep_norm = f_cond_keep_norm,
+        .cond_noise_negative = condNegative(),
     };
+    // The toggle is the switch: an empty curve is off on the engine side too, so a
+    // disabled section cannot leave a curve applied.
+    if (f_cond_on) params.cond_noise.set(f_cond_curve.slice());
+    for (0..f_steer_n) |i| {
+        // An empty term or a zero scale is DROPPED rather than sent: each term
+        // costs a text-encoder forward on the host, and "off" should cost nothing.
+        if (f_steer_text[i].slice().len == 0 or f_steer_scale[i] == 0) continue;
+        params.steers[params.steer_count].set(f_steer_text[i].slice());
+        params.steers[params.steer_count].scale = f_steer_scale[i];
+        params.steers[params.steer_count].mode = pipeline_map.toPipelineSteerMode(f_steer_mode[i]);
+        params.steer_count += 1;
+    }
 
     var specs: [max_loras]wire.LoraSpec = undefined;
     var n_specs: usize = 0;
@@ -1489,6 +1724,22 @@ pub fn saveDefaults(cfg: *config.Config, fam: ?model_spec.Family) void {
     cfg.prompt_syntax = f_syntax;
     cfg.emphasis = f_emphasis;
     cfg.compat = f_compat;
+    cfg.cond_noise = f_cond_on;
+    cfg.cond_noise_curve = f_cond_curve;
+    cfg.cond_noise_shape = f_cond_shape;
+    cfg.cond_noise_keep_norm = f_cond_keep_norm;
+    cfg.cond_noise_amount = condAmount();
+    cfg.cond_noise_negative = condNegative();
+    cfg.cond_steers = .{};
+    for (0..f_steer_n) |i| {
+        if (f_steer_text[i].slice().len == 0) continue;
+        cfg.cond_steers.items[cfg.cond_steers.count] = .{
+            .text = f_steer_text[i],
+            .scale = f_steer_scale[i],
+            .mode = f_steer_mode[i],
+        };
+        cfg.cond_steers.count += 1;
+    }
     // Size goes through the framing pair, which is its single writer; the exact
     // fields are the same value in pixels, so they map back rather than opening
     // a second route to `width`/`height`.
