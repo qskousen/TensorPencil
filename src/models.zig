@@ -109,6 +109,9 @@ pub const minimax_h3_vae_encode_cuda = @import("models/minimax_h3_vae_encode_cud
 /// H3's vision tower: Qwen3-VL-32B's ViT with DeepStack. NOT `vit35.zig`, which
 /// is the same tower from llama.cpp's lineage and diverges in two conventions.
 pub const minimax_h3_vit = @import("models/minimax_h3_vit.zig");
+/// That tower on the CUDA backend. Its own file rather than `vit35_cuda`, which
+/// refuses DeepStack and flattens its merger into the `Vit`.
+pub const minimax_h3_vit_cuda = @import("models/minimax_h3_vit_cuda.zig");
 /// H3's prompt presentation: reference labels and spliced vision blocks, and the
 /// one place the tag / injection / mrope spans are derived from.
 pub const minimax_h3_present = @import("models/minimax_h3_present.zig");
@@ -140,6 +143,7 @@ test {
     _ = minimax_h3_vae_encode;
     _ = minimax_h3_vae_encode_cuda;
     _ = minimax_h3_vit;
+    _ = minimax_h3_vit_cuda;
     _ = minimax_h3_present;
     _ = quant_weight;
     _ = lin;

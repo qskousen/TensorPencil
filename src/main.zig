@@ -10,6 +10,11 @@ pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
+    // Per-step buffers churn (alloc/free every forward pass); the process arena
+    // never frees, so a render gets a real allocator. A clip makes the difference
+    // impossible to miss: three [seq][hidden] f32 buffers a step, 2.8 GB per step
+    // at 15 seconds of 512x768, none of it coming back until the process exits.
+    const gpa = std.heap.smp_allocator;
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
@@ -399,9 +404,9 @@ pub fn main(init: std.process.Init) !void {
         const budget_gib: f64 = if (args.len >= 5) (std.fmt.parseFloat(f64, args[4]) catch 3.0) else 3.0;
         try cudaStreamTest(arena, io, stdout, path, lat, budget_gib);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "generate")) {
-        try generate(arena, io, stdout, args[2..]);
+        try generate(gpa, io, stdout, args[2..]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "generate-clip")) {
-        try generateClip(arena, io, stdout, args[2..]);
+        try generateClip(gpa, io, stdout, args[2..]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-encode-cuda-test")) {
         const ck = if (args.len >= 3 and !std.mem.eql(u8, args[2], "libs")) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_video_vae_fp16.safetensors";
         const libs = for (args[2..]) |a| {
@@ -1251,7 +1256,7 @@ fn cudaLibsAttnTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
         try be.tensorUpload(dk, std.mem.sliceAsBytes(k));
         try be.tensorUpload(dv, std.mem.sliceAsBytes(v));
 
-        var plan = cudnn.SdpaPlan.build(api, handle, 1, c.hq, c.hkv, c.s, c.s, c.d) catch |err| {
+        var plan = cudnn.SdpaPlan.build(api, handle, 1, c.hq, c.hkv, c.s, c.s, c.d, cudnn.b.DATA_HALF) catch |err| {
             try stdout.print("SDPA build failed ({t}) for hq={d} hkv={d} s={d} d={d}\n", .{ err, c.hq, c.hkv, c.s, c.d });
             return;
         };
@@ -1320,7 +1325,7 @@ fn cudaLibsAttnTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
         defer be.tensorDestroy(&dv);
         var do2 = try be.tensorCreate(t.s * hq * d * 2);
         defer be.tensorDestroy(&do2);
-        var plan = try cudnn.SdpaPlan.build(api, handle, 1, hq, hkv, t.s, t.s, d);
+        var plan = try cudnn.SdpaPlan.build(api, handle, 1, hq, hkv, t.s, t.s, d, cudnn.b.DATA_HALF);
         defer plan.deinit(api);
         var ws: cuda.backend.DeviceBuffer = .{};
         if (plan.workspace_bytes > 0) ws = try be.tensorCreate(plan.workspace_bytes);
@@ -4089,20 +4094,26 @@ fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     var prng = std.Random.DefaultPrng.init(0xB10C);
     const rnd = prng.random();
 
+    // `batched` runs the twenty iterations inside ONE beginBatch, which is how a
+    // stepper issues them; unbatched is one submit-and-fence per op. The gap
+    // between the two columns is what per-submission cost a decode actually pays.
     const T = struct {
         io: Io,
-        fn run(self: @This(), comptime f: anytype, args: anytype) !f64 {
+        ctx: *gpu.Context,
+        fn run(self: @This(), comptime batched: bool, comptime f: anytype, args: anytype) !f64 {
             for (0..20) |_| try @call(.auto, f, args);
             var best: f64 = std.math.inf(f64);
             for (0..5) |_| {
                 const t0 = std.Io.Clock.real.now(self.io);
+                if (batched) try self.ctx.beginBatch();
                 for (0..20) |_| try @call(.auto, f, args);
+                if (batched) try self.ctx.endBatch();
                 const ns = std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds;
                 best = @min(best, @as(f64, @floatFromInt(ns)) / 1e6 / 20.0);
             }
             return best;
         }
-    }{ .io = io };
+    }{ .io = io, .ctx = ctx };
 
     for (shapes) |sh| {
         var x_d = try ctx.tensorCreate(sh.cols * 4);
@@ -4115,8 +4126,8 @@ fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         for (xh) |*v| v.* = rnd.floatNorm(f32);
         try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(xh));
 
-        try stdout.print("\n=== {s} ===\n{s:<11} {s:>10} {s:>10} {s:>11} {s:>8}\n", .{
-            sh.who, "dtype", "ms", "GB/s", "Gelem/s", "MiB",
+        try stdout.print("\n=== {s} ===\n{s:<11} {s:>10} {s:>10} {s:>10} {s:>11} {s:>8}\n", .{
+            sh.who, "dtype", "1-per-submit", "batched", "GB/s", "Gelem/s", "MiB",
         });
         for (dts) |dt| {
             // Random block bytes with the scales pinned, not a real quantization:
@@ -4140,12 +4151,15 @@ fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
                 else => std.mem.writeInt(u16, q[off..][0..2], 0x2A66, .little),
             };
 
-            const ms = try T.run(gpu.Context.opGemvQuantDual, .{ ctx, dt, y_d, @as(usize, 0), x_d, @as([]const u8, q), @as(f32, 1.0), sh.rows, sh.cols });
-            try stdout.print("{s:<11} {d:7.3} ms {d:9.1} {d:11.1} {d:8.0}\n", .{
+            const args = .{ ctx, dt, y_d, @as(usize, 0), x_d, @as([]const u8, q), @as(f32, 1.0), sh.rows, sh.cols };
+            const ms = try T.run(false, gpu.Context.opGemvQuantDual, args);
+            const bms = try T.run(true, gpu.Context.opGemvQuantDual, args);
+            try stdout.print("{s:<11} {d:7.3} ms {d:7.3} ms {d:9.1} {d:11.1} {d:8.0}\n", .{
                 @tagName(dt),
                 ms,
-                @as(f64, @floatFromInt(q.len)) / (ms * 1e-3) / 1e9,
-                @as(f64, @floatFromInt(sh.rows * sh.cols)) / (ms * 1e-3) / 1e9,
+                bms,
+                @as(f64, @floatFromInt(q.len)) / (bms * 1e-3) / 1e9,
+                @as(f64, @floatFromInt(sh.rows * sh.cols)) / (bms * 1e-3) / 1e9,
                 @as(f64, @floatFromInt(q.len)) / (1 << 20),
             });
         }

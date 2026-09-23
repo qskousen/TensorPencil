@@ -1903,25 +1903,34 @@ pub fn embedPacked(
     @memcpy(audio_rows[0..in.cond_audio.len], in.cond_audio);
     packAudio(audio_rows[in.cond_audio.len..], in.audio, at);
 
-    const video_embed = try a.alloc(f32, n_video_rows * hidden);
-    const audio_embed = try a.alloc(f32, n_audio_rows * hidden);
-    try ops.matmul.matmul(io, gpa, video_embed, video_rows, n_video_rows, dit.video_patch, dit.video_patch_bias);
-    try ops.matmul.matmul(io, gpa, audio_embed, audio_rows, n_audio_rows, dit.audio_patch, dit.audio_patch_bias);
-
     // Segments are contiguous and in packed order, and each stream's embedded
     // rows are consumed in that same order.
+    //
+    // A spliced vision block splits the text region into `.text` and
+    // `.text_vision` runs, so a text segment takes its own SLICE of the encoder
+    // output: both kinds are text-encoder rows, and the text region is packed
+    // first, so a segment's row range indexes `in.text` directly.
+    //
+    // The patch projection runs PER SEGMENT, straight into the packed buffer,
+    // rather than embedding every row into a `[rows][hidden]` staging buffer and
+    // copying it in afterwards. It is the same arithmetic -- the projection is
+    // row-independent and a segment is a contiguous run of rows -- and it saves
+    // the staging, which is 884 MB at 15 seconds of 512x768, every step.
     var v_off: usize = 0;
     var a_off: usize = 0;
     for (layout.segments) |sg| {
         const n = sg.len();
         const dst = out_h[sg.start * hidden ..][0 .. n * hidden];
-        if (sg.kind == .text) {
-            @memcpy(dst, in.text);
+        if (sg.kind == .text or sg.kind == .text_vision) {
+            std.debug.assert(sg.stop <= layout.text_len);
+            @memcpy(dst, in.text[sg.start * hidden ..][0 .. n * hidden]);
         } else if (sg.kind.isVideoRow()) {
-            @memcpy(dst, video_embed[v_off * hidden ..][0 .. n * hidden]);
+            const src = video_rows[v_off * patch_dim ..][0 .. n * patch_dim];
+            try ops.matmul.matmul(io, gpa, dst, src, n, dit.video_patch, dit.video_patch_bias);
             v_off += n;
         } else {
-            @memcpy(dst, audio_embed[a_off * hidden ..][0 .. n * hidden]);
+            const src = audio_rows[a_off * audio_latent_channels ..][0 .. n * audio_latent_channels];
+            try ops.matmul.matmul(io, gpa, dst, src, n, dit.audio_patch, dit.audio_patch_bias);
             a_off += n;
         }
     }
@@ -1942,11 +1951,47 @@ pub fn embedPacked(
     );
 }
 
+/// The final layer's modulation table with `final.norm`'s weight FOLDED into the
+/// scale: `[labels][2][hidden]`, premul then shift.
+///
+/// `finalHead` computes `rmsNorm(x, norm) * (1 + scale) + shift`, which is
+/// `rms(x) * (norm * (1 + scale)) + shift` -- so a WEIGHTLESS norm-and-modulate
+/// kernel reproduces it exactly given this table, and the device path needs no
+/// head-specific kernel. The fold is free: the table is one row per timestep
+/// label, not one per token.
+///
+/// Slot order is premul then shift, which is what `Backend.rmsModRowsAt` reads;
+/// the raw adaLN projection emits shift then scale, so the two are NOT the same
+/// layout and swapping them is finite and wrong.
+pub fn buildFinalModTable(
+    dit: *const DiT,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out: []f32,
+    t_emb: []const f32,
+    labels: usize,
+) !void {
+    const hidden = dit.cfg.hidden;
+    std.debug.assert(out.len == labels * 2 * hidden);
+    const raw = try gpa.alloc(f32, labels * 2 * hidden);
+    defer gpa.free(raw);
+    try ops.matmul.matmul(io, gpa, raw, t_emb, labels, dit.final.adaln, dit.final.adaln_bias);
+    for (0..labels) |r| {
+        const shift = raw[r * 2 * hidden ..][0..hidden];
+        const scale = raw[r * 2 * hidden + hidden ..][0..hidden];
+        const premul_o = out[r * 2 * hidden ..][0..hidden];
+        const shift_o = out[r * 2 * hidden + hidden ..][0..hidden];
+        for (premul_o, dit.final.norm, scale) |*o, nw, sc| o.* = nw * (1.0 + sc);
+        @memcpy(shift_o, shift);
+    }
+}
+
 /// The output heads: norm + modulate each target segment, project, unpack, negate.
 ///
-/// `trunk` is the packed sequence after the last block, on the host. Shared by
-/// both paths: the heads are 96 and 32 rows, below `opI8Gemm`'s 128-row floor, so
-/// the device path downloads and finishes here.
+/// `trunk` is the packed sequence after the last block, on the host. The CPU and
+/// Vulkan paths finish here; the CUDA path runs the same arithmetic on the device
+/// (`minimax_h3_cuda.finalHeadDev`) off `buildFinalModTable`, because downloading
+/// the trunk to reach a 96-row projection costs more than the projection does.
 pub fn finalHeads(
     dit: *const DiT,
     io: std.Io,
@@ -2865,6 +2910,145 @@ fn relL2(want: []const f32, got: []const f32) f64 {
         l2_err += @as(f64, e - a) * (e - a);
     }
     return if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+}
+
+test "the folded final-layer table reproduces norm-then-modulate exactly" {
+    // The device path runs a WEIGHTLESS norm-and-modulate over this table instead
+    // of `finalHead`'s `rmsNorm(x, norm)` followed by `* (1 + scale) + shift`.
+    // Folding the norm weight into the scale is what makes those the same
+    // arithmetic; get the slot order or the `1 +` wrong and the render is finite
+    // and wrong, which is the whole reason this is pinned.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, forward_fixture);
+    defer st.deinit();
+    var dit = try DiT.load(gpa, .{ .safetensors = &st });
+    defer dit.deinit();
+
+    const hidden = dit.cfg.hidden;
+    const labels: usize = 3;
+    const rows: usize = 5;
+    const eps = dit.cfg.final_norm_eps;
+
+    const t_emb = try gpa.alloc(f32, labels * dit.cfg.time_embed_dim);
+    defer gpa.free(t_emb);
+    for (t_emb, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.13 - 0.4;
+
+    const x = try gpa.alloc(f32, rows * hidden);
+    defer gpa.free(x);
+    for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 23)) * 0.31 - 3.0;
+
+    // Reference: exactly what `finalHead` does, for one label.
+    const raw = try gpa.alloc(f32, labels * 2 * hidden);
+    defer gpa.free(raw);
+    try ops.matmul.matmul(io, gpa, raw, t_emb, labels, dit.final.adaln, dit.final.adaln_bias);
+    const want = try gpa.alloc(f32, rows * hidden);
+    defer gpa.free(want);
+    ops.norm.rmsNorm(want, x, dit.final.norm, eps);
+    const r: usize = 2;
+    for (0..rows) |i| {
+        const shift = raw[r * 2 * hidden ..][0..hidden];
+        const scale = raw[r * 2 * hidden + hidden ..][0..hidden];
+        const row = want[i * hidden ..][0..hidden];
+        for (row, scale, shift) |*v, sc, sh| v.* = v.* * (1.0 + sc) + sh;
+    }
+
+    // Folded: a weightless norm, then one multiply-add from the table.
+    const tbl = try gpa.alloc(f32, labels * 2 * hidden);
+    defer gpa.free(tbl);
+    try buildFinalModTable(&dit, io, gpa, tbl, t_emb, labels);
+    const got = try gpa.alloc(f32, rows * hidden);
+    defer gpa.free(got);
+    ops.norm.rmsNormUnit(got, x, hidden, eps);
+    for (0..rows) |i| {
+        const premul = tbl[r * 2 * hidden ..][0..hidden];
+        const shift = tbl[r * 2 * hidden + hidden ..][0..hidden];
+        const row = got[i * hidden ..][0..hidden];
+        for (row, premul, shift) |*v, pm, sh| v.* = v.* * pm + sh;
+    }
+
+    const err = relL2(want, got);
+    errdefer std.debug.print("folded vs reference: rel l2 {e}\n", .{err});
+    try std.testing.expect(err < 1e-6);
+    // ...and the table is not inert, or an all-ones fold would pass.
+    var moved: f32 = 0;
+    for (tbl[r * 2 * hidden ..][0..hidden]) |v| moved = @max(moved, @abs(v - 1.0));
+    try std.testing.expect(moved > 1e-3);
+}
+
+test "splicing a vision block into the text region moves no embedded row" {
+    // Tagging splits the text region into `.text` and `.text_vision` runs. It
+    // changes which modulation row each run reads, and NOTHING about the embedded
+    // sequence: same text rows in the same places, same video and audio rows after
+    // them. So the two packs must agree to the last bit.
+    //
+    // Before the fix each `.text` run copied the WHOLE encoder output from its own
+    // start (overrunning into the rows after it) and `.text_vision` fell through to
+    // the audio branch, taking audio rows and desynchronizing every audio segment
+    // behind it. Both are silent in a release build, where `@memcpy` does not check.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, forward_fixture);
+    defer st.deinit();
+    var dit = try DiT.load(gpa, .{ .safetensors = &st });
+    defer dit.deinit();
+
+    const shape: PackedLayout.Shape = .{
+        .text_len = 4,
+        .latent_t = 2,
+        .latent_h = 4,
+        .latent_w = 6,
+        .audio_t = 3,
+    };
+
+    const text = try (try st.require("in.refined")).toF32Alloc(gpa);
+    defer gpa.free(text);
+    const video = try (try st.require("in.video")).toF32Alloc(gpa);
+    defer gpa.free(video);
+    const audio = try (try st.require("in.audio")).toF32Alloc(gpa);
+    defer gpa.free(audio);
+
+    const in: Inputs = .{
+        .video = video,
+        .audio = audio,
+        .text = text,
+        .sigma = 0.7,
+        .shifts = .{ .video = 12.0, .audio = 3.0 },
+    };
+
+    // The interior span is the interesting one: it leaves a text run on each side,
+    // so the pack has three text-region segments and only the first starts at row 0.
+    var plain = try PackedLayout.build(gpa, shape, &.{}, &.{}, &.{});
+    defer plain.deinit();
+    var tagged = try PackedLayout.build(gpa, shape, &.{}, &.{}, &.{.{ .start = 1, .len = 2 }});
+    defer tagged.deinit();
+    try std.testing.expectEqual(plain.seq_len, tagged.seq_len);
+
+    var ws_p = try Workspace.init(gpa, dit.cfg, &plain);
+    defer ws_p.deinit(gpa);
+    var ws_t = try Workspace.init(gpa, dit.cfg, &tagged);
+    defer ws_t.deinit(gpa);
+
+    var ts_p = try embedPacked(&dit, io, gpa, ws_p.h, &plain, in);
+    defer ts_p.deinit(gpa);
+    var ts_t = try embedPacked(&dit, io, gpa, ws_t.h, &tagged, in);
+    defer ts_t.deinit(gpa);
+
+    const n = plain.seq_len * dit.cfg.hidden;
+    errdefer std.debug.print("packed rows differ: rel l2 {e}\n", .{relL2(ws_p.h[0..n], ws_t.h[0..n])});
+    try std.testing.expectEqualSlices(f32, ws_p.h[0..n], ws_t.h[0..n]);
+
+    // ...and the split really happened, or this passes on two identical layouts:
+    // three text-region runs against one, the middle one tagged video.
+    try std.testing.expectEqual(Kind.text, plain.segments[0].kind);
+    try std.testing.expectEqualSlices(Kind, &.{ .text, .text_vision, .text }, &.{
+        tagged.segments[0].kind, tagged.segments[1].kind, tagged.segments[2].kind,
+    });
+    try std.testing.expectEqual(@as(usize, 1), tagged.segments[1].start);
+    try std.testing.expectEqual(@as(usize, 3), tagged.segments[1].stop);
+    try std.testing.expectEqual(Tag.video, tagged.segments[1].kind.tag());
 }
 
 test "a uniform denoise mask gives the same forward either way it is expressed" {

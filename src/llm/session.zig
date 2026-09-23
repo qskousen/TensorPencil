@@ -58,6 +58,8 @@ pub const Stats = struct {
 /// split (the speculative path). Splitting matters: `elapsed / n` charges the
 /// prompt forward and every first-touch device cost to token generation, which
 /// on a short run reads far below the real decode rate.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 pub fn rateSuffix(t: engine.Timing, buf: []u8) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     if (t.ppRate()) |pp| w.print(", pp {d} @ {d:.1} tok/s", .{ t.prefill_tokens, pp }) catch return "";
@@ -77,6 +79,20 @@ pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f
         try stdout.print("\n\n[{d} tokens in {d:.1}s{s}; ctx {d}/{d}{s}; setup {d:.1}s]\n", .{
             n, elapsed_s, rateSuffix(timing, &rbuf), stats.tokens, stats.window, stats.vramSuffix(&vbuf), setup_s,
         });
+        // DIAGNOSTIC (`TP_VK_STATS`): where a Vulkan run's time went. Submit is
+        // GPU execution plus the fence wait; the rest of the wall clock is the
+        // driver recording dispatches on the CPU.
+        if (getenv("TP_VK_STATS") != null) {
+            const ctx = @import("tp_gpu").context.Context;
+            const subs_ms = @as(f64, @floatFromInt(ctx.stat_submit_ns)) / 1e6;
+            try stdout.print("[vk: {d} dispatches, {d} submits, {d:.0} ms in submit+fence ({d:.0}% of wall), {d:.1} us/dispatch]\n", .{
+                ctx.stat_ops,
+                ctx.stat_submits,
+                subs_ms,
+                100.0 * subs_ms / (elapsed_s * 1000.0),
+                1000.0 * subs_ms / @as(f64, @floatFromInt(@max(ctx.stat_ops, 1))),
+            });
+        }
     } else {
         try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
     }

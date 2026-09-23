@@ -10,10 +10,20 @@
 //!
 //!   1. IBM Plex Sans / Plex Mono — the design's face. Latin, Greek, Cyrillic,
 //!      Vietnamese. 895 codepoints, all BMP.
-//!   2. Noto Sans CJK / Noto Sans Mono CJK — everything else with a glyph:
-//!      CJK, arrows, math, box drawing, the long tail.
+//!   2. Noto Sans CJK Regular — everything else with a glyph: CJK, arrows,
+//!      math, box drawing, the long tail. Also the mono fallback: ideographs
+//!      are full-width in every Noto CJK cut and Plex Mono holds the Latin, so
+//!      a Mono CJK face would add 16 MB and change no pixel. And the bold
+//!      fallback: a bold face is another 10 MB for a weight change, so bold
+//!      CJK runs render regular. FreeType can synthesize a bold from the
+//!      regular outlines, but that is a dvui change, not a font.
 //!   3. Noto Emoji — monochrome outlines, since dvui's rasterizer is monochrome
 //!      and cannot use a color emoji font.
+//!
+//! The Noto files are cut by tools/gen_fonts.py to what dvui can reach: it
+//! draws per codepoint through FT_Load_Char and reads no GSUB, so shaper-only
+//! glyphs, the layout tables and a variable font's deltas are dead weight.
+//! Run the generator on a new upstream file rather than dropping it in here.
 //!
 //! Tier 1 membership is decided by parsing each Plex face's own `cmap` at
 //! startup (`Coverage`), never by a hand-written codepoint range table: the
@@ -40,9 +50,8 @@ pub const sans = "PlexSans";
 pub const sans_med = "PlexSansMed";
 pub const mono = "PlexMono";
 pub const mono_med = "PlexMonoMed";
-/// Tier 2, the coverage backstop.
+/// Tier 2, the coverage backstop for sans and mono alike.
 pub const cjk = "NotoSansCJK";
-pub const cjk_mono = "NotoSansMonoCJK";
 pub const emoji_family = "NotoEmoji";
 
 const plex_sans_regular = @embedFile("fonts/IBMPlexSans-Regular.ttf");
@@ -52,10 +61,8 @@ const plex_sans_italic = @embedFile("fonts/IBMPlexSans-Italic.ttf");
 const plex_sans_semibold_italic = @embedFile("fonts/IBMPlexSans-SemiBoldItalic.ttf");
 const plex_mono_regular = @embedFile("fonts/IBMPlexMono-Regular.ttf");
 const plex_mono_medium = @embedFile("fonts/IBMPlexMono-Medium.ttf");
-const cjk_regular = @embedFile("fonts/NotoSansCJK-Regular.ttc");
-const cjk_bold = @embedFile("fonts/NotoSansCJK-Bold.ttc");
-const cjk_mono_regular = @embedFile("fonts/NotoSansMonoCJKjp-Regular.otf");
-const emoji_bytes = @embedFile("fonts/NotoEmoji.ttf");
+const cjk_regular = @embedFile("fonts/NotoSansCJKjp-Regular.otf");
+const emoji_bytes = @embedFile("fonts/NotoEmoji-Regular.ttf");
 
 /// Registered via `Theme.embedded_fonts` (plain `dvui.addFont` can only
 /// register normal weight/style). dvui dedups sources by bytes pointer, so one
@@ -69,8 +76,6 @@ const sources = [_]dvui.Font.Source{
     .{ .family = dvui.Font.array(mono), .bytes = plex_mono_regular },
     .{ .family = dvui.Font.array(mono_med), .bytes = plex_mono_medium },
     .{ .family = dvui.Font.array(cjk), .bytes = cjk_regular },
-    .{ .family = dvui.Font.array(cjk), .weight = .bold, .bytes = cjk_bold },
-    .{ .family = dvui.Font.array(cjk_mono), .bytes = cjk_mono_regular },
     .{ .family = dvui.Font.array(emoji_family), .bytes = emoji_bytes },
 };
 
@@ -110,8 +115,8 @@ fn rdU32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .big);
 }
 
-/// Byte offset of an sfnt table, or null. Plain TTF/OTF only (the Plex faces);
-/// the Noto collections are tier 2 and never need a coverage lookup.
+/// Byte offset of an sfnt table, or null. Plain TTF/OTF only, which every
+/// bundled face is; a ttcf collection would need the face directory first.
 fn tableOffset(ttf: []const u8, tag: *const [4]u8) ?usize {
     const n = rdU16(ttf, 4);
     for (0..n) |i| {
@@ -170,22 +175,18 @@ fn parseCoverage(ttf: []const u8, out: *Coverage) void {
 
 // ------------------------------------------------------------ tier routing
 
-/// How one role's runs escalate when tier 1 lacks a codepoint. `fallback_weight`
-/// exists because Plex Medium has no Noto twin: a 500-weight run drops to Noto
-/// Regular rather than jumping to Bold.
+/// How one role's runs escalate when tier 1 lacks a codepoint.
 const Chain = struct {
     cover: *const Coverage,
     fallback: []const u8,
-    fallback_weight: dvui.Font.Weight = .normal,
 };
 
 const sans_chain: Chain = .{ .cover = &cov_sans, .fallback = cjk };
-const sans_bold_chain: Chain = .{ .cover = &cov_sans, .fallback = cjk, .fallback_weight = .bold };
-const mono_chain: Chain = .{ .cover = &cov_mono, .fallback = cjk_mono };
+const mono_chain: Chain = .{ .cover = &cov_mono, .fallback = cjk };
 
-fn chainFor(fam: []const u8, weight: dvui.Font.Weight) Chain {
+fn chainFor(fam: []const u8) Chain {
     if (std.mem.eql(u8, fam, mono) or std.mem.eql(u8, fam, mono_med)) return mono_chain;
-    return if (weight == .bold) sans_bold_chain else sans_chain;
+    return sans_chain;
 }
 
 /// Register the bundled fonts, build the tier-1 coverage index, and point the
@@ -248,7 +249,7 @@ fn fontFor(cp: u21, style: Style, base: dvui.Font) dvui.Font {
         // only ever renders digits, identifiers and units, and a proportional
         // CJK run beats a tofu row. No bold mono face is bundled.
         const fam: []const u8 = if (std.mem.eql(u8, base.familyName(), mono_med)) mono_med else mono;
-        const c = chainFor(fam, .normal);
+        const c = chainFor(fam);
         if (c.cover.has(cp)) return f.withFamily(fam).withWeight(.normal);
         return f.withFamily(c.fallback).withWeight(.normal);
     }
@@ -265,15 +266,17 @@ fn fontFor(cp: u21, style: Style, base: dvui.Font) dvui.Font {
     else
         sans;
 
-    const c = chainFor(primary, if (bold) .bold else .normal);
+    const c = chainFor(primary);
     if (c.cover.has(cp)) {
         var r = f.withFamily(primary);
         if (!std.mem.eql(u8, primary, sans_med)) r = r.withWeight(if (bold) .bold else .normal);
         return if (style.italic) r.withStyle(.italic) else r;
     }
     // Tier 2. Italic is dropped rather than faked: Noto CJK ships no italic,
-    // and CJK is conventionally emphasized without one.
-    return f.withFamily(c.fallback).withWeight(c.fallback_weight);
+    // and CJK is conventionally emphasized without one. Weight too: regular is
+    // the one Noto weight bundled, and asking dvui for a bold it has no source
+    // for logs an error per size rather than falling back quietly.
+    return f.withFamily(c.fallback).withWeight(.normal);
 }
 
 /// Add `text` to a text layout, split into same-face runs. `opts` applies to
@@ -451,10 +454,43 @@ test "medium weight keeps its own family but borrows real bold and italic faces"
     try std.testing.expectEqual(dvui.Font.Style.italic, i.style);
 }
 
+test "a bold CJK run asks for the one Noto weight bundled" {
+    testCoverage();
+    const base = dvui.Font{ .family = dvui.Font.array(sans), .size = 12 };
+    const heading = base.withWeight(.bold);
+    for ([_]dvui.Font{ fontFor('日', .{ .bold = true }, base), fontFor('日', .{}, heading) }) |f| {
+        try std.testing.expectEqualStrings(cjk, f.familyName());
+        try std.testing.expectEqual(dvui.Font.Weight.normal, f.weight);
+    }
+    // ...while a bold Latin run keeps its real SemiBold.
+    try std.testing.expectEqual(dvui.Font.Weight.bold, fontFor('A', .{ .bold = true }, base).weight);
+}
+
 test "mono content leaves mono rather than showing tofu" {
     testCoverage();
     const m = dvui.Font{ .family = dvui.Font.array(mono), .size = 10 };
     try std.testing.expectEqualStrings(mono, fontFor('4', .{ .code = true }, m).familyName());
     // A CJK chat title in a mono slot renders proportional, not as boxes.
-    try std.testing.expectEqualStrings(cjk_mono, fontFor('日', .{ .code = true }, m).familyName());
+    try std.testing.expectEqualStrings(cjk, fontFor('日', .{ .code = true }, m).familyName());
+}
+
+test "bundled Noto faces are the generator's output" {
+    // A raw upstream file (a ttcf collection, a variable font, a GSUB) renders
+    // the same and is three times the size; tools/gen_fonts.py is the fix.
+    for ([_][]const u8{ cjk_regular, emoji_bytes }) |face| {
+        try std.testing.expect(!std.mem.eql(u8, face[0..4], "ttcf"));
+        try std.testing.expect(tableOffset(face, "cmap") != null);
+        try std.testing.expect(tableOffset(face, "GSUB") == null);
+        try std.testing.expect(tableOffset(face, "fvar") == null);
+    }
+    // ...and the cut kept every codepoint the routing tests send there.
+    var cov: Coverage = .{};
+    parseCoverage(cjk_regular, &cov);
+    for ([_]u21{ '日', '한', '⌘', '─', '▪', '◦' }) |cp| {
+        errdefer std.debug.print("cjk face lacks U+{X}\n", .{cp});
+        try std.testing.expect(cov.has(cp));
+    }
+    cov = .{};
+    parseCoverage(emoji_bytes, &cov);
+    try std.testing.expect(cov.has('⏸'));
 }

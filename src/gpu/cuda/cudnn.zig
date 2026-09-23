@@ -69,6 +69,7 @@ pub const b = struct {
     // cudnnDataType_t
     pub const DATA_FLOAT: c_int = 0;
     pub const DATA_HALF: c_int = 2;
+    pub const DATA_BFLOAT16: c_int = 9;
     pub const DATA_INT32: c_int = 4;
 
     // cudnnTensorFormat_t / cudnnConvolutionMode_t / cudnnMathType_t /
@@ -285,7 +286,10 @@ pub const SdpaPlan = struct {
 
     /// `s_q` and `s_kv` differ for cross-attention (a UNet's image tokens onto a
     /// 77-row text conditioning); pass them equal for self-attention.
-    pub fn build(api: *const Api, handle: Handle, bsz: usize, hq: usize, hkv: usize, s_q: usize, s_kv: usize, d: usize) Error!SdpaPlan {
+    /// `io_dt` is the storage type of Q/K/V/O (`DATA_HALF` or `DATA_BFLOAT16`).
+    /// The accumulation type is FLOAT either way, so bf16 costs mantissa bits in
+    /// the operands and nothing in the softmax or the P@V sum.
+    pub fn build(api: *const Api, handle: Handle, bsz: usize, hq: usize, hkv: usize, s_q: usize, s_kv: usize, d: usize, io_dt: c_int) Error!SdpaPlan {
         var self: SdpaPlan = .{};
         errdefer self.deinit(api);
 
@@ -306,10 +310,10 @@ pub const SdpaPlan = struct {
         const sc_dims = [4]i64{ 1, 1, 1, 1 };
         const sc_str = [4]i64{ 1, 1, 1, 1 };
 
-        const qt = try self.tensor(api, uid_q, b.DATA_HALF, &q_dims, &q_str, false);
-        const kt = try self.tensor(api, uid_k, b.DATA_HALF, &kv_dims, &kv_str, false);
-        const vt = try self.tensor(api, uid_v, b.DATA_HALF, &kv_dims, &kv_str, false);
-        const ot = try self.tensor(api, uid_o, b.DATA_HALF, &o_dims, &o_str, false);
+        const qt = try self.tensor(api, uid_q, io_dt, &q_dims, &q_str, false);
+        const kt = try self.tensor(api, uid_k, io_dt, &kv_dims, &kv_str, false);
+        const vt = try self.tensor(api, uid_v, io_dt, &kv_dims, &kv_str, false);
+        const ot = try self.tensor(api, uid_o, io_dt, &o_dims, &o_str, false);
         const sct = try self.tensor(api, uid_scale, b.DATA_FLOAT, &sc_dims, &sc_str, true);
 
         var op: BackendDescriptor = null;

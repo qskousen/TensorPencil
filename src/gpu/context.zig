@@ -4991,7 +4991,20 @@ pub const Context = struct {
         }));
     }
 
+    /// DIAGNOSTIC (`TP_VK_STATS`): dispatches recorded, submissions made, and
+    /// nanoseconds spent inside submit+fence-wait. Total wall time minus the
+    /// submit time is CPU RECORDING, which is what says whether this backend is
+    /// bound by the GPU, by the driver, or by the fence.
+    pub var stat_ops: u64 = 0;
+    pub var stat_submits: u64 = 0;
+    pub var stat_submit_ns: u64 = 0;
+
     fn submitAndWaitBuf(self: *Context, cb: vk.CommandBuffer) Error!void {
+        const t0 = std.Io.Clock.real.now(self.io);
+        defer {
+            stat_submit_ns +%= @intCast(std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds);
+            stat_submits += 1;
+        }
         try check(self.d.EndCommandBuffer(cb));
         var cb_mut = cb;
         const submit: vk.SubmitInfo = .{
@@ -5086,11 +5099,22 @@ pub const Context = struct {
     /// this dispatch's writes before every later dispatch's reads/writes
     /// (unless the op is inside an `independent` group).
     fn opEnd(self: *Context) Error!void {
+        stat_ops += 1;
         const in_group = self.indep_remaining > 1;
         if (self.indep_remaining > 0) self.indep_remaining -= 1;
         if (self.batching) {
-            if (!in_group) {
-                const bar: vk.MemoryBarrier = .{
+            // DIAGNOSTIC (`TP_VK_NOBAR`): drop the barrier entirely. WRONG
+            // ANSWERS, valid timing, and the isolation that measured what these
+            // cost: an LLM decode runs 2.6x faster without them (9B q6_k 8.4 ->
+            // 21.6 tok/s, 27B mixed 3.9 -> 6.7), so a full global drain between
+            // every pair of the ~633 dispatches a token issues is where this
+            // backend's time goes -- not submission, which batching shows is
+            // worth 10%. See BACKEND.md §5.
+            if (!in_group and getenv("TP_VK_NOBAR") == null) {
+                const bar: vk.MemoryBarrier = if (getenv("TP_VK_BAR0") != null) .{
+                    .src_access_mask = 0,
+                    .dst_access_mask = 0,
+                } else .{
                     .src_access_mask = vk.Access.shader_write,
                     .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
                 };

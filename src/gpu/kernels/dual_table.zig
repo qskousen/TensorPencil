@@ -87,6 +87,7 @@ pub const entries = [_]Entry{
     .{ .name = "f32_to_bf16_pad", .wg = elem_wg },
     .{ .name = "h16_to_h16_pad", .wg = elem_wg },
     .{ .name = "bf16_to_h16_pad", .wg = elem_wg },
+    .{ .name = "bf16_to_f32", .wg = elem_wg },
     .{ .name = "f16_to_f32", .wg = elem_wg },
     .{ .name = "add_h16", .wg = elem_wg },
     .{ .name = "silu_mul_h16", .wg = elem_wg },

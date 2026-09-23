@@ -740,6 +740,11 @@ pub const Backend = struct {
     /// forward by a model carrying an f16 activation stream (`sd_unet_cuda`), rather
     /// than added to those signatures, which every family and both arms share.
     attn_io_f16: bool = false,
+    /// Run cuDNN's SDPA with bf16 Q/K/V/O instead of f16. Same 16 bits and the
+    /// same f32 accumulation, but f32's exponent range, so an UNNORMED operand
+    /// cannot overflow the format the way f16's 65504 ceiling lets it. Costs 3
+    /// mantissa bits. Set per model, like `attn_io_f16`.
+    attn_bf16: bool = false,
     // per-category profiler (sync-per-op device timing; the plan's methodology).
     profile: bool = false,
     zero_bias_host: []f32 = &.{},
@@ -5293,6 +5298,18 @@ pub const Backend = struct {
         try self.dualElems("f32_to_h16", src, null, null, dst, .{ @intCast(guard / 2), @intCast(real), 0, 0, 0, 0, 0 }, .{ 1.0, 0 }, guard / 2);
     }
 
+    /// f32 -> bf16 over `n` elements. bf16 carries f32's exponent range, so this
+    /// cannot overflow the way the f16 cast can; it drops mantissa bits instead.
+    pub fn cvtF32ToBf16(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize) Error!void {
+        std.debug.assert(n % 2 == 0);
+        try self.pad2d("f32_to_bf16_pad", src, dst, n, n, 1, n, 1.0);
+    }
+
+    /// bf16 -> f32 over `n` elements, widening back to an f32 activation stream.
+    pub fn cvtBf16ToF32(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize) Error!void {
+        try self.dualElems("bf16_to_f32", src, dst, null, null, .{ @intCast(n), @intCast(n), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+    }
+
     /// Tight [rows][cols] -> [*][cols_pad] 16-bit rows over `total` elements, zero in
     /// the pads, scaled by `scale`. `entry` picks the source and destination widths
     /// (f32_to_h16_pad, f32_to_bf16_pad, h16_to_h16_pad, bf16_to_h16_pad); `cols_pad`
@@ -5922,19 +5939,47 @@ pub const Backend = struct {
     }
 
     /// One cuDNN SDPA plan is valid for exactly one of these shapes.
-    pub const SdpaKey = struct { seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize };
+    pub const SdpaKey = struct { seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, bf16: bool };
 
     /// Build (or fetch cached) a cuDNN fused-SDPA plan for this GQA shape.
     fn sdpaPlan(self: *Backend, n_heads: usize, kv_heads: usize, seq_q: usize, seq_kv: usize, hd: usize) Error!cudnn.SdpaPlan {
-        const key: SdpaKey = .{ .seq_q = seq_q, .seq_kv = seq_kv, .n_heads = n_heads, .kv_heads = kv_heads, .hd = hd };
+        const key: SdpaKey = .{ .seq_q = seq_q, .seq_kv = seq_kv, .n_heads = n_heads, .kv_heads = kv_heads, .hd = hd, .bf16 = self.attn_bf16 };
         if (self.sdpa_plans.get(key)) |p| return p;
         const L = &self.libs.?;
         const sdpa_t0 = ctxmod.monoNs();
-        const p = cudnn.SdpaPlan.build(&L.dnn, try self.dnnHandle(), 1, n_heads, kv_heads, seq_q, seq_kv, hd) catch return error.CudaError;
+        const io_dt: c_int = if (self.attn_bf16) cudnn.b.DATA_BFLOAT16 else cudnn.b.DATA_HALF;
+        const p = cudnn.SdpaPlan.build(&L.dnn, try self.dnnHandle(), 1, n_heads, kv_heads, seq_q, seq_kv, hd, io_dt) catch return error.CudaError;
         self.sdpa_ns += ctxmod.monoNs() -% sdpa_t0;
         self.sdpa_count += 1;
         self.sdpa_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
         return p;
+    }
+
+    /// Build the cuDNN SDPA plan for a shape the caller already knows and reserve
+    /// what `opAttnCudnn` would otherwise allocate on first use.
+    ///
+    /// Those allocations are lazy, so on a long sequence over a gigabyte appears
+    /// AFTER a residency pass has measured free VRAM and pinned weights against
+    /// it, and the pin is the one thing eviction cannot undo. Reserving here puts
+    /// the bytes on the card while everything is still evictable. The plan is
+    /// cached and `ensureDeviceBuffer` is idempotent, so the forward reuses
+    /// exactly these rather than allocating again.
+    ///
+    /// A no-op off the library backend, which does not use cuDNN attention.
+    pub fn reserveAttnCudnn(self: *Backend, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize) Error!void {
+        if (self.kernels != .libs) return;
+        // Same sense as `opAttnCudnn`: an f16 activation stream hands the op its
+        // own tensors, so the staging exists only for an f32 one.
+        if (!self.attn_io_f16) {
+            const qn = seq_q * n_heads * hd;
+            const kn = seq_kv * kv_heads * hd;
+            try self.ensureDeviceBuffer(&self.cudnn_q16, qn * 2);
+            try self.ensureDeviceBuffer(&self.cudnn_k16, kn * 2);
+            try self.ensureDeviceBuffer(&self.cudnn_v16, kn * 2);
+            try self.ensureDeviceBuffer(&self.cudnn_o16, qn * 2);
+        }
+        const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd);
+        if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
     }
 
     /// cuDNN fused flash attention (.libs mode): O = softmax(scale*Q*Kᵀ)*V in one
@@ -5963,9 +6008,15 @@ pub const Backend = struct {
             k16 = self.cudnn_k16;
             v16 = self.cudnn_v16;
             o16 = self.cudnn_o16;
-            try self.cvtF32ToH16(q, q16, qn, qn);
-            try self.cvtF32ToH16(k, k16, kn, kn);
-            try self.cvtF32ToH16(v, v16, kn, kn);
+            if (self.attn_bf16) {
+                try self.cvtF32ToBf16(q, q16, qn);
+                try self.cvtF32ToBf16(k, k16, kn);
+                try self.cvtF32ToBf16(v, v16, kn);
+            } else {
+                try self.cvtF32ToH16(q, q16, qn, qn);
+                try self.cvtF32ToH16(k, k16, kn, kn);
+                try self.cvtF32ToH16(v, v16, kn, kn);
+            }
         }
         const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd);
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
@@ -5973,7 +6024,10 @@ pub const Backend = struct {
         const L = &self.libs.?;
         plan.execute(&L.dnn, try self.dnnHandle(), q16.ptr(), k16.ptr(), v16.ptr(), o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
         if (io_f16) return;
-        try self.dualElems("f16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn);
+        if (self.attn_bf16)
+            try self.dualElems("bf16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn)
+        else
+            try self.dualElems("f16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn);
     }
 
     /// Head-batched attention: process `G` heads per launch (grid.z=G) so the PV

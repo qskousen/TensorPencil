@@ -246,15 +246,18 @@ const L = struct {
         return v.toF32Alloc(s.alloc);
     }
 
-    /// A 2-D weight, materialized to f32. The tower is bf16 in the checkpoint and
-    /// small enough (a few hundred MB) that keeping it packed buys nothing here.
+    /// A 2-D weight, kept in the checkpoint's own dtype as a view into the
+    /// mapping. Both matmuls take bf16 directly, so materializing to f32 only
+    /// doubled it into anonymous memory: 2.22 GB for the 32B tower, which is
+    /// per-reference and canvas-independent, and was most of what a render with a
+    /// reference cost the host over one with none.
     fn mat(s: L, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         const v = try s.view(fmt, args);
         if (v.info.elemCount() != rows * cols) {
             std.log.err("minimax_h3_vit: a weight has {d} elements, expected {d}x{d}", .{ v.info.elemCount(), rows, cols });
             return error.ShapeMismatch;
         }
-        return Weight.fromF32(try v.toF32Alloc(s.alloc), rows, cols);
+        return Weight.init(v.bytes, v.info.dtype, rows, cols);
     }
 
     fn merger(s: L, comptime fmt: []const u8, args: anytype, cfg: Config, post_merge: bool) !Merger {

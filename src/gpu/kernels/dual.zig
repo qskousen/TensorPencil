@@ -41,6 +41,13 @@ extern var a: FBuf addrspace(.storage_buffer);
 extern var b: FBuf addrspace(.storage_buffer);
 extern var c: FBuf addrspace(.storage_buffer);
 extern var d: FBuf addrspace(.storage_buffer);
+/// A `vec4` ALIAS of binding 1, the activation slot: logical addressing has no
+/// pointer to re-cast, so a whole-quad load has to come from a second variable
+/// on the same binding with a wider element type (the trick `dp4a.zig` used for
+/// its u16 weight view). Without it `ld4` is four scalar loads, and these GEMVs
+/// are bound by load instructions.
+const VBuf = extern struct { data: [1 << 26]@Vector(4, f32) };
+extern var bv: VBuf addrspace(.storage_buffer);
 extern var pc: Push addrspace(.push_constant);
 // Subgroup builtins std.gpu does not declare; the BuiltIn decorations are in
 // `decorate`.
@@ -70,6 +77,10 @@ inline fn decorate() void {
         \\OpDecorate %bc Binding 2
         \\OpDecorate %bd DescriptorSet 0
         \\OpDecorate %bd Binding 3
+        \\OpDecorate %vt Block
+        \\OpMemberDecorate %vt 0 Offset 0
+        \\OpDecorate %bv DescriptorSet 0
+        \\OpDecorate %bv Binding 1
         \\OpDecorate %ss BuiltIn SubgroupSize
         \\OpDecorate %sl BuiltIn SubgroupLocalInvocationId
         \\OpDecorate %si BuiltIn SubgroupId
@@ -80,6 +91,8 @@ inline fn decorate() void {
           [bb] "" (&b),
           [bc] "" (&c),
           [bd] "" (&d),
+          [vt] "t" (VBuf),
+          [bv] "" (&bv),
           [ss] "" (&sg_size),
           [sl] "" (&sg_lane),
           [si] "" (&sg_id),
@@ -209,9 +222,10 @@ pub const Env = if (is_ptx) struct {
             .d => d.data[i] = v,
         }
     }
-    /// `ld4` on SPIR-V: logical addressing has no pointer to re-cast, so this is
-    /// four loads the driver is free to merge.
+    /// `ld4` on SPIR-V. Slot b reads through the `vec4` alias, one load for the
+    /// quad; the rest have no alias and fall back to four scalars.
     pub inline fn ld4(e: Env, comptime s: Slot, i: u32) [4]f32 {
+        if (s == .b) return bv.data[i >> 2];
         return .{ e.ld(s, i), e.ld(s, i + 1), e.ld(s, i + 2), e.ld(s, i + 3) };
     }
     pub inline fn ldW(e: Env, comptime s: Slot, i: u32) u32 {
@@ -572,6 +586,7 @@ const bodies = .{
     .{ "f32_to_bf16_pad", elt.f32ToBf16Pad },
     .{ "h16_to_h16_pad", elt.h16ToH16Pad },
     .{ "bf16_to_h16_pad", elt.bf16ToH16Pad },
+    .{ "bf16_to_f32", elt.bf16ToF32 },
     .{ "f16_to_f32", elt.f16ToF32 },
     .{ "add_h16", elt.addH16 },
     .{ "silu_mul_h16", elt.siluMulH16 },

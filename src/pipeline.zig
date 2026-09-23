@@ -79,6 +79,7 @@ const minimax_h3_audio = @import("tp_models").models.minimax_h3_audio;
 const minimax_h3_audio_cuda = @import("tp_models").models.minimax_h3_audio_cuda;
 const minimax_h3_present = @import("tp_models").models.minimax_h3_present;
 const minimax_h3_vit = @import("tp_models").models.minimax_h3_vit;
+const minimax_h3_vit_cuda = @import("tp_models").models.minimax_h3_vit_cuda;
 const minimax_h3_vae_encode = @import("tp_models").models.minimax_h3_vae_encode;
 const minimax_h3_vae_encode_cuda = @import("tp_models").models.minimax_h3_vae_encode_cuda;
 const minimax_h3_audio_encode = @import("tp_models").models.minimax_h3_audio_encode;
@@ -1877,7 +1878,6 @@ pub const Denoiser = struct {
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
-
     /// Anima's forward, on whichever of `anima_cuda` / `anima_gpu` / the host DiT the
     /// backend and checkpoint support. When neither device arm was built, the warning
     /// naming why was already logged in `denoiser`, a GPU render that silently drops
@@ -3075,7 +3075,6 @@ fn interleavedToPlanar(gpa: std.mem.Allocator, inter: []const f32, c: usize, n: 
     return out;
 }
 
-
 /// The sigma-schedule shift a family was trained with, for a caller that did not ask
 /// for one. The SD arm's value is unused, its ladder comes from the betas, and is
 /// returned only so this is total.
@@ -3133,7 +3132,6 @@ pub const Session = struct {
     /// public stages itself (ggufy's ladder, the GUI's per-image config) gets the same
     /// behaviour without threading it through four stage signatures.
     compat: CompatConfig = .{},
-
 
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -3726,7 +3724,6 @@ pub const Session = struct {
 
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .minimax_h3 = m };
-
             },
             .sd15, .sdxl => {
                 const cfgs = sdConfigs(fam);
@@ -5569,9 +5566,151 @@ pub const Session = struct {
     /// Euler over the packed two-stream latent. There is no CFG branch: every H3
     /// conditioning node emits ONE conditioning and takes no negative, so there
     /// is nothing to guide against.
+    /// Pin as much of the denoiser as physically fits, and drop the unpinned text
+    /// encoder when it and the denoiser's working set cannot both stay resident.
+    ///
+    /// Every sampling entry point calls this after its text encode and before its
+    /// first forward. Without it `pin_budget` stays 0, nothing pins, and the whole
+    /// denoiser re-streams from the checkpoint mapping on EVERY step: a four-step
+    /// clip whose weights are 21 GB read 61 GB off disk, and the page cache that
+    /// churn builds is what takes the box down rather than anything in VRAM.
+    ///
+    /// Reads the effective budget off the backend rather than taking it as a
+    /// parameter: a caller sets `budget_override` / `min_weights` there first, and
+    /// those are the values that govern.
+    fn armDenoiserResidency(self: *Session) void {
+        // First-touch pinning, sized to the budget minus a reserve for the encoder
+        // and the sampling activations, so it self-limits: a generous budget pins
+        // the whole denoiser, a tight one pins part and the rest streams. The
+        // caller left the encoder unpinned (pin_budget 0) and the VAE, reached
+        // after this has filled pin_budget, stays unpinned too.
+        if (self.cu_be) |b| {
+            // Pin as much DiT as fits. Two caps: the shared BUDGET (b.budget_override,
+            // 0 = no cap; = card limit − LLM resident in the GUI), and, critically
+            // what is PHYSICALLY reachable right now. The budget is blind to other
+            // processes on the card (desktop, a running ComfyUI, ...); if we pin to it
+            // we OOM the moment physical VRAM runs out, and pinned weights can't be
+            // evicted to recover. Physical room = live free VRAM + our own unpinned
+            // weights (the text encoder), which evict + re-stream as the DiT pins.
+            // Reserve the live activation scratch + a small margin on top.
+            // Unknown free VRAM leaves only our own evictable weights as provable
+            // room, which is a near-total loss of pinning: say so, a silent one
+            // reads as a mysterious slowdown on every image.
+            const free_now = if (b.ctx.memGetInfo()) |mi| mi.free else blk: {
+                std.log.warn("[vram] free VRAM unknown: pinning only what our own evictable weights cover", .{});
+                break :blk 0;
+            };
+            const evictable = b.evictableWeightBytes();
+            const room = free_now + evictable;
+            // `min` asks for no resident weights at all, and a pin is exactly the
+            // thing eviction cannot undo, so it pins nothing however much room the
+            // card has. Without this the DiT pins on a big card and `min` reports
+            // the whole model resident.
+            const budget = if (b.min_weights)
+                0
+            else if (b.budget_override > 0) @min(b.budget_override, room) else room;
+            const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
+            // `pin_budget` is a TOTAL cap (`pinNew` tests
+            // `pinned_bytes + size > pin_budget`), but `room` is what is ADDITIONALLY
+            // reachable, live free VRAM plus our own evictable weights, and so
+            // excludes whatever is already pinned. Adding the resident total back is
+            // what keeps the two in the same units.
+            //
+            // Without this, every image after the first stops pinning entirely: a
+            // queued image finds ~11.7 GB of DiT already pinned against a `room`-only
+            // budget of ~1 GB, so `pinned_bytes > pin_budget` on the very first test
+            // and the rest of the DiT streams on every step for the whole image.
+            // Image 1 is unaffected (nothing pinned yet, so total == increment).
+            //
+            // Safe to be generous here: `pin_floor` is the physical backstop and is
+            // still checked per pin, so a budget larger than live VRAM cannot
+            // over-commit, it only stops the cap from being the binding constraint
+            // when it should not be.
+            b.pin_budget = b.pinnedWeightBytes() + (budget -| pin_reserve);
+            // Same reserve as a LIVE floor for first-touch pinning: pinNew keeps
+            // this much VRAM free, so pinning never eats the room the (lazily
+            // allocated, per-block) attention scratch + activation workspace need.
+            // pin_budget above is blind to the working set not yet allocated at
+            // pin time; the floor is the physical backstop that makes streaming
+            // actually fit, the whole point of a tight budget.
+            b.pin_floor = pin_reserve;
+            // `req` is what the caller ASKED for; `eff` is what physical room
+            // allows and what actually governs. Printing only `req` next to a much
+            // smaller `pin` reads as a bug ("16 GB budget, pinning 689 MB?") when
+            // it is the `@min` above doing its job.
+            std.log.info("[diff-vram] budget req={d}MB room={d}MB -> eff={d}MB · reserve={d}MB pin={d}MB (free={d}MB + evictable={d}MB)", .{
+                b.budget_override >> 20, room >> 20,         budget >> 20,
+                pin_reserve >> 20,       b.pin_budget >> 20, free_now >> 20,
+                evictable >> 20,
+            });
+
+            // Proactively drop the transient text encoder when it can't stay
+            // resident alongside the DiT's working set. It's evictable but nothing
+            // forces it out until the DiT's own allocations reactively reclaim it
+            // which happens DURING step 1, so step 1 pins little (streams around
+            // the resident encoder) and runs slow; only once it's cleared do later
+            // steps pin properly and speed up (the 11s->3s first-step cliff under a
+            // resident LLM). Evicting up front lets step 1 pin from the start. The
+            // encode (both CFG passes) is already done, so the encoder has no
+            // further use THIS image; on a big card where it all fits we keep it
+            // (the next queued image's encode reuses it).
+            //
+            // The test must discount the DiT already on the card, and getting
+            // that wrong made this fire on every queued image. On the FIRST image
+            // the cache holds only the encoder, so "does dit + reserve fit in free?"
+            // is right. On a SUBSEQUENT image the previous DiT is still pinned
+            // (evictUnpinned below deliberately keeps it), which is *why* free VRAM
+            // is low, so counting the whole DiT again double-counts it against a
+            // `free_now` that already excludes it. Observed: dit=13477 + reserve=2560
+            // > free=2628 "true" with the DiT wholly resident, evicting an encoder
+            // that fit perfectly well. Subtracting the resident part reduces the
+            // second image to `reserve > free`, which is the real question.
+            //
+            // Pinned bytes are the right proxy for "resident DiT": the encoder and
+            // the VAE are both left UNPINNED by design (see pin_budget above), so on
+            // this path anything pinned is DiT. Clamped to `dit_bytes` so a stray
+            // pin can never make the requirement negative.
+            const dit_bytes = self.denoiserPayloadLen();
+            const dit_resident = @min(dit_bytes, b.pinnedWeightBytes());
+            const dit_to_place = dit_bytes - dit_resident;
+            if (dit_to_place + pin_reserve > free_now) {
+                // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
+                // queued image, drop only the (unpinned) encoder + any stray stream.
+                const freed = b.evictUnpinned();
+                // Says "unpinned weights", not "text encoder": on a subsequent
+                // image the VAE is resident and unpinned too, so this drops that as
+                // well (harmless, the decode is after sampling, by which point the
+                // streaming DiT would have reclaimed it anyway). Naming only the
+                // encoder made the line describe less than it did.
+                //
+                // The inequality is the one actually tested. The old line printed
+                // the WHOLE DiT against free VRAM, which framed streaming-by-design
+                // as a fit failure and implied dropping ~600 MB could make 13 GB fit.
+                // `free_now` is the figure that TRIGGERED the drop; print what free
+                // VRAM is after it too, since that is what the pinning below sees
+                // and the two differ by exactly what was freed.
+                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve, free {d} -> {d}MB", .{
+                    freed >> 20,        dit_to_place >> 20, dit_bytes >> 20,
+                    dit_resident >> 20, pin_reserve >> 20,  free_now >> 20,
+                    b.ctx.freeMiB(),
+                });
+            }
+        }
+    }
+
     pub fn generateClip(self: *Session, gpa: std.mem.Allocator, o: ClipOptions, progress: ?*std.Io.Writer) !Clip {
         if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
         const shifts = self.clipShifts(o);
+
+        // Same weight residency the still-image path uses, for the same reason: a
+        // clip runs the text encoder once and the denoiser once per step, so the
+        // encoder must stay evictable and the denoiser must PIN, or every step
+        // re-uploads it from the mapping. CUDA's current context is per-thread, so
+        // bind before anything reads free VRAM.
+        if (self.cu_be) |b| {
+            b.bindThread();
+            b.pin_budget = 0;
+        }
 
         const shape = try self.latentShape(o.width, o.height, o.length);
         var cond = try self.encode(gpa, o.prompt, .{
@@ -5590,6 +5729,16 @@ pub const Session = struct {
             .h3_target_frames = self.pixelFrames(shape),
         });
         defer cond.deinit(gpa);
+        // The encode is done, so its attention/conv scratch and its weights have no
+        // further use this clip, and what follows is an activation workspace sized
+        // by the packed sequence: 17 GB at 15 seconds of 768x1152, against 1.8 GB
+        // free if this is skipped. The still-image path gets away without it
+        // because an image's workspace is a tenth the size; a clip cannot.
+        if (self.cu_be) |b| {
+            b.freeAttnScratch();
+            b.freeConvScratch();
+            _ = b.evictUnpinned();
+        }
 
         const sigmas = try self.schedule(gpa, o.steps, shifts.video);
         defer gpa.free(sigmas);
@@ -5605,15 +5754,14 @@ pub const Session = struct {
             });
         }
 
-        var den = try self.clipDenoiser(gpa, cond, shape, shifts);
-        defer den.deinit(gpa);
-        if (cont) |c| {
-            den.video_mask = c.video_mask;
-            den.audio_mask = c.audio_mask;
-        }
-
+        // Scoped, so the denoiser's workspace and its device weights are gone
+        // before the VAE decode below: at 15 seconds that workspace is ~9 GB at
+        // 512x768 and 20.7 GB at 768x1152, and holding it across the decode made
+        // the VAE re-stream per temporal window (measured: decode 63s -> 197s,
+        // 272 GB of reads). Nothing after sampling reads the denoiser.
         // The sampler's latent starts as pure noise. Its audio half lives in the
-        // carried space from here until `processLatentOut` below.
+        // carried space from here until `processLatentOut` below. Declared outside
+        // the sampling scope because the decode reads it after the denoiser is gone.
         const x = try gpa.alloc(f32, shape.elems());
         defer gpa.free(x);
         sampler.fillNoiseFrom(x, o.seed, self.compat.noise_src);
@@ -5626,43 +5774,77 @@ pub const Session = struct {
         defer if (noise0.len > 0) gpa.free(noise0);
         if (cont != null) noise0 = try gpa.dupe(f32, x);
 
-        const v = try gpa.alloc(f32, shape.elems());
-        defer gpa.free(v);
+        {
+            const v = try gpa.alloc(f32, shape.elems());
+            defer gpa.free(v);
 
-        const n_steps = sigmas.len - 1;
-        // Per-step and total sampling time, reported rather than inferred. A whole
-        // render's wall clock here is dominated by paging in a 21 GB checkpoint,
-        // and that floor moves by 3x between runs, so differencing two wall times
-        // measures the page cache and not the change under test.
-        const samp_start = std.Io.Clock.real.now(self.io);
-        var step_start = samp_start;
-        for (0..n_steps) |i| {
-            // Preserved rows are placed ANALYTICALLY at this sigma rather than
-            // stepped. The reference sets the velocity instead (`v = noise - ref`,
-            // independent of sigma, which is the same straight line); placing `x`
-            // reaches the same trajectory without having to express it in the
-            // sampler's carried audio space, where the velocity picks up the
-            // carry's own sigma dependence.
-            if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[i]);
-            try den.predict(gpa, v, x, sigmas[i]);
-            // Euler for flow matching: the trajectory derivative IS the velocity.
-            const dt = sigmas[i + 1] - sigmas[i];
-            for (x, v) |*xi, vi| xi.* += dt * vi;
-            const now = std.Io.Clock.real.now(self.io);
-            try note(progress, "step {d}/{d} (sigma {d:.4}) {d:.2}s\n", .{
-                i + 1, n_steps, sigmas[i],
-                @as(f64, @floatFromInt(now.nanoseconds - step_start.nanoseconds)) / 1e9,
+            var den = try self.clipDenoiser(gpa, cond, shape, shifts);
+            defer den.deinit(gpa);
+            // AFTER the denoiser, not after the encode as the still-image path does,
+            // because a clip's activation workspace is sized by the packed sequence and
+            // dwarfs an image's. Arming here lets it be allocated while everything is
+            // still evictable, and leaves `free` already net of it, so the pin shrinks
+            // as the clip lengthens and a long one streams instead of failing on a pin
+            // that eviction cannot undo.
+            self.armDenoiserResidency();
+            if (cont) |c| {
+                den.video_mask = c.video_mask;
+                den.audio_mask = c.audio_mask;
+            }
+
+            const n_steps = sigmas.len - 1;
+            // Per-step and total sampling time, reported rather than inferred. A whole
+            // render's wall clock here is dominated by paging in a 21 GB checkpoint,
+            // and that floor moves by 3x between runs, so differencing two wall times
+            // measures the page cache and not the change under test.
+            const samp_start = std.Io.Clock.real.now(self.io);
+            var step_start = samp_start;
+            // Per-step scratch. The forward allocates and frees a few [seq][hidden]
+            // f32 buffers every step: 2.8 GB a step at 15 seconds of 512x768. The
+            // process arena never hands those back (28.7 GB peak by the end) and a
+            // general allocator pays mmap/munmap for each (+14% sampling), so reset
+            // an arena instead -- bounded at one step's peak, no syscall churn.
+            var step_scratch = std.heap.ArenaAllocator.init(gpa);
+            defer step_scratch.deinit();
+
+            for (0..n_steps) |i| {
+                // Preserved rows are placed ANALYTICALLY at this sigma rather than
+                // stepped. The reference sets the velocity instead (`v = noise - ref`,
+                // independent of sigma, which is the same straight line); placing `x`
+                // reaches the same trajectory without having to express it in the
+                // sampler's carried audio space, where the velocity picks up the
+                // carry's own sigma dependence.
+                if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[i]);
+                _ = step_scratch.reset(.retain_capacity);
+                try den.predict(step_scratch.allocator(), v, x, sigmas[i]);
+                // Euler for flow matching: the trajectory derivative IS the velocity.
+                const dt = sigmas[i + 1] - sigmas[i];
+                for (x, v) |*xi, vi| xi.* += dt * vi;
+                const now = std.Io.Clock.real.now(self.io);
+                try note(progress, "step {d}/{d} (sigma {d:.4}) {d:.2}s\n", .{
+                    i + 1,                                                                   n_steps, sigmas[i],
+                    @as(f64, @floatFromInt(now.nanoseconds - step_start.nanoseconds)) / 1e9,
+                });
+                step_start = now;
+            }
+            try note(progress, "sampled {d} steps in {d:.1}s\n", .{
+                n_steps,
+                @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - samp_start.nanoseconds)) / 1e9,
             });
-            step_start = now;
-        }
-        try note(progress, "sampled {d} steps in {d:.1}s\n", .{
-            n_steps,
-            @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - samp_start.nanoseconds)) / 1e9,
-        });
 
-        // ...and once more at the final sigma, because the last Euler step moved
-        // the preserved rows off their line and nothing re-places them after it.
-        if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[n_steps]);
+            // ...and once more at the final sigma, because the last Euler step moved
+            // the preserved rows off their line and nothing re-places them after it.
+            if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[n_steps]);
+        }
+
+        // The trunk is done with the card. Its pins are exactly what the decode
+        // cannot evict, so drop them rather than leaving the VAE to stream around
+        // a model that will not be read again.
+        if (self.cu_be) |b| {
+            b.pin_budget = 0;
+            b.freeAttnScratch();
+            b.evictWeights();
+        }
 
         self.processLatentOut(x, shape, shifts);
         return self.decodeClip(gpa, x, shape, progress);
@@ -6237,6 +6419,22 @@ pub const Session = struct {
     }
 
     /// One keyframe through both towers, at the GENERATION's canvas.
+    /// The vision tower, on the device when this backend has it.
+    ///
+    /// It is the largest single host allocation in a render that uses a reference
+    /// at all -- measured at 3.8 GB against 772 MB for the same render with none --
+    /// and it is paid per reference, not per step. The CPU path stays the fallback
+    /// and the reference for `minimax-h3-vit-cuda-test`.
+    fn h3Vit(self: *Session, gpa: std.mem.Allocator, vit: *const minimax_h3_vit.Vit, patches: []const f32, gh: usize, gw: usize) !minimax_h3_vit.Encoded {
+        if (self.cu_be) |b| {
+            if (minimax_h3_vit_cuda.supported(vit)) {
+                self.setMemTag(.te);
+                return minimax_h3_vit_cuda.encode(vit, b, gpa, patches, gh, gw);
+            }
+        }
+        return minimax_h3_vit.encode(vit, self.io, gpa, patches, gh, gw);
+    }
+
     fn h3EncodeKeyframe(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -6264,7 +6462,7 @@ pub const Session = struct {
         // image; the VAE takes the canvas directly.
         var prep = try minimax_h3_vit.preprocessStill(gpa, vit.cfg, pix, canvas_h, canvas_w, 3136, canvas_h * canvas_w);
         defer prep.deinit(gpa);
-        var enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+        var enc = try self.h3Vit(gpa, vit, prep.patches, prep.grid_h, prep.grid_w);
         errdefer enc.deinit(gpa);
 
         const vae_in = try gpa.alloc(f32, 3 * canvas_h * canvas_w);
@@ -6389,7 +6587,7 @@ pub const Session = struct {
             defer prep.deinit(gpa);
             grid_h = prep.grid_h;
             grid_w = prep.grid_w;
-            const enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+            const enc = try self.h3Vit(gpa, vit, prep.patches, prep.grid_h, prep.grid_w);
             merged[bi] = enc.merged;
             m_done += 1;
             ds[bi] = enc.deepstack;
@@ -6922,7 +7120,7 @@ pub const Session = struct {
         // --- the LLM's half: resize, patchify, run the tower ------------------
         var prep = try minimax_h3_vit.preprocessStill(gpa, vit.cfg, img.rgb, img.height, img.width, 3136, area_cap);
         defer prep.deinit(gpa);
-        var enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+        var enc = try self.h3Vit(gpa, vit, prep.patches, prep.grid_h, prep.grid_w);
         errdefer enc.deinit(gpa);
 
         // --- the DiT's half: the SAME resized extent through the VAE ----------
@@ -7046,6 +7244,33 @@ pub const Session = struct {
         return true;
     }
 
+    /// Planar f32 in [0, 1] -> interleaved RGB8, frames back to back, one decoded
+    /// window at a time. The frame index the run starts at is where it lands, so the
+    /// clip assembles in place and the whole-clip f32 volume never exists.
+    const Rgb8Sink = struct {
+        rgb: []u8,
+        plane: usize,
+        chans: usize,
+
+        fn sink(self: *Rgb8Sink) minimax_h3_vae.FrameSink {
+            return .{ .ctx = @ptrCast(self), .call = call };
+        }
+
+        fn call(ctx: *anyopaque, run: []const f32, first: usize, n: usize) anyerror!void {
+            const self: *Rgb8Sink = @ptrCast(@alignCast(ctx));
+            const pl = self.plane;
+            for (0..n) |f| {
+                const dst = self.rgb[(first + f) * pl * 3 ..][0 .. pl * 3];
+                for (0..pl) |i| {
+                    inline for (0..3) |c| {
+                        const v = run[(c * n + f) * pl + i];
+                        dst[i * 3 + c] = @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
+                    }
+                }
+            }
+        }
+    };
+
     pub fn decodeClip(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -7112,14 +7337,20 @@ pub const Session = struct {
         // The VAE and the DiT compute the clip length independently; if they ever
         // disagree the render has more or fewer frames than the model generated.
         std.debug.assert(frames == self.pixelFrames(shape));
-        const planar = try gpa.alloc(f32, vcfg.out_channels * frames * out_shape.height * out_shape.width);
-        defer gpa.free(planar);
-        try minimax_h3_vae.decodeTemporalWith(
+        // Straight to RGB8 as each window finishes, rather than assembling the
+        // whole clip as planar f32 and converting at the end: that volume is
+        // 2.1 GB at 15 seconds of 512x768 against 427 MB for the same clip in 8
+        // bits, and it is alive for the entire decode.
+        const plane = out_shape.height * out_shape.width;
+        const rgb = try gpa.alloc(u8, frames * plane * 3);
+        errdefer gpa.free(rgb);
+        var to_rgb: Rgb8Sink = .{ .rgb = rgb, .plane = plane, .chans = vcfg.out_channels };
+        try minimax_h3_vae.decodeTemporalTo(
             &m.vae,
             io,
             gpa,
             tp,
-            planar,
+            to_rgb.sink(),
             latent[0..shape.audioOffset()],
             shape.t,
             shape.h,
@@ -7157,19 +7388,6 @@ pub const Session = struct {
         try note(progress, "decoded in {d:.1}s\n", .{
             @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e9,
         });
-
-        // Planar f32 in [0, 1] -> interleaved RGB8, frames back to back.
-        const plane = out_shape.height * out_shape.width;
-        const rgb = try gpa.alloc(u8, frames * plane * 3);
-        errdefer gpa.free(rgb);
-        for (0..frames) |f| {
-            for (0..plane) |i| {
-                inline for (0..3) |c| {
-                    const v = planar[(c * frames + f) * plane + i];
-                    rgb[(f * plane + i) * 3 + c] = @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
-                }
-            }
-        }
 
         return .{
             .rgb = rgb,
@@ -7692,126 +7910,7 @@ pub const Session = struct {
         });
         if (n_variants > 1) try note(progress, "prompt schedule: {d} distinct conditionings\n", .{n_variants});
 
-        // Pin the DiT across images: first-touch pinning
-        // during sampling keeps the (large) DiT weights resident so a queued
-        // image reuses them instead of re-uploading ~13 GB each time. Sized to the
-        // available budget minus a reserve for the encoder (~5 GB, unpinned) +
-        // sampling activations, so it self-limits: a generous budget (image
-        // priority) pins the whole DiT; a tight one pins part (rest streams). The
-        // encoder above stayed unpinned (pin_budget 0); the VAE (after the DiT
-        // fills pin_budget) stays unpinned too.
-        if (cu_be) |b| {
-            // Pin as much DiT as fits. Two caps: the shared BUDGET (opts.vram_budget,
-            // 0 = no cap; = card limit − LLM resident in the GUI), and, critically
-            // what is PHYSICALLY reachable right now. The budget is blind to other
-            // processes on the card (desktop, a running ComfyUI, ...); if we pin to it
-            // we OOM the moment physical VRAM runs out, and pinned weights can't be
-            // evicted to recover. Physical room = live free VRAM + our own unpinned
-            // weights (the text encoder), which evict + re-stream as the DiT pins.
-            // Reserve the live activation scratch + a small margin on top.
-            // Unknown free VRAM leaves only our own evictable weights as provable
-            // room, which is a near-total loss of pinning: say so, a silent one
-            // reads as a mysterious slowdown on every image.
-            const free_now = if (b.ctx.memGetInfo()) |mi| mi.free else blk: {
-                std.log.warn("[vram] free VRAM unknown: pinning only what our own evictable weights cover", .{});
-                break :blk 0;
-            };
-            const evictable = b.evictableWeightBytes();
-            const room = free_now + evictable;
-            // `min` asks for no resident weights at all, and a pin is exactly the
-            // thing eviction cannot undo, so it pins nothing however much room the
-            // card has. Without this the DiT pins on a big card and `min` reports
-            // the whole model resident.
-            const budget = if (opts.vram_min_weights)
-                0
-            else if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
-            const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
-            // `pin_budget` is a TOTAL cap (`pinNew` tests
-            // `pinned_bytes + size > pin_budget`), but `room` is what is ADDITIONALLY
-            // reachable, live free VRAM plus our own evictable weights, and so
-            // excludes whatever is already pinned. Adding the resident total back is
-            // what keeps the two in the same units.
-            //
-            // Without this, every image after the first stops pinning entirely: a
-            // queued image finds ~11.7 GB of DiT already pinned against a `room`-only
-            // budget of ~1 GB, so `pinned_bytes > pin_budget` on the very first test
-            // and the rest of the DiT streams on every step for the whole image.
-            // Image 1 is unaffected (nothing pinned yet, so total == increment).
-            //
-            // Safe to be generous here: `pin_floor` is the physical backstop and is
-            // still checked per pin, so a budget larger than live VRAM cannot
-            // over-commit, it only stops the cap from being the binding constraint
-            // when it should not be.
-            b.pin_budget = b.pinnedWeightBytes() + (budget -| pin_reserve);
-            // Same reserve as a LIVE floor for first-touch pinning: pinNew keeps
-            // this much VRAM free, so pinning never eats the room the (lazily
-            // allocated, per-block) attention scratch + activation workspace need.
-            // pin_budget above is blind to the working set not yet allocated at
-            // pin time; the floor is the physical backstop that makes streaming
-            // actually fit, the whole point of a tight budget.
-            b.pin_floor = pin_reserve;
-            // `req` is what the caller ASKED for; `eff` is what physical room
-            // allows and what actually governs. Printing only `req` next to a much
-            // smaller `pin` reads as a bug ("16 GB budget, pinning 689 MB?") when
-            // it is the `@min` above doing its job.
-            std.log.info("[diff-vram] budget req={d}MB room={d}MB -> eff={d}MB · reserve={d}MB pin={d}MB (free={d}MB + evictable={d}MB)", .{
-                opts.vram_budget >> 20, room >> 20, budget >> 20,
-                pin_reserve >> 20,      b.pin_budget >> 20,
-                free_now >> 20,         evictable >> 20,
-            });
-
-            // Proactively drop the transient text encoder when it can't stay
-            // resident alongside the DiT's working set. It's evictable but nothing
-            // forces it out until the DiT's own allocations reactively reclaim it
-            // which happens DURING step 1, so step 1 pins little (streams around
-            // the resident encoder) and runs slow; only once it's cleared do later
-            // steps pin properly and speed up (the 11s->3s first-step cliff under a
-            // resident LLM). Evicting up front lets step 1 pin from the start. The
-            // encode (both CFG passes) is already done, so the encoder has no
-            // further use THIS image; on a big card where it all fits we keep it
-            // (the next queued image's encode reuses it).
-            //
-            // The test must discount the DiT already on the card, and getting
-            // that wrong made this fire on every queued image. On the FIRST image
-            // the cache holds only the encoder, so "does dit + reserve fit in free?"
-            // is right. On a SUBSEQUENT image the previous DiT is still pinned
-            // (evictUnpinned below deliberately keeps it), which is *why* free VRAM
-            // is low, so counting the whole DiT again double-counts it against a
-            // `free_now` that already excludes it. Observed: dit=13477 + reserve=2560
-            // > free=2628 "true" with the DiT wholly resident, evicting an encoder
-            // that fit perfectly well. Subtracting the resident part reduces the
-            // second image to `reserve > free`, which is the real question.
-            //
-            // Pinned bytes are the right proxy for "resident DiT": the encoder and
-            // the VAE are both left UNPINNED by design (see pin_budget above), so on
-            // this path anything pinned is DiT. Clamped to `dit_bytes` so a stray
-            // pin can never make the requirement negative.
-            const dit_bytes = self.denoiserPayloadLen();
-            const dit_resident = @min(dit_bytes, b.pinnedWeightBytes());
-            const dit_to_place = dit_bytes - dit_resident;
-            if (dit_to_place + pin_reserve > free_now) {
-                // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
-                // queued image, drop only the (unpinned) encoder + any stray stream.
-                const freed = b.evictUnpinned();
-                // Says "unpinned weights", not "text encoder": on a subsequent
-                // image the VAE is resident and unpinned too, so this drops that as
-                // well (harmless, the decode is after sampling, by which point the
-                // streaming DiT would have reclaimed it anyway). Naming only the
-                // encoder made the line describe less than it did.
-                //
-                // The inequality is the one actually tested. The old line printed
-                // the WHOLE DiT against free VRAM, which framed streaming-by-design
-                // as a fit failure and implied dropping ~600 MB could make 13 GB fit.
-                // `free_now` is the figure that TRIGGERED the drop; print what free
-                // VRAM is after it too, since that is what the pinning below sees
-                // and the two differ by exactly what was freed.
-                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve, free {d} -> {d}MB", .{
-                    freed >> 20,        dit_to_place >> 20, dit_bytes >> 20,
-                    dit_resident >> 20, pin_reserve >> 20,  free_now >> 20,
-                    b.ctx.freeMiB(),
-                });
-            }
-        }
+        self.armDenoiserResidency();
 
         // Stage 2: flow-matching sampling (reusing the resident DiT). DiT weights
         // (streamed lazily during forward) + per-step attention scratch are tagged

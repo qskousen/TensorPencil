@@ -899,6 +899,71 @@ The native canvas renders photorealistically with coherent motion. There, sampli
 dominates and it is where the FLOPs are: ~272 TFLOP per step at 7138 packed rows, about
 half of it attention.
 
+**Host RAM is per-step, so a per-step allocation is a leak in disguise.** The
+diffusion CLI hands the render a real allocator (`main.zig`), not the process
+arena, and the sampling loop resets a scratch arena per step: on the arena the
+forward's `[seq][hidden]` buffers grew 2.8 GB a STEP and never came back. The VAE
+decode resets its arena per window for the same reason, and emits frames to a sink
+as each window finishes rather than assembling the clip as f32 first. What is left
+of a 15 s 512x768 render's 5.9 GB is mostly load-time, not per-step.
+
+⚠️ **The output heads and the patch projections are where a host round-trip
+hides.** Reaching a 96-row projection used to cost a whole-trunk download every
+step; the heads now run on the device off `buildFinalModTable`, which folds
+`final.norm` into the modulation so the weightless norm-and-modulate kernel
+reproduces the CPU arithmetic. `embedPacked` projects per SEGMENT straight into
+the packed buffer instead of embedding every row and copying it in. Both are the
+same arithmetic: the second is bit-identical, the first moves the render by a
+sub-perceptual amount (35 dB PSNR over four steps) and leaves the CPU-parity
+figures unchanged.
+
+**VRAM is staged, and every stage has to hand the card back.** A clip's activation
+workspace is sized by the packed sequence, not by the frame: ~9 GB at 15 s of 512x768 and
+20.7 GB at 768x1152, against a 20 GB trunk on a 24 GB card. So `generateClip` releases the
+encode's scratch and weights before building the denoiser (without it the workspace starts
+with 1.8 GB free instead of 21.6 GB), arms `armDenoiserResidency` after the workspace
+exists so the pin shrinks as the clip lengthens, and scopes the denoiser so its workspace
+is gone before the VAE decode -- holding it across the decode made the VAE re-stream per
+temporal window, 63 s -> 197 s and 272 GB of reads. A clip cannot keep the trunk resident
+across renders the way an image does; the workspace wants the whole card.
+
+**The trunk works in BANDS of query rows** (`Workspace.attn_band`), which is what makes
+15 s at 768x1152 fit a 24 GB card at all: it started at a 20.7 GB workspace and an OOM.
+Only K and V are full-sequence, because every query attends to all of them; Q, the
+attention, the out-projection, the normalize-and-modulate feeding the qkv projections and
+the output heads all run a band at a time, and `t1_d` is band-sized with them. Two traps,
+both of which pass a single-band shape and fail a multi-band one:
+
+- ⚠️ **`opI8Gemm` writes its row count ROUNDED UP to 128.** A band-offset view of a
+  buffer that later bands still read is therefore clobbered, and the last band runs off
+  the end. The attention out-projection has its own `ao_d` for exactly this; `opMatmul`
+  (the f32 head projection) does NOT round, so the heads can write at a band offset.
+- ⚠️ **RoPE indexes its table by GLOBAL position (`pos0`) while the data is
+  band-relative.** Passing 0 rotates every band as if it began the clip.
+
+A band size is an output-affecting setting, like any tiling: it changes which sample comes
+out, not its quality. `minimax-h3-cuda-test` with `attn_band` forced to 64 is the gate --
+it reproduces the unbanded CPU-parity figures exactly, and caught both traps above.
+
+**K and V are stored bf16 and handed to cuDNN AS the operands** (`Workspace.kv_bf16`,
+`Backend.attn_bf16`). Not f16: H3's V is UNNORMED, and an unnormed operand is the one that
+outgrows f16's 65504 ceiling on a real conditioning while a synthetic one stays green --
+the failure that renders solid white with no error. bf16 carries f32's exponent so the
+range question does not arise, against a measured 5.5% worse CPU-parity from the 3 lost
+mantissa bits (video rel L2 0.01427 vs 0.01352). `qkNorm` and the rope run on the f32 band
+scratch before the narrowing, so neither needs a bf16 form. `TP_ATTN_F16=1` is the A/B.
+
+⚠️ **A reservation must name the shape and the dtype the forward will actually ask for.**
+`reserveAttnCudnn` exists so cuDNN's plan workspace and staging are on the card BEFORE
+residency pins against them; reserving `(seq, seq)` in f16 while the forward runs
+`(band, seq)` in bf16 allocates buffers nothing uses AND leaves the real ones to appear
+mid-forward, which is exactly what it was written to prevent. Worth 5.4 GB at 15 s of
+768x1152.
+
+⚠️ **`minimax-h3-cuda-test` takes `libs` as its THIRD argument**, and without it the test
+runs the hand-PTX arm -- not the cuDNN one every `--backend cuda` render uses. A parity
+figure from the wrong arm says nothing about the path that ships.
+
 ⚠️ **A whole-render wall time here is dominated by paging in the 21 GB checkpoint, not
 by the render.** Measured by differencing a 1-step run against a 9-step one at 512x512 /
 22 frames (~1850 packed rows), warm: **0.875 s/step**, against a ~40 s floor for load
@@ -1015,6 +1080,11 @@ wrong. This list is what reading the reference bought; add to it.
 - **The text span is not uniform.** Vision-pad tokens inside it carry tag 0 (video), not
   tag 1, so the span splits into tag runs. The tagged region widens by one on each side
   of a vision block, to cover `<|vision_start|>` / `<|vision_end|>`.
+- **So each text run takes its own SLICE of the encoder output**, and a run tagged video
+  is still text-encoder rows. Copying the whole output into every run overruns the rows
+  behind it, and letting the tagged run fall through to the audio branch fills it with
+  audio rows and shifts every audio segment after it. Both are silent in a release build,
+  where `@memcpy` does not check its lengths: it renders, and the prompt stops steering.
 - **adaLN curve lookup**: `t` clamps to `[0, 1]`, scales by `grid - 1`, and the lower
   index clamps to `grid - 2` so `t = 1.0` lands on the last interval instead of reading
   past the table.

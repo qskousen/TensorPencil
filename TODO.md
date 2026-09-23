@@ -205,3 +205,15 @@
   fixture in `tools/gen_sampler_fixtures.py`; the trap is that ComfyUI ships a SEPARATE
   `_RF` body for several of them and dispatches on `CONST`, which a port that reads
   only the eps form gets plausibly wrong on krea2 and Z-Image
+- tp-gui fonts: bold CJK runs render regular since the Bold face went (10.5 MB).
+  FreeType's synthetic bold (`FT_GlyphSlot_Embolden`, em/24) is a fair stand-in at
+  UI sizes, measured in-app, but it is a dvui change: `Font.Cache.getOrCreate`
+  knows when bold was asked and only a regular source matched, and the two
+  `FT_Load_Char` sites embolden the slot. ~20 lines, prototyped; needs a dvui fork
+  or an upstream PR, then fonts.zig routes tier-2 bold as `.bold` again
+- tp-gui fonts: the faces embed uncompressed, 21.5 MB. Measured on the 10 MB CJK
+  face in ReleaseFast: std zstd inflates at 22 MB/s (0.77 ratio, ~1 s for the set,
+  8 s in Debug), std xz at 27 MB/s (0.70), std flate at 190 MB/s but only 0.86, so
+  ~3 MB for 110 ms. libzstd does the same frame in 10 ms. `tools/gen_fonts.py
+  --pack zstd` emits the frames; wiring them in is worth it only with a libzstd
+  dependency, which is a 4.5 MB saving to weigh against a new C library

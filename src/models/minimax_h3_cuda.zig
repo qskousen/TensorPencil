@@ -2,12 +2,17 @@
 //!
 //! The split follows `dit_cuda`'s: the 50-block trunk runs on the device and the
 //! small host-cheap paths stay on the CPU. Here those are the patch projections,
-//! the adaLN projection, the token refiner, the final heads, and the
-//! patchify/pack transposes. Their combined cost at the default render is under
-//! 0.01% of a step, and several of them have shapes the device GEMMs refuse
-//! anyway: `adaln_proj` is `[96768, 8]`, whose 8 columns are below every tiled
-//! path's floor, and the output heads are 96 and 32 rows where `opI8Gemm` needs
-//! `rows % 128 == 0`.
+//! the adaLN projection, the token refiner, and the patchify/pack transposes.
+//! Their combined cost at the default render is under 0.01% of a step, and
+//! `adaln_proj` is `[96768, 8]`, whose 8 columns are below every tiled path's
+//! floor anyway.
+//!
+//! The output HEADS are on the device despite being 96 and 32 rows, well under
+//! `opI8Gemm`'s 128-row floor: those weights are f32, so they take `opMatmul`,
+//! which has no such floor. What made it worth moving is not the projection but
+//! what reaching it used to cost -- the whole trunk, `[seq][hidden]` f32,
+//! allocated on the host and downloaded every step, 925 MB at 15 seconds of
+//! 512x768 against 16 MB for the results.
 //!
 //! Three things differ from `dit_cuda` and each is load-bearing:
 //!
@@ -142,9 +147,26 @@ pub const Workspace = struct {
     k_d: Buf = .{},
     v_d: Buf = .{},
     attn_d: Buf = .{},
+    /// The attention out-projection for one query band. Its own buffer, not a
+    /// view into `t1_d`: `opI8Gemm` writes its row count ROUNDED UP to 128, so a
+    /// band-offset view would clobber the next band's still-needed normalized
+    /// rows, and the last band would run off the end.
+    ao_d: Buf = .{},
+    /// Q and the attention output for one band, in the attention's own bf16.
+    /// Only allocated when `kv_bf16`.
+    qb_d: Buf = .{},
+    ob_d: Buf = .{},
+    /// K and V are stored as bf16 and handed to cuDNN AS the operands, so the
+    /// conversion staging that an f32 stream needs does not exist: that staging
+    /// is another full copy of both, 2.62 GB at 15 s of 768x1152 on top of the
+    /// 2.62 GB the f32 originals cost. Off on the hand-PTX arm, which has no bf16
+    /// attention, and off under `force_naive_attn` for the same reason.
+    kv_bf16: bool = false,
     gate_d: Buf = .{},
     up_d: Buf = .{},
     mod_d: Buf = .{},
+    /// The final layer's modulation, `[max_labels][2][hidden]`, norm folded in.
+    fmod_d: Buf = .{},
     /// Per-row modulation LABEL indices (u32) for the two target segments, used
     /// only when a denoise mask relabels rows inside them. `seq` entries is an
     /// over-allocation of a few hundred KB, and sizing it from the mask would mean
@@ -159,6 +181,12 @@ pub const Workspace = struct {
     /// render an untiled pair would be 2.2 GB each. The MLP is per row, so the
     /// bands are independent.
     pub const mlp_tile: usize = 2048;
+
+    /// Query rows the attention is processed in. Every band attends to the WHOLE
+    /// key/value sequence, so only Q, the attention output and the out-projection
+    /// band; K and V stay full. That is what takes `q_d` and `attn_d` off the
+    /// sequence: 2.62 GB each at 15 seconds of 768x1152, against 117 MB here.
+    pub const attn_band: usize = 4096;
 
     /// Rows every int8 GEMM output must be sized for.
     ///
@@ -184,16 +212,29 @@ pub const Workspace = struct {
         var ws: Workspace = .{};
         errdefer ws.deinit(be);
         ws.x_d = try be.tensorCreate(mpad * cfg.hidden * 4);
-        ws.t1_d = try be.tensorCreate(mpad * cfg.hidden * 4);
-        ws.q_d = try be.tensorCreate(mpad * inner * 4);
-        ws.k_d = try be.tensorCreate(mpad * inner * 4);
-        ws.v_d = try be.tensorCreate(mpad * inner * 4);
-        ws.attn_d = try be.tensorCreate(mpad * inner * 4);
+        // Band-sized, not sequence-sized: every consumer (the qkv projections, the
+        // MLP, the output heads) now works a band at a time, and the widest band
+        // is the attention's.
+        const tband = padRows(@min(@max(attn_band, mlp_tile), seq));
+        ws.t1_d = try be.tensorCreate(tband * cfg.hidden * 4);
+        const aband = padRows(@min(attn_band, seq));
+        ws.kv_bf16 = be.kernels == .libs and !force_naive_attn;
+        const kvw: usize = if (ws.kv_bf16) 2 else 4;
+        ws.q_d = try be.tensorCreate(aband * inner * 4);
+        ws.k_d = try be.tensorCreate(mpad * inner * kvw);
+        ws.v_d = try be.tensorCreate(mpad * inner * kvw);
+        ws.attn_d = try be.tensorCreate(aband * inner * 4);
+        ws.ao_d = try be.tensorCreate(aband * cfg.hidden * 4);
+        if (ws.kv_bf16) {
+            ws.qb_d = try be.tensorCreate(aband * inner * 2);
+            ws.ob_d = try be.tensorCreate(aband * inner * 2);
+        }
         const tile = padRows(@min(mlp_tile, seq));
         ws.gate_d = try be.tensorCreate(tile * cfg.ffn * 4);
         ws.up_d = try be.tensorCreate(tile * cfg.ffn * 4);
         // All blocks' modulation in one buffer, so the whole step uploads once.
         ws.mod_d = try be.tensorCreate(dit.blocks.len * minimax_h3.Timesteps.max_labels * 3 * 6 * cfg.hidden * 4);
+        ws.fmod_d = try be.tensorCreate(minimax_h3.Timesteps.max_labels * 2 * cfg.hidden * 4);
         ws.vmask_d = try be.tensorCreate(seq * 4);
         ws.amask_d = try be.tensorCreate(seq * 4);
         if (loraScratch(dit, seq)) |sz| {
@@ -204,6 +245,32 @@ pub const Workspace = struct {
             // one stays in the pointer-keyed device weight cache. Reaching the
             // final size before the first GEMM means it never grows mid-render.
             _ = try be.zeroBias(sz.widest_out);
+        }
+        // The attention's own device memory, reserved at the shape the forward
+        // will ask for (full pack, MHA). cuDNN's plan workspace alone is 1.3 GB at
+        // 15 seconds of 768x1152, and allocating it lazily inside the first
+        // forward puts it AFTER the residency pass that decides how much of the
+        // trunk to pin, which is how a long clip failed where a short one fit.
+        if (!force_naive_attn) {
+            // Reserved in the SHAPES and the DTYPE the forward will ask for. The
+            // forward runs banded, so the plans are (band, seq) and (tail, seq),
+            // never (seq, seq); and under bf16 storage the operands arrive in the
+            // plan's own type, so there is no staging to reserve. Getting either
+            // wrong reserves buffers nothing uses and leaves the real ones to be
+            // allocated mid-forward, after residency has already pinned against
+            // the space they need -- which is the whole reason this exists.
+            const saved_io = be.attn_io_f16;
+            const saved_bf = be.attn_bf16;
+            be.attn_io_f16 = ws.kv_bf16;
+            be.attn_bf16 = ws.kv_bf16;
+            defer {
+                be.attn_io_f16 = saved_io;
+                be.attn_bf16 = saved_bf;
+            }
+            const full = @min(attn_band, seq);
+            try be.reserveAttnCudnn(full, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim);
+            const tail = seq % attn_band;
+            if (tail != 0 and tail != full) try be.reserveAttnCudnn(tail, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim);
         }
         return ws;
     }
@@ -238,7 +305,7 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        inline for (.{ &self.x_d, &self.t1_d, &self.q_d, &self.k_d, &self.v_d, &self.attn_d, &self.gate_d, &self.up_d, &self.mod_d, &self.vmask_d, &self.amask_d }) |b| {
+        inline for (.{ &self.x_d, &self.t1_d, &self.q_d, &self.k_d, &self.v_d, &self.attn_d, &self.ao_d, &self.qb_d, &self.ob_d, &self.gate_d, &self.up_d, &self.mod_d, &self.fmod_d, &self.vmask_d, &self.amask_d }) |b| {
             be.tensorDestroy(b);
         }
         if (self.lora) |*l| l.deinit(be);
@@ -342,11 +409,20 @@ pub fn forward(
     defer gpa.free(mod_host);
     try minimax_h3.buildModTable(dit, io, gpa, mod_host, t_emb, n_labels);
 
+    // The final layer's own table, norm folded into the premul so the heads use
+    // the same weightless norm-and-modulate kernel the blocks do. Allocated out
+    // here for the same reason `mod_host` is: its upload is queued on the stream
+    // and must outlive the batch.
+    const fmod_host = try gpa.alloc(f32, n_labels * 2 * h);
+    defer gpa.free(fmod_host);
+    try minimax_h3.buildFinalModTable(dit, io, gpa, fmod_host, t_emb, n_labels);
+
     // --- device: the trunk -------------------------------------------------
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
     try be.tensorUpload(ws.x_d, std.mem.sliceAsBytes(packed_h));
     try be.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(mod_host));
+    try be.tensorUpload(ws.fmod_d, std.mem.sliceAsBytes(fmod_host));
 
     // A denoise mask relabels rows inside a target segment, so those two segments
     // pick their modulation row PER ROW. The kernels take a u32 index buffer and a
@@ -390,81 +466,158 @@ pub fn forward(
         }
     }.go;
 
+    // bf16 attention operands. H3's V is UNNORMED, and an unnormed value is the
+    // operand that outgrows f16's 65504 ceiling on a real conditioning while a
+    // synthetic one stays green -- the failure that renders solid white with no
+    // error. bf16 carries f32's exponent, so the range question does not arise;
+    // it costs 3 mantissa bits against an f32 accumulation that is unchanged.
+    // `TP_ATTN_F16=1` puts it back on f16 for an A/B; there is no reason to pick
+    // f16 for a render, since the ranges are what differ and bf16 has the room.
+    const saved_io = be.attn_io_f16;
+    be.attn_bf16 = ws.kv_bf16;
+    // K/V/Q/O are handed over ALREADY in the plan's dtype, which is what this
+    // flag means: no staging copies, no conversion inside the attention.
+    be.attn_io_f16 = ws.kv_bf16;
+    defer {
+        be.attn_bf16 = false;
+        be.attn_io_f16 = saved_io;
+    }
+
     for (dit.blocks, 0..) |*b, bi| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
 
-        // Attention half. Each segment normalizes and modulates with its OWN
-        // modulation row; the segments are contiguous, so each is an offset view.
-        for (layout.segments) |sg| {
-            const t_row = ts.rowFor(sg.kind);
-            const tag = sg.kind.tag();
-            const idx = segIdx(sg.kind, vmask, amask);
-            // With an index buffer the scalar offsets are the LABEL-ZERO ones; the
-            // kernel adds `idx[row] * label_stride`.
-            const base = if (idx == null) t_row else 0;
-            try be.rmsModRowsAt(
-                ws.x_d,
-                sg.start,
-                ws.t1_d,
-                sg.start,
-                ws.mod_d,
-                sg.len(),
-                h,
-                modOff(cfg, n_labels, bi, base, tag, 0),
-                modOff(cfg, n_labels, bi, base, tag, 1),
-                eps,
-                idx,
-                0,
-                label_stride,
-            );
-        }
-        try linPrep(be, ws.t1_d, seq, h);
-        // The fused qkv, split by rows: three GEMMs into three planes rather
-        // than one GEMM and a de-interleave. The sidecar splits the same way,
-        // by row range, which is also how a block-diagonal factor lands.
-        try lin(be, ws.q_d, rowSlice(b.attn.qkv.w, 0, inner));
-        try lin(be, ws.k_d, rowSlice(b.attn.qkv.w, inner, inner));
-        try lin(be, ws.v_d, rowSlice(b.attn.qkv.w, 2 * inner, inner));
-        try sidecar(be, ws, dit.lora, ws.q_d, ws.t1_d, seq, b.attn.qkv, 0, inner);
-        try sidecar(be, ws, dit.lora, ws.k_d, ws.t1_d, seq, b.attn.qkv, inner, inner);
-        try sidecar(be, ws, dit.lora, ws.v_d, ws.t1_d, seq, b.attn.qkv, 2 * inner, inner);
+        // Attention half, in bands of query rows. `t1_d` is BAND-SIZED, so the
+        // normalize-and-modulate runs once per band into row 0 of it rather than
+        // once over the whole sequence: at 15 s of 768x1152 that buffer is 88 MB
+        // instead of 1.97 GB, and the int8 prep staging shrinks with it.
+        //
+        // Each segment modulates with its OWN row, so a band applies the
+        // INTERSECTION of itself with each segment, exactly as the MLP does.
+        const normBand = struct {
+            fn go(be2: *Backend, ws2: *Workspace, lay: *const minimax_h3.PackedLayout, t: *const minimax_h3.Timesteps, c: minimax_h3.Config, nl: usize, blk: usize, b0: usize, n: usize, hh: usize, stride: usize, vm: ?Buf, am: ?Buf) !void {
+                for (lay.segments) |sg| {
+                    const lo = @max(sg.start, b0);
+                    const hi = @min(sg.stop, b0 + n);
+                    if (lo >= hi) continue;
+                    const idx = switch (sg.kind) {
+                        .video => vm,
+                        .audio => am,
+                        else => null,
+                    };
+                    // With an index buffer the scalar offsets are the LABEL-ZERO
+                    // ones; the kernel adds `idx[row] * label_stride`.
+                    const base = if (idx == null) t.rowFor(sg.kind) else 0;
+                    try be2.rmsModRowsAt(
+                        ws2.x_d,
+                        lo,
+                        ws2.t1_d,
+                        lo - b0,
+                        ws2.mod_d,
+                        hi - lo,
+                        hh,
+                        modOff(c, nl, blk, base, sg.kind.tag(), 0),
+                        modOff(c, nl, blk, base, sg.kind.tag(), 1),
+                        eps,
+                        idx,
+                        lo - sg.start,
+                        stride,
+                    );
+                }
+            }
+        }.go;
 
         const qn = try normBuf(be, b.attn.q_norm);
         const kn = try normBuf(be, b.attn.k_norm);
-        try be.qkNorm(ws.q_d, ws.q_d, qn, seq * cfg.n_heads, cfg.head_dim, cfg.qk_norm_eps);
-        try be.qkNorm(ws.k_d, ws.k_d, kn, seq * cfg.n_heads, cfg.head_dim, cfg.qk_norm_eps);
-        // PARTIAL split-half rope: `pairs` pairs of a `head_dim`-wide head, so
-        // the tail passes through. `opRopeHalfPart` takes both widths for exactly
-        // this; the full-head `rope` would rotate dims that must not move.
-        try be.opRopeHalfPart(ws.q_d, sess.freqs_d, seq, cfg.n_heads, sess.pairs, sess.sinOff(), 0, cfg.head_dim);
-        try be.opRopeHalfPart(ws.k_d, sess.freqs_d, seq, cfg.n_heads, sess.pairs, sess.sinOff(), 0, cfg.head_dim);
-        // Full attention over the whole pack, and MHA: kv_heads == n_heads.
-        if (force_naive_attn)
-            try be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim, scale, false)
-        else
-            try be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim, scale);
 
-        try linPrep(be, ws.attn_d, seq, inner);
-        try lin(be, ws.t1_d, b.attn.out.w);
-        try sidecar(be, ws, dit.lora, ws.t1_d, ws.attn_d, seq, b.attn.out, 0, h);
-        for (layout.segments) |sg| {
-            const idx = segIdx(sg.kind, vmask, amask);
-            const base = if (idx == null) ts.rowFor(sg.kind) else 0;
-            try be.gatedAddRowsAt(
-                ws.x_d,
-                sg.start,
-                ws.t1_d,
-                sg.start,
-                ws.mod_d,
-                sg.len() * h,
-                h,
-                modOff(cfg, n_labels, bi, base, sg.kind.tag(), 2),
-                idx,
-                0,
-                label_stride,
-            );
+        // Pass one: K and V over the WHOLE sequence, because every query band
+        // attends to all of it. The fused qkv is split by rows, GEMMs into
+        // separate planes rather than one GEMM and a de-interleave; the sidecar
+        // splits the same way, which is also how a block-diagonal factor lands.
+        //
+        // This pass reads `x_d` before any of the residual adds below touch it,
+        // so K and V see the block's input, which is what they must.
+        var k0: usize = 0;
+        while (k0 < seq) : (k0 += Workspace.attn_band) {
+            const kn_rows = @min(Workspace.attn_band, seq - k0);
+            try normBand(be, ws, layout, &ts, cfg, n_labels, bi, k0, kn_rows, h, label_stride, vmask, amask);
+            try linPrep(be, ws.t1_d, kn_rows, h);
+            // With bf16 storage the GEMM lands in the f32 band scratch (`attn_d`,
+            // idle until pass two) and is narrowed into K/V at the band's offset;
+            // `qkNorm` and the rope run on the f32 form either way, so neither
+            // needs a bf16 variant.
+            const kvw: usize = if (ws.kv_bf16) 2 else 4;
+            const k_at = if (ws.kv_bf16) ws.attn_d else offsetBuf(ws.k_d, k0 * inner * 4);
+            try lin(be, k_at, rowSlice(b.attn.qkv.w, inner, inner));
+            try sidecar(be, ws, dit.lora, k_at, ws.t1_d, kn_rows, b.attn.qkv, inner, inner);
+            try be.qkNorm(k_at, k_at, kn, kn_rows * cfg.n_heads, cfg.head_dim, cfg.qk_norm_eps);
+            try be.opRopeHalfPart(k_at, sess.freqs_d, kn_rows, cfg.n_heads, sess.pairs, sess.sinOff(), k0, cfg.head_dim);
+            if (ws.kv_bf16) try be.cvtF32ToBf16(k_at, offsetBuf(ws.k_d, k0 * inner * kvw), kn_rows * inner);
+
+            const v_at = if (ws.kv_bf16) ws.attn_d else offsetBuf(ws.v_d, k0 * inner * 4);
+            try lin(be, v_at, rowSlice(b.attn.qkv.w, 2 * inner, inner));
+            try sidecar(be, ws, dit.lora, v_at, ws.t1_d, kn_rows, b.attn.qkv, 2 * inner, inner);
+            if (ws.kv_bf16) try be.cvtF32ToBf16(v_at, offsetBuf(ws.v_d, k0 * inner * kvw), kn_rows * inner);
         }
 
+        // Q, the attention and the out-projection, one band of query rows at a
+        // time, each band folded straight into the residual.
+        //
+        // ⚠️ The rope table is indexed by GLOBAL position (`pos0`) while the data
+        // is band-relative. Passing 0 there rotates every band as if it started at
+        // the beginning of the clip, which is finite and wrong.
+        var a0: usize = 0;
+        while (a0 < seq) : (a0 += Workspace.attn_band) {
+            const an = @min(Workspace.attn_band, seq - a0);
+            // Re-normalized rather than kept from pass one: holding it would mean
+            // a full-sequence `t1_d` again, which is the whole point of banding.
+            // The residual adds below only ever touch rows this pass has already
+            // read, so a later band still normalizes the block's own input.
+            try normBand(be, ws, layout, &ts, cfg, n_labels, bi, a0, an, h, label_stride, vmask, amask);
+            try linPrep(be, ws.t1_d, an, h);
+            try lin(be, ws.q_d, rowSlice(b.attn.qkv.w, 0, inner));
+            try sidecar(be, ws, dit.lora, ws.q_d, ws.t1_d, an, b.attn.qkv, 0, inner);
+            try be.qkNorm(ws.q_d, ws.q_d, qn, an * cfg.n_heads, cfg.head_dim, cfg.qk_norm_eps);
+            try be.opRopeHalfPart(ws.q_d, sess.freqs_d, an, cfg.n_heads, sess.pairs, sess.sinOff(), a0, cfg.head_dim);
+            // MHA: kv_heads == n_heads. Unmasked, so a band of queries over the
+            // whole key sequence is the same arithmetic as the square launch.
+            if (force_naive_attn) {
+                try be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, an, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim, scale, false);
+            } else if (ws.kv_bf16) {
+                try be.cvtF32ToBf16(ws.q_d, ws.qb_d, an * inner);
+                try be.opAttnCross(ws.qb_d, ws.k_d, ws.v_d, ws.ob_d, an, seq, cfg.n_heads, cfg.head_dim, scale);
+                try be.cvtBf16ToF32(ws.ob_d, ws.attn_d, an * inner);
+            } else {
+                try be.opAttnCross(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, an, seq, cfg.n_heads, cfg.head_dim, scale);
+            }
+
+            try linPrep(be, ws.attn_d, an, inner);
+            try lin(be, ws.ao_d, b.attn.out.w);
+            try sidecar(be, ws, dit.lora, ws.ao_d, ws.attn_d, an, b.attn.out, 0, h);
+
+            // The residual add, per band, as the INTERSECTION of the band with
+            // each segment: a band can straddle segments and each carries its own
+            // modulation row.
+            for (layout.segments) |sg| {
+                const lo = @max(sg.start, a0);
+                const hi = @min(sg.stop, a0 + an);
+                if (lo >= hi) continue;
+                const idx = segIdx(sg.kind, vmask, amask);
+                const base = if (idx == null) ts.rowFor(sg.kind) else 0;
+                try be.gatedAddRowsAt(
+                    ws.x_d,
+                    lo,
+                    ws.ao_d,
+                    lo - a0,
+                    ws.mod_d,
+                    (hi - lo) * h,
+                    h,
+                    modOff(cfg, n_labels, bi, base, sg.kind.tag(), 2),
+                    idx,
+                    lo - sg.start,
+                    label_stride,
+                );
+            }
+        }
         // MLP half, in row bands so the gate/up intermediates stay bounded.
         // A band can straddle segments, so the per-segment modulation is applied
         // as the INTERSECTION of the band with each segment.
@@ -529,13 +682,71 @@ pub fn forward(
             }
         }
     }
+    // --- device: the output heads ------------------------------------------
+    //
+    // On the device even though the projections are 96 and 32 rows, well under
+    // `opI8Gemm`'s 128-row floor: these weights are f32, so they take the plain
+    // f32 GEMM, which has no such floor. Keeping them here is what removes the
+    // whole-trunk download -- `[seq][hidden]` f32 is 925 MB at 15 seconds of
+    // 512x768, allocated AND transferred every step, where the results below are
+    // 16 MB.
+    const v_seg = layout.segmentOf(.video).?;
+    const a_seg = layout.segmentOf(.audio).?;
+    const v_dim = cfg.videoPatchDim();
+    const a_dim = minimax_h3.audio_latent_channels;
+    std.debug.assert(dit.final.video_out.dtype == .f32 and dit.final.audio_out.dtype == .f32);
+
+    try finalHeadDev(be, ws, ws.q_d, v_seg, ts.rowFor(.video), segIdx(.video, vmask, amask), h, dit.final.video_out, dit.final.video_bias, dit.cfg.final_norm_eps);
+    try finalHeadDev(be, ws, ws.k_d, a_seg, ts.rowFor(.audio), segIdx(.audio, vmask, amask), h, dit.final.audio_out, dit.final.audio_bias, dit.cfg.final_norm_eps);
     try be.endBatch();
 
-    // --- host: the output heads --------------------------------------------
-    const trunk = try gpa.alloc(f32, seq * h);
-    defer gpa.free(trunk);
-    try be.tensorDownload(ws.x_d, std.mem.sliceAsBytes(trunk));
-    try minimax_h3.finalHeads(dit, io, gpa, layout, &ts, t_emb, trunk, out_video, out_audio);
+    // --- host: unpack and negate -------------------------------------------
+    const v_rows = try gpa.alloc(f32, v_seg.len() * v_dim);
+    defer gpa.free(v_rows);
+    const a_rows = try gpa.alloc(f32, a_seg.len() * a_dim);
+    defer gpa.free(a_rows);
+    try be.tensorDownload(ws.q_d, std.mem.sliceAsBytes(v_rows));
+    try be.tensorDownload(ws.k_d, std.mem.sliceAsBytes(a_rows));
+
+    // The reference's last act is `[-video_out, -audio_out]`, and it is invisible
+    // in every norm.
+    minimax_h3.unpatchifyVideo(out_video, v_rows, layout.latent_t, layout.latent_h, layout.latent_w);
+    for (out_video) |*x| x.* = -x.*;
+    minimax_h3.unpackAudio(out_audio, a_rows, layout.audio_t);
+    for (out_audio) |*x| x.* = -x.*;
+}
+
+/// One output head on the device: weightless norm + modulate from the folded
+/// final table, then the f32 projection.
+///
+/// ⚠️ **The head modulates PER ROW when a denoise mask relabelled the segment.**
+/// With an index buffer the scalar offsets are the LABEL-ZERO ones and the kernel
+/// adds `idx[row] * stride`, exactly as the trunk's own segments do; passing the
+/// segment's own label instead renders a masked clip differently depending on how
+/// the mask happened to be expressed.
+fn finalHeadDev(
+    be: *Backend,
+    ws: *Workspace,
+    out: Buf,
+    seg: minimax_h3.Segment,
+    t_row: usize,
+    idx: ?Buf,
+    h: usize,
+    w: Weight,
+    bias: []const f32,
+    norm_eps: f32,
+) !void {
+    const n = seg.len();
+    const base = if (idx == null) t_row else 0;
+    // Banded, because `t1_d` is band-sized and the video segment is most of the
+    // sequence. `opMatmul` writes exactly `m * rows` (no 128-row rounding), so a
+    // band lands at its own byte offset in `out` with nothing spilling past it.
+    var r0: usize = 0;
+    while (r0 < n) : (r0 += Workspace.attn_band) {
+        const rn = @min(Workspace.attn_band, n - r0);
+        try be.rmsModRowsAt(ws.x_d, seg.start + r0, ws.t1_d, 0, ws.fmod_d, rn, h, base * 2 * h, base * 2 * h + h, norm_eps, idx, r0, 2 * h);
+        try be.opMatmul(out, r0 * w.rows * 4, ws.t1_d, 0, rn, w.bytes, false, w.rows, h, 1.0, bias);
+    }
 }
 
 fn normBuf(be: *Backend, w: []const f32) !Buf {

@@ -782,6 +782,13 @@ pub inline fn f16ToF32(e: Env) void {
     e.st(.b, i, e.h16(.a, i));
 }
 
+/// b[i] = f32(a[i]) from bf16. u0 = n. The widening every bf16 consumer needs on
+/// the way back to an f32 activation stream.
+pub inline fn bf16ToF32(e: Env) void {
+    const i = k.elem(e) orelse return;
+    e.st(.b, i, e.bf16(.a, i));
+}
+
 /// Two f16 activations summed in f32, in place. u0 = n (even).
 pub inline fn addH16(e: Env) void {
     const w = e.gid();

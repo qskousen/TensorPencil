@@ -898,13 +898,24 @@ k-split partials, an int8-repack one, and three cooperative ones, four of them b
 knobs are gone. VRAM fell ~800 MB (9B q6_k) to ~1 GB (27B mixed) with them, mostly the raw
 staging scratch the transpose pass needed.
 
-⚠️ **Vulkan LLM decode is SUBMIT-bound, not kernel-bound.** Every op outside `beginBatch`
-ends in `submitAndWait`, and at ~500 launches per token that dominates: switching every
-format to a 1.5-1.8x faster GEMV moved a 9B q6_k model from 7.5 to 7.5 tok/s. `vk-gemv-bench`
-shows the same floor directly — every format lands at 0.18-0.25 ms whether it reads 12 MiB or
-90. So a kernel change is not where this backend's 10x gap to CUDA lives; batching the
-submissions is. The formats still differ by 1.7x among themselves, which is why the per-format
-rate is still worth watching.
+⚠️ **Vulkan LLM decode is BARRIER-bound.** `opEnd` records a full global
+`CmdPipelineBarrier` (shader_write -> shader_read|write) after every op, and a token issues
+~633 of them (9B) to ~1900 (27B). Dropping them (`TP_VK_NOBAR`: wrong answers, valid timing)
+runs **2.6x faster** — 9B q6_k 8.4 -> 21.6 tok/s, 27B mixed 3.9 -> 6.7 — and takes the cost
+per dispatch from 202 us to 92. That per-dispatch cost is otherwise INDEPENDENT of the work:
+210.7 us on the 9B and 209.4 on the 27B, whose weights differ threefold. `TP_VK_STATS` prints
+the split.
+
+Two things this is NOT, both measured rather than assumed:
+- **Not submission.** A decode already batches (`beginBatch` in each stepper), ~29 dispatches
+  per submit; running the bench's ops inside one batch instead of one-per-submit is worth 10%.
+- **Not the kernels.** They are 1.2-1.8x faster than they were and end-to-end barely moved.
+
+So the lever here is eliding barriers, not faster GEMVs. `independent(n)` already exists for
+groups that provably do not conflict (the q/k/v linears off one norm, the FFN gate/up pair)
+and is barely used outside the dense path; beyond that a buffer-scoped barrier would let the
+driver stop draining the whole pipeline. ⚠️ Do not tune a Vulkan LLM kernel expecting
+end-to-end movement until this is fixed.
 
 Historical measurement, when the raw-layout formats first got a decode kernel at all (before
 that they dequantized the whole weight per token). Same greedy text before and after:
@@ -1375,6 +1386,13 @@ four `TP_VK_*` knobs are deleted, and VRAM fell ~800 MB to ~1 GB with them. §5 
 is left. The comparison cannot be re-run from this tree, since the alternatives are gone; `git log`
 has them.
 
+⚠️ **On SPIR-V a quad load needs an ALIAS binding.** Logical addressing has no pointer to
+re-cast, so `Env.ld4` was four scalar loads where CUDA's is one 16-byte load, and these GEMVs
+are bound by load instructions. A second `extern var` on binding 1 typed `@Vector(4, f32)`
+(the trick `dp4a.zig` used for its u16 weight view) was worth 1.2-1.8x on every Vulkan
+block-quant GEMV: q1_0 574 -> 1041 Gelem/s, q2_k 555 -> 883, iq3_s 480 -> 638, q8_0 1.53x.
+It does not change end-to-end, because that is barrier-bound (§5).
+
 ⚠️ **A 16-entry codebook belongs in the TABLE, not in a switch.** `iq4Codes` reading
 `kvalues_iq4nl` out of `iq_grid.blob` instead of an inline switch was 2.2x on iq4_nl and iq4_xs,
 and it is what flipped iq4_nl from losing to the int8 repack to beating it. Sixteen bytes is one
@@ -1565,7 +1583,7 @@ Delete a row when it closes.
 | No Vulkan ViT except gemma3 | `vit35`, `gemma4_vit`, `gemma4v_vit` are CPU/CUDA only. |
 | No Vulkan gemma4 | `Spec.Vulkan = void`; `--backend vulkan` is rejected for the arch. |
 | Vulkan has no int8 decode dot | The dual GEMV's `_q8` twin exists but `dp4a` compiles to arithmetic on SPIR-V, since `OpSDot`'s capability cannot go in the shared dual module. A second, capability-gated module is the fix. Low value while decode there is SUBMIT-bound. |
-| Vulkan LLM decode is submit-bound | ~500 `submitAndWait` round trips per token put every format at a ~0.2 ms floor regardless of the weight (`vk-gemv-bench`). Batching the submissions, not faster kernels, is where the 10x gap to CUDA is. |
+| Vulkan LLM decode is barrier-bound | A full global pipeline barrier after every one of a token's ~633-1900 dispatches costs **2.6x** (`TP_VK_NOBAR` isolation, §5). `independent(n)` and buffer-scoped barriers are the fixes; faster kernels are not. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
 | `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |
 | q8_0 MMQ built and LOST | `mmq_pipe_q8_0` exists, is correct (device test against an exact f64 reference, teeth checked by mis-wiring the per-substep scale) and is opt-in via `--dit-gguf-gemm mmq`. It measures **566 ms** of GEMM per step against the dequant route's **440** and cuBLASLt int8's **141**. ⚠️ Do not retry it expecting the estimate that motivated it: the premise was that `igemm_pipe` runs ~1.68x cuBLASLt, but igemm_pipe chains the mma's s32 C operand across k and NO MMQ can, because the scale changes every 32 elements. Isolation: A staging is 225 of the 566 (`TP_MMQ8_NOSTAGE` gives 342), and even at 342 it loses, because q4_k's nibble packing feeds TWO substeps from one 32-byte A fragment where 8-bit weights need their own, doubling shared A-load traffic on the one axis this kernel family responds to. The only real lever left is a one-time repack to planar qs + a scale plane, worth ~5% end-to-end on this card. |

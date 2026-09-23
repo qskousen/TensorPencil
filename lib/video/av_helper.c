@@ -56,6 +56,13 @@ struct TpMuxer {
 
     AVPacket *pkt;
     int header_written;
+
+    /* Padded copy of the caller's RGB frame. sws_scale reads its source in SIMD
+       blocks and can run past the final row; when the caller's buffer ends
+       exactly on a page boundary that is a fault, which is why a frame that
+       writes fine as a PNG can still kill the mux. */
+    uint8_t *rgb_pad;
+    size_t rgb_bytes;
 };
 
 static int drain(TpMuxer *m, AVCodecContext *cc, AVStream *st) {
@@ -86,6 +93,7 @@ static void destroy(TpMuxer *m) {
         avformat_free_context(m->fc);
     }
     free(m->pending);
+    av_free(m->rgb_pad);
     free(m);
 }
 
@@ -226,7 +234,15 @@ int tp_mux_write_frame(TpMuxer *m, const uint8_t *rgb) {
     int rc = av_frame_make_writable(m->vframe);
     if (rc < 0) { set_err("av_frame_make_writable", rc); return -1; }
 
-    const uint8_t *src[4] = {rgb, NULL, NULL, NULL};
+    if (!m->rgb_pad) {
+        m->rgb_bytes = (size_t)m->vc->width * (size_t)m->vc->height * 3;
+        m->rgb_pad = av_malloc(m->rgb_bytes + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!m->rgb_pad) { set_err("av_malloc (rgb padding)", 0); return -1; }
+        memset(m->rgb_pad + m->rgb_bytes, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    }
+    memcpy(m->rgb_pad, rgb, m->rgb_bytes);
+
+    const uint8_t *src[4] = {m->rgb_pad, NULL, NULL, NULL};
     int stride[4] = {m->vc->width * 3, 0, 0, 0};
     sws_scale(m->sws, src, stride, 0, m->vc->height, m->vframe->data, m->vframe->linesize);
     m->vframe->pts = m->vpts++;

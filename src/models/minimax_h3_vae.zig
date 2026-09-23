@@ -1134,6 +1134,19 @@ pub const VolumeFn = *const fn (
 
 pub const Volume = struct { ctx: *anyopaque, call: VolumeFn };
 
+/// Where finished frames go as each window completes.
+///
+/// `run` is planar `[out_channels][n][plane]` for `n` frames starting at output
+/// frame `first`, already through `finalizePixels`. It is the decoder's own
+/// scratch and does not outlive the call, so a sink copies or converts what it
+/// wants. This exists so a consumer that wants 8-bit pixels never makes the
+/// engine materialize the whole clip as f32 first: that volume is 2.1 GB at 15
+/// seconds of 512x768, against 427 MB for the same clip as RGB8.
+pub const FrameSink = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, run: []const f32, first: usize, n: usize) anyerror!void,
+};
+
 pub fn decodeTemporal(
     dec: *const VideoDecoder,
     io: std.Io,
@@ -1148,13 +1161,56 @@ pub fn decodeTemporal(
     return decodeTemporalWith(dec, io, gpa, tp, out, z, t, h, w, null);
 }
 
-/// `decodeTemporal` with the per-window decode supplied by the caller.
+/// `decodeTemporal` with the per-window decode supplied by the caller, writing
+/// the whole clip into `out` as planar f32.
 pub fn decodeTemporalWith(
     dec: *const VideoDecoder,
     io: std.Io,
     gpa: std.mem.Allocator,
     tp: Temporal,
     out: []f32,
+    z: []const f32,
+    t: usize,
+    h: usize,
+    w: usize,
+    vol: ?Volume,
+) !void {
+    const frames = tp.outputFrames(t);
+    const plane_sz = (h * dec.cfg.patch) * (w * dec.cfg.patch);
+    var into: PlanarSink = .{ .out = out, .frames = frames, .chans = dec.cfg.out_channels, .plane = plane_sz };
+    return decodeTemporalTo(dec, io, gpa, tp, into.sink(), z, t, h, w, vol);
+}
+
+/// The `out`-writing sink: scatters each run into the whole-clip planar buffer.
+const PlanarSink = struct {
+    out: []f32,
+    frames: usize,
+    chans: usize,
+    plane: usize,
+
+    fn sink(self: *PlanarSink) FrameSink {
+        return .{ .ctx = @ptrCast(self), .call = call };
+    }
+
+    fn call(ctx: *anyopaque, run: []const f32, first: usize, n: usize) anyerror!void {
+        const self: *PlanarSink = @ptrCast(@alignCast(ctx));
+        for (0..self.chans) |c| {
+            @memcpy(
+                self.out[(c * self.frames + first) * self.plane ..][0 .. n * self.plane],
+                run[c * n * self.plane ..][0 .. n * self.plane],
+            );
+        }
+    }
+};
+
+/// `decodeTemporalWith`, handing each finished run to `sink` instead of
+/// assembling the whole clip in one planar f32 buffer.
+pub fn decodeTemporalTo(
+    dec: *const VideoDecoder,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    tp: Temporal,
+    sink: FrameSink,
     z: []const f32,
     t: usize,
     h: usize,
@@ -1177,15 +1233,20 @@ pub fn decodeTemporalWith(
     const plane = height * width;
     const out_frames = tp.outputFrames(t);
     std.debug.assert(z.len == c_in * t * h * w);
-    std.debug.assert(out.len == cfg.out_channels * out_frames * plane);
 
     // Single-frame latents take the reference's own early path.
     if (t == 1) {
-        try volume(dec, vol, tiles, io, gpa, out, z, 1, h, w);
-        finalizePixels(out, cfg.out_channels, out_frames * plane);
-        return;
+        const one = try gpa.alloc(f32, cfg.out_channels * out_frames * plane);
+        defer gpa.free(one);
+        try volume(dec, vol, tiles, io, gpa, one, z, 1, h, w);
+        finalizePixels(one, cfg.out_channels, out_frames * plane);
+        return sink.call(sink.ctx, one, 0, out_frames);
     }
 
+    // Reset per WINDOW, not per decode: every window allocates its own latent
+    // slice, its decoded volume and its parts, and holding all of them for the
+    // whole decode is ~4.7 GB at 15 seconds of 512x768 for buffers that are dead
+    // as soon as the window is written.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1193,7 +1254,9 @@ pub fn decodeTemporalWith(
     // Pad by REPEATING the last latent frame, which is what the reference does.
     const p = tp.plan(t);
     const padded_t = t + p.pad_tokens;
-    const zp = try a.alloc(f32, c_in * padded_t * h * w);
+    // Outlives the reset: the window loop reads it every iteration.
+    const zp = try gpa.alloc(f32, c_in * padded_t * h * w);
+    defer gpa.free(zp);
     const sp = h * w;
     for (0..c_in) |c| {
         @memcpy(zp[c * padded_t * sp ..][0 .. t * sp], z[c * t * sp ..][0 .. t * sp]);
@@ -1207,23 +1270,39 @@ pub fn decodeTemporalWith(
     const pre = tp.framePrePadding();
 
     var write_pos: usize = 0;
-    // The tail of the previous window, held back to blend into the next one.
+    // The tail of the previous window, held back to blend into the next one. It
+    // has to OUTLIVE the arena reset that frees the window it came from, so it
+    // gets its own buffer rather than pointing into that window's `part`.
+    const tail_cap = tp.chunkSize() * tp.ratio_t;
+    const overlap_buf = try gpa.alloc(f32, cfg.out_channels * tail_cap * plane);
+    defer gpa.free(overlap_buf);
     var overlap: ?[]f32 = null;
     var overlap_frames: usize = 0;
 
+    // Hand a finished run over, clipped to the clip's real length: the padding
+    // tokens decode to frames the count already excludes, and they are always at
+    // the tail. A clipped run cannot go out as-is (its channel stride is still the
+    // full `n`), so the last one is compacted first.
     const writePart = struct {
-        fn call(dst: []f32, pos: *usize, part: []const f32, n: usize, chans: usize, pl: usize, total: usize) void {
+        fn call(al: std.mem.Allocator, sk: FrameSink, pos: *usize, part: []f32, n: usize, chans: usize, pl: usize, total: usize) !void {
             if (n == 0) return;
             const room = if (total > pos.*) total - pos.* else 0;
             const take = @min(n, room);
-            for (0..chans) |c| {
-                @memcpy(dst[(c * total + pos.*) * pl ..][0 .. take * pl], part[c * n * pl ..][0 .. take * pl]);
-            }
+            if (take == 0) return;
+            const run = if (take == n) part else blk: {
+                const c2 = try al.alloc(f32, chans * take * pl);
+                for (0..chans) |c| @memcpy(c2[c * take * pl ..][0 .. take * pl], part[c * n * pl ..][0 .. take * pl]);
+                break :blk c2;
+            };
+            try sk.call(sk.ctx, run, pos.*, take);
             pos.* += take;
         }
     }.call;
 
     for (0..p.num_chunks) |i| {
+        // Everything this window allocates dies with it; the held tail and `zp`
+        // are the two things that do not, and neither is on this arena.
+        _ = arena.reset(.retain_capacity);
         const t_start = @min(i * tp.chunkSize(), padded_t);
         const t_end = @min(t_start + tp.chunkSize() + tp.tokenOverlap(), padded_t);
         const win = t_end - t_start;
@@ -1256,9 +1335,12 @@ pub fn decodeTemporalWith(
                     overlap = null;
                 }
                 finalizePixels(part, cfg.out_channels, n * plane);
-                writePart(out, &write_pos, part, n, cfg.out_channels, plane, out_frames);
+                try writePart(a, sink, &write_pos, part, n, cfg.out_channels, plane, out_frames);
             } else {
-                overlap = part;
+                std.debug.assert(n <= tail_cap);
+                const held = overlap_buf[0 .. cfg.out_channels * n * plane];
+                @memcpy(held, part);
+                overlap = held;
                 overlap_frames = n;
             }
         }
@@ -1266,12 +1348,88 @@ pub fn decodeTemporalWith(
         if (i == p.num_chunks - 1) {
             if (overlap) |ov| {
                 finalizePixels(ov, cfg.out_channels, overlap_frames * plane);
-                writePart(out, &write_pos, ov, overlap_frames, cfg.out_channels, plane, out_frames);
+                try writePart(a, sink, &write_pos, ov, overlap_frames, cfg.out_channels, plane, out_frames);
                 overlap = null;
             }
         }
     }
     std.debug.assert(write_pos == out_frames);
+}
+
+test "temporal chunking assembles windows in order, with no gap and no repeat" {
+    // The frame COUNT test below says the arithmetic is right; it says nothing
+    // about the ORDER the windows are written in, and a clip that plays its own
+    // footage backwards or twice has the right count.
+    //
+    // So: a stub volume decode that stamps every pixel of a decoded frame with
+    // that frame's GLOBAL index, carried in the latent itself (token k holds k).
+    // The blend then cross-fades two windows that agree on every shared frame, so
+    // it is the identity on this ramp and the assembled output must read
+    // `pre, pre+1, pre+2, ...` exactly. A window written out of order, dropped or
+    // repeated moves one of those, and a misaligned overlap blends two DIFFERENT
+    // indices and lands between them.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cfg: Config = .{
+        .dim = 8,      .heads = 1,        .head_dim = 8,     .n_layers = 1, .ff = 8,
+        .patch = 1,    .patch_t = 4,      .in_channels = 1,  .out_channels = 1,
+        .n_register = 0,
+    };
+    var dec: VideoDecoder = undefined;
+    dec.cfg = cfg;
+
+    const Stub = struct {
+        // The latent's token value IS the global token index, so a window's first
+        // token says where the window starts and the stamp needs no shared state.
+        fn call(_: *anyopaque, _: std.Io, _: std.mem.Allocator, out: []f32, z: []const f32, t: usize, h: usize, w: usize) anyerror!void {
+            const plane = h * w;
+            for (0..t * cfg.patch_t) |f| {
+                const tok = z[(f / cfg.patch_t) * plane];
+                const global = tok * @as(f32, @floatFromInt(cfg.patch_t)) + @as(f32, @floatFromInt(f % cfg.patch_t));
+                // Pre-image of `finalizePixels`, so the stamp survives it unclamped.
+                const v = global / 512.0;
+                @memset(out[f * plane ..][0..plane], (v - pixel_mean[0]) / pixel_std[0]);
+            }
+        }
+    };
+    var ctx: u8 = 0;
+    const vol: Volume = .{ .ctx = &ctx, .call = Stub.call };
+
+    const tp: Temporal = .{};
+    const h: usize = 2;
+    const w: usize = 2;
+    // 22 is the 73-frame clip that renders forward, 37 the 124-frame native one
+    // that does not, and the rest bracket them.
+    for ([_]usize{ 2, 7, 12, 22, 37, 62, 107 }) |t| {
+        const z = try gpa.alloc(f32, t * h * w);
+        defer gpa.free(z);
+        for (0..t) |k| @memset(z[k * h * w ..][0 .. h * w], @floatFromInt(k));
+
+        const frames = tp.outputFrames(t);
+        const out = try gpa.alloc(f32, frames * h * w);
+        defer gpa.free(out);
+        try decodeTemporalWith(&dec, io, gpa, tp, out, z, t, h, w, vol);
+
+        const first = out[0] * 512.0;
+        errdefer std.debug.print("latent_t {d}: {d} frames, first stamp {d:.2}\n", .{ t, frames, first });
+        // The front padding is dropped, so the clip starts at frame `pre`.
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(tp.framePrePadding())), first, 1e-2);
+        // A window's 20 decoded frames become 17 output frames, so the stamp steps
+        // by 1 inside a window and by `ratio_t` across a boundary, where the held
+        // tail and the next window's head carry the SAME stamps and the blend is
+        // the identity. Strictly increasing throughout is the part that matters:
+        // footage played backwards steps down, footage played twice repeats.
+        var prev = first;
+        for (1..frames) |f| {
+            const got = out[f * h * w] * 512.0;
+            const step = got - prev;
+            errdefer std.debug.print("latent_t {d}: frame {d} stamped {d:.2}, previous {d:.2}\n", .{ t, f, got, prev });
+            try std.testing.expect(step > 0.99);
+            try std.testing.expect(step < @as(f32, @floatFromInt(tp.ratio_t)) + 0.01);
+            prev = got;
+        }
+    }
 }
 
 test "the VAE's frame count agrees with the DiT's time axis" {
