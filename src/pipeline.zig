@@ -304,6 +304,9 @@ pub const Options = struct {
     /// Seeded perturbation of the text conditioning (see `CondNoise`). Off by default;
     /// `cond_noise.curve` empty is the switch.
     cond_noise: CondNoise = .{},
+    /// Residual-stream steering (see `dit.ActSteer`). Empty `dirs` is off. The caller
+    /// owns the directions and they must outlive the render.
+    act_steer: ActSteerSpec = .{},
     /// Compute backend for the sampling loop (and encoder/VAE where supported).
     backend: Backend = .cpu,
     /// VAE decode-path override (see `VaeDecode`). Default `auto` (adaptive).
@@ -440,6 +443,399 @@ pub const Options = struct {
             .render_seed = self.seed,
         };
     }
+};
+
+/// Derive residual-stream directions: run two prompt sets and separate their mean
+/// per-block activations. Caller owns the result.
+///
+/// `sess` must already hold the model. Each prompt contributes ONE mean, so a long
+/// prompt's extra tokens do not outweigh a short one's.
+///
+/// A raw difference of means is nearly useless here, and both corrections below are
+/// what make the result depend on the concept at all. The capture averages over image
+/// tokens, so everything with spatial structure cancels and what is left is dominated
+/// by the residual's overall level. Unrelated concepts came out ~0.9 cosine apart, all
+/// of them a brightness knob:
+///
+///   - features are weighted by how RELIABLY they separate the sets (the difference
+///     over the spread across prompts), not by raw magnitude, so a big noisy feature
+///     stops drowning a small consistent one;
+///   - the grand mean over every prompt is projected out, since that is the shared
+///     axis itself.
+pub const ActDerive = struct {
+    /// Called with each prompt as it finishes, for a progress line.
+    pub const Step = struct {
+        ctx: *anyopaque,
+        on: *const fn (ctx: *anyopaque, prompt: []const u8, done: usize, total: usize) void,
+    };
+
+    pub fn run(
+        sess: *Session,
+        gpa: std.mem.Allocator,
+        opts: Options,
+        set_a: []const []const u8,
+        set_b: []const []const u8,
+        prog: ?Step,
+    ) ![]f32 {
+        const shape = sess.actShape() orelse return error.FamilyNotImplemented;
+        const n = shape.blocks * shape.features;
+        const total = set_a.len + set_b.len;
+        if (set_a.len == 0 or set_b.len == 0) return error.InvalidArgs;
+
+        const means = try gpa.alloc(f64, 2 * n);
+        defer gpa.free(means);
+        @memset(means, 0);
+        // Sum of squares of every prompt's mean, kept PER SET: the spread that matters
+        // is the one within a set, since a feature that separates them cleanly has a
+        // large spread across both and would weight itself down.
+        const sq = try gpa.alloc(f64, 2 * n);
+        defer gpa.free(sq);
+        @memset(sq, 0);
+
+        var done: usize = 0;
+        for ([_][]const []const u8{ set_a, set_b }, 0..) |set, which| {
+            const mean = means[which * n ..][0..n];
+            const s2 = sq[which * n ..][0..n];
+            for (set) |prompt| {
+                var cap: dit_mod.ActSteer.Capture = .{ .sums = try gpa.alloc(f64, n) };
+                defer gpa.free(cap.sums);
+                @memset(cap.sums, 0);
+                _ = sess.setActSteer(.{ .capture = &cap });
+                defer _ = sess.setActSteer(null);
+                try capture(sess, gpa, opts, prompt);
+                const rows: f64 = @floatFromInt(@max(cap.rows, 1));
+                for (mean, s2, cap.sums) |*m, *q, v| {
+                    const pm = v / rows;
+                    m.* += pm;
+                    q.* += pm * pm;
+                }
+                done += 1;
+                if (prog) |p| p.on(p.ctx, prompt, done, total);
+            }
+            for (mean, s2) |*m, *q| {
+                m.* /= @floatFromInt(set.len);
+                q.* /= @floatFromInt(set.len);
+            }
+        }
+
+        return directionsFrom(gpa, shape.blocks, shape.features, means[0..n], means[n..], sq[0..n], sq[n..], set_a.len, set_b.len);
+    }
+
+    /// The direction math, split out so it can be checked without a model.
+    /// `mean_a` / `mean_b` are the two sets' per-block means and `sq_a` / `sq_b` the
+    /// mean of the SQUARES of each set's per-prompt means, so the within-set spread
+    /// comes off them directly.
+    pub fn directionsFrom(
+        gpa: std.mem.Allocator,
+        blocks: usize,
+        features: usize,
+        mean_a: []const f64,
+        mean_b: []const f64,
+        sq_a: []const f64,
+        sq_b: []const f64,
+        n_a: usize,
+        n_b: usize,
+    ) ![]f32 {
+        const fa: f64 = @floatFromInt(n_a);
+        const fb: f64 = @floatFromInt(n_b);
+        const ft = fa + fb;
+        const dirs = try gpa.alloc(f32, blocks * features);
+        errdefer gpa.free(dirs);
+        const scratch = try gpa.alloc(f64, 2 * features);
+        defer gpa.free(scratch);
+        for (0..blocks) |b| {
+            const off = b * features;
+            const d = dirs[off..][0..features];
+            const w = scratch[0..features];
+            const g = scratch[features..][0..features];
+
+            // Spread WITHIN each set, pooled, and the block's average of it. Shrinking
+            // toward that average stops a feature that barely moved from dividing its
+            // way to dominance.
+            var avg: f64 = 0;
+            for (w, mean_a[off..][0..features], mean_b[off..][0..features], sq_a[off..][0..features], sq_b[off..][0..features]) |*sd, a, bb, qa, qb| {
+                const va = @max(0, qa - a * a);
+                const vb = @max(0, qb - bb * bb);
+                sd.* = @sqrt((fa * va + fb * vb) / ft);
+                avg += sd.*;
+            }
+            avg /= @floatFromInt(features);
+            // Nothing varied within either set, so there is no reliability to weight
+            // by; fall back to the raw difference rather than dividing by zero.
+            const floor = if (avg > 0) 0.25 * avg else 1;
+
+            for (w, g, mean_a[off..][0..features], mean_b[off..][0..features]) |*x, *gx, a, bb| {
+                const inv = 1 / (x.* + floor);
+                x.* = (a - bb) * inv;
+                gx.* = ((fa * a + fb * bb) / ft) * inv;
+            }
+
+            // Drop the grand mean: that axis is shared by every concept, and left in
+            // it swamps them all with one overall-level knob.
+            var dot: f64 = 0;
+            var gg: f64 = 0;
+            for (w, g) |x, gx| {
+                dot += x * gx;
+                gg += gx * gx;
+            }
+            if (gg > 0) {
+                const k = dot / gg;
+                for (w, g) |*x, gx| x.* -= k * gx;
+            }
+
+            var sum: f64 = 0;
+            for (w) |x| sum += x * x;
+            const norm = @sqrt(sum);
+            for (d, w) |*x, v| x.* = @floatCast(if (norm > 0) v / norm else 0);
+        }
+        return dirs;
+    }
+
+    /// One short sampling run, so the activations sit on a real trajectory rather
+    /// than on pure noise.
+    fn capture(sess: *Session, gpa: std.mem.Allocator, opts: Options, prompt: []const u8) !void {
+        var cond = try sess.encode(gpa, prompt, opts.encodeOptions(.positive, opts.steps));
+        defer cond.deinit(gpa);
+
+        // After the encode and before the first forward, like every other sampling
+        // entry point: without it nothing pins and the denoiser re-streams from the
+        // checkpoint mapping on every step.
+        sess.armDenoiserResidency();
+
+        const sigmas = try sess.schedule(gpa, opts.steps, opts.shift);
+        defer gpa.free(sigmas);
+
+        const lat_h = opts.height / sess.spatialDownscale();
+        const lat_w = opts.width / sess.spatialDownscale();
+        const lat_len = sess.latentChannels() * lat_h * lat_w;
+
+        const x = try gpa.alloc(f32, lat_len);
+        defer gpa.free(x);
+        sampler.fillNoiseFrom(x, 1234, opts.compatConfig().noise_src);
+
+        const v = try gpa.alloc(f32, lat_len);
+        defer gpa.free(v);
+
+        var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
+        defer den.deinit(gpa);
+        for (0..sigmas.len - 1) |st| {
+            try den.predict(gpa, v, x, sigmas[st], null);
+            sampler.eulerStep(x, v, sigmas[st], sigmas[st + 1]);
+        }
+    }
+
+    /// `ACTD1` bytes for `dirs`, ready to write.
+    pub fn encodeFile(gpa: std.mem.Allocator, blocks: usize, features: usize, dirs: []const f32) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "ACTD1");
+        try buf.appendSlice(gpa, std.mem.asBytes(&@as(u32, @intCast(blocks))));
+        try buf.appendSlice(gpa, std.mem.asBytes(&@as(u32, @intCast(features))));
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(dirs));
+        return buf.toOwnedSlice(gpa);
+    }
+};
+
+/// One synthetic concept for the direction tests: `vals[feature][prompt]`, the first
+/// half of each row set A, the second set B. Fills the four arrays `directionsFrom`
+/// takes.
+fn fakeCapture(
+    comptime feats: usize,
+    comptime prompts: usize,
+    vals: [feats][prompts]f64,
+    mean_a: *[feats]f64,
+    mean_b: *[feats]f64,
+    sq_a: *[feats]f64,
+    sq_b: *[feats]f64,
+) void {
+    const half = prompts / 2;
+    const h: f64 = @floatFromInt(half);
+    for (0..feats) |f| {
+        var a: f64 = 0;
+        var b: f64 = 0;
+        var qa: f64 = 0;
+        var qb: f64 = 0;
+        for (vals[f], 0..) |v, p| {
+            if (p < half) {
+                a += v;
+                qa += v * v;
+            } else {
+                b += v;
+                qb += v * v;
+            }
+        }
+        mean_a[f] = a / h;
+        mean_b[f] = b / h;
+        sq_a[f] = qa / h;
+        sq_b[f] = qb / h;
+    }
+}
+
+fn cosine(a: []const f32, b: []const f32) f64 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * y;
+        na += @as(f64, x) * x;
+        nb += @as(f64, y) * y;
+    }
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+test "act directions: a shared axis does not swamp the concept" {
+    const gpa = std.testing.allocator;
+    const feats = 4;
+    const prompts = 4;
+    // Both concepts move feature 0 hard and identically -- the overall-level axis --
+    // and each moves one small feature of its own. Raw, that shared move is nearly the
+    // whole vector, which is what made every derived direction the same knob.
+    var ma: [feats]f64 = undefined;
+    var mb: [feats]f64 = undefined;
+    var s1: [feats]f64 = undefined;
+    var s2: [feats]f64 = undefined;
+
+    const shared = [prompts]f64{ 125, 115, 105, 95 };
+    const own = [prompts]f64{ 2.5, 1.5, 0.5, -0.5 };
+    const off = [prompts]f64{ 0, 0, 0, 0 };
+
+    fakeCapture(feats, prompts, .{ shared, own, off, off }, &ma, &mb, &s1, &s2);
+    const d1 = try ActDerive.directionsFrom(gpa, 1, feats, &ma, &mb, &s1, &s2, prompts / 2, prompts / 2);
+    defer gpa.free(d1);
+
+    fakeCapture(feats, prompts, .{ shared, off, own, off }, &ma, &mb, &s1, &s2);
+    const d2 = try ActDerive.directionsFrom(gpa, 1, feats, &ma, &mb, &s1, &s2, prompts / 2, prompts / 2);
+    defer gpa.free(d2);
+
+    // Raw, these two concepts are 99% the same vector.
+    const raw1 = [feats]f32{ 20, 2, 0, 0 };
+    const raw2 = [feats]f32{ 20, 0, 2, 0 };
+    const raw_cos = cosine(&raw1, &raw2);
+    errdefer std.debug.print("raw cos {d:.4}\n", .{raw_cos});
+    try std.testing.expect(raw_cos > 0.98);
+
+    const got = cosine(d1, d2);
+    errdefer std.debug.print("derived cos {d:.4}  d1[0] {d:.4} d1[1] {d:.4}  d2[0] {d:.4} d2[2] {d:.4}\n", .{ got, d1[0], d1[1], d2[0], d2[2] });
+    try std.testing.expect(@abs(got) < 0.1);
+    // Each keeps its OWN feature as the largest one, rather than feature 0.
+    try std.testing.expect(@abs(d1[1]) > @abs(d1[0]));
+    try std.testing.expect(@abs(d2[2]) > @abs(d2[0]));
+}
+
+test "act directions: a reliable feature beats a bigger noisy one" {
+    const gpa = std.testing.allocator;
+    const feats = 5;
+    const prompts = 4;
+    var ma: [feats]f64 = undefined;
+    var mb: [feats]f64 = undefined;
+    var s1: [feats]f64 = undefined;
+    var s2: [feats]f64 = undefined;
+
+    fakeCapture(feats, prompts, .{
+        .{ 100, 100, 100, 100 }, // the level axis: no difference at all
+        .{ 60, -40, 50, -50 }, // difference 10, but it swings wildly per prompt
+        .{ 2, 2, 0, 0 }, // difference 2, and the same every time
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    }, &ma, &mb, &s1, &s2);
+
+    const d = try ActDerive.directionsFrom(gpa, 1, feats, &ma, &mb, &s1, &s2, prompts / 2, prompts / 2);
+    defer gpa.free(d);
+
+    // Raw, the noisy feature is 5x the reliable one; weighted by spread it loses.
+    errdefer std.debug.print("noisy {d:.4} reliable {d:.4}\n", .{ d[1], d[2] });
+    try std.testing.expect(ma[1] - mb[1] > ma[2] - mb[2]);
+    try std.testing.expect(@abs(d[2]) > @abs(d[1]));
+}
+
+test "act directions: effect size survives, so the spread must be the within-set one" {
+    const gpa = std.testing.allocator;
+    const feats = 4;
+    const prompts = 4;
+    var ma: [feats]f64 = undefined;
+    var mb: [feats]f64 = undefined;
+    var s1: [feats]f64 = undefined;
+    var s2: [feats]f64 = undefined;
+
+    // Two features separate the sets perfectly, one ten times harder than the other.
+    // Measuring the spread across BOTH sets counts that separation as noise, which
+    // scales with the difference itself and flattens the two to near parity.
+    fakeCapture(feats, prompts, .{
+        .{ 50, 50, -50, -50 }, // clean, big
+        .{ 5, 5, -5, -5 }, // clean, small
+        .{ 20, -20, 20, -20 }, // pure within-set noise, no difference at all
+        .{ 0, 0, 0, 0 },
+    }, &ma, &mb, &s1, &s2);
+
+    const d = try ActDerive.directionsFrom(gpa, 1, feats, &ma, &mb, &s1, &s2, prompts / 2, prompts / 2);
+    defer gpa.free(d);
+    errdefer std.debug.print("big {d:.4} small {d:.4} ratio {d:.2}\n", .{ d[0], d[1], @abs(d[0] / d[1]) });
+    try std.testing.expect(@abs(d[0]) > 5 * @abs(d[1]));
+}
+
+test "act directions: every block comes out unit length" {
+    const gpa = std.testing.allocator;
+    const feats = 4;
+    const prompts = 4;
+    const blocks = 3;
+    var ma: [blocks * feats]f64 = undefined;
+    var mb: [blocks * feats]f64 = undefined;
+    var s1: [blocks * feats]f64 = undefined;
+    var s2: [blocks * feats]f64 = undefined;
+    for (0..blocks) |b| {
+        var a: [feats]f64 = undefined;
+        var bb: [feats]f64 = undefined;
+        var x1: [feats]f64 = undefined;
+        var x2: [feats]f64 = undefined;
+        const k: f64 = @floatFromInt(b + 1);
+        fakeCapture(feats, prompts, .{
+            .{ 120 * k, 120 * k, 100 * k, 100 * k },
+            .{ 3 * k, 1 * k, 0, 0 },
+            .{ 0, 1 * k, 2 * k, 0 },
+            .{ 0, 0, 0, 0 },
+        }, &a, &bb, &x1, &x2);
+        @memcpy(ma[b * feats ..][0..feats], &a);
+        @memcpy(mb[b * feats ..][0..feats], &bb);
+        @memcpy(s1[b * feats ..][0..feats], &x1);
+        @memcpy(s2[b * feats ..][0..feats], &x2);
+    }
+    const d = try ActDerive.directionsFrom(gpa, blocks, feats, &ma, &mb, &s1, &s2, prompts / 2, prompts / 2);
+    defer gpa.free(d);
+    for (0..blocks) |b| {
+        var sum: f64 = 0;
+        for (d[b * feats ..][0..feats]) |v| sum += @as(f64, v) * v;
+        errdefer std.debug.print("block {d} norm {d:.6}\n", .{ b, @sqrt(sum) });
+        try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(sum), 1e-5);
+    }
+}
+
+/// The steering op, re-exported so `shared` can map to it without importing models.
+pub const dit_act = dit_mod.ActSteer;
+
+/// Read an `ACTD1` direction file: magic, block count, width, then
+/// `[blocks][features]` f32. Caller owns the result.
+pub fn loadActDirs(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]f32 {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20));
+    defer gpa.free(raw);
+    if (raw.len < 13 or !std.mem.eql(u8, raw[0..5], "ACTD1")) return error.InvalidHeader;
+    const blocks = std.mem.readInt(u32, raw[5..9], .little);
+    const feats = std.mem.readInt(u32, raw[9..13], .little);
+    const want = @as(usize, blocks) * feats * @sizeOf(f32);
+    if (raw.len - 13 != want) return error.InvalidHeader;
+    const out = try gpa.alloc(f32, @as(usize, blocks) * feats);
+    @memcpy(std.mem.sliceAsBytes(out), raw[13..]);
+    return out;
+}
+
+/// Directions for `dit.ActSteer`, as a render option.
+pub const ActSteerSpec = struct {
+    /// `[blocks][features]`, each a unit vector.
+    dirs: []const f32 = &.{},
+    scale: f32 = 0,
+    op: dit_mod.ActSteer.Op = .gain,
+    /// Per-block scale, `[blocks]`. Empty is flat.
+    curve_at: []const f32 = &.{},
+    keep_norm: bool = true,
 };
 
 /// A device-VRAM reclaim callback (see `Options.reclaim`); returns the number of
@@ -4193,6 +4589,15 @@ pub const Session = struct {
 
     /// Device bytes this diffusion session's backend currently holds (weights +
     /// activations). 0 for non-CUDA backends. Read by the GUI status bar.
+    /// Bind this session's CUDA context to the calling thread.
+    ///
+    /// A CUDA context is per THREAD, so anything driving the model from a thread
+    /// other than the one that loaded it gets `CUDA_ERROR_INVALID_CONTEXT` on the
+    /// first allocation and silently falls back to the CPU.
+    pub fn bindDevice(self: *Session) void {
+        if (self.cu_be) |b| b.bindThread();
+    }
+
     pub fn deviceUsed(self: *const Session) u64 {
         if (self.cu_be) |b| return b.deviceUsed();
         if (self.gpu_ctx) |c| return c.device_used;
@@ -4536,6 +4941,26 @@ pub const Session = struct {
         return switch (self.models) {
             .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => .flow,
             .sd15, .sdxl => .eps,
+        };
+    }
+
+    /// Residual-stream steering (`dit.ActSteer`), krea2 only. False when the family
+    /// has no hook, so a caller can say so rather than steering nothing.
+    pub fn setActSteer(self: *Session, st: ?dit_mod.ActSteer) bool {
+        switch (self.models) {
+            .krea2 => |*m| {
+                m.dit.act_steer = st;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Blocks and width a direction set must cover, or null where there is no hook.
+    pub fn actShape(self: *const Session) ?struct { blocks: usize, features: usize } {
+        return switch (self.models) {
+            .krea2 => |*m| .{ .blocks = m.dit.blocks.len, .features = dit_mod.features },
+            else => null,
         };
     }
 
@@ -8504,6 +8929,15 @@ pub const Session = struct {
     pub fn generate(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
         const gpa = self.gpa;
         const io = self.io;
+        // Set from `opts` every render, including back to off: a session outlives one
+        // image, so leaving the last one's steering installed would carry it forward.
+        _ = self.setActSteer(if (opts.act_steer.dirs.len > 0) .{
+            .dirs = opts.act_steer.dirs,
+            .scale = opts.act_steer.scale,
+            .op = opts.act_steer.op,
+            .curve_at = opts.act_steer.curve_at,
+            .keep_norm = opts.act_steer.keep_norm,
+        } else null);
         // A latent pixel is 8 image pixels for every family. Beyond that it is the
         // DENOISER that constrains: the patch-2 transformers (krea2, Z-Image, Anima)
         // need an even latent, so 16; the SD UNets take any latent, and their

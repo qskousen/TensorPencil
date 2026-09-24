@@ -196,6 +196,7 @@ pub const entries = [_]Entry{
     .{ .name = "qknorm_rope_f32", .wg = elem_wg },
     .{ .name = "l2norm_rows", .wg = row_wg, .kind = .rows },
     .{ .name = "l2norm_rows_g", .wg = row_wg, .kind = .rows },
+    .{ .name = "act_steer", .wg = row_wg, .kind = .rows },
     .{ .name = "rmsnorm", .wg = row_wg, .kind = .rows },
     .{ .name = "group_rmsnorm", .wg = row_wg, .kind = .rows },
     .{ .name = "rms_mod", .wg = row_wg, .kind = .rows },

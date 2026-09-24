@@ -11,6 +11,7 @@ const core = @import("tp_core");
 // The three prompt and compat enums live in pipeline.zig, so this is the one
 // import here that reaches above tp_core.
 const pipeline = @import("TensorPencil").pipeline;
+const models = @import("TensorPencil").models;
 
 pub const turn_stats = @import("turn_stats.zig");
 pub const TurnStats = turn_stats.TurnStats;
@@ -38,32 +39,42 @@ pub const ImageStatus = enum(u8) { pending, generating, done, failed, canceled, 
 /// enqueued image can hold by copy. `config.TextBuf` is the same idea one layer
 /// up and cannot be used here: `shared` imports `serve`, not the other way.
 pub const max_curve = 192;
-pub const CurveBuf = struct {
-    data: [max_curve]u8 = [_]u8{0} ** max_curve,
+pub const CurveBuf = FixedStr(max_curve);
 
-    pub fn slice(self: *const CurveBuf) []const u8 {
-        return std.mem.sliceTo(&self.data, 0);
-    }
+/// A fixed-capacity string, so a `RenderParams` stays a plain value an enqueued image
+/// can hold by copy. `config.TextBuf` is the same idea one layer up and cannot be used
+/// here: `shared` imports `serve`, not the other way.
+pub fn FixedStr(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        data: [cap]u8 = [_]u8{0} ** cap,
 
-    pub fn set(self: *CurveBuf, s: []const u8) void {
-        @memset(&self.data, 0);
-        const n = @min(s.len, self.data.len - 1);
-        @memcpy(self.data[0..n], s[0..n]);
-    }
+        pub fn slice(self: *const Self) []const u8 {
+            return std.mem.sliceTo(&self.data, 0);
+        }
 
-    /// A plain JSON string, not an array of `max_curve` bytes.
-    pub fn jsonStringify(self: CurveBuf, jws: anytype) !void {
-        try jws.write(self.slice());
-    }
+        pub fn set(self: *Self, s: []const u8) void {
+            @memset(&self.data, 0);
+            const n = @min(s.len, self.data.len - 1);
+            @memcpy(self.data[0..n], s[0..n]);
+        }
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !CurveBuf {
-        const s = try std.json.innerParse([]const u8, allocator, source, options);
-        var b: CurveBuf = .{};
-        b.set(s);
-        return b;
-    }
-};
+        /// A plain JSON string, not an array of `cap` bytes.
+        pub fn jsonStringify(self: Self, jws: anytype) !void {
+            try jws.write(self.slice());
+        }
 
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Self {
+            const s = try std.json.innerParse([]const u8, allocator, source, options);
+            var b: Self = .{};
+            b.set(s);
+            return b;
+        }
+    };
+}
+
+pub const max_path = 512;
+pub const PathBuf = FixedStr(max_path);
 pub const max_steers = 4;
 pub const max_steer_text = 96;
 
@@ -125,6 +136,13 @@ pub const RenderParams = struct {
     /// Steering terms, `steer_count` of them live. See `pipeline.CondNoise.Steer`.
     steers: [max_steers]SteerSpec = @splat(.{}),
     steer_count: u8 = 0,
+    /// Residual-stream steering (`dit.ActSteer`). A PATH, because the directions are
+    /// ~700 KB and belong on the host's disk, not in a render request. Empty is off.
+    act_dirs: PathBuf = .{},
+    act_scale: f32 = 0,
+    act_op: models.dit.ActSteer.Op = .add,
+    act_curve: CurveBuf = .{},
+    act_keep_norm: bool = true,
 
     /// Read the live recipe back out of `opts`, the single store for it.
     pub fn from(opts: *const pipeline.Options) RenderParams {
@@ -140,6 +158,9 @@ pub const RenderParams = struct {
             .cond_noise_negative = opts.cond_noise.neg_scale,
         };
         p.cond_noise.set(opts.cond_noise.curve);
+        p.act_scale = opts.act_steer.scale;
+        p.act_op = opts.act_steer.op;
+        p.act_keep_norm = opts.act_steer.keep_norm;
         for (opts.cond_noise.steers) |t| {
             if (p.steer_count == max_steers) break;
             p.steers[p.steer_count].set(t.text);
@@ -172,6 +193,14 @@ pub const RenderParams = struct {
             .shape = self.cond_noise_shape,
             .keep_norm = self.cond_noise_keep_norm,
             .neg_scale = self.cond_noise_negative,
+        };
+        // `act_steer.dirs` is NOT set here: the directions are a file the host reads,
+        // which `applyTo` has no allocator or io for. The caller loads them and fills
+        // the slice in.
+        opts.act_steer = .{
+            .scale = self.act_scale,
+            .op = self.act_op,
+            .keep_norm = self.act_keep_norm,
         };
         const n = @min(self.steer_count, max_steers);
         for (0..n) |i| scratch[i] = .{
@@ -257,6 +286,19 @@ pub const Request = union(enum) {
     /// type, so the two cannot drift, and the client's own fields never travel.
     settings: struct { json: []const u8 = "" },
     meter: struct { split: f32 = 0.60, limit: f32 = 0.95 },
+
+    /// Derive a set of residual-stream directions from two prompt sets and write
+    /// them beside the models. Runs on the engine thread and blocks it for the
+    /// duration, which is seconds: an explicit, one-off action.
+    act_derive: struct {
+        /// Prompts separated by ';'.
+        set_a: []const u8 = "",
+        set_b: []const u8 = "",
+        /// File stem; the host picks the folder and adds `.actd`.
+        name: []const u8 = "",
+        size: u32 = 256,
+        steps: u32 = 8,
+    },
 
     chat_submit: struct { text: []const u8 = "" },
     chat_regenerate,
@@ -452,6 +494,12 @@ pub const Event = union(enum) {
     queue: struct { images: []const ImageInfo = &.{} },
     /// One image changed.
     img: ImageInfo,
+    /// A direction set finished (or did not). `path` is where it landed, empty on
+    /// failure; `err` says why.
+    act_derived: struct {
+        path: []const u8 = "",
+        err: []const u8 = "",
+    },
     telemetry: Telemetry,
     /// The host's model catalog. `json` is the catalog's own index document,
     /// read back by the same code the index file uses, so the wire does not

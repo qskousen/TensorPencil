@@ -668,6 +668,19 @@ pub const CondSteer = struct {
 };
 pub const CondSteerList = FixedList(CondSteer, max_steers);
 
+/// How a residual-stream direction is applied. See `dit.ActSteer.Op`.
+pub const ActOp = enum(u8) {
+    add,
+    gain,
+
+    pub fn label(self: ActOp) []const u8 {
+        return switch (self) {
+            .add => "add",
+            .gain => "gain",
+        };
+    }
+};
+
 /// Folders the model catalog scans (recursively). A struct wrapper so
 /// `FixedList`'s `T = .{}` default applies.
 pub const max_model_dirs = 16;
@@ -902,6 +915,13 @@ pub const Config = struct {
     /// move along it (negative moves away). Independent and added, so "more
     /// tentacles" and "less anime" are two entries rather than one compromise.
     cond_steers: CondSteerList = .{},
+    /// Residual-stream steering: a direction file on the host, how far to move along
+    /// it, and where in the block stack. See `pipeline.ActSteerSpec`.
+    act_dirs: TextBuf(max_path) = .{},
+    act_scale: f32 = 0,
+    act_op: ActOp = .add,
+    act_curve: TextBuf(max_noise_curve) = .{},
+    act_keep_norm: bool = true,
     preview: Preview = .taesd,
     /// Resolution of the live TAESD preview as a fraction of the latent grid.
     /// Applied live (no reload) like the preview method itself.

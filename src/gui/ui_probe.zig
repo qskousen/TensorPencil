@@ -1221,6 +1221,10 @@ pub fn main(init: std.process.Init) !void {
             // exist when the toggle is, and an unopened section probes nothing.
             probe_cfg.studio_open_advanced = true;
             probe_cfg.cond_noise = true;
+            probe_cfg.act_dirs.set("/models/dirs/moon.actd");
+            probe_cfg.act_scale = 0.02;
+
+            probe_cfg.act_curve.set("max(0, (t-0.6)/0.2)");
             probe_cfg.cond_steers.items[0] = .{ .text = .lit("tentacles, suckers"), .scale = 1.2 };
             probe_cfg.cond_steers.items[1] = .{ .text = .lit("anime, cel shading"), .scale = -0.8 };
             probe_cfg.cond_steers.count = 2;

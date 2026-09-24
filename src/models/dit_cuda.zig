@@ -246,6 +246,8 @@ pub const Session = struct {
     txt0_d: DeviceBuffer,
     txt_len: usize, // element count (seq_txt * F)
     freqs_d: DeviceBuffer,
+    /// Steering directions, uploaded once. Empty when steering is off.
+    dirs_d: DeviceBuffer = .{},
     /// What `lin_cuda.plan` decided for this checkpoint's block linears.
     plan: lin_cuda.Plan,
 
@@ -276,6 +278,15 @@ pub const Session = struct {
         errdefer be.tensorDestroy(&freqs_d);
         try be.tensorUpload(freqs_d, std.mem.sliceAsBytes(fp));
 
+        // The model carries the steering set before a session is built, so the
+        // directions upload once here rather than per forward.
+        var dirs_d: DeviceBuffer = .{};
+        errdefer be.tensorDestroy(&dirs_d);
+        if (model.act_steer) |st| if (st.dirs.len > 0) {
+            dirs_d = try be.tensorCreate(st.dirs.len * 4);
+            try be.tensorUpload(dirs_d, std.mem.sliceAsBytes(st.dirs));
+        };
+
         return .{
             .seq_txt = seq_txt,
             .lat_h = lat_h,
@@ -283,6 +294,7 @@ pub const Session = struct {
             .txt0_d = txt0_d,
             .txt_len = txt_tokens.len,
             .freqs_d = freqs_d,
+            .dirs_d = dirs_d,
             .plan = plan,
         };
     }
@@ -290,6 +302,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, be: *Backend) void {
         be.tensorDestroy(&self.txt0_d);
         be.tensorDestroy(&self.freqs_d);
+        be.tensorDestroy(&self.dirs_d);
     }
 };
 
@@ -476,6 +489,31 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             try lin_cuda.gemm(be, plan, t1_d, mg_d, tile, blk.mlp.down, false); // down -> f32 t1_d for gatedAdd
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
         }
+        // Capture reads the residual back and reuses the CPU accumulator, rather
+        // than growing a kernel: one download per block is ~16 MB at 256^2, against
+        // the tens of seconds a CPU forward costs.
+        if (model.act_steer) |st| if (st.capture != null) {
+            const host = try gpa.alloc(f32, seq * F);
+            defer gpa.free(host);
+            try be.tensorDownload(x_d, std.mem.sliceAsBytes(host));
+            st.run(host, seq, seq_txt, b);
+        };
+        // Image rows only, matching the CPU arm: the text rows are the conditioning
+        // the blocks read.
+        if (model.act_steer) |st| if (sess.dirs_d.size > 0) {
+            const sc = st.scale * if (st.curve_at.len > b) st.curve_at[b] else 1;
+            if (sc != 0) try be.actSteer(
+                x_d,
+                sess.dirs_d,
+                seq - seq_txt,
+                F,
+                b * F,
+                seq_txt,
+                st.op == .add,
+                st.keep_norm,
+                sc,
+            );
+        };
     }
 
     // --- final layer ---

@@ -138,6 +138,8 @@ const outbox_max_bytes: usize = 256 << 20;
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
+    /// First scanned model folder, where a derived direction set is written.
+    out_dir: config.PathBuf = .{},
     io: Io,
     drv: Driver,
     inbox: Queue = .{},
@@ -515,6 +517,7 @@ pub const Host = struct {
             },
 
             .img_enqueue => |ir| self.enqueue(ir),
+            .act_derive => |dr| self.actDerive(dr),
             .img_cancel => |c| drv.cancelImage(c.image),
             .img_cancel_all => drv.cancelAllImages(),
             // Its print goes with it: the id is never minted again, so a kept
@@ -526,7 +529,13 @@ pub const Host = struct {
             .img_pause => |p| drv.setDiffPaused(p.paused),
             .img_eject => drv.diff_eject_armed = true,
             .img_fetch => |f| self.fetch(f),
-            .scan => |s| if (self.folders) |f| scan.startScan(f.dirs, f.files) else scan.startScan(s.dirs, s.files),
+            .scan => |s| {
+                const dirs = if (self.folders) |f| f.dirs else s.dirs;
+                // Remembered so a derived direction set has somewhere to land: the
+                // scan request's own slices die with the frame.
+                if (dirs.len > 0) self.out_dir.set(dirs[0]);
+                if (self.folders) |f| scan.startScan(f.dirs, f.files) else scan.startScan(s.dirs, s.files);
+            },
         }
     }
 
@@ -552,6 +561,51 @@ pub const Host = struct {
     /// is stamped on the image here, so a later settings change cannot reach it.
     /// LoRA paths go through `resolveRef` like a settings push: an id names a
     /// file of this host's, and a remote host takes no plain path.
+    /// Run a direction derivation and write the file beside the models.
+    ///
+    /// Inline on the engine thread: it takes seconds and there is nothing useful to
+    /// do meanwhile, so it blocks rather than growing a second kind of queued job.
+    fn actDerive(self: *Host, dr: anytype) void {
+        const gpa = self.gpa;
+        // Every exit answers with `act_derived`: the client is waiting on it, and an
+        // `err` event alone leaves it showing "working" for good.
+        const d = &(self.drv.diffuser orelse return self.actFailed("no image model"));
+        const stem = std.mem.trim(u8, dr.name, " \t");
+        if (stem.len == 0) return self.actFailed("needs a name");
+        if (std.mem.indexOfAny(u8, stem, "/\\") != null) return self.actFailed("the name cannot be a path");
+
+        const dir = self.out_dir.opt() orelse return self.actFailed("no model folder to write into");
+        const path = std.fmt.allocPrint(gpa, "{s}/{s}.actd", .{ dir, stem }) catch return self.actFailed("out of memory");
+        defer gpa.free(path);
+
+        var a_list: std.ArrayList([]const u8) = .empty;
+        defer a_list.deinit(gpa);
+        var b_list: std.ArrayList([]const u8) = .empty;
+        defer b_list.deinit(gpa);
+        for ([_][]const u8{ dr.set_a, dr.set_b }, [_]*std.ArrayList([]const u8){ &a_list, &b_list }) |set, list| {
+            var it = std.mem.splitScalar(u8, set, ';');
+            while (it.next()) |raw| {
+                const p = std.mem.trim(u8, raw, " \t\r\n");
+                if (p.len > 0) list.append(gpa, p) catch return self.actFailed("out of memory");
+            }
+        }
+        if (a_list.items.len == 0 or b_list.items.len == 0) return self.actFailed("needs prompts on both sides");
+
+        d.deriveActDirs(gpa, self.io, a_list.items, b_list.items, dr.size, dr.steps, path) catch |err| {
+            std.log.err("act-derive failed: {t}", .{err});
+            var buf: [96]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{t}", .{err}) catch "failed";
+            self.emit(.{ .act_derived = .{ .err = text } });
+            return;
+        };
+        self.emit(.{ .act_derived = .{ .path = path } });
+    }
+
+    fn actFailed(self: *Host, text: []const u8) void {
+        std.log.err("act-derive: {s}", .{text});
+        self.emit(.{ .act_derived = .{ .err = text } });
+    }
+
     fn enqueue(self: *Host, ir: wire.ImageRequest) void {
         const drv = &self.drv;
         if (limits.checkImageRequest(&ir)) |field| return self.emitErr(.bad_request, field);

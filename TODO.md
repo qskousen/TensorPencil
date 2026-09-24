@@ -101,6 +101,16 @@
 - cond steer: terms whose directions overlap partly cancel where their signs oppose. The
   engine logs the overlap; orthogonalizing terms against each other would fix the
   magnitudes at the cost of order-dependence
+- act-derive builds a full `Session`, so it loads the VAE and never decodes: the capture
+  stops at the denoiser. A lazy decoder in `Session.init`, or a capture path that skips
+  it, saves that load
+- act steer moves global attributes and cannot place an object: the capture averages the
+  residual over image tokens and the apply adds one vector to every token, so neither end
+  carries position. A `moon` direction shifts time of day instead of drawing a moon.
+  Per-token placement is the fix and it is a much larger change. The health check is the
+  cosine between directions for UNRELATED concepts against a random-direction control:
+  near the 1/sqrt(features) floor means the derive is separating concepts, high means it
+  has collapsed onto one axis again
 - gui: `ui-probe --click=X,Y` injects a press/release and prints what took keyboard
   focus, but nothing runs it as a check. An `--expect-focus` arm plus a build step would
   make it a regression guard; the probe already falls back to SDL's dummy driver

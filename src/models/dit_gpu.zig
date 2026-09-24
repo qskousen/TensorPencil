@@ -78,6 +78,8 @@ pub const Session = struct {
     txt0_d: gpu.DeviceBuffer,
     txt_len: usize,
     freqs_d: gpu.DeviceBuffer,
+    /// Steering directions, uploaded once. Empty when steering is off.
+    dirs_d: gpu.DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Per schedule entry: t (F) then tvec (6F).
     sigmas: []f32,
     tvs: []f32,
@@ -111,6 +113,15 @@ pub const Session = struct {
         defer gpa.free(fp);
         @memcpy(fp[0 .. seq * half], freqs.cos);
         @memcpy(fp[seq * half ..], freqs.sin);
+        // The model carries the steering set before a session is built, so the
+        // directions upload once here rather than per forward.
+        var dirs_d: gpu.DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        errdefer ctx.tensorDestroy(&dirs_d);
+        if (model.act_steer) |st| if (st.dirs.len > 0) {
+            dirs_d = try ctx.tensorCreate(st.dirs.len * 4);
+            try ctx.tensorUpload(dirs_d, std.mem.sliceAsBytes(st.dirs));
+        };
+
         var freqs_d = try ctx.tensorCreate(fp.len * 4);
         errdefer ctx.tensorDestroy(&freqs_d);
         try ctx.tensorUpload(freqs_d, std.mem.sliceAsBytes(fp));
@@ -131,6 +142,7 @@ pub const Session = struct {
             .seq_txt = seq_txt,
             .lat_h = lat_h,
             .lat_w = lat_w,
+            .dirs_d = dirs_d,
             .txt0_d = txt0_d,
             .txt_len = txt_tokens.len,
             .freqs_d = freqs_d,
@@ -142,6 +154,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, gpa: std.mem.Allocator, ctx: *gpu.Context) void {
         ctx.tensorDestroy(&self.txt0_d);
         ctx.tensorDestroy(&self.freqs_d);
+        ctx.tensorDestroy(&self.dirs_d);
         gpa.free(self.sigmas);
         gpa.free(self.tvs);
         self.* = undefined;
@@ -979,6 +992,29 @@ pub fn forward(
             }, seq * F, 1, 1);
         }
         mark(io, &t_mark, &prof.elt_ns);
+        // See dit_cuda: capture reads back and reuses the CPU accumulator.
+        if (model.act_steer) |st| if (st.capture != null) {
+            const host = try gpa.alloc(f32, seq * F);
+            defer gpa.free(host);
+            try ctx.tensorDownload(x_d, std.mem.sliceAsBytes(host));
+            st.run(host, seq, seq_txt, b);
+        };
+        // Image rows only, matching the other arms: the text rows are the
+        // conditioning the blocks read.
+        if (model.act_steer) |st| if (sess.dirs_d.size > 0) {
+            const sc = st.scale * if (st.curve_at.len > b) st.curve_at[b] else 1;
+            if (sc != 0) try ctx.opActSteer(
+                x_d,
+                sess.dirs_d,
+                seq - seq_txt,
+                F,
+                b * F,
+                seq_txt,
+                st.op == .add,
+                st.keep_norm,
+                sc,
+            );
+        };
     }
 
     // Final layer on device: modulated rmsnorm then the 6144 -> 64 linear

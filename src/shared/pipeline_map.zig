@@ -57,6 +57,13 @@ pub fn toPipelineSteerMode(c: config.SteerMode) pipeline.CondNoise.Mode {
     };
 }
 
+pub fn toPipelineActOp(o: config.ActOp) pipeline.dit_act.Op {
+    return switch (o) {
+        .add => .add,
+        .gain => .gain,
+    };
+}
+
 pub fn toPipelineCompat(c: config.Compat) pipeline.Compat {
     return switch (c) {
         .comfy => .comfy,

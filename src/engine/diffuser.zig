@@ -1495,6 +1495,73 @@ pub const Diffuser = struct {
 
     /// UI-thread, once per frame: reap a finished diffusion, then start the next
     /// pending one (at most one at a time to bound VRAM).
+    /// The resident session, loading the model if none is. Caller holds whatever
+    /// thread rule applies: the worker owns it while busy, and the engine thread may
+    /// load when it is not.
+    fn ensureSession(self: *Diffuser, opts: pipeline.Options, want: ModelConfig, progress: ?*std.Io.Writer) !*pipeline.Session {
+        if (self.session.load(.acquire)) |s| return s;
+        const t_load = nowNs(self.io);
+        const sess = try pipeline.Session.init(self.io, self.gpa, opts, progress);
+        self.load_error.store(0, .release);
+        self.loaded_family.store(@as(u8, @intFromEnum(sess.family())) + 1, .release);
+        std.log.info("[vram] diffusion model loaded in {d:.1}s ({t}): {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
+            @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9, sess.family(),
+            sess.deviceUsed() >> 20, opts.vram_budget >> 20, sess.freeVram() >> 20,
+        });
+        self.session.store(sess, .release);
+        // Record what's resident (gpa-owned; freed on the next reload / free).
+        self.loaded = ModelConfig.dupe(self.gpa, want) catch null;
+        return sess;
+    }
+
+    /// Derive residual-stream directions and write them to `path`.
+    ///
+    /// Reuses the loaded session when there is one and loads the model otherwise, so
+    /// it costs the same as the first render would. Blocks the caller.
+    pub fn deriveActDirs(
+        self: *Diffuser,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        set_a: []const []const u8,
+        set_b: []const []const u8,
+        size: u32,
+        steps: u32,
+        path: []const u8,
+    ) !void {
+        if (self.busy.load(.acquire)) return error.Busy;
+
+        var opts = self.opts;
+        const want = self.liveConfig();
+        want.applyTo(&opts);
+        // Loads the model when none is resident: a direction can be the first thing
+        // asked for in a session, before any render.
+        // Tell the arbiter this engine is using the card, exactly as a render does,
+        // so the LLM yields for it rather than the two fighting over VRAM.
+        if (!self.vram_entered) {
+            self.vram_entered = true;
+            self.vram.enter(self.vram.ctx);
+        }
+        const sess = try self.ensureSession(opts, want, null);
+        // This runs on the engine thread, not the diffusion worker that loaded the
+        // model, and a CUDA context belongs to a thread.
+        sess.bindDevice();
+        const shape = sess.actShape() orelse return error.FamilyNotImplemented;
+
+        opts.width = size;
+        opts.height = size;
+        opts.steps = steps;
+        opts.cfg = 1.0;
+        // Never steer while capturing: the point is what the model does untouched.
+        opts.act_steer = .{};
+        opts.cond_noise = .{};
+
+        const dirs = try pipeline.ActDerive.run(sess, gpa, opts, set_a, set_b, null);
+        defer gpa.free(dirs);
+        const bytes = try pipeline.ActDerive.encodeFile(gpa, shape.blocks, shape.features, dirs);
+        defer gpa.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
     pub fn pump(self: *Diffuser) void {
         self.trimTerminal();
         if (self.thread) |t| {
@@ -1628,6 +1695,26 @@ pub const Diffuser = struct {
         const recipe: RenderParams = gi.params orelse RenderParams.from(&self.opts);
         var steer_scratch: [wire.max_steers]pipeline.CondNoise.Steer = @splat(.{});
         recipe.applyTo(&opts, &steer_scratch);
+        // The directions live in a file on this machine; `applyTo` has no allocator
+        // or io to read it with, so the load happens here and lives as long as opts.
+        var act_dirs: []f32 = &.{};
+        defer if (act_dirs.len > 0) self.gpa.free(act_dirs);
+        var act_curve: []f32 = &.{};
+        defer if (act_curve.len > 0) self.gpa.free(act_curve);
+        if (recipe.act_dirs.slice().len > 0 and opts.act_steer.scale != 0) {
+            if (pipeline.loadActDirs(self.gpa, self.io, recipe.act_dirs.slice())) |d| {
+                act_dirs = d;
+                opts.act_steer.dirs = d;
+                if (recipe.act_curve.slice().len > 0) {
+                    const blocks = d.len / tp.models.dit.features;
+                    if (self.gpa.alloc(f32, blocks)) |cv| {
+                        tp.noise_curve.fill(recipe.act_curve.slice(), 1, cv);
+                        act_curve = cv;
+                        opts.act_steer.curve_at = cv;
+                    } else |_| {}
+                }
+            } else |err| std.log.warn("act steer: {s} did not load ({t})", .{ recipe.act_dirs.slice(), err });
+        }
         opts.prompt = gi.prompt;
         opts.negative = gi.req_negative;
         opts.cfg = gi.req_cfg;
@@ -1663,27 +1750,14 @@ pub const Diffuser = struct {
         // thread BEFORE this worker spawns (it frees the stale session so `session`
         // is null here), freeing on the worker thread would race the status-bar
         // readers, which sample `session` without gating on `busy`.
-        var sess = self.session.load(.acquire);
-        if (sess == null) {
-            const t_load = nowNs(self.io);
-            sess = pipeline.Session.init(self.io, self.gpa, opts, progress) catch |err| {
-                std.log.err("diffusion model load failed: {t}", .{err});
-                self.load_error.store(@intFromError(err), .release);
-                self.failImage(gi, err);
-                self.busy.store(false, .release);
-                self.wake();
-                return;
-            };
-            self.load_error.store(0, .release);
-            self.loaded_family.store(@as(u8, @intFromEnum(sess.?.family())) + 1, .release);
-            std.log.info("[vram] diffusion model loaded in {d:.1}s ({t}): {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
-                @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9, sess.?.family(),
-                sess.?.deviceUsed() >> 20, opts.vram_budget >> 20, sess.?.freeVram() >> 20,
-            });
-            self.session.store(sess, .release);
-            // Record what's resident (gpa-owned; freed on the next reload / free).
-            self.loaded = ModelConfig.dupe(self.gpa, want) catch null;
-        }
+        var sess: ?*pipeline.Session = self.ensureSession(opts, want, progress) catch |err| {
+            std.log.err("diffusion model load failed: {t}", .{err});
+            self.load_error.store(@intFromError(err), .release);
+            self.failImage(gi, err);
+            self.busy.store(false, .release);
+            self.wake();
+            return;
+        };
         // Reconcile the sidecars on whatever session we now hold. This is the
         // worker thread on purpose: the attach stores pointers into the stack,
         // so a swap must sit between forwards, and this is the only place that
@@ -2115,6 +2189,7 @@ test "every render-recipe field survives the round trip through Options" {
     src.emphasis = .no_norm;
     src.compat = .a1111;
 
+    src.act_steer = .{ .scale = 0.031, .op = .gain, .keep_norm = false };
     src.cond_noise = .{
         .steers = &.{
             .{ .text = "more tentacles", .scale = 1.25 },
@@ -2138,6 +2213,9 @@ test "every render-recipe field survives the round trip through Options" {
         // than at the top level, so it is walked separately just below.
         if (comptime std.mem.startsWith(u8, f.name, "cond_noise")) continue;
         if (comptime std.mem.startsWith(u8, f.name, "steer")) continue;
+        // `act_*` lives under `Options.act_steer`, and `act_dirs` is a PATH with no
+        // counterpart there at all: the worker reads the file and fills in `dirs`.
+        if (comptime std.mem.startsWith(u8, f.name, "act_")) continue;
         errdefer std.debug.print("field {s} did not survive\n", .{f.name});
         try std.testing.expectEqual(@field(src, f.name), @field(dst, f.name));
     }
@@ -2147,6 +2225,12 @@ test "every render-recipe field survives the round trip through Options" {
         errdefer std.debug.print("cond_noise.{s} did not survive\n", .{f.name});
         try std.testing.expectEqualDeep(@field(src.cond_noise, f.name), @field(dst.cond_noise, f.name));
     }
+    // The activation knobs the wire DOES carry. `dirs` and `curve_at` are absent by
+    // design: they come from the file the path names, which `applyTo` cannot read.
+    try std.testing.expectEqual(src.act_steer.scale, dst.act_steer.scale);
+    try std.testing.expectEqual(src.act_steer.op, dst.act_steer.op);
+    try std.testing.expectEqual(src.act_steer.keep_norm, dst.act_steer.keep_norm);
+
     // Steering terms round-trip as a list, text and scale both.
     try std.testing.expectEqual(src.cond_noise.steers.len, dst.cond_noise.steers.len);
     for (src.cond_noise.steers, dst.cond_noise.steers) |a, b| {

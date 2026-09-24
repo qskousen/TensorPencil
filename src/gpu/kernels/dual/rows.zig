@@ -90,6 +90,50 @@ pub inline fn rmsnorm(e: Env) void {
     }
 }
 
+/// Residual-stream steering: move each row along a unit direction.
+///
+/// a = rows, c = the direction (u4 offset, dim wide). u0 = rows, u1 = dim,
+/// u2 = op (0 scales the component already there, 1 injects the direction),
+/// u3 = keep the row's length, u4 = direction offset, u5 = first row. f0 = scale.
+///
+/// The first row is a parameter rather than an offset buffer: a Vulkan buffer is a
+/// handle, so it cannot be offset the way a CUDA pointer can.
+pub inline fn actSteer(e: Env) void {
+    const r = Rows(e);
+    const dim = e.u(1);
+    const doff = e.u(4);
+    var row = r.row;
+    while (row < e.u(0)) : (row += r.step) {
+        const base = (e.u(5) + row) * dim;
+        const before = if (e.u(3) != 0) k.sgSum(stridedSum(e, r, base, dim, false, sq)) else 0;
+
+        // gain needs the row's component along the direction; add needs its length.
+        var acc: f32 = 0;
+        if (e.u(2) == 0) {
+            var i = r.lane;
+            while (i < dim) : (i += r.lanes) acc += e.ld(.a, base + i) * e.ld(.c, doff + i);
+        } else {
+            var i = r.lane;
+            while (i < dim) : (i += r.lanes) acc += sq(e.ld(.a, base + i));
+        }
+        const m = k.sgSum(acc);
+        // gain SUBTRACTS the component, add ADDS the direction.
+        const step = if (e.u(2) == 0) -e.f(0) * m else e.f(0) * @sqrt(m);
+
+        var i = r.lane;
+        while (i < dim) : (i += r.lanes) e.st(.a, base + i, e.ld(.a, base + i) + step * e.ld(.c, doff + i));
+
+        if (e.u(3) != 0) {
+            const after = k.sgSum(stridedSum(e, r, base, dim, false, sq));
+            if (after > 0 and before > 0) {
+                const renorm = @sqrt(before / after);
+                var j = r.lane;
+                while (j < dim) : (j += r.lanes) e.st(.a, base + j, e.ld(.a, base + j) * renorm);
+            }
+        }
+    }
+}
+
 /// `rmsnorm` over groups: flattened groups are the rows, u1 their width, u2 the
 /// groups per original row (the weight is u2*u1 wide).
 pub inline fn groupRmsnorm(e: Env) void {

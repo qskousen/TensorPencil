@@ -5320,6 +5320,31 @@ pub const Backend = struct {
     }
 
     /// `dualLaunch` for a row kernel: one subgroup per row, striding.
+    /// Move each row of `x` along a unit direction (`dit.ActSteer`). `dir_off` is
+    /// where this block's direction starts in `dirs`.
+    pub fn actSteer(
+        self: *Backend,
+        x: DeviceBuffer,
+        dirs: DeviceBuffer,
+        rows: usize,
+        dim: usize,
+        dir_off: usize,
+        row_off: usize,
+        add_op: bool,
+        keep_norm: bool,
+        scale: f32,
+    ) Error!void {
+        try self.dualRows("act_steer", x, null, dirs, null, .{
+            @intCast(rows),
+            @intCast(dim),
+            @intFromBool(add_op),
+            @intFromBool(keep_norm),
+            @intCast(dir_off),
+            @intCast(row_off),
+            0,
+        }, .{ scale, 0 }, rows);
+    }
+
     fn dualRows(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, rows: usize) Error!void {
         try self.dualLaunch(entry, b0, b1, b2, b3, u, fp, dual_table.rowGroups(rows));
     }

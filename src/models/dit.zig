@@ -85,8 +85,95 @@ const LinearW = struct {
     b: ?[]const f32,
 };
 
+/// Edit the residual stream between blocks, along a direction per block.
+///
+/// The directions come from running the model on two prompt sets and taking the
+/// difference of their mean activations, so they name whatever separates the sets.
+/// Only image rows are touched: the text rows are the conditioning the blocks read.
+pub const ActSteer = struct {
+    /// `[blocks][features]`, each a unit vector. Empty while capturing.
+    dirs: []const f32 = &.{},
+    scale: f32 = 0,
+    op: Op = .gain,
+    /// Per-block scale, evaluated once per block into `curve_at`. Empty is flat.
+    curve_at: []const f32 = &.{},
+    /// Restore each row's length after the edit, so only its direction moves.
+    ///
+    /// Without this the edit compounds: every block adds along `d` and the residual
+    /// grows geometrically, so a scale of 0.3 is ~1550x over 28 blocks and the render
+    /// comes out flat. Holding the norm makes the scale a rotation instead.
+    keep_norm: bool = true,
+    /// Set instead of steering: accumulate per-block means for a derivation.
+    capture: ?*Capture = null,
+
+    pub const Op = enum {
+        /// `y -= s*d*(d.y)`: scales the component already there. s = 1 removes it,
+        /// s < 0 amplifies it. Cannot add what a row does not already have.
+        gain,
+        /// `y += s*|y|*d`: injects the direction whether or not it is present.
+        add,
+    };
+
+    pub const Capture = struct {
+        /// `[blocks][features]` running sums, and the rows that went into them.
+        sums: []f64,
+        rows: usize = 0,
+    };
+
+    /// Steer or capture one block's output. Public because the device arms call it
+    /// on a readback rather than carrying a second copy of the accumulation.
+    pub fn run(self: ActSteer, x: []f32, seq: usize, seq_txt: usize, block: usize) void {
+        const f = features;
+        const rows = seq - seq_txt;
+        if (self.capture) |cap| {
+            const acc = cap.sums[block * f ..][0..f];
+            for (0..rows) |r| {
+                const row = x[(seq_txt + r) * f ..][0..f];
+                for (acc, row) |*a, v| a.* += v;
+            }
+            if (block == 0) cap.rows += rows;
+            return;
+        }
+        if (self.dirs.len == 0) return;
+        const s = self.scale * if (self.curve_at.len > block) self.curve_at[block] else 1;
+        if (s == 0) return;
+        const d = self.dirs[block * f ..][0..f];
+        for (0..rows) |r| {
+            const row = x[(seq_txt + r) * f ..][0..f];
+            var before: f32 = 0;
+            if (self.keep_norm) for (row) |v| {
+                before += v * v;
+            };
+            switch (self.op) {
+                .gain => {
+                    var dot: f32 = 0;
+                    for (row, d) |v, dv| dot += v * dv;
+                    const k = s * dot;
+                    for (row, d) |*v, dv| v.* -= k * dv;
+                },
+                .add => {
+                    var sum: f32 = 0;
+                    for (row) |v| sum += v * v;
+                    const k = s * @sqrt(sum);
+                    for (row, d) |*v, dv| v.* += k * dv;
+                },
+            }
+            if (self.keep_norm and before > 0) {
+                var after: f32 = 0;
+                for (row) |v| after += v * v;
+                if (after > 0) {
+                    const renorm = @sqrt(before / after);
+                    for (row) |*v| v.* *= renorm;
+                }
+            }
+        }
+    }
+};
+
 pub const DiT = struct {
     arena: std.heap.ArenaAllocator,
+    /// Residual-stream steering, off by default. See `ActSteer`.
+    act_steer: ?ActSteer = null,
     first: LinearW, // 64 -> 6144
     blocks: []Block,
     /// Every block linear the device forwards run, the one list every support scan and
@@ -318,11 +405,12 @@ pub const DiT = struct {
         };
         defer freqs.deinit(gpa);
 
-        for (self.blocks) |*blk| {
+        for (self.blocks, 0..) |*blk, bi| {
             // Poll cancel between blocks so a stop lands mid-step (a full CPU
             // step can take 30+ seconds) rather than only at step boundaries.
             if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
             try self.blockForward(io, gpa, blk, x, seq, tvec, freqs);
+            if (self.act_steer) |st| st.run(x, seq, seq_txt, bi);
         }
 
         // Final layer on image tokens only (row-wise, so slicing first is safe).
@@ -1321,3 +1409,77 @@ test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
     try std.testing.expect(quantized > n_blocks * 5);
 }
 
+
+test "ActSteer gain scales the component along the direction, add injects it" {
+    const gpa = std.testing.allocator;
+    const seq_txt = 2;
+    const rows = 3;
+    const seq = seq_txt + rows;
+    const blocks = 2;
+
+    const x = try gpa.alloc(f32, seq * features);
+    defer gpa.free(x);
+    for (x, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017);
+    const base = try gpa.dupe(f32, x);
+    defer gpa.free(base);
+
+    const dirs = try gpa.alloc(f32, blocks * features);
+    defer gpa.free(dirs);
+    @memset(dirs, 0);
+    // Block 1's direction is one axis, so its effect is readable element by element.
+    dirs[1 * features + 7] = 1;
+
+    const st: ActSteer = .{ .dirs = dirs, .scale = 1, .op = .gain, .keep_norm = false };
+    st.run(x, seq, seq_txt, 1);
+    // Text rows are the conditioning the blocks read, and are left alone.
+    try std.testing.expectEqualSlices(f32, base[0 .. seq_txt * features], x[0 .. seq_txt * features]);
+    for (0..rows) |r| {
+        const off = (seq_txt + r) * features;
+        // scale 1 removes the component entirely...
+        try std.testing.expectApproxEqAbs(@as(f32, 0), x[off + 7], 1e-6);
+        // ...and touches nothing else.
+        try std.testing.expectEqual(base[off + 8], x[off + 8]);
+    }
+
+    @memcpy(x, base);
+    const add: ActSteer = .{ .dirs = dirs, .scale = 0.1, .op = .add, .keep_norm = false };
+    add.run(x, seq, seq_txt, 1);
+    for (0..rows) |r| {
+        const off = (seq_txt + r) * features;
+        var sum: f32 = 0;
+        for (base[off..][0..features]) |v| sum += v * v;
+        try std.testing.expectApproxEqRel(base[off + 7] + 0.1 * @sqrt(sum), x[off + 7], 1e-5);
+        try std.testing.expectEqual(base[off + 8], x[off + 8]);
+    }
+
+    // A block with no direction set moves nothing.
+    @memcpy(x, base);
+    st.run(x, seq, seq_txt, 0);
+    try std.testing.expectEqualSlices(f32, base, x);
+}
+
+test "ActSteer capture sums image rows and counts them once" {
+    const gpa = std.testing.allocator;
+    const seq_txt = 1;
+    const rows = 4;
+    const seq = seq_txt + rows;
+    const blocks = 2;
+
+    const x = try gpa.alloc(f32, seq * features);
+    defer gpa.free(x);
+    for (x, 0..) |*v, i| v.* = @floatFromInt(i % 5);
+
+    var cap: ActSteer.Capture = .{ .sums = try gpa.alloc(f64, blocks * features) };
+    defer gpa.free(cap.sums);
+    @memset(cap.sums, 0);
+    const st: ActSteer = .{ .capture = &cap };
+    for (0..blocks) |b| st.run(x, seq, seq_txt, b);
+
+    // Counted on block 0 only, or a 28-block model would count every row 28 times.
+    try std.testing.expectEqual(rows, cap.rows);
+    for (0..features) |i| {
+        var want: f64 = 0;
+        for (0..rows) |r| want += x[(seq_txt + r) * features + i];
+        try std.testing.expectApproxEqAbs(want, cap.sums[i], 1e-9);
+    }
+}

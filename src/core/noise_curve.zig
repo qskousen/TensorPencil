@@ -267,6 +267,20 @@ pub const cond_shapes = [_]CondShape{
     .{ .name = "Prompt tail", .expr = "a*l/n" },
 };
 
+/// Named shapes for a per-BLOCK curve over a diffusion denoiser's stack, where `t`
+/// is 0 at the first block and 1 at the last.
+///
+/// Separate from `cond_shapes` for the same reason those are separate from
+/// `documented_shapes`: the axis is different, so the names would mislead. Early
+/// blocks set the composition and late ones the rendering.
+pub const block_shapes = [_]CondShape{
+    .{ .name = "All blocks", .expr = "a" },
+    .{ .name = "Late only", .expr = "max(0, (t-0.7)/0.3)" },
+    .{ .name = "Late half", .expr = "max(0, (t-0.5)*2)" },
+    .{ .name = "Middle", .expr = "max(0, 1 - abs(t-0.5)*4)" },
+    .{ .name = "Early only", .expr = "max(0, 1-t/0.3)" },
+};
+
 pub const documented_shapes = [_][]const u8{
     "a", // flat
     "a*(1-t)^2", // front-loaded
@@ -438,4 +452,24 @@ test "a position-only curve responds to the amount" {
     // Still false for one that genuinely ignores the knob, both axes included.
     try std.testing.expect(!respondsToAmount("0.3*(1-t)^2"));
     try std.testing.expect(!respondsToAmount("l/n"));
+}
+
+test "every block shape parses and they are distinct" {
+    var seen: [block_shapes.len][5]f32 = undefined;
+    for (block_shapes, 0..) |sh, i| {
+        errdefer std.debug.print("shape '{s}' = {s}\n", .{ sh.name, sh.expr });
+        try validate(sh.expr);
+        // No `respondsToAmount` here: a block curve is a pure SHAPE evaluated at
+        // a = 1, and the strength is its own knob.
+        for (0..5) |k| {
+            const t: f32 = @as(f32, @floatFromInt(k)) / 4;
+            seen[i][k] = sanitize(try eval(sh.expr, .{ .t = t, .a = 1 }));
+        }
+    }
+    for (0..block_shapes.len) |i| for (i + 1..block_shapes.len) |j| {
+        errdefer std.debug.print("'{s}' and '{s}' sample identically\n", .{
+            block_shapes[i].name, block_shapes[j].name,
+        });
+        try std.testing.expect(!std.mem.eql(f32, &seen[i], &seen[j]));
+    };
 }

@@ -152,6 +152,19 @@ var f_steer_text: [max_steers]config.TextBuf(config.max_steer_text) = @splat(.{}
 var f_steer_scale: [max_steers]f32 = @splat(0.25);
 var f_steer_mode: [max_steers]config.SteerMode = @splat(.prompt);
 var f_steer_n: usize = 0;
+var f_act_dirs: config.TextBuf(config.max_path) = .{};
+var f_act_scale: f32 = 0;
+var f_act_op: config.ActOp = .add;
+var f_act_curve: config.TextBuf(config.max_noise_curve) = .{};
+var f_act_keep_norm: bool = true;
+/// The "create a direction" modal: open flag and its form.
+var g_act_modal = false;
+var g_act_set_a: [1024]u8 = @splat(0);
+var g_act_set_b: [1024]u8 = @splat(0);
+var g_act_name: [64]u8 = @splat(0);
+var g_act_size: [8]u8 = @splat(0);
+var g_act_steps: [8]u8 = @splat(0);
+var g_act_sent = false;
 /// Whether each term's text field had keyboard focus on the last frame. Read by
 /// `ui-probe --click`, which is how a click that never reaches a widget is told
 /// apart from one that reaches it and does nothing.
@@ -269,6 +282,11 @@ fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
     f_cond_keep_norm = cfg.cond_noise_keep_norm;
     setNum(&f_cond_amount_buf, cfg.cond_noise_amount);
     setNum(&f_cond_negative_buf, cfg.cond_noise_negative);
+    f_act_dirs = cfg.act_dirs;
+    f_act_scale = cfg.act_scale;
+    f_act_op = cfg.act_op;
+    f_act_curve = cfg.act_curve;
+    f_act_keep_norm = cfg.act_keep_norm;
     f_steer_n = cfg.cond_steers.count;
     for (cfg.cond_steers.slice(), 0..) |t, i| {
         f_steer_text[i] = t.text;
@@ -1268,6 +1286,10 @@ fn renderAdvancedSection(cfg: *config.Config, cb: Callbacks) void {
 
     renderCondNoise();
     renderCondSteer();
+    renderActSteer();
+    // Drawn from the section so it sits inside the same frame; a floating window
+    // is positioned by dvui, not by where it is called.
+    if (g_act_modal) renderActModal();
 
     help(2, "Everything above is per image: it is stamped on each render you queue, " ++
         "and Settings keeps the defaults new renders start from. Live preview, the " ++
@@ -1437,6 +1459,170 @@ fn renderCondSteer() void {
     }
 }
 
+/// Residual-stream steering: edit the DiT's own activations between blocks, along
+/// directions derived by `act-derive`.
+///
+/// The directions are a file on the HOST's disk, not something the client uploads:
+/// a set is ~700 KB and belongs beside the models.
+fn renderActSteer() void {
+    {
+        var row = rowBegin(@src(), 11, "Act steer");
+        defer row.deinit();
+        numChip(@src(), &f_act_dirs.data, "", 250, 0);
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 8, .h = 4 } });
+        defer row.deinit();
+        if (bubbles.secondaryButton(@src(), 2, "Create a direction…", true)) {
+            if (std.mem.sliceTo(&g_act_size, 0).len == 0) setBuf(&g_act_size, "256");
+            if (std.mem.sliceTo(&g_act_steps, 0).len == 0) setBuf(&g_act_steps, "8");
+            g_act_sent = false;
+            g_act_modal = true;
+        }
+    }
+    if (f_act_dirs.slice().len == 0) return;
+    {
+        var row = rowBegin(@src(), 12, "Strength");
+        defer row.deinit();
+        _ = dvui.sliderEntry(@src(), "{d:0.3}", .{
+            .value = &f_act_scale,
+            .min = -0.5,
+            .max = 0.5,
+            .interval = 0.001,
+        }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+        _ = enumChip(@src(), config.ActOp, &f_act_op, 0);
+    }
+    // Derived by matching the live expression, like the conditioning curve, so
+    // editing it cannot desync a remembered name. Empty means flat, which is what
+    // "All blocks" is, so it reads as that rather than as Custom.
+    const shapes = tp.noise_curve.block_shapes;
+    var sel: usize = shapes.len;
+    if (f_act_curve.slice().len == 0) {
+        sel = 0;
+    } else for (shapes, 0..) |sh, i| {
+        if (std.mem.eql(u8, sh.expr, f_act_curve.slice())) {
+            sel = i;
+            break;
+        }
+    }
+    {
+        var row = rowBegin(@src(), 13, "Blocks");
+        defer row.deinit();
+        var labels: [shapes.len + 1][]const u8 = undefined;
+        inline for (shapes, 0..) |sh, i| labels[i] = sh.name;
+        labels[shapes.len] = "Custom…";
+        if (style.chipDropdown(@src(), &labels, &sel, .{ .id_extra = 1 })) {
+            // Custom leaves the expression alone; the field below edits it.
+            if (sel < shapes.len) f_act_curve.set(shapes[sel].expr);
+        }
+    }
+    if (sel >= shapes.len) {
+        {
+            var row = rowBegin(@src(), 15, "Expression");
+            defer row.deinit();
+            numChip(@src(), &f_act_curve.data, "", 250, 3);
+        }
+        if (std.meta.isError(tp.noise_curve.validate(f_act_curve.slice()))) {
+            help(10, "That curve does not parse, so this render would steer nothing. " ++
+                "It is an expression in t, 0 at the first block and 1 at the last.");
+        }
+    }
+    {
+        var row = rowBegin(@src(), 14, "Keep length");
+        defer row.deinit();
+        _ = dvui.checkbox(@src(), &f_act_keep_norm, null, .{ .gravity_y = 0.5 });
+    }
+    help(7, "Edits the DiT's activations between blocks, not the prompt. Strength " ++
+        "compounds over the blocks it touches, so it bites far harder than the " ++
+        "conditioning knobs: start near 0.02. Early blocks set the composition and " ++
+        "late ones the rendering, so which blocks matters as much as how much.");
+}
+
+/// Open the create-direction modal, so `ui-probe` can draw it.
+pub fn openActModalForProbe() void {
+    g_act_modal = true;
+    setBuf(&g_act_set_a, "a hill at night with a large full moon; the ocean at night with a large full moon");
+    setBuf(&g_act_set_b, "a hill at night; the ocean at night");
+    setBuf(&g_act_name, "moon");
+    setBuf(&g_act_size, "256");
+    setBuf(&g_act_steps, "8");
+}
+
+/// Collect two prompt sets and ask the host to derive a direction from them.
+///
+/// The work happens on the host: it owns the model, and the file it writes lands
+/// beside the models there. The client only posts the request and waits.
+fn renderActModal() void {
+    var win = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &g_act_modal }, .{
+        .min_size_content = .{ .w = 520, .h = 420 },
+    });
+    defer win.deinit();
+    win.dragAreaSet(dvui.windowHeader("Create an activation direction", "", &g_act_modal));
+
+    help(8, "Two sets of prompts that differ in ONE thing. The direction is what " ++
+        "separates them: put the thing you want in every A prompt and leave it out " ++
+        "of the matching B prompt. Six matched pairs beat one unmatched pair by a " ++
+        "lot. Separate prompts with a semicolon. The name is one word; the file " ++
+        "lands in your first model folder as <name>.actd.");
+
+    for ([_][]const u8{ "With the thing (A)", "Without it (B)" }, [_][]u8{ &g_act_set_a, &g_act_set_b }, 0..) |label, buf, i| {
+        dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = i, .font = F.ui, .color_text = C.text_dim, .padding = .{ .y = 6 } });
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = buf },
+            .multiline = true,
+            .break_lines = true,
+            .scroll_horizontal = false,
+        }, .{ .id_extra = i, .expand = .horizontal, .min_size_content = .{ .h = 64 } });
+        te.deinit();
+    }
+    {
+        var row = rowBegin(@src(), 0, "Name");
+        defer row.deinit();
+        numChip(@src(), &g_act_name, "", 160, 0);
+        numChip(@src(), &g_act_size, "px", 54, 1);
+        numChip(@src(), &g_act_steps, "steps", 54, 2);
+    }
+
+    const busy = g_m.act_busy;
+    if (busy) {
+        help(9, "Working. The host is running every prompt through the model, which is " ++
+            "seconds per prompt and holds up its renders meanwhile.");
+    } else if (g_act_sent) {
+        if (g_m.act_err.slice().len > 0) {
+            var buf: [160]u8 = undefined;
+            help(9, std.fmt.bufPrint(&buf, "That did not work: {s}", .{g_m.act_err.slice()}) catch "That did not work.");
+        } else if (g_m.act_path.slice().len > 0) {
+            help(9, "Done. The path is filled in above; Generate uses it now.");
+        }
+    }
+
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 8 } });
+        defer row.deinit();
+        if (bubbles.secondaryButton(@src(), 0, if (busy) "Working…" else "Create", !busy)) {
+            g_act_sent = true;
+            g_m.act_busy = true;
+            g_m.act_path.set("");
+            g_m.act_err.set("");
+            g_post(.{ .act_derive = .{
+                .set_a = std.mem.sliceTo(&g_act_set_a, 0),
+                .set_b = std.mem.sliceTo(&g_act_set_b, 0),
+                .name = std.mem.sliceTo(&g_act_name, 0),
+                .size = @intCast(parseNum(&g_act_size, 256)),
+                .steps = @intCast(parseNum(&g_act_steps, 8)),
+            } });
+        }
+        if (bubbles.secondaryButton(@src(), 1, "Close", true)) g_act_modal = false;
+    }
+
+    // The host answered: take the path straight into the form, so the thing just
+    // made is the thing the next render uses.
+    if (g_act_sent and !busy and g_m.act_path.slice().len > 0) {
+        f_act_dirs.set(g_m.act_path.slice());
+        if (f_act_scale == 0) f_act_scale = 0.02;
+    }
+}
+
 /// A wrapped note under a section head.
 ///
 /// `F.row`, not `F.ui_sm`: the compact UI roles are single-spaced (line 1.0),
@@ -1590,6 +1776,11 @@ fn generate(cfg: *const config.Config) void {
     // The toggle is the switch: an empty curve is off on the engine side too, so a
     // disabled section cannot leave a curve applied.
     if (f_cond_on) params.cond_noise.set(f_cond_curve.slice());
+    params.act_dirs.set(f_act_dirs.slice());
+    params.act_scale = f_act_scale;
+    params.act_op = pipeline_map.toPipelineActOp(f_act_op);
+    params.act_curve.set(f_act_curve.slice());
+    params.act_keep_norm = f_act_keep_norm;
     for (0..f_steer_n) |i| {
         // An empty term or a zero scale is DROPPED rather than sent: each term
         // costs a text-encoder forward on the host, and "off" should cost nothing.
@@ -1730,6 +1921,11 @@ pub fn saveDefaults(cfg: *config.Config, fam: ?model_spec.Family) void {
     cfg.cond_noise_keep_norm = f_cond_keep_norm;
     cfg.cond_noise_amount = condAmount();
     cfg.cond_noise_negative = condNegative();
+    cfg.act_dirs = f_act_dirs;
+    cfg.act_scale = f_act_scale;
+    cfg.act_op = f_act_op;
+    cfg.act_curve = f_act_curve;
+    cfg.act_keep_norm = f_act_keep_norm;
     cfg.cond_steers = .{};
     for (0..f_steer_n) |i| {
         if (f_steer_text[i].slice().len == 0) continue;

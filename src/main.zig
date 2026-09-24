@@ -82,6 +82,8 @@ pub fn main(init: std.process.Init) !void {
         defer ctx.deinit();
         try stdout.print("cuda device: {s}\n", .{ctx.deviceName()});
         try cuda.kernels.blockQDecodeTest(&ctx, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "act-derive")) {
+        try actDerive(gpa, io, stdout, args[2..]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-fp8-test")) {
         try cudaFp8Test(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-encode-test")) {
@@ -3030,6 +3032,97 @@ fn renderParams(
     });
 }
 
+/// Derive residual-stream steering directions by running two prompt sets and taking
+/// the difference of their mean per-block activations.
+///
+/// File is `ACTD1` + blocks + features + `[blocks][features]` f32 unit vectors. Plain
+/// because nothing here writes safetensors.
+/// Takes a real allocator, never the process gpa: this runs one sampling pass per
+/// prompt, so per-step buffers that never come back add up over a whole prompt set.
+fn actDerive(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
+    var opts: TensorPencil.pipeline.Options = .{ .prompt = "" };
+    opts.width = 512;
+    opts.height = 512;
+    opts.steps = 4;
+    // The capture runs on whatever backend renders, so default to the fast one.
+    opts.backend = .cuda;
+    var set_a: []const u8 = "";
+    var set_b: []const u8 = "";
+    var out_path: []const u8 = "dirs.actd";
+
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 2) {
+        const flag = args[i];
+        const val = args[i + 1];
+        if (std.mem.eql(u8, flag, "--dit")) {
+            opts.dit_path = val;
+        } else if (std.mem.eql(u8, flag, "--text-encoder")) {
+            opts.text_encoder_path = val;
+            opts.explicit_text_encoder = true;
+        } else if (std.mem.eql(u8, flag, "--vae")) {
+            opts.vae_path = val;
+            opts.explicit_vae = true;
+        } else if (std.mem.eql(u8, flag, "--set-a")) {
+            set_a = val;
+        } else if (std.mem.eql(u8, flag, "--set-b")) {
+            set_b = val;
+        } else if (std.mem.eql(u8, flag, "--out")) {
+            out_path = val;
+        } else if (std.mem.eql(u8, flag, "--size")) {
+            opts.width = try std.fmt.parseInt(usize, val, 10);
+            opts.height = opts.width;
+        } else if (std.mem.eql(u8, flag, "--steps")) {
+            opts.steps = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, flag, "--backend")) {
+            opts.backend = std.meta.stringToEnum(TensorPencil.pipeline.Backend, val) orelse return error.InvalidArgs;
+        } else {
+            try stdout.print("unknown flag {s}\n", .{flag});
+            return error.InvalidArgs;
+        }
+    }
+    if (set_a.len == 0 or set_b.len == 0) {
+        try stdout.print("act-derive needs --set-a and --set-b (prompts separated by ';')\n", .{});
+        return error.InvalidArgs;
+    }
+
+    var sess = try TensorPencil.pipeline.Session.init(io, gpa, opts, stdout);
+    defer sess.deinit();
+    const shape = sess.actShape() orelse {
+        try stdout.print("this family has no residual-stream hook\n", .{});
+        return error.InvalidArgs;
+    };
+
+    var a_list: std.ArrayList([]const u8) = .empty;
+    defer a_list.deinit(gpa);
+    var b_list: std.ArrayList([]const u8) = .empty;
+    defer b_list.deinit(gpa);
+    for ([_][]const u8{ set_a, set_b }, [_]*std.ArrayList([]const u8){ &a_list, &b_list }) |set, list| {
+        var it = std.mem.splitScalar(u8, set, ';');
+        while (it.next()) |raw| {
+            const p = std.mem.trim(u8, raw, " \t");
+            if (p.len > 0) try list.append(gpa, p);
+        }
+    }
+
+    const Note = struct {
+        fn on(ctx: *anyopaque, prompt: []const u8, done: usize, total: usize) void {
+            const w: *Io.Writer = @ptrCast(@alignCast(ctx));
+            w.print("  [{d}/{d}] {s}\n", .{ done, total, prompt }) catch {};
+            w.flush() catch {};
+        }
+    };
+    const dirs = try TensorPencil.pipeline.ActDerive.run(sess, gpa, opts, a_list.items, b_list.items, .{
+        .ctx = @ptrCast(stdout),
+        .on = Note.on,
+    });
+    defer gpa.free(dirs);
+    const bytes = try TensorPencil.pipeline.ActDerive.encodeFile(gpa, shape.blocks, shape.features, dirs);
+    defer gpa.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+    try stdout.print("wrote {s} ({d} blocks x {d})\n", .{ out_path, shape.blocks, shape.features });
+    try stdout.flush();
+}
+
 fn mageflowBench(
     arena: std.mem.Allocator,
     io: Io,
@@ -5776,6 +5869,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     defer loras.deinit(arena);
     var steers: [8]TensorPencil.pipeline.CondNoise.Steer = @splat(.{});
     var n_steers: usize = 0;
+    var act_path: []const u8 = "";
+    var act_scale: f32 = 0;
+    var act_op: TensorPencil.models.dit.ActSteer.Op = .gain;
+    var act_keep_norm = true;
+    var act_curve: []const u8 = "";
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         const flag = args[i];
@@ -5902,6 +6000,23 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             };
         } else if (std.mem.eql(u8, flag, "--cond-noise-keep-norm")) {
             opts.cond_noise.keep_norm = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--act-steer")) {
+            act_path = val;
+        } else if (std.mem.eql(u8, flag, "--act-scale")) {
+            act_scale = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, flag, "--act-keep-norm")) {
+            act_keep_norm = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--act-curve")) {
+            TensorPencil.noise_curve.validate(val) catch {
+                try stdout.print("--act-curve '{s}' is not a valid curve\n", .{val});
+                return error.InvalidArgs;
+            };
+            act_curve = val;
+        } else if (std.mem.eql(u8, flag, "--act-op")) {
+            act_op = std.meta.stringToEnum(TensorPencil.models.dit.ActSteer.Op, val) orelse {
+                try stdout.print("unknown --act-op '{s}' (expected: gain, add)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--cond-steer")) {
             // Repeatable: each one opens a term, and the `--cond-steer-scale` after
             // it sets that term's scale. Terms are independent, so "more tentacles"
@@ -6045,6 +6160,24 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     // is the workflow's call upstream too.
     opts.loras = loras.items;
     opts.cond_noise.steers = steers[0..n_steers];
+    if (act_path.len > 0) {
+        const dirs = TensorPencil.pipeline.loadActDirs(arena, io, act_path) catch {
+            try stdout.print("{s} is not a readable ACTD1 direction file\n", .{act_path});
+            return error.InvalidArgs;
+        };
+        var curve_at: []f32 = &.{};
+        if (act_curve.len > 0) {
+            curve_at = try arena.alloc(f32, dirs.len / TensorPencil.models.dit.features);
+            TensorPencil.noise_curve.fill(act_curve, 1, curve_at);
+        }
+        opts.act_steer = .{
+            .dirs = dirs,
+            .scale = act_scale,
+            .op = act_op,
+            .curve_at = curve_at,
+            .keep_norm = act_keep_norm,
+        };
+    }
     if (ref_paths.items.len != 0) {
         // Both families' arrays from one decode: each ignores the other's field,
         // so the CLI does not have to know the architecture before the session

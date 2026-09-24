@@ -695,6 +695,7 @@ const bodies = .{
     .{ "qknorm_rope_f32", elt.qknormRopeF32 },
     .{ "l2norm_rows", rows.l2normRows },
     .{ "l2norm_rows_g", rows.l2normRowsG },
+    .{ "act_steer", rows.actSteer },
     .{ "rmsnorm", rows.rmsnorm },
     .{ "group_rmsnorm", rows.groupRmsnorm },
     .{ "rms_mod", rows.rmsMod },

@@ -10,6 +10,7 @@
 //! owner tells them apart by the generation the reconnect reports.
 const std = @import("std");
 const wire = @import("serve").wire;
+const config = @import("shared").config;
 const catalog = @import("shared").catalog;
 
 const log = std.log.scoped(.mirror);
@@ -255,6 +256,11 @@ pub const Mirror = struct {
     telemetry: wire.Telemetry = .{},
     /// Count of `turn_end` events, so a consumer can act once per finished turn.
     turns_ended: u64 = 0,
+    /// A direction derivation is running on this host; then where it landed, or why
+    /// it did not. Client-side only: the host keeps nothing about a finished one.
+    act_busy: bool = false,
+    act_path: config.PathBuf = .{},
+    act_err: config.TextBuf(96) = .{},
     /// The last error the host reported, until the consumer takes it.
     last_err: ?HostErr = null,
     /// The last informational notice, until the consumer takes it. One slot, as
@@ -624,6 +630,11 @@ pub const Mirror = struct {
                     var tmp: Call = .{ .msg = c.msg, .variant = c.variant, .index = c.index, .req = owned };
                     tmp.deinit(gpa);
                 };
+            },
+            .act_derived => |d| {
+                self.act_busy = false;
+                self.act_path.set(d.path);
+                self.act_err.set(d.err);
             },
             .telemetry => |t| {
                 self.telemetry = t;
