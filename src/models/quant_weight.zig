@@ -514,6 +514,28 @@ pub fn load(
     return lin.maybeDequant(alloc, w);
 }
 
+/// A convolution's weights as a loader hands them on: the checkpoint's own
+/// `[co][ci][k][k]` tensor, zero-copy, where every reader converts it as it reads
+/// (`ops.conv.Weights.torch`: dense f32/f16/bf16 and the block quants), else repacked to
+/// f32 once here (an f64 merge, a scaled fp8). A conv with fewer than 64 outputs, a
+/// model's RGB or latent end, is repacked too: the CUDA arm runs it on the f32 GEMM,
+/// which reads only repacked f32, and it is a few KB.
+///
+/// A 5-D `[co][ci][kt][k][k]` causal video kernel is read at its last temporal slice.
+pub fn convWeights(alloc: std.mem.Allocator, view: weights_mod.TensorView, co: usize, ci: usize, k: usize) !ops.conv.Weights {
+    const dt = view.info.dtype;
+    const shape = view.info.shape.slice();
+    const kt: usize = if (shape.len == 5) shape[2] else 1;
+    const keep = co >= 64 and switch (dt) {
+        .f32, .f16, .bf16 => true,
+        else => dt.isBlockQuant(),
+    };
+    const torch: ops.conv.Weights.Torch = .{ .w = Weight.init(view.bytes, dt, co, ci * kt * k * k), .kt = kt };
+    const probe: ops.conv.Conv2d = .{ .w = .{ .torch = torch }, .co = co, .ci = ci, .k = k };
+    if (keep) return probe.w;
+    return .{ .krsc = try probe.materialize(alloc) };
+}
+
 /// The checkpoint name on the Weight, which is what attributes a GEMM to a layer
 /// downstream (`ops.matmul.probe`, profiling, error messages). Duped because callers
 /// build the name in a stack buffer.

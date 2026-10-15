@@ -51,8 +51,14 @@
 //!   digest of the weights: no prompt, no reply, no pixel). `hash_models = false`
 //!   turns it off;
 //! - thread names (`/proc/self/task/*/comm`) and the GPU device nodes;
-//! - `~/.nv/ComputeCache/*`, which the NVIDIA driver writes on its own account
-//!   (compiled kernels, no user content) and which no unit test would find.
+//! - under `<XDG_CACHE_HOME or ~/.cache>/tensorpencil/` (Vulkan only): the
+//!   compiled-pipeline cache `vk-pipelines-<driver uuid>.bin`, the list of kernel
+//!   NAMES runs have used `vk-kernels-used` (`gpu/pipe_cache.zig`; off with
+//!   `TP_VK_PIPELINE_CACHE=0`), and the measured GEMM tile shapes `coop_tile`;
+//!   each through a `.tmp` and a rename;
+//! - `~/.nv/ComputeCache/*` and `~/.cache/nvidia/GLCache/*`, which the NVIDIA
+//!   driver writes on its own account (compiled kernels, no user content) and
+//!   which no unit test would find.
 //!
 //! Nothing on that list holds a prompt, a reply or a rendered pixel: the
 //! engine writes no files at all, and saving an image is the client's job.

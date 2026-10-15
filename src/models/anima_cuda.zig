@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const anima = @import("anima.zig");
+const anima_dev = @import("anima_dev.zig");
 const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -95,7 +96,7 @@ pub const Session = struct {
             .seq = seq,
             .ctx_seq = ctx_seq,
             .freqs_d = undefined,
-            .plan = try lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "anima cuda"),
+            .plan = try lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "anima cuda"),
             .ck_d = undefined,
             .cv_d = undefined,
             .sigmas = &.{},
@@ -138,6 +139,9 @@ pub const Session = struct {
             // Pre-size the decode scratches before any batch opens; one sizing serves the
             // cross-K/V batch below and every later forward.
             try lin_cuda.presize(be, self.plan, model.device_lins);
+            // The patch embed runs on the fused `opMatmul`. The cross K/V below are
+            // `ctx_seq` rows, the trunk's `seq`.
+            try lin_cuda.attachLora(be, &self.plan, model.lora, model.device_lins, @max(seq, ctx_seq));
 
             var cond_d = try be.tensorCreate(cond.len * 4);
             defer be.tensorDestroy(&cond_d);
@@ -154,9 +158,9 @@ pub const Session = struct {
                 const kv_out = self.ck_d.viewF32(off);
                 const vv_out = self.cv_d.viewF32(off);
                 // k and v share the context activation, so one prep serves both.
-                try lin_cuda.prep(be, self.plan, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v }, false);
-                try lin_cuda.gemm(be, self.plan, kv_out, cond_d, ctx_seq, blk.cross_attn.k, false);
-                try lin_cuda.gemm(be, self.plan, vv_out, cond_d, ctx_seq, blk.cross_attn.v, false);
+                const kv = try lin_cuda.prep(be, self.plan, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v });
+                try lin_cuda.gemm(be, self.plan, kv, kv_out, blk.cross_attn.k, null);
+                try lin_cuda.gemm(be, self.plan, kv, vv_out, blk.cross_attn.v, null);
                 // K is normed, V is NOT (`v_norm = nn.Identity()`), the asymmetry
                 // `DiT.projectKv` owns on the host path.
                 try be.qkNorm(kv_out, kv_out, try normBuf(be, blk.cross_attn.knorm), ctx_seq * cfg.n_heads, cfg.headDim(), cfg.qk_eps);
@@ -197,10 +201,12 @@ pub const Workspace = struct {
     mlp_d: Buf, // [seq][mlp_dim]
     mod_d: Buf, // this step's whole folded modulation table
     patch_d: Buf, // [seq][patchDim] raw patches
+    /// The storage of `x_d`, `nrm_d`, `dlt_d` and `mlp_d` (`anima_dev.streamDtFor`).
+    act: cuda.backend.Dt,
 
     const fields = [_][]const u8{ "x_d", "nrm_d", "dlt_d", "q_d", "k_d", "v_d", "attn_d", "mlp_d", "mod_d", "patch_d" };
 
-    pub fn init(be: *Backend, model: *const DiT, lat_h: usize, lat_w: usize) !Workspace {
+    pub fn init(be: *Backend, model: *const DiT, lat_h: usize, lat_w: usize, act: cuda.backend.Dt) !Workspace {
         const cfg = model.cfg;
         const seq = (lat_h / cfg.patch) * (lat_w / cfg.patch);
         const d = cfg.dim;
@@ -233,6 +239,8 @@ pub const Workspace = struct {
             @field(self, name) = try be.tensorCreate(size);
             made += 1;
         }
+        self.act = act;
+        inline for (.{ "x_d", "nrm_d", "dlt_d", "mlp_d" }) |name| @field(self, name).dt = act;
         return self;
     }
 
@@ -245,7 +253,8 @@ pub const Workspace = struct {
 /// Whether the CUDA arms can run every block linear this model has. The refusal, if
 /// any, is logged by name.
 pub fn supported(model: *const DiT) bool {
-    _ = lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "anima cuda") catch return false;
+    _ = lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "anima cuda") catch return false;
+    if (!lin_cuda.loraRunnable(model.lora, model.device_lins, "anima cuda")) return false;
     return true;
 }
 
@@ -263,11 +272,6 @@ pub fn forward(
     cancel: ?*std.atomic.Value(bool),
 ) !void {
     const cfg = model.cfg;
-    const d = cfg.dim;
-    const seq = sess.seq;
-    const hd = cfg.headDim();
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-
     std.debug.assert(x_lat.len == cfg.channels * sess.lat_h * sess.lat_w);
     std.debug.assert(out.len == cfg.out_channels * sess.lat_h * sess.lat_w);
 
@@ -279,119 +283,115 @@ pub fn forward(
         owned = tbl;
         break :blk tbl;
     };
-
     const patches = try anima.patchify(gpa, cfg, x_lat, sess.lat_h, sess.lat_w);
     defer gpa.free(patches);
-
     try be.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(mod));
     try be.tensorUpload(ws.patch_d, std.mem.sliceAsBytes(patches));
 
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
-
-    // `x_embedder` is one of the two weights the loader materializes to f32 (it feeds
-    // the fused `opMatmul`, which has no bf16 pipeline), so it takes the f32 arm.
-    try be.opMatmul(ws.x_d, 0, ws.patch_d, 0, seq, model.x_embedder.bytes, model.x_embedder.dtype == .f8_e4m3, d, cfg.patchDim(), model.x_embedder.scale, null);
-
-    // Prefetch one block ahead throughout, so each block's upload overlaps the
-    // previous block's compute. Without it the first step pays the whole weight
-    // upload serially, `zimage_cuda` measured 8.0 s for step 1 against a 2.6 s
-    // steady state at 1056x1584, which on a short render is a fifth of the total.
-    if (be.async_uploads and model.blocks.len > 0) prefetchBlock(be, model.blocks[0]);
-    for (model.blocks, 0..) |*blk, bi| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (be.async_uploads and bi + 1 < model.blocks.len) prefetchBlock(be, model.blocks[bi + 1]);
-        try blockForward(be, sess, cfg, blk, ws, bi, bi * 9 * d, attn_scale);
-    }
+    try anima_dev.body(Dev{ .model = model, .be = be, .sess = sess, .ws = ws }, model, sess.seq, cancel);
     try be.endBatch();
+    // A 16-bit stream that overflowed can leave the output finite (`allFinite`).
+    if (ws.act != .f32 and !try be.allFinite(ws.x_d, sess.seq * cfg.dim)) return error.NonFiniteActivation;
 
-    // --- the final layer, on the host ------------------------------------------
-    const rows = try gpa.alloc(f32, seq * d);
+    const rows = try gpa.alloc(f32, sess.seq * cfg.dim);
     defer gpa.free(rows);
-    try be.tensorDownload(ws.x_d, std.mem.sliceAsBytes(rows));
-    try model.finalize(io, gpa, out, rows, mod[cfg.n_layers * 9 * d ..][0 .. 2 * d], sess.lat_h, sess.lat_w);
+    try be.downloadF32(ws.x_d, rows);
+    try model.finalize(io, gpa, out, rows, mod[cfg.n_layers * 9 * cfg.dim ..][0 .. 2 * cfg.dim], sess.lat_h, sess.lat_w);
 }
 
-fn blockForward(
+/// `anima_dev`'s ops on this backend.
+const Dev = struct {
+    model: *const DiT,
     be: *Backend,
     sess: *Session,
-    cfg: anima.Config,
-    blk: anytype,
     ws: *Workspace,
-    bi: usize,
-    mod_base: usize,
-    attn_scale: f32,
-) !void {
-    const d = cfg.dim;
-    const seq = sess.seq;
-    const heads = cfg.n_heads;
-    const hd = cfg.headDim();
-    const half = hd / 2;
 
-    // --- self-attention --------------------------------------------------------
-    // The pre-norm's scale block carries the `1 +` already (`foldModulationTable`).
-    try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + d, mod_base, cfg.norm_eps);
-    // q/k/v share one activation, so one prep serves all three.
-    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{ blk.self_attn.q, blk.self_attn.k, blk.self_attn.v }, false);
-    try lin_cuda.gemm(be, sess.plan, ws.q_d, ws.nrm_d, seq, blk.self_attn.q, false);
-    try lin_cuda.gemm(be, sess.plan, ws.k_d, ws.nrm_d, seq, blk.self_attn.k, false);
-    try lin_cuda.gemm(be, sess.plan, ws.v_d, ws.nrm_d, seq, blk.self_attn.v, false);
-
-    // Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps`, unlike
-    // Z-Image, whose `RMSNorm(head_dim)` is built with no `eps` at all.
-    try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.self_attn.qnorm), seq * heads, hd, cfg.qk_eps);
-    try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, blk.self_attn.knorm), seq * heads, hd, cfg.qk_eps);
-    // SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved `be.rope` that
-    // Z-Image and krea2 use.
-    try be.ropeHalf(ws.q_d, sess.freqs_d, seq, heads, half, seq * half, 0);
-    try be.ropeHalf(ws.k_d, sess.freqs_d, seq, heads, half, seq * half, 0);
-
-    if (force_naive_attn) {
-        try be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, seq, heads, heads, hd, attn_scale, false);
-    } else {
-        try be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, heads, heads, hd, attn_scale);
+    fn scale(d: Dev) f32 {
+        return 1.0 / @sqrt(@as(f32, @floatFromInt(d.model.cfg.headDim())));
     }
-    try lin_cuda.prep(be, sess.plan, ws.attn_d, seq, d, &.{blk.self_attn.out}, false);
-    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.attn_d, seq, blk.self_attn.out, false);
-    try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 2 * d);
 
-    // --- cross-attention onto the adapter's output ------------------------------
-    // No RoPE here at all, and K/V come from the session's per-image cache rather
-    // than from two GEMMs, see the module header.
-    try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 4 * d, mod_base + 3 * d, cfg.norm_eps);
-    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{blk.cross_attn.q}, false);
-    try lin_cuda.gemm(be, sess.plan, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q, false);
-    try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.cross_attn.qnorm), seq * heads, hd, cfg.qk_eps);
-    {
-        const off = bi * sess.ctx_seq * d;
-        const ck = sess.ck_d.viewF32(off);
-        const cv = sess.cv_d.viewF32(off);
-        if (force_naive_attn) {
-            try be.opAttnCrossNaive(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, hd, attn_scale);
-        } else {
-            try be.opAttnTCRect(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, heads, hd, attn_scale);
-        }
+    /// `x_embedder` is one of the two weights the loader materializes to f32 (it feeds
+    /// the fused `opMatmul`, which has no bf16 pipeline), so it takes the f32 arm.
+    pub fn embed(d: Dev) !void {
+        try lin_cuda.linear(d.be, d.sess.plan, d.ws.x_d, d.ws.patch_d, d.sess.seq, d.model.x_embedder, null);
     }
-    try lin_cuda.prep(be, sess.plan, ws.attn_d, seq, d, &.{blk.cross_attn.out}, false);
-    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.attn_d, seq, blk.cross_attn.out, false);
-    try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 5 * d);
 
-    // --- MLP -------------------------------------------------------------------
-    try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 7 * d, mod_base + 6 * d, cfg.norm_eps);
-    try lin_cuda.prep(be, sess.plan, ws.nrm_d, seq, d, &.{blk.mlp1}, false);
-    try lin_cuda.gemm(be, sess.plan, ws.mlp_d, ws.nrm_d, seq, blk.mlp1, false);
-    // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
-    try be.geluErf(ws.mlp_d, seq * cfg.mlp_dim);
-    // Its own prep: the reduction width here is `mlp_dim`, not `dim`, and the prep
-    // state records ONE `cols`.
-    try lin_cuda.prep(be, sess.plan, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2}, false);
-    try lin_cuda.gemm(be, sess.plan, ws.dlt_d, ws.mlp_d, seq, blk.mlp2, false);
-    try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 8 * d);
-}
+    /// Prefetch one block ahead, so each upload overlaps the previous block's compute;
+    /// without it the first step pays the whole weight upload serially.
+    pub fn blockBegin(d: Dev, bi: usize) !void {
+        if (!d.be.async_uploads) return;
+        if (bi == 0) prefetchBlock(d.be, d.model.blocks[0]);
+        if (bi + 1 < d.model.blocks.len) prefetchBlock(d.be, d.model.blocks[bi + 1]);
+    }
+
+    pub fn lnMod(d: Dev, rows: usize, premul: usize, shift: usize) !void {
+        const cfg = d.model.cfg;
+        try d.be.lnMod(d.ws.x_d, d.ws.nrm_d, d.ws.mod_d, rows, cfg.dim, premul, shift, cfg.norm_eps);
+    }
+
+    pub fn prep(d: Dev, x: Buf, m: usize, cols: usize, group: []const Weight) !lin_cuda.Group {
+        return lin_cuda.prep(d.be, d.sess.plan, x, m, cols, group);
+    }
+
+    pub fn gemms(d: Dev, g: lin_cuda.Group, ys: []const Buf, group: []const Weight) !void {
+        for (ys, group) |y, w| try lin_cuda.gemm(d.be, d.sess.plan, g, y, w, null);
+    }
+
+    pub fn linear(d: Dev, y: Buf, x: Buf, m: usize, w: Weight) !void {
+        const g = try lin_cuda.prep(d.be, d.sess.plan, x, m, w.cols, &.{w});
+        try lin_cuda.gemm(d.be, d.sess.plan, g, y, w, null);
+    }
+
+    /// SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved `be.rope`.
+    pub fn qkNormRope(d: Dev, qnorm: []const f32, knorm: []const f32, seq: usize) !void {
+        const cfg = d.model.cfg;
+        const be = d.be;
+        const ws = d.ws;
+        const hd = cfg.headDim();
+        const half = hd / 2;
+        try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, qnorm), seq * cfg.n_heads, hd, cfg.qk_eps);
+        try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, knorm), seq * cfg.n_heads, hd, cfg.qk_eps);
+        try be.ropeHalf(ws.q_d, d.sess.freqs_d, seq, cfg.n_heads, half, seq * half, 0);
+        try be.ropeHalf(ws.k_d, d.sess.freqs_d, seq, cfg.n_heads, half, seq * half, 0);
+    }
+
+    pub fn qNorm(d: Dev, qnorm: []const f32, seq: usize) !void {
+        const cfg = d.model.cfg;
+        try d.be.qkNorm(d.ws.q_d, d.ws.q_d, try normBuf(d.be, qnorm), seq * cfg.n_heads, cfg.headDim(), cfg.qk_eps);
+    }
+
+    pub fn selfAttn(d: Dev, seq: usize) !void {
+        const cfg = d.model.cfg;
+        const ws = d.ws;
+        if (force_naive_attn) return d.be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, seq, cfg.n_heads, cfg.n_heads, cfg.headDim(), d.scale(), false);
+        try d.be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, seq, cfg.n_heads, cfg.n_heads, cfg.headDim(), d.scale());
+    }
+
+    pub fn crossAttn(d: Dev, bi: usize, seq: usize) !void {
+        const cfg = d.model.cfg;
+        const ws = d.ws;
+        const off = bi * d.sess.ctx_seq * cfg.dim;
+        const ck = d.sess.ck_d.viewF32(off);
+        const cv = d.sess.cv_d.viewF32(off);
+        if (force_naive_attn) return d.be.opAttnCrossNaive(ws.q_d, ck, cv, ws.attn_d, seq, d.sess.ctx_seq, cfg.n_heads, cfg.headDim(), d.scale());
+        try d.be.opAttnTCRect(ws.q_d, ck, cv, ws.attn_d, seq, d.sess.ctx_seq, cfg.n_heads, cfg.n_heads, cfg.headDim(), d.scale());
+    }
+
+    pub fn gelu(d: Dev, n: usize) !void {
+        try d.be.geluErf(d.ws.mlp_d, n);
+    }
+
+    pub fn gatedAdd(d: Dev, seq: usize, off: usize) !void {
+        const dim = d.model.cfg.dim;
+        try d.be.gatedAdd(d.ws.x_d, d.ws.dlt_d, d.ws.mod_d, seq * dim, dim, off);
+    }
+};
 
 /// Queue a block's streamable weights for async prefetch, called ONE BLOCK AHEAD so
 /// the upload overlaps the previous block's compute. Keys must be the same host
-/// pointers `blockForward` later fetches, or the prefetch is a cache miss and pure
+/// pointers the forward later fetches, or the prefetch is a cache miss and pure
 /// waste.
 ///
 /// `cross_attn.k`/`.v` are deliberately absent: `Session.init` consumes them ONCE per

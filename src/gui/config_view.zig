@@ -116,8 +116,12 @@ pub const Callbacks = struct {
     hostStatus: *const fn (name: []const u8, e: *const config.HostEntry) HostState,
     /// What a host row says about model files.
     hostSync: *const fn (name: []const u8) HostSync,
-    /// Send that host the image model it lacks.
-    sendModel: *const fn (name: []const u8) void,
+    /// Send that host the next model it lacks, or every one; each waits its
+    /// turn behind what is already going there.
+    sendModel: *const fn (name: []const u8, all: bool) void,
+    /// The transfer of one library file with one host, waiting or running.
+    /// `pull` asks for one coming FROM that host.
+    transferOf: *const fn (host: []const u8, stem: []const u8, pull: bool) ?CellTransfer,
     /// Send that host one named file, picked from the library grid. The path
     /// is this machine's, so only a file the local host holds can be offered.
     sendPath: *const fn (name: []const u8, path: []const u8) void,
@@ -149,13 +153,25 @@ pub const HostState = struct {
 pub const HostSync = struct {
     /// What is being sent, "" when nothing is.
     sending: []const u8 = "",
-    /// "hashing", "42%", "done", or why it failed.
+    /// How far, how fast and how long; then what it came to, or why it failed.
     status: []const u8 = "",
+    /// The transfer is still going: the row draws a bar and keeps repainting.
+    running: bool = false,
+    /// It comes FROM that host rather than going to it.
+    pull: bool = false,
+    fraction: f32 = 0,
+    /// Transfers with that host waiting behind this one.
+    queued: usize = 0,
     /// A model this host lacks; the Send button appears when it is set.
     missing: []const u8 = "",
     /// How many files it is short of in total. `missing` names the next one to
     /// go, so without this a host short of three files looks short of one.
     missing_count: usize = 0,
+};
+
+pub const CellTransfer = struct {
+    queued: bool,
+    fraction: f32,
 };
 
 /// The mirror and callbacks of the frame being rendered, for the rows below.
@@ -422,6 +438,27 @@ pub fn render(cfg: *config.Config, m: *const mirror.Mirror, u: *const models.Uni
         defer row.deinit();
         dvui.label(@src(), "VAE decode", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.VaeDecode, .{ .choice = &cfg.vae_decode }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+    help("Activation precision per component. auto starts at the model's own and " ++
+        "moves wider (f16, bf16, f32) if a render comes out invalid, remembering it " ++
+        "until the model is unloaded. A fixed choice fails such a render instead.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Text encoder precision", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.Precision, .{ .choice = &cfg.te_act }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Denoiser precision", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.Precision, .{ .choice = &cfg.dit_act }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "VAE precision", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.Precision, .{ .choice = &cfg.vae_act }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
 
     section("Backends");
@@ -1234,7 +1271,18 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
                 .gravity_y = 0.5,
             });
             defer cell.deinit();
-            if (models.has(r.render, i)) {
+            if (cellTransfer(e.stem(), i, n_hosts)) |t| {
+                var pbuf: [8]u8 = undefined;
+                const text = if (t.queued) "queued" else std.fmt.bufPrint(&pbuf, "{d}%", .{@as(u32, @intFromFloat(t.fraction * 100))}) catch "";
+                dvui.labelNoFmt(@src(), text, .{}, .{
+                    .id_extra = i,
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .font = style.F.ui_sm,
+                    .color_text = style.C.text_dim,
+                });
+                if (!t.queued) dvui.timer(cell.data().id, 250_000);
+            } else if (models.has(r.render, i)) {
                 presenceDot(7, style.C.meter_gpu, i);
             } else if (models.has(r.on, i)) {
                 presenceDot(5, style.C.meter_gpu.opacity(0.45), i);
@@ -1257,6 +1305,17 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
             }
         }
     }
+}
+
+/// The transfer of `stem` that belongs in column `i`, where the button that
+/// asked for it sits: a push under the host it goes to, a pull under this
+/// machine.
+fn cellTransfer(stem: []const u8, i: usize, n_hosts: usize) ?CellTransfer {
+    if (i > 0) return g_cb.transferOf(g_u.nameOf(i), stem, false);
+    for (1..n_hosts) |from| {
+        if (g_cb.transferOf(g_u.nameOf(from), stem, true)) |t| return t;
+    }
+    return null;
 }
 
 /// The add-host form's fields, kept until Add is pressed.
@@ -1348,32 +1407,57 @@ fn hostSyncRows(cfg: *config.Config) void {
     for (cfg.hosts.slice(), 0..) |*h, i| {
         const s = g_cb.hostSync(h.name.slice());
         if (s.sending.len == 0 and s.missing.len == 0) continue;
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .padding = .{ .x = 24, .y = 2 } });
-        defer row.deinit();
+        var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = i, .expand = .horizontal, .padding = .{ .x = 24, .y = 2 } });
+        defer col.deinit();
         // A model stem is model-visible text: through the run splitter.
         var buf: [256]u8 = undefined;
         // Both, when both apply: a transfer that just finished must not hide
-        // the next file still to go, or a host short of three files takes one
-        // and looks done.
+        // what is still to go, or a host short of three files takes one and
+        // looks done.
         if (s.sending.len > 0) {
-            const line = std.fmt.bufPrint(&buf, "sending {s} to {s}", .{ s.sending, h.name.slice() }) catch "sending a model";
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+            const line = std.fmt.bufPrint(&buf, "{s} {s} {s} {s}", .{
+                if (s.pull) "fetching" else "sending",
+                s.sending,
+                if (s.pull) "from" else "to",
+                h.name.slice(),
+            }) catch "moving a model";
             fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = style.C.text_dim });
+            if (s.running) {
+                dvui.progress(@src(), .{ .percent = s.fraction }, .{
+                    .gravity_y = 0.5,
+                    .margin = .{ .x = 8 },
+                    .min_size_content = .{ .w = 120, .h = 6 },
+                    .corner_radius = dvui.Rect.all(3),
+                });
+                // Nothing else wakes the UI for a transfer, and the rate is
+                // sampled on the frames this draws.
+                dvui.timer(row.data().id, 250_000);
+            }
             dvui.labelNoFmt(@src(), s.status, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono });
+            if (s.queued > 0) {
+                var qbuf: [32]u8 = undefined;
+                const q = std.fmt.bufPrint(&qbuf, "· {d} more queued", .{s.queued}) catch "";
+                dvui.labelNoFmt(@src(), q, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = style.C.text_dim });
+            }
         }
         if (s.missing.len > 0) {
-            var mbuf: [64]u8 = undefined;
-            const more = if (s.missing_count > 1)
-                std.fmt.bufPrint(&mbuf, " · {d} files still missing", .{s.missing_count}) catch ""
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+            // Already leaves out whatever is queued or moving there.
+            const line = if (s.missing_count > 1)
+                std.fmt.bufPrint(&buf, "{s} and {d} more are not on {s}", .{ s.missing, s.missing_count - 1, h.name.slice() }) catch "models are missing there"
             else
-                "";
-            const line = std.fmt.bufPrint(&buf, "{s}{s} is not on {s}{s}", .{
-                if (s.sending.len > 0) "next: " else "",
-                s.missing,
-                h.name.slice(),
-                more,
-            }) catch "a model is missing there";
-            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .margin = .{ .x = if (s.sending.len > 0) @as(f32, 12) else 0 }, .color_text = style.C.text_dim });
-            if (dvui.button(@src(), "Send it", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 } })) g_cb.sendModel(h.name.slice());
+                std.fmt.bufPrint(&buf, "{s} is not on {s}", .{ s.missing, h.name.slice() }) catch "a model is missing there";
+            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = style.C.text_dim });
+            const busy = s.running or s.queued > 0;
+            if (dvui.button(@src(), if (busy) "Queue it" else "Send it", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 } })) g_cb.sendModel(h.name.slice(), false);
+            if (s.missing_count > 1) {
+                var abuf: [24]u8 = undefined;
+                const label = std.fmt.bufPrint(&abuf, "{s} all {d}", .{ if (busy) "Queue" else "Send", s.missing_count }) catch "Send all";
+                if (dvui.button(@src(), label, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) g_cb.sendModel(h.name.slice(), true);
+            }
         }
     }
 }
@@ -1682,7 +1766,7 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
         const e = &cat.entries[ci];
         if (selection.loraListed(cfg, cat, fam, e.path)) continue;
         const info = e.lora.?.info;
-        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} linears, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
         lora_notes.append(arena, whereNote(arena, e)) catch return;
         paths.append(arena, e.path) catch return;
     }

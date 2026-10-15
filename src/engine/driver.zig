@@ -1155,6 +1155,9 @@ pub const Driver = struct {
             .text_encoder_2_path = self.settings.text_encoder_2.slice(),
             .backend = pipeline_map.toPipelineBackend(self.settings.diff_backend),
             .vae_decode = pipeline_map.toPipelineVae(self.settings.vae_decode),
+            .te_act = pipeline_map.toPipelineAct(self.settings.te_act),
+            .dit_act = pipeline_map.toPipelineAct(self.settings.dit_act),
+            .vae_act = pipeline_map.toPipelineAct(self.settings.vae_act),
             .loras = self.loraSpecsFromSettings(),
         };
     }

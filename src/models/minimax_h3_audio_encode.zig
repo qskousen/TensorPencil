@@ -31,6 +31,7 @@
 //! descript-audio-codec (MIT). Fixture: tools/gen_minimax_h3_audio_encode.py.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
@@ -762,7 +763,7 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 }
 
 const test_gate = @import("../test_gate.zig");
-const real_audio_vae = "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+const real_audio_vae = build_options.model_root ++ "/vae/minimax_h3_audio_vae_fp32.safetensors";
 
 test "the real audio VAE's encoder loads and its strides multiply to 800" {
     // Pins the values that are NOT stored: the strides recovered from the kernel

@@ -20,6 +20,8 @@ pub const weights = @import("tp_core").weights;
 pub const kv_cache = @import("tp_core").kv_cache;
 pub const sample = @import("tp_core").sample;
 pub const ops = @import("tp_ops");
+/// Root of the diffusion model folders, `-Dmodel-root`.
+pub const model_root = @import("build_options").model_root;
 pub const tokenizer = @import("tp_core").tokenizer;
 /// CLIP's BPE tokenizer and the weighted, multi-chunk `Prompt` the SD-family
 /// conditioner is driven from, public because a caller composing the stages itself
@@ -37,6 +39,7 @@ pub const sampler = @import("tp_core").sampler;
 pub const noise = @import("tp_core").noise;
 pub const noise_curve = @import("tp_core").noise_curve;
 pub const pipeline = @import("pipeline.zig");
+pub const precision = pipeline.precision;
 pub const vram = @import("tp_runtime").vram;
 /// CPU<->GPU layer-offload scheduling (shared by the CLI and the GUI, so the
 /// residency rules are defined once, see `vram.resolve`).
@@ -70,6 +73,7 @@ test {
     _ = embed;
     _ = sampler;
     _ = pipeline;
+    _ = precision;
     _ = vram;
     _ = gpu;
     _ = llm;

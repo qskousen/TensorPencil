@@ -23,6 +23,9 @@ pub const Context = context.Context;
 pub const Buffer = context.Buffer;
 pub const backend = @import("cuda/backend.zig");
 pub const Backend = backend.Backend;
+/// The weight-only int GEMM's rotation split and row decodes, the math its dual
+/// kernels run, for host tests.
+pub const wo_math = @import("kernels/dual/convrot.zig");
 
 /// cuBLASLt / cuDNN bindings for the library-backed `--backend cuda` (Phase 2):
 /// dlopen'd closed math libraries, same loading mechanism as the driver.

@@ -428,6 +428,8 @@ pub const ImageInfo = struct {
     model_hash: []const u8 = "",
     vae_hash: []const u8 = "",
     weight_dtype: []const u8 = "",
+    /// What each component's activations ran at, as the PNG field writes it.
+    act_dtype: []const u8 = "",
     shift: f32 = 0,
     /// Name, AutoV2 hash and strength per LoRA, in the order they were applied.
     loras: []const LoraInfo = &.{},

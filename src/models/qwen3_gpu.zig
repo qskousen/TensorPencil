@@ -13,8 +13,10 @@
 //! fixture as the CPU test.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const qwen3 = @import("qwen3.zig");
-const lin_gpu = @import("lin_llm_gpu.zig");
+const qwen3_enc_dev = @import("qwen3_enc_dev.zig");
+const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
@@ -24,6 +26,8 @@ const init_defaults = @import("tp_core").init_defaults;
 const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
+const kv_gpu = @import("kv_gpu.zig");
+const kvmod = @import("tp_core").kv_cache;
 
 // Only `head_dim` is a family-wide constant here. Every other dimension is read
 // off `enc.cfg` inside `encode`, because Anima's encoder is Qwen3-0.6B (28
@@ -38,324 +42,224 @@ const Buf = gpu.DeviceBuffer;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-/// Encode token ids to the encoder variant's conditioning stack,
-/// `[seq][enc.tapCount()][hidden]` (same layout the CPU `encode` returns). Caller
-/// frees the result.
-///
-/// The tap list and the RoPE theta come off `enc`, never from this file's
-/// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
-/// 1e6, and both would run to completion with the other's values.
-pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, use_f16: bool, cancel: ?*std.atomic.Value(bool)) ![]f32 {
+/// The encoder's tap stack `[seq][enc.tapCount()][hidden]` (see `qwen3_enc_dev`).
+/// Caller frees.
+pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, act: gpu.Dt, cancel: ?*std.atomic.Value(bool)) ![]f32 {
+    return encodeVision(enc, ctx, io, gpa, ids, .{}, act, cancel);
+}
+
+/// `encode` with a spliced vision payload: `qwen3_enc_dev.encode` on this backend.
+pub fn encodeVision(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, vision: qwen3.TextEncoder.Vision, act: gpu.Dt, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
-    const seq = ids.len;
-    std.debug.assert(seq > 0);
     if (getenv("TP_TE_DTYPES") != null) {
         for ([_]usize{ 0, enc.layers.len - 1 }) |li| {
             const l = enc.layers[li];
             std.log.warn("layer {d}: q#{d} k#{d} v#{d} o#{d} gate#{d} up#{d} down#{d}", .{
-                li, @intFromEnum(l.q.dtype), @intFromEnum(l.k.dtype), @intFromEnum(l.v.dtype),
+                li,                      @intFromEnum(l.q.dtype),    @intFromEnum(l.k.dtype),  @intFromEnum(l.v.dtype),
                 @intFromEnum(l.o.dtype), @intFromEnum(l.gate.dtype), @intFromEnum(l.up.dtype), @intFromEnum(l.down.dtype),
             });
         }
     }
-    const tap_count = enc.tapCount();
-    if (!supportsWeights(ctx, enc)) return error.UnsupportedDType;
+    var d: EncDev = .{ .ctx = ctx, .gpa = gpa, .enc = enc, .act = act };
+    return qwen3_enc_dev.encode(&d, enc, gpa, ids, vision, cancel);
+}
 
-    const c = enc.cfg;
-    const hidden = c.hidden;
-    const n_heads = c.n_heads;
-    const kv_heads = c.n_kv_heads;
-    const intermediate = c.intermediate;
-    const eps = c.rms_eps;
+/// The `qwen3_enc_dev` adapter.
+pub const EncDev = struct {
+    ctx: *gpu.Context,
+    gpa: std.mem.Allocator,
+    enc: *const qwen3.TextEncoder,
+    /// The width the residual, the norms and the FFN planes are stored at; a narrowing
+    /// GEMM route stages at it too (f16, else bf16).
+    act: gpu.Dt,
+    lin: ?lin_gpu.Lin = null,
+    plan: lin_gpu.Plan = undefined,
+    seq_pad: usize = 0,
+    b: Bufs = undefined,
+    have_bufs: bool = false,
+    freqs: Buf = none,
+    ds: []Buf = &.{},
 
-    // CPU: embedding gather and the rotate-half rope table. Through
-    // `embedTokens`, which dispatches on the embedding's own dtype. Hardcoding bf16
-    // and a `* 2` row stride here reads a GGUF encoder's q6_k embedding as garbage.
-    const x = try gpa.alloc(f32, seq * hidden);
-    defer gpa.free(x);
-    try qwen3.embedTokens(enc.embed, ids, x);
-
-    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
-    defer freqs.deinit(gpa);
-    const fp = try gpa.alloc(f32, 2 * seq * half);
-    defer gpa.free(fp);
-    @memcpy(fp[0 .. seq * half], freqs.cos);
-    @memcpy(fp[seq * half ..], freqs.sin);
-    const sin_off: u32 = @intCast(seq * half);
-
-    // Coop (tensor-core) GEMMs when requested and available: f32 activations
-    // in, f16 weights/accumulate, f32 out, GEMM outputs are 128-row padded.
-    // f16 shaves ~0.4s off the encode but ~doubles its image-delta
-    // contribution (0.23% -> 0.49%), so the caller decides; default is f32.
-    const coop = use_f16 and ctx.pipe_coop != .null_handle;
-    const seq_pad = std.mem.alignForward(usize, seq, 128);
-
-    // Device buffers for this (single) forward.
-    var bufs = try Bufs.init(ctx, c, seq, seq_pad, tap_count);
-    defer bufs.deinit(ctx);
-    var freqs_d = try ctx.tensorCreate(fp.len * 4);
-    defer ctx.tensorDestroy(&freqs_d);
-    try ctx.tensorUpload(freqs_d, std.mem.sliceAsBytes(fp));
-    try ctx.tensorUpload(bufs.x, std.mem.sliceAsBytes(x));
-
-    const x_d = bufs.x;
-    const nd = bufs.normed;
-    const q_d = bufs.q;
-    const k_d = bufs.k;
-    const v_d = bufs.v;
-    const qt_d = bufs.qt;
-    const kt_d = bufs.kt;
-    const s_d = bufs.s;
-    const attn_d = bufs.attn;
-    const g_d = bufs.gate;
-    const u_d = bufs.up;
-    const t_d = bufs.t;
-    const out_d = bufs.out;
-
-    try ctx.beginBatch();
-    errdefer if (ctx.batching) ctx.abortBatch();
-
-    var tap_idx: usize = 0;
-    // `n_layers + 1`: a tap index may be one PAST the last layer (Anima's is), and
-    // the `l >= enc.layers.len` break is what terminates the loop. See the CPU
-    // `encode` for why the range and the break are separate concerns.
-    for (0..c.n_layers + 1) |l| {
-        // Poll cancel between layers so a stop lands mid-encode; the errdefer
-        // above aborts the in-flight batch.
-        if (cancel) |cc| if (cc.load(.acquire)) return error.Canceled;
-        if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
-            // Snapshot the hidden state entering layer l into the tap-major
-            // output buffer (contiguous copy with a per-tap offset).
-            //
-            // A tap past the last layer carries the final norm. `.rmsnorm` has no
-            // destination-offset push slot, so it lands in the `normed` scratch and
-            // the existing offset copy moves it, two ops, no new kernel, and the
-            // f32 arm's reduction matches the CPU's.
-            var src = x_d;
-            if (enc.final_norm) |w| {
-                if (l == c.n_layers) {
-                    try rmsnorm(ctx, x_d, nd, try nbuf(ctx, w), seq, hidden, eps);
-                    src = nd;
-                }
-            }
-            try ctx.opElt(.copy, src, out_d, null, null, .{
-                .u0 = @intCast(seq * hidden),
-                .u2 = @intCast(tap_idx * seq * hidden),
-            }, seq * hidden, 1, 1);
-            tap_idx += 1;
+    pub fn setup(d: *EncDev, seq: usize, tap_count: usize, table: []const f32, deepstack: []const []const f32) !void {
+        errdefer d.teardown();
+        {
+            var arena = std.heap.ArenaAllocator.init(d.gpa);
+            defer arena.deinit();
+            const lins = try d.enc.deviceLins(arena.allocator());
+            d.lin = try lin_gpu.Lin.init(d.gpa, d.ctx, lin_gpu.maxRows(lins), 0, 0);
+            d.plan = lin_gpu.plan(d.ctx, lins, encoderUse(d.act == .f16), "qwen3_gpu encoder") catch return error.UnsupportedDType;
         }
-        if (l >= enc.layers.len) break;
-        const layer = enc.layers[l];
+        d.seq_pad = std.mem.alignForward(usize, seq, 128);
+        d.b = try Bufs.init(d.ctx, d.enc.cfg, seq, d.seq_pad, tap_count, d.act);
+        d.have_bufs = true;
+        d.ds = try d.gpa.alloc(Buf, deepstack.len);
+        @memset(d.ds, none);
+        // At the residual's width, so the row-span add is one dtype.
+        for (deepstack, d.ds) |feat, *b| {
+            var f32b = try d.ctx.tensorCreate(feat.len * 4);
+            defer if (d.act != .f32) d.ctx.tensorDestroy(&f32b);
+            try d.ctx.tensorUpload(f32b, std.mem.sliceAsBytes(feat));
+            if (d.act == .f32) {
+                b.* = f32b;
+                continue;
+            }
+            b.* = try d.ctx.tensorCreate(feat.len * d.act.bytes());
+            b.dt = d.act;
+            try d.ctx.opElt(gpu.eltCopy(.f32, d.act), f32b, b.*, null, null, .{ .u0 = @intCast(feat.len) }, feat.len, 1, 1);
+        }
+        d.freqs = try d.ctx.tensorCreate(table.len * 4);
+        try d.ctx.tensorUpload(d.freqs, std.mem.sliceAsBytes(table));
+    }
 
-        // --- Attention ---
-        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.input_norm), seq, hidden, eps);
-        try prepFor(ctx, layer.q, nd, seq, c.hidden);
-        try gemm(ctx, coop, q_d, nd, seq, seq_pad, layer.q);
-        try gemm(ctx, coop, k_d, nd, seq, seq_pad, layer.k);
-        try gemm(ctx, coop, v_d, nd, seq, seq_pad, layer.v);
-        // Per-head QK-norm (rows of head_dim), then rotate-half rope.
-        try rmsnorm(ctx, q_d, q_d, try nbuf(ctx, layer.q_norm), seq * n_heads, hd, eps);
-        try rmsnorm(ctx, k_d, k_d, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd, eps);
-        try ctx.opElt(.rope_half, q_d, null, freqs_d, null, .{
-            .u0 = @intCast(seq * n_heads * half),
+    pub fn teardown(d: *EncDev) void {
+        if (d.have_bufs) d.b.deinit(d.ctx);
+        d.have_bufs = false;
+        for (d.ds) |*b| d.ctx.tensorDestroy(b);
+        if (d.ds.len > 0) d.gpa.free(d.ds);
+        d.ds = &.{};
+        d.ctx.tensorDestroy(&d.freqs);
+        if (d.lin) |*l| l.deinit();
+        d.lin = null;
+    }
+
+    /// Into a 16-bit `b` through the f32 tap stack, which is free until the first tap.
+    pub fn upload(d: *EncDev, b: Buf, data: []const f32) !void {
+        if (b.dt == .f32) return d.ctx.tensorUpload(b, std.mem.sliceAsBytes(data));
+        try d.ctx.tensorUpload(d.b.out, std.mem.sliceAsBytes(data));
+        try d.ctx.opElt(gpu.eltCopy(.f32, b.dt), d.b.out, b, null, null, .{ .u0 = @intCast(data.len) }, data.len, 1, 1);
+    }
+
+    pub fn download(d: *EncDev, b: Buf, dst: []f32) !void {
+        try d.ctx.tensorDownload(b, std.mem.sliceAsBytes(dst));
+    }
+
+    pub fn beginBatch(d: *EncDev) !void {
+        try d.ctx.beginBatch();
+    }
+
+    pub fn endBatch(d: *EncDev) !void {
+        try d.ctx.endBatch();
+    }
+
+    pub fn abortBatch(d: *EncDev) void {
+        if (d.ctx.batching) d.ctx.abortBatch();
+    }
+
+    /// The context's own weight LRU streams what does not fit.
+    pub fn prefetch(_: *EncDev, _: anytype) void {}
+
+    pub fn rmsNorm(d: *EncDev, x: Buf, y: Buf, w: []const f32, rows: usize, dim: usize, eps: f32) !void {
+        try rmsnorm(d.ctx, x, y, try nbuf(d.ctx, w), rows, dim, eps);
+    }
+
+    /// GEMM outputs are written 128-row padded.
+    pub fn gemms(d: *EncDev, x: Buf, rows: usize, cols: usize, ws: []const lin_gpu.Weight, ys: []const Buf) !void {
+        const l = &d.lin.?;
+        const g = try l.prep(d.plan, x, rows, cols, ws);
+        for (ws, ys) |w, y| try l.gemm(d.plan, g, y, w, .{ .m_pad = d.seq_pad });
+    }
+
+    pub fn rope(d: *EncDev, x: Buf, rows: usize, heads: usize) !void {
+        try d.ctx.opElt(.rope_half, x, null, d.freqs, null, .{
+            .u0 = @intCast(rows * heads * half),
             .u1 = half,
-            .u2 = sin_off,
-            .u3 = @intCast(n_heads),
-        }, seq * n_heads * half, 1, 1);
-        try ctx.opElt(.rope_half, k_d, null, freqs_d, null, .{
-            .u0 = @intCast(seq * kv_heads * half),
-            .u1 = half,
-            .u2 = sin_off,
-            .u3 = @intCast(kv_heads),
-        }, seq * kv_heads * half, 1, 1);
-        // Causal attention: gather k-major, raw scores, fused-softmax P@V.
-        try ctx.opElt(.gather_kmajor, q_d, null, null, qt_d, .{
-            .u0 = @intCast(seq * n_heads * hd),
-            .u1 = @intCast(n_heads),
+            .u2 = @intCast(rows * half),
+            .u3 = @intCast(heads),
+        }, rows * heads * half, 1, 1);
+    }
+
+    /// Gather k-major, raw scores, then the fused-softmax P@V with the causal mask.
+    pub fn attention(d: *EncDev, seq: usize) !void {
+        const c = d.enc.cfg;
+        const b = d.b;
+        try d.ctx.opElt(.gather_kmajor, b.q, null, null, b.qt, .{
+            .u0 = @intCast(seq * c.n_heads * hd),
+            .u1 = @intCast(c.n_heads),
             .u2 = hd,
             .u3 = @intCast(seq),
-        }, seq * n_heads * hd, 1, 1);
-        try ctx.opElt(.gather_kmajor, k_d, null, null, kt_d, .{
-            .u0 = @intCast(seq * kv_heads * hd),
-            .u1 = @intCast(kv_heads),
+        }, seq * c.n_heads * hd, 1, 1);
+        try d.ctx.opElt(.gather_kmajor, b.k, null, null, b.kt, .{
+            .u0 = @intCast(seq * c.n_kv_heads * hd),
+            .u1 = @intCast(c.n_kv_heads),
             .u2 = hd,
             .u3 = @intCast(seq),
-        }, seq * kv_heads * hd, 1, 1);
+        }, seq * c.n_kv_heads * hd, 1, 1);
         const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
-        try ctx.opElt(.attn_scores, qt_d, kt_d, null, s_d, .{
+        try d.ctx.opElt(.attn_scores, b.qt, b.kt, null, b.s, .{
             .u0 = @intCast(seq),
-            .u1 = @intCast(n_heads),
-            .u2 = @intCast(kv_heads),
+            .u1 = @intCast(c.n_heads),
+            .u2 = @intCast(c.n_kv_heads),
             .u3 = hd,
             .u4 = 0,
             .f0 = attn_scale,
-        }, dc8, dc8, n_heads);
-        try ctx.opElt(.attn_out, s_d, null, v_d, attn_d, .{
+        }, dc8, dc8, c.n_heads);
+        try d.ctx.opElt(.attn_out, b.s, null, b.v, b.attn, .{
             .u0 = @intCast(seq),
-            .u1 = @intCast(n_heads),
-            .u2 = @intCast(kv_heads),
+            .u1 = @intCast(c.n_heads),
+            .u2 = @intCast(c.n_kv_heads),
             .u3 = hd,
             .u4 = 0,
             .u5 = @intCast(seq),
             .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
-            .f1 = @bitCast(@as(u32, 1)), // causal
-        }, hd / 8, dc8, n_heads);
-        try prepFor(ctx, layer.o, attn_d, seq, c.qDim());
-        try gemm(ctx, coop, t_d, attn_d, seq, seq_pad, layer.o);
-        try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
-
-        // --- MLP (SwiGLU) ---
-        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.post_norm), seq, hidden, eps);
-        try prepFor(ctx, layer.gate, nd, seq, c.hidden);
-        try gemm(ctx, coop, g_d, nd, seq, seq_pad, layer.gate);
-        try gemm(ctx, coop, u_d, nd, seq, seq_pad, layer.up);
-        try ctx.opElt(.silu_mul, g_d, u_d, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
-        try prepFor(ctx, layer.down, g_d, seq, intermediate);
-        try gemm(ctx, coop, t_d, g_d, seq, seq_pad, layer.down);
-        try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
+            .f1 = @bitCast(@as(u32, 1)),
+        }, hd / 8, dc8, c.n_heads);
     }
-    std.debug.assert(tap_idx == tap_count);
 
-    try ctx.endBatch();
-
-    // Download tap-major [tap][seq][hidden] and transpose to the token-major
-    // [seq][tap][hidden] layout the DiT context expects.
-    const tap_major = try gpa.alloc(f32, tap_count * seq * hidden);
-    defer gpa.free(tap_major);
-    try ctx.tensorDownload(out_d, std.mem.sliceAsBytes(tap_major));
-
-    const out = try gpa.alloc(f32, seq * tap_count * hidden);
-    errdefer gpa.free(out);
-    for (0..tap_count) |tp| {
-        for (0..seq) |t| {
-            const src = tap_major[(tp * seq + t) * hidden ..][0..hidden];
-            @memcpy(out[(t * tap_count + tp) * hidden ..][0..hidden], src);
-        }
+    pub fn add(d: *EncDev, x: Buf, y: Buf, n: usize) !void {
+        std.debug.assert(x.dt == y.dt);
+        try d.ctx.opElt(gpu.eltAt("add", x.dt), x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
     }
-    return out;
+
+    /// Row offsets are whole rows of `hidden` floats, which meets any device's storage
+    /// alignment for the hidden widths these encoders have.
+    pub fn addRows(d: *EncDev, layer: usize, x_off: usize, f_off: usize, n: usize) !void {
+        const e = d.act.bytes();
+        const xv = try d.ctx.view(d.b.x, x_off * e, n * e);
+        const fv = try d.ctx.view(d.ds[layer], f_off * e, n * e);
+        try d.add(xv, fv, n);
+    }
+
+    pub fn siluMul(d: *EncDev, g: Buf, u: Buf, n: usize) !void {
+        std.debug.assert(g.dt == u.dt);
+        try d.ctx.opElt(gpu.eltAt("silu_mul", g.dt), g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn copyTap(d: *EncDev, src: Buf, off: usize, n: usize) !void {
+        try d.ctx.opElt(gpu.eltCopy(src.dt, .f32), src, d.b.out, null, null, .{ .u0 = @intCast(n), .u2 = @intCast(off) }, n, 1, 1);
+    }
+};
+
+const none: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+
+/// What the encoder's linears run under. Its conditioning is computed once and steers
+/// every sampling step, so a block quant stays on the f16 expansion (the activation
+/// unquantized); `use_f16` false keeps every narrowing route off f16, which on this
+/// backend means the f32-activation kernels.
+fn encoderUse(use_f16: bool) lin_gpu.Use {
+    return .{ .blockq = .f16, .act16 = if (use_f16) .f16 else .bf16, .int8 = lin_gpu.dual_lin.encoderInt8() };
 }
 
-/// Map a weight's storage dtype to the dense-GEMV weight code. Only fp8 / bf16
-/// / f32 reach the Vulkan GEMV path (qwen3 rejects block-quant on vulkan); bf16
-/// is read natively (no widening) via the 2-byte transpose + GEMV bf16 branch.
-fn wcode(dt: @import("tp_core").dtype.DType) gpu.WCode {
-    return switch (dt) {
-        .f8_e4m3 => .f8,
-        .bf16 => .bf16,
-        else => .f32,
-    };
-}
-
-/// Widest zero bias any encoder GEMM needs: the f16-weight coop GEMM always folds a
-/// bias in and these linears have none. One full-width buffer for every width,
-/// `smallBuffer` caches by host POINTER, so a per-width slice would hand a later,
-/// wider GEMM whichever length was uploaded first.
-/// Widest zero bias any encoder GEMM folds. Sized for the LARGEST `intermediate`
-/// any variant here loads, not the module constant: Qwen3-4B is 9728 where
-/// MiniMax H3's encoder is 25600, and a short one fails the length check in
-/// `gemm` on the gate/up projection. Passed WHOLE, never sliced: `smallBuffer`
-/// caches by host POINTER, so a slice would map every width to the first length.
-const zero_bias: [25600]f32 = @splat(0);
-
-/// Whether this context can run the encoder's weights at all.
-///
-/// Assuming instead costs a blank white image. krea2's encoder is fp8 and Z-Image's is
-/// bf16; without the bf16 arm below, `gemm` falls through to `opMatmul` with
-/// `dtype_f8 = false`, which reads bf16 bytes as f32, so every GEMM is garbage, the
-/// conditioning non-finite, and the render pure white with no error anywhere. The
-/// `wcode` helper further down this file does read bf16 natively, but that is the LM's
-/// GEMV path, not this one; the two
-/// are easy to conflate and one comment does not cover the other.
+/// Whether this context can run the encoder's weights at all, every linear by its own
+/// storage, so a checkpoint that mixes formats by layer (a Q4_K_M GGUF is q4_k and
+/// q6_k) runs here as it does on the CUDA arms.
 pub fn supportsWeights(ctx: *gpu.Context, enc: *const qwen3.TextEncoder) bool {
     if (enc.layers.len == 0) return false;
-    // EVERY linear, not just the first layer's q: quantization is per weight, so a
-    // checkpoint may mix formats layer by layer, and a dtype this file has no arm
-    // for would otherwise reach the dense `else` below and be read as raw f32.
-    for (enc.layers) |l| {
-        inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
-            if (w.dtype != enc.layers[0].q.dtype) {
-                std.log.warn("qwen3_gpu: a block linear is dtype #{d} where the first is #{d}; mixed dtypes have no arm here", .{
-                    @intFromEnum(w.dtype), @intFromEnum(enc.layers[0].q.dtype),
-                });
-                return false;
-            }
-        }
-    }
-    return switch (enc.layers[0].q.dtype) {
-        .f8_e4m3, .f32 => true,
-        // int8-convrot (MiniMax H3's encoder). Needs the per-row scale the GEMM
-        // multiplies back in, and the rotation is the checkpoint's answer, not a
-        // choice: `prepFor` asks the weight, and both sides rotate or neither.
-        // 128 rows because `opI8Gemm` launches over the row count rounded up to
-        // its tile and writes whole tiles.
-        .i8 => (ctx.pipe_coop_i8 != .null_handle or ctx.pipe_coop_i8_sh != .null_handle) and
-            enc.layers[0].q.row_scale != null and enc.layers[0].q.rows % 128 == 0,
-        .bf16, .f16 => ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle,
-        // A GGUF encoder. `hasQuantPrefillGemm` IS the f16-weight coop pipeline the
-        // dequant path feeds, so ask it rather than restating the condition.
-        else => |dt| dt.isBlockQuant() and ctx.hasQuantPrefillGemm(),
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lins = enc.deviceLins(arena.allocator()) catch return false;
+    for ([_]bool{ false, true }) |half16| switch (lin_gpu.check(ctx, lins, encoderUse(half16))) {
+        .ok => {},
+        .refused => |r| {
+            lin_gpu.dual_lin.explain(r, "qwen3_gpu encoder");
+            return false;
+        },
     };
-}
-
-fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w: ops.matmul.Weight) !void {
-    const zeros: []const f32 = &zero_bias;
-    if (w.dtype.isBlockQuant()) {
-        // GGUF text encoder (`--text-encoder foo.gguf`): dequant the weight to f16
-        // k-major once, then the same coop GEMM every other arm below uses. This is
-        // the LLM prefill path (`opMatmulCoopQuant`), which suits an encoder exactly
-        // one call over the whole prompt, so the per-call re-dequant amortizes.
-        //
-        // NOT `wcode` below: that maps every non-f8/bf16 dtype to `.f32`, so a
-        // block quant reaching it would be read as f32, the same silent-garbage
-        // shape as the bf16 bug this file's `supportsWeights` comment describes.
-        return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows]);
-    }
-    switch (w.dtype) {
-        // int8-convrot: the activation is already quantized and rotated by the
-        // `prepFor` that ran before this GEMM's group, so this is the same
-        // `opI8Gemm` the H3 trunk drives.
-        .i8 => try ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false),
-        // Dense bf16/f16 weights go through the f16-weight tensor-core GEMM, the same
-        // route `dit_gpu` and `zimage_gpu` take for their dense blocks. Native bf16
-        // tensor cores where the device has that config, else bf16 -> f16 at upload.
-        // Only the dense arms fold a bias; int8 above rescales per row instead.
-        .bf16 => if (ctx.pipe_coop_bf16w != .null_handle)
-            try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, zeros)
-        else
-            try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
-        .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
-        // f32 and fp8 only: every other storage form has an arm above, and this one
-        // reads the bytes as f32. Refuse by name rather than render noise.
-        .f32, .f8_e4m3 => if (coop) {
-            try ctx.opMatmulCoop(y, x, m, m_pad, w.bytes, w.rows, w.cols, w.scale);
-        } else {
-            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null);
-        },
-        else => {
-            std.log.err("qwen3_gpu: a block linear has dtype #{d} ({d}x{d}, {d} bytes, row_scale {}), which has no GEMM arm here", .{
-                @intFromEnum(w.dtype), w.rows, w.cols, w.bytes.len, w.row_scale != null,
-            });
-            return error.UnsupportedDType;
-        },
-    }
-}
-
-/// Quantize (and rotate) the activation an int8 GEMM group is about to read.
-///
-/// One call per distinct activation, not per GEMM: q/k/v share a normed hidden and
-/// gate/up share the next one, exactly as the H3 trunk does it. A no-op for every
-/// dense dtype, so the dense arms below are untouched.
-///
-/// Whether the prep ROTATES is a property of the checkpoint (`Weight.convrot`), and
-/// both sides must agree: an unrotated activation against rotated weights renders
-/// uncorrelated noise with nothing to say so.
-fn prepFor(ctx: *gpu.Context, w: ops.matmul.Weight, x: Buf, m: usize, cols: usize) !void {
-    if (w.dtype != .i8) return;
-    try ctx.opI8PrepR(x, m, cols, w.convrot != 0);
+    return true;
 }
 
 fn rmsnorm(ctx: *gpu.Context, in: Buf, out: Buf, weight: Buf, rows: usize, dim: usize, eps: f32) !void {
-    try ctx.opElt(.rmsnorm, in, out, weight, null, .{
+    std.debug.assert(in.dt == out.dt);
+    try ctx.opElt(gpu.eltAt("rmsnorm", in.dt), in, out, weight, null, .{
         .u0 = @intCast(rows),
         .u1 = @intCast(dim),
         .f0 = eps,
@@ -383,7 +287,9 @@ const Bufs = struct {
     t: Buf,
     out: Buf,
 
-    fn init(ctx: *gpu.Context, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
+    /// `act` is the encoder dial's width for the buffers `isTyped` names; the rest
+    /// stay f32.
+    fn init(ctx: *gpu.Context, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize, act: gpu.Dt) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
@@ -392,22 +298,24 @@ const Bufs = struct {
         // GEMM outputs (q/k/v/attn/gate/up/t) are 128-row padded for the coop
         // path (pad rows written zero); the rest are indexed by real seq.
         const sizes = [fields.len]usize{
-            seq * c.hidden * 4, // x
-            seq * c.hidden * 4, // normed
-            seq_pad * c.qDim() * 4, // q
-            seq_pad * c.kvDim() * 4, // k
-            seq_pad * c.kvDim() * 4, // v
-            seq * c.qDim() * 4, // qt (k-major)
-            seq * c.kvDim() * 4, // kt (k-major)
-            c.n_heads * seq * seq * 4, // s (all heads batched)
-            seq_pad * c.qDim() * 4, // attn
-            seq_pad * c.intermediate * 4, // gate
-            seq_pad * c.intermediate * 4, // up
-            seq_pad * c.hidden * 4, // t
-            tap_count * seq * c.hidden * 4, // out (tap-major)
+            seq * c.hidden, // x
+            seq * c.hidden, // normed
+            seq_pad * c.qDim(), // q
+            seq_pad * c.kvDim(), // k
+            seq_pad * c.kvDim(), // v
+            seq * c.qDim(), // qt (k-major)
+            seq * c.kvDim(), // kt (k-major)
+            c.n_heads * seq * seq, // s (all heads batched)
+            seq_pad * c.qDim(), // attn
+            seq_pad * c.intermediate, // gate
+            seq_pad * c.intermediate, // up
+            seq_pad * c.hidden, // t
+            tap_count * seq * c.hidden, // out (tap-major)
         };
-        inline for (fields, sizes) |name, size| {
-            @field(self, name) = try ctx.tensorCreate(size);
+        inline for (fields, sizes) |name, elems| {
+            const w: gpu.Dt = if (comptime isTyped(name)) act else .f32;
+            @field(self, name) = try ctx.tensorCreate(elems * w.bytes());
+            @field(self, name).dt = w;
             created += 1;
         }
         return self;
@@ -419,171 +327,111 @@ const Bufs = struct {
     }
 
     const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "out" };
+
+    fn isTyped(comptime name: []const u8) bool {
+        inline for (.{ "x", "normed", "gate", "up", "t" }) |t| if (comptime std.mem.eql(u8, name, t)) return true;
+        return false;
+    }
 };
 
-/// KV-cached causal LM on the Vulkan backend (tp-llm --backend vulkan).
-/// Config-driven mirror of qwen3_cuda.CudaLM: the whole `cfg.n_layers` stack
-/// runs device-resident, one batched submission per step.
+/// KV-cached causal LM on the Vulkan backend (tp-llm --backend vulkan), the
+/// `qwen3_cuda.CudaLM` of this backend: `transformer_gpu.decoderLayer` over this
+/// stepper's ops, every linear through `lin_gpu` (so any format it takes, any head,
+/// tied or not) and attention as the dual flash-decoding kernel against the cache, so a
+/// chunk at any position takes the same batched forward.
 ///
-/// Two weight regimes share this stepper:
-///   * Dense (bf16/fp8, tied head, the Qwen3-VL text encoder checkpoints):
-///     prefill (seq > 1, empty cache) reuses the encoder's square attention
-///     (gather_kmajor + attn_scores + attn_out); decode uses the flash-decoding
-///     attn_dsplit/attn_dmerge pair. GEMMs are the f32-accumulate kernel with
-///     m = seq (m = 1 is a GEMV). The tied LM head is the embedding converted
-///     to f32 once and split into 4 vocab chunks (each under the kernels' 1 GiB
-///     type-level buffer bound). Speculative decode (stepAll) is supported.
-///   * Block-quant (GGUF q8_0/q4_k/q5_k/q6_k/iq4_nl layers, F16 embed, untied
-///     block-quant head, the llama/Mistral arch): decode is the per-row dequant
-///     GEMV and a fresh prompt takes the dequant->f16 coop GEMM where the device
-///     has it, else one token at a time (`lin_llm_gpu` picks per weight). The
-///     head is a separate block-quant tensor; the F16 embedding is host-gathered
-///     via the same f32 copy the dense path uses.
-///
-/// Hidden-dim norms take the 3-pass parallel rmsnorm (see `normWide`, which
-/// records why the one-launch subgroup form loses here). Optional per-head
-/// QK-norm (`cfg.qk_norm`; llama/Mistral omit it). eps / rope θ / vocab all come
-/// from `cfg`.
+/// A batch of at most `gemv_batch_max` rows (a speculative verify) is bit-identical
+/// per row to a decode step: the linears take the grouped GEMVs and the attention the
+/// decode split count.
 pub const VulkanLM = struct {
+    /// The prefill batch this stepper wants the engine to hand it.
+    pub const prefill_batch = prefill_chunk;
+    /// `tp-llm --bench` alternates the grouped and per-head attention kernels, which
+    /// must give the same logits hash.
+    pub const bench_toggle = &gpu.Context.attn_rows_grouped;
+
     lm: *const qwen3.CausalLM,
     ctx: *gpu.Context,
     gpa: std.mem.Allocator,
-    /// Model shape (mirrors lm.cfg): dims, vocab, eps, rope θ, qk_norm.
     cfg: qwen3.Config,
-    /// Block-quant layer weights (GGUF llama/Mistral): an untied block-quant head,
-    /// and prefill one token at a time unless `can_gemm_prefill`. A dense (bf16/fp8)
-    /// model has the tied head and the square-attention prefill.
-    quant: bool,
-    /// Block-quant prefill runs the tensor-core GEMM (dequant->f16->coopmat) in
-    /// one batched pass over the whole prompt instead of a forward per token,
-    /// when the device has the f16-weight coopmat pipeline (`lin.knobs.gemm_prefill`).
-    can_gemm_prefill: bool,
-    /// Every projection and the untied head go through here.
     lin: lin_gpu.Lin,
-    /// LM-head vocab-chunk size (dense tied head only); cfg.vocab / vocab_chunks.
-    chunk_rows: usize,
+    lin_plan: lin_gpu.Plan,
     capacity: usize,
     /// Committed cache length (absolute position of the next token).
     len: usize = 0,
-    max_rows: usize,
     sin_off: u32,
-    /// Token embedding converted to f32 (bf16 or f16 source): the CPU-side
-    /// gather scratch, and, for the dense tied-head path, the LM-head weight
-    /// source (weightBuffer caches by host pointer, so this must stay alive).
-    /// Block-quant models use it only for the gather; their head is `lm.head`.
-    embed_f32: []f32,
-    k_cache: [qwen3.Config.max_layers]Buf,
-    v_cache: [qwen3.Config.max_layers]Buf,
+    kv: kv_gpu.Kv,
     freqs_d: Buf,
     bufs: LmBufs,
+    /// `bufs.t` holds a residual not yet added to `bufs.x`: the next hidden norm adds it
+    /// in the same dispatch. Anything else that reads x must `flushResidual` first.
+    residual_pending: bool = false,
 
-    /// LM-head vocab split (dense tied head): 4 chunks so each stays under the
-    /// kernels' 1 GiB type-level buffer bound (cfg.vocab must divide by 4).
-    const vocab_chunks = 4;
-    /// KV chunks per head in the decode attention split pass.
-    const nsplit = 128;
-    /// Largest batch that runs the small-batch path (4-input grouped GEMVs +
-    /// batched flash-decoding): every speculative verify batch, and the
-    /// chunk size for follow-up (pos0 > 0) prefills, which cannot use the square
-    /// attention kernel because that one is pos0=0-only.
+    /// Rows per batched forward. Each chunk expands every block-quant weight to f16
+    /// once, so a bigger one amortizes that: Qwen3-4B q4_k, a 1309-token prompt, 512
+    /// rows 1563 tok/s, 1024 1779, 2048 1951.
+    const prefill_chunk = 2048;
+    /// KV chunks per head in the attention split pass: a decode step and a verify
+    /// batch, then a prefill chunk, whose query rows already fill the device.
+    const nsplit = 32;
+    const nsplit_prefill = 8;
+    /// Largest batch that is bit-identical per row to a decode step.
     const gemv_batch_max = spec_limits.max_draft + 1;
-    /// Interleaved chunks per row in the 3-pass rmsnorm.
-    const rms_chunks = 64;
-    /// Interleaved k chunks per output column in the decode GEMV.
+    /// Interleaved k chunks per output column in the dense GEMVs.
     const gemv_nchunk = 32;
-    /// Fresh-prompt length at/above which block-quant prefill switches to the
-    /// tensor-core GEMM. Below it, the per-token dequant GEMV wins: the GEMM
-    /// dequants every weight once up front (~a full extra weight pass), which
-    /// only pays off once that fixed cost beats `m` single-token forwards
-    /// (~crossover a couple dozen tokens on the 3090).
-    const prefill_gemm_min = 32;
 
-    /// Device bytes the KV cache reserves up front for `capacity` tokens (k +
-    /// v across all layers). Vulkan has no growable buffers, so this whole
-    /// window is allocated in init(), callers sizing a default weight-pin
-    /// budget must leave this much VRAM unpinned for it.
-    pub fn kvWindowBytes(cfg: qwen3.Config, capacity: usize) usize {
-        return 2 * cfg.n_layers * capacity * cfg.kvDim() * 4;
+    /// Device bytes the KV cache reserves up front for `capacity` tokens. Vulkan has no
+    /// growable buffers, so a caller sizing a weight-pin budget leaves this much free.
+    pub fn kvWindowBytes(cfg: qwen3.Config, capacity: usize, dtype: kvmod.KvDtype) usize {
+        return kv_gpu.Kv.windowBytes(cfg.n_layers, capacity, cfg.kvDim(), dtype);
     }
 
-    pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
+    pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, cap: kvmod.Capacity) !VulkanLM {
         const c = lm.cfg;
-        if (c.n_layers > qwen3.Config.max_layers) return error.UnsupportedModelConfig;
-        // The embedding table is host-gathered into an f32 copy, so any dtype
-        // `qwen3.embedTokens` converts works here, block quants included.
-        // Block-quant head (llama/Mistral) => per-row GEMV everything. A dense
-        // model must use the tied bf16 embedding as its LM head (the 4-chunk
-        // head path reads `embed_f32`, which assumes head == embed).
-        const quant = lm.head.dtype.isBlockQuant();
-        if (!quant) {
-            if (lm.embed.dtype != .bf16 or lm.head.bytes.ptr != lm.embed.bytes.ptr)
-                return error.UnsupportedModelConfig;
-            if (c.vocab % vocab_chunks != 0) return error.UnsupportedModelConfig;
-        }
-
         var self: VulkanLM = init_defaults.of(VulkanLM);
         self.lm = lm;
         self.ctx = ctx;
         self.gpa = gpa;
         self.cfg = c;
-        self.quant = quant;
+        self.capacity = cap.max;
+        self.len = 0;
+        self.sin_off = @intCast(cap.max * half);
+
         const max_out = @max(@max(c.vocab, c.qDim()), @max(c.intermediate, c.hidden));
         self.lin = try lin_gpu.Lin.init(gpa, ctx, max_out, gemv_nchunk, 3);
         errdefer self.lin.deinit();
-        self.can_gemm_prefill = quant and self.lin.knobs.gemm_prefill;
-        self.chunk_rows = c.vocab / vocab_chunks;
-        self.capacity = capacity;
-        self.len = 0;
-        // Block-quant WITHOUT the prefill GEMM runs one token at a time (no
-        // square-attention prefill), so its activation buffers only need the
-        // small-batch floor. Everything else (dense, or block-quant with the
-        // tensor-core prefill) sizes for the whole first prefill chunk.
-        self.max_rows = if (quant and !self.can_gemm_prefill) gemv_batch_max else @max(@max(first_seq, 1), gemv_batch_max);
-        self.sin_off = @intCast(capacity * half);
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            try self.lin.plan(try lm.deviceLins(arena.allocator()), if (quant and !self.can_gemm_prefill) 1 else self.max_rows, "qwen3 vulkan");
+            const lins = try lm.deviceLins(arena.allocator());
+            self.lin_plan = try self.lin.plan(lins, lin_gpu.Use.llm(prefill_chunk), "qwen3 vulkan");
+            // Not for the head: a prefill reads no logits and a step runs it as a GEMV,
+            // while its expansion would be vocab x hidden of scratch.
+            var batched: std.ArrayList(lin_gpu.Weight) = .empty;
+            for (lins) |w| if (w.bytes.ptr != lm.head.bytes.ptr) try batched.append(arena.allocator(), w);
+            try lin_gpu.presize(ctx, self.lin_plan, batched.items);
         }
 
-        self.embed_f32 = try gpa.alloc(f32, c.vocab * c.hidden);
-        errdefer gpa.free(self.embed_f32);
-        try safetensors.convertToF32(lm.embed.dtype, lm.embed.bytes, self.embed_f32);
-
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, c.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, hd, c.rope_theta);
         defer freqs.deinit(gpa);
-        const fp = try gpa.alloc(f32, 2 * capacity * half);
+        const fp = try gpa.alloc(f32, 2 * cap.max * half);
         defer gpa.free(fp);
-        @memcpy(fp[0 .. capacity * half], freqs.cos);
-        @memcpy(fp[capacity * half ..], freqs.sin);
+        @memcpy(fp[0 .. cap.max * half], freqs.cos);
+        @memcpy(fp[cap.max * half ..], freqs.sin);
         self.freqs_d = try ctx.tensorCreate(fp.len * 4);
         errdefer ctx.tensorDestroy(&self.freqs_d);
         try ctx.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
-        const kv_bytes = capacity * c.kvDim() * 4;
-        var created: usize = 0;
-        errdefer for (self.k_cache[0..created]) |*bf| ctx.tensorDestroy(bf);
-        for (self.k_cache[0..c.n_layers]) |*bf| {
-            bf.* = try ctx.tensorCreate(kv_bytes);
-            created += 1;
-        }
-        var vcreated: usize = 0;
-        errdefer for (self.v_cache[0..vcreated]) |*bf| ctx.tensorDestroy(bf);
-        for (self.v_cache[0..c.n_layers]) |*bf| {
-            bf.* = try ctx.tensorCreate(kv_bytes);
-            vcreated += 1;
-        }
-
-        self.bufs = try LmBufs.init(ctx, self.max_rows, c);
+        self.kv = try kv_gpu.Kv.init(gpa, ctx, c.n_layers, cap.max, c.kvDim(), cap.kv_dtype, &.{});
+        errdefer self.kv.deinit(gpa, ctx);
+        self.bufs = try LmBufs.init(ctx, c);
         return self;
     }
 
     pub fn deinit(self: *VulkanLM) void {
-        for (self.k_cache[0..self.cfg.n_layers]) |*bf| self.ctx.tensorDestroy(bf);
-        for (self.v_cache[0..self.cfg.n_layers]) |*bf| self.ctx.tensorDestroy(bf);
+        self.kv.deinit(self.gpa, self.ctx);
         self.ctx.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.ctx);
-        self.gpa.free(self.embed_f32);
         self.lin.deinit();
         self.* = undefined;
     }
@@ -600,164 +448,63 @@ pub const VulkanLM = struct {
         return self.capacity - self.len;
     }
 
-    /// Rows to forward per chunk. Dense: the whole fresh prompt through the
-    /// square-attention GEMM path, follow-up (pos0 > 0) through the batched
-    /// flash-decoding path. Block-quant WITH the tensor-core prefill: the fresh
-    /// prompt in one square-attention chunk (projections via the dequant->f16
-    /// GEMM), then one token at a time (decode / short follow-ups stay on the
-    /// exact per-row GEMV). Block-quant WITHOUT it: one token at a time always.
-    fn chunkRows(self: *const VulkanLM, avail: usize) usize {
-        if (self.quant) {
-            // GEMM prefill only for a fresh prompt long enough to amortize the
-            // dequant-all-weights pass; otherwise one token at a time.
-            if (self.can_gemm_prefill and self.len == 0 and avail >= prefill_gemm_min)
-                return @min(self.max_rows, avail);
-            return @min(@as(usize, 1), avail);
-        }
-        return if (self.len == 0) @min(self.max_rows, avail) else @min(gemv_batch_max, avail);
+    pub fn ensureCapacity(self: *VulkanLM, min_rows: usize) !void {
+        if (min_rows > self.capacity) return error.ContextFull;
     }
 
-    /// Single-pass per-head RMSNorm (QK-norm): rows is large (seq * heads), so
-    /// one thread per row parallelizes fine, unlike the hidden-dim norm.
-    fn rmsRows(self: *VulkanLM, in: Buf, out: Buf, weight: Buf, rows: usize, dim: usize) !void {
-        try self.ctx.opElt(.rmsnorm, in, out, weight, null, .{
-            .u0 = @intCast(rows),
-            .u1 = @intCast(dim),
-            .f0 = self.cfg.rms_eps,
-        }, rows, 1, 1);
-    }
-
-    /// Device VRAM (bytes) this Vulkan context has allocated, the analog of the
-    /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
+    /// Device VRAM (bytes) this Vulkan context has allocated, for the
+    /// end-of-response telemetry.
     pub fn vramUsed(self: *const VulkanLM) u64 {
         return self.ctx.device_used;
     }
 
-    /// Forward `ids` at positions [len, len+ids.len), then write
-    /// last-position vocab logits. A fresh-cache prompt chunks by max_rows
-    /// through the square-attention GEMM path; follow-up (pos0 > 0) prefills
-    /// chunk by gemv_batch_max through the batched flash-decoding path.
+    /// Forward `ids` at positions [len, len+ids.len) in chunks of `prefill_chunk`,
+    /// then write the last position's vocab logits.
     pub fn step(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
-        var off: usize = 0;
-        while (off < ids.len) {
-            const n = self.chunkRows(ids.len - off);
-            try self.stepChunk(io, ids[off..][0..n], logits);
-            off += n;
-        }
+        try self.forwardLast(io, ids);
+        try self.ctx.tensorDownload(self.bufs.logits, std.mem.sliceAsBytes(logits[0..self.cfg.vocab]));
     }
 
-    /// step, but with vocab logits for every new token ([ids.len, vocab]
-    /// row-major), the speculative-decode verify forward. The batch is
-    /// engine-capped at spec_limits.max_draft + 1.
+    /// `step`, with vocab logits for every new token ([ids.len, vocab] row-major): the
+    /// speculative-decode verify forward, engine-capped at `gemv_batch_max` rows.
     pub fn stepAll(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        _ = io;
         const ctx = self.ctx;
-        const seq = ids.len;
-        const nvocab = self.cfg.vocab;
-        std.debug.assert(logits.len == seq * nvocab);
-        std.debug.assert(seq > 0 and seq <= gemv_batch_max);
-
-        // Block-quant has no batched forward, verify each draft position with
-        // its own one-token forward (linear chain: position t appends its K/V
-        // and attends the committed prefix, exactly as a batched verify would).
-        if (self.quant) {
-            for (ids, 0..) |id, t| {
-                try self.stepChunk(io, &.{id}, logits[t * nvocab ..][0..nvocab]);
-            }
-            return;
-        }
-
         const b = &self.bufs;
-        const hidden_ = self.cfg.hidden;
+        const seq = ids.len;
+        std.debug.assert(logits.len == seq * self.cfg.vocab);
+        std.debug.assert(seq > 0 and seq <= gemv_batch_max);
         try self.layersForward(ids);
         errdefer if (ctx.batching) ctx.abortBatch();
-
-        // Final norm on every new position, then the LM head as 4 vocab
-        // chunks x 4-input groups (each weight chunk read once per group).
-        try self.normWide(b.x, b.normed, try nbuf(ctx, self.lm.final_norm), seq);
-        var g: usize = 0;
-        while (g * 4 < seq) : (g += 1) {
-            const n: usize = @min(4, seq - g * 4);
-            ctx.independent(vocab_chunks);
-            for (0..vocab_chunks) |ci| {
-                const w = self.embed_f32[ci * self.chunk_rows * hidden_ ..][0 .. self.chunk_rows * hidden_];
-                try ctx.opGemvPartial4(b.normed, g * 4 * hidden_, b.gemv_partials[ci], std.mem.sliceAsBytes(w), .f32, self.chunk_rows, hidden_, gemv_nchunk);
-            }
-            ctx.independent(vocab_chunks);
-            for (0..vocab_chunks) |ci| {
-                try ctx.opGemvCombine4(b.logits, g * 4 * nvocab + ci * self.chunk_rows, nvocab, b.gemv_partials[ci], self.chunk_rows, 1.0, gemv_nchunk, n);
-            }
-        }
+        try self.hiddenNorm(self.lm.final_norm, seq);
+        try self.lin.linear(self.lin_plan, b.logits, 0, b.normed, seq, self.lm.head);
         try ctx.endBatch();
         self.len += seq;
-
         try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits));
     }
 
-    /// Roll the KV cache back to `new_len` tokens (speculative-decode
-    /// rejection); device rows past `new_len` are overwritten by later steps.
+    /// An empty context; there is no recurrent state to clear.
+    pub fn resetCache(self: *VulkanLM) !void {
+        self.truncate(0);
+    }
+
+    /// Roll the KV cache back to `new_len` tokens (speculative-decode rejection);
+    /// device rows past it are overwritten by later steps.
     pub fn truncate(self: *VulkanLM, new_len: usize) void {
         std.debug.assert(new_len <= self.len);
         self.len = new_len;
     }
 
-    fn stepChunk(self: *VulkanLM, io: std.Io, ids: []const u32, logits: ?[]f32) !void {
-        _ = io;
-        const ctx = self.ctx;
-        const seq = ids.len;
-        const b = &self.bufs;
-        const hidden_ = self.cfg.hidden;
-        const nvocab = self.cfg.vocab;
-
-        try self.layersForward(ids);
-        errdefer if (ctx.batching) ctx.abortBatch();
-
-        // Final norm on the last position, then the LM head.
-        try ctx.opElt(.copy, b.x, b.t, null, null, .{
-            .u0 = @intCast(hidden_),
-            .u2 = 0,
-            .u3 = @intCast((seq - 1) * hidden_),
-        }, hidden_, 1, 1);
-        try self.normWide(b.t, b.normed, try nbuf(ctx, self.lm.final_norm), 1);
-        if (self.quant) {
-            // Untied block-quant head: one fused per-row dequant GEMV.
-            try self.lin.linear(b.logits, 0, b.normed, 1, self.lm.head);
-        } else {
-            // Dense tied head: 4 vocab chunks (each weight chunk read once).
-            ctx.independent(vocab_chunks);
-            for (0..vocab_chunks) |ci| {
-                const w = self.embed_f32[ci * self.chunk_rows * hidden_ ..][0 .. self.chunk_rows * hidden_];
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), .f32, self.chunk_rows, hidden_, gemv_nchunk);
-            }
-            ctx.independent(vocab_chunks);
-            for (0..vocab_chunks) |ci| {
-                try ctx.opGemvCombine(b.logits, ci * self.chunk_rows, b.gemv_partials[ci], self.chunk_rows, 1.0, gemv_nchunk);
-            }
-        }
-        try ctx.endBatch();
-        self.len += seq;
-
-        // `null` leaves the last position's logits resident (stepArgmax runs the
-        // device argmax on them instead of paying the ~608 KB vocab download).
-        if (logits) |l| try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(l[0..nvocab]));
-    }
-
-    /// Greedy decode without the vocab download: forward `ids`, then argmax the
-    /// last position's logits on-device and return just that token id. Matches
-    /// sample.argmax (temperature 0). The engine uses this for the greedy path.
+    /// Greedy decode without the vocab download: argmax on the device. Matches
+    /// sample.argmax (temperature 0).
     pub fn stepArgmax(self: *VulkanLM, io: std.Io, ids: []const u32) !u32 {
         return self.stepArgmaxPen(io, ids, &.{}, .{});
     }
 
-    /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see sample.zig), keeps penalized greedy decode
-    /// on the GPU path instead of the full-vocab download.
+    /// `stepArgmax` with sampling penalties scattered onto the device logits first
+    /// (opPenalize), so penalized greedy decode stays on the GPU.
     pub fn stepArgmaxPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
-        var off: usize = 0;
-        while (off < ids.len) {
-            const n = self.chunkRows(ids.len - off);
-            try self.stepChunk(io, ids[off..][0..n], null);
-            off += n;
-        }
+        try self.forwardLast(io, ids);
         const ctx = self.ctx;
         const b = &self.bufs;
         try ctx.opPenalize(b.logits, pen, sp);
@@ -773,24 +520,17 @@ pub const VulkanLM = struct {
         return gpu.topk_lanes * gpu.topk_m;
     }
 
-    /// Stochastic decode: forward `ids`, select the top-k candidates on-device,
-    /// and download just those (id,logit) pairs into out_id/out_logit (a few KB
-    /// vs the ~608 KB vocab). Returns the candidate count; the engine's Sampler
-    /// finishes (softmax/top-p/RNG) on the CPU over this small set.
+    /// Stochastic decode: forward `ids`, select the top-k candidates on the device and
+    /// download only those (id, logit) pairs. Returns the candidate count; the engine's
+    /// Sampler finishes on the CPU over this small set.
     pub fn stepSelect(self: *VulkanLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
         return self.stepSelectPen(io, ids, &.{}, .{}, out_id, out_logit);
     }
 
-    /// `stepSelect` with sampling penalties scattered onto the device logits
-    /// before the top-k (opPenalize), the selected candidates are the true
-    /// post-penalty top set, so penalized stochastic decode stays on the GPU.
+    /// `stepSelect` with sampling penalties applied before the top-k, so the selected
+    /// candidates are the true post-penalty top set.
     pub fn stepSelectPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
-        var off: usize = 0;
-        while (off < ids.len) {
-            const n = self.chunkRows(ids.len - off);
-            try self.stepChunk(io, ids[off..][0..n], null);
-            off += n;
-        }
+        try self.forwardLast(io, ids);
         const ctx = self.ctx;
         const b = &self.bufs;
         try ctx.opPenalize(b.logits, pen, sp);
@@ -803,179 +543,156 @@ pub const VulkanLM = struct {
         return count;
     }
 
-    /// The `cfg.n_layers` stack over `ids` at positions [len, len+seq):
-    /// embedding upload, then the whole transformer inside an open batch. The
-    /// caller finishes the batch (LM head variants differ), on success the
-    /// batch is still open, with the final hidden states in bufs.x.
+    /// Every chunk of `ids`, then the last position's logits left in `bufs.logits`.
+    fn forwardLast(self: *VulkanLM, io: std.Io, ids: []const u32) !void {
+        _ = io;
+        std.debug.assert(ids.len >= 1 and ids.len <= self.remaining());
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        const hidden_ = self.cfg.hidden;
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n: usize = @min(prefill_chunk, ids.len - off);
+            try self.layersForward(ids[off..][0..n]);
+            errdefer if (ctx.batching) ctx.abortBatch();
+            if (off + n == ids.len) {
+                // Every row is normed (the residual is pending on all of them); the head
+                // reads the last.
+                try self.hiddenNorm(self.lm.final_norm, n);
+                var last = b.normed;
+                if (n > 1) {
+                    try ctx.opElt(.copy, b.normed, b.t, null, null, .{
+                        .u0 = @intCast(hidden_),
+                        .u2 = 0,
+                        .u3 = @intCast((n - 1) * hidden_),
+                    }, hidden_, 1, 1);
+                    last = b.t;
+                }
+                try self.lin.linear(self.lin_plan, b.logits, 0, last, 1, self.lm.head);
+            }
+            try ctx.endBatch();
+            self.len += n;
+            off += n;
+        }
+    }
+
+    /// The layer stack over `ids` at positions [len, len+seq), inside a batch it leaves
+    /// open with the final hidden states in bufs.x. Polls `ops.cancel` between layers.
     fn layersForward(self: *VulkanLM, ids: []const u32) !void {
-        const gpa = self.gpa;
         const ctx = self.ctx;
         const seq = ids.len;
-        std.debug.assert(seq > 0 and seq <= self.remaining() and seq <= self.max_rows);
+        std.debug.assert(seq > 0 and seq <= self.remaining() and seq <= prefill_chunk);
         const pos0 = self.len;
         const hidden_ = self.cfg.hidden;
 
-        // CPU: embedding gather from the f32 copy, upload.
-        const x = try gpa.alloc(f32, seq * hidden_);
-        defer gpa.free(x);
-        for (ids, 0..) |id, t| {
-            if (id >= self.cfg.vocab) return error.TokenIdOutOfRange;
-            @memcpy(x[t * hidden_ ..][0..hidden_], self.embed_f32[@as(usize, id) * hidden_ ..][0..hidden_]);
-        }
-        try ctx.tensorUpload(self.bufs.x, std.mem.sliceAsBytes(x));
+        const x = try self.gpa.alloc(f32, seq * hidden_);
+        defer self.gpa.free(x);
+        try qwen3.embedTokens(self.lm.embed, ids, x);
+        // Before the batch opens: an upload inside it would flush the recording.
+        try ctx.tensorUpload(try ctx.view(self.bufs.x, 0, seq * hidden_ * 4), std.mem.sliceAsBytes(x));
 
         try ctx.beginBatch();
         errdefer if (ctx.batching) ctx.abortBatch();
-
+        self.residual_pending = false;
+        const ctok = ops.cancel.token;
         for (self.lm.layers, 0..) |layer, l| {
+            if (ops.cancel.canceled(ctok)) return error.Canceled;
             try transformer_gpu.decoderLayer(transformer.qwen3_spec, self, layer, l, seq, pos0);
         }
     }
 
-    // --- transformer_gpu.decoderLayer stepper methods (faithful lifts of the
-    // former inline layer loop; each keeps its leading independent() hint so op
-    // and scheduling order are byte-for-byte preserved). ---
+    // `transformer_gpu.decoderLayer` stepper methods.
 
     pub fn normInput(self: *VulkanLM, layer: anytype, seq: usize) !void {
-        try self.normWide(self.bufs.x, self.bufs.normed, try nbuf(self.ctx, layer.input_norm), seq);
+        try self.hiddenNorm(layer.input_norm, seq);
     }
 
     pub fn projectQKV(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
-        _ = l; // qwen3: uniform geometry
         const b = &self.bufs;
-        if (seq == 1) return self.lin.linearGroup(&.{ b.q, b.k, b.v }, b.normed, &.{ layer.q, layer.k, layer.v });
-        try self.lin.linear(b.q, 0, b.normed, seq, layer.q);
-        try self.lin.linear(b.k, 0, b.normed, seq, layer.k);
-        try self.lin.linear(b.v, 0, b.normed, seq, layer.v);
+        const kv = try self.kvOut(l, seq);
+        if (seq == 1) return self.lin.linearGroup(self.lin_plan, &.{ b.q, kv[0], kv[1] }, b.normed, &.{ layer.q, layer.k, layer.v });
+        const g = try self.lin.prep(self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
+        try self.lin.gemm(self.lin_plan, g, b.q, layer.q, .{});
+        try self.lin.gemm(self.lin_plan, g, kv[0], layer.k, .{});
+        try self.lin.gemm(self.lin_plan, g, kv[1], layer.v, .{});
     }
 
+    /// Where layer `l` projects its k and v: straight into the cache rows when it can
+    /// (`Kv.rowsAt`, a batch small enough for the row-exact GEMVs), else the scratch
+    /// `appendKV` stores from.
+    fn kvOut(self: *VulkanLM, l: usize, seq: usize) ![2]Buf {
+        const layer = self.lm.layers[l];
+        if (seq <= gemv_batch_max and self.lin.writesRows(self.lin_plan, layer.k, seq) and self.lin.writesRows(self.lin_plan, layer.v, seq))
+            if (try self.kv.rowsAt(self.ctx, l, self.len, seq)) |rows| return rows;
+        return .{ self.bufs.k, self.bufs.v };
+    }
+
+    /// With a q/k norm, the rope too, in the same pass (`applyRope` then has nothing
+    /// left): the position is the cache length, which `layersForward` passes as pos0.
     pub fn normQK(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
-        _ = l;
         const c = self.cfg;
-        if (!c.qk_norm) return; // llama/Mistral: no per-head QK-norm
+        if (!c.qk_norm) return;
         const ctx = self.ctx;
         const b = &self.bufs;
         if (seq == 1) ctx.independent(2);
-        try self.rmsRows(b.q, b.q, try nbuf(ctx, layer.q_norm), seq * c.n_heads, hd);
-        try self.rmsRows(b.k, b.k, try nbuf(ctx, layer.k_norm), seq * c.n_kv_heads, hd);
+        try ctx.opQkNormRope(b.q, try nbuf(ctx, layer.q_norm), self.freqs_d, seq * c.n_heads, hd, c.n_heads, self.len, self.sin_off, c.rms_eps);
+        try ctx.opQkNormRope((try self.kvOut(l, seq))[0], try nbuf(ctx, layer.k_norm), self.freqs_d, seq * c.n_kv_heads, hd, c.n_kv_heads, self.len, self.sin_off, c.rms_eps);
     }
 
     pub fn applyRope(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
-        _ = l; // qwen3: single rope table for all layers
         const ctx = self.ctx;
         const b = &self.bufs;
         const c = self.cfg;
+        std.debug.assert(pos0 == self.len);
+        if (c.qk_norm) return;
         if (seq == 1) ctx.independent(2);
-        try ctx.opElt(.rope_half, b.q, null, self.freqs_d, null, .{
-            .u0 = @intCast(seq * c.n_heads * half),
-            .u1 = half,
-            .u2 = self.sin_off,
-            .u3 = @intCast(c.n_heads),
-            .u4 = @intCast(pos0),
-        }, seq * c.n_heads * half, 1, 1);
-        try ctx.opElt(.rope_half, b.k, null, self.freqs_d, null, .{
-            .u0 = @intCast(seq * c.n_kv_heads * half),
-            .u1 = half,
-            .u2 = self.sin_off,
-            .u3 = @intCast(c.n_kv_heads),
-            .u4 = @intCast(pos0),
-        }, seq * c.n_kv_heads * half, 1, 1);
+        for ([2]Buf{ b.q, (try self.kvOut(l, seq))[0] }, [2]usize{ c.n_heads, c.n_kv_heads }) |buf, heads| {
+            try ctx.opElt(.rope_half, buf, null, self.freqs_d, null, .{
+                .u0 = @intCast(seq * heads * half),
+                .u1 = half,
+                .u2 = self.sin_off,
+                .u3 = @intCast(heads),
+                .u4 = @intCast(pos0),
+            }, seq * heads * half, 1, 1);
+        }
     }
 
     pub fn appendKV(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
-        const ctx = self.ctx;
-        const b = &self.bufs;
-        const kvd = self.cfg.kvDim();
-        // Append K/V to the cache (in-batch device copy).
-        if (seq == 1) ctx.independent(2);
-        try ctx.opElt(.copy, b.k, self.k_cache[l], null, null, .{
-            .u0 = @intCast(seq * kvd),
-            .u2 = @intCast(pos0 * kvd),
-        }, seq * kvd, 1, 1);
-        try ctx.opElt(.copy, b.v, self.v_cache[l], null, null, .{
-            .u0 = @intCast(seq * kvd),
-            .u2 = @intCast(pos0 * kvd),
-        }, seq * kvd, 1, 1);
+        // Projected straight into the cache.
+        if ((try self.kvOut(l, seq))[0].buf != self.bufs.k.buf) return;
+        if (seq == 1) self.ctx.independent(2);
+        try self.kv.store(self.ctx, l, self.bufs.k, self.bufs.v, pos0, seq);
     }
 
     pub fn attention(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
-        const ctx = self.ctx;
-        const b = &self.bufs;
         const c = self.cfg;
-        if (seq <= gemv_batch_max) {
-            // Batched flash-decoding split/merge against the cached prefix:
-            // query t sees pos0 + 1 + t keys (causal), covers decode (seq == 1),
-            // speculative verify, and follow-up prefill chunks at any pos0.
-            try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
-                .u0 = @intCast(pos0 + 1),
-                .u1 = @intCast(c.n_heads),
-                .u2 = @intCast(c.n_kv_heads),
-                .u3 = hd,
-                .u4 = nsplit,
-                .u5 = @intCast(seq),
-                .f0 = attn_scale,
-            }, seq * c.n_heads * nsplit, 1, 1);
-            try ctx.opElt(.attn_dmerge, b.attn_scratch, null, null, b.attn, .{
-                .u0 = @intCast(seq * c.n_heads),
-                .u1 = hd,
-                .u2 = nsplit,
-            }, seq * c.n_heads * hd, 1, 1);
-        } else {
-            // Square causal attention (prefill starts from an empty cache).
-            std.debug.assert(pos0 == 0);
-            try ctx.opElt(.gather_kmajor, b.q, null, null, b.qt, .{
-                .u0 = @intCast(seq * c.n_heads * hd),
-                .u1 = @intCast(c.n_heads),
-                .u2 = hd,
-                .u3 = @intCast(seq),
-            }, seq * c.n_heads * hd, 1, 1);
-            try ctx.opElt(.gather_kmajor, b.k, null, null, b.kt, .{
-                .u0 = @intCast(seq * c.n_kv_heads * hd),
-                .u1 = @intCast(c.n_kv_heads),
-                .u2 = hd,
-                .u3 = @intCast(seq),
-            }, seq * c.n_kv_heads * hd, 1, 1);
-            const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
-            try ctx.opElt(.attn_scores, b.qt, b.kt, null, b.s, .{
-                .u0 = @intCast(seq),
-                .u1 = @intCast(c.n_heads),
-                .u2 = @intCast(c.n_kv_heads),
-                .u3 = hd,
-                .u4 = 0,
-                .f0 = attn_scale,
-            }, dc8, dc8, c.n_heads);
-            try ctx.opElt(.attn_out, b.s, null, b.v, b.attn, .{
-                .u0 = @intCast(seq),
-                .u1 = @intCast(c.n_heads),
-                .u2 = @intCast(c.n_kv_heads),
-                .u3 = hd,
-                .u4 = 0,
-                .u5 = @intCast(seq),
-                .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
-                .f1 = @bitCast(@as(u32, 1)), // causal
-            }, hd / 8, dc8, c.n_heads);
-        }
+        const b = &self.bufs;
+        const ns: usize = if (seq <= gemv_batch_max) nsplit else nsplit_prefill;
+        try self.kv.attend(self.ctx, l, b.q, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, ns, attn_scale, 0, 0);
     }
 
     pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        try self.lin.linear(self.bufs.t, 0, self.bufs.attn, seq, layer.o);
+        try self.lin.linear(self.lin_plan, self.bufs.t, 0, self.bufs.attn, seq, layer.o);
     }
 
+    /// Deferred into the next `hiddenNorm`, which adds it in the same dispatch.
     pub fn addResidual(self: *VulkanLM, seq: usize) !void {
-        const n = seq * self.cfg.hidden;
-        try self.ctx.opElt(.add, self.bufs.x, self.bufs.t, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+        _ = seq;
+        std.debug.assert(!self.residual_pending);
+        self.residual_pending = true;
     }
 
     pub fn normPreFfn(self: *VulkanLM, layer: anytype, seq: usize) !void {
-        try self.normWide(self.bufs.x, self.bufs.normed, try nbuf(self.ctx, layer.post_norm), seq);
+        try self.hiddenNorm(layer.post_norm, seq);
     }
 
     pub fn projectGateUp(self: *VulkanLM, layer: anytype, seq: usize) !void {
         const b = &self.bufs;
-        if (seq == 1) return self.lin.linearGroup(&.{ b.gate, b.up }, b.normed, &.{ layer.gate, layer.up });
-        try self.lin.linear(b.gate, 0, b.normed, seq, layer.gate);
-        try self.lin.linear(b.up, 0, b.normed, seq, layer.up);
+        if (seq == 1) return self.lin.linearGroup(self.lin_plan, &.{ b.gate, b.up }, b.normed, &.{ layer.gate, layer.up });
+        const g = try self.lin.prep(self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try self.lin.gemm(self.lin_plan, g, b.gate, layer.gate, .{});
+        try self.lin.gemm(self.lin_plan, g, b.up, layer.up, .{});
     }
 
     pub fn activate(self: *VulkanLM, comptime act: transformer.Activation, seq: usize) !void {
@@ -988,36 +705,15 @@ pub const VulkanLM = struct {
     }
 
     pub fn projectDown(self: *VulkanLM, layer: anytype, seq: usize) !void {
-        try self.lin.linear(self.bufs.t, 0, self.bufs.gate, seq, layer.down);
+        try self.lin.linear(self.lin_plan, self.bufs.t, 0, self.bufs.gate, seq, layer.down);
     }
 
-    /// 3-pass parallel rmsnorm over [rows][hidden].
-    ///
-    /// MEASURED slower on the one-subgroup-per-row kernel the DiT uses, and for a
-    /// structural reason: at the decode's rows = 1 that kernel is 32 lanes over a
-    /// 4096-wide row on ONE multiprocessor, where the chunked partials spread the
-    /// same row over 64 and the apply pass over `hidden` threads. Interleaved
-    /// same-binary A/B, 8B q8_0 on a 3090: 30.9 vs 29.0 tok/s decode, prefill a
-    /// wash. Row count is what decides it, so a batched caller would flip the
-    /// answer; nothing here is batched enough to.
-    fn normWide(self: *VulkanLM, in: Buf, out: Buf, weight: Buf, rows: usize) !void {
-        const ctx = self.ctx;
-        const h: u32 = @intCast(self.cfg.hidden);
-        try ctx.opElt(.rms_partial, in, null, null, self.bufs.rms_partials, .{
-            .u0 = @intCast(rows * rms_chunks),
-            .u1 = h,
-            .u2 = rms_chunks,
-        }, rows * rms_chunks, 1, 1);
-        try ctx.opElt(.rms_combine, self.bufs.rms_partials, null, null, self.bufs.rms_inv, .{
-            .u0 = @intCast(rows),
-            .u1 = h,
-            .u2 = rms_chunks,
-            .f0 = self.cfg.rms_eps,
-        }, rows, 1, 1);
-        try ctx.opElt(.rms_apply_w, in, out, weight, self.bufs.rms_inv, .{
-            .u0 = @intCast(rows * self.cfg.hidden),
-            .u1 = h,
-        }, rows * self.cfg.hidden, 1, 1);
+    /// `normed = rmsnorm(x) * w` over `rows` rows, adding the pending residual into x
+    /// first.
+    fn hiddenNorm(self: *VulkanLM, w: []const f32, rows: usize) !void {
+        const b = &self.bufs;
+        try self.ctx.opAddRmsNorm(b.x, if (self.residual_pending) b.t else null, try nbuf(self.ctx, w), b.normed, rows, self.cfg.hidden, self.cfg.rms_eps);
+        self.residual_pending = false;
     }
 };
 
@@ -1027,17 +723,11 @@ const LmBufs = struct {
     q: Buf,
     k: Buf,
     v: Buf,
-    qt: Buf,
-    kt: Buf,
-    s: Buf,
     attn: Buf,
     gate: Buf,
     up: Buf,
     t: Buf,
     attn_scratch: Buf,
-    rms_partials: Buf,
-    rms_inv: Buf,
-    gemv_partials: [4]Buf,
     logits: Buf,
     // GPU-argmax scratch (opArgmax): per-lane max value + index, and the 1-id out.
     argmax_v: Buf,
@@ -1047,65 +737,45 @@ const LmBufs = struct {
     topk_v: Buf,
     topk_i: Buf,
 
-    fn init(ctx: *gpu.Context, rows: usize, cfg: qwen3.Config) !LmBufs {
-        const hidden_ = cfg.hidden;
-        const q_dim_ = cfg.qDim();
-        const kv_dim_ = cfg.kvDim();
-        const inter = cfg.intermediate;
-        const nvocab = cfg.vocab;
-        const chunk_rows = nvocab / VulkanLM.vocab_chunks;
+    /// Every activation holds a whole chunk, a multiple of the coop GEMMs' 128-row tile.
+    fn init(ctx: *gpu.Context, cfg: qwen3.Config) !LmBufs {
+        const r = VulkanLM.prefill_chunk;
+        const sizes = [fields.len]usize{
+            r * cfg.hidden, // x
+            r * cfg.hidden, // normed
+            r * cfg.qDim(), // q
+            r * cfg.kvDim(), // k
+            r * cfg.kvDim(), // v
+            r * cfg.qDim(), // attn
+            r * cfg.intermediate, // gate
+            r * cfg.intermediate, // up
+            r * cfg.hidden, // t
+            @max(VulkanLM.gemv_batch_max * VulkanLM.nsplit, r * VulkanLM.nsplit_prefill) * cfg.n_heads * (hd + 2), // attn_scratch
+            VulkanLM.gemv_batch_max * cfg.vocab, // logits (verify writes a row per position)
+            4096, // argmax_v (>= opArgmax lane count)
+            4096, // argmax_i
+            1, // argmax_out
+            gpu.topk_lanes * gpu.topk_m, // topk_v
+            gpu.topk_lanes * gpu.topk_m, // topk_i
+        };
         var self: LmBufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
             if (i < created) ctx.tensorDestroy(&@field(self, name));
         };
-        const r4 = std.mem.alignForward(usize, rows, 4); // grouped-GEMV inputs are read 4 rows at a time
-        const sizes = [fields.len]usize{
-            rows * hidden_ * 4, // x
-            r4 * hidden_ * 4, // normed
-            rows * q_dim_ * 4, // q
-            rows * kv_dim_ * 4, // k
-            rows * kv_dim_ * 4, // v
-            rows * q_dim_ * 4, // qt (prefill k-major)
-            rows * kv_dim_ * 4, // kt
-            cfg.n_heads * rows * rows * 4, // s (prefill scores)
-            r4 * q_dim_ * 4, // attn
-            r4 * inter * 4, // gate
-            rows * inter * 4, // up
-            rows * hidden_ * 4, // t (o/down GEMM out; also last-row scratch)
-            VulkanLM.gemv_batch_max * cfg.n_heads * VulkanLM.nsplit * (hd + 2) * 4, // attn_scratch (a row per verify query)
-            rows * VulkanLM.rms_chunks * 4, // rms_partials
-            rows * 4, // rms_inv
-            VulkanLM.gemv_batch_max * nvocab * 4, // logits (verify writes a row per position)
-            4096 * 4, // argmax_v (>= opArgmax lane count)
-            4096 * 4, // argmax_i
-            4, // argmax_out (1 id)
-            gpu.topk_lanes * gpu.topk_m * 4, // topk_v
-            gpu.topk_lanes * gpu.topk_m * 4, // topk_i
-        };
         inline for (fields, sizes) |name, size| {
-            @field(self, name) = try ctx.tensorCreate(size);
+            @field(self, name) = try ctx.tensorCreate(size * 4);
             created += 1;
-        }
-        // GEMV k-split partials: one per member of an `independent` group
-        // (q/k/v, gate/up, the 4 LM-head chunks). Sized for the largest
-        // user, times 4 for the 4-input verify variant.
-        var pcreated: usize = 0;
-        errdefer for (self.gemv_partials[0..pcreated]) |*pb| ctx.tensorDestroy(pb);
-        for (&self.gemv_partials) |*pb| {
-            pb.* = try ctx.tensorCreate(4 * @max(chunk_rows, inter) * VulkanLM.gemv_nchunk * 4);
-            pcreated += 1;
         }
         return self;
     }
 
     fn deinit(self: *LmBufs, ctx: *gpu.Context) void {
         inline for (fields) |name| ctx.tensorDestroy(&@field(self, name));
-        for (&self.gemv_partials) |*pb| ctx.tensorDestroy(pb);
         self.* = undefined;
     }
 
-    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "attn_scratch", "rms_partials", "rms_inv", "logits", "argmax_v", "argmax_i", "argmax_out", "topk_v", "topk_i" };
+    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "attn_scratch", "logits", "argmax_v", "argmax_i", "argmax_out", "topk_v", "topk_i" };
 };
 
 // Parity against the CPU encode (same weights, same fixture prompt); gated on
@@ -1116,7 +786,7 @@ test "gpu encode matches cpu encode" {
     const io = std.testing.io;
     const krea2_text = @import("krea2_text.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
 
@@ -1137,9 +807,9 @@ test "gpu encode matches cpu encode" {
     const want = try enc.encode(io, gpa, ids.items, null);
     defer gpa.free(want);
 
-    // f32 path (default): near-bit-parity (reduction-order noise only).
-    // f16 coop path: same rounding regime as the DiT's tensor-core GEMMs.
-    inline for (.{ .{ false, 1e-3 }, .{ true, 1e-2 } }) |cfg| {
+    // f32 (default): near-bit-parity (reduction-order noise only). f16: the residual
+    // stored f16 and the coop GEMMs on f16 operands, the DiT's regime.
+    inline for (.{ .{ gpu.Dt.f32, 1e-3 }, .{ gpu.Dt.f16, 1e-2 } }) |cfg| {
         const got = try encode(&enc, ctx, io, gpa, ids.items, cfg[0], null);
         defer gpa.free(got);
         try std.testing.expectEqual(want.len, got.len);
@@ -1149,7 +819,7 @@ test "gpu encode matches cpu encode" {
             max_err = if (std.math.isNan(a)) std.math.inf(f32) else @max(max_err, @abs(e - a));
             max_val = @max(max_val, @abs(e));
         }
-        std.debug.print("qwen gpu parity (f16={}): max_err={d:.5} max_val={d:.2}\n", .{ cfg[0], max_err, max_val });
+        errdefer std.debug.print("qwen gpu parity ({t}): max_err={d:.5} max_val={d:.2}\n", .{ cfg[0], max_err, max_val });
         try std.testing.expect(max_err < cfg[1] * @max(1.0, max_val));
     }
 }
@@ -1164,7 +834,7 @@ test "vulkan spec decode matches vanilla greedy" {
     const tokenizer_mod = @import("tp_core").tokenizer;
     const chat = @import("../llm/chat.zig");
     const engine = @import("../llm/engine.zig");
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
 
@@ -1189,13 +859,13 @@ test "vulkan spec decode matches vanilla greedy" {
     try ids_spec.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityPlanFor(opts, ids_vanilla.items.len));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
     {
         opts.spec_k = 2;
-        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids_spec.items.len), ids_spec.items.len);
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityPlanFor(opts, ids_spec.items.len));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_spec, opts, null);
     }
@@ -1219,7 +889,7 @@ test "vulkan bf16 prefill argmax matches cpu" {
     const tokenizer_mod = @import("tp_core").tokenizer;
     const chat = @import("../llm/chat.zig");
     const engine = @import("../llm/engine.zig");
-    const path = "models/text_encoders/qwen3_4b_instruct.safetensors";
+    const path = build_options.model_root ++ "/text_encoders/qwen3_4b_instruct.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
@@ -1266,7 +936,7 @@ test "vulkan bf16 prefill argmax matches cpu" {
         defer st.deinit();
         var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
         defer lm.deinit();
-        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids.items.len), ids.items.len);
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityPlanFor(opts, ids.items.len));
         defer model.deinit();
         try model.step(io, ids.items, vk_logits);
     }

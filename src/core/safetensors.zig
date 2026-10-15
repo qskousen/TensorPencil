@@ -6,6 +6,7 @@
 //! by the OS page cache and nothing is copied at open time.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const dtypes = @import("dtype.zig");
 const filemap = @import("filemap.zig");
@@ -627,7 +628,7 @@ test "real model headers" {
     }.f;
     var checked: usize = 0;
 
-    const vae_path = "models/vae/krea2RealVae_v10.safetensors";
+    const vae_path = build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors";
     if (have(io, vae_path)) {
         checked += 1;
         var st = try SafeTensors.open(gpa, io, vae_path);
@@ -654,7 +655,7 @@ test "real model headers" {
         try std.testing.expectEqualSlices(usize, &.{10000}, sigmas.info.shape.slice());
     }
 
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     if (have(io, te_path)) {
         checked += 1;
         var st = try SafeTensors.open(gpa, io, te_path);

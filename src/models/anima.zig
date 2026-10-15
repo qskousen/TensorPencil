@@ -19,10 +19,12 @@
 //! anima_gpu.zig and anima_cuda.zig.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const lora_mod = @import("lora.zig");
 const lin = @import("lin.zig");
 
 const WeightStore = weights_mod.WeightStore;
@@ -285,6 +287,9 @@ pub const Adapter = struct {
     blocks: []AdapterBlock,
     out_proj: LinearW,
     norm: []const f32,
+    /// Set with the trunk's by `DiT.attachLora`: the adapter is part of the
+    /// denoiser in ComfyUI's key space.
+    lora: ?*const lora_mod.Stack = null,
 
     /// The denoiser's cross-attention context for one prompt.
     ///
@@ -354,7 +359,7 @@ pub const Adapter = struct {
         }
 
         // `self.norm(self.out_proj(x))`, then the emphasis weights.
-        try ops.matmul.matmul(io, gpa, delta, x, n_t, self.out_proj.w, self.out_proj.b);
+        try mm(io, gpa, self.lora, delta, x, n_t, self.out_proj.w, self.out_proj.b);
         ops.norm.rmsNorm(x, delta, self.norm, cfg.norm_eps);
 
         // A per-ROW scalar, applied after the norm: `out = out * t5xxl_weights`
@@ -383,9 +388,9 @@ pub const Adapter = struct {
         const inner = self.cfg.mlp_dim;
         const hidden = try gpa.alloc(f32, n * inner);
         defer gpa.free(hidden);
-        try ops.matmul.matmul(io, gpa, hidden, x, n, blk.mlp1.w, blk.mlp1.b);
+        try mm(io, gpa, self.lora, hidden, x, n, blk.mlp1.w, blk.mlp1.b);
         ops.act.geluErf(hidden);
-        try ops.matmul.matmul(io, gpa, out, hidden, n, blk.mlp2.w, blk.mlp2.b);
+        try mm(io, gpa, self.lora, out, hidden, n, blk.mlp2.w, blk.mlp2.b);
     }
 
     /// Shared by both of the adapter's attentions. Queries are rotated by
@@ -414,9 +419,9 @@ pub const Adapter = struct {
         defer gpa.free(k);
         const v = try gpa.alloc(f32, n_kv * inner);
         defer gpa.free(v);
-        try ops.matmul.matmul(io, gpa, q, xq, n_q, attn.q, null);
-        try ops.matmul.matmul(io, gpa, k, xkv, n_kv, attn.k, null);
-        try ops.matmul.matmul(io, gpa, v, xkv, n_kv, attn.v, null);
+        try mm(io, gpa, self.lora, q, xq, n_q, attn.q, null);
+        try mm(io, gpa, self.lora, k, xkv, n_kv, attn.k, null);
+        try mm(io, gpa, self.lora, v, xkv, n_kv, attn.v, null);
 
         // Per-head norms before RoPE; `rmsNorm` reduces over `weight.len == head_dim`,
         // so the flat `[n, heads*head_dim]` buffer is already the right shape. `v` is
@@ -435,7 +440,7 @@ pub const Adapter = struct {
             .n_kv_heads = cfg.n_heads,
             .head_dim = hd,
         });
-        try ops.matmul.matmul(io, gpa, out, attn_out, n_q, attn.out, null);
+        try mm(io, gpa, self.lora, out, attn_out, n_q, attn.out, null);
     }
 };
 
@@ -458,6 +463,9 @@ pub const DiT = struct {
     final_ada: [2]Weight,
     final_linear: Weight,
     adapter: Adapter,
+    /// The LoRA sidecars every host linear applies (`mm`), and the device arms
+    /// read. Set by `attachLora`, owned by the caller.
+    lora: ?*const lora_mod.Stack = null,
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore, cfg: Config) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -516,6 +524,33 @@ pub const DiT = struct {
         self.* = undefined;
     }
 
+    /// Resolve `stack` against every linear this model runs, trunk, AdaLN and
+    /// adapter, host and device, and hold it. Returns the file keys that apply.
+    pub fn attachLora(self: *DiT, gpa: std.mem.Allocator, stack: *lora_mod.Stack) !usize {
+        self.lora = stack;
+        self.adapter.lora = stack;
+        stack.beginAttach();
+        try stack.resolveAll(self.device_lins);
+        for (self.blocks) |*b| {
+            try stack.resolveAll(&b.ada_sa);
+            try stack.resolveAll(&b.ada_ca);
+            try stack.resolveAll(&b.ada_mlp);
+        }
+        try stack.resolveAll(&self.final_ada);
+        try stack.resolveAll(&.{ self.x_embedder, self.t_linear1, self.t_linear2, self.final_linear, self.adapter.out_proj.w });
+        for (self.adapter.blocks) |*b| {
+            try stack.resolveAll(&.{ b.self_attn.q, b.self_attn.k, b.self_attn.v, b.self_attn.out });
+            try stack.resolveAll(&.{ b.cross_attn.q, b.cross_attn.k, b.cross_attn.v, b.cross_attn.out });
+            try stack.resolveAll(&.{ b.mlp1.w, b.mlp2.w });
+        }
+        return stack.finishAttach(gpa);
+    }
+
+    pub fn detachLora(self: *DiT) void {
+        self.lora = null;
+        self.adapter.lora = null;
+    }
+
     // --- per-step constants -------------------------------------------------
     //
     // Split the way krea2's and Z-Image's are: `pipeline.Denoiser` builds the
@@ -550,9 +585,9 @@ pub const DiT = struct {
         {
             const h1 = try gpa.alloc(f32, d);
             defer gpa.free(h1);
-            try ops.matmul.matmul(io, gpa, h1, sinus, 1, self.t_linear1, null);
+            try mm(io, gpa, self.lora, h1, sinus, 1, self.t_linear1, null);
             ops.act.silu(h1);
-            try ops.matmul.matmul(io, gpa, lora, h1, 1, self.t_linear2, null);
+            try mm(io, gpa, self.lora, lora, h1, 1, self.t_linear2, null);
         }
 
         // Convention 5: SiLU on the input, then the rank-`adaln_dim` pair with no
@@ -573,8 +608,8 @@ pub const DiT = struct {
             const per_block = out[bi * 9 * d ..][0 .. 9 * d];
             for ([_][2]Weight{ blk.ada_sa, blk.ada_ca, blk.ada_mlp }, 0..) |ada, si| {
                 const dst = per_block[si * 3 * d ..][0 .. 3 * d];
-                try ops.matmul.matmul(io, gpa, low, gated, 1, ada[0], null);
-                try ops.matmul.matmul(io, gpa, dst, low, 1, ada[1], null);
+                try mm(io, gpa, self.lora, low, gated, 1, ada[0], null);
+                try mm(io, gpa, self.lora, dst, low, 1, ada[1], null);
                 // Convention 4: the one shared LoRA vector is added to all three.
                 for (dst, lora) |*v, lv| v.* += lv;
             }
@@ -583,8 +618,8 @@ pub const DiT = struct {
         // The final layer takes only the FIRST 2*dim of the LoRA vector.
         {
             const dst = out[cfg.n_layers * 9 * d ..][0 .. 2 * d];
-            try ops.matmul.matmul(io, gpa, low, gated, 1, self.final_ada[0], null);
-            try ops.matmul.matmul(io, gpa, dst, low, 1, self.final_ada[1], null);
+            try mm(io, gpa, self.lora, low, gated, 1, self.final_ada[0], null);
+            try mm(io, gpa, self.lora, dst, low, 1, self.final_ada[1], null);
             for (dst, lora[0 .. 2 * d]) |*v, lv| v.* += lv;
         }
         return out;
@@ -636,9 +671,9 @@ pub const DiT = struct {
         {
             const h1 = try gpa.alloc(f32, n * d);
             defer gpa.free(h1);
-            try ops.matmul.matmul(io, gpa, h1, sinus, n, self.t_linear1, null);
+            try mm(io, gpa, self.lora, h1, sinus, n, self.t_linear1, null);
             ops.act.silu(h1);
-            try ops.matmul.matmul(io, gpa, lora, h1, n, self.t_linear2, null);
+            try mm(io, gpa, self.lora, lora, h1, n, self.t_linear2, null);
         }
 
         // Convention 5: SiLU on the input, then the rank-`adaln_dim` pair with no
@@ -655,8 +690,8 @@ pub const DiT = struct {
 
         for (self.blocks, 0..) |*blk, bi| {
             for ([_][2]Weight{ blk.ada_sa, blk.ada_ca, blk.ada_mlp }, 0..) |ada, si| {
-                try ops.matmul.matmul(io, gpa, low, gated, n, ada[0], null);
-                try ops.matmul.matmul(io, gpa, dst, low, n, ada[1], null);
+                try mm(io, gpa, self.lora, low, gated, n, ada[0], null);
+                try mm(io, gpa, self.lora, dst, low, n, ada[1], null);
                 for (0..n) |i| {
                     const row = dst[i * 3 * d ..][0 .. 3 * d];
                     const lo = lora[i * 3 * d ..][0 .. 3 * d];
@@ -669,10 +704,10 @@ pub const DiT = struct {
 
         // The final layer takes only the FIRST 2*dim of the LoRA vector.
         {
-            try ops.matmul.matmul(io, gpa, low, gated, n, self.final_ada[0], null);
+            try mm(io, gpa, self.lora, low, gated, n, self.final_ada[0], null);
             const fin = try gpa.alloc(f32, n * 2 * d);
             defer gpa.free(fin);
-            try ops.matmul.matmul(io, gpa, fin, low, n, self.final_ada[1], null);
+            try mm(io, gpa, self.lora, fin, low, n, self.final_ada[1], null);
             for (0..n) |i| {
                 const row = fin[i * 2 * d ..][0 .. 2 * d];
                 const lo = lora[i * 3 * d ..][0 .. 2 * d];
@@ -737,7 +772,7 @@ pub const DiT = struct {
         {
             const patches = try patchify(gpa, cfg, x_lat, lat_h, lat_w);
             defer gpa.free(patches);
-            try ops.matmul.matmul(io, gpa, x, patches, seq, self.x_embedder, null);
+            try mm(io, gpa, self.lora, x, patches, seq, self.x_embedder, null);
         }
 
         const normed = try gpa.alloc(f32, seq * d);
@@ -775,7 +810,7 @@ pub const DiT = struct {
         modulatedNorm(rows, rows, final_mod[0..d], final_mod[d .. 2 * d], cfg.norm_eps);
         const patches = try gpa.alloc(f32, seq * cfg.outPatchDim());
         defer gpa.free(patches);
-        try ops.matmul.matmul(io, gpa, patches, rows, seq, self.final_linear, null);
+        try mm(io, gpa, self.lora, patches, rows, seq, self.final_linear, null);
         unpatchify(cfg, out, patches, lat_h, lat_w);
     }
 
@@ -852,10 +887,10 @@ pub const DiT = struct {
         const inner = self.cfg.mlp_dim;
         const hidden = try gpa.alloc(f32, seq * inner);
         defer gpa.free(hidden);
-        try ops.matmul.matmul(io, gpa, hidden, x, seq, blk.mlp1, null);
+        try mm(io, gpa, self.lora, hidden, x, seq, blk.mlp1, null);
         // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
         ops.act.geluErf(hidden);
-        try ops.matmul.matmul(io, gpa, out, hidden, seq, blk.mlp2, null);
+        try mm(io, gpa, self.lora, out, hidden, seq, blk.mlp2, null);
     }
 
     /// The key/value half of one attention: project `src` and apply the K norm
@@ -876,8 +911,8 @@ pub const DiT = struct {
         k: []f32,
         v: []f32,
     ) !void {
-        try ops.matmul.matmul(io, gpa, k, src, n, attn.k, null);
-        try ops.matmul.matmul(io, gpa, v, src, n, attn.v, null);
+        try mm(io, gpa, self.lora, k, src, n, attn.k, null);
+        try mm(io, gpa, self.lora, v, src, n, attn.v, null);
         // Per-head norm: `rmsNorm` reduces over `weight.len == head_dim`, so the flat
         // `[n, heads*head_dim]` buffer is already the right shape.
         ops.norm.rmsNorm(k, k, attn.knorm, self.cfg.qk_eps);
@@ -924,7 +959,7 @@ pub const DiT = struct {
         defer gpa.free(k);
         const v = try gpa.alloc(f32, n_kv * inner);
         defer gpa.free(v);
-        try ops.matmul.matmul(io, gpa, q, xq, n_q, attn.q, null);
+        try mm(io, gpa, self.lora, q, xq, n_q, attn.q, null);
         try self.projectKv(io, gpa, attn, xkv, n_kv, k, v);
 
         ops.norm.rmsNorm(q, q, attn.qnorm, cfg.qk_eps);
@@ -942,7 +977,7 @@ pub const DiT = struct {
             .n_kv_heads = cfg.n_heads,
             .head_dim = hd,
         });
-        try ops.matmul.matmul(io, gpa, out, attn_out, n_q, attn.out, null);
+        try mm(io, gpa, self.lora, out, attn_out, n_q, attn.out, null);
     }
 };
 
@@ -1138,6 +1173,13 @@ fn embedRows(embed: Weight, ids: []const u32, out: []f32) !void {
     }
 }
 
+/// Every host GEMM on a model weight goes through here, so a LoRA cannot be
+/// missed at one call site.
+fn mm(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, out: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, out, x, m, w, bias);
+    if (stack) |s| try s.applyHost(io, gpa, out, w.rows, x, m, w, bias);
+}
+
 /// Every linear one block's DEVICE forward runs; `DiT.device_lins` is these flattened.
 ///
 /// Cross-attention's k/v belong here: they run on the device, so a checkpoint that
@@ -1283,8 +1325,8 @@ const tokenizer_mod = tp_core.tokenizer;
 const t5_tokenizer = tp_core.t5_tokenizer;
 
 const ref_path = "src/models/assets/anima_ref.safetensors";
-const anima_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
-const anima_te = "/home/qt/genai/comfyui/models/text_encoders/qwen_3_06b_base.safetensors";
+const anima_ckpt = build_options.model_root ++ "/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
+const anima_te = build_options.model_root ++ "/text_encoders/qwen_3_06b_base.safetensors";
 const anima_int8_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/anima_baseV10-INT8_CONVROT-MIXED.safetensors";
 /// Trunk depths the fp32 reference keeps, see the generator's docstring. The pair
 /// is what shows whether the disagreement grows linearly with depth (the block is

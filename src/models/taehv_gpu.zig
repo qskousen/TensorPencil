@@ -1,26 +1,19 @@
-//! Vulkan (generic-GPU) decode for the taew2_1 (TAEHV) approx VAE, the GPU
-//! path for the live per-step preview when the diffuser runs on the Vulkan
-//! backend. Mirrors `taehv_cuda.decode` on the `Context` abstraction, reusing
-//! the same banded im2col + GEMM conv as `vae_gpu` (tensor cores via
-//! `opMatmulCoopF16W` for co >= 96, the f32 register-tile GEMM below that).
-//!
-//! The input Clamp (tanh(x/3)*3) is applied on the host before upload (it's on
-//! the small latent). Each stage's spatial Upsample is fused into that stage's
-//! 3x3 conv (`up=true`), valid because it commutes with the per-pixel TGrow
-//! 1x1 conv that sits between them. Weights are read straight from the loaded
+//! Vulkan decode for the taew2_1 (TAEHV) approx VAE: the adapter for `taehv_dev.zig`.
+//! The conv is a banded im2col + GEMM (tensor cores via `opMatmulCoopF16W` for
+//! co >= 96, the f32 register-tile GEMM below that). Weights are read straight from the loaded
 //! `taehv.Decoder`; the packed [co][kh][kw][ci] layout is exactly the
 //! [rows][cols] the GEMM weight cache expects, so they upload/transpose lazily
 //! on first use and stay cached across preview steps.
 const std = @import("std");
 const wan_vae = @import("wan_vae.zig");
+const conv_gpu = @import("conv_gpu.zig");
 const taehv = @import("taehv.zig");
+const taehv_dev = @import("taehv_dev.zig");
+const sd_unet_gpu = @import("sd_unet_gpu.zig");
 const gpu_context = @import("tp_gpu").context;
 
 const Context = gpu_context.Context;
 const DeviceBuffer = gpu_context.DeviceBuffer;
-
-/// Cap on the im2col patch band (bytes); bands iterate over output rows.
-const patch_band_bytes: usize = 256 << 20;
 
 const none: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 
@@ -35,117 +28,58 @@ const Bufs = struct {
     }
 };
 
-/// Decode planar [16][zh][zw] sampler latent to RGB8 [8*zh][8*zw][3].
+/// `taehv_dev.decode` on this backend. Caller frees.
 pub fn decode(dec: *const taehv.Decoder, ctx: *Context, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize) ![]u8 {
-    std.debug.assert(z.len == taehv.latent_channels * zh * zw);
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
-
-    var h = zh;
-    var w = zw;
-    const n0 = zh * zw;
-    {
-        const rows = try wan_vae.planarToRows(gpa, z, taehv.latent_channels, n0);
-        defer gpa.free(rows);
-        for (rows) |*v| v.* = std.math.tanh(v.* / 3.0) * 3.0; // Clamp, on host
-        try ctx.ensureDeviceBuffer(&bufs.x, n0 * taehv.latent_channels * 4);
-        try ctx.tensorUpload(bufs.x, std.mem.sliceAsBytes(rows));
-    }
-
-    try ctx.beginBatch();
-    var batched = true;
-    errdefer if (batched) ctx.endBatch() catch {};
-
-    try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, dec.conv_in, false); // 16 -> 256
-    std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
-    try relu(ctx, bufs.x, h * w * dec.conv_in.co);
-
-    for (dec.stages) |stage| {
-        for (stage.mb) |mb| try memBlock(ctx, &bufs, h, w, mb);
-        try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, stage.tgrow, false); // TGrow 1x1 (first-frame slice)
-        std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
-        try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, stage.sc, true); // 3x3 with fused 2x upsample
-        std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
-        h *= 2;
-        w *= 2;
-    }
-
-    try relu(ctx, bufs.x, h * w * 64); // ReLU before head
-    try conv(ctx, &bufs, &bufs.x, &bufs.u, h, w, dec.head_conv, false); // 64 -> 3
-
-    batched = false;
-    try ctx.endBatch();
-
-    const n = h * w;
-    const rgb_rows = try gpa.alloc(f32, n * 3);
-    defer gpa.free(rgb_rows);
-    try ctx.tensorDownload(bufs.u, std.mem.sliceAsBytes(rgb_rows));
-    const rgb = try gpa.alloc(u8, n * 3);
-    for (rgb, rgb_rows) |*o, v| o.* = @intFromFloat(std.math.clamp(v, 0.0, 1.0) * 255.0);
-    return rgb;
+    return taehv_dev.decode(Dev{ .ctx = ctx, .bufs = &bufs }, dec, gpa, z, zh, zw);
 }
 
-/// MemBlock (past=0): out = ReLU(conv4(ReLU(conv2(ReLU(conv0(x))))) + x), in
-/// place on bufs.x. The final `+ skip` and its ReLU are one fused `add_relu`.
-fn memBlock(ctx: *Context, bufs: *Bufs, h: usize, w: usize, mb: taehv.MemBlock) !void {
-    const n = h * w * mb.n;
-    try conv(ctx, bufs, &bufs.x, &bufs.t, h, w, mb.conv0, false);
-    try relu(ctx, bufs.t, n);
-    try conv(ctx, bufs, &bufs.t, &bufs.u, h, w, mb.conv2, false);
-    try relu(ctx, bufs.u, n);
-    try conv(ctx, bufs, &bufs.u, &bufs.t, h, w, mb.conv4, false);
-    try ctx.opElt(.add_relu, bufs.t, bufs.x, null, null, .{ .u0 = @intCast(n) }, n, 1, 1); // + skip, fused ReLU
-    std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
-}
+/// The `taehv_dev` adapter.
+const Dev = struct {
+    ctx: *Context,
+    bufs: *Bufs,
 
-fn relu(ctx: *Context, x: DeviceBuffer, n: usize) !void {
-    try ctx.opElt(.relu, x, null, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
-}
-
-/// 3x3 (optionally with fused nearest-2x upsample) or 1x1 conv. Mirrors
-/// vae_gpu.conv: co >= 96 convs use the f16 tensor-core GEMM (when the coop
-/// pipeline exists), smaller ones the f32 GEMM.
-fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer, h: usize, w: usize, cv: wan_vae.Conv2d, up: bool) !void {
-    const wbytes = std.mem.sliceAsBytes(cv.w);
-    const coop = ctx.pipe_coop_f16w != .null_handle and cv.co >= 96;
-    if (cv.k == 1) {
-        std.debug.assert(!up);
-        const n = h * w;
-        try ctx.ensureDeviceBuffer(dst, n * cv.co * 4);
-        if (coop) return ctx.opMatmulCoopF16W(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, cv.b);
-        return ctx.opMatmul(dst.*, 0, src.*, 0, n, wbytes, false, cv.co, cv.ci, 1.0, cv.b);
+    pub fn upload(d: Dev, b: *DeviceBuffer, data: []const f32) !void {
+        try d.ctx.ensureDeviceBuffer(b, data.len * 4);
+        try d.ctx.tensorUpload(b.*, std.mem.sliceAsBytes(data));
     }
-    std.debug.assert(cv.k == 3);
 
-    const oh = if (up) 2 * h else h;
-    const ow = if (up) 2 * w else w;
-    const n_out = oh * ow;
-    const patch_len = 9 * cv.ci;
+    pub fn download(d: Dev, b: DeviceBuffer, dst: []f32) !void {
+        try d.ctx.tensorDownload(b, std.mem.sliceAsBytes(dst));
+    }
+
+    pub fn beginBatch(d: Dev) !void {
+        try d.ctx.beginBatch();
+    }
+
+    pub fn endBatch(d: Dev) !void {
+        try d.ctx.endBatch();
+    }
+
+    pub fn abortBatch(d: Dev) void {
+        if (d.ctx.batching) d.ctx.endBatch() catch {};
+    }
+
+    pub fn conv(d: Dev, src: *const DeviceBuffer, dst: *DeviceBuffer, h: usize, w: usize, cv: wan_vae.Conv2d, up: bool) !void {
+        try convAt(d.ctx, d.bufs, src, dst, h, w, cv, up);
+    }
+
+    pub fn relu(d: Dev, x: DeviceBuffer, n: usize) !void {
+        try d.ctx.opElt(.relu, x, null, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn addRelu(d: Dev, x: DeviceBuffer, y: DeviceBuffer, n: usize) !void {
+        try d.ctx.opElt(.add_relu, x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+};
+
+/// 3x3 (optionally with a fused nearest-2x upsample) or 1x1 conv, through the shared
+/// conv (`conv_gpu.conv2d`).
+fn convAt(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer, h: usize, w: usize, cv: wan_vae.Conv2d, up: bool) !void {
+    const n_out = if (up) 4 * h * w else h * w;
     try ctx.ensureDeviceBuffer(dst, n_out * cv.co * 4);
-
-    // Band positions: multiple of 4 keeps the GEMM's y byte offset 16-aligned
-    // for any co.
-    const band = @max(4, @min(n_out, patch_band_bytes / (patch_len * 4)) & ~@as(usize, 3));
-    try ctx.ensureDeviceBuffer(&bufs.patch, band * patch_len * 4);
-
-    var p0: usize = 0;
-    while (p0 < n_out) : (p0 += band) {
-        const bn = @min(band, n_out - p0);
-        try ctx.opElt(.im2col, src.*, null, null, bufs.patch, .{
-            .u0 = @intCast(bn * patch_len),
-            .u1 = @intCast(patch_len),
-            .u2 = @intCast(cv.ci),
-            .u3 = @intCast(w),
-            .u4 = @intCast(h),
-            .u5 = @intCast(p0),
-            .f0 = if (up) 1.0 else 0.0,
-        }, bn * patch_len, 1, 1);
-        if (coop) {
-            try ctx.opMatmulCoopF16W(dst.*, p0 * cv.co, bufs.patch, bn, cv.w, cv.co, patch_len, cv.b);
-        } else {
-            try ctx.opMatmul(dst.*, p0 * cv.co * 4, bufs.patch, 0, bn, wbytes, false, cv.co, patch_len, 1.0, cv.b);
-        }
-    }
+    try conv_gpu.conv2d(ctx, &bufs.patch, dst, src, h, w, cv.asOps(), if (up) .upsample2x else .stride1, null, null, 1.0);
 }
 
 // --- tests -----------------------------------------------------------------
@@ -178,7 +112,7 @@ test "gpu taehv decode matches cpu reference" {
     try std.testing.expectEqual(want.len, got.len);
     var max_diff: u32 = 0;
     for (want, got) |e, a| max_diff = @max(max_diff, @abs(@as(i32, e) - @as(i32, a)));
-    std.debug.print("taehv gpu parity: len={d} max_u8_diff={d}\n", .{ got.len, max_diff });
+    errdefer std.debug.print("taehv gpu parity: len={d} max_u8_diff={d}\n", .{ got.len, max_diff });
     // f16 tensor-core convs vs f32 CPU: allow a couple of 8-bit levels.
     try std.testing.expect(max_diff <= 2);
 }
@@ -206,14 +140,14 @@ test "gpu single coop conv float parity" {
     const in = try gpa.alloc(f32, h * w * ci);
     defer gpa.free(in);
     for (in) |*x| x.* = rand.floatNorm(f32);
-    const cv: wan_vae.Conv2d = .{ .w = wd, .b = bd, .co = co, .ci = ci, .k = 3 };
+    const cv: wan_vae.Conv2d = .{ .w = .{ .krsc = wd }, .b = bd, .co = co, .ci = ci, .k = 3 };
 
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
     try ctx.ensureDeviceBuffer(&bufs.x, in.len * 4);
     try ctx.tensorUpload(bufs.x, std.mem.sliceAsBytes(in));
     try ctx.beginBatch();
-    try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, cv, false);
+    try convAt(ctx, &bufs, &bufs.x, &bufs.t, h, w, cv, false);
     try ctx.endBatch();
     const got = try gpa.alloc(f32, h * w * co);
     defer gpa.free(got);
@@ -231,7 +165,7 @@ test "gpu single coop conv float parity" {
         };
         max_err = @max(max_err, @abs(@as(f32, @floatCast(acc)) - got[(y * w + xx) * co + o]));
     };
-    std.debug.print("single coop conv max_err={d:.5}\n", .{max_err});
+    errdefer std.debug.print("single coop conv max_err={d:.5}\n", .{max_err});
     try std.testing.expect(max_err < 5e-2);
 }
 
@@ -256,7 +190,7 @@ fn syntheticDecoder(gpa: std.mem.Allocator) !taehv.Decoder {
             for (wd) |*x| x.* = r.floatNorm(f32) * std_dev;
             const bd = try al.alloc(f32, co);
             for (bd) |*x| x.* = r.floatNorm(f32) * 0.02;
-            return .{ .w = wd, .b = bd, .co = co, .ci = ci, .k = k };
+            return .{ .w = .{ .krsc = wd }, .b = bd, .co = co, .ci = ci, .k = k };
         }
     }.f;
 
@@ -276,7 +210,7 @@ fn syntheticDecoder(gpa: std.mem.Allocator) !taehv.Decoder {
             .n = s.n,
         };
         var tg = try mkConv(a, rand, s.n, s.tg_co, 1);
-        tg.w = tg.w[0 .. s.n * s.n]; // first-frame slice (first n output rows)
+        tg.w = .{ .krsc = tg.krsc()[0 .. s.n * s.n] }; // first-frame slice (first n output rows)
         tg.co = s.n;
         tg.b = tg.b[0..s.n];
         stage.* = .{ .mb = mb, .tgrow = tg, .sc = try mkConv(a, rand, s.n, s.sc_co, 3), .n = s.n };

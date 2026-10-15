@@ -251,13 +251,17 @@ pub fn previewFits(store: tp.weights.WeightStore, fam: Family) bool {
 /// VAE, that file went on reading as "fits nothing" in every existing index.
 /// Mixed into the index version, a rule change empties the cache instead.
 ///
-/// Covers this file, which holds the width and depth checks, and the pipeline's
-/// probe table. NOT `pipeline.detectFamily` or the GGUF metadata `catalog.probe`
-/// reads for a chat model; `catalog.index_version` is the hand bump for those.
+/// Covers this file, which holds the width and depth checks, the pipeline's
+/// probe table, and the two LoRA modules a LoRA's placement is read through
+/// (`lora.zig`'s spellings, `lora_sd.sdFits`). NOT `pipeline.detectFamily` or
+/// the GGUF metadata `catalog.probe` reads for a chat model;
+/// `catalog.index_version` is the hand bump for those.
 pub const rules_fingerprint: u32 = blk: {
     @setEvalBranchQuota(1 << 22);
     var h = std.hash.Wyhash.init(0);
     h.update(@embedFile("model_spec.zig"));
+    h.update(std.mem.asBytes(&tp.models.lora.source_fingerprint));
+    h.update(std.mem.asBytes(&tp.models.lora_sd.source_fingerprint));
     for (std.enums.values(Family)) |fam| {
         h.update(@tagName(fam));
         for (std.enums.values(Component)) |comp| {
@@ -273,14 +277,21 @@ pub const rules_fingerprint: u32 = blk: {
 
 /// What a LoRA file turned out to be, for the menu row.
 pub const LoraInfo = struct {
-    /// Base linears it patches.
+    /// Weights it patches.
     targets: u32 = 0,
     /// Rank of the first factor read. Real files are one rank throughout, and
     /// this is a label, not something the loader relies on.
     rank: u32 = 0,
-    /// Deepest `layers.N` it names, plus one. Zero when it names no layer.
+    /// Deepest block it names (`layers.N`, `blocks.N`), plus one. Zero when it
+    /// names none.
     depth: u32 = 0,
+    /// Whether a sidecar family can apply it: native `diffusion_model.` keys and no
+    /// reshaped pad (`lora.Sidecar.refusedSuffix`).
+    sidecar: bool = true,
 };
+
+/// Keys that end one adapter target, in every form either LoRA route reads.
+const target_ends = [_][]const u8{ ".hada_w1_a", ".lokr_w1", ".lokr_w1_a", ".diff" };
 
 /// Read a LoRA's shape from its header, or null when the file is not one.
 ///
@@ -289,61 +300,69 @@ pub const LoraInfo = struct {
 pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
     const lora = tp.models.lora;
     var out: LoraInfo = .{};
+    var native = false;
     for (store.names()) |name| {
-        if (!std.mem.startsWith(u8, name, lora.Sidecar.prefix)) continue;
-        // A DoRA or conv-CP adapter is not a LoRA this engine applies, and the
-        // loader refuses it, so the menu must not offer it either.
-        if (lora.Sidecar.refusedSuffix(name) != null) return null;
-        const stem = lora.Sidecar.factorStem(name) orelse continue;
-        out.targets += 1;
-        if (out.rank == 0) {
-            if (store.get(name)) |v| {
-                const dims = v.info.shape.slice();
-                if (dims.len == 2) out.rank = @intCast(dims[0]);
-            }
+        if (lora.Sidecar.refusedSuffix(name) != null) out.sidecar = false;
+        const ends = for (lora.dialects) |d| {
+            if (std.mem.endsWith(u8, name, d.b)) break true;
+        } else for (target_ends) |e| {
+            if (std.mem.endsWith(u8, name, e)) break true;
+        } else false;
+        if (!ends) {
+            if (out.rank == 0) for (lora.dialects) |d| if (std.mem.endsWith(u8, name, d.a)) {
+                if (store.get(name)) |v| {
+                    const dims = v.info.shape.slice();
+                    if (dims.len >= 2) out.rank = @intCast(dims[0]);
+                }
+            };
+            continue;
         }
-        if (layerIndex(stem)) |n| out.depth = @max(out.depth, n + 1);
+        out.targets += 1;
+        if (std.mem.startsWith(u8, name, lora.Sidecar.prefix)) {
+            native = true;
+            if (layerIndex(name)) |n| out.depth = @max(out.depth, n + 1);
+        }
     }
+    if (!native) out.sidecar = false;
     return if (out.targets == 0) null else out;
 }
 
-/// Whether `store` is LoRA-shaped but under a key prefix this engine does not
-/// map: kohya's `lora_unet_*` / `lora_te_*`, which is what most SD-family LoRAs
-/// ship as.
-///
-/// Only for the note. `loraScan` returning null and this returning true is a very
-/// different thing from a file that is not a model at all, and a folder of these
-/// is exactly what someone points the scanner at.
-pub fn loraForeignDialect(store: tp.weights.WeightStore) bool {
-    const lora = tp.models.lora;
-    for (store.names()) |name| {
-        for (lora.dialects) |d| {
-            if (std.mem.endsWith(u8, name, d.a) or std.mem.endsWith(u8, name, d.b)) return true;
+/// The deepest `layers.<N>.` or `blocks.<N>.` index in a tensor name, or null.
+/// `blocks.` also matches `transformer_blocks.` and `layerwise_blocks.`, which
+/// is the point: it is what tells a 60-block Qwen-Image LoRA from a Mage-Flow
+/// one, the two sharing every name and width.
+fn layerIndex(name: []const u8) ?u32 {
+    var best: ?u32 = null;
+    for ([_][]const u8{ "layers.", "blocks." }) |key| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, name, from, key)) |at| {
+            const rest = name[at + key.len ..];
+            from = at + key.len;
+            const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+            const n = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
+            best = @max(best orelse 0, n);
         }
     }
-    return false;
+    return best;
 }
 
-/// The `layers.<N>.` index in a base tensor name, or null.
-fn layerIndex(stem: []const u8) ?u32 {
-    const key = "layers.";
-    const at = std.mem.indexOf(u8, stem, key) orelse return null;
-    const rest = stem[at + key.len ..];
-    const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
-    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
-}
-
-/// Whether a LoRA `loraScan` accepted can patch `fam`'s denoiser.
+/// Whether a LoRA `loraScan` accepted can patch `fam`.
 ///
-/// The test is the family's own root and widths, read off the engine's config, so
-/// it cannot disagree with what the attach will then demand. ⚠️ Depth is a BOUND,
-/// not the equality `storeFits` uses for a side file: a style LoRA legitimately
-/// patches only some layers, and demanding it name the deepest one would reject a
-/// perfectly good file.
+/// The SD family's test is its own key map and context width
+/// (`lora_sd.sdFits`), and an adapter form its sidecar takes. Every other family is a sidecar, tested on the
+/// family's own root and widths read off the engine's config, so it cannot
+/// disagree with what the attach then demands. ⚠️ Depth is a BOUND, not the
+/// equality `storeFits` uses for a side file: a style LoRA legitimately patches
+/// only some layers.
 pub fn loraFits(store: tp.weights.WeightStore, fam: Family) bool {
-    const spec = loraSpec(fam) orelse return false;
     const info = loraScan(store) orelse return false;
-    if (info.depth > spec.layers) return false;
+    switch (fam) {
+        .sd15 => return tp.models.lora_sd.sidecarTakes(store) and tp.models.lora_sd.sdFits(std.heap.smp_allocator, store, tp.models.sd_unet.sd15),
+        .sdxl => return tp.models.lora_sd.sidecarTakes(store) and tp.models.lora_sd.sdFits(std.heap.smp_allocator, store, tp.models.sd_unet.sdxl),
+        else => {},
+    }
+    const spec = loraSpec(fam) orelse return false;
+    if (!info.sidecar or info.depth > spec.layers) return false;
     // One target, checked on both sides: `a` contracts the model's width and `b`
     // emits the linear's own. A LoRA for another variant of this architecture has
     // the right names and the wrong widths.
@@ -352,22 +371,24 @@ pub fn loraFits(store: tp.weights.WeightStore, fam: Family) bool {
 
 const LoraSpec = struct {
     /// A base tensor name this family's LoRAs are certain to patch, without the
-    /// `.weight`.
+    /// `.weight`, as the files spell it.
     probe: []const u8,
     in_dim: usize,
     out_dim: usize,
-    layers: u32,
+    /// The most blocks a file may name. Unbounded where the depth varies by
+    /// checkpoint.
+    layers: u32 = std.math.maxInt(u32),
 };
 
-/// The one linear every LoRA for a family patches, and its widths.
-///
-/// Only the families with a sidecar path get an entry; the rest refuse a LoRA in
-/// the engine (`Session.attachLoras`), so offering one here would be a menu entry
-/// that fails at load.
+/// The one linear every sidecar LoRA for a family patches, and its widths: the
+/// first block's query projection. H3 is absent because nothing here renders it.
+/// Anima's width is the 2B trunk's, and its depth is left unbounded because the
+/// trunk ships at more than one.
 fn loraSpec(fam: Family) ?LoraSpec {
+    const m = tp.models;
     return switch (fam) {
         .sensenova => blk: {
-            const cfg = tp.models.sensenova.u15_8b;
+            const cfg = m.sensenova.u15_8b;
             break :blk .{
                 .probe = "language_model.model.layers.0.self_attn.q_proj_mot_gen",
                 .in_dim = cfg.dim,
@@ -375,7 +396,16 @@ fn loraSpec(fam: Family) ?LoraSpec {
                 .layers = @intCast(cfg.n_layers),
             };
         },
-        .krea2, .zimage, .anima, .sd15, .sdxl, .minimax_h3, .mageflow => null,
+        .krea2 => .{ .probe = "blocks.0.attn.wq", .in_dim = m.dit.features, .out_dim = m.dit.features, .layers = m.dit.n_blocks },
+        .zimage => .{
+            .probe = "layers.0.attention.to_q",
+            .in_dim = m.zimage.z_image.dim,
+            .out_dim = m.zimage.z_image.dim,
+            .layers = @intCast(m.zimage.z_image.n_layers),
+        },
+        .anima => .{ .probe = "blocks.0.self_attn.q_proj", .in_dim = m.anima.anima_2b.dim, .out_dim = m.anima.anima_2b.dim },
+        .mageflow => .{ .probe = "transformer_blocks.0.attn.to_q", .in_dim = m.mageflow.features, .out_dim = m.mageflow.features, .layers = m.mageflow.n_blocks },
+        .sd15, .sdxl, .minimax_h3 => null,
     };
 }
 
@@ -854,7 +884,7 @@ test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
     }
 }
 
-test "a partial-depth LoRA fits, and a DoRA is refused" {
+test "a partial-depth LoRA fits, a DoRA fits, and a reshaped pad is refused" {
     const gpa = std.testing.allocator;
     const cfg = tp.models.sensenova.u15_8b;
     const rank: usize = 64;
@@ -879,9 +909,7 @@ test "a partial-depth LoRA fits, and a DoRA is refused" {
         try std.testing.expect(loraFits(store, .sensenova));
     }
 
-    // DoRA rescales the BASE weight, so applying the low-rank half alone is the
-    // wrong magnitude. The engine refuses the file, so the menu must not offer
-    // it either.
+    // DoRA is a sidecar too (its ratio is built from the base weight at attach).
     {
         const bytes = try stFile(gpa, &.{
             .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
@@ -892,23 +920,46 @@ test "a partial-depth LoRA fits, and a DoRA is refused" {
         var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
         defer st.deinit();
         const store: tp.weights.WeightStore = .{ .safetensors = &st };
-        try std.testing.expect(loraScan(store) == null);
-        try std.testing.expect(!loraFits(store, .sensenova));
+        try std.testing.expect(loraScan(store).?.sidecar);
+        try std.testing.expect(loraFits(store, .sensenova));
     }
 
-    // A kohya SD LoRA: LoRA-shaped, but under a prefix this engine does not map.
-    // Distinguished from "not a model at all", which is what the note says.
+    // A reshaped pad changes the base weight's own shape, which a sidecar cannot.
     {
         const bytes = try stFile(gpa, &.{
-            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight", .dims = &.{ 32, 320 } },
-            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight", .dims = &.{ 320, 32 } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_down.weight", .dims = &.{ rank, cfg.dim } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.lora_up.weight", .dims = &.{ cfg.qDim(), rank } },
+            .{ .name = "diffusion_model.language_model.model.layers.0.self_attn.q_proj_mot_gen.reshape_weight", .dims = &.{2} },
         });
         defer gpa.free(bytes);
         var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
         defer st.deinit();
         const store: tp.weights.WeightStore = .{ .safetensors = &st };
-        try std.testing.expect(loraScan(store) == null);
-        try std.testing.expect(loraForeignDialect(store));
+        try std.testing.expect(!loraScan(store).?.sidecar);
+        try std.testing.expect(!loraFits(store, .sensenova));
+    }
+
+    // A kohya SD LoRA, one diffusers-named target and one LDM-named. The two SD
+    // UNets share LDM names, so what places it is the cross-attention `to_k`
+    // input: 768 is CLIP-L's context, SD1.5's; SDXL's is 2048. And no sidecar
+    // family takes it.
+    {
+        const bytes = try stFile(gpa, &.{
+            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight", .dims = &.{ 32, 320 } },
+            .{ .name = "lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight", .dims = &.{ 320, 32 } },
+            .{ .name = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_k.lora_down.weight", .dims = &.{ 32, 768 } },
+            .{ .name = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_k.lora_up.weight", .dims = &.{ 640, 32 } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        const info = loraScan(store).?;
+        try std.testing.expectEqual(@as(u32, 2), info.targets);
+        try std.testing.expect(!info.sidecar);
+        try std.testing.expect(loraFits(store, .sd15));
+        try std.testing.expect(!loraFits(store, .sdxl));
+        try std.testing.expect(!loraFits(store, .sensenova));
     }
 }
 

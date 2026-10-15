@@ -24,6 +24,7 @@
 //! `AutoencoderKL.decode` does, so that a parity test can compare the decoder alone.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
@@ -32,6 +33,7 @@ const ops = @import("tp_ops");
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 const Conv2d = ops.conv.Conv2d;
+const quant_weight = @import("quant_weight.zig");
 
 /// Which spelling a checkpoint uses for the *same* `AutoencoderKL` graph.
 ///
@@ -392,6 +394,74 @@ pub const Decoder = struct {
     norm_out: GroupNormW,
     conv_out: Conv2d,
 
+    /// Every convolution in the decoder. Caller frees the list.
+    pub fn convList(self: *Decoder, gpa: std.mem.Allocator) ![]*Conv2d {
+        var out: std.ArrayList(*Conv2d) = .empty;
+        errdefer out.deinit(gpa);
+        const Walk = struct {
+            fn res(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, r: *Resnet) !void {
+                try o.appendSlice(a, &.{ &r.conv1, &r.conv2 });
+                if (r.nin) |*c| try o.append(a, c);
+            }
+        };
+        if (self.post_quant) |*c| try out.append(gpa, c);
+        try out.appendSlice(gpa, &.{ &self.conv_in, &self.conv_out, &self.mid_attn.q, &self.mid_attn.k, &self.mid_attn.v, &self.mid_attn.proj });
+        try Walk.res(&out, gpa, &self.mid1);
+        try Walk.res(&out, gpa, &self.mid2);
+        for (self.levels) |*lv| {
+            for (lv.blocks) |*b| try Walk.res(&out, gpa, b);
+            if (lv.upsample) |*c| try out.append(gpa, c);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Repack every checkpoint-order convolution to f32 patch order, into the model
+    /// arena, for an arm that reads only that and keys its weights on their host
+    /// address (Vulkan), so a copy that came and went would serve stale uploads.
+    /// Idempotent.
+    pub fn repackConvs(self: *Decoder, gpa: std.mem.Allocator) !void {
+        try repackInto(self, gpa, self.arena.allocator());
+    }
+
+    /// A copy of this decoder whose convolutions are all repacked f32, for a CPU
+    /// decode that runs it once per tile and would otherwise decode every conv per tile.
+    /// Only `levels` and the repacked weights are its own; everything else is borrowed,
+    /// so `dec` must not outlive this decoder and is never `deinit`ed.
+    pub const Repacked = struct {
+        arena: std.heap.ArenaAllocator,
+        dec: Decoder,
+
+        pub fn deinit(self: *Repacked, gpa: std.mem.Allocator) void {
+            self.arena.deinit();
+            gpa.destroy(self);
+        }
+    };
+
+    pub fn repacked(self: *const Decoder, gpa: std.mem.Allocator) !*Repacked {
+        const r = try gpa.create(Repacked);
+        errdefer gpa.destroy(r);
+        r.arena = .init(gpa);
+        errdefer r.arena.deinit();
+        const a = r.arena.allocator();
+        r.dec = self.*;
+        const levels = try a.dupe(Level, self.levels);
+        for (levels) |*lv| lv.blocks = try a.dupe(Resnet, lv.blocks);
+        r.dec.levels = levels;
+        try repackInto(&r.dec, gpa, a);
+        return r;
+    }
+
+    fn repackInto(self: *Decoder, gpa: std.mem.Allocator, into: std.mem.Allocator) !void {
+        const convs = try self.convList(gpa);
+        defer gpa.free(convs);
+        for (convs) |c| if (c.w == .torch) {
+            // A local first: assigning the union literal in place would switch `c.w`
+            // before `materialize` reads it.
+            const krsc = try c.materialize(into);
+            c.w = .{ .krsc = krsc };
+        };
+    }
+
     /// Latent cells per side the CALLER supplies for each cell `decode` consumes:
     /// 2 for a folded latent, 1 otherwise. A caller sizing buffers or reporting a
     /// resolution multiplies by this and by `spatial_scale`.
@@ -535,7 +605,8 @@ pub const Decoder = struct {
     /// decoder implements it, and reporting the narrow figure to a backend that still
     /// stores f32 sends the ladder into a whole-image decode that cannot fit, which is
     /// the OOM this estimate exists to prevent.
-    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize, scores_resident: bool, act_f16: bool) u64 {
+    /// `act16`: the activation chain is 16-bit (f16 or bf16).
+    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize, scores_resident: bool, act16: bool) u64 {
         const w = activationElems(self.cfg, zh, zw);
         const max_elems = w.wide;
         // q/k/v/out at latent resolution + the O(seq^2) mid-block scores plane
@@ -551,10 +622,10 @@ pub const Decoder = struct {
         const band: u64 = scoresBand(@intCast(seq));
         const attn = 4 * seq * self.cfg.innermost() * 4 +
             if (scores_resident) 2 * seq * self.cfg.innermost() * 4 + band * seq * 4 else 0;
-        // The activation buffers narrow with `act_f16`; the attention scratch does
+        // The activation buffers narrow with a 16-bit chain; the attention scratch does
         // not (q/k/v/out stay f32, they are at latent resolution, and both GPU
         // attention paths take f32 buffers).
-        const abytes: u64 = if (act_f16) 2 else 4;
+        const abytes: u64 = if (act16) 2 else 4;
         return (2 * max_elems + w.out) * abytes + attn;
     }
 
@@ -779,13 +850,11 @@ const Loader = struct {
             std.log.err("sd_vae: {s} has shape {any}, expected [{d}, {d}, {d}, {d}]", .{ nm, shape, co, ci, k, k });
             return error.ShapeMismatch;
         }
-        const torch_w = try v.toF32Alloc(l.alloc);
-        defer l.alloc.free(torch_w);
         // The GEMM this convolution becomes carries the checkpoint name, so an
         // activation capture can attribute it (see `ops.conv.Conv2d.tag`).
         const tag = try l.alloc.dupe(u8, nm);
         return .{
-            .w = try ops.conv.packWeight(l.alloc, torch_w, co, ci, k),
+            .w = try quant_weight.convWeights(l.alloc, v, co, ci, k),
             .tag = tag,
             .b = try l.vec(fmt, args, ".bias", co),
             .co = co,
@@ -845,7 +914,7 @@ const testing = std.testing;
 const test_gate = @import("../test_gate.zig");
 
 const ref_path = "src/models/assets/sd15_ref.safetensors";
-const sd15_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
+const sd15_ckpt = build_options.model_root ++ "/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
 
 test "the SD1.5 VAE decoder matches diffusers.AutoencoderKL.decode" {
     const gpa = testing.allocator;
@@ -951,7 +1020,7 @@ test "the VAE decoder still matches diffusers at the size images are rendered at
 }
 
 const sdxl_ref_path = "src/models/assets/sdxl_ref.safetensors";
-const sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
+const sdxl_ckpt = build_options.model_root ++ "/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
 
 test "the SDXL VAE decoder matches ComfyUI's AutoencoderKL at both sizes" {
     // The decoder is architecturally identical to SD1.5's, so this is really a test of
@@ -1057,7 +1126,7 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
 }
 
 const zimage_ref_path = "src/models/assets/zimage_ref.safetensors";
-const zimage_vae_ckpt = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
+const zimage_vae_ckpt = build_options.model_root ++ "/vae/z-image-turbo.vae.safetensors";
 
 test "the 16-channel Flux/Z-Image VAE decoder matches ComfyUI's AutoencoderKL" {
     // Same decoder graph as SD's, so what this actually exercises is the three
@@ -1152,7 +1221,7 @@ test "VAE naming is detected from the store, and the same VAE ships both ways" {
     try test_gate.requireIntegration();
 
     const cases = [_]struct { path: []const u8, want: Naming }{
-        .{ .path = "/home/qt/genai/comfyui/models/vae/ae.safetensors", .want = .ldm },
+        .{ .path = build_options.model_root ++ "/vae/ae.safetensors", .want = .ldm },
         .{ .path = zimage_vae_ckpt, .want = .diffusers },
     };
     var seen: usize = 0;
@@ -1246,7 +1315,7 @@ test "the Flux2 VAE config is the Flux one at twice the latent width" {
     try testing.expectEqual(@as(usize, 16), spatial_scale * PackedLatent.fold);
 }
 
-const flux2_vae_ckpt = "/home/qt/genai/comfyui/models/vae/flux2-vae.safetensors";
+const flux2_vae_ckpt = build_options.model_root ++ "/vae/flux2-vae.safetensors";
 
 test "the real Flux2 VAE loads as a folded-latent AutoencoderKL" {
     // What the fixture cannot say: that a shipped file actually has these shapes

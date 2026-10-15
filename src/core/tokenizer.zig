@@ -7,6 +7,7 @@
 //! binary from src/core/assets/qwen_tokenizer/.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tables = @import("unicode_tables.zig");
 const gguf_mod = @import("gguf.zig");
 const prompt_weights = @import("prompt_weights.zig");
@@ -1667,7 +1668,7 @@ test "tokenizer matches transformers Qwen2Tokenizer" {
 test "gguf tokenizer matches embedded tokenizer" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
+    const path = build_options.model_root ++ "/text_encoders/Qwen3-4B-Q4_K_M.gguf";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
     var g = try gguf_mod.Gguf.open(gpa, io, path);

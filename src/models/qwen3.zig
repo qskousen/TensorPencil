@@ -18,6 +18,7 @@
 //! dequantized inside the GEMM; the safetensors mapping must outlive this.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const safetensors = @import("tp_core").safetensors;
 const test_gate = @import("../test_gate.zig");
 const gguf_mod = @import("tp_core").gguf;
@@ -436,6 +437,15 @@ const Layer = struct {
 };
 
 pub const TextEncoder = struct {
+    /// The integer convrot kind of the first layer that has one, the storage the
+    /// encoder's activation dial governs (`dual_lin.encoderInt8`), or null for none.
+    pub fn integerKind(self: *const TextEncoder) ?lin.Kind {
+        for (self.layers) |l| {
+            if (lin.integerKind(&.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down })) |k| return k;
+        }
+        return null;
+    }
+
     /// This tower cannot apply per-token prompt weights, and the reason is structural
     /// rather than a missing feature: krea2 conditions on qwen3 tap states with no fixed
     /// token window, no chunking, and no empty-prompt reference of matching shape to
@@ -1328,7 +1338,7 @@ test "the H3 conditioning encoder matches the reference at a toy width" {
 // Config detection + weight wiring against a real llama.cpp GGUF; skipped
 // when the checkpoint is absent. Load-only, generation quality is validated
 // end-to-end via tp-llm (a Debug 4B forward is too slow for the suite).
-const h3_te_path = "/home/qt/genai/comfyui/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
+const h3_te_path = build_options.model_root ++ "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
 
 test "the MiniMax H3 encoder loads from the real checkpoint" {
     // The structural pin for the H3 variant against the file it has to match.
@@ -1393,7 +1403,7 @@ test "the MiniMax H3 encoder loads from the real checkpoint" {
 test "causal lm loads from real qwen3-4b gguf" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
+    const path = build_options.model_root ++ "/text_encoders/Qwen3-4B-Q4_K_M.gguf";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
     var g = try gguf_mod.Gguf.open(gpa, io, path);
@@ -1517,7 +1527,7 @@ test "krea2 conditioning matches comfyui" {
     const io = std.testing.io;
     const krea2_text = @import("krea2_text.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
     std.Io.Dir.cwd().access(io, "testdata/text_cond.bin", .{}) catch return error.SkipZigTest;
 

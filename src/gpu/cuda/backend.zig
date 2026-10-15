@@ -1,12 +1,12 @@
-//! CUDA `GpuBackend`, the dit_gpu/vae_gpu-facing surface on top of the thin
+//! CUDA `GpuBackend`, the model-facing surface on top of the thin
 //! driver `Context` (cu.zig/context.zig) and the hand-PTX `kernels`. Mirrors the
 //! method surface of the Vulkan `gpu.Context` so a generic (comptime-dispatched)
 //! `dit_gpu.forward` runs on either backend. Buffers are CUDA device pointers
 //! wrapped as opaque `Handle`s; a "batch" is just the context stream.
 //!
-//! Value types (`DeviceBuffer`, `EltPush`, `Elt`) are defined here with the same
-//! field/variant names the Vulkan context uses, so dit_gpu's anonymous literals
-//! (`.{ .u0 = ... }`) and enum literals (`.rmsnorm`) coerce against `@TypeOf(ctx)`.
+//! Value types (`DeviceBuffer`, `EltPush`) are defined here with the same field names
+//! the Vulkan context uses, so dit_gpu's anonymous literals (`.{ .u0 = ... }`) coerce
+//! against `@TypeOf(ctx)`.
 
 const std = @import("std");
 const cu = @import("cu.zig");
@@ -15,6 +15,7 @@ const kernels = @import("kernels.zig");
 const elt = @import("elt.zig");
 const dual_ptx = @embedFile("dual_ptx");
 const dual_table = @import("../kernels/dual_table.zig");
+pub const Dt = dual_table.Dt;
 const iq_grid = @import("../kernels/iq_grid.zig");
 const cublaslt = @import("cublaslt.zig");
 const cudnn = @import("cudnn.zig");
@@ -96,10 +97,10 @@ const LtKind = enum { i8, f16, bf16, f32 };
 /// One cuBLASLt plan is valid for exactly one of these shapes. A struct rather
 /// than packed bits: `m` is a pixel count and reaches millions at high resolution,
 /// and a key that silently wrapped would hand back a plan for a different shape.
-const LtKey = struct { kind: LtKind, n: usize, m: usize, k: usize, bias: bool, d_f16: bool = false };
+const LtKey = struct { kind: LtKind, n: usize, m: usize, k: usize, bias: bool, d: Dt = .f32 };
 
 /// One cuDNN 3x3 convolution plan is valid for exactly one of these shapes.
-const ConvKey = struct { h: usize, w: usize, ci: usize, co: usize };
+const ConvKey = struct { h: usize, w: usize, ci: usize, co: usize, bf16: bool };
 
 /// A cached cuBLASLt matmul plan for one (kind,n,m,k) shape: the operation
 /// descriptor, the three matrix layouts (no data pointer baked in), and the
@@ -124,9 +125,18 @@ pub const DeviceBuffer = struct {
     /// context's current tag at real allocation (tensorCreate); carried back to
     /// the context at free (tensorDestroy). Non-owning views keep `.other`.
     tag: ctxmod.MemTag = .other,
+    /// Picks the instance of a dtype-generic kernel; views keep it, and so does a regrow.
+    dt: Dt = .f32,
 
     pub fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
         return @intFromEnum(self.buf);
+    }
+
+    /// The same memory read as `dt`.
+    pub fn as(self: DeviceBuffer, dt: Dt) DeviceBuffer {
+        var v = self;
+        v.dt = dt;
+        return v;
     }
 
     /// A non-owning view offset `off_elems` f32 elements into this buffer, for a
@@ -139,7 +149,14 @@ pub const DeviceBuffer = struct {
     /// A view `off` BYTES in, for buffers whose element width the caller knows
     /// (an f16 activation stream, say).
     pub fn viewBytes(self: DeviceBuffer, off: u64) DeviceBuffer {
-        return .{ .buf = @enumFromInt(@intFromEnum(self.buf) + off), .mem = .null_handle, .size = if (self.size > off) self.size - off else 0 };
+        return dbOffset(self, off);
+    }
+
+    /// `size` bytes from `off` in, non-owning.
+    pub fn slice(self: DeviceBuffer, off: u64, size: u64) DeviceBuffer {
+        var v = dbOffset(self, off);
+        v.size = size;
+        return v;
     }
 };
 
@@ -153,7 +170,7 @@ fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
 /// Public so a model file can drive a per-item launch over a batched activation,
 /// `clip_text_cuda` runs one causal `attn` per prompt chunk this way.
 pub fn dbOffset(b: DeviceBuffer, off: u64) DeviceBuffer {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0 };
+    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0, .dt = b.dt };
 }
 
 /// Push constants for eltwise/attention kernels (matches the Vulkan EltPush).
@@ -168,34 +185,12 @@ pub const EltPush = extern struct {
     f1: f32 = 0,
 };
 
-/// The eltwise kernel selector. Names match the Vulkan `Elt` enum so dit_gpu's
-/// enum literals coerce. Only the DiT-path subset is implemented (see opElt).
-pub const Elt = enum {
-    rmsnorm,
-    rope_inter,
-    qknorm_rope16,
-    qknorm_rope_f32,
-    gather_kmajor,
-    gather_kmajor_h16,
-    gather_kmajor16,
-    f32_to_h16,
-    attn_scores,
-    softmax_partial,
-    softmax_combine,
-    attn_out,
-    sigmoid_mul,
-    sigmoid_mul_h16,
-    sigmoid_mul_g16,
-    silu_mul,
-    silu_mul_h16,
-    silu_mul16,
-    gated_add,
-    gated_add16,
-};
-
 const WeightEntry = struct {
     db: DeviceBuffer,
     last_use: u64 = 0,
+    /// `Context.launch_seq` at the last fetch: equal to the current one means an op
+    /// holds this handle and has not launched on it yet (`Backend.opHolds`).
+    fetch_seq: u64 = 0,
     /// Identity for weight noise: what separates one weight's perturbation from
     /// another's when the jitter keys on a block's offset WITHIN its weight (an
     /// absolute device address is not stable across runs, so a sweep keyed on one
@@ -220,10 +215,6 @@ const WeightEntry = struct {
     /// with pf_gen > pf_completed is still in flight on the prefetch thread; the
     /// consumer waits until pf_completed >= pf_gen before using it.
     pf_gen: u64 = 0,
-    /// The buffer has been rewritten from bf16 to f16 in place (`cachedWeightF16`).
-    /// False on a fresh entry, so a weight that was evicted and re-uploaded gets
-    /// converted again: a re-upload writes the checkpoint's bf16 bytes back.
-    f16_converted: bool = false,
 };
 
 const WeightAlias = struct {
@@ -414,6 +405,9 @@ pub const Backend = struct {
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
     weight_aliases: std.AutoHashMapUnmanaged(usize, WeightAlias) = .empty,
     use_counter: u64 = 0,
+    /// Device addresses of cached weights a caller holds across launches (`hold`).
+    held: [4]cu.CUdeviceptr = undefined,
+    held_n: usize = 0,
     /// A weight scope is open: new cache entries are tagged for group
     /// release (see WeightEntry.scoped).
     weight_scope: bool = false,
@@ -528,6 +522,8 @@ pub const Backend = struct {
     /// four codebook formats decode nothing without it.
     iq_tbl: DeviceBuffer = .{},
     fp8_w16: DeviceBuffer = .{},
+    /// The W·A32 weight-only GEMM's f32 weight (`intRowF32`).
+    wo_w32: DeviceBuffer = .{},
     fp8_a16: DeviceBuffer = .{},
     /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
     q8_act: DeviceBuffer = .{},
@@ -561,6 +557,14 @@ pub const Backend = struct {
     conv_w16: DeviceBuffer = .{},
     conv_a16: DeviceBuffer = .{},
     conv_c: DeviceBuffer = .{},
+    // `hgemmPadN`: a weight copied to a whole number of 128-row tiles, and a device
+    // zero bias for its compaction.
+    hg_wpad: DeviceBuffer = .{},
+    hg_zero: DeviceBuffer = .{},
+    // `weightF16`: a dense weight's source bytes on their way into a cached f16
+    // copy, and a block-quant conv's per-call decode in patch order.
+    conv_stage: DeviceBuffer = .{},
+    conv_wk: DeviceBuffer = .{},
 
     // int8 prep state (opI8Prep -> opI8Gemm contract).
     i8_x: DeviceBuffer = .{},
@@ -591,6 +595,16 @@ pub const Backend = struct {
     /// fused output and knows its widest before the first block.
     lora_lo: DeviceBuffer = .{},
     lora_hi: DeviceBuffer = .{},
+    /// The sidecar's other terms: a LoKr's per-group product, a diff's or DoRA's base
+    /// product (`lora_out`), and DoRA's rescaled input or LoKr's stacked groups (`lora_in`).
+    lora_out: DeviceBuffer = .{},
+    lora_in: DeviceBuffer = .{},
+    /// `lin_cuda`'s f32 copy of a 16-bit activation and f32 output plane, for a route
+    /// that reads or writes only f32.
+    lin_x32: DeviceBuffer = .{},
+    lin_y32: DeviceBuffer = .{},
+    /// `allFinite`'s flag word.
+    finite_flag: DeviceBuffer = .{},
 
     // tensor-core attention scratch (per-head, reused across heads/calls; grown
     // to the largest seq seen). f16 Q/K/Vt tiles, f32 scores, f16 probs, f32 out.
@@ -637,12 +651,10 @@ pub const Backend = struct {
     prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
     fused_mod: ?ctxmod.Module = null,
     fused_fn: cu.CUfunction = null,
-    // irescale (s32 acc * act_scale[row] * weight_scale[col] -> f32) for the
-    // cuBLASLt int8 path (.libs mode).
-    irescale_mod: ?ctxmod.Module = null,
-    irescale_fn: cu.CUfunction = null,
-    irescale_h16_mod: ?ctxmod.Module = null,
-    irescale_h16_fn: cu.CUfunction = null,
+    // irescale (s32 acc * act_scale[row] * weight_scale[col]) for the cuBLASLt int8
+    // path (.libs mode), one per output dtype.
+    irescale_mods: [3]?ctxmod.Module = @splat(null),
+    irescale_fns: [3]cu.CUfunction = @splat(null),
     // cuBLASLt matmul plans (desc + layouts + heuristic algo), keyed by shape.
     // Layouts hold no data pointer, so a plan is reused across
     // steps/blocks/weights of the same shape, the expensive heuristic query
@@ -736,15 +748,6 @@ pub const Backend = struct {
     dual_mod: ?ctxmod.Module = null,
     dual_fns: std.StringHashMapUnmanaged(cu.CUfunction) = .empty,
 
-    /// Q/K/V/O handed to `opAttnTC` / `opAttnCross` are f16, not f32. Set around a
-    /// forward by a model carrying an f16 activation stream (`sd_unet_cuda`), rather
-    /// than added to those signatures, which every family and both arms share.
-    attn_io_f16: bool = false,
-    /// Run cuDNN's SDPA with bf16 Q/K/V/O instead of f16. Same 16 bits and the
-    /// same f32 accumulation, but f32's exponent range, so an UNNORMED operand
-    /// cannot overflow the format the way f16's 65504 ceiling lets it. Costs 3
-    /// mantissa bits. Set per model, like `attn_io_f16`.
-    attn_bf16: bool = false,
     // per-category profiler (sync-per-op device timing; the plan's methodology).
     profile: bool = false,
     zero_bias_host: []f32 = &.{},
@@ -774,6 +777,19 @@ pub const Backend = struct {
     /// past the end.
     pub fn zeroBias(self: *Backend, co: usize) Error![]const f32 {
         if (self.zero_bias_host.len < co) {
+            const old = std.mem.sliceAsBytes(self.zero_bias_host);
+            if (old.len != 0) {
+                // Both device caches key on this host address, and an allocator that
+                // hands it out again would have that data served these zeros.
+                _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+                self.evictWeightRange(old);
+                inline for (.{ Dt.f16, Dt.bf16 }) |dt| {
+                    if (self.bias16.fetchRemove(derivedKey(old, dt))) |kv| {
+                        var b = kv.value;
+                        self.tensorDestroy(&b);
+                    }
+                }
+            }
             self.gpa.free(self.zero_bias_host);
             self.zero_bias_host = self.gpa.alloc(f32, co) catch return error.OutOfMemory;
             @memset(self.zero_bias_host, 0);
@@ -974,12 +990,17 @@ pub const Backend = struct {
         self.tensorDestroy(&self.fp8_lut);
         self.tensorDestroy(&self.iq_tbl);
         self.tensorDestroy(&self.fp8_w16);
+        self.tensorDestroy(&self.wo_w32);
         self.tensorDestroy(&self.fp8_a16);
         self.tensorDestroy(&self.q8_act);
         self.tensorDestroy(&self.pen_wire);
         self.tensorDestroy(&self.conv_w16);
         self.tensorDestroy(&self.conv_a16);
         self.tensorDestroy(&self.conv_c);
+        self.tensorDestroy(&self.hg_wpad);
+        self.tensorDestroy(&self.hg_zero);
+        self.tensorDestroy(&self.conv_stage);
+        self.tensorDestroy(&self.conv_wk);
         self.tensorDestroy(&self.i8_x);
         self.tensorDestroy(&self.i8_rot);
         self.tensorDestroy(&self.i8_scale);
@@ -988,13 +1009,17 @@ pub const Backend = struct {
         self.tensorDestroy(&self.bq_i8);
         self.tensorDestroy(&self.lora_lo);
         self.tensorDestroy(&self.lora_hi);
+        self.tensorDestroy(&self.lora_out);
+        self.tensorDestroy(&self.lora_in);
+        self.tensorDestroy(&self.lin_x32);
+        self.tensorDestroy(&self.lin_y32);
+        self.tensorDestroy(&self.finite_flag);
         self.tensorDestroy(&self.cudnn_q16);
         self.tensorDestroy(&self.cudnn_k16);
         self.tensorDestroy(&self.cudnn_v16);
         self.tensorDestroy(&self.cudnn_o16);
         self.tensorDestroy(&self.cudnn_ws);
-        if (self.irescale_mod) |m| m.unload(self.ctx);
-        if (self.irescale_h16_mod) |m| m.unload(self.ctx);
+        for (self.irescale_mods) |mm| if (mm) |m| m.unload(self.ctx);
         self.tensorDestroy(&self.attn_qh);
         self.tensorDestroy(&self.attn_kh);
         self.tensorDestroy(&self.attn_vth);
@@ -1480,10 +1505,21 @@ pub const Backend = struct {
         while (true) {
             var it = self.weights.keyIterator();
             const key = while (it.next()) |k| {
-                if (k.* >= lo and k.* < hi) break k.*;
+                const a = k.* & key_addr_mask;
+                if (a >= lo and a < hi) break k.*;
             } else return;
             self.evictWeightKey(key);
         }
+    }
+
+    /// Cache keys are host addresses; the top byte tags a converted copy of the weight
+    /// at that address (user-space addresses stay below 2^47 on every OS this targets).
+    const key_addr_mask: usize = (1 << 56) - 1;
+
+    fn derivedKey(bytes: []const u8, out: Dt) usize {
+        const a = @intFromPtr(bytes.ptr);
+        std.debug.assert(a & ~key_addr_mask == 0);
+        return a | (@as(usize, @intFromEnum(out) + 1) << 56);
     }
 
     fn evictWeightKey(self: *Backend, key: usize) void {
@@ -1524,10 +1560,10 @@ pub const Backend = struct {
                 sk_await += 1;
                 continue;
             } // prefetched, not yet consumed
-            if (e.value_ptr.last_use == mru_use) {
+            if (e.value_ptr.last_use == mru_use or self.opHolds(e.value_ptr)) {
                 sk_mru += 1;
                 continue;
-            } // protect the MRU
+            } // protect the MRU and what an op holds
             if (e.value_ptr.pf_gen > completed) {
                 sk_pf += 1;
                 continue;
@@ -1664,9 +1700,9 @@ pub const Backend = struct {
                     skipped_protected += 1;
                     continue; // prefetched, not yet consumed
                 }
-                if (e.value_ptr.last_use == mru_use) {
+                if (e.value_ptr.last_use == mru_use or self.opHolds(e.value_ptr)) {
                     skipped_protected += 1;
-                    continue; // protect the MRU
+                    continue; // protect the MRU and what an op holds
                 }
                 if (e.value_ptr.pf_gen > completed) {
                     skipped_protected += 1;
@@ -1919,6 +1955,8 @@ pub const Backend = struct {
         // Growth is rare (scratch reaches its high-water mark quickly), so
         // the sync is cheap.
         if (db.buf != .null_handle) _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        const dt = db.dt;
+        defer db.dt = dt;
         self.tensorDestroy(db);
         // The two dequant staging buffers are attributed here, by identity,
         // rather than at their half-dozen call sites: they are grown from
@@ -1938,6 +1976,32 @@ pub const Backend = struct {
     pub fn tensorDownload(self: *Backend, db: DeviceBuffer, out: []u8) Error!void {
         const b = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
         self.ctx.download(b, out) catch return error.CudaError;
+    }
+
+    /// Whether the first `n` elements of `db` are all finite, at its `dt`: one pass and a
+    /// 4-byte download (`Context.allFinite` says why a forward asks).
+    pub fn allFinite(self: *Backend, db: DeviceBuffer, n: usize) Error!bool {
+        try self.ensureDeviceBuffer(&self.finite_flag, 4);
+        const zero: u32 = 0;
+        try self.tensorUpload(self.finite_flag, std.mem.asBytes(&zero));
+        try self.dualElemsAt("flag_nonfinite", db.dt, db, null, null, self.finite_flag, .{ @intCast(n), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        var flag: u32 = 0;
+        try self.tensorDownload(self.finite_flag, std.mem.asBytes(&flag));
+        return flag == 0;
+    }
+
+    /// The first `host.len` elements of `db`, widened to f32 from its `dt`.
+    pub fn downloadF32(self: *Backend, db: DeviceBuffer, host: []f32) Error!void {
+        const gpa = self.gpa;
+        if (db.dt == .f32) return self.tensorDownload(db, std.mem.sliceAsBytes(host));
+        const raw = gpa.alloc(u16, host.len) catch return error.OutOfMemory;
+        defer gpa.free(raw);
+        try self.tensorDownload(db, std.mem.sliceAsBytes(raw));
+        for (host, raw) |*h, r| h.* = switch (db.dt) {
+            .f16 => @as(f16, @bitCast(r)),
+            .bf16 => @bitCast(@as(u32, r) << 16),
+            .f32 => unreachable,
+        };
     }
 
     pub fn tensorCopy(self: *Backend, dst: DeviceBuffer, dst_off: u64, src: DeviceBuffer, src_off: u64, size: u64) Error!void {
@@ -2150,7 +2214,7 @@ pub const Backend = struct {
         defer candidates.deinit(self.gpa);
         var it = self.weights.iterator();
         while (it.next()) |e| {
-            if (!e.value_ptr.pinned)
+            if (!e.value_ptr.pinned and !self.opHolds(e.value_ptr))
                 candidates.append(self.gpa, .{ .key = e.key_ptr.*, .last_use = e.value_ptr.last_use }) catch return 0;
         }
         std.mem.sort(Candidate, candidates.items, {}, struct {
@@ -2188,31 +2252,6 @@ pub const Backend = struct {
         self.streamed_bytes = 0;
     }
 
-    /// Upload+cache a weight blob (int8 weights / scales), keyed by host pointer.
-    /// Under memory pressure the LRU weight is evicted to make room; this weight
-    /// re-uploads here on its next use (the host bytes are the mmap'd checkpoint).
-    /// When async_uploads is on, the (re)upload runs on the transfer stream and
-    /// the compute stream waits on a per-weight event before the dependent GEMM,
-    /// so a re-upload overlaps the previous op's compute.
-    /// The cached bf16 weight, rewritten to f16 IN PLACE the first time it is asked
-    /// for, so the f16 tensor-core GEMMs read it directly instead of re-converting
-    /// it on every call. bf16 and f16 are both 16 bits, which is what makes the
-    /// rewrite possible: a second, f16 copy of an SDXL UNet's linears would cost
-    /// another two gigabytes of VRAM to save the same work.
-    ///
-    /// A weight reached through here must not also be read as raw bf16
-    /// (`opGemmBf16`'s native bf16 GEMM). Nothing does both: the dtype the loader
-    /// reports picks one GEMM entry point for a whole model.
-    fn cachedWeightF16(self: *Backend, bytes: []const u8, co: usize, k: usize) Error!DeviceBuffer {
-        const db = try self.cachedWeight(bytes);
-        const e = self.weights.getPtr(@intFromPtr(bytes.ptr)) orelse return db;
-        if (e.f16_converted) return db;
-        // Pad width == real width, so the index map is the identity and reading
-        // and writing the same buffer is one load and one store per element.
-        try self.pad2d("bf16_to_h16_pad", db, db, co * k, k, co, k, 1.0);
-        e.f16_converted = true;
-        return db;
-    }
 
     fn nextNoiseId(self: *Backend) u32 {
         self.noise_id_next +%= 1;
@@ -2239,7 +2278,7 @@ pub const Backend = struct {
         const alias = self.weight_aliases.get(key) orelse return null;
         if (self.weights.getPtr(alias.owner_key)) |owner| {
             if (owner.noise_id == alias.owner_noise_id) {
-                owner.last_use = self.use_counter;
+                self.touch(owner);
                 return alias.db;
             }
         }
@@ -2247,8 +2286,18 @@ pub const Backend = struct {
         return null;
     }
 
+    /// Upload+cache a weight blob (int8 weights / scales), keyed by host pointer.
+    /// Under memory pressure the LRU weight is evicted to make room; this weight
+    /// re-uploads here on its next use (the host bytes are the mmap'd checkpoint).
+    /// When async_uploads is on, the (re)upload runs on the transfer stream and
+    /// the compute stream waits on a per-weight event before the dependent GEMM,
+    /// so a re-upload overlaps the previous op's compute.
     fn cachedWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
-        const key = @intFromPtr(bytes.ptr);
+        return self.cachedWeightAt(@intFromPtr(bytes.ptr), bytes);
+    }
+
+
+    fn cachedWeightAt(self: *Backend, key: usize, bytes: []const u8) Error!DeviceBuffer {
         self.use_counter += 1;
         if (self.aliasWeight(key)) |db| return db;
         // A cached entry too small for `bytes` means the SAME host pointer was
@@ -2264,7 +2313,7 @@ pub const Backend = struct {
             self.tensorDestroy(&d);
         };
         if (self.weights.getPtr(key)) |e| {
-            e.last_use = self.use_counter;
+            self.touch(e);
             e.awaiting_use = false; // consumed: the prefetch paid off, evictable again
             const gen = e.pf_gen;
             const ev = e.upload_ev;
@@ -2304,8 +2353,40 @@ pub const Backend = struct {
             const cb = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
             self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
         }
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId() });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .fetch_seq = self.ctx.launch_seq, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId() });
         return db;
+    }
+
+    fn touch(self: *Backend, e: *WeightEntry) void {
+        e.last_use = self.use_counter;
+        e.fetch_seq = self.ctx.launch_seq;
+    }
+
+    /// Whether an op still needs `e`: fetched since the last launch (an op gathers its
+    /// weight, scale and bias, then may grow a scratch, and only then launches), or held
+    /// across launches (`hold`). Eviction for room never takes one of these.
+    fn opHolds(self: *const Backend, e: *const WeightEntry) bool {
+        if (e.fetch_seq == self.ctx.launch_seq) return true;
+        for (self.held[0..self.held_n]) |p| if (p == e.db.ptr()) return true;
+        return false;
+    }
+
+    /// Keep `db`, a cached weight, out of eviction until `unhold`, for a caller that
+    /// launches on it more than once (a conv's bands) while other fetches and
+    /// allocations happen in between. Nests.
+    pub fn hold(self: *Backend, db: DeviceBuffer) void {
+        std.debug.assert(self.held_n < self.held.len);
+        self.held[self.held_n] = db.ptr();
+        self.held_n += 1;
+    }
+
+    pub fn unhold(self: *Backend) void {
+        self.held_n -= 1;
+    }
+
+    /// Whether the weight cache holds `bytes` under their own address.
+    pub fn resident(self: *const Backend, bytes: []const u8) bool {
+        return self.weights.contains(@intFromPtr(bytes.ptr));
     }
 
     /// Claim pin residency for a newly cached `size`-byte weight (first-touch
@@ -2351,8 +2432,8 @@ pub const Backend = struct {
 
     // ---- int8 GEMM pair -----------------------------------------------------
 
-    fn prepFn(self: *Backend, cols: usize, in_f16: bool, rotate: bool, stage_global: bool) Error!cu.CUfunction {
-        const key = cols | (if (in_f16) @as(usize, 1) << 40 else 0) |
+    fn prepFn(self: *Backend, cols: usize, in_dt: Dt, rotate: bool, stage_global: bool) Error!cu.CUfunction {
+        const key = cols | (@as(usize, @intFromEnum(in_dt)) << 43) |
             (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
             (if (stage_global) @as(usize, 1) << 42 else 0); // variants keyed separately
         if (self.prep_mods.get(key)) |f| return f;
@@ -2360,7 +2441,7 @@ pub const Backend = struct {
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16, .none, 0, rotate, stage_global) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_dt, .none, 0, rotate, stage_global) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -2389,8 +2470,10 @@ pub const Backend = struct {
 
     fn matmulFn(self: *Backend) Error!cu.CUfunction {
         if (self.mm_mod != null) return self.mm_fn;
-        var mod = self.ctx.loadModule(kernels.f32gemm_ptx) catch return error.CudaError;
-        self.mm_fn = mod.getFunction(self.ctx, "f32gemm") catch return error.CudaError;
+        const src = kernels.buildSgemm(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(src);
+        var mod = self.ctx.loadModule(src) catch return error.CudaError;
+        self.mm_fn = mod.getFunction(self.ctx, "sgemm") catch return error.CudaError;
         self.mm_mod = mod;
         return self.mm_fn;
     }
@@ -2495,11 +2578,17 @@ pub const Backend = struct {
     /// are BYTE offsets to the first row. Only f32 weights (dtype_f8=false) are
     /// supported here, the int8 checkpoint's non-int8 layers (first/last) are f32.
     pub fn opMatmul(self: *Backend, y: DeviceBuffer, y_off: u64, x: DeviceBuffer, x_off: u64, m: usize, w_bytes: []const u8, dtype_f8: bool, rows: usize, cols: usize, scale: f32, bias: ?[]const f32) Error!void {
+        std.debug.assert(!dtype_f8); // fp8 path (fp8 checkpoint) not built on CUDA yet
+        return self.opMatmulDev(y, y_off, x, x_off, m, try self.cachedWeight(w_bytes), rows, cols, scale, bias);
+    }
+
+    /// `opMatmul` against an f32 weight already on the device.
+    pub fn opMatmulDev(self: *Backend, y: DeviceBuffer, y_off: u64, x: DeviceBuffer, x_off: u64, m: usize, w_db: DeviceBuffer, rows: usize, cols: usize, scale: f32, bias: ?[]const f32) Error!void {
+        self.hold(w_db);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(!dtype_f8); // fp8 path (fp8 checkpoint) not built on CUDA yet
         const f = try self.matmulFn();
-        const w_db = try self.cachedWeight(w_bytes);
         var bias_ptr: cu.CUdeviceptr = w_db.ptr(); // dummy (unread when hasbias=0)
         var hasbias: u32 = 0;
         if (bias) |bb| {
@@ -2507,28 +2596,29 @@ pub const Backend = struct {
             bias_ptr = bdb.ptr();
             hasbias = 1;
         }
-        const total: u32 = @intCast(m * rows);
         var py = y.ptr();
         var px = x.ptr();
         var pw = w_db.ptr();
-        var prows: u32 = @intCast(rows);
-        var pcols: u32 = @intCast(cols);
+        var pm: u32 = @intCast(m);
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(cols);
         var pscale: f32 = scale;
         var pyoff: u32 = @intCast(y_off / 4);
         var pxoff: u32 = @intCast(x_off / 4);
         var pg = [_]?*anyopaque{
-            @ptrCast(&py),    @ptrCast(&px),    @ptrCast(&pw),                @ptrCast(&bias_ptr),
-            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(@constCast(&total)), @ptrCast(&pscale),
+            @ptrCast(&py), @ptrCast(&px), @ptrCast(&pw),     @ptrCast(&bias_ptr),
+            @ptrCast(&pm), @ptrCast(&pn), @ptrCast(&pk),     @ptrCast(&pscale),
             @ptrCast(&pyoff), @ptrCast(&pxoff), @ptrCast(&hasbias),
         };
-        self.ctx.launch(f, .{ (total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, 0, &pg) catch return error.CudaError;
+        // `kernels.buildSgemm`: one 16x16 block per 64x64 tile of y.
+        self.ctx.launch(f, .{ @intCast((rows + 63) / 64), @intCast((m + 63) / 64), 1 }, .{ 16, 16, 1 }, 0, &pg) catch return error.CudaError;
     }
 
     /// fp8-e4m3 GEMM: y[m][rows] f32 = x[m][cols] f32 @ Wᵀ, W fp8-e4m3 [rows][cols]
     /// with a per-tensor `scale`. The fp8 weight streams through the cache; it is
     /// decoded to an f16 scratch (dequant_fp8_f16, scale folded), the activations
     /// are converted to f16 with the m->128 pad zeroed, and the validated f16
-    /// buildHgemm produces the f32 output. rows,cols must be multiples of 128,32.
+    /// buildHgemm produces the f32 output. cols must be a multiple of 32.
     /// (No y_off / bias, the text encoder writes each GEMM to its own buffer.)
     pub fn opMatmulFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
@@ -2548,8 +2638,29 @@ pub const Backend = struct {
             try self.ltMatmulF16(y, self.fp8_w16, self.fp8_a16, rows, mpad, cols);
         } else {
             const f_hg = try self.hgemmFn();
+            if (rows % 128 != 0) return self.hgemmPadN(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, mpad, rows, cols, null);
             try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
         }
+    }
+
+    /// `opMatmulFp8` in bf16, with a per-column bias: the weight decodes to bf16
+    /// (exact, e4m3 fits bf16) and the activation is staged as bf16, for activations
+    /// past f16's range.
+    pub fn opMatmulFp8Bf16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+        if (self.fp8_lut.buf == .null_handle) {
+            self.fp8_lut = try self.tensorCreate(256 * 4);
+            try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
+        }
+        const w_db = try self.cachedWeight(w_bytes);
+        {
+            self.ptic();
+            defer self.ptoc(.dequant);
+            try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+            try self.dualPairs("dequant_fp8_bf16", w_db, self.fp8_w16, self.fp8_lut, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
+        }
+        self.ptic();
+        defer self.ptoc(.matmul);
+        try self.gemmBf16X(y, x, m, self.fp8_w16, rows, cols, bias);
     }
 
     /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
@@ -2609,15 +2720,16 @@ pub const Backend = struct {
         // of the expected ordering.
         if (self.kernels == .libs) {
             try self.ensureDeviceBuffer(&self.fp8_a16, m * cols * 2);
-            try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, m * cols, cols, m, cols, 1.0);
-            try self.ltMatmulBf16(y, self.fp8_w16, self.fp8_a16, rows, m, cols);
+            try self.pad2d("pad_bf16", x, self.fp8_a16, m * cols, cols, m, cols, 1.0);
+            const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+            try self.ltMatmulBf16Bias(y, self.fp8_w16, self.fp8_a16, rows, m, cols, b_db.ptr());
             return;
         }
         // bf16, not f16, see `ops/nvfp4.zig`. The decoded weights are tiny, but this
         // converts the ACTIVATION to the same format, and Z-Image's trunk activations pass
         // f16's 65504 ceiling: an f16 path rendered it solid white on all three backends
         // identically. `f32_to_bf16_pad2d` zeroes the m-padding the GEMM's C tiles read.
-        try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, mpad * cols, cols, m, cols, 1.0);
+        try self.pad2d("pad_bf16", x, self.fp8_a16, mpad * cols, cols, m, cols, 1.0);
         // The GEMM writes `mpad` rows, not `m`, `launchHgemm` dispatches
         // `grid.y = mpad/128` and each block stores a whole 128x128 C tile, and the
         // cuBLASLt arm is handed `mpad` too. So it CANNOT write straight into a caller
@@ -2630,12 +2742,12 @@ pub const Backend = struct {
         // requirement on its callers implicitly ("the text encoder writes each GEMM to its
         // own buffer"); its zimage/anima `.f8_e4m3` arms have never been exercised. Worth
         // fixing the same way if an fp8 checkpoint for either ever shows up.
-        try self.ensureDeviceBuffer(&self.conv_c, mpad * rows * 4);
         const f_hg = try self.hgemmBf16Fn();
-        try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, self.conv_c, mpad, rows, cols);
-        // Strip the row padding into the tight `y`. These linears have no bias, but
-        // `bias_compact` needs a buffer regardless, the caller's full-width zero array.
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        if (rows % 128 != 0) return self.hgemmPadN(f_hg, self.fp8_a16, self.fp8_w16, y, m, mpad, rows, cols, b_db);
+        try self.ensureDeviceBuffer(&self.conv_c, mpad * rows * 4);
+        try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, self.conv_c, mpad, rows, cols);
+        // Strip the row padding into the tight `y`, adding the bias on the way.
         try self.dualElems("bias_compact", self.conv_c, b_db, null, y, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
     }
 
@@ -2745,7 +2857,7 @@ pub const Backend = struct {
         switch (dt) {
             inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s => |t| {
                 const tbl = try self.iqTable(dt);
-                return self.dualRows("gemv_dual_" ++ @tagName(t), w_db, x, y, tbl, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+                return self.dualRows("gemv_dual_" ++ @tagName(t), w_db, x, y, tbl, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, (rows + 1) / 2);
             },
             else => {},
         }
@@ -2911,7 +3023,8 @@ pub const Backend = struct {
                 tbl,
                 .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 },
                 .{ scale, 0 },
-                rows,
+                // Two rows a subgroup (`quant.gemvQ2`).
+                (rows + 1) / 2,
             ),
             else => unreachable,
         }
@@ -3382,24 +3495,42 @@ pub const Backend = struct {
     /// which reallocates on growth: `cachedWeight` keys on the host pointer, so a moved
     /// one leaves a device buffer registered against a freed address (see `opMatmulNvfp4`).
     pub fn opMatmulQuantBf16(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: []const f32) Error!void {
-        std.debug.assert(bias.len >= rows);
         const w_db = try self.cachedWeight(w_bytes);
-        const w16 = try self.opDequantBf16(dt, w_db, rows * cols);
+        try self.gemmBf16X(y, x, m, try self.opDequantBf16(dt, w_db, rows * cols), rows, cols, bias);
+    }
+
+    /// Rows a staged bf16 activation carries: cuBLASLt takes `m` as is, the hand-PTX
+    /// `hgemm` runs whole 128-row tiles.
+    fn bf16Rows(self: *const Backend, m: usize) usize {
+        return if (self.kernels == .libs) m else std.mem.alignForward(usize, m, 128);
+    }
+
+    /// `y[m][rows] f32 = x @ w16ᵀ` for an f32 `x` and a bf16 weight already on the
+    /// device: `x` converts to bf16 in the shared activation scratch first. Writes
+    /// exactly `m` rows of `y`; see `opMatmulQuantBf16` for `bias`.
+    fn gemmBf16X(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w16: DeviceBuffer, rows: usize, cols: usize, bias: []const f32) Error!void {
+        std.debug.assert(bias.len >= rows);
         // cuBLASLt takes an arbitrary `m` and writes exactly `m` rows; the hand-PTX
         // `hgemm` dispatches `grid.y = mpad/128` and each block stores a whole 128x128 C
         // tile, so it stages into `conv_c` and compacts, exactly as `opMatmulNvfp4` does.
-        const libs = self.kernels == .libs;
-        const mrun = if (libs) m else std.mem.alignForward(usize, m, 128);
+        const mrun = self.bf16Rows(m);
         {
             self.ptic();
             defer self.ptoc(.elt);
             try self.ensureDeviceBuffer(&self.fp8_a16, mrun * cols * 2);
-            try self.pad2d("f32_to_bf16_pad", x, self.fp8_a16, mrun * cols, cols, m, cols, 1.0);
+            try self.pad2d("pad_bf16", x, self.fp8_a16, mrun * cols, cols, m, cols, 1.0);
         }
-        if (libs) {
+        if (self.kernels == .libs) {
+            const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
             self.ptic();
             defer self.ptoc(.matmul);
-            return self.ltMatmulBf16(y, w16, self.fp8_a16, rows, m, cols);
+            return self.ltMatmulBf16Bias(y, w16, self.fp8_a16, rows, m, cols, b_db.ptr());
+        }
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        if (rows % 128 != 0) {
+            self.ptic();
+            defer self.ptoc(.matmul);
+            return self.hgemmPadN(try self.hgemmBf16Fn(), self.fp8_a16, w16, y, m, mrun, rows, cols, b_db);
         }
         try self.ensureDeviceBuffer(&self.conv_c, mrun * rows * 4);
         {
@@ -3408,8 +3539,143 @@ pub const Backend = struct {
             const f_hg = try self.hgemmBf16Fn();
             try self.launchHgemm(f_hg, self.fp8_a16, w16, self.conv_c, mrun, rows, cols);
         }
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         try self.dualElems("bias_compact", self.conv_c, b_db, null, y, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
+    }
+
+    // ---- weight-only integer convrot GEMM (int8, int4, W4A8 as bf16) ----------
+
+    /// An integer convrot weight times its per-row scale, rotated BACK into the
+    /// checkpoint's basis, as bf16 in the shared dequant scratch (`opDequantBf16`'s,
+    /// same lifetime rule). `bits` is 8 for int8 and W4A8's int8 decode, 4 for int4.
+    ///
+    /// The rotation goes on the weight and not the activation, though both are exact:
+    /// a rotated activation carries the outlier channel's magnitude into every value
+    /// of its group, and bf16's relative rounding then costs every channel of it.
+    fn intRowBf16(self: *Backend, w_db: DeviceBuffer, s_db: DeviceBuffer, rows: usize, cols: usize, comptime bits: u32, rotate: bool) Error!DeviceBuffer {
+        return self.intRow16(w_db, s_db, rows, cols, bits, rotate, false);
+    }
+
+    /// `intRowBf16`, as f16 (`half`) or bf16.
+    fn intRow16(self: *Backend, w_db: DeviceBuffer, s_db: DeviceBuffer, rows: usize, cols: usize, comptime bits: u32, rotate: bool, comptime half: bool) Error!DeviceBuffer {
+        const w = if (half) "f16" else "bf16";
+        self.ptic();
+        defer self.ptoc(.dequant);
+        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+        if (!rotate) {
+            std.debug.assert(bits == 8 and cols % 4 == 0);
+            const n = rows * cols / 4;
+            try self.dualElems("dequant_i8row_" ++ w, w_db, self.fp8_w16, s_db, null, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+            return self.fp8_w16;
+        }
+        // Whole groups per lane set, which the kernel's shuffles rely on.
+        std.debug.assert(cols % 256 == 0);
+        const n = rows * cols / 16;
+        try self.dualElems((if (bits == 8) "i8row_rot_" else "i4row_rot_") ++ w, w_db, self.fp8_w16, s_db, null, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        return self.fp8_w16;
+    }
+
+    /// An integer convrot weight times its per-row scale, rotation undone, as f32 in its
+    /// own scratch: the W8A32 / W4A32 weight-only GEMM's operand.
+    fn intRowF32(self: *Backend, w_db: DeviceBuffer, s_db: DeviceBuffer, rows: usize, cols: usize, comptime bits: u32, rotate: bool) Error!DeviceBuffer {
+        self.ptic();
+        defer self.ptoc(.dequant);
+        try self.ensureDeviceBuffer(&self.wo_w32, rows * cols * 4);
+        if (!rotate) {
+            std.debug.assert(bits == 8 and cols % 4 == 0);
+            const n = rows * cols / 4;
+            try self.dualElems("dequant_i8row_f32", w_db, self.wo_w32, s_db, null, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+            return self.wo_w32;
+        }
+        std.debug.assert(cols % 256 == 0);
+        const n = rows * cols / 16;
+        try self.dualElems(if (bits == 8) "i8row_rot_f32" else "i4row_rot_f32", w_db, self.wo_w32, s_db, null, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        return self.wo_w32;
+    }
+
+    /// `y[m][rows] = x[m][cols] @ w32ᵀ + bias` in true f32: cuBLASLt's FFMA GEMM where it
+    /// runs, the f32 kernel otherwise.
+    fn gemmF32Dev(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w32: DeviceBuffer, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        self.opMatmulF32LtDev(y, x, m, w32, rows, cols, bias) catch |err| switch (err) {
+            error.UnsupportedKernelArm => return self.opMatmulDev(y, 0, x, 0, m, w32, rows, cols, 1.0, bias),
+            else => return err,
+        };
+    }
+
+    /// int8 convrot linear, weight-only in f32 (W8A32).
+    pub fn opI8GemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: ?[]const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmF32Dev(y, x, m, try self.intRowF32(w_db, s_db, rows, cols, 8, rotate), rows, cols, bias);
+    }
+
+    /// int4 convrot linear, weight-only in f32 (W4A32).
+    pub fn opI4GemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmF32Dev(y, x, m, try self.intRowF32(w_db, s_db, rows, cols, 4, true), rows, cols, bias);
+    }
+
+    /// A packed W4A8 weight, weight-only in f32: its int8 decode, then the f32 expansion.
+    pub fn opW4A8GemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, packed_bytes: []const u8, s_rel: []const u8, levels: []const u8, row_scale: []const f32, rows: usize, cols: usize, group_size: usize, rotate: bool, bias: ?[]const f32) Error!void {
+        const q = try self.w4a8ToI8(packed_bytes, s_rel, levels, rows, cols, group_size);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmF32Dev(y, x, m, try self.intRowF32(q, s_db, rows, cols, 8, rotate), rows, cols, bias);
+    }
+
+    /// The W·A32 scratch for one `[rows][cols]` linear.
+    pub fn reserveWo32(self: *Backend, rows: usize, cols: usize) Error!void {
+        try self.ensureDeviceBuffer(&self.wo_w32, rows * cols * 4);
+    }
+
+    /// Grow the weight-only scratches for one `[rows][cols]` linear over `m` rows (0:
+    /// the weight side only), so a caller presizing over its linears reaches the
+    /// high-water mark up front.
+    pub fn reserveWo(self: *Backend, rows: usize, cols: usize, m: usize) Error!void {
+        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+        if (m != 0) try self.ensureDeviceBuffer(&self.fp8_a16, self.bf16Rows(m) * cols * 2);
+    }
+
+    /// int8 convrot linear, weight-only: the weight expands to bf16 per GEMM and stays
+    /// packed in the cache; `x` is the f32 activation, never quantized.
+    pub fn opI8GemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: []const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmBf16X(y, x, m, try self.intRowBf16(w_db, s_db, rows, cols, 8, rotate), rows, cols, bias);
+    }
+
+    /// `opI8GemmWo` for a packed W4A8 weight: its int8 decode, then the same expansion.
+    pub fn opW4A8GemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, packed_bytes: []const u8, s_rel: []const u8, levels: []const u8, row_scale: []const f32, rows: usize, cols: usize, group_size: usize, rotate: bool, bias: []const f32) Error!void {
+        const q = try self.w4a8ToI8(packed_bytes, s_rel, levels, rows, cols, group_size);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmBf16X(y, x, m, try self.intRowBf16(q, s_db, rows, cols, 8, rotate), rows, cols, bias);
+    }
+
+    /// The f16 twins of the three weight-only GEMMs: the weight expands to f16 and runs
+    /// the f16 GEMM against an f16 activation (`opConvF16W`), three more mantissa bits
+    /// than bf16 for an activation that fits f16's range. What a one-shot tower wants.
+    pub fn opI8GemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: []const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.opConvF16W(y, 0, x, m, try self.intRow16(w_db, s_db, rows, cols, 8, rotate, true), rows, cols, bias, 1.0);
+    }
+
+    pub fn opW4A8GemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, packed_bytes: []const u8, s_rel: []const u8, levels: []const u8, row_scale: []const f32, rows: usize, cols: usize, group_size: usize, rotate: bool, bias: []const f32) Error!void {
+        const q = try self.w4a8ToI8(packed_bytes, s_rel, levels, rows, cols, group_size);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.opConvF16W(y, 0, x, m, try self.intRow16(q, s_db, rows, cols, 8, rotate, true), rows, cols, bias, 1.0);
+    }
+
+    pub fn opI4GemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.opConvF16W(y, 0, x, m, try self.intRow16(w_db, s_db, rows, cols, 4, true, true), rows, cols, bias, 1.0);
+    }
+
+    /// `opI8GemmWo` for an int4 convrot weight, nibble-packed `[rows][cols/2]`.
+    pub fn opI4GemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        try self.gemmBf16X(y, x, m, try self.intRowBf16(w_db, s_db, rows, cols, 4, true), rows, cols, bias);
     }
 
     /// Convert `m` rows of f32 activations to f16 in the shared activation
@@ -3427,6 +3693,8 @@ pub const Backend = struct {
     /// y[mpad][rows] f32 = W16[rows][cols] @ A16[mpad][cols]; `mpad` must be a
     /// multiple of 128 and both operands resident f16.
     pub fn opGemmF16Dev(self: *Backend, y: DeviceBuffer, w16: DeviceBuffer, a16: DeviceBuffer, rows: usize, mpad: usize, cols: usize) Error!void {
+        self.hold(w16);
+        defer self.unhold();
         std.debug.assert(mpad % 128 == 0);
         self.ptic();
         defer self.ptoc(.matmul);
@@ -3434,6 +3702,7 @@ pub const Backend = struct {
             try self.ltMatmulF16(y, w16, a16, rows, mpad, cols);
         } else {
             const f_hg = try self.hgemmFn();
+            if (rows % 128 != 0) return self.hgemmPadN(f_hg, a16, w16, y, mpad, mpad, rows, cols, null);
             try self.launchHgemm(f_hg, a16, w16, y, mpad, rows, cols);
         }
     }
@@ -3634,20 +3903,20 @@ pub const Backend = struct {
     }
 
     /// Classic LayerNorm with weight and bias (ViT ln1/ln2/post_ln):
-    /// out = (x - mean)/sqrt(var + eps) * w + b, one block per row. w/b are
-    /// host f32 slices cached device-side by pointer.
-    /// `h16` selects f16 activation STORAGE for `x` and `out`; `w`/`b` are
-    /// per-channel and stay f32 either way. The reduction is f32 regardless.
-    pub fn opLayerNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32, h16: bool) Error!void {
+    /// out = (x - mean)/sqrt(var + eps) * w + b, one block per row, the reduction f32.
+    /// w/b are host f32 slices cached device-side by pointer. `x` and `out` at one
+    /// dtype, or `x` f32 and `out` 16-bit.
+    pub fn opLayerNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const w_db = try self.cachedWeight(std.mem.sliceAsBytes(w));
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(b));
         const u = [7]u32{ @intCast(rows), @intCast(dim), 0, 0, 0, 0, 0 };
-        if (h16) {
-            try self.dualRows("layernorm_h16", x, out, w_db, b_db, u, .{ eps, 0 }, rows);
-        } else {
-            try self.dualRows("layernorm", x, out, w_db, b_db, u, .{ eps, 0 }, rows);
+        if (out.dt == x.dt) return self.dualRowsAt("layernorm", x.dt, x, out, w_db, b_db, u, .{ eps, 0 }, rows);
+        std.debug.assert(x.dt == .f32);
+        switch (out.dt) {
+            .f32 => unreachable,
+            inline else => |d| try self.dualRows("layernorm_f32_" ++ @tagName(d), x, out, w_db, b_db, u, .{ eps, 0 }, rows),
         }
     }
 
@@ -3872,6 +4141,45 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ @intCast(heads), 1, 1 }, .{ @intCast(d), 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
+    /// `opGdnDeltaChunk` through the dual kernel Vulkan runs (`dual/attn.zig`), the same
+    /// arithmetic in the same order; for a head dim it was instantiated at (64, 128).
+    pub fn opGdnDeltaChunkDual(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        const u = [7]u32{ @intCast(heads), @intCast(d), @intCast(k_heads), @intCast(n), @intCast(channels), 0, 0 };
+        switch (d) {
+            64 => try self.dualElems("gdn_delta_chunk_d64", state, conv_out, gates, o, u, .{ scale, 0 }, heads * d),
+            128 => try self.dualElems("gdn_delta_chunk_d128", state, conv_out, gates, o, u, .{ scale, 0 }, heads * d),
+            else => unreachable,
+        }
+    }
+
+    /// `opAttnDecode` (no window, ring or bidirectional block) through the dual kernels
+    /// Vulkan runs: `seq_q` queries, query t seeing `kv_len0 + t` keys. `scratch` holds
+    /// seq_q * n_heads * nsplit * (hd + 2) f32.
+    pub fn opAttnRowsDual(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, kv_fmt: KvFmt) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        // The grouped kernel under the Vulkan arm's rule (`Context.opAttnRows`): one pass
+        // of 8 dims a lane, a batch or an f32 decode step.
+        const group = n_heads / kv_heads;
+        const grouped = n_heads % kv_heads == 0 and hd <= 8 * 32 and (seq_q > 1 or kv_fmt == .f32) and (group == 2 or group == 4 or group == 8);
+        const rows = seq_q * (if (grouped) kv_heads else n_heads) * nsplit;
+        const u = [7]u32{ @intCast(rows), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(kv_len0), 0 };
+        if (grouped) switch (group) {
+            inline 2, 4, 8 => |g| switch (kv_fmt) {
+                inline else => |f| try self.dualRows(std.fmt.comptimePrint("attn_rows_g{d}_{s}", .{ g, if (f == .q8_0) "q8" else @tagName(f) }), q, k, v, scratch, u, .{ scale, 0 }, rows),
+            },
+            else => unreachable,
+        } else switch (kv_fmt) {
+            .f32 => try self.dualRows("attn_rows_f32", q, k, v, scratch, u, .{ scale, 0 }, rows),
+            .f16 => try self.dualRows("attn_rows_f16", q, k, v, scratch, u, .{ scale, 0 }, rows),
+            .q8_0 => try self.dualRows("attn_rows_q8", q, k, v, scratch, u, .{ scale, 0 }, rows),
+        }
+        const total = seq_q * n_heads * hd;
+        try self.dualElems("attn_merge", scratch, null, null, out, .{ @intCast(total), @intCast(hd), @intCast(nsplit), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     /// Per-head delta-net gates: decay = exp(a*softplus(alpha+dt)),
     /// beta = sigmoid(beta_in).
     pub fn opGdnGates(self: *Backend, alpha_beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize) Error!void {
@@ -3983,71 +4291,121 @@ pub const Backend = struct {
     ///
     /// The bias is NOT scaled: `bias_compact` adds it after undoing the scale.
     pub fn opConvF16Scaled(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32, act_div: f32) Error!void {
-        return self.opConvF16Prec(dst, dst_off_elems, src, m, w_bytes, co, k, bias, act_div, false, false);
+        const op = operand16(src, dst);
+        return self.opGemm16(dst, dst_off_elems, src, m, try self.weight16(w_bytes, .f32, false, co, k, 1, 1, op), co, k, bias, act_div, op);
     }
 
-    /// `opConvF16Scaled` with f16 activation STORAGE on either side. The GEMM is
-    /// unchanged, it already ran f16 operands with an f32 accumulator; these flags
-    /// only say how `src` and `dst` are laid out in memory, which is where a VAE
-    /// decode's gigabytes actually live.
-    pub fn opConvF16Prec(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32, act_div: f32, src_f16: bool, dst_f16: bool) Error!void {
+    /// `opGemm16` at f16 operands, for a weight from `weightF16`.
+    pub fn opConvF16W(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w16: DeviceBuffer, co: usize, k: usize, bias: []const f32, act_div: f32) Error!void {
+        self.hold(w16);
+        defer self.unhold();
+        return self.opGemm16(dst, dst_off_elems, src, m, w16.as(.f16), co, k, bias, act_div, .f16);
+    }
+
+    /// The 16-bit GEMM operand width for a linear from `src` to `dst`: bf16 when either
+    /// side is bf16, since a bf16 chain carries values an f16 operand cannot hold.
+    pub fn operand16(src: DeviceBuffer, dst: DeviceBuffer) Dt {
+        return if (src.dt == .bf16 or dst.dt == .bf16) .bf16 else .f16;
+    }
+
+    /// `dst[m][co]` (from element `dst_off_elems`) = `src[m][k]` @ `w16`ᵀ + bias on the
+    /// 16-bit tensor cores at operand width `op`, f32 accumulate, `w16` `[co][k]` at
+    /// `op` (`weight16`) and `src` / `dst` at their own dtypes. `src` is divided by
+    /// `act_div` on the way in and the result multiplied back (exact at a power of
+    /// two); an f16 `src` cannot carry it, since a value that needed it could not be
+    /// in it. The bias is not scaled.
+    pub fn opGemm16(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w16: DeviceBuffer, co: usize, k: usize, bias: []const f32, act_div: f32, op: Dt) Error!void {
+        self.hold(w16);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
+        std.debug.assert(op != .f32 and w16.dt == op);
+        std.debug.assert(src.dt != .f16 or act_div == 1.0);
+        std.debug.assert(op == .bf16 or dst.dt != .bf16);
+        // Unpadded, bias in the GEMM epilogue, and D in the destination's own width.
+        if (self.ltHalfOk(k, op, dst.dt)) {
+            const a16 = try self.halfActivation(src, m, k, op, 1.0 / act_div);
+            return self.ltGemmHalfBias(dst, dst_off_elems, a16, w16, bias, m, co, k, act_div, op);
+        }
         const co_pad = std.mem.alignForward(usize, co, 128);
         const k_pad = std.mem.alignForward(usize, k, 32);
         const m_pad = std.mem.alignForward(usize, m, 128);
-        const w_db = try self.cachedWeight(w_bytes);
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        // Unpadded, bias in the GEMM epilogue, and D in the destination's own width.
-        if (self.kernels == .libs and k % 8 == 0) {
-            try self.ensureDeviceBuffer(&self.conv_w16, co * k * 2);
-            try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-            try self.pad2d("f32_to_h16_pad", w_db, self.conv_w16, co * k, k, co, k, 1.0);
-            if (src_f16) {
-                std.debug.assert(act_div == 1.0);
-                try self.pad2d("h16_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
-            } else {
-                try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0 / act_div);
-            }
-            return self.ltGemmHalfBias(dst, dst_off_elems, self.conv_a16, self.conv_w16, bias, m, co, k, act_div, dst_f16);
-        }
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        // The WEIGHT is never scaled, conv weights are O(1) and it is the
-        // activation that overflows.
-        try self.pad2d("f32_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
-        // An f16 source is already in the GEMM's format: `f16_pad2d` only pads.
-        // It takes no scale, so an f16 source cannot carry `act_div`, asserted
-        // rather than silently ignored, since that is a wrong image, not an error.
-        if (src_f16) {
-            std.debug.assert(act_div == 1.0);
-            try self.pad2d("h16_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
-        } else {
-            try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0 / act_div);
-        }
+        // The WEIGHT is never scaled: it is the activation that overflows.
+        try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
+        try self.pad2dTo(op, src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 0, 1.0 / act_div);
         if (self.kernels == .libs) {
-            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+            if (op == .bf16) {
+                try self.ltMatmulBf16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+            } else {
+                try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+            }
         } else {
-            const f_hg = try self.hgemmFn();
+            const f_hg = if (op == .bf16) try self.hgemmBf16Fn() else try self.hgemmFn();
             try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
         }
         const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0, 0 };
-        if (dst_f16) {
-            std.debug.assert(dst_off_elems % 2 == 0);
-            try self.dualPairs("bias_compact_h16", self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+        try self.dualElemsAt("bias_compact", dst.dt, self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+    }
+
+    /// `opGemm16` for a band of `m` output positions of a 3x3 convolution, its patch
+    /// gathered from `src` straight into the GEMM's 16-bit operand rather than through
+    /// an f32 patch and a convert. Callers check `taps.fits` at `gatherKPad(9 * ci)`.
+    pub fn opConvGemm16(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w16: DeviceBuffer, co: usize, taps: dual_table.ConvTaps, bias: []const f32, act_div: f32, op: Dt) Error!void {
+        self.hold(w16);
+        defer self.unhold();
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(op != .f32 and w16.dt == op);
+        std.debug.assert(src.dt != .f16 or act_div == 1.0);
+        std.debug.assert(op == .bf16 or dst.dt != .bf16);
+        const k = 9 * taps.ci;
+        const lt = self.ltHalfOk(k, op, dst.dt);
+        const k_pad = if (lt) k else std.mem.alignForward(usize, k, 32);
+        const m_pad = if (lt) m else std.mem.alignForward(usize, m, 128);
+        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
+        const u = taps.push(m_pad, k_pad, m);
+        const fp = [2]f32{ @floatFromInt(taps.mode), 1.0 / act_div };
+        if (op == .bf16) {
+            try self.dualElemsAt("im2col_bf16", src.dt, src, null, null, self.conv_a16, u, fp, u[0]);
         } else {
-            try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+            try self.dualElemsAt("im2col_h16", src.dt, src, null, null, self.conv_a16, u, fp, u[0]);
         }
+        if (lt) return self.ltGemmHalfBias(dst, dst_off_elems, self.conv_a16.as(op), w16, bias, m, co, k, act_div, op);
+        const co_pad = std.mem.alignForward(usize, co, 128);
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+        try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
+        const f_hg = if (op == .bf16) try self.hgemmBf16Fn() else try self.hgemmFn();
+        try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0, 0 };
+        try self.dualElemsAt("bias_compact", dst.dt, self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+    }
+
+    /// The operand width `opConvGemm16` gathers a `k`-wide patch into for a `dst`.
+    pub fn gatherKPad(self: *const Backend, k: usize, op: Dt, dst: Dt) usize {
+        return if (self.ltHalfOk(k, op, dst)) k else std.mem.alignForward(usize, k, 32);
+    }
+
+    /// Whether a 16-bit GEMM can take `ltGemmHalfBias`: cuBLASLt loads k 8 at a time,
+    /// and has no bf16 GEMM writing f16 (that pair takes the padded path, whose
+    /// `bias_compact` writes any width).
+    fn ltHalfOk(self: *const Backend, k: usize, op: Dt, dst: Dt) bool {
+        return self.kernels == .libs and k % 8 == 0 and !(op == .bf16 and dst == .f16);
     }
 
     /// Native bf16 GEMM: dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16
     /// [co][k]. The weight is fed to the bf16 tensor cores DIRECTLY from the
     /// cached raw checkpoint bytes, no f16 conversion, so a streamed weight is
-    /// touched exactly once (DMA in, read by the MMA). Requires co%128==0 and
-    /// k%32==0 (true for every krea2 DiT block linear) so the raw [co][k] layout
-    /// is already the GEMM's B operand, no pad/transpose. Only the small
-    /// activation converts (f32->bf16) per call. Ampere+ only (bf16 MMA).
+    /// touched exactly once (DMA in, read by the MMA). Requires co%32==0 and
+    /// k%32==0. At co%128==0 (every DiT block linear) the raw [co][k] layout is
+    /// already the hand-PTX GEMM's B operand; a narrower co (a LoRA rank) is
+    /// zero-padded to the tile per call on that arm, which cuBLASLt does not need.
+    /// Only the small activation converts (f32->bf16) per call. Ampere+ only.
     ///
     /// `bias` is OPTIONAL, and passing `null` is not just tidier, under
     /// `.libs` it removes a whole streaming pass. With no bias to add and
@@ -4058,19 +4416,26 @@ pub const Backend = struct {
     /// measured at 70 GB per Z-Image step. Callers with a real bias (`dit_cuda`)
     /// keep the staged path unchanged.
     pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        return self.opGemmBf16Ld(dst, src, k, m, w_bytes, co, k, bias);
+    }
+
+    /// `opGemmBf16` whose source rows are `src_ld` elements apart (`src_ld >= k`),
+    /// read at the source's dtype.
+    pub fn opGemmBf16Ld(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
+        std.debug.assert(src_ld >= k);
         // cuBLASLt writes straight into `dst`, bias in the epilogue. The
         // alternative below stages an m-padded f32 plane and re-reads it to add
         // the bias, which at Mage-Flow's widths is ~10 GB a forward of traffic
         // for an add cuBLASLt does for free.
         if (self.kernels == .libs) {
             std.debug.assert(w_bytes.len == co * k * 2);
-            std.debug.assert(co % 128 == 0 and k % 32 == 0);
+            std.debug.assert(co % 32 == 0 and k % 32 == 0);
             const w_direct = try self.cachedWeight(w_bytes);
             try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
             if (!bench_gemm_only) {
-                try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
+                try self.pad2dAt("pad_bf16", src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
             }
             var bias_ptr: u64 = 0;
             if (bias) |bv| {
@@ -4089,24 +4454,32 @@ pub const Backend = struct {
         // in Debug only, since asserts vanish in ReleaseFast.
         const bias_s = bias orelse try self.zeroBias(co);
         std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
-        std.debug.assert(co % 128 == 0 and k % 32 == 0); // raw weight IS the B operand
+        std.debug.assert(co % 32 == 0 and k % 32 == 0);
         const m_pad = std.mem.alignForward(usize, m, 128);
-        const w_db = try self.cachedWeight(w_bytes); // raw bf16, resident, no convert
+        const co_pad = std.mem.alignForward(usize, co, 128);
+        var w_db = try self.cachedWeight(w_bytes); // raw bf16, resident, no convert
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
+        if (co_pad != co) {
+            // The GEMM's B tiles are 128 weight rows. The pad rows are left as they
+            // are: they only reach output columns `bias_compact` drops.
+            try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k * 2);
+            try self.opCopyOff(self.conv_w16.as(.bf16), 0, w_db.as(.bf16), 0, co * k);
+            w_db = self.conv_w16;
+        }
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k * 2);
-        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co * 4);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
         if (!bench_gemm_only) {
-            try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m_pad * k, k, m, k, 1.0);
+            try self.pad2dAt("pad_bf16", src, self.conv_a16, m_pad * k, k, m, k, src_ld, 1.0);
         }
-        if (self.kernels == .libs) {
-            try self.ltMatmulBf16(self.conv_c, w_db, self.conv_a16, co, m_pad, k);
-        } else {
-            const f_hg = try self.hgemmBf16Fn();
-            try self.launchHgemm(f_hg, self.conv_a16, w_db, self.conv_c, m_pad, co, k);
-        }
+        const f_hg = try self.hgemmBf16Fn();
+        try self.launchHgemm(f_hg, self.conv_a16, w_db, self.conv_c, m_pad, co_pad, k);
         if (bench_gemm_only) return;
-        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
+
+    /// DIAGNOSTIC: the accumulating GEMMs overwrite `dst` (beta 0) instead, which is
+    /// wrong output and removes exactly their read of it (`lora-sidecar-bench`).
+    pub var bench_acc_overwrite: bool = false;
 
     /// `dst[m][co] += scale * (src[m][k] @ Wᵀ)`, W bf16 `[co][k]` straight from
     /// the mapping, accumulating into `dst` rather than overwriting it.
@@ -4123,105 +4496,77 @@ pub const Backend = struct {
     /// writes its C tiles unconditionally, so a caller on that arm keeps the
     /// scratch-plus-add route. Returns `error.Unsupported` there rather than
     /// silently overwriting, which would drop the base GEMM's output.
-    pub fn opGemmBf16Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
+    ///
+    /// `src` rows are `src_ld` f32 apart (`src_ld >= k`).
+    pub fn opGemmBf16Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
         if (self.kernels != .libs) return error.UnsupportedKernelArm;
         self.ptic();
         defer self.ptoc(.matmul);
         std.debug.assert(w_bytes.len == co * k * 2);
-        std.debug.assert(co % 128 == 0 and k % 32 == 0);
+        std.debug.assert(co % 32 == 0 and k % 32 == 0 and src_ld >= k);
         const w_direct = try self.cachedWeight(w_bytes);
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-        try self.pad2d("f32_to_bf16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
-        try self.ltMatmulBf16Scaled(dst, w_direct, self.conv_a16, co, m, k, scale, 1.0);
+        try self.pad2dAt("pad_bf16", src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
+        try self.ltMatmulBf16Scaled(dst, w_direct, self.conv_a16, co, m, k, scale, if (bench_acc_overwrite) 0.0 else 1.0);
     }
 
-    /// opConvF16's bf16-weight twin (ViT GEMMs over the mmproj's bf16
-    /// tensors): dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16 [co][k]
-    /// straight from the GGUF mmap. Weight and activation convert to f16
-    /// zero-padded to the coop tile (co->128-mult, k->32-mult, m->128), then
-    /// bias_compact strips the pad + adds bias into the tight dst. Handles
-    /// any co/k (e.g. the ViT's ffn 4304).
-    pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32, src_f16: bool, dst_f16: bool) Error!void {
+    /// `dst[m][co]` f32 = `src[m][k]` f16 @ Wᵀ, W bf16 `[co][k]` run as f16
+    /// (`weightF16`): a sidecar's A GEMM on an f16 activation. `libs` only.
+    pub fn opGemmHalfIn(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize) Error!void {
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
         self.ptic();
         defer self.ptoc(.matmul);
-        // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
-        // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
-        // cached by pointer and sized from the first call's length, so a narrow layer
-        // seen first would leave every wider one reading past the end). The kernels read
-        // only `co` entries, so a longer slice is free. Asserting `== co` is the exact
-        // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
-        // in Debug only, since asserts vanish in ReleaseFast.
-        const bias_s = bias orelse try self.zeroBias(co);
-        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
-        const co_pad = std.mem.alignForward(usize, co, 128);
-        const k_pad = std.mem.alignForward(usize, k, 32);
-        const m_pad = std.mem.alignForward(usize, m, 128);
-        const w_db = try self.cachedWeight(w_bytes);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
-        // Unpadded, bias in the GEMM epilogue. See `ltGemmHalfBias`.
-        if (self.kernels == .libs and k % 8 == 0) {
-            const w16 = try self.cachedWeightF16(w_bytes, co, k);
-            const a16 = try self.halfActivation(src, m, k, src_f16);
-            return self.ltGemmHalfBias(dst, 0, a16, w16, bias_s, m, co, k, 1.0, dst_f16);
-        }
-        std.debug.assert(!src_f16 and !dst_f16); // no hand-PTX f16-storage twin
-        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        try self.pad2d("bf16_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
-        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
-        if (self.kernels == .libs) {
-            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
-        } else {
-            const f_hg = try self.hgemmFn();
-            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
-        }
-        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        std.debug.assert(k % 8 == 0);
+        const w16 = try self.weightF16(w_bytes, .bf16, false, co, k, 1, 1);
+        const plan = try self.ltPlan(.f16, co, m, k, 0, .f32);
+        var alpha: f32 = 1;
+        var beta: f32 = 0;
+        try self.ltRun(plan, dst, w16, src, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
-    /// Like `opMatmulBf16` but for an f16 weight (some GGUF mmproj towers ship
-    /// f16, e.g. Qwen3.5-9B's). Identical except the weight is padded with a
-    /// straight f16 copy instead of a bf16->f16 convert.
-    pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32, src_f16: bool, dst_f16: bool) Error!void {
+    /// `opGemmBf16Acc` onto a 16-bit `dst`: `dst[m][co] += scale * src[m][..k] @ Wᵀ`,
+    /// `src` with rows `src_ld` apart, W bf16, the operands at `dst.dt` and the add done
+    /// by the GEMM (beta 1) so `dst` is rounded once. `libs` only.
+    pub fn opGemmHalfAcc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
         self.ptic();
         defer self.ptoc(.matmul);
-        // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
-        // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
-        // cached by pointer and sized from the first call's length, so a narrow layer
-        // seen first would leave every wider one reading past the end). The kernels read
-        // only `co` entries, so a longer slice is free. Asserting `== co` is the exact
-        // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
-        // in Debug only, since asserts vanish in ReleaseFast.
-        const bias_s = bias orelse try self.zeroBias(co);
-        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
-        const co_pad = std.mem.alignForward(usize, co, 128);
-        const k_pad = std.mem.alignForward(usize, k, 32);
-        const m_pad = std.mem.alignForward(usize, m, 128);
-        const w_db = try self.cachedWeight(w_bytes);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
-        // Unpadded, bias in the GEMM epilogue, and the cached weight IS the f16 B
-        // operand already, so the whole weight pass disappears. See `ltGemmHalfBias`.
-        if (self.kernels == .libs and k % 8 == 0) {
-            const a16 = try self.halfActivation(src, m, k, src_f16);
-            return self.ltGemmHalfBias(dst, 0, a16, w_db, bias_s, m, co, k, 1.0, dst_f16);
-        }
-        std.debug.assert(!src_f16 and !dst_f16); // no hand-PTX f16-storage twin
-        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        try self.pad2d("h16_to_h16_pad", w_db, self.conv_w16, co_pad * k_pad, k_pad, co, k, 1.0);
-        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 1.0);
-        if (self.kernels == .libs) {
-            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
-        } else {
-            const f_hg = try self.hgemmFn();
-            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
-        }
-        try self.dualElems("bias_compact", self.conv_c, b_db, null, dst, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * co);
+        const op = dst.dt;
+        std.debug.assert(k % 8 == 0 and src_ld >= k and op != .f32);
+        const w16 = try self.weight16(w_bytes, .bf16, false, co, k, 1, 1, op);
+        try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
+        try self.pad2dTo(op, src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
+        const plan = try self.ltPlan(if (op == .bf16) .bf16 else .f16, co, m, k, 0, op);
+        var alpha = scale;
+        var beta: f32 = if (bench_acc_overwrite) 0 else 1;
+        try self.ltRun(plan, dst, w16, self.conv_a16, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
-    /// Free the shared GEMM conversion scratch (conv_w16/a16/c, the padded
-    /// f16 weight/activation planes and the padded f32 C). The GPU ViT calls
+    /// The dense-16 GEMM over a bf16 weight `[co][k]` straight from the mapping:
+    /// `dst[m][co] = src @ Wᵀ + bias`, `src` and `dst` at their own dtypes, the operand
+    /// width from `operand16`. Any co/k (the ViT's ffn 4304).
+    pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        return self.opMatmulHalfW(dst, src, m, w_bytes, .bf16, co, k, bias);
+    }
+
+    /// `opMatmulBf16` over an f16 weight (some GGUF mmproj towers ship f16).
+    pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        return self.opMatmulHalfW(dst, src, m, w_bytes, .f16, co, k, bias);
+    }
+
+    fn opMatmulHalfW(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, wdt: dtypes.DType, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        // `bias.len >= co`, not `== co`: a caller may pass its whole zero array for a
+        // null bias (a bias is cached by pointer and sized from the first call's
+        // length, so a narrow layer seen first would leave every wider one reading
+        // past the end), and the kernels read only `co` entries.
+        const bias_s = bias orelse try self.zeroBias(co);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
+        const op = operand16(src, dst);
+        return self.opGemm16(dst, 0, src, m, try self.weight16(w_bytes, wdt, false, co, k, 1, 1, op), co, k, bias_s, 1.0, op);
+    }
+
+    /// Free the shared GEMM conversion scratch (conv_w16/a16/c and hg_wpad, the
+    /// padded f16 weight/activation planes and the padded f32 C). The GPU ViT calls
     /// this after encoding so image-sized scratch doesn't stay resident
     /// through the LLM session. Syncs first (recorded ops may still read it).
     pub fn freeConvScratch(self: *Backend) void {
@@ -4229,44 +4574,128 @@ pub const Backend = struct {
         self.tensorDestroy(&self.conv_w16);
         self.tensorDestroy(&self.conv_a16);
         self.tensorDestroy(&self.conv_c);
+        self.tensorDestroy(&self.hg_wpad);
+        self.tensorDestroy(&self.hg_zero);
+        self.tensorDestroy(&self.conv_stage);
+        self.tensorDestroy(&self.conv_wk);
+    }
+
+    fn convW16(self: *Backend, out: Dt, src: DeviceBuffer, dst: DeviceBuffer, u: [7]u32, pairs: usize) Error!void {
+        if (out == .bf16) return self.dualElems("conv_w_bf16", src, null, null, dst, u, .{ 0, 0 }, pairs);
+        try self.dualElems("conv_w_h16", src, null, null, dst, u, .{ 0, 0 }, pairs);
+    }
+
+    /// `weight16` at f16.
+    pub fn weightF16(self: *Backend, bytes: []const u8, dt: dtypes.DType, torch_order: bool, co: usize, ci: usize, kk: usize, kt: usize) Error!DeviceBuffer {
+        return self.weight16(bytes, dt, torch_order, co, ci, kk, kt, .f16);
+    }
+
+    /// The `out` (f16 or bf16) `[co][kk][ci]` device weight every 16-bit conv and dense
+    /// GEMM kernel reads, from `bytes` of `dt` stored in patch order or (`torch_order`)
+    /// as `[co][ci][kt][kk]`, read at temporal slice `kt - 1`. A linear is `kk = kt = 1`,
+    /// `ci = cols`.
+    ///
+    /// A dense weight is converted once and cached beside its bytes under
+    /// `derivedKey`, so a GEMM reading the original still finds it and
+    /// `evictWeightRange` frees both; no device copy of the source is kept. A block
+    /// quant stays packed in the cache and is decoded into a scratch per call, which the
+    /// caller must consume before the next call.
+    pub fn weight16(self: *Backend, bytes: []const u8, dt: dtypes.DType, torch_order: bool, co: usize, ci: usize, kk: usize, kt: usize, out: Dt) Error!DeviceBuffer {
+        std.debug.assert(kt >= 1 and (kt == 1 or torch_order) and out != .f32);
+        const n = co * ci * kk;
+        const pairs = (n + 1) / 2;
+        const src_kind: u32 = switch (dt) {
+            .f32 => 0,
+            .f16 => 1,
+            .bf16 => 2,
+            else => {
+                if (!dt.isBlockQuant()) return error.UnsupportedDtype;
+                const flat = try self.opDequantF16(dt, try self.cachedWeight(bytes), n * kt);
+                try self.ensureDeviceBuffer(&self.conv_wk, pairs * 4);
+                const u = [7]u32{ @intCast(pairs), @intCast(ci), @intCast(kk), 1, @intFromBool(torch_order), @intCast(n), @intCast(kt) };
+                try self.convW16(out, flat, self.conv_wk, u, pairs);
+                return self.conv_wk.as(out);
+            },
+        };
+        std.debug.assert(@intFromPtr(bytes.ptr) % 2 == 0 and bytes.len == dt.storageBytes(n * kt));
+        if (!torch_order and ((dt == .f16 and out == .f16) or (dt == .bf16 and out == .bf16))) return (try self.cachedWeight(bytes)).as(out);
+        const key = derivedKey(bytes, out);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            self.touch(e);
+            return e.db.as(out);
+        }
+        try self.ensureDeviceBuffer(&self.conv_stage, bytes.len);
+        {
+            const cb = ctxmod.Buffer{ .ptr = self.conv_stage.ptr(), .bytes = @intCast(bytes.len) };
+            self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
+        }
+        const size = pairs * 4;
+        self.reserveForWeights(size);
+        const pin = self.pinNew(size);
+        errdefer if (pin) {
+            self.pinned_bytes -|= size;
+        };
+        var db = try self.weightBufAcquire(size, pin);
+        errdefer {
+            if (!pin) self.streamed_bytes -|= db.size;
+            var d = db;
+            self.tensorDestroy(&d);
+        }
+        const u = [7]u32{ @intCast(pairs), @intCast(ci), @intCast(kk), src_kind, @intFromBool(torch_order), @intCast(n), @intCast(kt) };
+        try self.convW16(out, self.conv_stage, db, u, pairs);
+        db.dt = out;
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .fetch_seq = self.ctx.launch_seq, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId() });
+        return db;
     }
 
     /// cuDNN fused 3×3 NHWC convolution (.libs mode), the VAE's big convs.
     /// dst[dst_off_elems..][n][co] f32 = conv3x3(src[n][ci] f32, W[co][3][3][ci]
     /// f32) + bias. src/weight convert to f16 (tensor cores, f32 accumulate),
-    /// cuDNN writes f16, then `bias_add_f16` adds the per-channel bias into the
+    /// cuDNN writes f16, then `bias_add` adds the per-channel bias into the
     /// f32 dst. No im2col materialization (IMPLICIT_PRECOMP_GEMM). Same numeric
     /// regime as `opConvF16` (f16 conv), validated vs the CPU VAE.
-    pub fn opConvCudnn(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, h: usize, w: usize, w_bytes: []const u8, co: usize, ci: usize, bias: []const f32, src_f16: bool, dst_f16: bool) Error!void {
+    pub fn opConvCudnn(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, h: usize, w: usize, w_bytes: []const u8, co: usize, ci: usize, bias: []const f32) Error!void {
+        const w16 = try self.weightF16(w_bytes, .f32, false, co, ci, 9, 1);
+        return self.opConvCudnnW16(dst, dst_off_elems, src, h, w, w16, co, ci, bias);
+    }
+
+    /// `opConvCudnn` against a device f16 `[co][3][3][ci]` weight (`weightF16`).
+    pub fn opConvCudnnW16(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, h: usize, w: usize, w16: DeviceBuffer, co: usize, ci: usize, bias: []const f32) Error!void {
+        self.hold(w16);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
         const n = h * w;
-        const w_db = try self.cachedWeight(w_bytes);
+        // The weight's width is the operand width (`weight16`), and X, W and Y share it.
+        const op = w16.dt;
+        std.debug.assert(op != .f32);
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        try self.ensureDeviceBuffer(&self.conv_w16, co * 9 * ci * 2);
         try self.ensureDeviceBuffer(&self.conv_c, n * co * 2);
-        // An f16 source is already cuDNN's X tensor.
-        const x16 = if (src_f16) src else blk: {
+        const x16 = if (src.dt == op) src else if (src.dt == .f32 and op == .f16) blk: {
             try self.ensureDeviceBuffer(&self.conv_a16, n * ci * 2);
             try self.cvtF32ToH16(src, self.conv_a16, n * ci, n * ci);
             break :blk self.conv_a16;
-        };
-        try self.cvtF32ToH16(w_db, self.conv_w16, co * 9 * ci, co * 9 * ci);
+        } else try self.halfActivation(src, n, ci, op, 1.0);
         const L = &self.libs.?;
-        const ckey: ConvKey = .{ .h = h, .w = w, .ci = ci, .co = co };
+        const ckey: ConvKey = .{ .h = h, .w = w, .ci = ci, .co = co, .bf16 = op == .bf16 };
         const plan = self.conv_plans.get(ckey) orelse blk: {
-            const p = cudnn.ConvPlan.build(&L.dnn, try self.dnnHandle(), h, w, ci, co) catch return error.CudaError;
+            const p = cudnn.ConvPlan.build(&L.dnn, try self.dnnHandle(), h, w, ci, co, op == .bf16) catch return error.CudaError;
             self.conv_plans.put(self.gpa, ckey, p) catch return error.OutOfMemory;
             break :blk p;
         };
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
-        plan.execute(&L.dnn, try self.dnnHandle(), x16.ptr(), self.conv_w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
+        plan.execute(&L.dnn, try self.dnnHandle(), x16.ptr(), w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
         const u_b = [7]u32{ @intCast(n * co), @intCast(co), @intCast(dst_off_elems), 0, 0, 0, 0 };
-        if (dst_f16) {
-            std.debug.assert(co % 2 == 0 and dst_off_elems % 2 == 0);
-            try self.dualPairs("bias_add_h16", self.conv_c, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
-        } else {
-            try self.dualElems("bias_add_f16", self.conv_c, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+        const yc = self.conv_c;
+        switch (op) {
+            .f16 => try self.dualElemsAt("bias_add", dst.dt, yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co),
+            else => {
+                std.debug.assert(dst.dt != .f16);
+                if (dst.dt == .bf16) {
+                    try self.dualElems("bias_add_bf16", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+                } else try self.dualElems("bias_add_bf16_f32", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+            },
         }
     }
 
@@ -4279,19 +4708,16 @@ pub const Backend = struct {
         return error.CudaError;
     }
 
-    fn irescaleFn(self: *Backend, c_h16: bool) Error!cu.CUfunction {
-        if (c_h16) {
-            if (self.irescale_h16_mod != null) return self.irescale_h16_fn;
-            var mod = self.ctx.loadModule(kernels.irescale_h16_ptx) catch return error.CudaError;
-            self.irescale_h16_fn = mod.getFunction(self.ctx, "irescale_h16") catch return error.CudaError;
-            self.irescale_h16_mod = mod;
-            return self.irescale_h16_fn;
-        }
-        if (self.irescale_mod != null) return self.irescale_fn;
-        var mod = self.ctx.loadModule(kernels.irescale_ptx) catch return error.CudaError;
-        self.irescale_fn = mod.getFunction(self.ctx, "irescale") catch return error.CudaError;
-        self.irescale_mod = mod;
-        return self.irescale_fn;
+    fn irescaleFn(self: *Backend, out: Dt) Error!cu.CUfunction {
+        const slot = @intFromEnum(out);
+        if (self.irescale_mods[slot] != null) return self.irescale_fns[slot];
+        const src = switch (out) {
+            inline else => |d| comptime kernels.irescalePtx(d),
+        };
+        var mod = self.ctx.loadModule(src) catch return error.CudaError;
+        self.irescale_fns[slot] = mod.getFunction(self.ctx, "irescale") catch return error.CudaError;
+        self.irescale_mods[slot] = mod;
+        return self.irescale_fns[slot];
     }
 
     /// Build (or fetch cached) the cuBLASLt plan for a TN GEMM of shape
@@ -4303,11 +4729,20 @@ pub const Backend = struct {
     /// `bias_ptr` non-null builds the plan with the BIAS epilogue, so the per-output
     /// -channel add happens in the GEMM's own store instead of a second pass over D.
     /// The pointer is not read here, only its alignment; `ltRun` supplies the live one.
-    fn ltPlan(self: *Backend, kind: LtKind, n: usize, m: usize, k: usize, bias_ptr: u64, d_f16: bool) Error!LtPlan {
+    fn ltType(d: Dt) c_int {
+        return switch (d) {
+            .f32 => cublaslt.R_32F,
+            .f16 => cublaslt.R_16F,
+            .bf16 => cublaslt.R_16BF,
+        };
+    }
+
+    fn ltPlan(self: *Backend, kind: LtKind, n: usize, m: usize, k: usize, bias_ptr: u64, d: Dt) Error!LtPlan {
         // cuBLASLt has no plan for an f32 bias over an f16 D: the heuristic rejects
         // the combination outright (INVALID_VALUE). The bias type follows D, and
         // `cachedBiasF16` supplies the matching vector.
-        const key: LtKey = .{ .kind = kind, .n = n, .m = m, .k = k, .bias = bias_ptr != 0, .d_f16 = d_f16 };
+        const key: LtKey = .{ .kind = kind, .n = n, .m = m, .k = k, .bias = bias_ptr != 0, .d = d };
+        std.debug.assert(d == .f32 or kind == .f16 or kind == .bf16);
         if (self.lt_plans.get(key)) |p| return p;
 
         const ab_type: c_int = switch (kind) {
@@ -4318,9 +4753,9 @@ pub const Backend = struct {
         };
         const d_type: c_int = switch (kind) {
             .i8 => cublaslt.R_32I,
-            // f16 D halves the GEMM's output traffic and lands straight in an f16
-            // activation buffer; the accumulator is f32 either way (COMPUTE_32F).
-            .f16, .bf16 => if (d_f16) cublaslt.R_16F else cublaslt.R_32F,
+            // A 16-bit D halves the GEMM's output traffic and lands straight in a
+            // 16-bit activation buffer; the accumulator is f32 either way (COMPUTE_32F).
+            .f16, .bf16 => ltType(d),
             .f32 => cublaslt.R_32F,
         };
         const compute: c_int = switch (kind) {
@@ -4351,7 +4786,7 @@ pub const Backend = struct {
             try self.ltCheck(lt.cublasLtMatmulDescSetAttribute(desc, cublaslt.DESC_BIAS_POINTER, @ptrCast(&bp), @sizeOf(u64)), "SetBiasPointer");
             // Explicit rather than defaulted: an f32 D silently defaults to an f16
             // bias type, which reads our f32 vectors as garbage.
-            var bt: c_int = if (d_f16) cublaslt.R_16F else cublaslt.R_32F;
+            var bt: c_int = ltType(d);
             try self.ltCheck(lt.cublasLtMatmulDescSetAttribute(desc, cublaslt.DESC_BIAS_DATA_TYPE, @ptrCast(&bt), @sizeOf(c_int)), "SetBiasDataType");
         }
 
@@ -4390,8 +4825,10 @@ pub const Backend = struct {
     /// The per-channel bias as f16, for the epilogue when D is f16. Cached by host
     /// pointer like the weight itself; a bias is `co` floats, so the second copy is
     /// negligible where a second copy of a WEIGHT would not be.
-    fn cachedBiasF16(self: *Backend, bias: []const f32) Error!DeviceBuffer {
-        const key = @intFromPtr(bias.ptr);
+    /// `bias` at `dt` (f16 or bf16), the vector a 16-bit-D cuBLASLt epilogue reads.
+    fn cachedBias16(self: *Backend, bias: []const f32, dt: Dt) Error!DeviceBuffer {
+        std.debug.assert(dt != .f32);
+        const key = derivedKey(std.mem.sliceAsBytes(bias), dt);
         // Same trap as `cachedWeight`: one host pointer handed out at several
         // lengths (the shared zero-bias array) must not be served from an entry
         // sized by the first, narrowest call.
@@ -4404,25 +4841,25 @@ pub const Backend = struct {
         const src = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         var db: DeviceBuffer = .{};
         errdefer self.tensorDestroy(&db);
-        try self.ensureDeviceBuffer(&db, bias.len * 2);
-        try self.cvtF32ToH16(src, db, bias.len, bias.len);
+        const n2 = std.mem.alignForward(usize, bias.len, 2);
+        try self.ensureDeviceBuffer(&db, n2 * 2);
+        try self.pad2dTo(dt, src, db, n2, n2, 1, bias.len, 0, 1.0);
         self.bias16.put(self.gpa, key, db) catch return error.OutOfMemory;
         return db;
     }
 
-    /// The GEMM's A operand as tight f16 [m][k]. An activation that is already f16
-    /// IS that operand, so the conversion disappears entirely rather than becoming a
-    /// copy — which is the point of carrying the stream as f16.
-    fn halfActivation(self: *Backend, src: DeviceBuffer, m: usize, k: usize, src_f16: bool) Error!DeviceBuffer {
-        if (src_f16) return src;
+    /// The GEMM's A operand as tight `[m][k]` at `op`, times `scale`. An unscaled
+    /// activation already at `op` IS that operand, so the conversion disappears.
+    fn halfActivation(self: *Backend, src: DeviceBuffer, m: usize, k: usize, op: Dt, scale: f32) Error!DeviceBuffer {
+        if (src.dt == op and scale == 1.0) return src;
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-        try self.pad2d("f32_to_h16_pad", src, self.conv_a16, m * k, k, m, k, 1.0);
-        return self.conv_a16;
+        try self.pad2dTo(op, src, self.conv_a16, m * k, k, m, k, 0, scale);
+        return self.conv_a16.as(op);
     }
 
-    /// f16 tensor-core linear on cuBLASLt with nothing padded and the bias added in
-    /// the GEMM's own epilogue: `dst[m][co]` f32 = alpha * (`a16[m][k]` @ `w16[co][k]`ᵀ)
-    /// + `b_db[co]`. Both operands are already f16 and tightly packed.
+    /// 16-bit tensor-core linear on cuBLASLt with nothing padded and the bias added in
+    /// the GEMM's own epilogue: `dst[m][co]` = alpha * (`a16[m][k]` @ `w16[co][k]`ᵀ) +
+    /// bias, both operands tight at `op`, D at `dst.dt` (an f16 operand never writes bf16).
     ///
     /// The padded callers below exist for the hand-PTX GEMM, whose tile wants m and
     /// co on 128 and k on 32. cuBLASLt wants none of that, and the padding is not
@@ -4431,7 +4868,7 @@ pub const Backend = struct {
     /// it and add the bias. On an SDXL step those passes cost about as much as all
     /// of the attention.
     ///
-    /// cuBLASLt's f16 kernels load 8 elements at a time along k, so `k % 8 == 0`;
+    /// cuBLASLt's 16-bit kernels load 8 elements at a time along k, so `k % 8 == 0`;
     /// callers check before routing here. m and co are unconstrained.
     fn ltGemmHalfBias(
         self: *Backend,
@@ -4444,15 +4881,14 @@ pub const Backend = struct {
         co: usize,
         k: usize,
         alpha: f32,
-        /// D is f16 rather than f32, for an f16 activation stream.
-        d_f16: bool,
+        op: Dt,
     ) Error!void {
-        const b_db = if (d_f16) try self.cachedBiasF16(bias) else try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        const plan = try self.ltPlan(.f16, co, m, k, b_db.ptr(), d_f16);
+        std.debug.assert(op == .bf16 or dst.dt != .bf16);
+        const b_db = if (dst.dt == .f32) try self.cachedWeight(std.mem.sliceAsBytes(bias)) else try self.cachedBias16(bias, dst.dt);
+        const plan = try self.ltPlan(if (op == .bf16) .bf16 else .f16, co, m, k, b_db.ptr(), dst.dt);
         var al = alpha;
         var beta: f32 = 0;
-        const d = if (d_f16) dst.viewBytes(dst_off_elems * 2) else dst.viewF32(dst_off_elems);
-        try self.ltRun(plan, d, w16, a16, @ptrCast(&al), @ptrCast(&beta), b_db.ptr());
+        try self.ltRun(plan, dst.viewBytes(dst_off_elems * dst.dt.bytes()), w16, a16, @ptrCast(&al), @ptrCast(&beta), b_db.ptr());
     }
 
     /// Issue a cuBLASLt matmul for a prepared plan against device pointers.
@@ -4493,7 +4929,7 @@ pub const Backend = struct {
     /// accumulator (row-major [m][n]). cuBLASLt does ONLY the GEMM, the
     /// per-row×per-col rescale is a separate `irescale` pass.
     pub fn ltMatmulI8(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
-        const plan = try self.ltPlan(.i8, n, m, k, 0, false);
+        const plan = try self.ltPlan(.i8, n, m, k, 0, .f32);
         var alpha: i32 = 1;
         var beta: i32 = 0;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), 0);
@@ -4503,7 +4939,7 @@ pub const Backend = struct {
     /// f32 accumulate) via cuBLASLt, the drop-in for the hand-PTX `buildHgemm`
     /// used by the fp8 encoder GEMMs and the VAE convs.
     pub fn ltMatmulF16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
-        const plan = try self.ltPlan(.f16, n, m, k, 0, false);
+        const plan = try self.ltPlan(.f16, n, m, k, 0, .f32);
         var alpha: f32 = 1;
         var beta: f32 = 0;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), 0);
@@ -4518,7 +4954,7 @@ pub const Backend = struct {
     /// `ltMatmulBf16` with a per-column bias added in the GEMM epilogue.
     /// `bias_ptr` 0 means none, which is the plain call.
     pub fn ltMatmulBf16Bias(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize, bias_ptr: u64) Error!void {
-        const plan = try self.ltPlan(.bf16, n, m, k, bias_ptr, false);
+        const plan = try self.ltPlan(.bf16, n, m, k, bias_ptr, .f32);
         var alpha: f32 = 1;
         var beta: f32 = 0;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), bias_ptr);
@@ -4527,13 +4963,11 @@ pub const Backend = struct {
     /// `dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias`, W f32 `[co][k]`, on cuBLASLt
     /// in TRUE f32 (FFMA, not TF32 and not tensor cores).
     ///
-    /// This exists because the f16 tensor-core path is not always accurate enough
-    /// and the fallback was a one-thread-per-output kernel. Measured on the H3
-    /// BigVGAN vocoder against its f32 CPU reference: the f16 route is 2.4e-3
-    /// relative with a 8.3e-3 worst sample, about -42 dB, which for a VOCODER is
-    /// an audible noise floor; f32 is 9.5e-6 / 2.8e-5, under 16-bit PCM's own
-    /// quantum. The naive kernel gets the same numbers at a third of the speed,
-    /// so this is the arm that makes precision affordable.
+    /// For callers the f16 tensor-core path is not accurate enough for. Measured on
+    /// the H3 BigVGAN vocoder against its f32 CPU reference: the f16 route is 2.4e-3
+    /// relative with a 8.3e-3 worst sample, about -42 dB, which for a VOCODER is an
+    /// audible noise floor; f32 is 9.5e-6 / 2.8e-5, under 16-bit PCM's own quantum.
+    /// The hand-PTX arm's f32 GEMM is the tiled `sgemm` (`kernels.buildSgemm`).
     ///
     /// `libs` only, and the caller must have a fallback: `error.UnsupportedKernelArm`
     /// on the hand-PTX arm, which has no tiled f32 GEMM.
@@ -4542,14 +4976,21 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.matmul);
         std.debug.assert(w_bytes.len == co * k * 4);
-        const w_db = try self.cachedWeight(w_bytes);
-        const plan = try self.ltPlan(.f32, co, m, k, 0, false);
+        return self.opMatmulF32LtDev(dst, src, m, try self.cachedWeight(w_bytes), co, k, bias);
+    }
+
+    /// `opMatmulF32Lt` against an f32 weight already on the device.
+    pub fn opMatmulF32LtDev(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_db: DeviceBuffer, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        self.hold(w_db);
+        defer self.unhold();
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        const plan = try self.ltPlan(.f32, co, m, k, 0, .f32);
         var alpha: f32 = 1;
         var beta: f32 = 0;
         try self.ltRun(plan, dst, w_db, src, @ptrCast(&alpha), @ptrCast(&beta), 0);
         if (bias) |bb| {
             const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bb));
-            try self.opAddBiasRows(dst, b_db, m, co, 0, false);
+            try self.opAddBiasRows(dst, b_db, m, co, 0);
         }
     }
 
@@ -4557,18 +4998,18 @@ pub const Backend = struct {
     /// is free here because `ltRun` already hands cuBLASLt the same buffer and
     /// layout for C and D; the plan cache is keyed on shape, not on beta.
     pub fn ltMatmulBf16Scaled(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize, alpha_v: f32, beta_v: f32) Error!void {
-        const plan = try self.ltPlan(.bf16, n, m, k, 0, false);
+        const plan = try self.ltPlan(.bf16, n, m, k, 0, .f32);
         var alpha = alpha_v;
         var beta = beta_v;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
     /// Fetch/build the cached cuDNN fused int8-GEMM+dequant plan for this shape.
-    fn mdqPlan(self: *Backend, m: usize, n: usize, k: usize, d_f16: bool) Error!cudnn.MatmulDequantPlan {
-        const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 22) | (@as(u64, k) << 1) | @intFromBool(d_f16);
+    fn mdqPlan(self: *Backend, m: usize, n: usize, k: usize, d: Dt) Error!cudnn.MatmulDequantPlan {
+        const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 23) | (@as(u64, k) << 2) | @intFromEnum(d);
         if (self.mdq_plans.get(key)) |p| return p;
         const L = &self.libs.?;
-        const p = cudnn.MatmulDequantPlan.build(&L.dnn, try self.dnnHandle(), m, n, k, d_f16) catch return error.CudaError;
+        const p = cudnn.MatmulDequantPlan.build(&L.dnn, try self.dnnHandle(), m, n, k, d) catch return error.CudaError;
         self.mdq_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
         return p;
     }
@@ -4576,11 +5017,12 @@ pub const Backend = struct {
     /// cuBLASLt int8 linear: GEMM into the s32 scratch, then fused rescale to y.
     /// With `use_fused_i8`, replaced by a single cuDNN op graph (GEMM+dequant
     /// fused; no s32 round-trip, no separate irescale).
-    fn opI8GemmLibs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, c_h16: bool) Error!void {
+    fn opI8GemmLibs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias_ptr: u64) Error!void {
         const m = self.i8_mpad;
         const k = self.i8_cols;
-        if (self.use_fused_i8) {
-            const plan = try self.mdqPlan(m, rows, k, c_h16);
+        // The cuDNN graph has no bias node, so a biased linear takes cuBLASLt + irescale.
+        if (self.use_fused_i8 and bias_ptr == 0) {
+            const plan = try self.mdqPlan(m, rows, k, y.dt);
             if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
             const L = &self.libs.?;
             plan.execute(&L.dnn, try self.dnnHandle(), self.i8_x.ptr(), w_db.ptr(), self.i8_scale.ptr(), ws_db.ptr(), y.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
@@ -4589,7 +5031,7 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.i8_acc, m * rows * 4);
         try self.ltMatmulI8(self.i8_acc, w_db, self.i8_x, rows, m, k);
         if (bench_skip_rescale) return; // DIAGNOSTIC: measure irescale's batched cost
-        const f = try self.irescaleFn(c_h16);
+        const f = try self.irescaleFn(y.dt);
         const total = m * rows;
         var pacc = self.i8_acc.ptr();
         var py = y.ptr();
@@ -4597,14 +5039,15 @@ pub const Backend = struct {
         var pws = ws_db.ptr();
         var prows: u32 = @intCast(rows);
         var ptot: u32 = @intCast(total);
-        var pr = [_]?*anyopaque{ @ptrCast(&pacc), @ptrCast(&py), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&prows), @ptrCast(&ptot) };
+        var pb = bias_ptr;
+        var pr = [_]?*anyopaque{ @ptrCast(&pacc), @ptrCast(&py), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&prows), @ptrCast(&ptot), @ptrCast(&pb) };
         self.ctx.launch(f, .{ @intCast((total + 255) / 256), 1, 1 }, .{ 256, 1, 1 }, 0, &pr) catch return error.CudaError;
     }
 
     /// Rotate + per-row dynamic quantize x[m][cols] -> internal i8_x (s8) +
     /// i8_scale (per-row f32), padding m up to 128. Consumed by opI8Gemm.
-    pub fn opI8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, in_f16: bool) Error!void {
-        return self.opI8PrepR(x, m, cols, in_f16, true);
+    pub fn opI8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+        return self.opI8PrepR(x, m, cols, true);
     }
 
     /// `opI8Prep` with the convrot rotation selectable. False belongs with an unrotated
@@ -4634,7 +5077,8 @@ pub const Backend = struct {
     /// device-vs-CPU check cannot see it (int8 over 50 layers has a ~1e-4 floor).
     pub var force_global_prep: bool = false;
 
-    pub fn opI8PrepR(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, in_f16: bool, rotate: bool) Error!void {
+    /// Reads `x` at its own dtype.
+    pub fn opI8PrepR(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, rotate: bool) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
         const mpad = std.mem.alignForward(usize, m, 128);
@@ -4657,7 +5101,7 @@ pub const Backend = struct {
         const stage_global = force_global_prep or
             kernels.prepNeedsGlobalStage(cols, @intCast(@max(self.ctx.shared_optin_max, 0)));
         if (stage_global) try self.ensureDeviceBuffer(&self.i8_rot, mpad * cols * 4);
-        const f = try self.prepFn(cols, in_f16, rotate, stage_global);
+        const f = try self.prepFn(cols, x.dt, rotate, stage_global);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
@@ -4671,10 +5115,9 @@ pub const Backend = struct {
         self.i8_cols = cols;
     }
 
-    /// A block-quant weight format the convrot decode covers, or null. The GPU DiT
-    /// forwards gate on `dit.gpuLinKindSupported` before dispatching; this is the same
-    /// answer stated where the kernel is built, so a format added to one and not the
-    /// other fails loudly rather than reading the bytes as something else.
+    /// A block-quant weight format the convrot decode covers, or null. Routing asks
+    /// this (`lin_cuda.Caps.blockQDecode`), so a format is routed here only once the
+    /// kernel builds for it.
     pub fn blockQFormat(dt: dtypes.DType) ?kernels.PrepBlock {
         return switch (dt) {
             .q2_k => .q2_k,
@@ -4694,7 +5137,7 @@ pub const Backend = struct {
     fn bqPrepFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_prep_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, 0, rotate, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, bits, .f32, block, 0, rotate, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("block-quant prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -4727,7 +5170,7 @@ pub const Backend = struct {
     fn bqDecFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_dec_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, bits, .f32, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const nm = if (bits == 4)
@@ -4779,7 +5222,7 @@ pub const Backend = struct {
     /// One scratch serves every linear, so a decode must not be reordered past the GEMM
     /// consuming the previous one. Both are issued on `ctx.stream` and CUDA serializes a
     /// stream; do NOT move either onto a concurrent stream without its own scratch.
-    pub fn opI8GemmBlockQ(self: *Backend, y: DeviceBuffer, dt: dtypes.DType, w_bytes: []const u8, rows: usize, cols: usize, c_h16: bool, rotate: bool) Error!void {
+    pub fn opI8GemmBlockQ(self: *Backend, y: DeviceBuffer, dt: dtypes.DType, w_bytes: []const u8, rows: usize, cols: usize, rotate: bool, bias: ?[]const f32) Error!void {
         const block = blockQFormat(dt) orelse return error.UnsupportedDtype;
         const w_db = try self.cachedWeight(w_bytes);
         try self.ensureDeviceBuffer(&self.bq_i8, blockQScratchBytes(rows, cols));
@@ -4795,7 +5238,7 @@ pub const Backend = struct {
             const nblk: u32 = @intCast(rows * (cols / bqChunk(cols)));
             self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols), false)), &pp) catch return error.CudaError;
         }
-        return self.opI8GemmDevWs(y, self.bq_i8, ws, rows, c_h16);
+        return self.opI8GemmDevWs(y, self.bq_i8, ws, rows, bias);
     }
 
     /// Bytes of int4 scratch a decoded block-quant weight of this shape needs.
@@ -4806,7 +5249,7 @@ pub const Backend = struct {
     /// `opI8GemmBlockQ` with the decode's output width dropped to 4 bits and the s4
     /// tensor-core GEMM on the end. The activation must have come through `opI4Prep`,
     /// not `opI8Prep`: this reads the s4 activation scratch.
-    pub fn opI4GemmBlockQ(self: *Backend, y: DeviceBuffer, dt: dtypes.DType, w_bytes: []const u8, rows: usize, cols: usize, rotate: bool) Error!void {
+    pub fn opI4GemmBlockQ(self: *Backend, y: DeviceBuffer, dt: dtypes.DType, w_bytes: []const u8, rows: usize, cols: usize, rotate: bool, bias: ?[]const f32) Error!void {
         const block = blockQFormat(dt) orelse return error.UnsupportedDtype;
         const w_db = try self.cachedWeight(w_bytes);
         try self.ensureDeviceBuffer(&self.bq_i8, blockQScratchBytesI4(rows, cols));
@@ -4822,14 +5265,14 @@ pub const Backend = struct {
             const nblk: u32 = @intCast(rows * (cols / bqChunk(cols)));
             self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols), false)), &pp) catch return error.CudaError;
         }
-        return self.opI4GemmDevWs(y, self.bq_i8, ws, rows);
+        return self.opI4GemmDevWs(y, self.bq_i8, ws, rows, bias);
     }
 
     /// int8 GEMM + fused rescale against the last opI8Prep:
-    /// y[m][rows] = prepped @ Wᵀ * act_scale[row] * weight_scale[col] (f32).
-    pub fn opI8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+    /// y[m][rows] = prepped @ Wᵀ * act_scale[row] * weight_scale[col] (+ bias[col]).
+    pub fn opI8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, bias: ?[]const f32) Error!void {
         const w_db = try self.cachedWeight(w_bytes);
-        return self.opI8GemmDev(y, w_db, weight_scale, rows, c_h16);
+        return self.opI8GemmDev(y, w_db, weight_scale, rows, bias);
     }
 
     /// Decode a packed ComfyUI `asym_w4a8_int8` weight into a reusable device scratch
@@ -4856,10 +5299,10 @@ pub const Backend = struct {
         rows: usize,
         cols: usize,
         group_size: usize,
-        c_h16: bool,
+        bias: ?[]const f32,
     ) Error!void {
         const w_db = try self.w4a8ToI8(packed_bytes, s_rel, levels, rows, cols, group_size);
-        return self.opI8GemmDev(y, w_db, weight_scale, rows, c_h16);
+        return self.opI8GemmDev(y, w_db, weight_scale, rows, bias);
     }
 
     /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here, the raw
@@ -4906,19 +5349,20 @@ pub const Backend = struct {
         return self.w4a8_i8;
     }
 
-    fn opI8GemmDev(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+    fn opI8GemmDev(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, weight_scale: []const f32, rows: usize, bias: ?[]const f32) Error!void {
         const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
-        return self.opI8GemmDevWs(y, w_db, ws_db, rows, c_h16);
+        return self.opI8GemmDevWs(y, w_db, ws_db, rows, bias);
     }
 
     /// `opI8GemmDev` when the per-output-row weight scale is ALREADY on the device
     /// rather than a host slice to be uploaded and cached. That is the case when the
     /// weight was decoded on the GPU this call, so its scale was computed there too.
-    fn opI8GemmDevWs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, c_h16: bool) Error!void {
+    fn opI8GemmDevWs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias: ?[]const f32) Error!void {
+        const bias_ptr = try self.epilogueBias(bias, rows);
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(!c_h16 or self.kernels == .libs); // f16 output only on the cuBLASLt/irescale path
-        if (self.kernels == .libs) return self.opI8GemmLibs(y, w_db, ws_db, rows, c_h16);
+        std.debug.assert(y.dt == .f32 or self.kernels == .libs); // 16-bit output only on the cuBLASLt/irescale path
+        if (self.kernels == .libs) return self.opI8GemmLibs(y, w_db, ws_db, rows, bias_ptr);
         const f = try self.fusedFn();
         var pa = self.i8_x.ptr();
         var pb = w_db.ptr();
@@ -4927,7 +5371,8 @@ pub const Backend = struct {
         var pk: u32 = @intCast(self.i8_cols);
         var pas = self.i8_scale.ptr();
         var pws = ws_db.ptr();
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws) };
+        var pbias = bias_ptr;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias) };
         self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
@@ -4939,7 +5384,7 @@ pub const Backend = struct {
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 4, false, .none, 0, true, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, 4, .f32, .none, 0, true, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -4996,15 +5441,25 @@ pub const Backend = struct {
     /// int4 GEMM + fused rescale against the last opI4Prep. `w_bytes` are the
     /// packed-s4 weight [rows][cols/2]; layout/params match opI8Gemm exactly
     /// (the m16n8k64.s4 kernel derives the k/2 byte stride from the element k).
-    pub fn opI4Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize) Error!void {
+    pub fn opI4Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, bias: ?[]const f32) Error!void {
         const w_db = try self.cachedWeight(w_bytes);
         const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
-        return self.opI4GemmDevWs(y, w_db, ws_db, rows);
+        return self.opI4GemmDevWs(y, w_db, ws_db, rows, bias);
+    }
+
+    /// The device address of an int GEMM epilogue's bias, 0 for none. Cached by host
+    /// pointer like a weight, and uploaded whole: an array shared by two widths would
+    /// otherwise be served at whichever width came first.
+    fn epilogueBias(self: *Backend, bias: ?[]const f32, rows: usize) Error!u64 {
+        const b = bias orelse return 0;
+        std.debug.assert(b.len >= rows);
+        return (try self.cachedWeight(std.mem.sliceAsBytes(b))).ptr();
     }
 
     /// `opI4Gemm` when the packed weight and its per-row scale are ALREADY on the
     /// device, which is the case when both were produced there this call.
-    fn opI4GemmDevWs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize) Error!void {
+    fn opI4GemmDevWs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias: ?[]const f32) Error!void {
+        const bias_ptr = try self.epilogueBias(bias, rows);
         self.ptic();
         defer self.ptoc(.matmul);
         const f = try self.i4fusedFn();
@@ -5015,7 +5470,8 @@ pub const Backend = struct {
         var pk: u32 = @intCast(self.i8_cols);
         var pas = self.i8_scale.ptr();
         var pws = ws_db.ptr();
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws) };
+        var pbias = bias_ptr;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias) };
         self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
@@ -5214,8 +5670,11 @@ pub const Backend = struct {
 
     /// dst[dst_off + i] = src[src_off + i] as a kernel, usable inside
     /// recorded batches and graph captures (unlike the null-stream memcpy).
-    pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize, h16: bool) Error!void {
-        // An f16 copy moves whole words: offsets and count must be even.
+    /// Elements of `dst`'s width; `src` must share it.
+    pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize) Error!void {
+        std.debug.assert(src.dt.bytes() == dst.dt.bytes());
+        const h16 = dst.dt != .f32;
+        // A 16-bit copy moves whole words: offsets and count must be even.
         if (h16) std.debug.assert(count % 2 == 0 and dst_off_elems % 2 == 0 and src_off_elems % 2 == 0);
         const sh: u1 = @intFromBool(h16);
         try self.dualElems("copy", src, dst, null, null, .{ @intCast(count >> sh), 0, @intCast(dst_off_elems >> sh), @intCast(src_off_elems >> sh), 0, 0, 0 }, .{ 0, 0 }, count >> sh);
@@ -5286,6 +5745,30 @@ pub const Backend = struct {
         try self.dualLaunch(entry, b0, b1, b2, b3, u, fp, (total + wg - 1) / wg);
     }
 
+    /// dst[dst_off + i] = src[i] for `n` elements, each side at its own dtype (one of
+    /// them f32 when they differ), one element per thread.
+    pub fn opCast(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, dst_off: usize) Error!void {
+        std.debug.assert(src.dt == dst.dt or src.dt == .f32 or dst.dt == .f32);
+        switch (src.dt) {
+            inline else => |i| switch (dst.dt) {
+                inline else => |o| if (i != o and i != .f32 and o != .f32) unreachable else try self.dualElems(comptime dual_table.copyName(i, o), src, dst, null, null, .{ @intCast(n), 0, @intCast(dst_off), 0, 0, 0, 0 }, .{ 0, 0 }, n),
+            },
+        }
+    }
+
+    /// `dualElems` on the instance of a dtype-generic body at `dt`.
+    fn dualElemsAt(self: *Backend, comptime base: []const u8, dt: Dt, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, total: usize) Error!void {
+        switch (dt) {
+            inline else => |d| try self.dualElems(comptime dual_table.typedName(base, d), b0, b1, b2, b3, u, fp, total),
+        }
+    }
+
+    fn dualRowsAt(self: *Backend, comptime base: []const u8, dt: Dt, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, rows: usize) Error!void {
+        switch (dt) {
+            inline else => |d| try self.dualRows(comptime dual_table.typedName(base, d), b0, b1, b2, b3, u, fp, rows),
+        }
+    }
+
     /// `dualLaunch` for a kernel writing f16 pairs: one thread per two elements.
     fn dualPairs(self: *Backend, comptime entry: [:0]const u8, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [7]u32, fp: [2]f32, elems: usize) Error!void {
         try self.dualElems(entry, b0, b1, b2, b3, u, fp, (elems + 1) / 2);
@@ -5302,7 +5785,7 @@ pub const Backend = struct {
     /// cannot overflow the way the f16 cast can; it drops mantissa bits instead.
     pub fn cvtF32ToBf16(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize) Error!void {
         std.debug.assert(n % 2 == 0);
-        try self.pad2d("f32_to_bf16_pad", src, dst, n, n, 1, n, 1.0);
+        try self.pad2d("pad_bf16", src, dst, n, n, 1, n, 1.0);
     }
 
     /// bf16 -> f32 over `n` elements, widening back to an f32 activation stream.
@@ -5312,11 +5795,31 @@ pub const Backend = struct {
 
     /// Tight [rows][cols] -> [*][cols_pad] 16-bit rows over `total` elements, zero in
     /// the pads, scaled by `scale`. `entry` picks the source and destination widths
-    /// (f32_to_h16_pad, f32_to_bf16_pad, h16_to_h16_pad, bf16_to_h16_pad); `cols_pad`
+    /// (`pad_h16`, `pad_bf16`, each over an f32, f16 or bf16 source); `cols_pad`
     /// must be even.
     fn pad2d(self: *Backend, comptime entry: [:0]const u8, src: DeviceBuffer, dst: DeviceBuffer, total: usize, cols_pad: usize, rows: usize, cols: usize, scale: f32) Error!void {
+        try self.pad2dLd(entry, src, dst, total, cols_pad, rows, cols, 0, scale);
+    }
+
+    /// `pad2d` from source rows `src_ld` elements apart; 0 means `cols`.
+    fn pad2dLd(self: *Backend, comptime entry: [:0]const u8, src: DeviceBuffer, dst: DeviceBuffer, total: usize, cols_pad: usize, rows: usize, cols: usize, src_ld: usize, scale: f32) Error!void {
         std.debug.assert(cols_pad % 2 == 0 and total % 2 == 0);
-        try self.dualElems(entry, src, null, null, dst, .{ @intCast(total / 2), @intCast(cols), @intCast(cols_pad), @intCast(rows), 0, 0, 0 }, .{ scale, 0 }, total / 2);
+        std.debug.assert(src_ld == 0 or src_ld >= cols);
+        try self.dualElems(entry, src, null, null, dst, .{ @intCast(total / 2), @intCast(cols), @intCast(cols_pad), @intCast(rows), @intCast(src_ld), 0, 0 }, .{ scale, 0 }, total / 2);
+    }
+
+    /// `pad2dLd` from `src` at its own dtype, `base` naming the output width.
+    fn pad2dAt(self: *Backend, comptime base: []const u8, src: DeviceBuffer, dst: DeviceBuffer, total: usize, cols_pad: usize, rows: usize, cols: usize, src_ld: usize, scale: f32) Error!void {
+        switch (src.dt) {
+            inline else => |d| try self.pad2dLd(comptime dual_table.typedName(base, d), src, dst, total, cols_pad, rows, cols, src_ld, scale),
+        }
+    }
+
+    /// `pad2dAt` to a 16-bit operand `op` (f16 or bf16).
+    fn pad2dTo(self: *Backend, op: Dt, src: DeviceBuffer, dst: DeviceBuffer, total: usize, cols_pad: usize, rows: usize, cols: usize, src_ld: usize, scale: f32) Error!void {
+        if (op == .bf16) return self.pad2dAt("pad_bf16", src, dst, total, cols_pad, rows, cols, src_ld, scale);
+        std.debug.assert(op == .f16);
+        try self.pad2dAt("pad_h16", src, dst, total, cols_pad, rows, cols, src_ld, scale);
     }
 
     /// `dualLaunch` for a row kernel: one subgroup per row, striding.
@@ -5334,7 +5837,7 @@ pub const Backend = struct {
         keep_norm: bool,
         scale: f32,
     ) Error!void {
-        try self.dualRows("act_steer", x, null, dirs, null, .{
+        try self.dualRowsAt("act_steer", x.dt, x, null, dirs, null, .{
             @intCast(rows),
             @intCast(dim),
             @intFromBool(add_op),
@@ -5394,7 +5897,8 @@ pub const Backend = struct {
         // must agree here: a stride with no buffer dereferences a null pointer on
         // the device, which is an illegal access and not a wrong number.
         const stride: u32 = if (idx == null) 0 else @intCast(idx_stride);
-        try self.dualRows("rms_mod", x, out, mod, idx, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), stride, @intCast(x_row), @intCast(out_row) }, .{ eps, @floatFromInt(idx_row) }, rows);
+        std.debug.assert(x.dt == out.dt);
+        try self.dualRowsAt("rms_mod", x.dt, x, out, mod, idx, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), stride, @intCast(x_row), @intCast(out_row) }, .{ eps, @floatFromInt(idx_row) }, rows);
     }
 
     /// out = (x - mean)*inv*mod[premul+c] + mod[shift+c], inv = 1/sqrt(var+eps).
@@ -5406,7 +5910,8 @@ pub const Backend = struct {
     pub fn lnMod(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualRows("ln_mod", x, out, mod, null, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0, 0 }, .{ eps, 0 }, rows);
+        std.debug.assert(x.dt == out.dt);
+        try self.dualRowsAt("ln_mod", x.dt, x, out, mod, null, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     /// per-head RMS norm * weight, one thread per row (rows = seq*n_heads).
@@ -5416,11 +5921,12 @@ pub const Backend = struct {
         // A few wide rows (an LLM decode hidden norm, 1 x 2560..5376) are latency-bound
         // for one subgroup per row; the hand kernel puts a whole block on each row and
         // measures ~1.6x faster there. Everywhere else the shared kernel wins.
-        if (rows < 64 and hd >= 1024 or !rms_dual) {
+        std.debug.assert(x.dt == out.dt);
+        if (x.dt == .f32 and (rows < 64 and hd >= 1024 or !rms_dual)) {
             const f = try self.eltFn(elt.qk_rmsnorm_par_ptx, "qk_rmsnorm_par");
             return self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
         }
-        try self.dualRows("rmsnorm", x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+        try self.dualRowsAt("rmsnorm", x.dt, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
     pub fn groupRmsNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, groups: usize, eps: f32) Error!void {
@@ -5436,7 +5942,7 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         const total = rows * n_heads * half;
-        try self.dualElems("rope_inter", qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("rope_inter", qk.dt, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal`
@@ -5489,24 +5995,21 @@ pub const Backend = struct {
 
     /// a += b, in place (plain residual add). total = element count.
     /// `a += b` over two f16 activations, summed in f32.
-    pub fn opAddH16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
-        self.ptic();
-        defer self.ptoc(.elt);
-        try self.dualPairs("add_h16", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
-    }
-
+    /// a += b, both at `a`'s dtype.
     pub fn opAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("add", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(a.dt == b.dt);
+        try self.dualElemsAt("add", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// a += scale * b, in place. The LoRA sidecar's accumulate, where `scale`
-    /// is a runtime dial that must not be baked into a weight.
+    /// a += scale * b, in place, `a` at its own dtype and `b` f32. The LoRA sidecar's
+    /// accumulate, where `scale` is a runtime dial that must not be baked into a weight.
     pub fn opAddScaled(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("add_scaled", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, total);
+        std.debug.assert(b.dt == .f32);
+        try self.dualElemsAt("add_scaled", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, total);
     }
 
     /// In-place scalar multiply: a[i] *= scalar (Gemma 4 per-layer out_scale).
@@ -5542,7 +6045,7 @@ pub const Backend = struct {
     pub fn opSilu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("silu", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("silu", a.dt, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     pub fn opSoftplusGate(self: *Backend, a: DeviceBuffer, gate: DeviceBuffer, total: usize) Error!void {
@@ -5610,15 +6113,15 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(scratch_v, lanes * 4);
         try self.ensureDeviceBuffer(scratch_i, lanes * 4);
         try self.dualElems("argmax_reduce", logits, null, scratch_v.*, scratch_i.*, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
-        try self.dualElems("argmax_final", scratch_v.*, scratch_i.*, null, out_id, .{ @intCast(lanes), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, 1);
+        try self.dualRows("argmax_final", scratch_v.*, scratch_i.*, null, out_id, .{ @intCast(lanes), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, 1);
     }
 
-    /// VAE per-position channel L2 norm (+ optional fused silu). x/out [n][c]
-    /// channel-last, gamma [c]. One thread per position.
+    /// The Wan VAE's per-position channel norm (+ optional fused silu), at `x.dt`. x/out
+    /// [n][c] channel-last, gamma [c] f32.
     pub fn opVaeNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, gamma: DeviceBuffer, n: usize, c: usize, silu: bool) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("vae_norm", x, out, gamma, null, .{ @intCast(n), @intCast(c), @intFromBool(silu), 0, 0, 0, 0 }, .{ 1e-12, 0 }, n);
+        try self.dualRowsAt("vae_norm", x.dt, x, out, gamma, null, .{ @intCast(n), @intCast(c), @intFromBool(silu), 0, 0, 0, 0 }, .{ 1e-12, 0 }, n);
     }
 
     // --- SD family (UNet / AutoencoderKL) --------------------------------
@@ -5642,44 +6145,36 @@ pub const Backend = struct {
         chunks: usize,
         eps: f32,
         silu: bool,
-        /// `x` and `out` are f16 rather than f32. Statistics, weight and bias stay
-        /// f32 either way, they are per-channel, not per-position.
-        act_f16: bool,
     ) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(out.dt == x.dt);
         const per_group = ch / groups;
         const u_st = [7]u32{ @intCast(groups * chunks), @intCast(ch), @intCast(chunks), @intCast(per_group), @intCast(n), 0, 0 };
-        if (act_f16) {
-            try self.dualRows("gn_stats_h16", x, null, null, gstat, u_st, .{ 0, 0 }, groups * chunks);
-        } else {
-            try self.dualRows("gn_stats", x, null, null, gstat, u_st, .{ 0, 0 }, groups * chunks);
-        }
+        try self.dualRowsAt("gn_stats", x.dt, x, null, null, gstat, u_st, .{ 0, 0 }, groups * chunks);
         try self.dualElems("gn_combine", gstat, null, null, gmi, .{ @intCast(groups), 0, @intCast(chunks), 0, 0, 0, 0 }, .{ eps, 0 }, groups);
         const u_ap = [7]u32{ @intCast(n * ch), @intCast(ch), @intCast(per_group), @intCast(groups), @intCast(ch), @intFromBool(silu), 0 };
-        if (act_f16) {
-            try self.dualPairs("gn_apply_h16", x, out, cat, gmi, u_ap, .{ 0, 0 }, n * ch);
-        } else {
-            try self.dualElems("gn_apply", x, out, cat, gmi, u_ap, .{ 0, 0 }, n * ch);
-        }
+        try self.dualElemsAt("gn_apply", x.dt, x, out, cat, gmi, u_ap, .{ 0, 0 }, n * ch);
     }
 
-    /// dst[p][c] += bias[off + c], broadcast over positions.
     /// Per-ROW AdaLN: `x[r][j] = x[r][j] * (1 + mod[r][D+j]) + mod[r][j]`, with
-    /// `mod` `[rows][3 * D]` as shift, scale, gate.
+    /// `mod` `[rows][3 * D]` as shift, scale, gate. Both at one dtype.
     pub fn opModulatePerRow(self: *Backend, x: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(x.dt == mod.dt);
         const total = rows * dim;
-        try self.dualElems("modulate_pr", x, null, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("modulate_pr", x.dt, x, null, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// `x[r][j] += mod[r][2D+j] * delta[r][j]`, the gated half of the above.
+    /// `x[r][j] += mod[r][2D+j] * delta[r][j]`, the gated half of the above: `x` f32,
+    /// `delta` and `mod` at one dtype.
     pub fn opGatedAddPerRow(self: *Backend, x: DeviceBuffer, delta: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(x.dt == .f32 and delta.dt == mod.dt);
         const total = rows * dim;
-        try self.dualElems("gated_add_pr", x, delta, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("gated_add_pr", delta.dt, x, delta, mod, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Depthwise 3x3, stride 1, pad 1, over a channel-last `[h][w][ch]`
@@ -5688,22 +6183,31 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         const total = h * w * ch;
-        try self.dualElems("dw_conv3", dst, src, weight, bias, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), 0, 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(dst.dt == src.dt);
+        try self.dualElemsAt("dw_conv3", src.dt, dst, src, weight, bias, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// Column means of a `[rows][dim]` activation, one thread per column.
-    pub fn opColMean(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, rows: usize, dim: usize) Error!void {
+    /// Column means of a `[rows][dim]` activation into f32, through `part`, which holds
+    /// `ceil(rows / dual_table.col_mean_chunk) * dim` f32.
+    pub fn opColMean(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, part: DeviceBuffer, rows: usize, dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("col_mean", dst, src, null, null, .{ @intCast(dim), @intCast(rows), 0, 0, 0, 0, 0 }, .{ 0, 0 }, dim);
+        std.debug.assert(dst.dt == .f32 and part.dt == .f32);
+        const chunk = dual_table.col_mean_chunk;
+        const chunks = std.math.divCeil(usize, rows, chunk) catch unreachable;
+        const inv = 1.0 / @as(f32, @floatFromInt(rows));
+        if (chunks == 1) return self.dualElemsAt("col_mean", src.dt, dst, src, null, null, .{ @intCast(dim), @intCast(rows), @intCast(chunk), @intCast(dim), 0, 0, 0 }, .{ inv, 0 }, dim);
+        try self.dualElemsAt("col_mean", src.dt, part, src, null, null, .{ @intCast(chunks * dim), @intCast(rows), @intCast(chunk), @intCast(dim), 0, 0, 0 }, .{ inv, 0 }, chunks * dim);
+        try self.dualElems("col_mean", dst, part, null, null, .{ @intCast(dim), @intCast(chunks), @intCast(chunks), @intCast(dim), 0, 0, 0 }, .{ 1, 0 }, dim);
     }
 
-    /// `x[i] *= sigmoid(gate[i % dim])`: a per-column gate broadcast over rows.
+    /// `x[i] *= sigmoid(gate[i % dim])`: a per-column f32 gate broadcast over rows.
     pub fn opMulColsSigmoid(self: *Backend, x: DeviceBuffer, gate: DeviceBuffer, rows: usize, dim: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(gate.dt == .f32);
         const total = rows * dim;
-        try self.dualElems("mul_cols_sigmoid", x, gate, null, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("mul_cols_sigmoid", x.dt, x, gate, null, null, .{ @intCast(total), @intCast(dim), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Mage-VAE's per-pixel MLP input: zero pixel, the patch's own channels for
@@ -5713,7 +6217,47 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const wide = 3 + hidden_x + dct_dim;
         const total = tiles * patch_area * wide;
-        try self.dualElems("nerf_feat", dst, y, dct, null, .{ @intCast(total), @intCast(wide), @intCast(patch_area), @intCast(hidden_x), @intCast(dct_dim), 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(dst.dt == y.dt);
+        try self.dualElemsAt("nerf_feat", y.dt, dst, y, dct, null, .{ @intCast(total), @intCast(wide), @intCast(patch_area), @intCast(hidden_x), @intCast(dct_dim), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// LoKr's cross-group mix onto `y` (at its dtype): `y[p][out_off + i*ok + q] += g *
+    /// sum_j w1[i][j] * h[p * h_row + j * h_group + q]`, `h` and `w1` f32 (`dual/elt.zig`
+    /// `kronMix`). `ol = im = 1` with `w1 = [1]` is a strided scaled add.
+    pub fn opKronMix(self: *Backend, y: DeviceBuffer, h: DeviceBuffer, w1: DeviceBuffer, rows: usize, ol: usize, ok: usize, im: usize, y_stride: usize, out_off: usize, h_row: usize, h_group: usize, g: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(h.dt == .f32);
+        const total = rows * ol * ok;
+        try self.dualElemsAt("kron_mix", y.dt, y, h, w1, null, .{ @intCast(total), @intCast(ol), @intCast(ok), @intCast(im), @intCast(y_stride), @intCast(out_off), @intCast(h_group) }, .{ g, @bitCast(@as(u32, @intCast(h_row))) }, total);
+    }
+
+    /// Groups `[j0, j0 + im)` of `src` (`[h][w][ci]`, groups of `in_n` channels) stacked
+    /// as images `[im][h + 1][w][in_n]` with a zero row closing each, at `src`'s dtype.
+    pub fn opKronStack(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, im: usize, h: usize, w: usize, in_n: usize, ci: usize, j0: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(dst.dt == src.dt);
+        const total = im * (h + 1) * w * in_n;
+        try self.dualElemsAt("kron_stack", src.dt, dst, src, null, null, .{ @intCast(total), @intCast(w), @intCast(h), @intCast(in_n), @intCast(ci), @intCast(im), @intCast(j0) }, .{ 0, 0 }, total);
+    }
+
+    /// An output-axis DoRA's rescale of the base product in `y` (at its dtype), `bias`
+    /// what the base added there.
+    pub fn opDoraRows(self: *Backend, y: DeviceBuffer, ratio: DeviceBuffer, bias: ?DeviceBuffer, rows: usize, width: usize, s: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = rows * width;
+        try self.dualElemsAt("dora_rows", y.dt, y, ratio, bias orelse ratio, null, .{ @intCast(total), @intCast(width), @intFromBool(bias != null), 0, 0, 0, 0 }, .{ s, 0 }, total);
+    }
+
+    /// `dst[p][j] = (d[j] - 1) * src[p][j]` into f32, `src` at its dtype.
+    pub fn opDoraCols(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, d: DeviceBuffer, rows: usize, width: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(dst.dt == .f32);
+        const total = rows * width;
+        try self.dualElemsAt("dora_cols", src.dt, dst, src, d, null, .{ @intCast(total), @intCast(width), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// Scatter per-patch pixels back into a `[h][w][3]` image.
@@ -5742,36 +6286,29 @@ pub const Backend = struct {
         try self.dualElems("win_scatter", dst, src, null, null, .{ @intCast(total), @intCast(h), @intCast(w), @intCast(ch), @intCast(npw), @intCast(side), @intCast(n_win) }, .{ 0, 0 }, total);
     }
 
-    pub fn opAddBiasRows(self: *Backend, dst: DeviceBuffer, bias: DeviceBuffer, n: usize, ch: usize, off: usize, h16: bool) Error!void {
+    pub fn opAddBiasRows(self: *Backend, dst: DeviceBuffer, bias: DeviceBuffer, n: usize, ch: usize, off: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const u = [7]u32{ @intCast(n * ch), @intCast(ch), 0, @intCast(off), 0, 0, 0 };
-        if (h16) {
-            std.debug.assert(ch % 2 == 0);
-            try self.dualPairs("add_bias_rows_h16", dst, bias, null, null, u, .{ 0, 0 }, n * ch);
-        } else {
-            try self.dualElems("add_bias_rows", dst, bias, null, null, u, .{ 0, 0 }, n * ch);
-        }
+        try self.dualElemsAt("add_bias_rows", dst.dt, dst, bias, null, null, u, .{ 0, 0 }, n * ch);
     }
 
     /// GEGLU: dst[p][j] = src[p][j] * geluErf(src[p][inner+j]).
-    pub fn opGeglu(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, inner: usize, h16: bool) Error!void {
+    pub fn opGeglu(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, inner: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(dst.dt == src.dt);
         const u = [7]u32{ @intCast(n * inner), @intCast(inner), 0, 0, 0, 0, 0 };
-        if (h16) {
-            std.debug.assert(inner % 2 == 0);
-            try self.dualPairs("geglu_h16", src, dst, null, null, u, .{ 0, 0 }, n * inner);
-        } else {
-            try self.dualElems("geglu", src, dst, null, null, u, .{ 0, 0 }, n * inner);
-        }
+        try self.dualElemsAt("geglu", src.dt, src, dst, null, null, u, .{ 0, 0 }, n * inner);
     }
 
     /// Channel-axis concatenation: dst[p][off + j] = src[p][j].
-    pub fn opConcatCh(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, src_ch: usize, dst_ch: usize, off: usize, h16: bool) Error!void {
+    pub fn opConcatCh(self: *Backend, src: DeviceBuffer, dst: DeviceBuffer, n: usize, src_ch: usize, dst_ch: usize, off: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        // An f16 concatenation moves whole words: every channel count is even.
+        std.debug.assert(src.dt.bytes() == dst.dt.bytes());
+        // A 16-bit concatenation moves whole words: every channel count is even.
+        const h16 = dst.dt != .f32;
         if (h16) std.debug.assert(src_ch % 2 == 0 and dst_ch % 2 == 0 and off % 2 == 0);
         const sh: u1 = @intFromBool(h16);
         try self.dualElems("concat_ch", src, dst, null, null, .{
@@ -5832,7 +6369,7 @@ pub const Backend = struct {
         if (self.kernels == .libs) {
             self.ptic();
             defer self.ptoc(.attn);
-            return self.opAttnCudnn(q, k, v, out, seq_q, seq_kv, heads, heads, hd, scale, self.attn_io_f16);
+            return self.opAttnCudnn(q, k, v, out, seq_q, seq_kv, heads, heads, hd, scale);
         }
         const hp = std.mem.alignForward(usize, hd, 128);
         if (hp == hd) return self.opAttnTCRect(q, k, v, out, seq_q, seq_kv, heads, heads, hd, scale);
@@ -5867,18 +6404,13 @@ pub const Backend = struct {
         p0: usize,
         out_w: usize,
         mode: u2,
-        /// The SOURCE activation is f16; the patch written is f32 either way.
-        src_f16: bool,
     ) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        std.debug.assert(patch.dt == .f32);
         const total = bn * patch_len;
         const u = [7]u32{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0), @intCast(out_w) };
-        if (src_f16) {
-            try self.dualElems("im2col_sd_h16", src, null, null, patch, u, .{ @floatFromInt(mode), 0 }, total);
-        } else {
-            try self.dualElems("im2col_sd", src, null, null, patch, u, .{ @floatFromInt(mode), 0 }, total);
-        }
+        try self.dualElemsAt("im2col_sd", src.dt, src, null, null, patch, u, .{ @floatFromInt(mode), 0 }, total);
     }
 
     /// f32 [seq][heads*hd_src] -> f16 [seq_pad][heads*hd_out], each head
@@ -5937,7 +6469,7 @@ pub const Backend = struct {
         if (self.kernels == .libs) {
             self.ptic();
             defer self.ptoc(.attn);
-            return self.opAttnCudnn(q, k, v, out, seq, seq, n_heads, kv_heads, hd, scale, self.attn_io_f16);
+            return self.opAttnCudnn(q, k, v, out, seq, seq, n_heads, kv_heads, hd, scale);
         }
         // Single-head goes to the flash path at EVERY size, not just when the
         // plane is large. That was the old gate, and it is the wrong axis: the
@@ -5951,7 +6483,7 @@ pub const Backend = struct {
         if (n_heads == 1 and kv_heads == 1) {
             self.ptic();
             defer self.ptoc(.attn);
-            return self.opAttnTCFlash(q, k, v, out, seq, hd, scale);
+            return self.opAttnTCFlash(q, k, v, out, seq, 1, hd, scale);
         }
         if (self.attn_batched) {
             // sub-timed internally (attn_scores/softmax/pv + gather/scatter in .attn)
@@ -5967,12 +6499,12 @@ pub const Backend = struct {
     pub const SdpaKey = struct { seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, bf16: bool };
 
     /// Build (or fetch cached) a cuDNN fused-SDPA plan for this GQA shape.
-    fn sdpaPlan(self: *Backend, n_heads: usize, kv_heads: usize, seq_q: usize, seq_kv: usize, hd: usize) Error!cudnn.SdpaPlan {
-        const key: SdpaKey = .{ .seq_q = seq_q, .seq_kv = seq_kv, .n_heads = n_heads, .kv_heads = kv_heads, .hd = hd, .bf16 = self.attn_bf16 };
+    fn sdpaPlan(self: *Backend, n_heads: usize, kv_heads: usize, seq_q: usize, seq_kv: usize, hd: usize, bf16: bool) Error!cudnn.SdpaPlan {
+        const key: SdpaKey = .{ .seq_q = seq_q, .seq_kv = seq_kv, .n_heads = n_heads, .kv_heads = kv_heads, .hd = hd, .bf16 = bf16 };
         if (self.sdpa_plans.get(key)) |p| return p;
         const L = &self.libs.?;
         const sdpa_t0 = ctxmod.monoNs();
-        const io_dt: c_int = if (self.attn_bf16) cudnn.b.DATA_BFLOAT16 else cudnn.b.DATA_HALF;
+        const io_dt: c_int = if (bf16) cudnn.b.DATA_BFLOAT16 else cudnn.b.DATA_HALF;
         const p = cudnn.SdpaPlan.build(&L.dnn, try self.dnnHandle(), 1, n_heads, kv_heads, seq_q, seq_kv, hd, io_dt) catch return error.CudaError;
         self.sdpa_ns += ctxmod.monoNs() -% sdpa_t0;
         self.sdpa_count += 1;
@@ -5991,11 +6523,11 @@ pub const Backend = struct {
     /// exactly these rather than allocating again.
     ///
     /// A no-op off the library backend, which does not use cuDNN attention.
-    pub fn reserveAttnCudnn(self: *Backend, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize) Error!void {
+    pub fn reserveAttnCudnn(self: *Backend, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, io: Dt) Error!void {
         if (self.kernels != .libs) return;
-        // Same sense as `opAttnCudnn`: an f16 activation stream hands the op its
-        // own tensors, so the staging exists only for an f32 one.
-        if (!self.attn_io_f16) {
+        // Same sense as `opAttnCudnn`: 16-bit operands are the op's own tensors, so
+        // the staging exists only for f32 ones.
+        if (io == .f32) {
             const qn = seq_q * n_heads * hd;
             const kn = seq_kv * kv_heads * hd;
             try self.ensureDeviceBuffer(&self.cudnn_q16, qn * 2);
@@ -6003,7 +6535,7 @@ pub const Backend = struct {
             try self.ensureDeviceBuffer(&self.cudnn_v16, kn * 2);
             try self.ensureDeviceBuffer(&self.cudnn_o16, qn * 2);
         }
-        const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd);
+        const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd, io == .bf16);
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
     }
 
@@ -6015,16 +6547,19 @@ pub const Backend = struct {
     ///
     /// `seq_kv` differs from `seq_q` for cross-attention; K and V carry `seq_kv`
     /// rows, Q and the output `seq_q`.
-    fn opAttnCudnn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, io_f16: bool) Error!void {
+    /// Q/K/V/O at one dtype. 16-bit operands are the op's own tensors (a bf16 plan for
+    /// bf16, which carries f32's range and so an unnormed V); f32 ones are staged
+    /// through f16 and converted back.
+    fn opAttnCudnn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        const io = q.dt;
+        std.debug.assert(k.dt == io and v.dt == io and out.dt == io);
         const qn = seq_q * n_heads * hd;
         const kn = seq_kv * kv_heads * hd;
-        // f16 Q/K/V/O are already the op's own tensors: with an f16 activation stream
-        // the four conversions around every attention disappear rather than shrink.
         var q16 = q;
         var k16 = k;
         var v16 = v;
         var o16 = out;
-        if (!io_f16) {
+        if (io == .f32) {
             try self.ensureDeviceBuffer(&self.cudnn_q16, qn * 2);
             try self.ensureDeviceBuffer(&self.cudnn_k16, kn * 2);
             try self.ensureDeviceBuffer(&self.cudnn_v16, kn * 2);
@@ -6033,26 +6568,17 @@ pub const Backend = struct {
             k16 = self.cudnn_k16;
             v16 = self.cudnn_v16;
             o16 = self.cudnn_o16;
-            if (self.attn_bf16) {
-                try self.cvtF32ToBf16(q, q16, qn);
-                try self.cvtF32ToBf16(k, k16, kn);
-                try self.cvtF32ToBf16(v, v16, kn);
-            } else {
-                try self.cvtF32ToH16(q, q16, qn, qn);
-                try self.cvtF32ToH16(k, k16, kn, kn);
-                try self.cvtF32ToH16(v, v16, kn, kn);
-            }
+            try self.cvtF32ToH16(q, q16, qn, qn);
+            try self.cvtF32ToH16(k, k16, kn, kn);
+            try self.cvtF32ToH16(v, v16, kn, kn);
         }
-        const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd);
+        const plan = try self.sdpaPlan(n_heads, kv_heads, seq_q, seq_kv, hd, io == .bf16);
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
         var sc = scale;
         const L = &self.libs.?;
         plan.execute(&L.dnn, try self.dnnHandle(), q16.ptr(), k16.ptr(), v16.ptr(), o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
-        if (io_f16) return;
-        if (self.attn_bf16)
-            try self.dualElems("bf16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn)
-        else
-            try self.dualElems("f16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn);
+        if (io != .f32) return;
+        try self.dualElems("f16_to_f32", o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0, 0 }, .{ 0, 0 }, qn);
     }
 
     /// Head-batched attention: process `G` heads per launch (grid.z=G) so the PV
@@ -6265,7 +6791,9 @@ pub const Backend = struct {
     /// scratch is bounded by `attn_scratch_budget` regardless of seq. Used for the
     /// VAE mid-block attention over every latent position (seq² is tens of GB at
     /// high resolution). Reuses the fused scores/softmax-md/attn-out kernels.
-    fn opAttnTCFlash(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, hd: usize, scale: f32) Error!void {
+    /// Tensor-core attention with an f32 scores band, one head at a time over interleaved
+    /// `[seq][n_heads][hd]` f32 (no GQA). For attention whose logits f16 cannot hold.
+    pub fn opAttnTCFlash(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, hd: usize, scale: f32) Error!void {
         const mpad = std.mem.alignForward(usize, seq, 128);
 
         // Resident single-head tiles + full O; only S/MD are query-tiled.
@@ -6302,26 +6830,29 @@ pub const Backend = struct {
         const s_o: u32 = @intCast(mpad * hd);
         const s_s: u32 = @intCast(mpad * mpad); // per-head stride; unused at gs=1
 
-        // Gather the single head (n_heads = head = 0), padding rows seq..mpad.
-        try self.dualPairs("gather_head", q, self.attn_qh, null, null, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
-        try self.dualPairs("gather_head", k, self.attn_kh, null, null, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
-        try self.dualPairs("gather_vt", v, self.attn_vth, null, null, .{ seq32, 1, 0, hd32, mpad32, hd32 * mpad32, 0 }, .{ 0, 0 }, hd * mpad);
+        const nh32: u32 = @intCast(n_heads);
+        for (0..n_heads) |h| {
+            const h32: u32 = @intCast(h);
+            // Gather one head, padding rows seq..mpad.
+            try self.dualPairs("gather_head", q, self.attn_qh, null, null, .{ seq32, nh32, h32, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+            try self.dualPairs("gather_head", k, self.attn_kh, null, null, .{ seq32, nh32, h32, hd32, mpad32 * hd32, 0, 0 }, .{ 0, 0 }, mpad * hd);
+            try self.dualPairs("gather_vt", v, self.attn_vth, null, null, .{ seq32, nh32, h32, hd32, mpad32, hd32 * mpad32, 0 }, .{ 0, 0 }, hd * mpad);
 
-        var q0: usize = 0;
-        while (q0 < mpad) : (q0 += qb) {
-            const m = @min(qb, mpad - q0); // 128-multiple (mpad, qb both are)
-            const m32: u32 = @intCast(m);
-            const qblk = dbFromPtr(self.attn_qh.ptr() + @as(u64, q0) * hd * 2, m * hd * 2);
-            const oblk = dbFromPtr(self.attn_oh.ptr() + @as(u64, q0) * hd * 4, m * hd * 4);
-            // S[m][mpad] f16 = scale*(Qblk @ Kᵀ)  (scale prefolded in the C-store)
-            try self.launchHgemmB(f_scores, qblk, self.attn_kh, self.attn_s, m, mpad, hd, 1, s_qk, s_qk, s_s, scale);
-            // MD[m][2] f32 = {max, 1/sum} per row over valid cols 0..seq
-            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq, mpad, no_causal);
-            // O[m][hd] f32 = softmax(S) @ Vt  (k = mpad keys)
-            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32, no_causal);
+            var q0: usize = 0;
+            while (q0 < mpad) : (q0 += qb) {
+                const m = @min(qb, mpad - q0); // 128-multiple (mpad, qb both are)
+                const m32: u32 = @intCast(m);
+                const qblk = dbFromPtr(self.attn_qh.ptr() + @as(u64, q0) * hd * 2, m * hd * 2);
+                const oblk = dbFromPtr(self.attn_oh.ptr() + @as(u64, q0) * hd * 4, m * hd * 4);
+                // S[m][mpad] f32 = scale*(Qblk @ Kᵀ)  (scale prefolded in the C-store)
+                try self.launchHgemmB(f_scores, qblk, self.attn_kh, self.attn_s, m, mpad, hd, 1, s_qk, s_qk, s_s, scale);
+                // MD[m][2] f32 = {max, 1/sum} per row over valid cols 0..seq
+                try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq, mpad, no_causal);
+                // O[m][hd] f32 = softmax(S) @ Vt  (k = mpad keys)
+                try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32, no_causal);
+            }
+            try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, nh32, h32, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
         }
-        // Scatter O rows 0..seq into out (n_heads = head = 0).
-        try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, 1, 0, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
     }
 
     /// Per-head attention reference (A/B against the batched path). Scratch reused
@@ -6356,6 +6887,27 @@ pub const Backend = struct {
             try self.launchHgemm(f_hg, self.attn_p, self.attn_vth, self.attn_oh, mpad, hd, mpad);
             try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, nh32, head32, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
         }
+    }
+
+    /// A weight GEMM `y[m][rows] (+ bias) = A[mpad][cols] @ W[rows][cols]ᵀ` on the hand
+    /// kernel for a `rows` that is not a multiple of 128. The kernel runs whole 128-wide
+    /// N tiles, so `w16` is read through a copy long enough for the last one; its pad
+    /// rows reach only the output columns the compaction drops, so they are never zeroed.
+    fn hgemmPadN(self: *Backend, f: cu.CUfunction, a: DeviceBuffer, w16: DeviceBuffer, y: DeviceBuffer, m: usize, mpad: usize, rows: usize, cols: usize, bias: ?DeviceBuffer) Error!void {
+        const npad = std.mem.alignForward(usize, rows, 128);
+        var b = w16;
+        if (w16.size < npad * cols * 2) {
+            try self.ensureDeviceBuffer(&self.hg_wpad, npad * cols * 2);
+            try self.opCopyOff(self.hg_wpad.as(.f16), 0, w16.as(.f16), 0, rows * cols);
+            b = self.hg_wpad;
+        }
+        try self.ensureDeviceBuffer(&self.conv_c, mpad * npad * 4);
+        try self.launchHgemm(f, a, b, self.conv_c, mpad, npad, cols);
+        if (self.hg_zero.size < rows * 4) {
+            try self.ensureDeviceBuffer(&self.hg_zero, rows * 4);
+            try self.tensorZero(self.hg_zero, self.hg_zero.size);
+        }
+        try self.dualElems("bias_compact", self.conv_c, bias orelse self.hg_zero, null, y, .{ @intCast(m * rows), @intCast(rows), @intCast(npad), 0, 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
     }
 
     /// hgemm: C[m][n] f32 = A[m][k] f16 @ B[n][k] f16ᵀ. m,n multiples of 128.
@@ -6450,7 +7002,8 @@ pub const Backend = struct {
     pub fn sigmoidMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("sigmoid_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(a.dt == b.dt);
+        try self.dualElemsAt("sigmoid_mul", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = silu(a)*b, in place (a=gate, b=up).
@@ -6465,7 +7018,8 @@ pub const Backend = struct {
     pub fn siluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("silu_mul", a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        std.debug.assert(a.dt == b.dt);
+        try self.dualElemsAt("silu_mul", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// GeGLU gate: a = geluTanh(a) * b, in place (Gemma FFN). total = elements.
@@ -6486,7 +7040,7 @@ pub const Backend = struct {
     pub fn gelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("gelu", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("gelu", a.dt, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = x*sigmoid(1.702x), in place, CLIP-L's FFN activation. total = element count.
@@ -6501,7 +7055,7 @@ pub const Backend = struct {
     pub fn geluErf(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        try self.dualElems("gelu_erf", a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.dualElemsAt("gelu_erf", a.dt, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a += mod[gate_off + col] * b, in place (residual with gate). total=rows*dim.
@@ -6522,7 +7076,17 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         // Same pairing as `rmsModRows`: no index buffer means no index stride.
         const stride: u32 = if (idx == null) 0 else @intCast(idx_stride);
-        try self.dualElems("gated_add", a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), stride, @intCast(a_row * dim), @intCast(b_row * dim), @intCast(idx_row) }, .{ 0, 0 }, total);
+        std.debug.assert(a.dt == b.dt);
+        try self.dualElemsAt("gated_add", a.dt, a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), stride, @intCast(a_row * dim), @intCast(b_row * dim), @intCast(idx_row) }, .{ 0, 0 }, total);
+    }
+
+    /// `gatedAddRowsAt` into `a` at its own dtype from an f32 `b`, times `scale`.
+    pub fn gatedAddScaledRowsAt(self: *Backend, a: DeviceBuffer, a_row: usize, b: DeviceBuffer, b_row: usize, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize, idx: ?DeviceBuffer, idx_row: usize, idx_stride: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const stride: u32 = if (idx == null) 0 else @intCast(idx_stride);
+        std.debug.assert(b.dt == .f32);
+        try self.dualElemsAt("gated_add_scaled", a.dt, a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), stride, @intCast(a_row * dim), @intCast(b_row * dim), @intCast(idx_row) }, .{ scale, 0 }, total);
     }
 };
 
@@ -7404,7 +7968,7 @@ test "bf16 matmul op matches CPU reference" {
         be.tensorDestroy(&yd);
     }
     try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-    try be.opMatmulBf16(y_d, x_d, m, std.mem.sliceAsBytes(w16), co, k, bias, false, false);
+    try be.opMatmulBf16(y_d, x_d, m, std.mem.sliceAsBytes(w16), co, k, bias);
     const got = try gpa.alloc(f32, m * co);
     defer gpa.free(got);
     try be.tensorDownload(y_d, std.mem.sliceAsBytes(got));
@@ -7808,7 +8372,7 @@ test "stacked skinny weights through the pipe MMQ match per-weight grouped GEMVs
         var off: usize = 0;
         while (off < m) : (off += 8) {
             const ng: usize = @min(8, m - off);
-            try be.opGemvQuantQ8N(.q4_k, offsetBufSizedTest(yg_d, off * heads * 4, ng * heads * 4), w, 1.0, heads, cols, ng, off, m);
+            try be.opGemvQuantQ8N(.q4_k, yg_d.slice(off * heads * 4, ng * heads * 4), w, 1.0, heads, cols, ng, off, m);
         }
         try be.tensorDownload(yg_d, std.mem.sliceAsBytes(yg));
         for (0..m) |t| for (0..heads) |h| {
@@ -7860,7 +8424,7 @@ test "block-quant convrot decode matches a CPU-decoded weight" {
     for (x) |*v| v.* = (prng.random().float(f32) - 0.5) * 3.0;
     const x_d = try be.tensorCreate(x.len * 4);
     try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-    try be.opI8Prep(x_d, m, cols, false);
+    try be.opI8Prep(x_d, m, cols);
 
     const y_ref_d = try be.tensorCreate(m * rows * 4);
     const y_got_d = try be.tensorCreate(m * rows * 4);
@@ -7893,9 +8457,9 @@ test "block-quant convrot decode matches a CPU-decoded weight" {
             }
         }
 
-        try be.opI8Gemm(y_ref_d, std.mem.sliceAsBytes(cpu_i8), cpu_scale, rows, false);
+        try be.opI8Gemm(y_ref_d, std.mem.sliceAsBytes(cpu_i8), cpu_scale, rows, null);
         try be.tensorDownload(y_ref_d, std.mem.sliceAsBytes(y_ref));
-        try be.opI8GemmBlockQ(y_got_d, dt, wbytes, rows, cols, false, true);
+        try be.opI8GemmBlockQ(y_got_d, dt, wbytes, rows, cols, true, null);
         try be.tensorDownload(y_got_d, std.mem.sliceAsBytes(y_got));
 
         for (y_ref, y_got, 0..) |rv, gv, i| {
@@ -8060,7 +8624,7 @@ test "gdn ops match CPU reference" {
 
     try be.opGdnGates(ab_d, adt_d, gates_d, heads);
     try be.opGdnConvStep(st_d, qkv_d, cw_d, conv_d, channels);
-    try be.opL2NormRows(offsetBufSizedTest(conv_d, 0, 2 * k_heads * d * 4), 2 * k_heads, d, eps);
+    try be.opL2NormRows(conv_d.slice(0, 2 * k_heads * d * 4), 2 * k_heads, d, eps);
     try be.opGdnDeltaStep(state_d, conv_d, gates_d, o_d, heads, d, k_heads, scale);
 
     var got_o: [heads * d]f32 = undefined;
@@ -8193,13 +8757,179 @@ test "qwen35 attention ops match CPU reference" {
     for (xr_ref, got_x) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-5);
 }
 
-fn offsetBufSizedTest(b: DeviceBuffer, off_bytes: usize, size: usize) DeviceBuffer {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
+test "the dual attention and delta-chunk kernels match the CUDA ones" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rand = prng.random();
+
+    // The recurrence: dual chunk, PTX chunk and PTX per-token, bit for bit.
+    {
+        const heads = 4;
+        const kh = 2;
+        const d = 128;
+        const n = 9;
+        const channels = 2 * kh * d + heads * d;
+        const scale = 1.0 / @sqrt(@as(f32, d));
+        const st = try gpa.alloc(f32, heads * d * d);
+        defer gpa.free(st);
+        for (st) |*x| x.* = rand.floatNorm(f32) * 0.1;
+        const conv = try gpa.alloc(f32, n * channels);
+        defer gpa.free(conv);
+        for (conv) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        var gates: [n * 2 * heads]f32 = undefined;
+        for (&gates) |*x| x.* = 0.05 + 0.9 * rand.float(f32);
+        var bufs: [3][2]DeviceBuffer = undefined;
+        for (&bufs) |*b| {
+            b[0] = try be.tensorCreate(st.len * 4);
+            b[1] = try be.tensorCreate(n * heads * d * 4);
+            try be.tensorUpload(b[0], std.mem.sliceAsBytes(st));
+        }
+        defer for (&bufs) |*b| {
+            be.tensorDestroy(&b[0]);
+            be.tensorDestroy(&b[1]);
+        };
+        var conv_d = try be.tensorCreate(conv.len * 4);
+        defer be.tensorDestroy(&conv_d);
+        var gates_d = try be.tensorCreate(gates.len * 4);
+        defer be.tensorDestroy(&gates_d);
+        try be.tensorUpload(conv_d, std.mem.sliceAsBytes(conv));
+        try be.tensorUpload(gates_d, std.mem.sliceAsBytes(&gates));
+        try be.opGdnDeltaChunk(bufs[0][0], conv_d, gates_d, bufs[0][1], heads, d, kh, n, channels, scale);
+        try be.opGdnDeltaChunkDual(bufs[1][0], conv_d, gates_d, bufs[1][1], heads, d, kh, n, channels, scale);
+        for (0..n) |t| try be.opGdnDeltaStep(
+            bufs[2][0],
+            conv_d.slice(t * channels * 4, channels * 4),
+            gates_d.slice(t * 2 * heads * 4, 2 * heads * 4),
+            bufs[2][1].slice(t * heads * d * 4, heads * d * 4),
+            heads,
+            d,
+            kh,
+            scale,
+        );
+        var got: [3][2][]f32 = undefined;
+        for (&got, bufs) |*g, b| {
+            g[0] = try gpa.alloc(f32, st.len);
+            g[1] = try gpa.alloc(f32, n * heads * d);
+            try be.tensorDownload(b[0], std.mem.sliceAsBytes(g[0]));
+            try be.tensorDownload(b[1], std.mem.sliceAsBytes(g[1]));
+        }
+        defer for (got) |g| {
+            gpa.free(g[0]);
+            gpa.free(g[1]);
+        };
+        for (1..3) |w| for (0..2) |part| {
+            var diff: usize = 0;
+            var worst: f32 = 0;
+            for (got[0][part], got[w][part]) |x, y| if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+                diff += 1;
+                worst = @max(worst, @abs(x - y));
+            };
+            errdefer std.debug.print("delta: arm {d} {s}: {d} of {d} differ from the PTX chunk, worst {e}\n", .{ w, if (part == 0) "state" else "output", diff, got[0][part].len, worst });
+            try std.testing.expectEqual(@as(usize, 0), diff);
+        };
+    }
+
+    // Attention: several queries at once, a GQA group, every KV format, against the
+    // CUDA kernel reading the same cache, and f32 also against the CPU.
+    for ([_]usize{ 128, 256 }) |hd| {
+        const heads = 4;
+        const kvh = 2;
+        const seq_q = 3;
+        const kv_len0 = 5;
+        const kv_total = kv_len0 + seq_q - 1;
+        const nsplit = 8;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const q = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(q);
+        const kf = try gpa.alloc(f32, kv_total * kvh * hd);
+        defer gpa.free(kf);
+        const vf = try gpa.alloc(f32, kv_total * kvh * hd);
+        defer gpa.free(vf);
+        for (q) |*x| x.* = rand.floatNorm(f32);
+        for (kf) |*x| x.* = rand.floatNorm(f32);
+        for (vf) |*x| x.* = rand.floatNorm(f32);
+        const ref = try gpa.alloc(f32, q.len);
+        defer gpa.free(ref);
+        for (0..seq_q) |t| for (0..heads) |h| {
+            const g = h / (heads / kvh);
+            const len = kv_len0 + t;
+            var sc: [kv_total]f32 = undefined;
+            var mx: f32 = -std.math.inf(f32);
+            for (0..len) |j| {
+                var dot: f32 = 0;
+                for (0..hd) |c| dot += q[(t * heads + h) * hd + c] * kf[(j * kvh + g) * hd + c];
+                sc[j] = dot * scale;
+                mx = @max(mx, sc[j]);
+            }
+            var den: f32 = 0;
+            for (sc[0..len]) |*x| {
+                x.* = @exp(x.* - mx);
+                den += x.*;
+            }
+            for (0..hd) |c| {
+                var acc: f32 = 0;
+                for (0..len) |j| acc += sc[j] * vf[(j * kvh + g) * hd + c];
+                ref[(t * heads + h) * hd + c] = acc / den;
+            }
+        };
+        var q_d = try be.tensorCreate(q.len * 4);
+        defer be.tensorDestroy(&q_d);
+        var kf_d = try be.tensorCreate(kf.len * 4);
+        defer be.tensorDestroy(&kf_d);
+        var vf_d = try be.tensorCreate(vf.len * 4);
+        defer be.tensorDestroy(&vf_d);
+        var k_d = try be.tensorCreate(kf.len * 4);
+        defer be.tensorDestroy(&k_d);
+        var v_d = try be.tensorCreate(vf.len * 4);
+        defer be.tensorDestroy(&v_d);
+        var out_d = try be.tensorCreate(q.len * 4);
+        defer be.tensorDestroy(&out_d);
+        var scratch_d = try be.tensorCreate(seq_q * heads * nsplit * (hd + 4) * 4);
+        defer be.tensorDestroy(&scratch_d);
+        try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(kf_d, std.mem.sliceAsBytes(kf));
+        try be.tensorUpload(vf_d, std.mem.sliceAsBytes(vf));
+        const want = try gpa.alloc(f32, q.len);
+        defer gpa.free(want);
+        const got = try gpa.alloc(f32, q.len);
+        defer gpa.free(got);
+        for ([_]KvFmt{ .f32, .f16, .q8_0 }) |fmt| {
+            const n = kf.len;
+            switch (fmt) {
+                .f32 => {
+                    try be.tensorCopy(k_d, 0, kf_d, 0, n * 4);
+                    try be.tensorCopy(v_d, 0, vf_d, 0, n * 4);
+                },
+                .f16 => {
+                    try be.opStoreKvF16(k_d, 0, kf_d, 0, n);
+                    try be.opStoreKvF16(v_d, 0, vf_d, 0, n);
+                },
+                .q8_0 => {
+                    try be.opStoreKvQ8(k_d, 0, kf_d, 0, n);
+                    try be.opStoreKvQ8(v_d, 0, vf_d, 0, n);
+                },
+            }
+            try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len0, seq_q, heads, kvh, hd, nsplit, scale, 0, 0, false, fmt);
+            try be.tensorDownload(out_d, std.mem.sliceAsBytes(want));
+            try be.opAttnRowsDual(q_d, k_d, v_d, out_d, scratch_d, kv_len0, seq_q, heads, kvh, hd, nsplit, scale, fmt);
+            try be.tensorDownload(out_d, std.mem.sliceAsBytes(got));
+            for (want, got, 0..) |w, g, i| {
+                errdefer std.debug.print("attention hd {d} {t}: element {d} cuda {d} dual {d}\n", .{ hd, fmt, i, w, g });
+                try std.testing.expectApproxEqAbs(w, g, 1e-4);
+            }
+            if (fmt == .f32) for (ref, got, 0..) |r, g, i| {
+                errdefer std.debug.print("attention hd {d}: element {d} cpu {d} dual {d}\n", .{ hd, i, r, g });
+                try std.testing.expectApproxEqAbs(r, g, 2e-3);
+            };
+        }
+    }
 }
 
-// Query-tiled single-head attention (opAttnTCFlash, the VAE mid-block path) vs a
-// full CPU softmax reference. A tiny scratch budget forces several query blocks,
-// so the block-boundary handling is actually exercised.
+// Query-tiled attention (opAttnTCFlash, the VAE path) over interleaved heads vs a full
+// CPU softmax reference. A tiny scratch budget forces several query blocks, so the
+// block-boundary handling is actually exercised, and three heads exercise the offsets.
 test "flash (query-tiled) attention matches CPU reference" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -8207,12 +8937,14 @@ test "flash (query-tiled) attention matches CPU reference" {
 
     const seq = 384; // 3 query blocks at qb=128
     const hd = 128; // this kernel family tiles n=hd by 128 (VAE uses hd=384)
+    const nh = 3;
+    const row = nh * hd;
     var prng = std.Random.DefaultPrng.init(4242);
     const rand = prng.random();
 
-    const q = try gpa.alloc(f32, seq * hd);
-    const k = try gpa.alloc(f32, seq * hd);
-    const v = try gpa.alloc(f32, seq * hd);
+    const q = try gpa.alloc(f32, seq * row);
+    const k = try gpa.alloc(f32, seq * row);
+    const v = try gpa.alloc(f32, seq * row);
     defer gpa.free(q);
     defer gpa.free(k);
     defer gpa.free(v);
@@ -8221,28 +8953,30 @@ test "flash (query-tiled) attention matches CPU reference" {
     for (v) |*x| x.* = rand.floatNorm(f32);
     const scale = 1.0 / @sqrt(@as(f32, hd));
 
-    // CPU reference: full (non-causal) single-head attention.
-    const ref = try gpa.alloc(f32, seq * hd);
+    // CPU reference: full (non-causal) attention per head.
+    const ref = try gpa.alloc(f32, seq * row);
     defer gpa.free(ref);
     const scores = try gpa.alloc(f32, seq);
     defer gpa.free(scores);
-    for (0..seq) |i| {
-        var mx: f32 = -std.math.inf(f32);
-        for (0..seq) |j| {
-            var s: f32 = 0;
-            for (0..hd) |c| s += q[i * hd + c] * k[j * hd + c];
-            scores[j] = s * scale;
-            mx = @max(mx, scores[j]);
-        }
-        var den: f32 = 0;
-        for (scores) |*s| {
-            s.* = @exp(s.* - mx);
-            den += s.*;
-        }
-        for (0..hd) |c| {
-            var acc: f32 = 0;
-            for (0..seq) |j| acc += scores[j] * v[j * hd + c];
-            ref[i * hd + c] = acc / den;
+    for (0..nh) |h| {
+        for (0..seq) |i| {
+            var mx: f32 = -std.math.inf(f32);
+            for (0..seq) |j| {
+                var s: f32 = 0;
+                for (0..hd) |c| s += q[i * row + h * hd + c] * k[j * row + h * hd + c];
+                scores[j] = s * scale;
+                mx = @max(mx, scores[j]);
+            }
+            var den: f32 = 0;
+            for (scores) |*s| {
+                s.* = @exp(s.* - mx);
+                den += s.*;
+            }
+            for (0..hd) |c| {
+                var acc: f32 = 0;
+                for (0..seq) |j| acc += scores[j] * v[j * row + h * hd + c];
+                ref[i * row + h * hd + c] = acc / den;
+            }
         }
     }
 
@@ -8263,9 +8997,9 @@ test "flash (query-tiled) attention matches CPU reference" {
     const saved_budget = be.attn_scratch_budget;
     be.attn_scratch_budget = 128 * (std.mem.alignForward(usize, seq, 128)) * 2; // force qb=128
     defer be.attn_scratch_budget = saved_budget;
-    try be.opAttnTCFlash(q_d, k_d, v_d, out_d, seq, hd, scale);
+    try be.opAttnTCFlash(q_d, k_d, v_d, out_d, seq, nh, hd, scale);
 
-    const got = try gpa.alloc(f32, seq * hd);
+    const got = try gpa.alloc(f32, seq * row);
     defer gpa.free(got);
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(got));
     for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-2);

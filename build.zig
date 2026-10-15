@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     // into the library as raw module bytes.
     // One object per kernel: the 0.16 SPIR-V backend only supports workgroup
     // storage in a single entry point per module.
-    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "subgroup", "dual" };
+    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "dual" };
     var kernel_objs: [kernel_names.len]*std.Build.Step.Compile = undefined;
     for (kernel_names, 0..) |kname, i| {
         kernel_objs[i] = b.addObject(.{
@@ -271,6 +271,9 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
+    // Where the real-model tests and device commands look for checkpoints.
+    const model_root = b.option([]const u8, "model-root", "Root of the diffusion model folders (checkpoints/, vae/, text_encoders/, ...)") orelse "/mnt/watch/models/diffusion";
+    build_opts.addOption([]const u8, "model_root", model_root);
     build_opts.addOption(bool, "privacy", privacy);
     // Tie the compile-time flag to whether ggml was actually wired: if the
     // dependency is disabled (or unavailable), the library compiles its

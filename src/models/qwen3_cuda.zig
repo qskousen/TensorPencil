@@ -15,11 +15,12 @@
 //! CPU/GPU layer split (--cpu-layers / --offload-grow).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const init_defaults = @import("tp_core").init_defaults;
 const qwen3 = @import("qwen3.zig");
+const qwen3_enc_dev = @import("qwen3_enc_dev.zig");
 const lin = @import("lin.zig");
 const lin_cuda = @import("lin_cuda.zig");
-const lin_llm = @import("lin_llm_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
@@ -34,6 +35,7 @@ const bnd = @import("tp_runtime").boundary;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
+const Dt = cuda.backend.Dt;
 const Growable = Backend.GrowableTensor;
 
 /// Map the session KV dtype onto the backend's kernel-format tag.
@@ -44,7 +46,6 @@ fn kvFmt(dt: kvmod.KvDtype) cuda.backend.KvFmt {
         .q8_0 => .q8_0,
     };
 }
-
 
 // Only `head_dim` is a family-wide constant. Every other dimension in `encode`
 // is read off `enc.cfg`, because Anima's encoder is Qwen3-0.6B (28 layers, 1024
@@ -60,49 +61,16 @@ const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 /// migrates first); kept for interface parity with qwen35_cuda.
 pub const CpuSplitPolicy = enum { tail, attn };
 
-/// The block-quant GEMM the text encoders take, `--te-gguf-gemm`.
-///
-/// `f16` by default, not the DiT's `auto`: the int8 and MMQ routes quantize the
-/// ACTIVATION to 8 bits, and a conditioning tensor is computed once and then steers every
-/// sampling step, so that error is baked into the whole render for a fraction of a second
-/// saved once. The other values exist to measure exactly that trade (`te-test
-/// --gguf-gemm`).
-pub var encoder_gemm: lin_cuda.BlockQGemm = .f16;
-
-/// Encode token ids to the encoder variant's conditioning stack,
-/// `[seq][enc.tapCount()][hidden]` (same token-major layout the CPU `encode`
-/// returns). Caller frees the result.
-///
-/// The tap list and the RoPE theta come off `enc`, never from this file's
-/// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
-/// 1e6, and both would run to completion with the other's values.
-///
-/// Every GEMM goes through `lin_cuda` under `encoder_gemm`, so the weight dtype is
-/// dispatched per linear and a format with no kernel is refused by name up front;
-/// `supportsWeights` is the same check for callers that want to fall back to the CPU.
-/// Each layer's weights are prefetched one layer ahead, so an encoder larger than VRAM
-/// streams through at PCIe speed rather than moving to the CPU.
-pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
-    return encodeVision(enc, be, io, gpa, ids, .{}, cancel);
+/// The encoder's tap stack `[seq][enc.tapCount()][hidden]` (see `qwen3_enc_dev`).
+/// Every GEMM goes through `lin_cuda` under `lin_cuda.encoder_gemm`, so a format with no
+/// kernel is refused by name up front; `supportsWeights` is the same check for callers
+/// that want to fall back to the CPU. Caller frees.
+/// `act` is the encoder dial's width for the residual, the norms and the FFN planes.
+pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, act: Dt, cancel: ?*std.atomic.Value(bool)) ![]f32 {
+    return encodeVision(enc, be, io, gpa, ids, .{}, act, cancel);
 }
 
-/// `encode` with a spliced vision payload: pre-embedded rows over the placeholder
-/// tokens, multimodal rope, and DeepStack features added at the image rows.
-///
-/// Three things the plain path does not do, and each is why H3's reference renders
-/// were forced to the CPU until this existed:
-///
-/// 1. **The block rows are pasted before the upload**, on the host, because the
-///    embedding gather already runs there.
-/// 2. **mrope replaces the 1-D rope table** -- and only when there are positions,
-///    matching the reference, which emits none without an image. The two tables have
-///    the same `[seq][half]` cos-then-sin shape, so nothing downstream changes.
-/// 3. ⚠️ **DeepStack needs no kernel.** An injection span is a CONTIGUOUS row run,
-///    so adding a feature to it is `opAdd` on an offset view of both buffers. A
-///    per-row kernel would be the obvious reach and buys nothing.
-///
-/// ⚠️ `l` indexes the LLM's layers, not the tower's: features are collected from
-/// deep ViT blocks and injected into the FIRST few decoder layers.
+/// `encode` with a spliced vision payload: `qwen3_enc_dev.encode` on this backend.
 pub fn encodeVision(
     enc: *const qwen3.TextEncoder,
     be: *Backend,
@@ -110,191 +78,147 @@ pub fn encodeVision(
     gpa: std.mem.Allocator,
     ids: []const u32,
     vision: qwen3.TextEncoder.Vision,
+    act: Dt,
     cancel: ?*std.atomic.Value(bool),
 ) ![]f32 {
     _ = io;
-    const seq = ids.len;
-    std.debug.assert(seq > 0);
-    const seq_pad = std.mem.alignForward(usize, seq, 128);
-    const tap_count = enc.tapCount();
-    const plan = blk: {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        break :blk try lin_cuda.plan(try enc.deviceLins(arena.allocator()), encoder_gemm, "qwen3 cuda encoder");
-    };
-
-    const c = enc.cfg;
-    const hidden = c.hidden;
-    const n_heads = c.n_heads;
-    const kv_heads = c.n_kv_heads;
-    const q_dim = c.qDim();
-    const intermediate = c.intermediate;
-    const eps = c.rms_eps;
-
-    // CPU: embedding gather and the rotate-half rope table. Through
-    // `embedTokens`, which dispatches on the embedding's own dtype. Hardcoding bf16
-    // and a `* 2` row stride here reads a GGUF encoder's q6_k embedding as garbage.
-    const x = try gpa.alloc(f32, seq * hidden);
-    defer gpa.free(x);
-    try qwen3.embedTokens(enc.embed, ids, x);
-
-    // Spliced vision blocks replace the placeholder tokens' embeddings. The ids
-    // under a block are real pad ids, so the gather above already succeeded.
-    for (vision.blocks) |b| {
-        if (b.rows.len % hidden != 0) return error.ShapeMismatch;
-        const n = b.rows.len / hidden;
-        if (b.at + n > seq) return error.ShapeMismatch;
-        @memcpy(x[b.at * hidden ..][0..b.rows.len], b.rows);
-    }
-    const inject_rows = vision.injectRows();
-    if (vision.deepstack.len > 0) {
-        if (inject_rows == 0) return error.ShapeMismatch;
-        for (vision.deepstack) |d| if (d.len != inject_rows * hidden) return error.ShapeMismatch;
-        for (vision.inject) |sp| if (sp.start + sp.len > seq) return error.ShapeMismatch;
-    }
-
-    // Multimodal rope only when there are images, matching the reference: without
-    // them it emits no position ids, and the plain 1-D sequence is not an
-    // approximation of mrope but the same thing when all three axes agree.
-    var freqs = if (vision.positions) |pos|
-        try ops.rope.mropeInterleavedFreqs(gpa, pos, seq, hd, vision.rope_dims, enc.cfg.rope_theta)
-    else
-        try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
-    defer freqs.deinit(gpa);
-    const fp = try gpa.alloc(f32, 2 * seq * half);
-    defer gpa.free(fp);
-    @memcpy(fp[0 .. seq * half], freqs.cos);
-    @memcpy(fp[seq * half ..], freqs.sin);
-    const sin_off = seq * half;
-
-    var bufs = try Bufs.init(be, c, seq, seq_pad, tap_count);
-    defer bufs.deinit(be);
-
-    // The DeepStack features, one contiguous device buffer per LLM layer that takes
-    // one. Uploaded once, before the batch opens, so the host slices they come from
-    // do not have to outlive it.
-    var ds_d: []Buf = &.{};
-    var ds_done: usize = 0;
-    defer {
-        for (ds_d[0..ds_done]) |*b| be.tensorDestroy(b);
-        if (ds_d.len > 0) gpa.free(ds_d);
-    }
-    if (vision.deepstack.len > 0) {
-        ds_d = try gpa.alloc(Buf, vision.deepstack.len);
-        for (vision.deepstack, ds_d) |feat, *b| {
-            b.* = try be.tensorCreate(feat.len * 4);
-            ds_done += 1;
-            try be.tensorUpload(b.*, std.mem.sliceAsBytes(feat));
-        }
-    }
-    var freqs_d = try be.tensorCreate(fp.len * 4);
-    defer be.tensorDestroy(&freqs_d);
-    try be.tensorUpload(freqs_d, std.mem.sliceAsBytes(fp));
-    try be.tensorUpload(bufs.x, std.mem.sliceAsBytes(x));
-
-    const x_d = bufs.x;
-    const nd = bufs.normed;
-    const q_d = bufs.q;
-    const k_d = bufs.k;
-    const v_d = bufs.v;
-    const attn_d = bufs.attn;
-    const g_d = bufs.gate;
-    const u_d = bufs.up;
-    const t_d = bufs.t;
-    const out_d = bufs.out;
-
-    try be.beginBatch();
-    errdefer if (be.batching()) be.abortBatch();
-
-    if (be.async_uploads and enc.layers.len > 0) prefetchLayer(be, enc.layers[0]);
-    var tap_idx: usize = 0;
-    // `n_layers + 1`: a tap index may be one PAST the last layer (Anima's is), and
-    // the `l >= enc.layers.len` break is what terminates the loop.
-    for (0..c.n_layers + 1) |l| {
-        // Poll cancel between layers so a stop lands mid-encode; the errdefer
-        // above aborts the in-flight batch.
-        if (cancel) |cc| if (cc.load(.acquire)) return error.Canceled;
-        if (be.async_uploads and l + 1 < enc.layers.len) prefetchLayer(be, enc.layers[l + 1]);
-        if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
-            // Snapshot the hidden state entering layer l into the tap-major output.
-            // A tap past the last layer carries the final norm; it lands in the
-            // `normed` scratch first, since `tensorCopy` is what applies the per-tap
-            // offset. Same two-op shape as the Vulkan arm.
-            var src = x_d;
-            if (enc.final_norm) |w| {
-                if (l == c.n_layers) {
-                    try be.qkNorm(x_d, nd, try nbuf(be, w), seq, hidden, eps);
-                    src = nd;
-                }
-            }
-            try be.tensorCopy(out_d, tap_idx * seq * hidden * 4, src, 0, seq * hidden * 4);
-            tap_idx += 1;
-        }
-        if (l >= enc.layers.len) break;
-        const layer = enc.layers[l];
-
-        // --- Attention ---
-        try be.qkNorm(x_d, nd, try nbuf(be, layer.input_norm), seq, hidden, eps);
-        try lin_cuda.prep(be, plan, nd, seq, hidden, &.{ layer.q, layer.k, layer.v }, false);
-        try lin_cuda.gemm(be, plan, q_d, nd, seq, layer.q, false);
-        try lin_cuda.gemm(be, plan, k_d, nd, seq, layer.k, false);
-        try lin_cuda.gemm(be, plan, v_d, nd, seq, layer.v, false);
-        try be.qkNorm(q_d, q_d, try nbuf(be, layer.q_norm), seq * n_heads, hd, eps);
-        try be.qkNorm(k_d, k_d, try nbuf(be, layer.k_norm), seq * kv_heads, hd, eps);
-        try be.ropeHalf(q_d, freqs_d, seq, n_heads, half, sin_off, 0);
-        try be.ropeHalf(k_d, freqs_d, seq, kv_heads, half, sin_off, 0);
-        try be.attn(q_d, k_d, v_d, attn_d, seq, seq, n_heads, kv_heads, hd, attn_scale, true);
-        try lin_cuda.prep(be, plan, attn_d, seq, q_dim, &.{layer.o}, false);
-        try lin_cuda.gemm(be, plan, t_d, attn_d, seq, layer.o, false);
-        try be.opAdd(x_d, t_d, seq * hidden);
-
-        // --- MLP (SwiGLU) ---
-        try be.qkNorm(x_d, nd, try nbuf(be, layer.post_norm), seq, hidden, eps);
-        try lin_cuda.prep(be, plan, nd, seq, hidden, &.{ layer.gate, layer.up }, false);
-        try lin_cuda.gemm(be, plan, g_d, nd, seq, layer.gate, false);
-        try lin_cuda.gemm(be, plan, u_d, nd, seq, layer.up, false);
-        try be.siluMul(g_d, u_d, seq * intermediate);
-        try lin_cuda.prep(be, plan, g_d, seq, intermediate, &.{layer.down}, false);
-        try lin_cuda.gemm(be, plan, t_d, g_d, seq, layer.down, false);
-        try be.opAdd(x_d, t_d, seq * hidden);
-
-        // DeepStack, added at the image rows AFTER this layer. Each injection span
-        // is a contiguous row run in both the sequence and the feature, so the whole
-        // thing is one offset `opAdd` per span.
-        if (l < ds_d.len) {
-            var row: usize = 0;
-            for (vision.inject) |sp| {
-                const n = sp.len * hidden;
-                try be.opAdd(
-                    offsetBufSized(x_d, sp.start * hidden * 4, n * 4),
-                    offsetBufSized(ds_d[l], row * hidden * 4, n * 4),
-                    n,
-                );
-                row += sp.len;
-            }
-            std.debug.assert(row == inject_rows);
-        }
-    }
-    std.debug.assert(tap_idx == tap_count);
-    try be.endBatch();
-
-    // Download tap-major [tap][seq][hidden]; transpose to token-major.
-    const tap_major = try gpa.alloc(f32, tap_count * seq * hidden);
-    defer gpa.free(tap_major);
-    try be.tensorDownload(out_d, std.mem.sliceAsBytes(tap_major));
-
-    const out = try gpa.alloc(f32, seq * tap_count * hidden);
-    errdefer gpa.free(out);
-    for (0..tap_count) |tp| {
-        for (0..seq) |t| {
-            @memcpy(out[(t * tap_count + tp) * hidden ..][0..hidden], tap_major[(tp * seq + t) * hidden ..][0..hidden]);
-        }
-    }
-    return out;
+    var d: EncDev = .{ .be = be, .gpa = gpa, .enc = enc, .act = act };
+    return qwen3_enc_dev.encode(&d, enc, gpa, ids, vision, cancel);
 }
 
+/// The `qwen3_enc_dev` adapter.
+pub const EncDev = struct {
+    be: *Backend,
+    gpa: std.mem.Allocator,
+    enc: *const qwen3.TextEncoder,
+    /// The width the residual, the norms and the FFN planes are stored at.
+    act: Dt = .f32,
+    plan: lin_cuda.Plan = undefined,
+    seq: usize = 0,
+    b: Bufs = undefined,
+    have_bufs: bool = false,
+    freqs: Buf = .{},
+    /// One contiguous buffer per LLM layer that takes a DeepStack feature, uploaded
+    /// before the batch opens so the host slices need not outlive it.
+    ds: []Buf = &.{},
+
+    pub fn setup(d: *EncDev, seq: usize, tap_count: usize, table: []const f32, deepstack: []const []const f32) !void {
+        d.seq = seq;
+        d.plan = blk: {
+            var arena = std.heap.ArenaAllocator.init(d.gpa);
+            defer arena.deinit();
+            const lins = try d.enc.deviceLins(arena.allocator());
+            const p = lin_cuda.withInt8(try lin_cuda.plan(lins, .{ .blockq = lin_cuda.encoder_gemm }, "qwen3 cuda encoder"), d.be, lin_cuda.dual_lin.encoderInt8());
+            // Before the batch: a scratch grown mid-batch frees memory queued kernels
+            // still read (the weight-only route's bf16 weight copy faulted on a 32B).
+            try lin_cuda.presize(d.be, p, lins);
+            try lin_cuda.presizeRows(d.be, p, lins, std.mem.alignForward(usize, seq, 128));
+            break :blk p;
+        };
+        errdefer d.teardown();
+        d.b = try Bufs.init(d.be, d.enc.cfg, seq, std.mem.alignForward(usize, seq, 128), tap_count, d.act);
+        d.have_bufs = true;
+        d.ds = try d.gpa.alloc(Buf, deepstack.len);
+        @memset(d.ds, .{});
+        // At the residual's width, so the row-span add is one dtype.
+        for (deepstack, d.ds) |feat, *b| {
+            var f32b = try d.be.tensorCreate(feat.len * 4);
+            defer if (d.act != .f32) d.be.tensorDestroy(&f32b);
+            try d.be.tensorUpload(f32b, std.mem.sliceAsBytes(feat));
+            if (d.act == .f32) {
+                b.* = f32b;
+                continue;
+            }
+            b.* = try d.be.tensorCreate(feat.len * d.act.bytes());
+            b.dt = d.act;
+            try d.be.opCast(f32b, b.*, feat.len, 0);
+        }
+        d.freqs = try d.be.tensorCreate(table.len * 4);
+        try d.be.tensorUpload(d.freqs, std.mem.sliceAsBytes(table));
+    }
+
+    pub fn teardown(d: *EncDev) void {
+        if (d.have_bufs) d.b.deinit(d.be);
+        d.have_bufs = false;
+        for (d.ds) |*b| d.be.tensorDestroy(b);
+        if (d.ds.len > 0) d.gpa.free(d.ds);
+        d.ds = &.{};
+        d.be.tensorDestroy(&d.freqs);
+    }
+
+    /// Into a 16-bit `b` through the f32 tap stack, which is free until the first tap.
+    pub fn upload(d: *EncDev, b: Buf, data: []const f32) !void {
+        if (b.dt == .f32) return d.be.tensorUpload(b, std.mem.sliceAsBytes(data));
+        try d.be.tensorUpload(d.b.out.slice(0, data.len * 4), std.mem.sliceAsBytes(data));
+        try d.be.opCast(d.b.out, b, data.len, 0);
+    }
+
+    pub fn download(d: *EncDev, b: Buf, dst: []f32) !void {
+        try d.be.tensorDownload(b, std.mem.sliceAsBytes(dst));
+    }
+
+    pub fn beginBatch(d: *EncDev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: *EncDev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: *EncDev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    /// One layer ahead, so an encoder larger than VRAM streams at PCIe speed.
+    pub fn prefetch(d: *EncDev, layer: anytype) void {
+        if (d.be.async_uploads) prefetchLayer(d.be, layer);
+    }
+
+    pub fn rmsNorm(d: *EncDev, x: Buf, y: Buf, w: []const f32, rows: usize, dim: usize, eps: f32) !void {
+        try d.be.qkNorm(x, y, try nbuf(d.be, w), rows, dim, eps);
+    }
+
+    pub fn gemms(d: *EncDev, x: Buf, rows: usize, cols: usize, ws: []const lin_cuda.Weight, ys: []const Buf) !void {
+        const g = try lin_cuda.prep(d.be, d.plan, x, rows, cols, ws);
+        for (ws, ys) |w, y| try lin_cuda.gemm(d.be, d.plan, g, y, w, null);
+    }
+
+    pub fn rope(d: *EncDev, x: Buf, rows: usize, heads: usize) !void {
+        try d.be.ropeHalf(x, d.freqs, rows, heads, half, rows * half, 0);
+    }
+
+    /// Causal flash-decoding over the prompt's own K/V (query t sees t + 1 keys); the
+    /// one-thread-per-query kernel serializes every key and cost a 1313-token prompt 10 s.
+    pub fn attention(d: *EncDev, seq: usize) !void {
+        const c = d.enc.cfg;
+        const b = d.b;
+        if (hd == 128 or hd == 256 or hd == 512)
+            try d.be.opAttnDecode(b.q, b.k, b.v, b.attn, b.scratch, 1, seq, c.n_heads, c.n_kv_heads, hd, enc_nsplit, attn_scale, 0, 0, false, .f32)
+        else
+            try d.be.attn(b.q, b.k, b.v, b.attn, seq, seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
+    }
+
+    pub fn add(d: *EncDev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn addRows(d: *EncDev, layer: usize, x_off: usize, f_off: usize, n: usize) !void {
+        const e = d.act.bytes();
+        try d.be.opAdd(d.b.x.slice(x_off * e, n * e), d.ds[layer].slice(f_off * e, n * e), n);
+    }
+
+    pub fn siluMul(d: *EncDev, g: Buf, u: Buf, n: usize) !void {
+        try d.be.siluMul(g, u, n);
+    }
+
+    pub fn copyTap(d: *EncDev, src: Buf, off: usize, n: usize) !void {
+        if (src.dt == .f32) return d.be.tensorCopy(d.b.out, off * 4, src, 0, n * 4);
+        try d.be.opCast(src, d.b.out, n, off);
+    }
+};
+
 /// Whether this backend's `encode` has a GEMM for every one of the encoder's weights
-/// under `encoder_gemm`, so the pipeline can fall back to the CPU encode instead of
+/// under `lin_cuda.encoder_gemm`, so the pipeline can fall back to the CPU encode instead of
 /// finding out from the image. A property of the checkpoint alone: an encoder that
 /// outgrows VRAM streams its layers (`prefetchLayer`), it never moves to the CPU.
 pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
@@ -302,7 +226,7 @@ pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const lins = enc.deviceLins(arena.allocator()) catch return false;
-    return lin_cuda.check(lins, encoder_gemm) == .ok;
+    return lin_cuda.check(lins, .{ .blockq = lin_cuda.encoder_gemm }) == .ok;
 }
 
 /// Queue one layer's weights for async upload so they land while the previous layer
@@ -338,6 +262,8 @@ fn nbuf(be: *Backend, weights: []const f32) !Buf {
 /// stepper (see llm/engine.zig generate()).
 pub const CudaLM = struct {
     lm: *const qwen3.CausalLM,
+    /// What `lin_cuda.plan` decided for this checkpoint, passed to every linear.
+    lin_plan: lin_cuda.Plan,
     be: *Backend,
     gpa: std.mem.Allocator,
     /// Model shape (mirrors lm.cfg): the 4B target or the 0.6B draft.
@@ -452,7 +378,7 @@ pub const CudaLM = struct {
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            try lin_llm.plan(try lm.deviceLins(arena.allocator()), @max(first_seq, spec_limits.max_draft + 1), "qwen3 cuda");
+            self.lin_plan = try lin_cuda.plan(try lm.deviceLins(arena.allocator()), lin_cuda.Use.llm(@max(first_seq, spec_limits.max_draft + 1)), "qwen3 cuda");
         }
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
@@ -768,7 +694,7 @@ pub const CudaLM = struct {
         try be.graphLaunch(self.graph_exec);
         self.advance(1);
         // `null` leaves logits resident for the on-device argmax (stepArgmax).
-        if (logits) |l| try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
+        if (logits) |l| try be.tensorDownload(self.bufs.logits.slice(0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
     }
 
     fn captureDecodeGraph(self: *CudaLM) !void {
@@ -794,7 +720,7 @@ pub const CudaLM = struct {
     /// Device-side embedding gather of g_state[0]'s row into bufs.x.
     fn embedGather(self: *CudaLM) !void {
         const c = self.cfg;
-        const x = offsetBufSized(self.bufs.x, 0, c.hidden * 4);
+        const x = self.bufs.x.slice(0, c.hidden * 4);
         if (self.lm.embed.dtype == .bf16) {
             try self.be.opEmbedGatherS(x, self.lm.embed.bytes, c.hidden);
         } else if (self.lm.embed.dtype == .f16) {
@@ -822,10 +748,10 @@ pub const CudaLM = struct {
                 }
             }
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, c.rms_eps);
-            const qkv = try lin_llm.prep(be, b.normed, 1, c.hidden, &.{ layer.q, layer.k, layer.v });
-            try lin_llm.gemm(be, qkv, b.q, layer.q);
-            try lin_llm.gemm(be, qkv, b.k, layer.k);
-            try lin_llm.gemm(be, qkv, b.v, layer.v);
+            const qkv = try lin_cuda.prep(be, self.lin_plan, b.normed, 1, c.hidden, &.{ layer.q, layer.k, layer.v });
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.q, layer.q, null);
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.k, layer.k, null);
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.v, layer.v, null);
             if (c.qk_norm) {
                 try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), c.n_heads, hd, c.rms_eps);
                 try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, c.rms_eps);
@@ -836,19 +762,19 @@ pub const CudaLM = struct {
             try be.opKvAppendS(self.k_cache[l].buf, b.k, c.kvDim(), c.kvDim(), 0, fmt);
             try be.opKvAppendS(self.v_cache[l].buf, b.v, c.kvDim(), c.kvDim(), 0, fmt);
             try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, fmt);
-            try lin_llm.linear(be, b.t, b.attn, 1, layer.o);
+            try lin_cuda.linear(be, self.lin_plan, b.t, b.attn, 1, layer.o, null);
             try be.opAdd(b.x, b.t, c.hidden);
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, c.rms_eps);
-            const gu = try lin_llm.prep(be, b.normed, 1, c.hidden, &.{ layer.gate, layer.up });
-            try lin_llm.gemm(be, gu, b.gate, layer.gate);
-            try lin_llm.gemm(be, gu, b.up, layer.up);
+            const gu = try lin_cuda.prep(be, self.lin_plan, b.normed, 1, c.hidden, &.{ layer.gate, layer.up });
+            try lin_cuda.gemm(be, self.lin_plan, gu, b.gate, layer.gate, null);
+            try lin_cuda.gemm(be, self.lin_plan, gu, b.up, layer.up, null);
             try be.siluMul(b.gate, b.up, c.intermediate);
-            try lin_llm.linear(be, b.t, b.gate, 1, layer.down);
+            try lin_cuda.linear(be, self.lin_plan, b.t, b.gate, 1, layer.down, null);
             try be.opAdd(b.x, b.t, c.hidden);
         }
-        try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, c.rms_eps);
+        try be.qkNorm(b.x.slice(0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, c.rms_eps);
         be.weight_noise.atHead();
-        try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
+        try lin_cuda.linear(be, self.lin_plan, b.logits, b.t, 1, self.lm.head, null);
     }
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
@@ -858,7 +784,7 @@ pub const CudaLM = struct {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
         std.debug.assert(logits.len == ids.len * self.cfg.vocab);
         try self.forwardAll(ids);
-        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, ids.len * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
+        try self.be.tensorDownload(self.bufs.logits.slice(0, ids.len * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
     /// Batched verify forward that leaves the per-row logits resident in
@@ -876,7 +802,7 @@ pub const CudaLM = struct {
         const h = self.cfg.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, self.cfg.rms_eps);
         be.weight_noise.atHead();
-        try lin_llm.linear(be, b.logits, b.t, seq, self.lm.head);
+        try lin_cuda.linear(be, self.lin_plan, b.logits, b.t, seq, self.lm.head, null);
         try be.endBatch();
         self.advance(seq);
     }
@@ -892,7 +818,7 @@ pub const CudaLM = struct {
         const be = self.be;
         const b = &self.bufs;
         for (0..ids.len) |r| {
-            try be.opArgmax(offsetBufSized(b.logits, r * self.cfg.vocab * 4, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+            try be.opArgmax(b.logits.slice(r * self.cfg.vocab * 4, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
             var idf: [1]f32 = undefined;
             try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
             out_ids[r] = @intFromFloat(idf[0]);
@@ -1018,8 +944,8 @@ pub const CudaLM = struct {
             // The host shadow stores the same dtype as the device cache
             // (kRowBytes is the device byte layout), so this is a raw copy.
             const dt = self.kv_dtype;
-            try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
-            try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
+            try self.be.tensorDownload(self.k_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+            try self.be.tensorDownload(self.v_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
         }
         self.be.growableDestroy(&self.k_cache[l]);
         self.be.growableDestroy(&self.v_cache[l]);
@@ -1111,8 +1037,8 @@ pub const CudaLM = struct {
         self.k_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
         self.v_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
         if (self.len > 0) {
-            try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
-            try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
+            try self.be.tensorUpload(self.k_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+            try self.be.tensorUpload(self.v_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
@@ -1261,14 +1187,14 @@ pub const CudaLM = struct {
             }
         }
         const meta_off = n * c.n_heads * nsplit * (hd + 4);
-        try be.tensorUpload(offsetBufSized(tb.pos, 0, n * 4), std.mem.sliceAsBytes(pos[0..n]));
-        try be.tensorUpload(offsetBufSized(tb.scratch, meta_off * 4, n * (n + 1) * 4), std.mem.sliceAsBytes(meta[0 .. n * (n + 1)]));
+        try be.tensorUpload(tb.pos.slice(0, n * 4), std.mem.sliceAsBytes(pos[0..n]));
+        try be.tensorUpload(tb.scratch.slice(meta_off * 4, n * (n + 1) * 4), std.mem.sliceAsBytes(meta[0 .. n * (n + 1)]));
 
         // CPU: embedding gather (storage dtype -> f32), upload.
         const x = try gpa.alloc(f32, n * c.hidden);
         defer gpa.free(x);
         try qwen3.embedTokens(self.lm.embed, tokens, x);
-        try be.tensorUpload(offsetBufSized(b.x, 0, n * c.hidden * 4), std.mem.sliceAsBytes(x));
+        try be.tensorUpload(b.x.slice(0, n * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         be.weight_noise.tick();
         try be.beginBatch();
@@ -1277,15 +1203,15 @@ pub const CudaLM = struct {
             be.weight_noise.atLayer(l);
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden, false);
+                    if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
                 }
             }
             // --- Attention ---
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, c.hidden, c.rms_eps);
-            const qkv = try lin_llm.prep(be, b.normed, n, c.hidden, &.{ layer.q, layer.k, layer.v });
-            try lin_llm.gemm(be, qkv, b.q, layer.q);
-            try lin_llm.gemm(be, qkv, b.k, layer.k);
-            try lin_llm.gemm(be, qkv, b.v, layer.v);
+            const qkv = try lin_cuda.prep(be, self.lin_plan, b.normed, n, c.hidden, &.{ layer.q, layer.k, layer.v });
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.q, layer.q, null);
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.k, layer.k, null);
+            try lin_cuda.gemm(be, self.lin_plan, qkv, b.v, layer.v, null);
             if (c.qk_norm) {
                 try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * c.n_heads, hd, c.rms_eps);
                 try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, c.rms_eps);
@@ -1295,16 +1221,16 @@ pub const CudaLM = struct {
             try be.tensorCopy(self.k_cache[l].buf, self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
             try be.tensorCopy(self.v_cache[l].buf, self.capacity * c.kvDim() * 4, b.v, 0, n * c.kvDim() * 4);
             try be.opAttnDecodeTree(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, tb.scratch, self.len, self.capacity, n, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
-            try lin_llm.linear(be, b.t, b.attn, n, layer.o);
+            try lin_cuda.linear(be, self.lin_plan, b.t, b.attn, n, layer.o, null);
             try be.opAdd(b.x, b.t, n * c.hidden);
 
             // --- MLP (SwiGLU) ---
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), n, c.hidden, c.rms_eps);
-            const gu = try lin_llm.prep(be, b.normed, n, c.hidden, &.{ layer.gate, layer.up });
-            try lin_llm.gemm(be, gu, b.gate, layer.gate);
-            try lin_llm.gemm(be, gu, b.up, layer.up);
+            const gu = try lin_cuda.prep(be, self.lin_plan, b.normed, n, c.hidden, &.{ layer.gate, layer.up });
+            try lin_cuda.gemm(be, self.lin_plan, gu, b.gate, layer.gate, null);
+            try lin_cuda.gemm(be, self.lin_plan, gu, b.up, layer.up, null);
             try be.siluMul(b.gate, b.up, n * c.intermediate);
-            try lin_llm.linear(be, b.t, b.gate, n, layer.down);
+            try lin_cuda.linear(be, self.lin_plan, b.t, b.gate, n, layer.down, null);
             try be.opAdd(b.x, b.t, n * c.hidden);
         }
 
@@ -1313,11 +1239,11 @@ pub const CudaLM = struct {
         const h = c.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, c.rms_eps);
         be.weight_noise.atHead();
-        try lin_llm.linear(be, tb.logits, b.t, n, self.lm.head);
+        try lin_cuda.linear(be, self.lin_plan, tb.logits, b.t, n, self.lm.head, null);
         try be.endBatch();
         self.tree_n = n;
 
-        try be.tensorDownload(offsetBufSized(tb.logits, 0, n * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
+        try be.tensorDownload(tb.logits.slice(0, n * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
     /// Copy the accepted root path's K/V rows (and tap rows, when the
@@ -1333,15 +1259,15 @@ pub const CudaLM = struct {
         for (0..c.n_layers) |l| {
             for (path, 0..) |idx, j| {
                 std.debug.assert(idx < self.tree_n);
-                try be.opCopyOff(self.k_cache[l].buf, (self.len + j) * kvd, self.k_cache[l].buf, (self.capacity + idx) * kvd, kvd, false);
-                try be.opCopyOff(self.v_cache[l].buf, (self.len + j) * kvd, self.v_cache[l].buf, (self.capacity + idx) * kvd, kvd, false);
+                try be.opCopyOff(self.k_cache[l].buf, (self.len + j) * kvd, self.k_cache[l].buf, (self.capacity + idx) * kvd, kvd);
+                try be.opCopyOff(self.v_cache[l].buf, (self.len + j) * kvd, self.v_cache[l].buf, (self.capacity + idx) * kvd, kvd);
             }
         }
         if (self.taps_on) {
             const tb = &self.tree.?;
             for (0..3) |t| {
                 for (path, 0..) |idx, j| {
-                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec_limits.max_tree_nodes + idx) * c.hidden, c.hidden, false);
+                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec_limits.max_tree_nodes + idx) * c.hidden, c.hidden);
                 }
             }
         }
@@ -1358,14 +1284,14 @@ pub const CudaLM = struct {
 
         // Final norm on the last position + tied bf16 LM head, on device.
         const h = self.cfg.hidden;
-        try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, self.cfg.rms_eps);
+        try be.qkNorm(b.x.slice((seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, self.cfg.rms_eps);
         be.weight_noise.atHead();
-        try lin_llm.linear(be, b.logits, b.t, 1, self.lm.head);
+        try lin_cuda.linear(be, self.lin_plan, b.logits, b.t, 1, self.lm.head, null);
         try be.endBatch();
         self.advance(seq);
 
         // `null` leaves logits resident for the on-device argmax (stepArgmax).
-        if (logits) |l| try be.tensorDownload(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
+        if (logits) |l| try be.tensorDownload(b.logits.slice(0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
     }
 
     /// Greedy decode without the vocab download: forward `ids`, then argmax the
@@ -1400,8 +1326,8 @@ pub const CudaLM = struct {
     fn argmaxLogits(self: *CudaLM, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        try be.opArgmax(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var id_f: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
         return @intFromFloat(id_f[0]);
@@ -1439,8 +1365,8 @@ pub const CudaLM = struct {
         }
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        const count = try be.opTopK(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
         var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
@@ -1464,10 +1390,10 @@ pub const CudaLM = struct {
     pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // qwen3: uniform geometry
         const b = &self.bufs;
-        const g = try lin_llm.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
-        try lin_llm.gemm(self.be, g, b.q, layer.q);
-        try lin_llm.gemm(self.be, g, b.k, layer.k);
-        try lin_llm.gemm(self.be, g, b.v, layer.v);
+        const g = try lin_cuda.prep(self.be, self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.q, layer.q, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.k, layer.k, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.v, layer.v, null);
     }
     pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -1503,29 +1429,16 @@ pub const CudaLM = struct {
     pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const c = self.cfg;
         const b = &self.bufs;
-        // f16/q8_0 K/V is only read by the flash-split kernels (opAttnDecode);
-        // the square `be.attn` path is f32-only, so non-f32 dtypes route all
-        // prefill through opAttnDecode (correct for any seq_q, just less
-        // parallel for big batches).
-        if (self.kv_dtype != .f32 or seq <= gemv_batch_max) {
-            // Batched flash-decoding: the naive square kernel has too little
-            // parallelism for a handful of queries. Query batches BEYOND the
-            // spec-verify size (f16/q8_0 prefill chunks, up to max_rows) take the
-            // smaller prefill split count, attn_scratch is sized for
-            // max_rows x nsplit_prefill, and a full nsplit there would
-            // overrun it (the fault behind the GUI's "PTX JIT failed:
-            // CUDA_ERROR_ILLEGAL_ADDRESS" on a long f16 first prompt). Small
-            // batches keep nsplit so spec-verify logits stay bitwise
-            // identical to the decode path.
-            const ns: usize = if (seq <= gemv_batch_max) nsplit else nsplit_prefill;
-            try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, ns, attn_scale, 0, 0, false, kvFmt(self.kv_dtype));
-        } else {
-            try self.be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
-        }
+        // Flash-decoding over the cache for every batch and KV dtype. Batches past the
+        // spec-verify size take the prefill split count, which `attn_scratch` is sized
+        // for; small ones keep `nsplit`, so spec-verify logits stay bitwise identical
+        // to the decode path.
+        const ns: usize = if (seq <= gemv_batch_max) nsplit else nsplit_prefill;
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, ns, attn_scale, 0, 0, false, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        try lin_llm.linear(self.be, self.bufs.t, self.bufs.attn, seq, layer.o);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.t, self.bufs.attn, seq, layer.o, null);
     }
     pub fn addResidual(self: *CudaLM, seq: usize) !void {
         try self.be.opAdd(self.bufs.x, self.bufs.t, seq * self.cfg.hidden);
@@ -1536,9 +1449,9 @@ pub const CudaLM = struct {
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
         const b = &self.bufs;
-        const g = try lin_llm.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
-        try lin_llm.gemm(self.be, g, b.gate, layer.gate);
-        try lin_llm.gemm(self.be, g, b.up, layer.up);
+        const g = try lin_cuda.prep(self.be, self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.gate, layer.gate, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.up, layer.up, null);
     }
     pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -1548,7 +1461,7 @@ pub const CudaLM = struct {
         }
     }
     pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
-        try lin_llm.linear(self.be, self.bufs.t, self.bufs.gate, seq, layer.down);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.t, self.bufs.gate, seq, layer.down, null);
     }
 
     fn layersForward(self: *CudaLM, ids: []const u32) !void {
@@ -1563,7 +1476,7 @@ pub const CudaLM = struct {
         const x = try gpa.alloc(f32, seq * c.hidden);
         defer gpa.free(x);
         try qwen3.embedTokens(self.lm.embed, ids, x);
-        try be.tensorUpload(offsetBufSized(self.bufs.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(x));
+        try be.tensorUpload(self.bufs.x.slice(0, seq * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         const b = &self.bufs;
         // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
@@ -1577,7 +1490,7 @@ pub const CudaLM = struct {
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden, false);
+                    if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden);
                 }
             }
             // Hybrid CPU/GPU split: run host-resident layers on the CPU via the
@@ -1587,7 +1500,7 @@ pub const CudaLM = struct {
             if (self.split) |*sp| {
                 if (!sp.on_gpu[l]) {
                     if (!sp.on_host) {
-                        try be.tensorDownload(offsetBufSized(b.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
+                        try be.tensorDownload(b.x.slice(0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
                         sp.on_host = true;
                     }
                     const host_io = self.io orelse return error.SplitIoUnset;
@@ -1600,7 +1513,7 @@ pub const CudaLM = struct {
                     continue;
                 }
                 if (sp.on_host) {
-                    try be.tensorUpload(offsetBufSized(b.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
+                    try be.tensorUpload(b.x.slice(0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
                     sp.on_host = false;
                 }
             }
@@ -1611,7 +1524,7 @@ pub const CudaLM = struct {
         // last layers first, so this is the common case), bring the final
         // hidden back to the device for the final norm + LM head.
         if (self.split) |*sp| if (sp.on_host) {
-            try be.tensorUpload(offsetBufSized(b.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
+            try be.tensorUpload(b.x.slice(0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
             sp.on_host = false;
         };
     }
@@ -1634,11 +1547,6 @@ pub const CudaLM = struct {
     /// max_rows x nsplit would be huge. Matches gemma3_cuda.
     const nsplit_prefill = 8;
 };
-
-/// offsetBuf carrying an explicit size (tensorUpload/Download use db.size).
-fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
-}
 
 const LmBufs = struct {
     x: Buf,
@@ -1750,7 +1658,7 @@ test "cuda tree spec matches vanilla greedy on the real model" {
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -1804,7 +1712,7 @@ fn cpuSplitGenerateBody(kv_dtype: kvmod.KvDtype) !void {
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -1907,7 +1815,7 @@ test "cuda cpu split with q8_0 kv: host layers generate, rollback stays in sync,
 test "cuda cpu split survives a kv dtype toggle (reinitCache)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -1956,7 +1864,7 @@ test "cuda gui turn lifecycle: prefill, checkpoint rollback, residency reset" {
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -2033,8 +1941,12 @@ const Bufs = struct {
     up: Buf,
     t: Buf,
     out: Buf, // tap-major [tap][seq][hidden]
+    /// The split-attention partials, `enc_nsplit` per query and head.
+    scratch: Buf,
 
-    fn init(be: *Backend, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
+    /// `act` is the encoder dial's width, for the buffers in `typed`; q/k/v, the
+    /// attention and the tap stack stay f32.
+    fn init(be: *Backend, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize, act: Dt) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
@@ -2043,20 +1955,23 @@ const Bufs = struct {
         // GEMM outputs (q/k/v/gate/up/t) are 128-row padded (pad rows are zero);
         // x/normed/attn are indexed by real seq.
         const sizes = [fields.len]usize{
-            seq * c.hidden * 4, // x
-            seq * c.hidden * 4, // normed
-            seq_pad * c.qDim() * 4, // q
-            seq_pad * c.kvDim() * 4, // k
-            seq_pad * c.kvDim() * 4, // v
-            seq * c.qDim() * 4, // attn
-            seq_pad * c.intermediate * 4, // gate
-            seq_pad * c.intermediate * 4, // up
-            seq_pad * c.hidden * 4, // t
-            tap_count * seq * c.hidden * 4, // out
+            seq * c.hidden, // x
+            seq * c.hidden, // normed
+            seq_pad * c.qDim(), // q
+            seq_pad * c.kvDim(), // k
+            seq_pad * c.kvDim(), // v
+            seq * c.qDim(), // attn
+            seq_pad * c.intermediate, // gate
+            seq_pad * c.intermediate, // up
+            seq_pad * c.hidden, // t
+            tap_count * seq * c.hidden, // out
+            seq * c.n_heads * enc_nsplit * (qwen3.head_dim + 4), // scratch
         };
-        inline for (fields, sizes) |name, size| {
-            be.noteBuf(name, size);
-            @field(self, name) = try be.tensorCreate(size);
+        inline for (fields, sizes) |name, elems| {
+            const w: Dt = if (comptime isTyped(name)) act else .f32;
+            be.noteBuf(name, elems * w.bytes());
+            @field(self, name) = try be.tensorCreate(elems * w.bytes());
+            @field(self, name).dt = w;
             created += 1;
         }
         return self;
@@ -2067,8 +1982,16 @@ const Bufs = struct {
         self.* = undefined;
     }
 
-    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "out" };
+    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "out", "scratch" };
+
+    fn isTyped(comptime name: []const u8) bool {
+        inline for (.{ "x", "normed", "gate", "up", "t" }) |t| if (comptime std.mem.eql(u8, name, t)) return true;
+        return false;
+    }
 };
+
+/// KV chunks per query and head in the encoder's split attention.
+const enc_nsplit = 8;
 
 // qwen3 twin of the gemma3/qwen35 live-VRAM plan test: with most of the card
 // occupied, a generous budget must still plan layers onto the host (the clamp
@@ -2077,7 +2000,7 @@ test "cpu split plan respects live free VRAM" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const test_gate = @import("../test_gate.zig");
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -2112,7 +2035,7 @@ test "cpu split plan respects live free VRAM" {
 test "cuda f16 kv long prefill does not overrun the attention scratch" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;

@@ -1,5 +1,7 @@
 //! GPU-resident SenseNova U1.5 on the CUDA backends (`zig-cuda`'s hand-PTX and
-//! `cuda`'s vendor libraries), the device twin of `models/sensenova.zig`.
+//! `cuda`'s vendor libraries), the device twin of `models/sensenova.zig`. The passes
+//! themselves are `sensenova_dev.zig`; this is their adapter (`Dev`) and what the
+//! backend owns.
 //!
 //! Both passes run here, and they are different shapes rather than one shape twice:
 //!
@@ -22,7 +24,10 @@
 
 const std = @import("std");
 const sensenova = @import("sensenova.zig");
+const conv_cuda = @import("conv_cuda.zig");
+const sd_unet_cuda = @import("sd_unet_cuda.zig");
 const lin_cuda = @import("lin_cuda.zig");
+const sensenova_dev = @import("sensenova_dev.zig");
 const lora_cuda = @import("lora_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -32,6 +37,7 @@ const Config = sensenova.Config;
 const Prefix = sensenova.Prefix;
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
+const Dt = cuda.backend.Dt;
 const Weight = ops.matmul.Weight;
 
 /// Force the naive one-thread-per-(query, head) attention instead of the
@@ -39,9 +45,10 @@ const Weight = ops.matmul.Weight;
 /// both.
 pub var force_naive_attn: bool = false;
 
-/// Cap on one im2col band, so a 3x3 over a 1024-wide canvas does not materialize a
-/// [4096][9216] patch in one allocation.
-const patch_band_bytes: usize = 64 << 20;
+/// Run integer weights weight-only, so the device check can split a W8A8 forward's
+/// activation noise from everything else. At f16 (`weight_only_f16`): a bf16 expansion
+/// rounds every int8-times-scale weight to 8 bits and read 2x the dense floor at depth.
+pub var force_weight_only: bool = false;
 
 /// Whether the CUDA arms can run every linear this model has, in BOTH streams. The
 /// refusal is logged by name; the caller says the trunk then runs on the CPU.
@@ -50,8 +57,8 @@ const patch_band_bytes: usize = 64 << 20;
 /// copies differently would otherwise build a session and fail inside the encode.
 pub fn supported(model: *const Model) bool {
     if (model.layers.len == 0) return false;
-    _ = lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "sensenova cuda") catch return false;
-    _ = lin_cuda.plan(model.prefix_lins, lin_cuda.blockq_gemm, "sensenova cuda prefix") catch return false;
+    _ = lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "sensenova cuda") catch return false;
+    _ = lin_cuda.plan(model.prefix_lins, .{ .blockq = lin_cuda.encoder_gemm }, "sensenova cuda prefix") catch return false;
     // A sidecar this backend cannot apply makes the whole trunk unsupported, not
     // "supported without the LoRA": running the base GEMMs alone is a different
     // model, silently.
@@ -63,6 +70,13 @@ pub fn supported(model: *const Model) bool {
         }
     }
     return true;
+}
+
+/// Build the int8 A of every attached LoRA hit on an int8 linear, over both streams.
+/// Call once the stack is resolved against `model`, before the first forward.
+pub fn quantizeLora(gpa: std.mem.Allocator, model: *const Model, stack: *@import("lora.zig").Stack) !void {
+    try lin_cuda.quantizeLora(gpa, stack, model.device_lins, lin_cuda.blockq_gemm, .w8a8);
+    try lin_cuda.quantizeLora(gpa, stack, model.prefix_lins, lin_cuda.encoder_gemm, lin_cuda.dual_lin.encoderInt8());
 }
 
 // --- shared pieces ----------------------------------------------------------
@@ -81,37 +95,19 @@ fn uploadU32(be: *Backend, values: []const u32) !Buf {
     return buf;
 }
 
-/// A rotate-half table flattened as `cos` then `sin`, the layout every rope kernel
-/// here reads with `sin_off = rows * half`.
+/// A `sensenova.FlatRope` on the device.
 const Table = struct {
     buf: Buf,
     half: usize,
     sin_off: usize,
 
-    fn init(be: *Backend, gpa: std.mem.Allocator, rows: usize, span: usize, theta: f64) !Table {
-        var f = try ops.rope.rotateHalfFreqs(gpa, rows, span, theta);
-        defer f.deinit(gpa);
-        return upload(be, gpa, f, rows);
-    }
-
-    fn initInterleaved(be: *Backend, gpa: std.mem.Allocator, rows: usize, dim: usize, theta: f64) !Table {
-        const pos = try gpa.alloc(f32, rows);
-        defer gpa.free(pos);
-        for (pos, 0..) |*p, i| p.* = @floatFromInt(i);
-        var f = try ops.rope.fluxFreqs(gpa, pos, &.{dim}, theta);
-        defer f.deinit(gpa);
-        return upload(be, gpa, f, rows);
-    }
-
-    fn upload(be: *Backend, gpa: std.mem.Allocator, f: ops.rope.Freqs, rows: usize) !Table {
-        const flat = try gpa.alloc(f32, 2 * rows * f.half);
-        defer gpa.free(flat);
-        @memcpy(flat[0 .. rows * f.half], f.cos[0 .. rows * f.half]);
-        @memcpy(flat[rows * f.half ..], f.sin[0 .. rows * f.half]);
-        const buf = try be.tensorCreate(flat.len * 4);
+    fn init(be: *Backend, gpa: std.mem.Allocator, rows: usize, span: usize, theta: f64, interleaved: bool) !Table {
+        const f = try sensenova.FlatRope.init(gpa, rows, span, theta, interleaved);
+        defer gpa.free(f.data);
+        const buf = try be.tensorCreate(f.data.len * 4);
         errdefer be.tensorDestroy(@constCast(&buf));
-        try be.tensorUpload(buf, std.mem.sliceAsBytes(flat));
-        return .{ .buf = buf, .half = f.half, .sin_off = rows * f.half };
+        try be.tensorUpload(buf, std.mem.sliceAsBytes(f.data));
+        return .{ .buf = buf, .half = f.half, .sin_off = f.sin_off };
     }
 
     fn deinit(self: *Table, be: *Backend) void {
@@ -119,61 +115,6 @@ const Table = struct {
     }
 };
 
-/// The per-head norms and the three-span rope, applied to a q or k buffer in place.
-///
-/// `norm_w` is the layer's `[q_norm ++ q_norm_hw]` pair as one 128-wide vector, so
-/// `groupRmsNorm` normalizes each half of the head against its own scale in one
-/// launch: the two spans are contiguous and equally wide, which is exactly the
-/// group form.
-fn qkPrepare(
-    be: *Backend,
-    cfg: Config,
-    x: Buf,
-    rows: usize,
-    heads: usize,
-    norm_w: Buf,
-    pos: [3]Buf,
-    tables: [3]Table,
-) !void {
-    try be.groupRmsNorm(x, x, norm_w, rows * heads, cfg.head_dim, 2, cfg.norm_eps);
-    const t_span = cfg.spanT();
-    const hw = cfg.spanHw();
-    const offs = [3]usize{ 0, t_span, t_span + hw };
-    inline for (0..3) |i| {
-        try be.opRopeHalfSpanPos(x, pos[i], tables[i].buf, rows, heads, tables[i].half, tables[i].sin_off, cfg.head_dim, offs[i]);
-    }
-}
-
-/// A non-overlapping k x k stride-k convolution over channel-last `[h][w][ci]`:
-/// gather the patch matrix, then one GEMM. `dst` is `[h/k * w/k][co]`.
-fn convStride(be: *Backend, patch: *Buf, dst: Buf, src: Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
-    const n_out = (h / cv.k) * (w / cv.k);
-    const plen = cv.k * cv.k * cv.ci;
-    try be.ensureDeviceBuffer(patch, n_out * plen * 4);
-    try be.opIm2colStride(patch.*, src, h, w, cv.ci, cv.k);
-    try be.opConvF16(dst, 0, patch.*, n_out, std.mem.sliceAsBytes(cv.w), cv.co, plen, cv.b.?);
-}
-
-/// A 3x3 pad-1 stride-1 convolution over channel-last `[h][w][ci]`. cuDNN when the
-/// vendor libraries are loaded, else the SD family's banded im2col plus the same
-/// f16 GEMM.
-fn conv3x3(be: *Backend, patch: *Buf, dst: Buf, src: Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
-    std.debug.assert(cv.k == 3 and cv.stride == 1 and cv.pad == 1);
-    const bias = cv.b.?;
-    if (be.kernels == .libs and ops.matmul.probe == null) {
-        return be.opConvCudnn(dst, 0, src, h, w, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, bias, false, false);
-    }
-    const n_out = h * w;
-    const plen = 9 * cv.ci;
-    const band = @max(4, @min(n_out, patch_band_bytes / (plen * 4)) & ~@as(usize, 3));
-    try be.ensureDeviceBuffer(patch, band * plen * 4);
-    var p0: usize = 0;
-    while (p0 < n_out) : (p0 += band) {
-        const bn = @min(band, n_out - p0);
-        try be.opIm2colSd(src, patch.*, bn, plen, cv.ci, w, h, p0, w, 0, false);
-        try be.opConvF16(dst, p0 * cv.co, patch.*, bn, std.mem.sliceAsBytes(cv.w), cv.co, plen, bias);
-    }
-}
 
 // --- the prefix pass --------------------------------------------------------
 
@@ -225,6 +166,11 @@ const PrefixWs = struct {
     }
 };
 
+/// The generation stream's linear plan, without a LoRA.
+pub fn canvasPlan(_: *Backend, model: *const Model) !lin_cuda.Plan {
+    return lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "sensenova cuda");
+}
+
 /// Run the prompt through the base MoT copy and return the prefix KV cache, the
 /// conditioning this family's `encode` produces.
 ///
@@ -238,13 +184,18 @@ pub fn prefixForward(
     gpa: std.mem.Allocator,
     layout: sensenova.PromptLayout,
     refs: []const sensenova.RefImage,
+    act: Dt,
     cancel: ?*std.atomic.Value(bool),
 ) !Prefix {
     const cfg = model.cfg;
     const seq = layout.ids.len;
     std.debug.assert(seq > 0);
-    var plan = try lin_cuda.plan(model.prefix_lins, lin_cuda.blockq_gemm, "sensenova cuda prefix");
+    // The prompt pass is the conditioning, so it takes the text encoders' policy for
+    // both packed kinds: at full depth a q4_k prefix on the int8 decode (which
+    // quantizes the activation) is 35% off the exact KV, on f16 0.19%.
+    var plan = lin_cuda.withInt8(try lin_cuda.plan(model.prefix_lins, .{ .blockq = lin_cuda.encoder_gemm }, "sensenova cuda prefix"), be, lin_cuda.dual_lin.encoderInt8());
     try lin_cuda.presize(be, plan, model.prefix_lins);
+    try lin_cuda.presizeRows(be, plan, model.prefix_lins, seq);
     if (model.lora) |stack| {
         plan.lora = stack;
         try lin_cuda.presizeLora(be, stack, model.prefix_lins, seq);
@@ -261,33 +212,18 @@ pub fn prefixForward(
 
     var ws = try PrefixWs.init(be, cfg, seq);
     defer ws.deinit(be);
+    inline for (.{ "x", "nrm", "mg", "mu" }) |name| @field(ws, name).dt = sensenova_dev.streamDtFor(act);
 
-    // The position arrays are `usize` on the host and `u32` on the device; the
-    // tables are sized to the largest position each axis actually reaches, which
-    // is 1 row for the hw axes of a prompt with no pictures in it.
-    const pos32 = try gpa.alloc(u32, 3 * seq);
-    defer gpa.free(pos32);
-    var maxpos = [3]usize{ 0, 0, 0 };
-    for ([3][]const usize{ layout.pos_t, layout.pos_h, layout.pos_w }, 0..) |src, axis| {
-        for (src, 0..) |v, i| {
-            pos32[axis * seq + i] = @intCast(v);
-            maxpos[axis] = @max(maxpos[axis], v);
-        }
-    }
-
-    var tab_t = try Table.init(be, gpa, maxpos[0] + 1, cfg.spanT(), cfg.theta_t);
+    var pp = try sensenova.PromptPositions.init(gpa, layout);
+    defer gpa.free(pp.pos);
+    var tab_t = try Table.init(be, gpa, pp.max[0] + 1, cfg.spanT(), cfg.theta_t, false);
     defer tab_t.deinit(be);
-    var tab_h = try Table.init(be, gpa, maxpos[1] + 1, cfg.spanHw(), cfg.theta_hw);
+    var tab_h = try Table.init(be, gpa, pp.max[1] + 1, cfg.spanHw(), cfg.theta_hw, false);
     defer tab_h.deinit(be);
-    var tab_w = try Table.init(be, gpa, maxpos[2] + 1, cfg.spanHw(), cfg.theta_hw);
+    var tab_w = try Table.init(be, gpa, pp.max[2] + 1, cfg.spanHw(), cfg.theta_hw, false);
     defer tab_w.deinit(be);
-    var pos_bufs = [3]Buf{
-        try uploadU32(be, pos32[0..seq]),
-        try uploadU32(be, pos32[seq..][0..seq]),
-        try uploadU32(be, pos32[2 * seq ..][0..seq]),
-    };
+    var pos_bufs = [3]Buf{ try uploadU32(be, pp.axis(0)), try uploadU32(be, pp.axis(1)), try uploadU32(be, pp.axis(2)) };
     defer for (&pos_bufs) |*p| be.tensorDestroy(p);
-    const tables = [3]Table{ tab_t, tab_h, tab_w };
 
     // The block-causal bound, as the batched attention's per-query key range: an
     // image block's tokens see each other in full, so their range runs past their
@@ -307,45 +243,20 @@ pub fn prefixForward(
         // the trunk's 8B, and it runs once per conditioning rather than per step.
         const emb = try model.embedPrompt(io, gpa, layout, refs);
         defer gpa.free(emb);
-        try be.tensorUpload(ws.x, std.mem.sliceAsBytes(emb));
+        try be.tensorUpload(ws.dlt, std.mem.sliceAsBytes(emb));
     }
 
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const kv_bytes = seq * cfg.kvDim() * 4;
-    for (model.layers, 0..) |*layer, li| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (be.async_uploads and li + 1 < model.layers.len) prefetchStream(be, &model.layers[li + 1].base);
-        try be.beginBatch();
-        errdefer if (be.batching()) be.abortBatch();
-        try layerForward(be, plan, cfg, &layer.base, .{
-            .x = ws.x,
-            .nrm = ws.nrm,
-            .dlt = ws.dlt,
-            .q = ws.q,
-            .k = ws.k,
-            .v = ws.v,
-            .kcat = ws.k,
-            .vcat = ws.v,
-            .attn = ws.attn,
-            .mg = ws.mg,
-            .mu = ws.mu,
-        }, seq, seq, .{
-            .pos = pos_bufs,
-            .tables = tables,
-            .norm_q = try smallBuf(be, layer.base.q_norm_pair),
-            .norm_k = try smallBuf(be, layer.base.k_norm_pair),
-            .scale = scale,
-            .causal = true,
-            .bounds = bounds,
-            .prefix_rows = 0,
-        });
-        try be.endBatch();
-        // Down per layer rather than at the end: the whole cache is 172 KB per
-        // token per layer, and holding 42 layers of it on the device as well as on
-        // the host would cost the generation stack the room it needs.
-        try be.tensorDownload(offsetBuf(ws.k, 0, kv_bytes), std.mem.sliceAsBytes(pre.kv[(li * 2) * seq * cfg.kvDim() ..][0 .. seq * cfg.kvDim()]));
-        try be.tensorDownload(offsetBuf(ws.v, 0, kv_bytes), std.mem.sliceAsBytes(pre.kv[(li * 2 + 1) * seq * cfg.kvDim() ..][0 .. seq * cfg.kvDim()]));
-    }
+    try sensenova_dev.prefix(Dev{
+        .be = be,
+        .plan = plan,
+        .cfg = cfg,
+        .b = .{ .x = ws.x, .nrm = ws.nrm, .dlt = ws.dlt, .q = ws.q, .k = ws.k, .v = ws.v, .kcat = ws.k, .vcat = ws.v, .attn = ws.attn, .mg = ws.mg, .mu = ws.mu },
+        .pos = pos_bufs,
+        .tables = .{ tab_t, tab_h, tab_w },
+        .causal = true,
+        .bounds = bounds,
+        .kv = pre.kv,
+    }, model, seq, cancel);
     return pre;
 }
 
@@ -409,7 +320,10 @@ pub const Session = struct {
             .tw = tw,
             .n_img = n_img,
             .prefix_seq = pre.seq,
-            .plan = try lin_cuda.plan(model.device_lins, lin_cuda.blockq_gemm, "sensenova cuda"),
+            .plan = blk: {
+                const p = try canvasPlan(be, model);
+                break :blk if (force_weight_only) lin_cuda.withInt8(p, be, .weight_only_f16) else p;
+            },
             .prefix_kv = undefined,
             .tab_t = undefined,
             .tab_h = undefined,
@@ -446,51 +360,24 @@ pub const Session = struct {
         try be.tensorUpload(self.prefix_kv, std.mem.sliceAsBytes(pre.kv));
 
         // Every image token takes the same t index, one past the whole prefix.
-        self.tab_t = try Table.init(be, gpa, pre.time + 1, cfg.spanT(), cfg.theta_t);
+        self.tab_t = try Table.init(be, gpa, pre.time + 1, cfg.spanT(), cfg.theta_t, false);
         made += 1;
-        self.tab_h = try Table.init(be, gpa, th, cfg.spanHw(), cfg.theta_hw);
+        self.tab_h = try Table.init(be, gpa, th, cfg.spanHw(), cfg.theta_hw, false);
         made += 1;
-        self.tab_w = try Table.init(be, gpa, tw, cfg.spanHw(), cfg.theta_hw);
+        self.tab_w = try Table.init(be, gpa, tw, cfg.spanHw(), cfg.theta_hw, false);
         made += 1;
-        self.tab_vx = try Table.initInterleaved(be, gpa, gw, cfg.vis_dim / 2, cfg.theta_vis);
+        self.tab_vx = try Table.init(be, gpa, gw, cfg.vis_dim / 2, cfg.theta_vis, true);
         made += 1;
-        self.tab_vy = try Table.initInterleaved(be, gpa, gh, cfg.vis_dim / 2, cfg.theta_vis);
+        self.tab_vy = try Table.init(be, gpa, gh, cfg.vis_dim / 2, cfg.theta_vis, true);
         made += 1;
 
         // Position arrays get device buffers of their own rather than going through
         // `smallBuffer`: that cache is keyed on the HOST POINTER, so a scratch array
         // freed here whose address is later recycled would be served this upload.
-        {
-            const t = try gpa.alloc(u32, n_img);
-            defer gpa.free(t);
-            const h = try gpa.alloc(u32, n_img);
-            defer gpa.free(h);
-            const w = try gpa.alloc(u32, n_img);
-            defer gpa.free(w);
-            for (0..n_img) |i| {
-                t[i] = pre.time;
-                h[i] = @intCast(i / tw);
-                w[i] = @intCast(i % tw);
-            }
-            self.pos_t = try uploadU32(be, t);
-            made += 1;
-            self.pos_h = try uploadU32(be, h);
-            made += 1;
-            self.pos_w = try uploadU32(be, w);
-            made += 1;
-        }
-        {
-            const x = try gpa.alloc(u32, gh * gw);
-            defer gpa.free(x);
-            const y = try gpa.alloc(u32, gh * gw);
-            defer gpa.free(y);
-            for (0..gh * gw) |i| {
-                x[i] = @intCast(i % gw);
-                y[i] = @intCast(i / gw);
-            }
-            self.vis_x = try uploadU32(be, x);
-            made += 1;
-            self.vis_y = try uploadU32(be, y);
+        var cp = try sensenova.CanvasPositions.init(gpa, pre.time, tw, n_img, gw, gh * gw);
+        defer cp.deinit(gpa);
+        inline for (.{ "pos_t", "pos_h", "pos_w", "vis_x", "vis_y" }, .{ .t, .h, .w, .vis_x, .vis_y }) |name, axis| {
+            @field(self, name) = try uploadU32(be, cp.axis(axis));
             made += 1;
         }
         return self;
@@ -525,6 +412,8 @@ pub const Workspace = struct {
     fm_a: Buf,
     fm_b: Buf,
     tvec: Buf,
+    /// The canvas stream's storage (`img`, `nrm`, `mg`, `mu`); `sensenova_dev`.
+    act: Dt,
 
     const fields = [_][]const u8{ "patch", "cells", "img", "nrm", "dlt", "q", "k", "v", "kcat", "vcat", "attn", "mg", "mu", "fm_a", "fm_b", "tvec" };
 
@@ -533,7 +422,7 @@ pub const Workspace = struct {
     /// are different lengths (an edit's negative presents the pictures with no
     /// prompt, so it is shorter; a plain negative is shorter still), and sizing to
     /// one of them writes the other off the end of `kcat`.
-    pub fn init(be: *Backend, model: *const Model, sess: *const Session, prefix_cap: usize) !Workspace {
+    pub fn init(be: *Backend, model: *const Model, sess: *const Session, prefix_cap: usize, act: Dt) !Workspace {
         const cfg = model.cfg;
         const rows = std.mem.alignForward(usize, sess.n_img, 128);
         const kv_rows = std.mem.alignForward(usize, @max(prefix_cap, sess.prefix_seq) + sess.n_img, 128);
@@ -570,6 +459,8 @@ pub const Workspace = struct {
             @field(self, name) = try be.tensorCreate(size);
             made += 1;
         }
+        self.act = act;
+        inline for (.{ "img", "nrm", "mg", "mu" }) |name| @field(self, name).dt = act;
         return self;
     }
 
@@ -601,27 +492,11 @@ pub fn forward(
     const xp = try sensenova.padCanvas(gpa, cfg, x_lat, ch, sess.lat_h, sess.lat_w);
     defer gpa.free(xp);
 
-    // The patch matrix of the 16x16 embedder is built on the host: it reads the
-    // canvas, which arrives on the host anyway, and it is a pure gather that would
-    // otherwise cost an upload of the canvas plus a kernel for the same bytes.
+    // The patch rows are gathered on the host: the canvas arrives there anyway, and on
+    // the device it would cost an upload of the canvas plus a kernel for the same bytes.
     {
-        const plen = cfg.patch * cfg.patch * ch;
-        const patch = try gpa.alloc(f32, sess.gh * sess.gw * plen);
+        const patch = try sensenova.patchRows(gpa, cfg, xp, sess.ph, sess.pw);
         defer gpa.free(patch);
-        for (0..sess.gh) |cy| {
-            for (0..sess.gw) |cx| {
-                const dst = patch[(cy * sess.gw + cx) * plen ..][0..plen];
-                for (0..cfg.patch) |dy| {
-                    for (0..cfg.patch) |dx| {
-                        const sy = cy * cfg.patch + dy;
-                        const sx = cx * cfg.patch + dx;
-                        for (0..ch) |c| {
-                            dst[(dy * cfg.patch + dx) * ch + c] = xp[c * sess.ph * sess.pw + sy * sess.pw + sx];
-                        }
-                    }
-                }
-            }
-        }
         try be.ensureDeviceBuffer(&ws.patch, patch.len * 4);
         try be.tensorUpload(ws.patch, std.mem.sliceAsBytes(patch));
     }
@@ -635,84 +510,22 @@ pub fn forward(
 
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
-
-    // --- the generation vision tower -----------------------------------------
-    const cells = sess.gh * sess.gw;
-    try be.opConvF16(ws.cells, 0, ws.patch, cells, std.mem.sliceAsBytes(model.vision_gen.patch.w), cfg.vis_dim, cfg.patch * cfg.patch * ch, model.vision_gen.patch.b.?);
-    try be.geluErf(ws.cells, cells * cfg.vis_dim);
-    const vhalf = cfg.vis_dim / 2;
-    try be.opRopeInterSpanPos(ws.cells, sess.vis_x, sess.tab_vx.buf, cells, cfg.vis_dim, sess.tab_vx.half, sess.tab_vx.sin_off, 0);
-    try be.opRopeInterSpanPos(ws.cells, sess.vis_y, sess.tab_vy.buf, cells, cfg.vis_dim, sess.tab_vy.half, sess.tab_vy.sin_off, vhalf);
-    trace(be, "cells", 0, ws.cells, cells * cfg.vis_dim);
-    try convStride(be, &ws.patch, ws.img, ws.cells, sess.gh, sess.gw, model.vision_gen.dense);
-    trace(be, "vision", 0, ws.img, sess.n_img * cfg.dim);
-    try be.opAddBiasRows(ws.img, ws.tvec, sess.n_img, cfg.dim, 0, false);
-    trace(be, "trunk_in", 0, ws.img, sess.n_img * cfg.dim);
-
-    // --- the trunk ------------------------------------------------------------
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const pos = [3]Buf{ sess.pos_t, sess.pos_h, sess.pos_w };
-    const tables = [3]Table{ sess.tab_t, sess.tab_h, sess.tab_w };
-    const kv_bytes = sess.prefix_seq * cfg.kvDim() * 4;
-    for (model.layers, 0..) |*layer, li| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (be.async_uploads and li + 1 < model.layers.len) prefetchStream(be, &model.layers[li + 1].gen);
-        // The prefix half of the concatenated K/V is a device-to-device copy from
-        // the cache uploaded once per conditioning.
-        try be.tensorCopy(ws.kcat, 0, sess.prefix_kv, (li * 2) * kv_bytes, kv_bytes);
-        try be.tensorCopy(ws.vcat, 0, sess.prefix_kv, (li * 2 + 1) * kv_bytes, kv_bytes);
-        try layerForward(be, sess.plan, cfg, &layer.gen, .{
-            .x = ws.img,
-            .nrm = ws.nrm,
-            .dlt = ws.dlt,
-            .q = ws.q,
-            .k = ws.k,
-            .v = ws.v,
-            .kcat = ws.kcat,
-            .vcat = ws.vcat,
-            .attn = ws.attn,
-            .mg = ws.mg,
-            .mu = ws.mu,
-        }, sess.n_img, sess.prefix_seq + sess.n_img, .{
-            .pos = pos,
-            .tables = tables,
-            .norm_q = try smallBuf(be, layer.gen.q_norm_pair),
-            .norm_k = try smallBuf(be, layer.gen.k_norm_pair),
-            .scale = scale,
-            .causal = false,
-            .prefix_rows = sess.prefix_seq,
-        });
-        trace(be, "layer", li, ws.img, sess.n_img * cfg.dim);
-    }
-    try be.qkNorm(ws.img, ws.img, try smallBuf(be, model.norm_gen), sess.n_img, cfg.dim, cfg.norm_eps);
-    trace(be, "norm", 0, ws.img, sess.n_img * cfg.dim);
-
-    // --- fm_head ---------------------------------------------------------------
-    // The token plane IS the channel-last input the first shuffle reads.
-    try be.opPixelShuffle(ws.fm_a, ws.img, sess.th, sess.tw, cfg.fmC1(), 2);
-    try conv3x3(be, &ws.patch, ws.fm_b, ws.fm_a, sess.th * 2, sess.tw * 2, model.fm1);
-    try be.geluErf(ws.fm_b, sess.th * 2 * sess.tw * 2 * cfg.fmC1());
-    try be.opPixelShuffle(ws.fm_a, ws.fm_b, sess.th * 2, sess.tw * 2, cfg.fmC2(), 2);
-    try conv3x3(be, &ws.patch, ws.fm_b, ws.fm_a, sess.th * 4, sess.tw * 4, model.fm2);
-    try be.opPixelShuffle(ws.fm_a, ws.fm_b, sess.th * 4, sess.tw * 4, ch, 8);
-    trace(be, "pred", 0, ws.fm_a, sess.ph * sess.pw * ch);
+    try sensenova_dev.canvas(Dev{
+        .be = be,
+        .plan = sess.plan,
+        .cfg = cfg,
+        .b = .{ .x = ws.img, .nrm = ws.nrm, .dlt = ws.dlt, .q = ws.q, .k = ws.k, .v = ws.v, .kcat = ws.kcat, .vcat = ws.vcat, .attn = ws.attn, .mg = ws.mg, .mu = ws.mu },
+        .pos = .{ sess.pos_t, sess.pos_h, sess.pos_w },
+        .tables = .{ sess.tab_t, sess.tab_h, sess.tab_w },
+        .causal = false,
+    }, model, sess, ws, cancel);
     try be.endBatch();
+    if (ws.act != .f32 and !try be.allFinite(ws.img, sess.n_img * cfg.dim)) return error.NonFiniteActivation;
 
-    // The x0-to-velocity conversion and the crop are three planes of arithmetic;
-    // they ride back with the download rather than costing a kernel.
     const rgb = try gpa.alloc(f32, sess.ph * sess.pw * ch);
     defer gpa.free(rgb);
-    try be.tensorDownload(offsetBuf(ws.fm_a, 0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
-    const denom = @max(1.0 - t, cfg.velocity_eps);
-    for (0..ch) |c| {
-        const src = xp[c * sess.ph * sess.pw ..];
-        const dst = out[c * sess.lat_h * sess.lat_w ..];
-        for (0..sess.lat_h) |y| {
-            for (0..sess.lat_w) |x| {
-                dst[y * sess.lat_w + x] = (src[y * sess.pw + x] - rgb[(y * sess.pw + x) * ch + c]) / denom;
-            }
-        }
-    }
+    try be.tensorDownload(ws.fm_a.slice(0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
+    sensenova.velocityFromRows(cfg, out, xp, rgb, t, sess.lat_h, sess.lat_w, sess.ph, sess.pw);
 }
 
 const LayerBufs = struct {
@@ -729,79 +542,148 @@ const LayerBufs = struct {
     mu: Buf,
 };
 
-const LayerArgs = struct {
-    pos: [3]Buf,
-    tables: [3]Table,
-    norm_q: Buf,
-    norm_k: Buf,
-    scale: f32,
-    causal: bool,
-    /// The block-causal per-query key range of a prompt carrying reference
-    /// pictures, as `opAttnBatched` wants it; null is plain `causal`.
-    bounds: ?Buf = null,
-    /// Rows of `kcat`/`vcat` already filled with the prefix cache; 0 for the
-    /// prefix pass, which attends over itself alone.
-    prefix_rows: usize,
-};
-
-fn layerForward(
+/// The `sensenova_dev` adapter for one pass.
+const Dev = struct {
     be: *Backend,
     plan: lin_cuda.Plan,
     cfg: Config,
-    s: *const sensenova.Stream,
     b: LayerBufs,
-    rows: usize,
-    seq_kv: usize,
-    a: LayerArgs,
-) !void {
-    const dim = cfg.dim;
-    const kv_dim = cfg.kvDim();
+    pos: [3]Buf,
+    tables: [3]Table,
+    causal: bool,
+    /// The block-causal per-query key range of a prompt carrying reference pictures,
+    /// as `opAttnBatched` wants it; null is plain `causal`.
+    bounds: ?Buf = null,
+    /// The prefix pass's host cache, `[layer][k|v][seq][kv_dim]`.
+    kv: []f32 = &.{},
 
-    try be.qkNorm(b.x, b.nrm, try smallBuf(be, s.in_norm), rows, dim, cfg.norm_eps);
-    try lin_cuda.prep(be, plan, b.nrm, rows, dim, &.{ s.q, s.k, s.v }, false);
-    try lin_cuda.gemm(be, plan, b.q, b.nrm, rows, s.q, false);
-    try lin_cuda.gemm(be, plan, b.k, b.nrm, rows, s.k, false);
-    try lin_cuda.gemm(be, plan, b.v, b.nrm, rows, s.v, false);
-
-    try qkPrepare(be, cfg, b.q, rows, cfg.n_heads, a.norm_q, a.pos, a.tables);
-    try qkPrepare(be, cfg, b.k, rows, cfg.n_kv_heads, a.norm_k, a.pos, a.tables);
-    trace(be, "q", 0, b.q, rows * cfg.qDim());
-    trace(be, "k", 0, b.k, rows * kv_dim);
-    trace(be, "v", 0, b.v, rows * kv_dim);
-
-    // The generation stream attends over the prefix's keys and then its own, with
-    // no mask; the prefix pass attends causally over itself alone.
-    if (a.prefix_rows != 0) {
-        try be.tensorCopy(b.kcat, a.prefix_rows * kv_dim * 4, b.k, 0, rows * kv_dim * 4);
-        try be.tensorCopy(b.vcat, a.prefix_rows * kv_dim * 4, b.v, 0, rows * kv_dim * 4);
-    }
-    if (a.bounds) |bnd| {
-        // No tensor-core form: the block-causal range is per query, and both TC
-        // paths take one rule for the whole launch. It runs once per conditioning.
-        try be.opAttnBatched(b.q, b.kcat, b.vcat, b.attn, bnd, rows, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, a.scale);
-    } else if (force_naive_attn) {
-        try be.attn(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, a.scale, a.causal);
-    } else if (a.causal) {
-        try be.opAttnTCCausal(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, a.scale, 0);
-    } else {
-        try be.opAttnTCRect(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, a.scale);
+    pub fn rmsNorm(d: Dev, x: Buf, y: Buf, w: []const f32, rows: usize, eps: f32) !void {
+        try d.be.qkNorm(x, y, try smallBuf(d.be, w), rows, d.cfg.dim, eps);
     }
 
-    trace(be, "attn", 0, b.attn, rows * cfg.qDim());
-    try lin_cuda.prep(be, plan, b.attn, rows, cfg.qDim(), &.{s.o}, false);
-    try lin_cuda.gemm(be, plan, b.dlt, b.attn, rows, s.o, false);
-    try be.opAdd(b.x, b.dlt, rows * dim);
-    trace(be, "attn_res", 0, b.x, rows * dim);
+    pub fn gemms(d: Dev, x: Buf, rows: usize, cols: usize, ws: []const Weight, ys: []const Buf) !void {
+        const g = try lin_cuda.prep(d.be, d.plan, x, rows, cols, ws);
+        for (ws, ys) |w, y| try lin_cuda.gemm(d.be, d.plan, g, y, w, null);
+    }
 
-    try be.qkNorm(b.x, b.nrm, try smallBuf(be, s.post_norm), rows, dim, cfg.norm_eps);
-    try lin_cuda.prep(be, plan, b.nrm, rows, dim, &.{ s.gate, s.up }, false);
-    try lin_cuda.gemm(be, plan, b.mg, b.nrm, rows, s.gate, false);
-    try lin_cuda.gemm(be, plan, b.mu, b.nrm, rows, s.up, false);
-    try be.siluMul(b.mg, b.mu, rows * cfg.inter);
-    try lin_cuda.prep(be, plan, b.mg, rows, cfg.inter, &.{s.down}, false);
-    try lin_cuda.gemm(be, plan, b.dlt, b.mg, rows, s.down, false);
-    try be.opAdd(b.x, b.dlt, rows * dim);
-}
+    pub fn linear(d: Dev, y: Buf, x: Buf, rows: usize, w: Weight) !void {
+        try lin_cuda.linear(d.be, d.plan, y, x, rows, w, null);
+    }
+
+    /// `norm_pair` is the layer's `[q_norm ++ q_norm_hw]` as one 128-wide vector, so
+    /// `groupRmsNorm` normalizes each half of the head against its own scale in one
+    /// launch: the two spans are contiguous and equally wide, which is the group form.
+    pub fn qkPrepare(d: Dev, x: Buf, rows: usize, heads: usize, norm_pair: []const f32) !void {
+        const cfg = d.cfg;
+        try d.be.groupRmsNorm(x, x, try smallBuf(d.be, norm_pair), rows * heads, cfg.head_dim, 2, cfg.norm_eps);
+        const offs = [3]usize{ 0, cfg.spanT(), cfg.spanT() + cfg.spanHw() };
+        for (d.pos, d.tables, offs) |p, tb, off| {
+            try d.be.opRopeHalfSpanPos(x, p, tb.buf, rows, heads, tb.half, tb.sin_off, cfg.head_dim, off);
+        }
+    }
+
+    /// Casts when the two dtypes differ, which happens only at the trunk's ends.
+    pub fn copy(d: Dev, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        if (dst.dt == src.dt) {
+            const eb = dst.dt.bytes();
+            return d.be.tensorCopy(dst, dst_off * eb, src, src_off * eb, n * eb);
+        }
+        std.debug.assert(src_off == 0);
+        try d.be.opCast(src, dst, n, dst_off);
+    }
+
+    pub fn attention(d: Dev, rows: usize, seq_kv: usize) !void {
+        const cfg = d.cfg;
+        const b = d.b;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        if (d.bounds) |bnd| {
+            // No tensor-core form: the block-causal range is per query, and both TC
+            // paths take one rule for the whole launch. It runs once per conditioning.
+            try d.be.opAttnBatched(b.q, b.kcat, b.vcat, b.attn, bnd, rows, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale);
+        } else if (force_naive_attn) {
+            try d.be.attn(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, d.causal);
+        } else if (d.causal) {
+            try d.be.opAttnTCCausal(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, 0);
+        } else {
+            try d.be.opAttnTCRect(b.q, b.kcat, b.vcat, b.attn, rows, seq_kv, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale);
+        }
+    }
+
+    pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+        try d.be.siluMul(g, u, n);
+    }
+
+    pub fn addScaled(d: Dev, x: Buf, y: Buf, n: usize, s: f32) !void {
+        try d.be.opAddScaled(x, y, n, s);
+    }
+
+    pub fn scaleBy(d: Dev, x: Buf, s: f32, n: usize) !void {
+        try d.be.opScale(x, s, n);
+    }
+
+    pub fn gelu(d: Dev, x: Buf, n: usize) !void {
+        try d.be.geluErf(x, n);
+    }
+
+    /// One layer ahead, so the upload overlaps the previous layer's compute. The base
+    /// stack is a second full 8B that no denoise step reads, so it is left to the
+    /// cache's LRU rather than pinned: keeping it resident would evict the generation
+    /// stack the render actually runs.
+    pub fn prefetch(d: Dev, s: *const sensenova.Stream) void {
+        if (d.be.async_uploads) prefetchStream(d.be, s);
+    }
+
+    pub fn beginBatch(d: Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn keepKv(d: Dev, li: usize) !void {
+        const n = d.kv.len / (d.cfg.n_layers * 2);
+        try d.be.tensorDownload(d.b.k.slice(0, n * 4), std.mem.sliceAsBytes(d.kv[(li * 2) * n ..][0..n]));
+        try d.be.tensorDownload(d.b.v.slice(0, n * 4), std.mem.sliceAsBytes(d.kv[(li * 2 + 1) * n ..][0..n]));
+    }
+
+    pub fn patchEmbed(d: Dev, dst: Buf, src: Buf, rows: usize, cv: sensenova.Conv) !void {
+        try conv_cuda.patchGemm(d.be, dst, src, rows, cv);
+    }
+
+    pub fn ropeInter(d: Dev, x: Buf, positions: Buf, tb: Table, rows: usize, row_dim: usize, off: usize) !void {
+        try d.be.opRopeInterSpanPos(x, positions, tb.buf, rows, row_dim, tb.half, tb.sin_off, off);
+    }
+
+    pub fn convStride(d: Dev, patch: *Buf, dst: Buf, src: Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
+        try conv_cuda.convStride(d.be, patch, dst, src, h, w, cv);
+    }
+
+    pub fn addBiasRows(d: Dev, x: Buf, bias: Buf, rows: usize, cols: usize) !void {
+        try d.be.opAddBiasRows(x, bias, rows, cols, 0);
+    }
+
+    pub fn pixelShuffle(d: Dev, dst: Buf, src: Buf, h: usize, w: usize, co: usize, r: usize) !void {
+        try d.be.opPixelShuffle(dst, src, h, w, co, r);
+    }
+
+    pub fn conv3x3(d: Dev, patch: *Buf, dst: *Buf, src: *Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
+        std.debug.assert(cv.k == 3 and cv.stride == 1 and cv.pad == 1);
+        try conv_cuda.conv2d(d.be, patch, dst, src, h, w, cv, .stride1, null, 1.0);
+    }
+
+    pub fn trace(d: Dev, what: []const u8, i: usize, buf: Buf, elems: usize) void {
+        traceBuf(d.be, what, i, buf, elems);
+    }
+};
 
 /// Queue one stream's weights for async prefetch, ONE LAYER AHEAD, so the upload
 /// overlaps the previous layer's compute. The keys must be the same host pointers
@@ -815,14 +697,14 @@ fn prefetchStream(be: *Backend, s: *const sensenova.Stream) void {
 /// call, so it is env-gated and never on in a render.
 var trace_on: ?bool = null;
 
-fn trace(be: *Backend, what: []const u8, i: usize, buf: Buf, elems: usize) void {
+fn traceBuf(be: *Backend, what: []const u8, i: usize, buf: Buf, elems: usize) void {
     if (trace_on == null) trace_on = std.c.getenv("TP_SENSENOVA_TRACE") != null;
     if (!trace_on.?) return;
     const host = be.gpa.alloc(f32, elems) catch return;
     defer be.gpa.free(host);
     const batching = be.batching();
     if (batching) be.endBatch() catch return;
-    be.tensorDownload(offsetBuf(buf, 0, elems * 4), std.mem.sliceAsBytes(host)) catch return;
+    be.downloadF32(buf, host) catch return;
     var mx: f32 = 0;
     var sum: f64 = 0;
     var bad: usize = 0;
@@ -834,7 +716,3 @@ fn trace(be: *Backend, what: []const u8, i: usize, buf: Buf, elems: usize) void 
     if (batching) be.beginBatch() catch return;
 }
 
-/// A non-owning device-pointer view at a byte offset, sized to what will be read.
-fn offsetBuf(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = size };
-}

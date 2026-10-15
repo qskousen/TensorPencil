@@ -35,7 +35,7 @@ const usage =
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>] [--cpu-layers tail|attn] [--offload-grow]
-    \\              [--llm-gemm auto|grouped|mmq|dequant]
+    \\              [--llm-gemm auto|grouped|mmq|dequant] [--bench <rounds>]
     \\              [--image <image> --mmproj <mmproj.gguf>]
     \\              [--vision-budget low|medium|high|ultra|max | <tokens>]  (gemma4v)
     \\
@@ -161,8 +161,17 @@ const usage =
 /// already stands one in where it can.
 var g_canonical_template: bool = false;
 
+/// `--bench N`: time N warm rounds of the one-shot prompt on the live stepper instead
+/// of chatting (`benchStepper`). Read by the drivers that support it.
+var g_bench_rounds: usize = 0;
+
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
+    // DIAGNOSTICS of the decode GEMV policy (`dual_lin.dual_decode`, `.decode_dp4a`):
+    // the dual row GEMV for every block quant, and the f32 dequant in place of the
+    // q8 activation, so one model measures the two kernels against each other.
+    if (getenv("TP_DUAL_DECODE") != null) TensorPencil.models.dual_lin.dual_decode = true;
+    if (getenv("TP_NO_DP4A") != null) TensorPencil.models.dual_lin.decode_dp4a = false;
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     // Per-token buffers churn (alloc/free every forward pass); the process
@@ -320,13 +329,15 @@ pub fn main(init: std.process.Init) !void {
             dynamic_offload = true;
         } else if (std.mem.eql(u8, a, "--llm-gemm")) {
             const name = try nextArg(args, &i);
-            TensorPencil.models.lin_llm_cuda.force = std.meta.stringToEnum(TensorPencil.models.lin_llm_cuda.Force, name) orelse {
+            TensorPencil.models.dual_lin.force = std.meta.stringToEnum(TensorPencil.models.dual_lin.Force, name) orelse {
                 try stdout.print("unknown --llm-gemm: {s} (auto | grouped | mmq | dequant)\n", .{name});
                 try stdout.flush();
                 return error.InvalidArgument;
             };
         } else if (std.mem.eql(u8, a, "--profile")) {
             profile = true;
+        } else if (std.mem.eql(u8, a, "--bench")) {
+            g_bench_rounds = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--backend")) {
             const name = try nextArg(args, &i);
             backend = std.meta.stringToEnum(BackendKind, name) orelse {
@@ -633,7 +644,7 @@ fn runQwen3(
         if (max_context_arg == null) {
             const free = ctx.liveVram();
             const weight_est: u64 = if (st.mapping()) |m| m.len else 0;
-            const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(lm.cfg, 1);
+            const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(lm.cfg, 1, opts.kv_dtype);
             const avail = free -| weight_est -| (2 << 30); // activations + freqs + margin
             const trained = @min(trainedContext(st), auto_context_cap);
             opts.max_context = std.math.clamp(avail / per_tok, 4096, trained);
@@ -1505,15 +1516,78 @@ const Qwen35Driver = struct {
         }
         // t0 after the (setup) cpu-split migration, so it counts as setup not generation.
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        if (g_bench_rounds > 0) {
+            try benchStepper(model, self.io, self.gpa, self.ids.items, g_bench_rounds, self.stdout);
+            return .{ .n = 0, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = .{} };
+        }
         var timing: llm.engine.Timing = .{};
         const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat, &timing);
         return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };
     }
 };
 
-/// qwen3's `Spec`: unlike the uniform archs, its CUDA/Vulkan steppers size
-/// fixed batch/tap buffers from the prompt length, so the builders thread
-/// `first_seq` through (and Vulkan takes `cap.max`, not the whole `Capacity`).
+/// `--bench`: one untimed warm-up round, then `rounds` of (reset, prefill `ids`, decode
+/// 32 greedy tokens) on one stepper, each forward a plain `step` with a host argmax so
+/// every backend runs the same calls. Prints each round's rates and two hashes, of the
+/// prefill's last logits and of the decoded ids: a change that should be exact must
+/// leave both alone.
+fn benchStepper(model: anytype, io: Io, gpa: std.mem.Allocator, ids: []const u32, rounds: usize, stdout: *Io.Writer) !void {
+    if (comptime !@hasDecl(@typeInfo(@TypeOf(model)).pointer.child, "resetCache")) {
+        try stdout.writeAll("--bench needs a stepper that can reset its cache\n");
+        return;
+    }
+    const decode = 32;
+    // A stepper with a diagnostic switch gets it alternated per round, so its two
+    // settings are timed interleaved in one process.
+    const M = @typeInfo(@TypeOf(model)).pointer.child;
+    const toggle: ?*bool = if (comptime @hasDecl(M, "bench_toggle")) M.bench_toggle else null;
+    const arms: usize = if (toggle != null) 2 else 1;
+    defer if (toggle) |t| {
+        t.* = false;
+    };
+    const logits = try gpa.alloc(f32, model.vocab());
+    defer gpa.free(logits);
+    const pp = try gpa.alloc(f64, rounds * arms);
+    defer gpa.free(pp);
+    const tg = try gpa.alloc(f64, rounds * arms);
+    defer gpa.free(tg);
+    for (0..(rounds + 1) * arms) |ri| {
+        const arm = ri % arms;
+        const r = ri / arms;
+        if (toggle) |t| t.* = arm == 1;
+        try model.resetCache();
+        const t0 = Io.Clock.awake.now(io).nanoseconds;
+        try model.step(io, ids, logits);
+        const t1 = Io.Clock.awake.now(io).nanoseconds;
+        const lh = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(logits));
+        var out: [decode]u32 = undefined;
+        for (&out) |*o| {
+            o.* = @intCast(std.mem.indexOfMax(f32, logits));
+            try model.step(io, o[0..1], logits);
+        }
+        const t2 = Io.Clock.awake.now(io).nanoseconds;
+        if (r == 0) continue;
+        const slot = arm * rounds + r - 1;
+        pp[slot] = @as(f64, @floatFromInt(ids.len)) / (@as(f64, @floatFromInt(t1 - t0)) / 1e9);
+        tg[slot] = decode / (@as(f64, @floatFromInt(t2 - t1)) / 1e9);
+        try stdout.print("bench round {d}{s}: pp {d} @ {d:.1} tok/s, tg {d} @ {d:.1} tok/s, logits {x:0>16}, ids {x:0>16}\n", .{ r, armName(toggle != null, arm), ids.len, pp[slot], decode, tg[slot], lh, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&out)) });
+    }
+    for (0..arms) |arm| {
+        const p = pp[arm * rounds ..][0..rounds];
+        const g = tg[arm * rounds ..][0..rounds];
+        std.mem.sort(f64, p, {}, std.sort.asc(f64));
+        std.mem.sort(f64, g, {}, std.sort.asc(f64));
+        try stdout.print("bench median{s}: pp {d:.1} tok/s, tg {d:.1} tok/s over {d} warm rounds\n", .{ armName(toggle != null, arm), p[rounds / 2], g[rounds / 2], rounds });
+    }
+    try stdout.flush();
+}
+
+fn armName(toggled: bool, arm: usize) []const u8 {
+    return if (!toggled) "" else if (arm == 1) " (toggle on)" else " (toggle off)";
+}
+
+/// qwen3's `Spec`: unlike the uniform archs, its CUDA stepper sizes fixed batch and
+/// tap buffers from the prompt length, so the builders thread `first_seq` through.
 const Qwen3Spec = struct {
     pub const Model = qwen3.CausalLM;
     pub const Cpu = llm.engine.CpuModel;
@@ -1526,11 +1600,8 @@ const Qwen3Spec = struct {
         return Cuda.init(gpa, be, lm, cap, first_seq);
     }
     pub fn buildVulkan(gpa: std.mem.Allocator, ctx: *TensorPencil.gpu.Context, lm: *const Model, cap: llm.engine.Capacity, first_seq: usize) !Vulkan {
-        // qwen3 Vulkan uses the hd128 attn_dsplit path (no f16/q8_0 variant) and
-        // its generation is a known-broken path; f16/q8_0 KV is gemma3/qwen35-only
-        // on Vulkan.
-        if (cap.kv_dtype != .f32) return error.KvDtypeUnsupported;
-        return Vulkan.init(gpa, ctx, lm, cap.max, first_seq);
+        _ = first_seq;
+        return Vulkan.init(gpa, ctx, lm, cap);
     }
 };
 
@@ -1563,6 +1634,10 @@ const Qwen3Driver = struct {
     // setup work is not attributed to generation time.
     fn gen(self: Qwen3Driver, model: anytype, drafter: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        if (g_bench_rounds > 0) {
+            try benchStepper(model, self.io, self.gpa, self.ids.items, g_bench_rounds, self.stdout);
+            return .{ .n = 0, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = .{} };
+        }
         var timing: llm.engine.Timing = .{};
         const n = try runSession(model, drafter, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, null, &timing);
         return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };

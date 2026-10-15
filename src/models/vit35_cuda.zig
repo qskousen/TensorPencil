@@ -20,6 +20,7 @@
 //! LLM weights and their captured decode graph must survive the encode.
 
 const std = @import("std");
+const lin_cuda = @import("lin_cuda.zig");
 const vit35 = @import("vit35.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -32,12 +33,7 @@ const Weight = ops.matmul.Weight;
 /// GEMM in the mmproj weight's storage dtype (bf16 tensors, plus the f32
 /// host-summed patch kernel), y[m][w.rows] = x @ Wᵀ + bias, tight rows.
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32) !void {
-    switch (w.dtype) {
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, bias),
-        else => return error.UnsupportedDType,
-    }
+    try lin_cuda.towerLinear(be, dst, src, m, w, bias, null);
 }
 
 /// Encode interleaved RGB pixels to LLM embeddings on the CUDA backend.
@@ -132,7 +128,7 @@ pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []cons
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     for (vit.blocks) |*blk| {
-        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps);
         try gemm(be, qkv_d, normed_d, np, blk.qkv, blk.qkv_b);
         try be.opHeadPad(q_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, 0);
         try be.opHeadPad(k_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, dim);
@@ -144,13 +140,13 @@ pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []cons
         try gemm(be, t_d, normed_d, np, blk.out, blk.out_b);
         try be.opAdd(x_d, t_d, np * dim);
 
-        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps);
         try gemm(be, big_d, normed_d, np, blk.up, blk.up_b);
         try be.gelu(big_d, np * cfg.ffn);
         try gemm(be, t_d, big_d, np, blk.down, blk.down_b);
         try be.opAdd(x_d, t_d, np * dim);
     }
-    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps, false);
+    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps);
 
     // 2x2 merge is a reinterpret (tokens are block-ordered), then the
     // two-layer projector. h0 reuses normed (nm*merged_dim == np*dim).
@@ -227,7 +223,7 @@ test "cuda vit matches cpu encode" {
         min_cos = @min(min_cos, dot / (@sqrt(na) * @sqrt(nb)));
     }
     const rel = @sqrt(num / den);
-    std.debug.print("cuda vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, rel });
+    errdefer std.debug.print("cuda vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, rel });
     try std.testing.expect(min_cos > 0.999);
     try std.testing.expect(rel < 0.05);
 }

@@ -17,11 +17,13 @@
 //! it.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const safetensors = @import("tp_core").safetensors;
 const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
 const lin = @import("lin.zig");
+const lora_mod = @import("lora.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -47,6 +49,19 @@ pub const txt_mlp_dim = 6912;
 
 const rms_eps: f32 = 1e-5;
 
+/// DIAGNOSTIC: round the CPU forward's residual stream to this width after every
+/// gated add, to measure what a 16-bit stream costs on its own (`velocity-diff
+/// --cpu-round-residual`). Null in every normal run.
+pub var round_residual: ?enum { f16, bf16 } = null;
+
+fn roundResidual(x: []f32) void {
+    const r = round_residual orelse return;
+    for (x) |*v| v.* = switch (r) {
+        .f16 => @floatCast(@as(f16, @floatCast(v.*))),
+        .bf16 => @bitCast(@as(u32, @import("tp_core").dtype.f32ToBf16(v.*)) << 16),
+    };
+}
+
 const Attn = struct {
     wq: Weight,
     wk: Weight,
@@ -65,7 +80,7 @@ const Swiglu = struct {
     down: Weight,
 };
 
-const Block = struct {
+pub const Block = struct {
     mod: []const f32, // [6 * features]
     prenorm: []const f32,
     postnorm: []const f32,
@@ -174,6 +189,9 @@ pub const DiT = struct {
     arena: std.heap.ArenaAllocator,
     /// Residual-stream steering, off by default. See `ActSteer`.
     act_steer: ?ActSteer = null,
+    /// The LoRA sidecars every host linear applies (`mm`), and the device arms
+    /// read. Set by `attachLora`, owned by the caller.
+    lora: ?*const lora_mod.Stack = null,
     first: LinearW, // 64 -> 6144
     blocks: []Block,
     /// Every block linear the device forwards run, the one list every support scan and
@@ -299,6 +317,28 @@ pub const DiT = struct {
         self.* = undefined;
     }
 
+    /// Resolve `stack` against every linear this model runs, host and device, and
+    /// hold it. Returns the file keys that apply.
+    pub fn attachLora(self: *DiT, gpa: std.mem.Allocator, stack: *lora_mod.Stack) !usize {
+        self.lora = stack;
+        stack.beginAttach();
+        try stack.resolveAll(self.device_lins);
+        for (&self.txt_layerwise) |*b| try stack.resolveAll(&blockLins(b));
+        for (&self.txt_refiner) |*b| try stack.resolveAll(&blockLins(b));
+        try stack.resolveAll(&.{
+            self.first.w,   self.tmlp0.w,       self.tmlp2.w,       self.tproj1.w, self.txtmlp1.w,
+            self.txtmlp3.w, self.last_linear.w, self.txt_projector,
+        });
+        return stack.finishAttach(gpa);
+    }
+
+    /// The text-fusion projector's 12 layer weights, with any LoRA delta on
+    /// them. It is applied as a weighted sum, not through `mm`.
+    pub fn projectorWeights(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, out: *[txt_layers]f32) !void {
+        try safetensors.convertToF32(self.txt_projector.dtype, self.txt_projector.bytes, out);
+        if (self.lora) |s| try s.addDelta(io, gpa, self.txt_projector, out);
+    }
+
     /// Predict velocity for one latent. `x_lat`/`out` are planar
     /// [channels][lat_h][lat_w]; `ctx` is [seq_txt][12][2560] (post-strip
     /// encoder output); `sigma` is the flow-matching timestep.
@@ -339,9 +379,9 @@ pub const DiT = struct {
         {
             const t0 = try gpa.alloc(f32, features);
             defer gpa.free(t0);
-            try linear(io, gpa, t0, &temb, 1, self.tmlp0);
+            try linear(io, gpa, self.lora, t0, &temb, 1, self.tmlp0);
             ops.act.geluTanh(t0);
-            try linear(io, gpa, t, t0, 1, self.tmlp2);
+            try linear(io, gpa, self.lora, t, t0, 1, self.tmlp2);
         }
         const tvec = try gpa.alloc(f32, 6 * features);
         defer gpa.free(tvec);
@@ -350,7 +390,7 @@ pub const DiT = struct {
             defer gpa.free(tg);
             @memcpy(tg, t);
             ops.act.geluTanh(tg);
-            try linear(io, gpa, tvec, tg, 1, self.tproj1);
+            try linear(io, gpa, self.lora, tvec, tg, 1, self.tproj1);
         }
 
         // Text path: txtfusion over the 12-layer stack, then txtmlp to 6144.
@@ -364,9 +404,9 @@ pub const DiT = struct {
             ops.norm.rmsNorm(txt_tokens, txt_tokens, self.txtmlp_norm, rms_eps);
             const mid = try gpa.alloc(f32, seq_txt * features);
             defer gpa.free(mid);
-            try linear(io, gpa, mid, txt_tokens, seq_txt, self.txtmlp1);
+            try linear(io, gpa, self.lora, mid, txt_tokens, seq_txt, self.txtmlp1);
             ops.act.geluTanh(mid);
-            try linear(io, gpa, x[0 .. seq_txt * features], mid, seq_txt, self.txtmlp3);
+            try linear(io, gpa, self.lora, x[0 .. seq_txt * features], mid, seq_txt, self.txtmlp3);
         }
         {
             // Patchify: token (hi, wi), feature (c, ph, pw).
@@ -385,7 +425,7 @@ pub const DiT = struct {
                     }
                 }
             }
-            try linear(io, gpa, x[seq_txt * features ..], img_in, n_img, self.first);
+            try linear(io, gpa, self.lora, x[seq_txt * features ..], img_in, n_img, self.first);
         }
 
         // RoPE table: text at (0,0,0), image at (0, row, col).
@@ -434,7 +474,7 @@ pub const DiT = struct {
         }
         const final = try gpa.alloc(f32, n_img * channels * patch * patch);
         defer gpa.free(final);
-        try linear(io, gpa, final, img_rows, n_img, self.last_linear);
+        try linear(io, gpa, self.lora, final, img_rows, n_img, self.last_linear);
 
         // Unpatchify.
         for (0..h) |hi| {
@@ -465,9 +505,9 @@ pub const DiT = struct {
         {
             const t0 = try gpa.alloc(f32, features);
             defer gpa.free(t0);
-            try linear(io, gpa, t0, &temb, 1, self.tmlp0);
+            try linear(io, gpa, self.lora, t0, &temb, 1, self.tmlp0);
             ops.act.geluTanh(t0);
-            try linear(io, gpa, t, t0, 1, self.tmlp2);
+            try linear(io, gpa, self.lora, t, t0, 1, self.tmlp2);
         }
         const tvec = try gpa.alloc(f32, 6 * features);
         errdefer gpa.free(tvec);
@@ -476,7 +516,7 @@ pub const DiT = struct {
             defer gpa.free(tg);
             @memcpy(tg, t);
             ops.act.geluTanh(tg);
-            try linear(io, gpa, tvec, tg, 1, self.tproj1);
+            try linear(io, gpa, self.lora, tvec, tg, 1, self.tproj1);
         }
         return .{ .t = t, .tvec = tvec };
     }
@@ -489,15 +529,34 @@ pub const DiT = struct {
         ops.norm.rmsNorm(fused, fused, self.txtmlp_norm, rms_eps);
         const mid = try gpa.alloc(f32, seq_txt * features);
         defer gpa.free(mid);
-        try linear(io, gpa, mid, fused, seq_txt, self.txtmlp1);
+        try linear(io, gpa, self.lora, mid, fused, seq_txt, self.txtmlp1);
         ops.act.geluTanh(mid);
         const out_tokens = try gpa.alloc(f32, seq_txt * features);
         errdefer gpa.free(out_tokens);
-        try linear(io, gpa, out_tokens, mid, seq_txt, self.txtmlp3);
+        try linear(io, gpa, self.lora, out_tokens, mid, seq_txt, self.txtmlp3);
         return out_tokens;
     }
 
     /// Patchify a planar latent into [n_img, channels*patch^2] rows.
+    /// The device forward's modulation tables from `timestepVectors`: per block `[6][F]`
+    /// (`tvec` plus the block's offset) with the pre/post norm weights folded into slots
+    /// 0 and 3, which the modulated norm reads as a premultiplier; and the final layer's
+    /// `[premul | shift]`.
+    pub fn modulation(self: *const DiT, t: []const f32, tvec: []const f32, mv: []f32, fin: []f32) void {
+        for (self.blocks, 0..) |*blk, b| {
+            const base = b * 6 * features;
+            for (mv[base..][0 .. 6 * features], tvec, blk.mod) |*m, tv, bm| m.* = tv + bm;
+            for (0..features) |c| {
+                mv[base + c] = (1.0 + mv[base + c]) * blk.prenorm[c];
+                mv[base + 3 * features + c] = (1.0 + mv[base + 3 * features + c]) * blk.postnorm[c];
+            }
+        }
+        for (0..features) |c| {
+            fin[c] = (1.0 + t[c] + self.last_mod[c]) * self.last_norm[c];
+            fin[features + c] = t[c] + self.last_mod[features + c];
+        }
+    }
+
     pub fn patchify(gpa: std.mem.Allocator, x_lat: []const f32, lat_h: usize, lat_w: usize) ![]f32 {
         const h = lat_h / patch;
         const w = lat_w / patch;
@@ -560,7 +619,7 @@ pub const DiT = struct {
         }
         const final = try gpa.alloc(f32, n_img * channels * patch * patch);
         defer gpa.free(final);
-        try linear(io, gpa, final, img_rows, n_img, self.last_linear);
+        try linear(io, gpa, self.lora, final, img_rows, n_img, self.last_linear);
         unpatchify(out, final, lat_h, lat_w);
     }
 
@@ -597,7 +656,7 @@ pub const DiT = struct {
         errdefer gpa.free(projected);
         {
             var pw: [txt_layers]f32 = undefined;
-            try safetensors.convertToF32(self.txt_projector.dtype, self.txt_projector.bytes, &pw);
+            try self.projectorWeights(io, gpa, &pw);
             for (0..seq_txt) |tok| {
                 const dst = projected[tok * txt_dim ..][0..txt_dim];
                 @memset(dst, 0);
@@ -617,7 +676,6 @@ pub const DiT = struct {
     /// TextFusionBlock: x += attn(prenorm(x)); x += mlp(postnorm(x)).
     /// `x` holds n_seqs sequences of seq_len rows of txt_dim, no RoPE/mask.
     fn txtBlockForward(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, blk: *const TxtBlock, x: []f32, n_seqs: usize, seq_len: usize) !void {
-        _ = self;
         const rows = n_seqs * seq_len;
         const normed = try gpa.alloc(f32, rows * txt_dim);
         defer gpa.free(normed);
@@ -625,17 +683,16 @@ pub const DiT = struct {
 
         const a = try gpa.alloc(f32, rows * txt_dim);
         defer gpa.free(a);
-        try attnForward(io, gpa, &blk.attn, normed, n_seqs, seq_len, txt_dim, null, a);
+        try attnForward(io, gpa, self.lora, &blk.attn, normed, n_seqs, seq_len, txt_dim, null, a);
         for (x, a) |*xi, ai| xi.* += ai;
 
         ops.norm.rmsNorm(normed, x, blk.postnorm, rms_eps);
-        try swigluForward(io, gpa, &blk.mlp, normed, rows, txt_dim, txt_mlp_dim, a);
+        try swigluForward(io, gpa, self.lora, &blk.mlp, normed, rows, txt_dim, txt_mlp_dim, a);
         for (x, a) |*xi, ai| xi.* += ai;
     }
 
     /// SingleStreamBlock with AdaLN-single modulation.
     fn blockForward(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, blk: *const Block, x: []f32, seq: usize, tvec: []const f32, freqs: ops.rope.Freqs) !void {
-        _ = self;
         // Six modulation chunks: tvec + per-block learned offset.
         const mv = try gpa.alloc(f32, 6 * features);
         defer gpa.free(mv);
@@ -655,14 +712,16 @@ pub const DiT = struct {
         // x += pre_gate * attn((1+pre_scale) * prenorm(x) + pre_shift)
         ops.norm.rmsNorm(normed, x, blk.prenorm, rms_eps);
         modulate(normed, pre_scale, pre_shift);
-        try attnForward(io, gpa, &blk.attn, normed, 1, seq, features, freqs, a);
+        try attnForward(io, gpa, self.lora, &blk.attn, normed, 1, seq, features, freqs, a);
         gatedAdd(x, a, pre_gate);
+        roundResidual(x);
 
         // x += post_gate * mlp((1+post_scale) * postnorm(x) + post_shift)
         ops.norm.rmsNorm(normed, x, blk.postnorm, rms_eps);
         modulate(normed, post_scale, post_shift);
-        try swigluForward(io, gpa, &blk.mlp, normed, seq, features, mlp_dim, a);
+        try swigluForward(io, gpa, self.lora, &blk.mlp, normed, seq, features, mlp_dim, a);
         gatedAdd(x, a, post_gate);
+        roundResidual(x);
     }
 };
 
@@ -689,6 +748,7 @@ fn gatedAdd(x: []f32, delta: []const f32, gate: []const f32) void {
 fn attnForward(
     io: std.Io,
     gpa: std.mem.Allocator,
+    stack: ?*const lora_mod.Stack,
     attn: *const Attn,
     x: []const f32,
     n_seqs: usize,
@@ -710,10 +770,10 @@ fn attnForward(
     defer gpa.free(v);
     const g = try gpa.alloc(f32, rows * dim);
     defer gpa.free(g);
-    try ops.matmul.matmul(io, gpa, q, x, rows, attn.wq, null);
-    try ops.matmul.matmul(io, gpa, k, x, rows, attn.wk, null);
-    try ops.matmul.matmul(io, gpa, v, x, rows, attn.wv, null);
-    try ops.matmul.matmul(io, gpa, g, x, rows, attn.gate, null);
+    try mm(io, gpa, stack, q, x, rows, attn.wq, null);
+    try mm(io, gpa, stack, k, x, rows, attn.wk, null);
+    try mm(io, gpa, stack, v, x, rows, attn.wv, null);
+    try mm(io, gpa, stack, g, x, rows, attn.gate, null);
 
     ops.norm.rmsNorm(q, q, attn.qnorm, rms_eps);
     ops.norm.rmsNorm(k, k, attn.knorm, rms_eps);
@@ -743,27 +803,34 @@ fn attnForward(
         );
     }
     ops.act.sigmoidMul(attn_out, g);
-    try ops.matmul.matmul(io, gpa, out, attn_out, rows, attn.wo, null);
+    try mm(io, gpa, stack, out, attn_out, rows, attn.wo, null);
 }
 
-fn swigluForward(io: std.Io, gpa: std.mem.Allocator, mlp: *const Swiglu, x: []const f32, rows: usize, dim: usize, inner: usize, out: []f32) !void {
+fn swigluForward(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, mlp: *const Swiglu, x: []const f32, rows: usize, dim: usize, inner: usize, out: []f32) !void {
     std.debug.assert(x.len == rows * dim and out.len == rows * dim);
     const gate = try gpa.alloc(f32, rows * inner);
     defer gpa.free(gate);
     const up = try gpa.alloc(f32, rows * inner);
     defer gpa.free(up);
-    try ops.matmul.matmul(io, gpa, gate, x, rows, mlp.gate, null);
-    try ops.matmul.matmul(io, gpa, up, x, rows, mlp.up, null);
+    try mm(io, gpa, stack, gate, x, rows, mlp.gate, null);
+    try mm(io, gpa, stack, up, x, rows, mlp.up, null);
     ops.act.siluMul(gate, up);
-    try ops.matmul.matmul(io, gpa, out, gate, rows, mlp.down, null);
+    try mm(io, gpa, stack, out, gate, rows, mlp.down, null);
 }
 
-fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usize, lw: LinearW) !void {
-    try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
+fn linear(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, out: []f32, x: []const f32, m: usize, lw: LinearW) !void {
+    try mm(io, gpa, stack, out, x, m, lw.w, lw.b);
 }
 
-/// The eight linears one block's device forward runs.
-pub fn blockLins(b: *const Block) [8]Weight {
+/// Every host GEMM on a model weight goes through here, so a LoRA cannot be
+/// missed at one call site.
+fn mm(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, out: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, out, x, m, w, bias);
+    if (stack) |s| try s.applyHost(io, gpa, out, w.rows, x, m, w, bias);
+}
+
+/// The eight linears one block (or text-fusion block) runs.
+pub fn blockLins(b: anytype) [8]Weight {
     return .{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down };
 }
 
@@ -934,7 +1001,7 @@ test "an unrotated int8_tensorwise checkpoint loads with a broadcast scale" {
     // that have no int GEMM on that path.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "models/diffusion_model/rayArtshoot_krea2NSFWV4.safetensors";
+    const path = build_options.model_root ++ "/diffusion_models/krea2/rayArtshoot_krea2NSFWV4.safetensors";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
     var st = try SafeTensors.open(gpa, io, path);

@@ -15,6 +15,7 @@
 //! a bad drafter costs speed, never correctness.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const qwen3 = @import("qwen3.zig");
 const qwen3_cuda = @import("qwen3_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
@@ -181,8 +182,8 @@ pub const Eagle3Head = struct {
         try be.qkNorm(b.emb, b.embn, try nbuf(be, self.input_norm), rows, hidden, eps);
         try be.qkNorm(b.feat, b.hidn, try nbuf(be, self.hidden_norm), rows, hidden, eps);
         for (0..rows) |r| {
-            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden, false);
-            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden, false);
+            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden);
+            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden);
         }
         try self.linear(b.q, b.cat, self.q, q_dim, cat_dim, rows);
         try self.linear(b.k, b.cat, self.k, kv_dim, cat_dim, rows);
@@ -209,9 +210,9 @@ pub const Eagle3Head = struct {
     pub fn draftToken(self: *Eagle3Head, row: usize, logits: []f32) !u32 {
         const be = self.be;
         const b = &self.b;
-        try be.qkNorm(offsetBufSized(b.feat, row * hidden * 4, hidden * 4), b.t, try nbuf(be, self.final_norm), 1, hidden, eps);
+        try be.qkNorm(b.feat.slice(row * hidden * 4, hidden * 4), b.t, try nbuf(be, self.final_norm), 1, hidden, eps);
         try be.opGemvBf16(b.logits, b.t, self.lm_head.bytes, 1.0, draft_vocab, hidden);
-        try be.tensorDownload(offsetBufSized(b.logits, 0, draft_vocab * 4), std.mem.sliceAsBytes(logits[0..draft_vocab]));
+        try be.tensorDownload(b.logits.slice(0, draft_vocab * 4), std.mem.sliceAsBytes(logits[0..draft_vocab]));
         return self.d2t[sample.argmax(logits[0..draft_vocab])];
     }
 
@@ -239,15 +240,15 @@ pub const Eagle3Head = struct {
 
         var pos: [tree_level_cap]u32 = undefined;
         for (pos[0..rows]) |*p| p.* = @intCast(p0 + depth);
-        try be.tensorUpload(offsetBufSized(b.tree_pos, 0, rows * 4), std.mem.sliceAsBytes(pos[0..rows]));
+        try be.tensorUpload(b.tree_pos.slice(0, rows * 4), std.mem.sliceAsBytes(pos[0..rows]));
         const meta_off = rows * n_heads * nsplit * (hd + 4);
-        try be.tensorUpload(offsetBufSized(b.tree_scratch, meta_off * 4, meta.len * 4), std.mem.sliceAsBytes(meta));
+        try be.tensorUpload(b.tree_scratch.slice(meta_off * 4, meta.len * 4), std.mem.sliceAsBytes(meta));
 
         try be.qkNorm(b.emb, b.embn, try nbuf(be, self.input_norm), rows, hidden, eps);
         try be.qkNorm(b.feat, b.hidn, try nbuf(be, self.hidden_norm), rows, hidden, eps);
         for (0..rows) |r| {
-            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden, false);
-            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden, false);
+            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden);
+            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden);
         }
         try self.linear(b.q, b.cat, self.q, q_dim, cat_dim, rows);
         try self.linear(b.k, b.cat, self.k, kv_dim, cat_dim, rows);
@@ -267,7 +268,7 @@ pub const Eagle3Head = struct {
         try self.linear(b.t, b.gate, self.down, hidden, intermediate, rows);
         try be.opAdd(b.feat, b.t, rows * hidden);
 
-        try be.opCopyOff(b.node_hidden, first_node * hidden, b.feat, 0, rows * hidden, false);
+        try be.opCopyOff(b.node_hidden, first_node * hidden, b.feat, 0, rows * hidden);
         try self.logitsFromFeat(0, rows);
     }
 
@@ -277,13 +278,13 @@ pub const Eagle3Head = struct {
         const be = self.be;
         const b = &self.b;
         std.debug.assert(rows >= 1 and rows <= tree_level_cap and row0 + rows <= max_rows);
-        try be.qkNorm(offsetBufSized(b.feat, row0 * hidden * 4, rows * hidden * 4), b.t, try nbuf(be, self.final_norm), rows, hidden, eps);
+        try be.qkNorm(b.feat.slice(row0 * hidden * 4, rows * hidden * 4), b.t, try nbuf(be, self.final_norm), rows, hidden, eps);
         var off: usize = 0;
         while (off < rows) : (off += 4) {
             const g: usize = @min(4, rows - off); // annotated: @min would narrow
             try be.opGemvBf16N(
-                offsetBufSized(b.logits, off * draft_vocab * 4, g * draft_vocab * 4),
-                offsetBufSized(b.t, off * hidden * 4, 4 * hidden * 4),
+                b.logits.slice(off * draft_vocab * 4, g * draft_vocab * 4),
+                b.t.slice(off * hidden * 4, 4 * hidden * 4),
                 self.lm_head.bytes,
                 self.lm_head.scale,
                 draft_vocab,
@@ -304,8 +305,8 @@ pub const Eagle3Head = struct {
         while (off < seq) : (off += 4) {
             const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
             try be.opGemvBf16N(
-                offsetBufSized(y, off * rows_out * 4, n * rows_out * 4),
-                offsetBufSized(x, off * cols * 4, 4 * cols * 4),
+                y.slice(off * rows_out * 4, n * rows_out * 4),
+                x.slice(off * cols * 4, 4 * cols * 4),
                 w.bytes,
                 w.scale,
                 rows_out,
@@ -394,11 +395,6 @@ const HeadBufs = struct {
 
     const fields = [_][]const u8{ "feat", "fc_in", "emb", "embn", "hidn", "cat", "q", "k", "v", "attn", "normed", "gate", "up", "t", "attn_scratch", "logits", "node_hidden", "tree_pos", "tree_scratch" };
 };
-
-/// offsetBuf carrying an explicit size (tensorUpload/Download use db.size).
-fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
-}
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
@@ -490,7 +486,7 @@ pub const Eagle3Drafter = struct {
             // fc inputs: pack the 3 tap rows per position into [rows][3*hidden].
             for (0..3) |j| {
                 for (0..rows) |r| {
-                    try be.opCopyOff(head.b.fc_in, r * fused_dim + j * hidden, self.target.tap_d, (j * self.target.capacity + a + r) * hidden, hidden, false);
+                    try be.opCopyOff(head.b.fc_in, r * fused_dim + j * hidden, self.target.tap_d, (j * self.target.capacity + a + r) * hidden, hidden);
                 }
             }
             try head.linear(head.b.feat, head.b.fc_in, head.fc, hidden, fused_dim, rows);
@@ -524,9 +520,9 @@ pub const Eagle3Drafter = struct {
         if (head.len + max_depth > head.capacity) return 0;
 
         // Root: hidden feeds level 1's rollout rows; logits seed the beam.
-        try be.opCopyOff(head.b.node_hidden, 0, head.b.feat, (rows_in_buf - 1) * hidden, hidden, false);
+        try be.opCopyOff(head.b.node_hidden, 0, head.b.feat, (rows_in_buf - 1) * hidden, hidden);
         try head.logitsFromFeat(rows_in_buf - 1, 1);
-        try be.tensorDownload(offsetBufSized(head.b.logits, 0, draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0..draft_vocab]));
+        try be.tensorDownload(head.b.logits.slice(0, draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0..draft_vocab]));
 
         // Per-node bookkeeping (node 0 = root; slice index i is node i+1).
         var node_parent: [spec_limits.max_tree_nodes]u32 = undefined;
@@ -561,7 +557,7 @@ pub const Eagle3Drafter = struct {
             var level_tokens: [tree_level_cap]u32 = undefined;
             for (level[0..level_n], 0..) |node, r| {
                 level_tokens[r] = tokens[node - 1];
-                try be.opCopyOff(head.b.feat, r * hidden, head.b.node_hidden, node_parent[node] * hidden, hidden, false);
+                try be.opCopyOff(head.b.feat, r * hidden, head.b.node_hidden, node_parent[node] * hidden, hidden);
             }
             try self.uploadEmbeds(level_tokens[0..level_n]);
             // Attention meta: kv_len = grounded prefix + depth; the ancestor
@@ -580,7 +576,7 @@ pub const Eagle3Drafter = struct {
                 std.debug.assert(d == 0);
             }
             try head.forwardTreeLevel(level[0], level_n, depth, meta[0 .. level_n * (level_n + 1)]);
-            try be.tensorDownload(offsetBufSized(head.b.logits, 0, level_n * draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0 .. level_n * draft_vocab]));
+            try be.tensorDownload(head.b.logits.slice(0, level_n * draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0 .. level_n * draft_vocab]));
 
             // Rank all continuations by cumulative log-probability.
             const Cand = struct { parent: u32, tok: u32, lp: f32 };
@@ -655,7 +651,7 @@ pub const Eagle3Drafter = struct {
             const row = head.embed_bytes[@as(usize, id) * hidden * 2 ..][0 .. hidden * 2];
             try safetensors.convertToF32(.bf16, row, self.emb_row[r * hidden ..][0..hidden]);
         }
-        try head.be.tensorUpload(offsetBufSized(head.b.emb, 0, tokens.len * hidden * 4), std.mem.sliceAsBytes(self.emb_row[0 .. tokens.len * hidden]));
+        try head.be.tensorUpload(head.b.emb.slice(0, tokens.len * hidden * 4), std.mem.sliceAsBytes(self.emb_row[0 .. tokens.len * hidden]));
     }
 
     fn commonPrefix(a: []const u32, b: []const u32) usize {
@@ -673,13 +669,13 @@ pub const Eagle3Drafter = struct {
 test "eagle drafter matches vanilla greedy on the real models" {
     // The failure this has actually shown is an ERROR out of the drafter, not a
     // mismatch, and an error with no message says nothing about which stage.
-    errdefer |e| std.debug.print("eagle chain: {t}\n", .{e});
+    errdefer |e| if (e != error.SkipZigTest) std.debug.print("eagle chain: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    const head_path = "models/text_encoders/qwen3_4b_eagle3.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const head_path = build_options.model_root ++ "/text_encoders/qwen3_4b_eagle3.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, head_path, .{}) catch return error.SkipZigTest;
@@ -741,13 +737,13 @@ test "eagle drafter matches vanilla greedy on the real models" {
 test "eagle tree drafter matches vanilla greedy on the real models" {
     // The failure this has actually shown is an ERROR out of the drafter, not a
     // mismatch, and an error with no message says nothing about which stage.
-    errdefer |e| std.debug.print("eagle tree: {t}\n", .{e});
+    errdefer |e| if (e != error.SkipZigTest) std.debug.print("eagle tree: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    const head_path = "models/text_encoders/qwen3_4b_eagle3.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const head_path = build_options.model_root ++ "/text_encoders/qwen3_4b_eagle3.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, head_path, .{}) catch return error.SkipZigTest;

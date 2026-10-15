@@ -15,6 +15,7 @@
 //! GEMM regime (validated cos > 0.999 vs CPU).
 
 const std = @import("std");
+const lin_cuda = @import("lin_cuda.zig");
 const gemma4v_vit = @import("gemma4v_vit.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -31,13 +32,8 @@ const Weight = ops.matmul.Weight;
 /// bias.len==w.rows), so a length-`w.rows` zero slice stands in for the absent
 /// gemma4v biases; the quant path takes no bias.
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, zero: []const f32) !void {
-    switch (w.dtype) {
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, zero[0..w.rows], false, false),
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, zero[0..w.rows], false, false),
-        .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, zero[0..w.rows]),
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => try be.opMatmulQuant(w.dtype, dst, src, m, w.bytes, w.rows, w.cols),
-        else => return error.UnsupportedDType,
-    }
+    _ = zero;
+    try lin_cuda.towerLinear(be, dst, src, m, w, null, null);
 }
 
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {

@@ -9,12 +9,18 @@
 //! whole forward pass is the planned next step.
 
 const std = @import("std");
+const pipe_cache_file = @import("pipe_cache.zig");
 const builtin = @import("builtin");
 const dynlib = @import("tp_core").dynlib;
+const tp_core = @import("tp_core");
 const build_options = @import("build_options");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
+
+/// Output rows the int8 cooperative GEMM stores per tile; a weight's rows must be a
+/// multiple of it.
+pub const i8_row_tile: usize = 16 * coopmat.i8_nt;
 const convrot = @import("tp_ops").convrot;
 const ops = @import("tp_ops");
 const mem_tag = @import("mem_tag.zig");
@@ -26,9 +32,9 @@ const matmul_f32_spv = @embedFile("matmul_f32_spv");
 const transpose_spv = @embedFile("transpose_spv");
 const eltwise_spv = @embedFile("eltwise_spv");
 const attn_batched_spv = @embedFile("attn_batched_spv");
-const subgroup_spv = @embedFile("subgroup_spv");
 const dual_spv = @embedFile("dual_spv");
 const dual_table = @import("kernels/dual_table.zig");
+pub const Dt = dual_table.Dt;
 const iq_grid = @import("kernels/iq_grid.zig");
 
 /// Push constants for the standalone `attn_batched` kernel (matches the Push
@@ -55,6 +61,11 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// the user's cache dir, set this false; `TP_COOP_AUTOTUNE=0` does the same from outside.
 /// An already-cached device never screens either way.
 pub var autotune_tiles: bool = true;
+
+/// Whether the pipeline cache is read from and written to the user's cache dir
+/// (`pipe_cache.zig`). Off (or `TP_VK_PIPELINE_CACHE=0`), every run compiles every kernel
+/// it binds.
+pub var persist_pipeline_cache: bool = true;
 
 /// Overrides where the measured-tile cache lives, for an embedder that keeps its own state
 /// directory rather than using `TP_COOP_TILE_CACHE` or the XDG location.
@@ -116,8 +127,8 @@ pub fn coopI8TileFits(wm: u32, wn: u32, fm: u32, fnn: u32, nwarps: u32, max_shar
 // The measured-tile cache, read at init so the pipelines are built at the chosen tile the
 // first time rather than re-tiled afterwards. `tune-coop` writes it.
 /// Where the tile cache lives. `TP_COOP_TILE_CACHE` names the file outright; otherwise it
-/// is `<XDG_CACHE_HOME or HOME/.cache>/tensorpencil/coop_tile`. Returns null when neither
-/// env var is set, which just means "no cache", not an error.
+/// is `coop_tile` in the cache dir (`pipe_cache.path`). Null when there is none, which just
+/// means "no cache", not an error.
 pub fn coopTileCachePath(buf: []u8) ?[:0]const u8 {
     if (tile_cache_path) |v| {
         if (v.len + 1 > buf.len) return null;
@@ -132,16 +143,9 @@ pub fn coopTileCachePath(buf: []u8) ?[:0]const u8 {
         buf[v.len] = 0;
         return buf[0..v.len :0];
     }
-    const sub = "/tensorpencil/coop_tile";
-    if (getenv("XDG_CACHE_HOME")) |p| {
-        const v = std.mem.sliceTo(p, 0);
-        return std.fmt.bufPrintZ(buf, "{s}" ++ sub, .{v}) catch null;
-    }
-    if (getenv("HOME")) |p| {
-        const v = std.mem.sliceTo(p, 0);
-        return std.fmt.bufPrintZ(buf, "{s}/.cache" ++ sub, .{v}) catch null;
-    }
-    return null;
+    const p = pipe_cache_file.path(buf[0 .. buf.len - 1], "coop_tile") orelse return null;
+    buf[p.len] = 0;
+    return buf[0..p.len :0];
 }
 
 /// Key identifying a device+driver in the cache. Includes the driver version so a driver
@@ -227,13 +231,7 @@ pub fn writeCoopTileCache(io: std.Io, key: []const u8, f16w: [2]u32, i8t: [2]u32
     const mine = std.fmt.bufPrint(out[n..], "{s} f16={d}x{d} i8={d}x{d}\n", .{ key, f16w[0], f16w[1], i8t[0], i8t[1] }) catch return;
     n += mine.len;
 
-    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    var f = std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true }) catch return;
-    defer f.close(io);
-    var wbuf: [1024]u8 = undefined;
-    var w = f.writer(io, &wbuf);
-    w.interface.writeAll(out[0..n]) catch return;
-    w.interface.flush() catch return;
+    pipe_cache_file.write(io, path, out[0..n]) catch return;
 }
 
 /// Pick a screened tile: the fastest candidate that beats the 64x64 default by `win` in
@@ -368,23 +366,20 @@ pub const topk_lanes = 1024;
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
 
-/// Reduction widths with a FUSED int8 prep kernel. Every convrot `cols` a model's
-/// device GEMMs use should appear here or that prep silently takes the 3-pass fallback,
-/// which round-trips a full f32 copy of the activation through global memory. krea2 needs
-/// 6144 and 16384; Anima needs 2048 (`dim`) and 8192 (`mlp_dim`); SenseNova needs 4096
-/// (`dim`, and its q projection's output) and 12288 (`inter`).
-pub const i8_prep_cols = [_]u32{ 2048, 4096, 6144, 8192, 12288, 16384 };
+/// DIAGNOSTIC: the stages `opMatmulCoopQuant` leaves out (wrong output), so
+/// `vk-bq-bench` can time the rest: `.pack` drops the k-major transpose, `.expand` the
+/// dequant too.
+pub var bench_bq_skip: enum { none, pack, expand } = .none;
+
+/// Run the int8 prep as the 3-pass chain at every width, for an A/B against the fused
+/// kernel (`diffusion-profile --ab prep3`).
+pub var force_i8_prep_3pass: bool = false;
 
 /// Which pass of the two-pass flash attention (`coopmat.buildFlashAttn`). Named rather than
 /// inline so a caller can pass it through `@call`.
 pub const FlashPass = enum { md, out };
 
-fn i8PrepIndex(cols: usize) ?usize {
-    for (i8_prep_cols, 0..) |c, i| if (c == cols) return i;
-    return null;
-}
-
-pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, attn_dsplit_gemma, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad, scale_f32, add_scaled, gelu_quick_mul, geglu_h16, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, bf16_to_h16_pad, f16_to_f32, bias_add_f16, bias_add_h16, add_bias_rows, add_bias_rows_h16, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_fp8_f32, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q4_0_f32, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q1_0_f32, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g64_f32, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_q2_0_g128_f32, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_iq4_xs_f32, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, layernorm_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q2_k_f32, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_q3_k_f32, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xxs_f32, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq2_xs_f32, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_xxs_f32, dequant_iq3_s_f16, dequant_iq3_s_bf16, dequant_iq3_s_f32, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8 };
+pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q3_k, gemv4_dual_q4_k, gemv4_dual_q8_0, gemv4_dual_q4_0, gemv4_dual_iq4_nl, gemv4_dual_iq4_xs, gemv4_dual_q5_k, gemv4_dual_q6_k, gemv4_dual_q1_0, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g128, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xs, gemv4_dual_iq3_xxs, gemv4_dual_iq3_s, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16 };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("act_steer"),
     dualEntry("rmsnorm"),
@@ -406,11 +401,10 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("softmax_combine"),
     .{ .name = "attn_out", .x = 16, .y = 16 },
     dualEntry("f32_to_h16"),
-    dualEntry("f32_to_h16_pad"),
+    dualEntry("pad_h16"),
     dualEntry("vae_norm"),
     dualEntry("im2col"),
     dualEntry("bias_compact"),
-    dualEntry("qknorm_rope16"),
     dualEntry("gather_kmajor16"),
     dualEntry("silu_mul16"),
     dualEntry("sigmoid_mul_g16"),
@@ -426,9 +420,7 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "nvfp4_decode_t", .x = 256, .y = 1 },
     dualEntry("scale_i32"),
     dualEntry("scale_concat"),
-    dualEntry("qknorm_rope_f32"),
-    .{ .name = "attn_dsplit", .x = 256, .y = 1 },
-    .{ .name = "attn_dmerge", .x = 256, .y = 1 },
+    dualEntry("qknorm_rope"),
     .{ .name = "gemv_partial", .x = 256, .y = 1 },
     dualEntry("gemv_combine"),
     .{ .name = "gemv_partial4", .x = 256, .y = 1 },
@@ -438,28 +430,20 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gdn_gates"),
     dualEntry("gdn_conv_step"),
     .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
-    .{ .name = "attn_dsplit_gemma", .x = 256, .y = 1 },
     dualEntry("gelu_mul"),
     dualEntry("gelu"),
     dualEntry("layernorm"),
     .{ .name = "attn_full", .x = 64, .y = 1 },
-    dualEntry("f32_to_bf16_pad"),
+    dualEntry("pad_bf16"),
     dualEntry("relu"),
     dualEntry("add_relu"),
     dualEntry("argmax_reduce"),
     dualEntry("argmax_final"),
     dualEntry("topk_reduce"),
-    .{ .name = "attn_dsplit_gemma_f16", .x = 256, .y = 1 },
     dualEntry("kv_store_f16"),
     dualEntry("penalize"),
-    .{ .name = "attn_dsplit_gemma_q8", .x = 256, .y = 1 },
     .{ .name = "kv_store_q8_0", .x = 256, .y = 1 },
-    dualEntry("dequant_q8_0_f32"),
-    dualEntry("dequant_q4_k_f32"),
-    dualEntry("dequant_q5_k_f32"),
-    dualEntry("dequant_q6_k_f32"),
-    dualEntry("dequant_iq4_nl_f32"),
-    dualEntry("pack_h16_kmajor"),
+    dualEntry("transpose_kmajor16"),
     dualEntry("gn_stats"),
     dualEntry("gn_combine"),
     dualEntry("gn_apply"),
@@ -473,16 +457,9 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "attn_causal_batched", .x = 64, .y = 1 },
     dualEntry("gelu_quick"),
     dualEntry("gelu_erf"),
-    dualEntry("gn_stats_h16"),
-    dualEntry("gn_apply_h16"),
-    dualEntry("add_h16"),
-    dualEntry("bias_compact_h16"),
-    dualEntry("im2col_sd_h16"),
-    dualEntry("h16_to_h16_pad"),
     dualEntry("scale_f32"),
     dualEntry("add_scaled"),
     dualEntry("gelu_quick_mul"),
-    dualEntry("geglu_h16"),
     dualEntry("softplus_gate"),
     dualEntry("rope_half_pos"),
     dualEntry("rope_half_part"),
@@ -497,12 +474,9 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gather_head_b"),
     dualEntry("gather_vt_b"),
     dualEntry("scatter_head_b"),
-    dualEntry("bf16_to_h16_pad"),
     dualEntry("f16_to_f32"),
-    dualEntry("bias_add_f16"),
-    dualEntry("bias_add_h16"),
+    dualEntry("bias_add"),
     dualEntry("add_bias_rows"),
-    dualEntry("add_bias_rows_h16"),
     dualEntry("gather_rows"),
     dualEntry("scatter_add_rows"),
     dualEntry("moe_combine"),
@@ -519,26 +493,20 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("mean_heads_pool"),
     dualEntry("dequant_fp8_f16"),
     dualEntry("dequant_fp8_bf16"),
-    dualEntry("dequant_fp8_f32"),
     dualEntry("dequant_q8_0_f16"),
     dualEntry("dequant_q8_0_bf16"),
     dualEntry("dequant_q4_0_f16"),
     dualEntry("dequant_q4_0_bf16"),
-    dualEntry("dequant_q4_0_f32"),
     dualEntry("dequant_q1_0_f16"),
     dualEntry("dequant_q1_0_bf16"),
-    dualEntry("dequant_q1_0_f32"),
     dualEntry("dequant_q2_0_g64_f16"),
     dualEntry("dequant_q2_0_g64_bf16"),
-    dualEntry("dequant_q2_0_g64_f32"),
     dualEntry("dequant_q2_0_g128_f16"),
     dualEntry("dequant_q2_0_g128_bf16"),
-    dualEntry("dequant_q2_0_g128_f32"),
     dualEntry("dequant_iq4_nl_f16"),
     dualEntry("dequant_iq4_nl_bf16"),
     dualEntry("dequant_iq4_xs_f16"),
     dualEntry("dequant_iq4_xs_bf16"),
-    dualEntry("dequant_iq4_xs_f32"),
     dualEntry("dequant_q4_k_f16"),
     dualEntry("dequant_q4_k_bf16"),
     dualEntry("dequant_q5_k_f16"),
@@ -548,7 +516,6 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("group_rmsnorm"),
     dualEntry("rms_mod"),
     dualEntry("rms_mod_h16"),
-    dualEntry("layernorm_h16"),
     dualEntry("ln_mod"),
     dualEntry("l2norm_rows_g"),
     dualEntry("rope_half_span_pos"),
@@ -568,22 +535,16 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gated_add_pr"),
     dualEntry("dequant_q2_k_f16"),
     dualEntry("dequant_q2_k_bf16"),
-    dualEntry("dequant_q2_k_f32"),
     dualEntry("dequant_q3_k_f16"),
     dualEntry("dequant_q3_k_bf16"),
-    dualEntry("dequant_q3_k_f32"),
     dualEntry("dequant_iq2_xxs_f16"),
     dualEntry("dequant_iq2_xxs_bf16"),
-    dualEntry("dequant_iq2_xxs_f32"),
     dualEntry("dequant_iq2_xs_f16"),
     dualEntry("dequant_iq2_xs_bf16"),
-    dualEntry("dequant_iq2_xs_f32"),
     dualEntry("dequant_iq3_xxs_f16"),
     dualEntry("dequant_iq3_xxs_bf16"),
-    dualEntry("dequant_iq3_xxs_f32"),
     dualEntry("dequant_iq3_s_f16"),
     dualEntry("dequant_iq3_s_bf16"),
-    dualEntry("dequant_iq3_s_f32"),
     dualEntry("gemv_dual_q2_k"),
     dualEntry("gemv_dual_q2_k_q8"),
     dualEntry("gemv_dual_q3_k"),
@@ -616,7 +577,173 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gemv_dual_iq3_xxs_q8"),
     dualEntry("gemv_dual_iq3_s"),
     dualEntry("gemv_dual_iq3_s_q8"),
+    dualEntry("compact_acc"),
+    dualEntry("attn_rows_f32"),
+    dualEntry("attn_rows_f16"),
+    dualEntry("attn_rows_q8"),
+    dualEntry("attn_merge"),
+    dualEntry("gdn_delta_chunk_d64"),
+    dualEntry("gdn_delta_chunk_d128"),
+    dualEntry("quantize_q8_1"),
+    dualEntry("gemv4_dual_q2_k"),
+    dualEntry("gemv4_dual_q3_k"),
+    dualEntry("gemv4_dual_q4_k"),
+    dualEntry("gemv4_dual_q8_0"),
+    dualEntry("gemv4_dual_q4_0"),
+    dualEntry("gemv4_dual_iq4_nl"),
+    dualEntry("gemv4_dual_iq4_xs"),
+    dualEntry("gemv4_dual_q5_k"),
+    dualEntry("gemv4_dual_q6_k"),
+    dualEntry("gemv4_dual_q1_0"),
+    dualEntry("gemv4_dual_q2_0_g64"),
+    dualEntry("gemv4_dual_q2_0_g128"),
+    dualEntry("gemv4_dual_iq2_xxs"),
+    dualEntry("gemv4_dual_iq2_xs"),
+    dualEntry("gemv4_dual_iq3_xxs"),
+    dualEntry("gemv4_dual_iq3_s"),
+    dualEntry("attn_rows_g2_f32"),
+    dualEntry("attn_rows_g2_f16"),
+    dualEntry("attn_rows_g2_q8"),
+    dualEntry("attn_rows_g4_f32"),
+    dualEntry("attn_rows_g4_f16"),
+    dualEntry("attn_rows_g4_q8"),
+    dualEntry("attn_rows_g8_f32"),
+    dualEntry("attn_rows_g8_f16"),
+    dualEntry("attn_rows_g8_q8"),
+    dualEntry("qk_norm_rope"),
+    dualEntry("add_f16"),
+    dualEntry("add_bf16"),
+    dualEntry("geglu_f16"),
+    dualEntry("geglu_bf16"),
+    dualEntry("bias_compact_f16"),
+    dualEntry("bias_compact_bf16"),
+    dualEntry("add_bias_rows_f16"),
+    dualEntry("add_bias_rows_bf16"),
+    dualEntry("gn_apply_f16"),
+    dualEntry("gn_apply_bf16"),
+    dualEntry("im2col_sd_f16"),
+    dualEntry("im2col_sd_bf16"),
+    dualEntry("qknorm_rope_f16"),
+    dualEntry("qknorm_rope_bf16"),
+    dualEntry("layernorm_f16"),
+    dualEntry("layernorm_bf16"),
+    dualEntry("gn_stats_f16"),
+    dualEntry("gn_stats_bf16"),
+    dualEntry("pad_h16_f16"),
+    dualEntry("pad_h16_bf16"),
+    dualEntry("pad_bf16_f16"),
+    dualEntry("pad_bf16_bf16"),
+    dualEntry("bias_add_f16"),
+    dualEntry("bias_add_bf16"),
+    dualEntry("scale_i32_f16"),
+    dualEntry("scale_i32_bf16"),
+    dualEntry("copy_f16"),
+    dualEntry("copy_bf16"),
+    dualEntry("copy_f32_f16"),
+    dualEntry("copy_f32_bf16"),
+    dualEntry("copy_f16_f32"),
+    dualEntry("copy_bf16_f32"),
+    dualEntry("concat_ch_f16"),
+    dualEntry("concat_ch_bf16"),
+    dualEntry("compact_acc_f16"),
+    dualEntry("compact_acc_bf16"),
+    dualEntry("silu_mul_f16"),
+    dualEntry("silu_mul_bf16"),
+    dualEntry("sigmoid_mul_f16"),
+    dualEntry("sigmoid_mul_bf16"),
+    dualEntry("gated_add_f16"),
+    dualEntry("gated_add_bf16"),
+    dualEntry("rope_inter_f16"),
+    dualEntry("rope_inter_bf16"),
+    dualEntry("act_steer_f16"),
+    dualEntry("act_steer_bf16"),
+    dualEntry("rmsnorm_f16"),
+    dualEntry("rmsnorm_bf16"),
+    dualEntry("rms_mod_f16"),
+    dualEntry("rms_mod_bf16"),
+    dualEntry("rms_mod_h16_f16"),
+    dualEntry("rms_mod_h16_bf16"),
+    dualEntry("modulate_f16"),
+    dualEntry("modulate_bf16"),
+    dualEntry("gelu_erf_f16"),
+    dualEntry("gelu_erf_bf16"),
+    dualEntry("ln_mod_f16"),
+    dualEntry("ln_mod_bf16"),
+    dualEntry("gelu_f16"),
+    dualEntry("gelu_bf16"),
+    dualEntry("flag_nonfinite"),
+    dualEntry("flag_nonfinite_f16"),
+    dualEntry("flag_nonfinite_bf16"),
+    dualEntry("add_scaled_f16"),
+    dualEntry("add_scaled_bf16"),
+    dualEntry("gated_add_scaled"),
+    dualEntry("gated_add_scaled_f16"),
+    dualEntry("gated_add_scaled_bf16"),
+    dualEntry("wo_unpack_f32"),
+    dualEntry("transpose_pad_f32"),
+    dualEntry("vae_norm_f16"),
+    dualEntry("vae_norm_bf16"),
+    dualEntry("im2col_h16"),
+    dualEntry("im2col_h16_f16"),
+    dualEntry("im2col_h16_bf16"),
+    dualEntry("im2col_bf16"),
+    dualEntry("im2col_bf16_f16"),
+    dualEntry("im2col_bf16_bf16"),
+    dualEntry("silu_f16"),
+    dualEntry("silu_bf16"),
+    dualEntry("modulate_pr_f16"),
+    dualEntry("modulate_pr_bf16"),
+    dualEntry("gated_add_pr_f16"),
+    dualEntry("gated_add_pr_bf16"),
+    dualEntry("dw_conv3_f16"),
+    dualEntry("dw_conv3_bf16"),
+    dualEntry("col_mean_f16"),
+    dualEntry("col_mean_bf16"),
+    dualEntry("mul_cols_sigmoid_f16"),
+    dualEntry("mul_cols_sigmoid_bf16"),
+    dualEntry("nerf_feat_f16"),
+    dualEntry("nerf_feat_bf16"),
+    dualEntry("layernorm_f32_f16"),
+    dualEntry("layernorm_f32_bf16"),
+    dualEntry("kron_mix"),
+    dualEntry("kron_mix_f16"),
+    dualEntry("kron_mix_bf16"),
+    dualEntry("kron_stack"),
+    dualEntry("kron_stack_f16"),
+    dualEntry("kron_stack_bf16"),
+    dualEntry("dora_rows"),
+    dualEntry("dora_rows_f16"),
+    dualEntry("dora_rows_bf16"),
+    dualEntry("dora_cols"),
+    dualEntry("dora_cols_f16"),
+    dualEntry("dora_cols_bf16"),
 };
+
+// A pipeline is found by `Elt` ordinal, so a slot out of order launches another kernel.
+comptime {
+    @setEvalBranchQuota(200_000);
+    for (std.meta.fieldNames(Elt), elt_entry_sizes) |name, es| {
+        if (!std.mem.eql(u8, name, es.name)) @compileError("Elt." ++ name ++ " sits at the table slot of " ++ es.name);
+    }
+}
+
+/// The `Elt` of a dual body that takes an element type (`dual_table.typedName`).
+pub fn eltAt(comptime base: []const u8, dt: Dt) Elt {
+    return switch (dt) {
+        inline else => |d| @field(Elt, dual_table.typedName(base, d)),
+    };
+}
+
+/// The `copy` from `in` to `out` (u0 = n, u2 = dst offset, u3 = src offset). Only one
+/// side may be 16-bit when they differ.
+pub fn eltCopy(in: Dt, out: Dt) Elt {
+    std.debug.assert(in == out or in == .f32 or out == .f32);
+    return switch (in) {
+        inline else => |i| switch (out) {
+            inline else => |o| if (i != o and i != .f32 and o != .f32) unreachable else @field(Elt, dual_table.copyName(i, o)),
+        },
+    };
+}
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
 pub const EltPush = extern struct {
@@ -639,6 +766,43 @@ const TransposePush = extern struct {
     k_pad: u32 = 0, // bf16_to_f16_coopw only
 };
 
+/// DIAGNOSTIC (`TP_VK_PROFILE`): GPU time per pipeline over every batch, printed at
+/// `deinit`. Ops are separated by barriers, so a timestamp after each one gives its
+/// span; a shim on `CmdBindPipeline` says which pipeline the op ran. One context.
+const Prof = struct {
+    pool: vk.QueryPool,
+    n: u32 = 0,
+    pipes: [cap]vk.Pipeline = undefined,
+    period_ns: f64,
+    totals: std.AutoHashMapUnmanaged(vk.Pipeline, Total) = .empty,
+
+    const cap = 4096;
+    const Total = struct { ns: f64 = 0, count: u64 = 0 };
+};
+var prof: ?*Prof = null;
+var prof_last: vk.Pipeline = .null_handle;
+var prof_real_bind: vk.PfnCmdBindPipeline = undefined;
+
+fn profBind(cb: vk.CommandBuffer, bp: vk.PipelineBindPoint, p: vk.Pipeline) callconv(.c) void {
+    prof_last = p;
+    prof_real_bind(cb, bp, p);
+}
+
+fn profStart(self: *Context, period: f32) void {
+    var pool: vk.QueryPool = .null_handle;
+    if (self.d.CreateQueryPool(self.device, &.{ .query_count = Prof.cap }, null, &pool) != .success) return;
+    const pf = self.gpa.create(Prof) catch return;
+    pf.* = .{ .pool = pool, .period_ns = period };
+    prof = pf;
+    prof_real_bind = self.d.CmdBindPipeline;
+    self.d.CmdBindPipeline = profBind;
+}
+
+/// Host buffers that live only within one call (a weight's conversion before upload).
+/// Not `Context.gpa`: a caller may hand the context an arena, whose `free` keeps
+/// everything until the process ends.
+const transient = std.heap.smp_allocator;
+
 pub const Error = error{
     VulkanUnavailable,
     NoSuitableDevice,
@@ -649,6 +813,8 @@ pub const Error = error{
     OutOfMemory,
     /// A GGUF block-quant dtype without a Vulkan GEMV kernel yet.
     UnsupportedDType,
+    /// A buffer view whose offset the device cannot bind (`Context.view`).
+    UnalignedView,
 } || spv.Error;
 
 /// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
@@ -659,28 +825,28 @@ pub const Error = error{
 const EltSrc = enum { eltwise, dual };
 const EntrySize = struct { name: []const u8, x: u32, y: u32, src: EltSrc = .eltwise, rows: bool = false };
 
-fn eltEntriesOf(comptime src: EltSrc) [eltEntryCount(src)]EntrySize {
-    var out: [eltEntryCount(src)]EntrySize = undefined;
-    var n: usize = 0;
-    for (elt_entry_sizes) |es| {
-        if (es.src == src) {
-            out[n] = es;
-            n += 1;
-        }
-    }
-    return out;
-}
-fn eltEntryCount(comptime src: EltSrc) usize {
-    var n: usize = 0;
-    for (elt_entry_sizes) |es| n += @intFromBool(es.src == src);
-    return n;
-}
 fn dualEntry(comptime name: [:0]const u8) EntrySize {
     const t = dual_table.get(name);
     return .{ .name = name, .x = t.wg, .y = 1, .src = .dual, .rows = t.kind == .rows };
 }
-const eltwise_entries = eltEntriesOf(.eltwise);
-const dual_entries = eltEntriesOf(.dual);
+
+/// The module-wide patches `createKernelModule` applies, without the per-entry workgroup
+/// sizes: what `EltMaker` cuts each kernel's module from.
+fn patchKernelModule(gpa: std.mem.Allocator, code: []const u8, caps: []const u32, ext: ?[]const u8) Error![]align(4) u8 {
+    var current = try gpa.alignedAlloc(u8, .of(u32), code.len);
+    @memcpy(current, code);
+    if (caps.len > 0) {
+        const capped = try spv.withCapabilities(gpa, current, caps, ext);
+        gpa.free(current);
+        current = capped;
+    }
+    defer gpa.free(current);
+    const logical = try spv.withLogicalAddressing(gpa, current);
+    defer gpa.free(logical);
+    const stripped = try spv.stripWorkgroupStrides(gpa, logical);
+    defer gpa.free(stripped);
+    return spv.dedupeDecorations(gpa, stripped);
+}
 
 fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, code: []const u8, entries: []const EntrySize, caps: []const u32, ext: ?[]const u8, out: *vk.ShaderModule) Error!void {
     var current = try gpa.alignedAlloc(u8, .of(u32), code.len);
@@ -818,14 +984,33 @@ fn check(r: vk.Result) Error!void {
 /// gets a RequiredSubgroupSize create-info via VK_EXT_subgroup_size_control,
 /// core 1.3); it is null on wave32 devices (e.g. NVIDIA), leaving the created
 /// pipeline byte-identical to the un-pinned path.
+/// Create one compute pipeline through `cache` and say whether it COMPILED (missed the
+/// cache): from the driver's creation feedback where the device has it, else from how
+/// long it took, which misreads a slow hit (each one still hashes the whole module).
+fn createPipe(io: std.Io, d: *const Dispatch, device: vk.Device, cache: vk.PipelineCache, feedback: bool, info_in: vk.ComputePipelineCreateInfo, out: *vk.Pipeline) Error!bool {
+    var info = info_in;
+    var fb: vk.PipelineCreationFeedback = .{};
+    var fbi: vk.PipelineCreationFeedbackCreateInfo = .{ .p_next = info.p_next, .p_pipeline_creation_feedback = &fb };
+    if (feedback) info.p_next = &fbi;
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    try check(d.CreateComputePipelines(device, cache, 1, @ptrCast(&info), null, @ptrCast(out)));
+    if (fb.flags & vk.pipeline_creation_feedback_valid != 0) return fb.flags & vk.pipeline_creation_feedback_cache_hit == 0;
+    return std.Io.Clock.awake.now(io).nanoseconds - t0 > compile_ns;
+}
+
+/// One cooperative-matrix (or plain `main`) pipeline, at `coop_sg` lanes when given.
+/// Returns whether it compiled.
 fn createCoopPipe(
+    io: std.Io,
     d: *const Dispatch,
     device: vk.Device,
+    cache: vk.PipelineCache,
+    feedback: bool,
     module: vk.ShaderModule,
     layout: vk.PipelineLayout,
     coop_sg: ?u32,
     out: *vk.Pipeline,
-) Error!void {
+) Error!bool {
     var sgs: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo =
         .{ .required_subgroup_size = coop_sg orelse 0 };
     const info: vk.ComputePipelineCreateInfo = .{
@@ -836,7 +1021,169 @@ fn createCoopPipe(
         },
         .layout = layout,
     };
-    try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(out)));
+    return createPipe(io, d, device, cache, feedback, info, out);
+}
+
+/// The pipelines `Context.init` builds outside the eltwise table, created together on
+/// every core (`run`). Nothing in init reads one before the batch runs, only the module
+/// it comes from, which is what lets them wait.
+const PipeBatch = struct {
+    const Job = struct { module: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline };
+    jobs: [32]Job = undefined,
+    n: usize = 0,
+
+    fn add(b: *PipeBatch, module: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline) void {
+        b.jobs[b.n] = .{ .module = module, .layout = layout, .sg = sg, .out = out };
+        b.n += 1;
+    }
+
+    /// Create every queued pipeline; returns how many compiled (missed the cache).
+    fn run(b: *PipeBatch, io: std.Io, d: *const Dispatch, device: vk.Device, cache: vk.PipelineCache, feedback: bool) Error!usize {
+        if (b.n == 0) return 0;
+        const Run = struct {
+            b: *PipeBatch,
+            io: std.Io,
+            d: *const Dispatch,
+            device: vk.Device,
+            cache: vk.PipelineCache,
+            feedback: bool,
+            compiled: std.atomic.Value(usize) = .init(0),
+            failed: std.atomic.Value(bool) = .init(false),
+
+            fn work(r: *@This(), first: usize, step: usize) void {
+                var k = first;
+                while (k < r.b.n) : (k += step) {
+                    const j = r.b.jobs[k];
+                    const compiled = createCoopPipe(r.io, r.d, r.device, r.cache, r.feedback, j.module, j.layout, j.sg, j.out) catch {
+                        r.failed.store(true, .monotonic);
+                        continue;
+                    };
+                    if (compiled) _ = r.compiled.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+        var r: Run = .{ .b = b, .io = io, .d = d, .device = device, .cache = cache, .feedback = feedback };
+        const max_threads = 32;
+        const threads = @min(b.n, max_threads, std.Thread.getCpuCount() catch 1);
+        const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+        var pool: [max_threads]?std.Thread = @splat(null);
+        for (1..threads) |t| pool[t] = std.Thread.spawn(.{}, Run.work, .{ &r, t, threads }) catch null;
+        r.work(0, threads);
+        for (pool[1..threads]) |th| if (th) |t| t.join();
+        // A thread that never started left its share undone; do it here.
+        for (1..threads) |t| if (pool[t] == null) r.work(t, threads);
+        if (r.failed.load(.monotonic)) return error.VulkanFailed;
+        const compiled = r.compiled.load(.monotonic);
+        if (compiled > 0) {
+            const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e9;
+            std.log.info("vulkan: compiled {d} GEMM and attention pipelines in {d:.1} s on {d} threads (new build or driver; cached from now on)", .{ compiled, secs, threads });
+        }
+        return compiled;
+    }
+};
+
+const EltSet = std.StaticBitSet(elt_entry_sizes.len);
+
+/// What creating an eltwise pipeline needs, outside a `Context`.
+const EltMaker = struct {
+    d: *const Dispatch,
+    device: vk.Device,
+    cache: vk.PipelineCache,
+    layout: vk.PipelineLayout,
+    spv_e: []align(4) const u8,
+    spv_dual: []align(4) const u8,
+    io: std.Io,
+    feedback: bool,
+
+    /// Whether it compiled (missed the cache). The driver is handed a module holding
+    /// only this kernel: given the whole module it processes all of it per pipeline.
+    /// Thread-safe, so the scratch comes from `smp_allocator`, not the Context's.
+    fn create(m: *const EltMaker, i: usize, out: *vk.Pipeline) Error!bool {
+        const gpa = std.heap.smp_allocator;
+        const es = elt_entry_sizes[i];
+        const one = try spv.forEntry(gpa, if (es.src == .dual) m.spv_dual else m.spv_e, es.name);
+        defer gpa.free(one);
+        const sized = try spv.withLocalSize(gpa, one, es.name, es.x, es.y, 1);
+        defer gpa.free(sized);
+        var module: vk.ShaderModule = .null_handle;
+        try check(m.d.CreateShaderModule(m.device, &.{ .code_size = sized.len, .p_code = @ptrCast(sized.ptr) }, null, &module));
+        defer m.d.DestroyShaderModule(m.device, module, null);
+        var name: [64:0]u8 = @splat(0);
+        @memcpy(name[0..es.name.len], es.name);
+        const info: vk.ComputePipelineCreateInfo = .{
+            .stage = .{ .module = module, .p_name = &name },
+            .layout = m.layout,
+        };
+        return createPipe(m.io, m.d, m.device, m.cache, m.feedback, info, out);
+    }
+};
+
+/// Builds whose pipeline caches stay on disk; older ones are deleted on save.
+const keep_pipeline_caches = 4;
+
+/// Names this build's pipeline cache: a build with different kernels gets its own file.
+fn moduleHash() u64 {
+    // Bump when how a kernel's module is built changes: an old file's entries then
+    // stay with the old name and are pruned.
+    const module_format = 2;
+    var h = std.hash.Wyhash.init(module_format);
+    h.update(eltwise_spv);
+    h.update(dual_spv);
+    return h.final();
+}
+
+/// A pipeline taking longer than this to create was compiled, not read from the cache.
+const compile_ns: i96 = 30 * std.time.ns_per_ms;
+
+/// Create the eltwise pipelines in `want` across every core; a driver compiles one call's
+/// pipelines in turn, but separate threads' calls in parallel. Returns how many compiled
+/// (missed the cache). A failure leaves its slot null for `eltPipe` to retry and report.
+fn warmElt(io: std.Io, m: *const EltMaker, want: EltSet, out: *[elt_entry_sizes.len]vk.Pipeline) usize {
+    var idx: [elt_entry_sizes.len]u16 = undefined;
+    var n: usize = 0;
+    var it = want.iterator(.{});
+    while (it.next()) |i| : (n += 1) idx[n] = @intCast(i);
+    if (n == 0) return 0;
+    const Job = struct {
+        m: *const EltMaker,
+        io: std.Io,
+        idx: []const u16,
+        out: *[elt_entry_sizes.len]vk.Pipeline,
+        compiled: std.atomic.Value(usize) = .init(0),
+
+        fn run(job: *@This(), first: usize, step: usize) void {
+            var k = first;
+            while (k < job.idx.len) : (k += step) {
+                const i = job.idx[k];
+                if (job.m.create(i, &job.out[i]) catch continue) _ = job.compiled.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var job: Job = .{ .m = m, .io = io, .idx = idx[0..n], .out = out };
+    const max_threads = 32;
+    const threads = @min(n, max_threads, std.Thread.getCpuCount() catch 1);
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    var pool: [max_threads]?std.Thread = @splat(null);
+    // A thread that fails to start leaves its share to `eltPipe`.
+    for (1..threads) |t| pool[t] = std.Thread.spawn(.{}, Job.run, .{ &job, t, threads }) catch null;
+    job.run(0, threads);
+    for (pool[1..threads]) |th| if (th) |t| t.join();
+    const compiled = job.compiled.load(.monotonic);
+    if (compiled > 0) {
+        const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e9;
+        std.log.info("vulkan: compiled {d} of {d} GPU kernels earlier runs used in {d:.1} s on {d} threads (new build or driver; cached from now on)", .{ compiled, n, secs, threads });
+    }
+    return compiled;
+}
+
+/// Mark the eltwise kernels `pipe_cache.used_list` names.
+fn readUsedKernels(gpa: std.mem.Allocator, io: std.Io, set: *EltSet) void {
+    var buf: [1024]u8 = undefined;
+    const p = pipe_cache_file.path(&buf, pipe_cache_file.used_list) orelse return;
+    const text = pipe_cache_file.read(gpa, io, p) orelse return;
+    defer gpa.free(text);
+    var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (lines.next()) |name| if (std.meta.stringToEnum(Elt, name)) |e| set.set(@intFromEnum(e));
 }
 
 /// Function table. Field names match the command names minus the `vk` prefix;
@@ -867,6 +1214,9 @@ const Dispatch = struct {
     CreatePipelineLayout: vk.PfnCreatePipelineLayout,
     DestroyPipelineLayout: vk.PfnDestroyPipelineLayout,
     CreateComputePipelines: vk.PfnCreateComputePipelines,
+    CreatePipelineCache: vk.PfnCreatePipelineCache,
+    DestroyPipelineCache: vk.PfnDestroyPipelineCache,
+    GetPipelineCacheData: vk.PfnGetPipelineCacheData,
     DestroyPipeline: vk.PfnDestroyPipeline,
     CreateDescriptorPool: vk.PfnCreateDescriptorPool,
     DestroyDescriptorPool: vk.PfnDestroyDescriptorPool,
@@ -879,6 +1229,11 @@ const Dispatch = struct {
     EndCommandBuffer: vk.PfnEndCommandBuffer,
     ResetCommandBuffer: vk.PfnResetCommandBuffer,
     CmdBindPipeline: vk.PfnCmdBindPipeline,
+    CreateQueryPool: vk.PfnCreateQueryPool,
+    DestroyQueryPool: vk.PfnDestroyQueryPool,
+    CmdResetQueryPool: vk.PfnCmdResetQueryPool,
+    CmdWriteTimestamp: vk.PfnCmdWriteTimestamp,
+    GetQueryPoolResults: vk.PfnGetQueryPoolResults,
     CmdBindDescriptorSets: vk.PfnCmdBindDescriptorSets,
     CmdDispatch: vk.PfnCmdDispatch,
     CmdPipelineBarrier: vk.PfnCmdPipelineBarrier,
@@ -904,10 +1259,24 @@ pub const DeviceBuffer = struct {
     buf: vk.Buffer,
     mem: vk.DeviceMemory,
     size: u64,
+    /// Byte offset into `buf` where this buffer starts: nonzero only for a view
+    /// (`Context.view`), which every binding and copy honours. A view owns no memory
+    /// (`mem` null), so it must never be destroyed or grown.
+    off: u64 = 0,
     /// Component attribution for the VRAM meter (set from the context's current
     /// tag at createBuffer; read at freeDeviceBuffer). `.other` unless tagging is
     /// active (diffusion backend only).
     tag: MemTag = .other,
+    /// The element type of an activation this buffer holds, which picks the instance
+    /// of a dtype-generic kernel (`eltAt`). Views keep it, and so does a regrow.
+    dt: Dt = .f32,
+
+    /// The same memory read as `dt`.
+    pub fn as(self: DeviceBuffer, dt: Dt) DeviceBuffer {
+        var v = self;
+        v.dt = dt;
+        return v;
+    }
 };
 
 /// Cached device weight buffer + LRU stamp. Since the DiT walks its blocks
@@ -991,6 +1360,8 @@ pub const Context = struct {
     /// after init (the tuner measures candidates on the live device) and every one
     /// still has to be checked against what the device actually allows.
     max_shared_bytes: u32 = 0,
+    /// `minStorageBufferOffsetAlignment`: what a view's offset must be a multiple of.
+    storage_align: u64 = 256,
     max_wg_invocations: u32 = 0,
     /// Kept so anything the context does later that needs file or clock access has one
     /// (0.16 puts both behind Io). The measured-tile cache read at init uses it.
@@ -1044,32 +1415,27 @@ pub const Context = struct {
     pipe_repack_q8_0: vk.Pipeline, // raw q8_0 -> int8-interleaved dp4a layout
     pipe_repack_iq4_nl: vk.Pipeline, // raw iq4_nl -> int8-interleaved dp4a layout (LUT pre-applied)
     pipeline_layout_e: vk.PipelineLayout,
-    shader_e: vk.ShaderModule,
-    shader_dual: vk.ShaderModule,
+    /// The eltwise modules, patched; `EltMaker` cuts one kernel's module from them.
+    spv_e: []align(4) u8,
+    spv_dual: []align(4) u8,
+    /// Created on first use (`eltPipe`); null until then.
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
-    /// int8 dp4a block-quant decode GEMV, present iff the device supports
-    /// VK_KHR_shader_integer_dot_product. Pipelines: [0] quant_act_i8,
-    /// [1] gemv_q8_0_dp4a, [2] gemv_iq4_nl_dp4a.
+    /// Every pipeline compiles through it; `pipe_cache_path` is where it persists, null
+    /// when it does not.
+    pipe_cache: vk.PipelineCache,
+    pipe_cache_path: ?[]u8,
+    /// A kernel compiled this run, so the file is stale.
+    pipe_cache_dirty: bool,
+    /// VK_EXT_pipeline_creation_feedback: `createPipe` can tell a cache hit from a compile.
+    has_feedback: bool,
+    /// Eltwise kernels this run bound, plus those earlier runs listed.
+    elt_used: EltSet,
+    elt_used_loaded: EltSet,
     /// The device advertises `VK_KHR_shader_integer_dot_product`. Nothing reads
     /// this any more: the kernels that used it went with the dp4a module, and the
     /// negotiation is left in place because unpicking a `p_next` chain risks every
     /// Vulkan path for no gain.
     has_int_dot: bool = false,
-    /// [0] quant_act_i8, [1] gemv_repack_dp4a, [2] dequant_repack_f32,
-    /// [3] gemv_q8_0_sg_dp4a, [4] gemv_iq4_nl_sg_dp4a (cooperative dp4a: raw
-    /// weight + subgroup reduce, no repack, need GroupNonUniform caps too),
-    /// [5] gemv_q8_0_t_dp4a, [6] gemv_iq4_nl_t_dp4a (dp4a over the _t layout +
-    /// k-split, repack-dp4a speed, no int8 repack / no extra VRAM).
-    /// Subgroup-cooperative kernels (kernels/subgroup.zig): reductions done
-    /// within a subgroup, no workgroup storage (the NVIDIA-safe escape hatch).
-    /// Built whenever subgroup arithmetic is available (core Vulkan 1.1); null
-    /// on the rare device that rejects the module.
-    /// [0] subgroup_sum (capability probe), [1] gemv_q8_0_sg, [2] gemv_q4_k_sg,
-    /// [3] gemv_q5_k_sg, [4] gemv_q6_k_sg, [5] gemv_iq4_nl_sg,
-    /// [6] attn_decode_sg (folded flash-decode attention). The norms live in the
-    /// dual-target module now.
-    shader_sg: vk.ShaderModule = .null_handle,
-    pipe_sg: [2]vk.Pipeline = @splat(.null_handle),
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
     // module, which is at the SPIR-V backend's per-module entry-point limit.
@@ -1106,15 +1472,17 @@ pub const Context = struct {
     /// GEMM outputs feed the fused f16 eltwise chain (att16/mlp16), no convert.
     shader_coop_i8_fs16: vk.ShaderModule = .null_handle,
     pipe_coop_i8_fs16: vk.Pipeline = .null_handle,
-    /// Stage B: fused int8 prep (rotate FWHT + rowmax + quantize) in one
-    /// f16-shared-memory kernel. Two builds: cols=6144 (qkv/wo/mlp-gu) and
-    /// cols=16384 (mlp.down). Replaces the 3-pass chain + its xr round-trip.
-    /// Fused int8 prep (rotate + rowmax + quantize in one kernel), one build per
-    /// reduction width, the FWHT is unrolled for a fixed `cols`. Indexed by
-    /// `i8_prep_cols`; `.null_handle` for a width with no build, which falls back to the
-    /// width-general 3-pass chain.
-    shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle),
-    pipe_i8_prep: [i8_prep_cols.len]vk.Pipeline = @splat(.null_handle),
+    /// The fused int8 prep (`coopmat.buildFusedPrepI8`), one build per reduction width,
+    /// made on first use (`i8PrepPipe`). A width it cannot build takes the 3-pass chain.
+    i8_prep: std.AutoHashMapUnmanaged(u32, struct { shader: vk.ShaderModule, pipe: vk.Pipeline }) = .empty,
+    /// Whether this device runs the fused prep at all.
+    i8_prep_ok: bool = false,
+    /// `coopmat.buildIntWoPack`, indexed by `woPackIndex`.
+    shader_wo_pack: [4]vk.ShaderModule = @splat(.null_handle),
+    pipe_wo_pack: [4]vk.Pipeline = @splat(.null_handle),
+    /// `coopmat.buildAddRms` on the eltwise layout: residual add + hidden RMSNorm.
+    shader_add_rms: vk.ShaderModule = .null_handle,
+    pipe_add_rms: vk.Pipeline = .null_handle,
     /// Tensor-core attention GEMMs (present iff pipe_coop is).
     shader_scores: vk.ShaderModule = .null_handle,
     pipe_scores: vk.Pipeline = .null_handle,
@@ -1149,9 +1517,14 @@ pub const Context = struct {
     y_pad: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Device-local scratch for raw (untransposed) weight uploads.
     raw_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// `allFinite`'s flag word.
+    finite_flag: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Block-quant prefill GEMM scratch: one weight dequanted to f32 row-major,
     /// then repacked to f16 k-major (both reused, barrier-ordered per weight).
-    deq_f32: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    deq_rows: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// The decode activation as q8_1 blocks (`opGemvQuantizeX`): d[nblk] f32, the
+    /// int8 values, s[nblk] f32.
+    q8_act: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     deq_f16k: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// dp4a decode scratch: the activation quantized to int8 (packed, 4/u32)
     /// and its per-32-block f32 scales.
@@ -1169,6 +1542,11 @@ pub const Context = struct {
     i8_acc3: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     i8_hadamard: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     i8_partials: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// The W·A32 weight-only GEMM's scratch (`opMatmulIntWoF32`): the f32 weight in the
+    /// f32 GEMM's layout, its row-major form, and the rotation's (unread) partials.
+    wo32_t: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    wo32_r: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    wo32_p: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Stage A: assembled [act(m_pad) | weight(rows)] scale buffer for the
     /// fused-rescale GEMM (rebuilt per GEMM by scale_concat; batch-safe).
     i8_scalecat: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
@@ -1196,7 +1574,7 @@ pub const Context = struct {
     small_bufs: std.AutoHashMapUnmanaged(usize, DeviceBuffer) = .empty,
     /// Device-local transposed weight buffers, keyed by host weight pointer,
     /// LRU-evicted when the device memory budget runs out.
-    weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
+    weights: std.AutoHashMapUnmanaged(WeightKey, WeightEntry) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Error!*Context {
         // Integration tests are gated behind `-Dintegration`: fail init in test
@@ -1413,6 +1791,8 @@ pub const Context = struct {
         // OpSDot). Core in Vulkan 1.3; absent on older stacks, where the block-
         // quant decode falls back to the scalar-f32 GEMV.
         var has_int_dot = false;
+        // Says whether each pipeline came from the cache (`createPipe`).
+        var has_feedback = false;
         {
             var count: u32 = 0;
             if (d.EnumerateDeviceExtensionProperties(phys, null, &count, null) == .success and count > 0) {
@@ -1423,19 +1803,19 @@ pub const Context = struct {
                             const name = std.mem.sliceTo(&e.extension_name, 0);
                             if (std.mem.eql(u8, name, "VK_EXT_memory_budget")) has_memory_budget = true;
                             if (std.mem.eql(u8, name, "VK_KHR_shader_integer_dot_product")) has_int_dot = true;
+                            if (std.mem.eql(u8, name, "VK_EXT_pipeline_creation_feedback")) has_feedback = true;
                         }
                     }
                 } else |_| {}
             }
         }
 
-        // storageBuffer16BitAccess: needed by the aligned-u16 dp4a GEMV kernels
-        // (they read quant blocks as native 16-bit words instead of assembling
-        // from u32). Query support before enabling, turning on an unsupported
-        // feature would fail CreateDevice and break ALL Vulkan. Only used by the
-        // dp4a path, so only queried when has_int_dot.
+        // storageBuffer16BitAccess: the dual module's f16 and bf16 activations are
+        // real 16-bit loads and stores (`dual.zig` `ldT` / `stT`), so the module cannot
+        // build without it. Every desktop driver has it; a device that lacks it is
+        // refused here rather than failing pipeline creation later.
         var has_16bit = false;
-        if (has_int_dot) {
+        {
             const getf2: ?vk.PfnGetPhysicalDeviceFeatures2 =
                 if (gipa(instance, "vkGetPhysicalDeviceFeatures2")) |p|
                     @ptrCast(p)
@@ -1449,6 +1829,10 @@ pub const Context = struct {
                 getf(phys, &f2);
                 has_16bit = s16.storage_buffer_16bit_access == vk.TRUE;
             }
+        }
+        if (!has_16bit) {
+            std.log.err("vulkan: this device has no storageBuffer16BitAccess, which the kernels need", .{});
+            return error.VulkanUnavailable;
         }
 
         // Logical device with the features the Zig SPIR-V backend requires.
@@ -1502,7 +1886,7 @@ pub const Context = struct {
                 .queue_count = 1,
                 .p_queue_priorities = @ptrCast(&priority),
             };
-            var exts: [4][*:0]const u8 = undefined;
+            var exts: [5][*:0]const u8 = undefined;
             var ext_n: u32 = 0;
             if (coop_m != 0) {
                 exts[ext_n] = "VK_KHR_cooperative_matrix";
@@ -1518,6 +1902,10 @@ pub const Context = struct {
             }
             if (has_int_dot) {
                 exts[ext_n] = "VK_KHR_shader_integer_dot_product";
+                ext_n += 1;
+            }
+            if (has_feedback) {
+                exts[ext_n] = "VK_EXT_pipeline_creation_feedback";
                 ext_n += 1;
             }
             try check(d.CreateDevice(phys, &.{
@@ -1581,15 +1969,46 @@ pub const Context = struct {
             .{ .name = "repack_q8_0", .x = 256, .y = 1 },
             .{ .name = "repack_iq4_nl", .x = 256, .y = 1 },
         }, &.{}, null, &shader_tr);
-        var shader_e: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, eltwise_spv, &eltwise_entries, &.{}, null, &shader_e);
-        errdefer d.DestroyShaderModule(device, shader_e, null);
-        var shader_dual: vk.ShaderModule = .null_handle;
+        // The eltwise modules are patched once and kept: each kernel's pipeline is built
+        // from a module cut down to that kernel (`EltMaker`).
+        const spv_e = try patchKernelModule(gpa, eltwise_spv, &.{}, null);
+        errdefer gpa.free(spv_e);
         // Subgroup reductions (`sgSum`/`sgMax`) are inline asm; the caps are core 1.1.
-        const dual_caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
-        try createKernelModule(gpa, &d, device, dual_spv, &dual_entries, &dual_caps, null, &shader_dual);
-        errdefer d.DestroyShaderModule(device, shader_dual, null);
+        // The 16-bit aliases `ldT` / `stT` use need StorageBuffer16BitAccess.
+        const dual_caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic, spv.cap_storage_buffer_16bit };
+        const spv_dual = try patchKernelModule(gpa, dual_spv, &dual_caps, null);
+        errdefer gpa.free(spv_dual);
         errdefer d.DestroyShaderModule(device, shader_tr, null);
+
+        // Every pipeline compiles through this cache (`pipe_cache.zig`).
+        const persist = persist_pipeline_cache and
+            !(if (getenv("TP_VK_PIPELINE_CACHE")) |v| std.mem.eql(u8, std.mem.sliceTo(v, 0), "0") else false);
+        var cache_path_buf: [1024]u8 = undefined;
+        var cache_name_buf: [96]u8 = undefined;
+        const cache_path: ?[]const u8 = if (persist)
+            pipe_cache_file.path(&cache_path_buf, pipe_cache_file.fileName(&cache_name_buf, props.pipeline_cache_uuid, moduleHash()))
+        else
+            null;
+        var pipe_cache: vk.PipelineCache = .null_handle;
+        {
+            const initial: ?[]u8 = if (cache_path) |p| pipe_cache_file.read(gpa, io, p) else null;
+            defer if (initial) |b| gpa.free(b);
+            const data: []const u8 = initial orelse &.{};
+            // Data the driver rejects (a corrupt file) is dropped, not fatal.
+            if (d.CreatePipelineCache(device, &.{ .initial_data_size = data.len, .p_initial_data = data.ptr }, null, &pipe_cache) != .success)
+                try check(d.CreatePipelineCache(device, &.{}, null, &pipe_cache));
+            if (cache_path) |p| {
+                if (initial) |b|
+                    std.log.info("vulkan: pipeline cache {s} ({d} MB)", .{ p, b.len >> 20 })
+                else
+                    std.log.info("vulkan: no pipeline cache at {s} yet: each GPU kernel compiles the first time it runs and is saved there", .{p});
+            }
+        }
+        errdefer d.DestroyPipelineCache(device, pipe_cache, null);
+        const pipe_cache_path: ?[]u8 = if (cache_path) |p| try gpa.dupe(u8, p) else null;
+        errdefer if (pipe_cache_path) |p| gpa.free(p);
+
+        var batch: PipeBatch = .{};
 
         var dsl: vk.DescriptorSetLayout = .null_handle;
         {
@@ -1632,7 +2051,7 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_f8, .p_name = "matmul_f8" }, .layout = pipeline_layout },
                 .{ .stage = .{ .module = shader_f32, .p_name = "matmul_f32" }, .layout = pipeline_layout },
             };
-            try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes));
+            try check(d.CreateComputePipelines(device, pipe_cache, infos.len, &infos, null, &pipes));
         }
         errdefer for (pipes) |p| d.DestroyPipeline(device, p, null);
 
@@ -1682,7 +2101,7 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_tr, .p_name = "repack_q8_0" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "repack_iq4_nl" }, .layout = pipeline_layout_tr },
             };
-            try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes_tr));
+            try check(d.CreateComputePipelines(device, pipe_cache, infos.len, &infos, null, &pipes_tr));
         }
         errdefer for (pipes_tr) |pp| d.DestroyPipeline(device, pp, null);
 
@@ -1703,60 +2122,16 @@ pub const Context = struct {
             }, null, &pipeline_layout_e));
         }
         errdefer d.DestroyPipelineLayout(device, pipeline_layout_e, null);
+        // The eltwise kernels are created on first use (`eltPipe`): a driver compiles each
+        // from the whole module, ~0.4 s apiece, and a run binds a few dozen of ~400. The
+        // ones earlier runs bound compile now, on every core.
         var pipes_e: [elt_entry_sizes.len]vk.Pipeline = @splat(vk.Pipeline.null_handle);
-        {
-            var infos: [elt_entry_sizes.len]vk.ComputePipelineCreateInfo = undefined;
-            var names: [elt_entry_sizes.len][64]u8 = undefined;
-            for (&infos, elt_entry_sizes, 0..) |*info, es, i| {
-                @memset(&names[i], 0);
-                @memcpy(names[i][0..es.name.len], es.name);
-                const module = switch (es.src) {
-                    .eltwise => shader_e,
-                    .dual => shader_dual,
-                };
-                info.* = .{ .stage = .{ .module = module, .p_name = @ptrCast(&names[i]) }, .layout = pipeline_layout_e };
-            }
-            try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes_e));
-        }
+        var elt_used: EltSet = .initEmpty();
+        if (persist) readUsedKernels(gpa, io, &elt_used);
+        const warm_compiled = warmElt(io, &.{ .d = &d, .device = device, .cache = pipe_cache, .layout = pipeline_layout_e, .spv_e = spv_e, .spv_dual = spv_dual, .io = io, .feedback = has_feedback }, elt_used, &pipes_e);
         errdefer for (pipes_e) |pp| d.DestroyPipeline(device, pp, null);
 
 
-        // Subgroup-cooperative kernel module (kernels/subgroup.zig): reductions
-        // WITHIN a subgroup via OpGroupNonUniform*, needing no workgroup storage
-        // class, the verified escape hatch from the NVIDIA hang on Zig-emitted
-        // workgroup memory. Subgroup arithmetic is core Vulkan 1.1: only the
-        // module capabilities are injected, no extension and no device feature.
-        // A failure here just leaves the pipelines null, never failing bring-up.
-        var shader_sg: vk.ShaderModule = .null_handle;
-        var pipe_sg: [2]vk.Pipeline = @splat(vk.Pipeline.null_handle);
-        sg: {
-            const sg_entries = [_]EntrySize{
-                .{ .name = "subgroup_sum", .x = 32, .y = 1 },
-                // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
-                // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
-                .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
-            };
-            const caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
-            createKernelModule(gpa, &d, device, subgroup_spv, &sg_entries, &caps, null, &shader_sg) catch |e| {
-                std.log.warn("subgroup module unavailable ({t}); flash-decode attention is off", .{e});
-                break :sg;
-            };
-            const infos = [2]vk.ComputePipelineCreateInfo{
-                .{ .stage = .{ .module = shader_sg, .p_name = "subgroup_sum" }, .layout = pipeline_layout_e },
-                .{ .stage = .{ .module = shader_sg, .p_name = "attn_decode_sg" }, .layout = pipeline_layout_e },
-            };
-            if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_sg) != .success) {
-                std.log.warn("subgroup pipelines unavailable; flash-decode attention is off", .{});
-                for (pipe_sg) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
-                pipe_sg = @splat(vk.Pipeline.null_handle);
-                d.DestroyShaderModule(device, shader_sg, null);
-                shader_sg = .null_handle;
-            }
-        }
-        errdefer if (shader_sg != .null_handle) {
-            for (pipe_sg) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
-            d.DestroyShaderModule(device, shader_sg, null);
-        };
 
         // Standalone batched-attention kernel: own shader module, 5-buffer set
         // (a=q,b=k,c=v,d=out,e=bounds), and one persistent descriptor set (the
@@ -1791,7 +2166,7 @@ pub const Context = struct {
         var pipe_ab: vk.Pipeline = .null_handle;
         {
             const info = [1]vk.ComputePipelineCreateInfo{.{ .stage = .{ .module = shader_ab, .p_name = "attn_batched" }, .layout = pipeline_layout_ab }};
-            try check(d.CreateComputePipelines(device, .null_handle, 1, &info, null, @ptrCast(&pipe_ab)));
+            try check(d.CreateComputePipelines(device, pipe_cache, 1, &info, null, @ptrCast(&pipe_ab)));
         }
         errdefer d.DestroyPipeline(device, pipe_ab, null);
         var pool_ab: vk.DescriptorPool = .null_handle;
@@ -1897,13 +2272,13 @@ pub const Context = struct {
         errdefer if (shader_coop_bf16w != .null_handle) d.DestroyShaderModule(device, shader_coop_bf16w, null);
         if (shader_coop != .null_handle) {
             inline for (.{ .{ shader_coop, &pipe_coop }, .{ shader_coop_f16w, &pipe_coop_f16w } }) |v| {
-                try createCoopPipe(&d, device, v[0], pipeline_layout, coop_sg, v[1]);
+                batch.add(v[0], pipeline_layout, coop_sg, v[1]);
             }
             if (shader_coop_c16 != .null_handle) {
-                try createCoopPipe(&d, device, shader_coop_c16, pipeline_layout, coop_sg, &pipe_coop_c16);
+                batch.add(shader_coop_c16, pipeline_layout, coop_sg, &pipe_coop_c16);
             }
             if (shader_coop_bf16w != .null_handle) {
-                try createCoopPipe(&d, device, shader_coop_bf16w, pipeline_layout, coop_sg, &pipe_coop_bf16w);
+                batch.add(shader_coop_bf16w, pipeline_layout, coop_sg, &pipe_coop_bf16w);
             }
         }
         errdefer if (pipe_coop != .null_handle) d.DestroyPipeline(device, pipe_coop, null);
@@ -1945,7 +2320,7 @@ pub const Context = struct {
                 .code_size = code.len,
                 .p_code = @ptrCast(@alignCast(code.ptr)),
             }, null, &shader_coop_i8));
-            try createCoopPipe(&d, device, shader_coop_i8, pipeline_layout, coop_sg, &pipe_coop_i8);
+            batch.add(shader_coop_i8, pipeline_layout, coop_sg, &pipe_coop_i8);
         }
         errdefer if (shader_coop_i8 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8, null);
         errdefer if (pipe_coop_i8 != .null_handle) d.DestroyPipeline(device, pipe_coop_i8, null);
@@ -1971,7 +2346,7 @@ pub const Context = struct {
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
                 }, null, cfg[2]));
-                try createCoopPipe(&d, device, cfg[2].*, pipeline_layout, coop_sg, cfg[3]);
+                batch.add(cfg[2].*, pipeline_layout, coop_sg, cfg[3]);
             }
         }
         errdefer if (shader_coop_i8_fs16 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_fs16, null);
@@ -1981,27 +2356,38 @@ pub const Context = struct {
         errdefer if (shader_coop_i8_fs != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_fs, null);
         errdefer if (pipe_coop_i8_fs != .null_handle) d.DestroyPipeline(device, pipe_coop_i8_fs, null);
 
-        // Stage B: fused int8 prep kernels (f16-shared FWHT; hand-assembled),
-        // one per convrot cols (6144, 16384).
-        var shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle);
-        var pipe_i8_prep: [i8_prep_cols.len]vk.Pipeline = @splat(.null_handle);
-        if (i8_shape_ok and coopmat.i8_shared) {
-            for (i8_prep_cols, 0..) |cols, i| {
-                const code = try coopmat.buildFusedPrepI8(gpa, cols);
+
+        var shader_wo_pack: [4]vk.ShaderModule = @splat(.null_handle);
+        var pipe_wo_pack: [4]vk.Pipeline = @splat(.null_handle);
+        errdefer for (shader_wo_pack) |sh| if (sh != .null_handle) d.DestroyShaderModule(device, sh, null);
+        errdefer for (pipe_wo_pack) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
+        if (shader_coop_f16w != .null_handle) {
+            for (0..4) |i| {
+                const code = try coopmat.buildIntWoPack(gpa, i & 2 != 0, i & 1 != 0);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, &shader_i8_prep[i]));
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = shader_i8_prep[i], .p_name = "main" },
-                    .layout = pipeline_layout,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_i8_prep[i])));
+                }, null, &shader_wo_pack[i]));
+                batch.add(shader_wo_pack[i], pipeline_layout, null, &pipe_wo_pack[i]);
             }
         }
-        errdefer for (shader_i8_prep) |sh| if (sh != .null_handle) d.DestroyShaderModule(device, sh, null);
-        errdefer for (pipe_i8_prep) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
+
+        var shader_add_rms: vk.ShaderModule = .null_handle;
+        var pipe_add_rms: vk.Pipeline = .null_handle;
+        {
+            const wg = @min(1024, props.limits.max_compute_work_group_invocations, props.limits.max_compute_work_group_size[0]);
+            const code = try coopmat.buildAddRms(gpa, wg);
+            defer gpa.free(code);
+            try check(d.CreateShaderModule(device, &.{
+                .code_size = code.len,
+                .p_code = @ptrCast(@alignCast(code.ptr)),
+            }, null, &shader_add_rms));
+            errdefer d.DestroyShaderModule(device, shader_add_rms, null);
+            batch.add(shader_add_rms, pipeline_layout_e, null, &pipe_add_rms);
+        }
+        errdefer d.DestroyShaderModule(device, shader_add_rms, null);
+        errdefer d.DestroyPipeline(device, pipe_add_rms, null);
 
         // Attention-scores GEMM on the same cooperative-matrix support; uses
         // the eltwise pipeline layout (same 4-buffer set, EltPush-sized push).
@@ -2037,7 +2423,7 @@ pub const Context = struct {
                 .{ shader_scores_vae, &pipe_scores_vae },
                 .{ shader_scores_sd, &pipe_scores_sd },
             }) |v| {
-                try createCoopPipe(&d, device, v[0], pipeline_layout_e, coop_sg, v[1]);
+                batch.add(v[0], pipeline_layout_e, coop_sg, v[1]);
             }
         }
         errdefer if (pipe_scores != .null_handle) d.DestroyPipeline(device, pipe_scores, null);
@@ -2056,7 +2442,7 @@ pub const Context = struct {
         }
         errdefer if (shader_attn_out != .null_handle) d.DestroyShaderModule(device, shader_attn_out, null);
         if (shader_attn_out != .null_handle) {
-            try createCoopPipe(&d, device, shader_attn_out, pipeline_layout_e, coop_sg, &pipe_attn_out);
+            batch.add(shader_attn_out, pipeline_layout_e, coop_sg, &pipe_attn_out);
         }
         errdefer if (pipe_attn_out != .null_handle) d.DestroyPipeline(device, pipe_attn_out, null);
 
@@ -2077,7 +2463,7 @@ pub const Context = struct {
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
                 }, null, v[1]));
-                try createCoopPipe(&d, device, v[1].*, pipeline_layout_e, coop_sg, v[2]);
+                batch.add(v[1].*, pipeline_layout_e, coop_sg, v[2]);
             }
         }
         errdefer if (shader_flash_md != .null_handle) d.DestroyShaderModule(device, shader_flash_md, null);
@@ -2134,6 +2520,8 @@ pub const Context = struct {
             }, batch_sets.ptr));
         }
 
+        const batch_compiled = try batch.run(io, &d, device, pipe_cache, has_feedback);
+
         const self = try gpa.create(Context);
         self.* = .{
             .gpa = gpa,
@@ -2153,6 +2541,7 @@ pub const Context = struct {
             // 2 x 2 grid: both wg dimensions are 2 warp tiles.
             .io = io,
             .max_shared_bytes = props.limits.max_compute_shared_memory_size,
+            .storage_align = props.limits.min_storage_buffer_offset_alignment,
             .max_wg_invocations = props.limits.max_compute_work_group_invocations,
             .coop_i8_wg_m = 2 * i8_want_m,
             .coop_i8_wg_n = (i8_nwarps / 2) * i8_want_n,
@@ -2187,12 +2576,16 @@ pub const Context = struct {
             .pipe_repack_q8_0 = pipes_tr[6],
             .pipe_repack_iq4_nl = pipes_tr[7],
             .pipeline_layout_e = pipeline_layout_e,
-            .shader_e = shader_e,
-            .shader_dual = shader_dual,
+            .spv_e = spv_e,
+            .spv_dual = spv_dual,
             .pipes_e = pipes_e,
+            .pipe_cache = pipe_cache,
+            .pipe_cache_path = pipe_cache_path,
+            .pipe_cache_dirty = warm_compiled > 0 or batch_compiled > 0,
+            .has_feedback = has_feedback,
+            .elt_used = elt_used,
+            .elt_used_loaded = elt_used,
             .has_int_dot = has_int_dot,
-            .shader_sg = shader_sg,
-            .pipe_sg = pipe_sg,
             .shader_ab = shader_ab,
             .dsl_ab = dsl_ab,
             .pipeline_layout_ab = pipeline_layout_ab,
@@ -2209,8 +2602,11 @@ pub const Context = struct {
             .pipe_coop_i8_fs = pipe_coop_i8_fs,
             .shader_coop_i8_fs16 = shader_coop_i8_fs16,
             .pipe_coop_i8_fs16 = pipe_coop_i8_fs16,
-            .shader_i8_prep = shader_i8_prep,
-            .pipe_i8_prep = pipe_i8_prep,
+            .i8_prep_ok = i8_shape_ok and coopmat.i8_shared,
+            .shader_wo_pack = shader_wo_pack,
+            .pipe_wo_pack = pipe_wo_pack,
+            .shader_add_rms = shader_add_rms,
+            .pipe_add_rms = pipe_add_rms,
             .shader_coop_c16 = shader_coop_c16,
             .pipe_coop_c16 = pipe_coop_c16,
             .shader_coop_f16w = shader_coop_f16w,
@@ -2256,11 +2652,19 @@ pub const Context = struct {
         {
             self.screenCoopTiles(gpa);
         }
+        if (getenv("TP_VK_PROFILE") != null) profStart(self, props.limits.timestamp_period);
         return self;
     }
 
     pub fn deinit(self: *Context) void {
         _ = self.d.DeviceWaitIdle(self.device);
+        if (prof) |pf| {
+            self.profReport(pf);
+            pf.totals.deinit(self.gpa);
+            self.d.DestroyQueryPool(self.device, pf.pool, null);
+            self.gpa.destroy(pf);
+            prof = null;
+        }
         var it = self.weights.valueIterator();
         while (it.next()) |wb| {
             self.freeDeviceBuffer(wb.db);
@@ -2273,7 +2677,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.finite_flag, &self.deq_rows, &self.q8_act, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.wo32_t, &self.wo32_r, &self.wo32_p, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -2293,7 +2697,10 @@ pub const Context = struct {
         self.d.DestroyPipeline(self.device, self.pipe_repack_iq4_nl, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f32, null);
+        self.savePipelineCache();
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
+        self.d.DestroyPipelineCache(self.device, self.pipe_cache, null);
+        if (self.pipe_cache_path) |p| self.gpa.free(p);
         if (self.pipe_coop != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop, null);
         if (self.shader_coop != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop, null);
         if (self.pipe_coop_i8 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8, null);
@@ -2304,8 +2711,18 @@ pub const Context = struct {
         if (self.shader_coop_i8_fs != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs, null);
         if (self.pipe_coop_i8_fs16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8_fs16, null);
         if (self.shader_coop_i8_fs16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs16, null);
-        for (self.pipe_i8_prep) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
-        for (self.shader_i8_prep) |sh| if (sh != .null_handle) self.d.DestroyShaderModule(self.device, sh, null);
+        {
+            var pit = self.i8_prep.valueIterator();
+            while (pit.next()) |p| {
+                self.d.DestroyPipeline(self.device, p.pipe, null);
+                self.d.DestroyShaderModule(self.device, p.shader, null);
+            }
+            self.i8_prep.deinit(self.gpa);
+        }
+        for (self.pipe_wo_pack) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
+        self.d.DestroyPipeline(self.device, self.pipe_add_rms, null);
+        self.d.DestroyShaderModule(self.device, self.shader_add_rms, null);
+        for (self.shader_wo_pack) |sh| if (sh != .null_handle) self.d.DestroyShaderModule(self.device, sh, null);
         if (self.pipe_coop_c16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_c16, null);
         if (self.shader_coop_c16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_c16, null);
         if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
@@ -2330,12 +2747,8 @@ pub const Context = struct {
         self.d.DestroyShaderModule(self.device, self.shader_f8, null);
         self.d.DestroyShaderModule(self.device, self.shader_f32, null);
         self.d.DestroyShaderModule(self.device, self.shader_tr, null);
-        if (self.shader_sg != .null_handle) {
-            for (self.pipe_sg) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
-            self.d.DestroyShaderModule(self.device, self.shader_sg, null);
-        }
-        self.d.DestroyShaderModule(self.device, self.shader_e, null);
-        self.d.DestroyShaderModule(self.device, self.shader_dual, null);
+        self.gpa.free(self.spv_e);
+        self.gpa.free(self.spv_dual);
         self.d.DestroyPipeline(self.device, self.pipe_ab, null);
         self.d.DestroyPipelineLayout(self.device, self.pipeline_layout_ab, null);
         self.d.DestroyShaderModule(self.device, self.shader_ab, null);
@@ -2493,13 +2906,26 @@ pub const Context = struct {
         return hb.mapped.?;
     }
 
+    /// How a cached weight is laid out. One tensor may be cached in several, because two
+    /// routes may read it differently (an LLM weight decodes through the GEMV layout and
+    /// prefills through the coop one), so the layout is part of the key; a pointer alone
+    /// would serve one route the other's copy.
+    const WeightLayout = enum(u8) { kmajor, raw, f16_from_f32, bf16_coop, f16_from_bf16, bf16_from_f32, f16_from_conv, bf16_from_conv };
+
+    /// The length is part of it: a row slice starts at its whole weight's address.
+    const WeightKey = struct { ptr: usize, len: usize, layout: WeightLayout };
+
+    fn weightKey(bytes: anytype, layout: WeightLayout) WeightKey {
+        return .{ .ptr = @intFromPtr(bytes.ptr), .len = std.mem.sliceAsBytes(bytes).len, .layout = layout };
+    }
+
     /// Device-local weight buffer in the transposed k-major layout
     /// (element (k, col) at k * w_stride + col, w_stride = align(rows, tile_n)),
     /// uploaded once and cached by host pointer. The raw bytes are DMA'd as-is
     /// and transposed on the GPU (kernels/transpose.zig), no CPU-side work
     /// beyond the staging memcpy.
     fn weightBuffer(self: *Context, bytes: []const u8, esize: u64, rows: usize, cols: usize) Error!vk.Buffer {
-        const key = @intFromPtr(bytes.ptr);
+        const key = weightKey(bytes, .kmajor);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -2604,7 +3030,7 @@ pub const Context = struct {
     /// for GGUF block-quant weights whose row-major block layout the quant
     /// GEMV kernels read directly. Cached by host pointer, same residency.
     fn weightBufferRaw(self: *Context, bytes: []const u8) Error!vk.Buffer {
-        const key = @intFromPtr(bytes.ptr);
+        const key = weightKey(bytes, .raw);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -2648,7 +3074,10 @@ pub const Context = struct {
 
     /// Grow-on-demand device-local storage buffer.
     pub fn ensureDeviceBuffer(self: *Context, db: *DeviceBuffer, size: u64) Error!void {
+        std.debug.assert(db.off == 0);
         if (db.size >= size) return;
+        const dt = db.dt;
+        defer db.dt = dt;
         if (db.buf != .null_handle) {
             // Recorded-but-unsubmitted dispatches may still reference the
             // old buffer; submit them before destroying it.
@@ -2685,6 +3114,7 @@ pub const Context = struct {
 
     pub fn tensorDestroy(self: *Context, db: *DeviceBuffer) void {
         if (db.buf == .null_handle) return;
+        std.debug.assert(db.off == 0 and db.mem != .null_handle);
         self.freeDeviceBuffer(db.*);
         db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
     }
@@ -2704,11 +3134,39 @@ pub const Context = struct {
             const n: u64 = @min(chunk, bytes.len - off);
             @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
             try self.beginCmdBuf(cb);
-            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = dst_off + off, .size = n };
+            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = db.off + dst_off + off, .size = n };
             self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
             try self.submitAndWaitBuf(cb);
             off += n;
         }
+    }
+
+    /// Whether the first `n` elements of `db` are all finite, at its `dt`: one pass and a
+    /// 4-byte download. A 16-bit activation stream overflows to inf; a row the output
+    /// never reads (a text token in a joint stream) can hold one while the output looks
+    /// fine, so a forward on one checks its residual too.
+    pub fn allFinite(self: *Context, db: DeviceBuffer, n: usize) Error!bool {
+        try self.ensureDeviceBuffer(&self.finite_flag, 4);
+        const zero: u32 = 0;
+        try self.tensorUpload(self.finite_flag, std.mem.asBytes(&zero));
+        try self.opElt(eltAt("flag_nonfinite", db.dt), db, null, null, self.finite_flag, .{ .u0 = @intCast(n) }, n, 1, 1);
+        var flag: u32 = 0;
+        try self.tensorDownloadAt(self.finite_flag, 0, std.mem.asBytes(&flag));
+        return flag == 0;
+    }
+
+    /// `host.len` elements of `db` from element `elem_off`, widened to f32 from its `dt`.
+    pub fn downloadF32At(self: *Context, db: DeviceBuffer, elem_off: usize, host: []f32) Error!void {
+        const gpa = self.gpa;
+        if (db.dt == .f32) return self.tensorDownloadAt(db, elem_off * 4, std.mem.sliceAsBytes(host));
+        const bits = gpa.alloc(u16, host.len) catch return error.OutOfMemory;
+        defer gpa.free(bits);
+        try self.tensorDownloadAt(db, elem_off * 2, std.mem.sliceAsBytes(bits));
+        for (host, bits) |*h, r| h.* = switch (db.dt) {
+            .f16 => @as(f16, @bitCast(r)),
+            .bf16 => @bitCast(@as(u32, r) << 16),
+            .f32 => unreachable,
+        };
     }
 
     pub fn tensorDownload(self: *Context, db: DeviceBuffer, out: []u8) Error!void {
@@ -2722,7 +3180,7 @@ pub const Context = struct {
         if (self.batching) try self.flushBatch();
         const cb = self.nowCmd();
         try self.beginCmdBuf(cb);
-        const region: vk.BufferCopy = .{ .src_offset = src_off, .dst_offset = dst_off, .size = size };
+        const region: vk.BufferCopy = .{ .src_offset = src.off + src_off, .dst_offset = dst.off + dst_off, .size = size };
         self.d.CmdCopyBuffer(cb, src.buf, dst.buf, 1, @ptrCast(&region));
         try self.submitAndWaitBuf(cb);
     }
@@ -2737,7 +3195,7 @@ pub const Context = struct {
         while (off < out.len) {
             const n: u64 = @min(chunk, out.len - off);
             try self.beginCmdBuf(cb);
-            const region: vk.BufferCopy = .{ .src_offset = src_off + off, .dst_offset = 0, .size = n };
+            const region: vk.BufferCopy = .{ .src_offset = db.off + src_off + off, .dst_offset = 0, .size = n };
             self.d.CmdCopyBuffer(cb, db.buf, self.staging.buf, 1, @ptrCast(&region));
             const to_host: vk.BufferMemoryBarrier = .{
                 .src_access_mask = vk.Access.transfer_write,
@@ -2778,8 +3236,34 @@ pub const Context = struct {
     /// Write the op's four buffers into a descriptor set and return it: the
     /// shared set outside a batch, the next ring set inside one (callers
     /// must opBegin() first, which guarantees ring capacity).
-    fn bind4(self: *Context, bufs: [4]vk.Buffer) vk.DescriptorSet {
-        return self.bind4Off(bufs, .{ 0, 0, 0, 0 });
+    /// `bytes` of `db` from byte `off`, as a buffer of its own: what a forward written
+    /// for pointer-addressed buffers slices with. The descriptor offset must meet the
+    /// device's storage alignment.
+    pub fn view(self: *const Context, db: DeviceBuffer, off: u64, bytes: u64) Error!DeviceBuffer {
+        std.debug.assert(db.size == 0 or off + bytes <= db.size);
+        const at = db.off + off;
+        if (at % self.storage_align != 0) {
+            std.log.err("vulkan: a view at byte {d} is not a multiple of the device's storage alignment {d}", .{ at, self.storage_align });
+            return error.UnalignedView;
+        }
+        return .{ .buf = db.buf, .mem = .null_handle, .size = bytes, .off = at, .tag = db.tag, .dt = db.dt };
+    }
+
+    /// A cached or scratch handle as a binding, at offset 0.
+    fn raw(buf: vk.Buffer) DeviceBuffer {
+        return .{ .buf = buf, .mem = .null_handle, .size = 0 };
+    }
+
+    /// The four storage bindings, each at its buffer's offset. Every descriptor a
+    /// dispatch reads is written here, so a view cannot lose its offset on the way.
+    fn bindViews(self: *Context, bufs: [4]DeviceBuffer) vk.DescriptorSet {
+        var raw_bufs: [4]vk.Buffer = undefined;
+        var offs: [4]u64 = undefined;
+        for (bufs, &raw_bufs, &offs) |b, *rb, *o| {
+            rb.* = b.buf;
+            o.* = b.off;
+        }
+        return self.bind4Off(raw_bufs, offs);
     }
 
     fn bind4Off(self: *Context, bufs: [4]vk.Buffer, offs: [4]u64) vk.DescriptorSet {
@@ -2841,7 +3325,25 @@ pub const Context = struct {
         scale: f32,
         bias: ?vk.Buffer,
     ) Error!void {
-        const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
+        return self.opMatmulW(y, y_off, x, x_off, m, try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols), dtype_f8, rows, cols, scale, bias);
+    }
+
+    /// `opMatmulB` against a weight already on the device in `weightBuffer`'s transposed,
+    /// row-padded layout.
+    fn opMatmulW(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: u64,
+        x: DeviceBuffer,
+        x_off: u64,
+        m: usize,
+        w_buf: vk.Buffer,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        bias: ?vk.Buffer,
+    ) Error!void {
         const bias_buf = bias orelse try self.dummyBuf();
 
         const push: Push = .{
@@ -2853,7 +3355,7 @@ pub const Context = struct {
             .scale = scale,
         };
         try self.opBegin();
-        var set = self.bind4Off(.{ w_buf, x.buf, y.buf, bias_buf }, .{ 0, x_off, y_off, 0 });
+        var set = self.bind4Off(.{ w_buf, x.buf, y.buf, bias_buf }, .{ 0, x.off + x_off, y.off + y_off, 0 });
         self.d.CmdBindPipeline(self.cmd, .compute, if (dtype_f8) self.pipe_f8 else self.pipe_f32);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, @sizeOf(Push), &push);
@@ -2932,77 +3434,110 @@ pub const Context = struct {
     }
     /// Partial rotate-half RoPE over the first rope_dim head dims (text-only
     /// decode). qk in place; freqs = cos then sin at sin_off. half = rope_dim/2.
-    pub fn opRopeQwen35(self: *Context, qk: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize, head_dim: usize, pos: usize) Error!void {
-        try self.opElt(.rope_half_part, qk, null, freqs, null, .{ .u0 = @intCast(n_heads * half), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(n_heads), .u4 = @intCast(pos), .u5 = @intCast(head_dim) }, n_heads * half, 1, 1);
-    }
-    /// Causal GQA attention for one decode query (online softmax, one thread
-    /// per query head). k/v caches: position j at j*(n_kv*hd) + kvh*hd.
-    /// KV chunks per head in the flash-decoding split (attn_dsplit_gemma):
-    /// turns the old one-thread-per-head attention into heads*nsplit threads.
-    pub const attn_decode_nsplit = 64;
+    /// Which keys `opAttnRows` reads beyond the causal prefix, and where a key sits.
+    pub const AttnSpan = struct {
+        /// Only the last `window` keys of each query's prefix (0: all).
+        window: usize = 0,
+        /// The cache is a ring of this many rows, key j at row j % ring (0: linear).
+        ring: usize = 0,
+        /// Every query sees the keys up to this position: a bidirectional block (0: causal).
+        bidir_end: usize = 0,
+    };
 
-    /// Causal GQA decode attention (one query), flash-split across nsplit kv
-    /// chunks then merged, parallelizes the naive one-thread-per-head kernel.
-    /// `scratch` holds n_heads*attn_decode_nsplit*(head_dim+2) f32 partials.
-    /// `window` (> 0) restricts to the last `window` keys; `ring` (> 0) enables
-    /// sliding-window ring addressing (KV storage row = pos%ring, gemma3 LOCAL
-    /// layers). 0 = full causal / linear.
-    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize, kv_fmt: KvFmt) Error!void {
-        const nsplit = attn_decode_nsplit;
-        const entry: Elt = switch (kv_fmt) {
-            .f32 => .attn_dsplit_gemma,
-            .f16 => .attn_dsplit_gemma_f16,
-            .q8_0 => .attn_dsplit_gemma_q8,
+    /// GQA attention for `seq_q` queries against the KV cache, query t seeing
+    /// `kv_len0 + t` keys as `sp` shapes them (`dual/attn.zig`): flash-split across
+    /// `nsplit` chunks, then merged. `scratch` holds seq_q * n_heads * nsplit *
+    /// (head_dim + 2) f32.
+    pub fn opAttnRows(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, n_kv: usize, head_dim: usize, nsplit: usize, scale: f32, kv_fmt: KvFmt, sp: AttnSpan) Error!void {
+        // Packed in one push word (see `dual/attn.zig` `span`).
+        std.debug.assert(sp.window < 1 << 16 and sp.ring < 1 << 16);
+        // The grouped kernel holds a head in one pass of 8 dims a lane. A decode step
+        // has `group` times fewer subgroups in it, which measured 4% slower on q8_0 and a
+        // wash on f16 (Qwen3-4B, 1.3k context), and 16% faster on f32.
+        const group = n_heads / n_kv;
+        const grouped = attn_rows_grouped and (seq_q > 1 or kv_fmt == .f32) and n_heads % n_kv == 0 and
+            head_dim <= 8 * self.subgroup_size and (group == 2 or group == 4 or group == 8);
+        const rows = seq_q * (if (grouped) n_kv else n_heads) * nsplit;
+        const entry: Elt = if (grouped) switch (group) {
+            inline 2, 4, 8 => |g| switch (kv_fmt) {
+                inline else => |f| @field(Elt, std.fmt.comptimePrint("attn_rows_g{d}_{s}", .{ g, if (f == .q8_0) "q8" else @tagName(f) })),
+            },
+            else => unreachable,
+        } else switch (kv_fmt) {
+            .f32 => .attn_rows_f32,
+            .f16 => .attn_rows_f16,
+            .q8_0 => .attn_rows_q8,
         };
-        // kv_end > kv_len marks a bidirectional image-block query (attends the
-        // whole block forward); 0 (or == kv_len) is the plain causal decode bound.
         try self.opElt(entry, q, k_cache, v_cache, scratch, .{
-            .u0 = @intCast(kv_len),
+            .u0 = @intCast(rows),
             .u1 = @intCast(n_heads),
             .u2 = @intCast(n_kv),
             .u3 = @intCast(head_dim),
-            .u4 = nsplit,
-            .u5 = @intCast(window),
+            .u4 = @intCast(nsplit),
+            .u5 = @intCast(kv_len0),
+            .u6 = @intCast(sp.window | sp.ring << 16),
             .f0 = scale,
-            .f1 = @bitCast(@as(u32, @intCast(ring))),
-            .u6 = @intCast(kv_end),
-        }, n_heads * nsplit, 1, 1);
-        try self.opElt(.attn_dmerge, scratch, null, null, out, .{
-            .u0 = @intCast(n_heads),
-            .u1 = @intCast(head_dim),
-            .u2 = nsplit,
-        }, n_heads * head_dim, 1, 1);
+            .f1 = @bitCast(@as(u32, @intCast(sp.bidir_end))),
+        }, rows, 1, 1);
+        const total = seq_q * n_heads * head_dim;
+        try self.opElt(.attn_merge, scratch, null, null, out, .{ .u0 = @intCast(total), .u1 = @intCast(head_dim), .u2 = @intCast(nsplit) }, total, 1, 1);
     }
 
-    /// Whether the folded flash-decode attention (attn_decode_sg) built.
-    pub fn hasAttnDecodeSg(self: *const Context) bool {
-        return self.pipe_sg[1] != .null_handle;
+    /// DIAGNOSTIC: `opAttnRows` may take the grouped kernel. The two are bit-identical,
+    /// which this is how to check.
+    pub var attn_rows_grouped = true;
+
+    /// M-RoPE (qwen3.5's interleaved sections) on `n_heads` heads of one row at the
+    /// (t, h, w) triple in `pos3`.
+    pub fn opRopeImrope(self: *Context, qk: DeviceBuffer, pos3: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize, sections: [3]u32, head_dim: usize) Error!void {
+        const total = n_heads * half;
+        try self.opElt(.rope_imrope, qk, pos3, freqs, null, .{ .u0 = @intCast(total), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(n_heads), .u4 = packSections(sections), .u5 = @intCast(head_dim) }, total, 1, 1);
     }
 
-    /// Folded flash-decode GQA attention (f32 KV): one subgroup per head, the
-    /// 32-way KV split + online-softmax merge done in-subgroup, no scratch, no
-    /// separate merge dispatch (vs opAttnDecodeQ35's dsplit+dmerge). Same
-    /// semantics: window/ring/kv_end as there. Requires hasAttnDecodeSg().
-    pub fn opAttnDecodeSg(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize) Error!void {
-        std.debug.assert(self.pipe_sg[1] != .null_handle);
-        try self.opBegin();
-        var set = self.bind4(.{ q.buf, k_cache.buf, v_cache.buf, out.buf });
-        const push: EltPush = .{
-            .u0 = @intCast(kv_len),
-            .u1 = @intCast(n_heads),
-            .u2 = @intCast(n_kv),
-            .u3 = @intCast(head_dim),
-            .u5 = @intCast(window),
-            .f0 = scale,
-            .f1 = @bitCast(@as(u32, @intCast(ring))),
-            .u6 = @intCast(kv_end),
+    /// `opRopeImrope` over `rows` rows, row r at the triple `pos3s[r]`.
+    pub fn opRopeImropePos(self: *Context, qk: DeviceBuffer, pos3s: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, sections: [3]u32, head_dim: usize) Error!void {
+        const total = rows * n_heads * half;
+        try self.opElt(.rope_imrope_pos, qk, pos3s, freqs, null, .{ .u0 = @intCast(total), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(n_heads), .u4 = packSections(sections), .u5 = @intCast(head_dim) }, total, 1, 1);
+    }
+
+    fn packSections(sections: [3]u32) u32 {
+        return sections[0] | (sections[1] << 8) | (sections[2] << 16);
+    }
+
+    /// L2 norm over `rows` rows of `dim` that sit `rows_per_group` to a group, groups
+    /// `group_stride` apart (the q/k slice of a batched GDN conv output).
+    pub fn opL2NormRowsGrouped(self: *Context, x: DeviceBuffer, rows: usize, dim: usize, rows_per_group: usize, group_stride: usize, eps: f32) Error!void {
+        std.debug.assert(dim <= 256 and rows_per_group > 0 and rows % rows_per_group == 0);
+        try self.opElt(.l2norm_rows_g, x, null, null, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(rows_per_group), .u3 = @intCast(group_stride), .f0 = eps }, rows, 1, 1);
+    }
+
+    /// The GDN causal conv over `n` tokens, then the rolling state advanced past them.
+    pub fn opGdnConvBatch(self: *Context, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize, n: usize) Error!void {
+        try self.opElt(.gdn_conv_batch, conv_state, x, conv_w, out, .{ .u0 = @intCast(n * channels), .u1 = @intCast(channels), .u2 = @intCast(n) }, n * channels, 1, 1);
+        try self.opElt(.gdn_conv_state, conv_state, x, null, null, .{ .u0 = @intCast(channels), .u1 = @intCast(n) }, channels, 1, 1);
+    }
+
+    /// The GDN gates for `n` tokens: alpha and beta `stride` floats a token.
+    pub fn opGdnGatesBatch(self: *Context, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize, stride: usize) Error!void {
+        try self.opElt(.gdn_gates_batch, alpha, beta, a_dt, out, .{ .u0 = @intCast(n * heads), .u1 = @intCast(heads), .u2 = @intCast(stride) }, n * heads, 1, 1);
+    }
+
+    /// Gated-delta recurrence over `n` tokens, the state in registers for the chunk
+    /// (`dual/attn.zig`); a decode step is `n` = 1. Head dims 64 and 128.
+    pub fn opGdnDeltaChunk(self: *Context, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
+        const which: Elt = switch (d) {
+            64 => .gdn_delta_chunk_d64,
+            128 => .gdn_delta_chunk_d128,
+            else => return error.UnsupportedDType,
         };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[1]);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        // LocalSize 32 = one subgroup per workgroup, one head per subgroup.
-        self.d.CmdDispatch(self.cmd, @intCast(n_heads), 1, 1);
-        try self.opEnd();
+        try self.opElt(which, state, conv_out, gates, o, .{
+            .u0 = @intCast(heads),
+            .u1 = @intCast(d),
+            .u2 = @intCast(k_heads),
+            .u3 = @intCast(n),
+            .u4 = @intCast(channels),
+            .f0 = scale,
+        }, heads * d, 1, 1);
     }
 
     /// Convert-store `n` f32 K/V elements from `src` (+`src_off` elems) into the
@@ -3157,7 +3692,7 @@ pub const Context = struct {
         // The kernel stages both operands through workgroup memory via
         // uvec4 views: binding 0 = activations, binding 3 = raw fp8
         // weights (binding 1 is unused; the layout still needs a buffer).
-        var set = self.bind4(.{ x16.buf, x16.buf, y.buf, w_buf });
+        var set = self.bindViews(.{ x16, x16, y, raw(w_buf) });
         self.d.CmdBindPipeline(self.cmd, .compute, if (c16) self.pipe_coop_c16 else self.pipe_coop);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
@@ -3202,7 +3737,7 @@ pub const Context = struct {
         if (!use_sh and (self.pipe_coop_i8 == .null_handle or
             m_pad % mtile != 0 or rows % ntile != 0 or cols % 32 != 0)) return error.UnsupportedDType;
         try self.opBegin();
-        var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, try self.dummyBuf() });
+        var set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(try self.dummyBuf()) });
         if (use_sh) {
             self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8_sh);
             self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
@@ -3245,7 +3780,7 @@ pub const Context = struct {
         const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
         try self.opBegin();
-        var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, scale_buf });
+        var set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(scale_buf) });
         self.d.CmdBindPipeline(self.cmd, .compute, pipe);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
@@ -3312,13 +3847,12 @@ pub const Context = struct {
             return;
         }
 
-        // Stage B: one fused kernel (rotate FWHT + rowmax + quantize in f16
-        // shared) replaces the 3-pass chain + its xr round-trip. One build per
-        // convrot cols (6144 for qkv/wo/mlp-gu, 16384 for mlp.down).
-        const prep_pipe: vk.Pipeline = if (i8PrepIndex(cols)) |i| self.pipe_i8_prep[i] else .null_handle;
+        // One fused kernel (`coopmat.buildFusedPrepI8`) at the widths it is built for,
+        // else the 3-pass chain and its round trip through `i8_xr`.
+        const prep_pipe = try self.i8PrepPipe(cols);
         if (prep_pipe != .null_handle) {
             try self.opBegin();
-            var set = self.bind4(.{ x.buf, self.i8_x.buf, self.i8_scale.buf, try self.dummyBuf() });
+            var set = self.bindViews(.{ x, self.i8_x, self.i8_scale, raw(try self.dummyBuf()) });
             self.d.CmdBindPipeline(self.cmd, .compute, prep_pipe);
             self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
             self.d.CmdDispatch(self.cmd, @intCast(m), 1, 1);
@@ -3347,8 +3881,8 @@ pub const Context = struct {
     /// its per-row scale. `rows` a multiple of 16*i8_nt.
     /// `c_h16` stores y half-precision (feeds the fused f16 attention chain);
     /// only honored on the fused shared path (falls back to f32 s32+scale_i32).
-    pub fn opI8Gemm(self: *Context, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
-        return self.opI8GemmBuf(y, null, w_bytes, weight_scale, rows, c_h16);
+    pub fn opI8Gemm(self: *Context, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize) Error!void {
+        return self.opI8GemmBuf(y, null, w_bytes, weight_scale, rows);
     }
 
     /// int8 GEMM against a PACKED ComfyUI `asym_w4a8_int8` weight: decode it into the
@@ -3374,10 +3908,9 @@ pub const Context = struct {
         rows: usize,
         cols: usize,
         group_size: usize,
-        c_h16: bool,
     ) Error!void {
         const w_buf = try self.w4a8Decode(packed_bytes, s_rel, levels, rows, cols, group_size);
-        return self.opI8GemmBuf(y, w_buf, &.{}, weight_scale, rows, c_h16);
+        return self.opI8GemmBuf(y, w_buf, &.{}, weight_scale, rows);
     }
 
     /// Whether this context can decode a packed W4A8 weight at all. The decode is an
@@ -3385,8 +3918,7 @@ pub const Context = struct {
     /// device without either must be REFUSED rather than fall through to the fp8 arm,
     /// which would read the packed nibbles as e4m3 and render a blank image.
     pub fn hasW4A8Decode(self: *const Context) bool {
-        return self.pipe_coop_i8 != .null_handle and
-            self.pipes_e[@intFromEnum(Elt.w4a8_decode_t)] != .null_handle;
+        return self.pipe_coop_i8 != .null_handle;
     }
 
     /// Bytes of k-major int8 scratch a W4A8 weight of this shape decodes into.
@@ -3444,8 +3976,7 @@ pub const Context = struct {
     /// Whether a nibble-packed int4-convrot weight can be decoded on the device instead of
     /// being widened to int8 at load. Needs the int8 coop pipeline the decode feeds.
     pub fn hasI4Decode(self: *const Context) bool {
-        return self.pipe_coop_i8 != .null_handle and
-            self.pipes_e[@intFromEnum(Elt.i4_decode_t)] != .null_handle;
+        return self.pipe_coop_i8 != .null_handle;
     }
 
     /// Bytes of k-major int8 scratch an int4 weight of this shape decodes into. Identical
@@ -3481,7 +4012,8 @@ pub const Context = struct {
         return self.i4_t.buf;
     }
 
-    pub fn opI8GemmBuf(self: *Context, y: DeviceBuffer, w_buf_in: ?vk.Buffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+    /// Writes `y` at its own dtype.
+    pub fn opI8GemmBuf(self: *Context, y: DeviceBuffer, w_buf_in: ?vk.Buffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize) Error!void {
         // Either kernel suffices; the register-tiled one is 16-fragment-only, so a device
         // with just the shared kernel (8x8 fragments) must not be required to have both.
         std.debug.assert(self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle);
@@ -3494,8 +4026,9 @@ pub const Context = struct {
         };
         // Stage A: fused rescale, assemble [act(m_pad) | weight(rows)] into one
         // scale buffer (batch-barrier-safe scale_concat dispatch) and run the
-        // GEMM that stores y directly (f16 if c_h16), no s32 acc / scale_i32 pass.
-        if (self.pipe_coop_i8_fs != .null_handle and
+        // GEMM that stores y directly (f32 or f16; it has no bf16 store), no s32 acc
+        // / scale_i32 pass.
+        if (y.dt != .bf16 and self.pipe_coop_i8_fs != .null_handle and
             self.i8_mpad % 128 == 0 and rows % 128 == 0 and self.i8_cols % 64 == 0)
         {
             const total = self.i8_mpad + rows;
@@ -3505,13 +4038,13 @@ pub const Context = struct {
                 .u1 = @intCast(m),
                 .u2 = @intCast(self.i8_mpad),
             }, total, 1, 1);
-            if (try self.opMatmulCoopI8Fused(y, self.i8_x, self.i8_mpad, w_buf_in, w_bytes, rows, self.i8_cols, self.i8_scalecat.buf, c_h16))
+            if (try self.opMatmulCoopI8Fused(y, self.i8_x, self.i8_mpad, w_buf_in, w_bytes, rows, self.i8_cols, self.i8_scalecat.buf, y.dt == .f16))
                 return;
         }
         // Fallback: s32 GEMM + separate scale_i32 pass.
         try self.ensureDeviceBuffer(&self.i8_acc, self.i8_mpad * rows * 4);
         try self.opMatmulCoopI8(self.i8_acc, self.i8_x, self.i8_mpad, w_buf_in, w_bytes, rows, self.i8_cols);
-        try self.opElt(.scale_i32, self.i8_acc, y, ws_buf, self.i8_scale, .{
+        try self.opElt(eltAt("scale_i32", y.dt), self.i8_acc, y, ws_buf, self.i8_scale, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),
         }, m * rows, 1, 1);
@@ -3544,7 +4077,7 @@ pub const Context = struct {
             .mem = .null_handle,
             .size = 0,
         };
-        try self.opElt(.scale_i32, acc, y, ws_buf, self.i8_scale, .{
+        try self.opElt(eltAt("scale_i32", y.dt), acc, y, ws_buf, self.i8_scale, .{
             .u0 = @intCast(self.i8_m * rows),
             .u1 = @intCast(rows),
         }, self.i8_m * rows, 1, 1);
@@ -3563,7 +4096,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.indep_remaining == 0);
         try self.opI8Prep(x, m, cols);
-        try self.opI8Gemm(y, w_bytes, weight_scale, rows, false);
+        try self.opI8Gemm(y, w_bytes, weight_scale, rows);
     }
 
     /// Device f16 k-major weight buffer converted from tight f32
@@ -3572,21 +4105,56 @@ pub const Context = struct {
     /// Uploaded once and cached by host pointer; VAE conv weights are a few
     /// MB each so the CPU pass is trivial next to the decode.
     fn weightBufferF16From32(self: *Context, w: []const f32, rows: usize, cols: usize) Error!vk.Buffer {
-        const key = @intFromPtr(w.ptr);
+        return self.weightBuffer16From32(w, rows, cols, false);
+    }
+
+    /// An f32 weight as the coop GEMM's 16-bit k-major `[k_pad][n_pad]` operand, f16 or
+    /// (`bf`) bf16, converted on the host once and cached.
+    fn weightBuffer16From32(self: *Context, w: []const f32, rows: usize, cols: usize, bf: bool) Error!vk.Buffer {
+        const key = weightKey(w, if (bf) .bf16_from_f32 else .f16_from_f32);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
             return e.db.buf;
         }
+        return self.upload16(key, w, rows, cols, bf);
+    }
 
+    /// A conv's coop weight, 16-bit k-major padded, from either form: a repacked `krsc`
+    /// one as `weightBuffer16From32`, a checkpoint-order one (any dtype the CPU conv
+    /// reads) decoded into a transient f32 copy and cached under the checkpoint bytes'
+    /// own address, so nothing stays on the host.
+    pub fn convWeight16(self: *Context, cv: ops.conv.Conv2d, bf: bool) Error!vk.Buffer {
+        const t = switch (cv.w) {
+            .krsc => |s| return self.weightBuffer16From32(s, cv.co, cv.patchLen(), bf),
+            .torch => |t| t,
+        };
+        const key = weightKey(t.w.bytes, if (bf) .bf16_from_conv else .f16_from_conv);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const krsc = cv.materialize(transient) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedDType,
+        };
+        defer transient.free(krsc);
+        return self.upload16(key, krsc, cv.co, cv.patchLen(), bf);
+    }
+
+    /// `w` `[rows][cols]` f32 to the coop GEMM's 16-bit k-major padded layout on the
+    /// device, cached under `key`.
+    fn upload16(self: *Context, key: WeightKey, w: []const f32, rows: usize, cols: usize, bf: bool) Error!vk.Buffer {
         const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
-        const half = self.gpa.alloc(u16, k_pad * n_pad) catch return error.OutOfMemory;
-        defer self.gpa.free(half);
+        const half = transient.alloc(u16, k_pad * n_pad) catch return error.OutOfMemory;
+        defer transient.free(half);
         @memset(half, 0);
         for (0..rows) |r| {
             for (0..cols) |k| {
-                half[k * n_pad + r] = @bitCast(@as(f16, @floatCast(w[r * cols + k])));
+                const v = w[r * cols + k];
+                half[k * n_pad + r] = if (bf) tp_core.dtype.f32ToBf16(v) else @bitCast(@as(f16, @floatCast(v)));
             }
         }
         const bytes = std.mem.sliceAsBytes(half);
@@ -3638,7 +4206,7 @@ pub const Context = struct {
     /// more mantissa bits than bf16, so the round trip is near-lossless for the
     /// < 1 weight range. Cached by host pointer, same residency accounting.
     fn weightBufferF16FromBf16(self: *Context, w_bytes: []const u8, rows: usize, cols: usize, native: bool) Error!vk.Buffer {
-        const key = @intFromPtr(w_bytes.ptr);
+        const key = weightKey(w_bytes, if (native) .bf16_coop else .f16_from_bf16);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -3735,7 +4303,7 @@ pub const Context = struct {
 
     /// Tensor-core GEMM for f32 weights (the VAE convs): B converts once to
     /// zero-padded k-major f16 (cached), the f32 activations convert per
-    /// call with the k tail padded (f32_to_h16_pad, since 9*ci is rarely a
+    /// call with the k tail padded (`pad_h16`, since 9*ci is rarely a
     /// multiple of 64), C lands in the column-padded y_pad scratch, and
     /// bias_compact strips the pad and adds the conv bias into `y` at
     /// element offset `y_off`.
@@ -3776,11 +4344,10 @@ pub const Context = struct {
         bias: []const f32,
         act_div: f32,
     ) Error!void {
-        return self.opMatmulCoopF16WPrec(y, y_off, x, m, w, rows, cols, bias, act_div, false, false);
+        return self.opMatmulCoopF16WPrec(y, y_off, x, m, w, rows, cols, bias, act_div);
     }
 
-    /// `opMatmulCoopF16WScaled` with f16 activation storage selectable on either
-    /// side, see `coopF16WDispatch`.
+    /// `opMatmulCoopF16WScaled`, x and y read and written at their own `dt`.
     pub fn opMatmulCoopF16WPrec(
         self: *Context,
         y: DeviceBuffer,
@@ -3792,37 +4359,41 @@ pub const Context = struct {
         cols: usize,
         bias: []const f32,
         act_div: f32,
-        src_f16: bool,
-        dst_f16: bool,
     ) Error!void {
-        std.debug.assert(self.pipe_coop_f16w != .null_handle);
-        const w_buf = try self.weightBufferF16From32(w, rows, cols);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, act_div, src_f16, dst_f16);
+        const bf = try self.coopOperandBf16(x, y);
+        const w_buf = try self.weightBuffer16From32(w, rows, cols, bf);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf, act_div);
     }
 
-    /// `opMatmulCoopF16W` with a device-resident bias, for the SD UNet's
-    /// ResBlocks: their convolution bias has the timestep-embedding projection
-    /// folded into it, so it changes every forward and cannot go through the
-    /// pointer-keyed `smallBuffer` cache (see `coopF16WDispatch`). Folding rather
-    /// than adding is exact, the projection is a per-channel constant over
-    /// positions, which is what a conv bias already is, and it saves a full
-    /// read-modify-write pass over the activation per ResBlock.
-    pub fn opMatmulCoopF16WDev(
+    /// A conv's GEMM on the coop path: `y[m][co]` = `x[m][patchLen]` @ Wᵀ + the `co` f32
+    /// at `bias_off` in `bias_buf`, W from `convWeight16`. The operand type follows `from`
+    /// rather than `x`: an f32 conv patch gathered from a bf16 chain carries its values.
+    pub fn opMatmulCoopConv(
         self: *Context,
         y: DeviceBuffer,
         y_off: usize,
         x: DeviceBuffer,
+        from: Dt,
         m: usize,
-        w: []const f32,
-        rows: usize,
-        cols: usize,
-        bias: DeviceBuffer,
+        cv: ops.conv.Conv2d,
+        bias_buf: vk.Buffer,
         bias_off: usize,
+        act_div: f32,
     ) Error!void {
-        std.debug.assert(self.pipe_coop_f16w != .null_handle);
-        const w_buf = try self.weightBufferF16From32(w, rows, cols);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias.buf, bias_off, false, 1.0, false, false);
+        const bf = try self.coopOperandBf16(x.as(from), y);
+        const w_buf = try self.convWeight16(cv, bf);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, cv.co, cv.patchLen(), bias_buf, bias_off, bf, act_div);
     }
+
+    /// Whether a coop GEMM from `x` to `y` runs bf16 operands: when either side is bf16,
+    /// since a bf16 chain carries values an f16 operand cannot hold.
+    fn coopOperandBf16(self: *const Context, x: DeviceBuffer, y: DeviceBuffer) Error!bool {
+        const bf = x.dt == .bf16 or y.dt == .bf16;
+        if (bf and self.pipe_coop_bf16w == .null_handle) return error.UnsupportedDType;
+        std.debug.assert(bf or self.pipe_coop_f16w != .null_handle);
+        return bf;
+    }
+
 
     /// Same f16-weight tensor-core GEMM as opMatmulCoopF16W, but the weight is a
     /// raw bf16 tensor (a dense bf16 DiT block linear). bf16 -> f16 conversion
@@ -3843,7 +4414,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, false);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
     }
 
     /// Same f16-weight tensor-core GEMM again, but the weight is a raw f16
@@ -3869,7 +4440,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
     }
 
     /// Native bf16 twin of opMatmulCoopF16Wb: the raw bf16 weight is kept bf16
@@ -3889,7 +4460,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_bf16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0, false, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0);
     }
 
     /// Shared body of the f16/bf16-weight coop GEMM: the weight is already
@@ -3937,17 +4508,13 @@ pub const Context = struct {
         // `bf16_ab = true`: the decode emits bf16 and this converts the ACTIVATION to
         // match. f16 would clip Z-Image's trunk activations at 65504 and render white,
         // see `ops/nvfp4.zig`.
-        return self.coopF16WDispatch(y, 0, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0, false, false);
+        return self.coopF16WDispatch(y, 0, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0);
     }
 
-    /// Bytes of bf16 scratch an NVFP4 weight of this shape decodes into, the padded
-    /// k-major layout `coopF16WDispatch` reads. `dit_gpu` pre-sizes with the max over the
-    /// model so `ensureDeviceBuffer` never flushes a recording batch mid-forward.
-    pub fn nvfp4ScratchBytes(rows: usize, cols: usize) usize {
-        // 128 rather than the live coop wg tile: this only SIZES the scratch, and a
-        // larger alignment is an over-estimate, never a wrong stride. The decode itself
-        // uses coopNPad.
-        return std.mem.alignForward(usize, cols, 64) * std.mem.alignForward(usize, rows, 128) * 2;
+    /// Bytes of the padded 16-bit k-major layout `coopF16WDispatch` reads, what an NVFP4
+    /// or block-quant weight of this shape expands into.
+    pub fn kmajor16Bytes(self: *const Context, rows: usize, cols: usize) usize {
+        return std.mem.alignForward(usize, cols, 64) * self.coopNPad(rows) * 2;
     }
 
     /// Decode a packed NVFP4 weight to bf16 in `self.nvfp4_w16` and return it. Public so a
@@ -3963,7 +4530,7 @@ pub const Context = struct {
         const nblk = cols / 16;
         const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
-        try self.ensureDeviceBuffer(&self.nvfp4_w16, nvfp4ScratchBytes(rows, cols));
+        try self.ensureDeviceBuffer(&self.nvfp4_w16, self.kmajor16Bytes(rows, cols));
         const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols / 2), .mem = .null_handle, .size = 0 };
         const sc: DeviceBuffer = .{ .buf = try self.weightBuffer(scales, 1, rows, nblk), .mem = .null_handle, .size = 0 };
         const lv: DeviceBuffer = .{ .buf = try self.smallBuffer(levels), .mem = .null_handle, .size = 0 };
@@ -3993,8 +4560,7 @@ pub const Context = struct {
     /// fall through to the fp8 arm, which would read the packed nibbles as e4m3 and render
     /// a blank image with no error.
     pub fn hasNvfp4Decode(self: *const Context) bool {
-        return self.pipe_coop_f16w != .null_handle and
-            self.pipes_e[@intFromEnum(Elt.nvfp4_decode_t)] != .null_handle;
+        return self.pipe_coop_f16w != .null_handle;
     }
 
     /// Padded N (output-column) extent of the f16 coop GEMM. EVERY producer of a
@@ -4039,7 +4605,7 @@ pub const Context = struct {
                 .code_size = code.len,
                 .p_code = @ptrCast(@alignCast(code.ptr)),
             }, null, &new_f16w));
-            try createCoopPipe(&self.d, self.device, new_f16w, self.pipeline_layout, sg, &new_f16w_pipe);
+            _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, new_f16w, self.pipeline_layout, sg, &new_f16w_pipe);
         }
         if (self.pipe_coop_bf16w != .null_handle) {
             const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true, self.coop_m, self.coop_n, wm, wn);
@@ -4048,7 +4614,7 @@ pub const Context = struct {
                 .code_size = code.len,
                 .p_code = @ptrCast(@alignCast(code.ptr)),
             }, null, &new_bf16w));
-            try createCoopPipe(&self.d, self.device, new_bf16w, self.pipeline_layout, sg, &new_bf16w_pipe);
+            _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, new_bf16w, self.pipeline_layout, sg, &new_bf16w_pipe);
         }
 
         self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
@@ -4227,7 +4793,7 @@ pub const Context = struct {
                 .code_size = code.len,
                 .p_code = @ptrCast(@alignCast(code.ptr)),
             }, null, &mods[i]));
-            try createCoopPipe(&self.d, self.device, mods[i], self.pipeline_layout, sg, &pipes[i]);
+            _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, mods[i], self.pipeline_layout, sg, &pipes[i]);
         }
 
         const old_pipes = [_]vk.Pipeline{ self.pipe_coop_i8_sh, self.pipe_coop_i8_fs, self.pipe_coop_i8_fs16 };
@@ -4260,46 +4826,17 @@ pub const Context = struct {
         bias_buf: vk.Buffer,
         bias_off: usize,
         bf16_ab: bool,
+        /// A divisor across the operand cast, undone in the epilogue, for an activation
+        /// too large for f16 (see `opMatmulCoopF16WScaled`); an f16 `x` could not have
+        /// held one, so it takes 1.
         act_div: f32,
-        /// f16 activation STORAGE on either side. The GEMM is unchanged, it already
-        /// ran f16 operands with an f32 accumulator; these say only how the caller's
-        /// big activation buffers are laid out, which is where a VAE decode's
-        /// gigabytes live. `src_f16` and `act_div != 1` are mutually exclusive:
-        /// the divisor exists to bring a value too large for f16 THROUGH the cast,
-        /// and an f16 buffer could not have held it in the first place.
-        src_f16: bool,
-        dst_f16: bool,
     ) Error!void {
-        std.debug.assert(!(src_f16 and act_div != 1.0));
-        const n_pad = self.coopNPad(rows);
-        const k_pad = std.mem.alignForward(usize, cols, 64);
-        const m_pad = std.mem.alignForward(usize, m, self.coop_wg_m);
-        try self.ensureDeviceBuffer(&self.x_h16, m_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.y_pad, m_pad * n_pad * 4);
-
-        // x f32 [m][cols] -> f16/bf16 [m_pad][k_pad], zeros in both pads. The
-        // `act_div` division rides along here and is undone in `bias_compact`; see
-        // `opMatmulCoopF16WScaled`.
-        const conv_kind: Elt = if (src_f16) .h16_to_h16_pad else if (bf16_ab) .f32_to_bf16_pad else .f32_to_h16_pad;
-        try self.opElt(conv_kind, x, null, null, self.x_h16, .{
-            .u0 = @intCast(m_pad * k_pad / 2),
-            .u1 = @intCast(cols),
-            .u2 = @intCast(k_pad),
-            .u3 = @intCast(m),
-            .f0 = 1.0 / act_div,
-        }, m_pad * k_pad / 2, 1, 1);
-
-        const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
-        try self.opBegin();
-        var set = self.bind4(.{ self.x_h16.buf, self.x_h16.buf, self.y_pad.buf, w_buf });
-        self.d.CmdBindPipeline(self.cmd, .compute, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-        self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(n_pad / self.coop_wg_n), @intCast(m_pad / self.coop_wg_m), 1);
-        try self.opEnd();
-
+        // x and y are read and written at their own `dt`; the GEMM between is f16 (or
+        // bf16) operands into an f32 accumulator whatever they are.
+        std.debug.assert(x.dt != .f16 or act_div == 1.0);
+        const n_pad = try self.coopGemmPad(x, m, w_buf, rows, cols, bf16_ab, act_div);
         const bias_db: DeviceBuffer = .{ .buf = bias_buf, .mem = .null_handle, .size = 0 };
-        try self.opElt(if (dst_f16) .bias_compact_h16 else .bias_compact, self.y_pad, bias_db, null, y, .{
+        try self.opElt(eltAt("bias_compact", y.dt), self.y_pad, bias_db, null, y, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),
             .u2 = @intCast(n_pad),
@@ -4307,6 +4844,118 @@ pub const Context = struct {
             .u4 = @intCast(bias_off),
             .f0 = act_div,
         }, m * rows, 1, 1);
+    }
+
+    /// `coopF16WDispatch` accumulating into `dst` rather than storing: `dst[m][rows] +=
+    /// scale * x @ Wᵀ`, W a raw bf16 `[rows][cols]`. The LoRA sidecar's B half, which
+    /// otherwise stores a delta plane only to read it back for the add.
+    pub fn opMatmulCoopAcc(self: *Context, dst: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32) Error!void {
+        const bf = self.pipe_coop_bf16w != .null_handle;
+        const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, bf);
+        const n_pad = try self.coopGemmPad(x, m, w_buf, rows, cols, bf, 1.0);
+        try self.opElt(eltAt("compact_acc", dst.dt), self.y_pad, null, null, dst, .{
+            .u0 = @intCast(m * rows),
+            .u1 = @intCast(rows),
+            .u2 = @intCast(n_pad),
+            .f0 = scale,
+        }, m * rows, 1, 1);
+    }
+
+    /// The padded shape of a coop GEMM, its operand `x_h16` and output `y_pad` grown to it.
+    const CoopShape = struct { m_pad: usize, n_pad: usize, k_pad: usize };
+
+    fn coopShape(self: *Context, m: usize, rows: usize, cols: usize) Error!CoopShape {
+        const sh: CoopShape = .{
+            .m_pad = std.mem.alignForward(usize, m, self.coop_wg_m),
+            .n_pad = self.coopNPad(rows),
+            .k_pad = std.mem.alignForward(usize, cols, 64),
+        };
+        try self.ensureDeviceBuffer(&self.x_h16, sh.m_pad * sh.k_pad * 2);
+        try self.ensureDeviceBuffer(&self.y_pad, sh.m_pad * sh.n_pad * 4);
+        return sh;
+    }
+
+    /// The convert and the GEMM of `coopF16WDispatch`, into `self.y_pad` `[m_pad][n_pad]`;
+    /// returns `n_pad`.
+    fn coopGemmPad(self: *Context, x: DeviceBuffer, m: usize, w_buf: vk.Buffer, rows: usize, cols: usize, bf16_ab: bool, act_div: f32) Error!usize {
+        const sh = try self.coopShape(m, rows, cols);
+
+        // x [m][cols] at `x.dt` -> f16/bf16 [m_pad][k_pad], zeros in both pads. The
+        // `act_div` division rides along here and is undone in `bias_compact`; see
+        // `opMatmulCoopF16WScaled`.
+        const conv_kind: Elt = if (bf16_ab) eltAt("pad_bf16", x.dt) else eltAt("pad_h16", x.dt);
+        try self.opElt(conv_kind, x, null, null, self.x_h16, .{
+            .u0 = @intCast(sh.m_pad * sh.k_pad / 2),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(sh.k_pad),
+            .u3 = @intCast(m),
+            .f0 = 1.0 / act_div,
+        }, sh.m_pad * sh.k_pad / 2, 1, 1);
+        try self.coopGemmRun(sh, w_buf, bf16_ab);
+        return sh.n_pad;
+    }
+
+    /// The coop GEMM over an operand already in `x_h16`, into `y_pad`.
+    fn coopGemmRun(self: *Context, sh: CoopShape, w_buf: vk.Buffer, bf16_ab: bool) Error!void {
+        const m_pad = sh.m_pad;
+        const n_pad = sh.n_pad;
+        const k_pad = sh.k_pad;
+        const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
+        try self.opBegin();
+        var set = self.bindViews(.{ self.x_h16, self.x_h16, self.y_pad, raw(w_buf) });
+        self.d.CmdBindPipeline(self.cmd, .compute, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+        self.d.CmdDispatch(self.cmd, @intCast(n_pad / self.coop_wg_n), @intCast(m_pad / self.coop_wg_m), 1);
+        try self.opEnd();
+    }
+
+    /// A band of `m` output positions of a 3x3 convolution on the f16 (or bf16) coop
+    /// GEMM, its patch gathered straight into the GEMM operand rather than through an
+    /// f32 patch and a pad pass. `w` is the repacked `[co][3][3][ci]` weight, `bias_buf`
+    /// `co` f32 at `bias_off`; `src` and `y` at their own dtypes, `act_div` as in
+    /// `opMatmulCoopF16WScaled`.
+    pub fn opConvCoop(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        src: DeviceBuffer,
+        m: usize,
+        cv: ops.conv.Conv2d,
+        taps: dual_table.ConvTaps,
+        bias_buf: vk.Buffer,
+        bias_off: usize,
+        act_div: f32,
+    ) Error!void {
+        std.debug.assert(src.dt != .f16 or act_div == 1.0);
+        std.debug.assert(cv.k == 3 and taps.ci == cv.ci);
+        const co = cv.co;
+        const cols = 9 * taps.ci;
+        const bf = try self.coopOperandBf16(src, y);
+        const w_buf = try self.convWeight16(cv, bf);
+        const sh = try self.coopShape(m, co, cols);
+        const kind: Elt = if (bf) eltAt("im2col_bf16", src.dt) else eltAt("im2col_h16", src.dt);
+        const u = taps.push(sh.m_pad, sh.k_pad, m);
+        try self.opElt(kind, src, null, null, self.x_h16, .{
+            .u0 = u[0],
+            .u1 = u[1],
+            .u2 = u[2],
+            .u3 = u[3],
+            .u4 = u[4],
+            .u5 = u[5],
+            .u6 = u[6],
+            .f0 = @floatFromInt(taps.mode),
+            .f1 = 1.0 / act_div,
+        }, u[0], 1, 1);
+        try self.coopGemmRun(sh, w_buf, bf);
+        try self.opElt(eltAt("bias_compact", y.dt), self.y_pad, .{ .buf = bias_buf, .mem = .null_handle, .size = 0 }, null, y, .{
+            .u0 = @intCast(m * co),
+            .u1 = @intCast(co),
+            .u2 = @intCast(sh.n_pad),
+            .u3 = @intCast(y_off),
+            .u4 = @intCast(bias_off),
+            .f0 = act_div,
+        }, m * co, 1, 1);
     }
 
     /// Whether the block-quant prefill tensor-core GEMM path is available on
@@ -4378,24 +5027,70 @@ pub const Context = struct {
             .u1 = @intCast(cols),
             .u2 = @intCast(y_off),
             .f0 = scale,
+        }, (rows + 1) / 2, 1, 1); // two rows a subgroup (`quant.gemvQ2`)
+    }
+
+    /// `opGemvQuantDual` over `n <= 4` activation rows `cols` apart, writing output row t
+    /// at `y_off + t * y_pitch`; each row bit-identical to a one-row call.
+    pub fn opGemvQuantDualN(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, y_pitch: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, n: usize) Error!void {
+        std.debug.assert(cols % dt.blockElems() == 0 and n >= 1 and n <= 4);
+        const entry: Elt = switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| @field(Elt, "gemv4_dual_" ++ @tagName(t)),
+            else => return error.UnsupportedDType,
+        };
+        const tbl = try self.iqTable(dt);
+        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        try self.opElt(entry, w_db, x, y, tbl, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .u3 = @intCast(n),
+            .u4 = @intCast(y_pitch),
+            .f0 = scale,
         }, rows, 1, 1);
     }
 
-    /// Dequant a block-quant weight into the k-major padded f16 layout the coop
-    /// GEMM consumes, returning its device buffer (`self.deq_f16k`). Reads the
-    /// RAW row-major weight, the same resident buffer the decode GEMV reads, so
-    /// there is no second copy and no layout for the two to disagree about; it
-    /// dequants to f32 row-major (`self.deq_f32`) through the shared per-element
-    /// dequantizer, then repacks to f16 k-major. Both scratches are reused across
-    /// a batched prefill; the per-op barriers order each weight's
-    /// dequant->pack->GEMM->(next weight) so the reuse is race-free.
-    fn quantWeightF16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32) Error!vk.Buffer {
+    /// Stage a decode activation `x` (f32[cols]) as q8_1 blocks in `q8_act`, for any
+    /// number of `opGemvQuantDualQ8` against it.
+    pub fn opGemvQuantizeX(self: *Context, x: DeviceBuffer, cols: usize) Error!void {
         std.debug.assert(cols % 32 == 0);
+        const nblk = cols / 32;
+        try self.ensureDeviceBuffer(&self.q8_act, nblk * 8 + cols);
+        try self.opElt(.quantize_q8_1, x, self.q8_act, null, null, .{ .u0 = @intCast(nblk) }, nblk, 1, 1);
+    }
+
+    /// `opGemvQuantDual` against the q8_1 activation `opGemvQuantizeX` staged: four
+    /// int8 products per dot instead of a float multiply each.
+    pub fn opGemvQuantDualQ8(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        std.debug.assert(cols % dt.blockElems() == 0 and self.q8_act.size >= cols / 32 * 4 + cols);
+        const entry: Elt = switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| @field(Elt, "gemv_dual_" ++ @tagName(t) ++ "_q8"),
+            else => return error.UnsupportedDType,
+        };
+        const tbl = try self.iqTable(dt);
+        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        try self.opElt(entry, w_db, self.q8_act, y, tbl, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .f0 = scale,
+        }, rows, 1, 1);
+    }
+
+    /// Dequant a block-quant weight into the k-major padded 16-bit layout the coop
+    /// GEMM consumes, f16 or bf16, returning its device buffer (`self.deq_f16k`). Reads
+    /// the RAW row-major weight the decode GEMV reads, so there is no second copy;
+    /// dequants it to 16-bit rows (`self.deq_rows`), then transposes those k-major.
+    /// Both scratches are reused across a batched prefill, ordered by the per-op
+    /// barriers.
+    fn quantWeight16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, comptime bf16: bool) Error!vk.Buffer {
+        std.debug.assert(cols % 32 == 0);
+        try self.ensureDeviceBuffer(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
+        if (bench_bq_skip == .expand) return self.deq_f16k.buf;
         // GGUF weights carry no per-tensor scale, and the dequantizers take none.
         std.debug.assert(scale == 1.0);
-        try self.ensureDeviceBuffer(&self.deq_f32, rows * cols * 4);
-        const w_raw = try self.weightBufferRaw(w_bytes);
-        const w_db: DeviceBuffer = .{ .buf = w_raw, .mem = .null_handle, .size = 0 };
+        try self.ensureDeviceBuffer(&self.deq_rows, rows * cols * 2);
+        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
         const entry: Elt = switch (dt) {
             inline .q8_0,
             .q4_0,
@@ -4413,67 +5108,120 @@ pub const Context = struct {
             .q1_0,
             .q2_0_g64,
             .q2_0_g128,
-            => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ "_f32"),
+            => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ (if (bf16) "_bf16" else "_f16")),
             else => return error.UnsupportedDType,
         };
         const elems = rows * cols;
-        try self.opElt(entry, w_db, self.deq_f32, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
+        try self.opElt(entry, w_db, self.deq_rows, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems / 2, 1, 1);
+        if (bench_bq_skip == .pack) return self.deq_f16k.buf;
 
-        const n_pad = std.mem.alignForward(usize, rows, 128);
-        const k_pad = std.mem.alignForward(usize, cols, 64);
-        const words = k_pad * n_pad / 2;
-        try self.ensureDeviceBuffer(&self.deq_f16k, k_pad * n_pad * 2);
-        try self.opElt(.pack_h16_kmajor, self.deq_f32, null, null, self.deq_f16k, .{
-            .u0 = @intCast(words),
+        const pairs = self.coopNPad(rows) / 2;
+        const chunks = std.mem.alignForward(usize, cols, 64) / 16;
+        try self.opElt(.transpose_kmajor16, self.deq_rows, null, null, self.deq_f16k, .{
+            .u0 = @intCast(pairs * chunks),
             .u1 = @intCast(rows),
             .u2 = @intCast(cols),
-            .u3 = @intCast(n_pad),
-        }, words, 1, 1);
+            .u3 = @intCast(pairs),
+        }, pairs * chunks, 1, 1);
         return self.deq_f16k.buf;
     }
 
-    /// Block-quant tensor-core GEMM for prefill: `y[m][rows] = dequant(W) @ x`.
-    /// Dequants the weight to f16 k-major (quantWeightF16K) once per call, then
-    /// runs the shared f16-weight coop GEMM. The weight is re-dequanted every
-    /// call (the f16 form is 4x the block-quant size and won't all fit resident);
-    /// amortized across the whole prompt batch it's a rounding error next to the
-    /// per-token GEMV prefill it replaces. `bias` is added per output row (pass
-    /// zeros for the LLM projections, which carry no bias).
-    pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32) Error!void {
-        std.debug.assert(self.pipe_coop_f16w != .null_handle);
-        const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
+    /// Block-quant tensor-core GEMM: `y[m][rows] = dequant(W) @ x`, the weight
+    /// expanded per call (its 16-bit form is 4x the block-quant size). `bf16`
+    /// expands to bf16 and stages the activation in bf16 too, for a family whose
+    /// activations overflow f16; it needs the bf16 coop GEMM.
+    pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32, comptime bf16: bool) Error!void {
+        std.debug.assert((if (bf16) self.pipe_coop_bf16w else self.pipe_coop_f16w) != .null_handle);
+        const w_buf = try self.quantWeight16K(dt, w_bytes, rows, cols, scale, bf16);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf16, 1.0);
     }
 
-    /// Run the subgroup-reduce capability probe: dispatch one 32-lane subgroup
-    /// summing 32 ones via OpGroupNonUniformFAdd, and return lane 0's result
-    /// (32.0 on success). Verifies that a Zig-emitted subgroup-scope kernel
-    /// actually EXECUTES on this device, the escape hatch from the NVIDIA hang
-    /// on Zig-emitted workgroup memory. Returns error.VulkanFailed on
-    /// DEVICE_LOST (the failure mode), error.VulkanUnavailable if the probe
-    /// pipeline didn't build.
-    pub fn subgroupProbe(self: *Context) Error!f32 {
-        const pipe = self.pipe_sg[0];
-        if (pipe == .null_handle) return error.VulkanUnavailable;
-        var a_d = try self.tensorCreate(32 * 4);
-        defer self.tensorDestroy(&a_d);
-        var d_d = try self.tensorCreate(32 * 4);
-        defer self.tensorDestroy(&d_d);
-        const ones: [32]f32 = @splat(1.0);
-        try self.tensorUpload(a_d, std.mem.sliceAsBytes(&ones));
-        const dummy = try self.dummyBuf();
+    /// What an integer weight is stored as, for `opMatmulCoopIntWo`.
+    pub const IntWeight = union(enum) {
+        i8: []const u8,
+        i4: []const u8,
+        w4a8: struct { packed_bytes: []const u8, s_rel: []const u8, levels: []const u8, group_size: usize },
+    };
+
+    /// An int8, int4 or W4A8 weight expanded per call to 16-bit k-major for the coop GEMM,
+    /// against the unquantized activation. The rotation comes off the WEIGHT, in f32:
+    /// rotating the activation instead would round it to 16 bits after the rotation has
+    /// smeared an outlier channel over its group. The int8 reaches the pack in the
+    /// k-major layout the int8 GEMM reads: cached at load, or the 4-bit decode's.
+    /// An integer convrot linear weight-only in true f32 (W8A32; int4 and W4A8 through
+    /// their int8 decode): the weight times its row scale as f32 rows, the rotation undone,
+    /// transposed into the f32 GEMM's layout, then that GEMM on the f32 activation.
+    /// `y_off` in elements.
+    pub fn opMatmulIntWoF32(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w: IntWeight, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: ?[]const f32) Error!void {
+        std.debug.assert(!rotate or cols % 256 == 0);
+        const wbuf = switch (w) {
+            .i8 => |b| try self.weightBuffer(b, 1, rows, cols),
+            .i4 => |b| try self.i4Decode(b, rows, cols),
+            .w4a8 => |q| try self.w4a8Decode(q.packed_bytes, q.s_rel, q.levels, rows, cols, q.group_size),
+        };
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        try self.reserveWo32(rows, cols);
+        const sc = try self.smallBuffer(std.mem.sliceAsBytes(row_scale));
+        const n = rows * cols;
+        // Unrotated, the rows land straight in `wo32_r`; rotated, in `wo32_t` (at least
+        // as large), and the rotation writes them to `wo32_r`.
+        const rows_at = if (rotate) self.wo32_t else self.wo32_r;
+        try self.opElt(.wo_unpack_f32, raw(wbuf), rows_at, raw(sc), null, .{ .u0 = @intCast(n), .u1 = @intCast(cols), .u2 = @intCast(stride) }, n, 1, 1);
+        if (rotate) try self.opElt(.rotate_fwht, self.wo32_t, self.wo32_r, null, self.wo32_p, .{ .u0 = @intCast(n / 256) }, n / 256, 1, 1);
+        const nt = cols * stride;
+        try self.opElt(.transpose_pad_f32, self.wo32_r, self.wo32_t, null, null, .{ .u0 = @intCast(nt), .u1 = @intCast(cols), .u2 = @intCast(stride), .u3 = @intCast(rows) }, nt, 1, 1);
+        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
+        return self.opMatmulW(y, y_off * 4, x, 0, m, self.wo32_t.buf, false, rows, cols, 1.0, bias_buf);
+    }
+
+    /// The W·A32 scratch for one `[rows][cols]` linear.
+    pub fn reserveWo32(self: *Context, rows: usize, cols: usize) Error!void {
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        try self.ensureDeviceBuffer(&self.wo32_t, cols * stride * 4);
+        try self.ensureDeviceBuffer(&self.wo32_r, rows * cols * 4);
+        try self.ensureDeviceBuffer(&self.wo32_p, @max(4, rows * (cols / 256) * 4));
+    }
+
+    pub fn opMatmulCoopIntWo(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w: IntWeight, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: []const f32, comptime bf16: bool) Error!void {
+        const pipe = self.pipe_wo_pack[@as(usize, @intFromBool(rotate)) * 2 + @intFromBool(bf16)];
+        std.debug.assert(pipe != .null_handle and (if (bf16) self.pipe_coop_bf16w else self.pipe_coop_f16w) != .null_handle);
+        std.debug.assert(!rotate or cols % 256 == 0);
+        const wbuf = switch (w) {
+            .i8 => |b| try self.weightBuffer(b, 1, rows, cols),
+            .i4 => |b| try self.i4Decode(b, rows, cols),
+            .w4a8 => |q| try self.w4a8Decode(q.packed_bytes, q.s_rel, q.levels, rows, cols, q.group_size),
+        };
+        const n_pad = self.coopNPad(rows);
+        try self.ensureDeviceBuffer(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
+        const sc = try self.smallBuffer(std.mem.sliceAsBytes(row_scale));
+        const push: [4]u32 = .{ @intCast(std.mem.alignForward(usize, rows, tile_n) / 4), @intCast(rows), @intCast(n_pad), @intCast(cols) };
         try self.opBegin();
-        errdefer if (self.batching) self.abortBatch();
-        var set = self.bind4(.{ a_d.buf, dummy, dummy, d_d.buf });
-        const push: EltPush = .{};
+        var set = self.bindViews(.{ raw(wbuf), self.deq_f16k, raw(sc), raw(try self.dummyBuf()) });
         self.d.CmdBindPipeline(self.cmd, .compute, pipe);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+        self.d.CmdDispatch(self.cmd, @intCast((rows + 31) / 32), @intCast((cols + 255) / 256), 1);
+        try self.opEnd();
+        return self.coopF16WDispatch(y, y_off, x, m, self.deq_f16k.buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf16, 1.0);
+    }
+
+    /// `x += t` when `t` is given, then `out = rmsnorm(x) * w` over `rows` rows of `dim`,
+    /// in one dispatch: a layer's residual add and hidden-size norm (`coopmat.buildAddRms`).
+    pub fn opAddRmsNorm(self: *Context, x: DeviceBuffer, t: ?DeviceBuffer, w: DeviceBuffer, out: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
+        try self.opBegin();
+        var set = self.bindViews(.{ x, t orelse x, w, out });
+        const push: EltPush = .{ .u1 = @intCast(dim), .u2 = @intFromBool(t != null), .f0 = eps };
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_add_rms);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, 1, 1, 1); // one 32-lane workgroup = one subgroup
+        self.d.CmdDispatch(self.cmd, @intCast(rows), 1, 1);
         try self.opEnd();
-        var out: [32]f32 = undefined;
-        try self.tensorDownload(d_d, std.mem.sliceAsBytes(&out));
-        return out[0];
+    }
+
+    /// Per-head RMSNorm then rotate-half RoPE, in place, over `rows` = positions * `heads`
+    /// rows of `dim`, the first at position `pos0`. `freqs` is cos then sin at `sin_off`.
+    pub fn opQkNormRope(self: *Context, x: DeviceBuffer, w: DeviceBuffer, freqs: DeviceBuffer, rows: usize, dim: usize, heads: usize, pos0: usize, sin_off: usize, eps: f32) Error!void {
+        try self.opElt(.qk_norm_rope, x, w, freqs, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(sin_off), .u3 = @intCast(heads), .u4 = @intCast(pos0), .f0 = eps }, rows, 1, 1);
     }
 
     /// The weighted rmsnorm is a dual-target row kernel, present on every device.
@@ -4501,7 +5249,7 @@ pub const Context = struct {
         keep_norm: bool,
         scale: f32,
     ) Error!void {
-        try self.opElt(.act_steer, x, null, dirs, null, .{
+        try self.opElt(eltAt("act_steer", x.dt), x, null, dirs, null, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(dim),
             .u2 = @intFromBool(add_op),
@@ -4513,7 +5261,8 @@ pub const Context = struct {
     }
 
     pub fn opRmsNormSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
-        try self.opElt(.rmsnorm, x, out, weight, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
+        std.debug.assert(x.dt == out.dt);
+        try self.opElt(eltAt("rmsnorm", x.dt), x, out, weight, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
     }
 
     /// Whether this reduction width has a FUSED int8 prep kernel, rather than falling back to
@@ -4521,8 +5270,32 @@ pub const Context = struct {
     /// full f32 copy of the activation through global memory). Exposed so a bench can state
     /// which path it measured instead of inferring it from the timing.
     pub fn hasFusedI8Prep(self: *const Context, cols: usize) bool {
-        const i = i8PrepIndex(cols) orelse return false;
-        return self.pipe_i8_prep[i] != .null_handle;
+        return self.i8_prep_ok and coopmat.fusedPrepChunk(cols) != null;
+    }
+
+    /// The fused int8 prep for `cols`, built on first use; `.null_handle` where it has no
+    /// build (`hasFusedI8Prep`), which takes the 3-pass chain.
+    fn i8PrepPipe(self: *Context, cols: usize) Error!vk.Pipeline {
+        if (force_i8_prep_3pass or !self.hasFusedI8Prep(cols)) return .null_handle;
+        const key: u32 = @intCast(cols);
+        if (self.i8_prep.get(key)) |p| return p.pipe;
+        const code = coopmat.buildFusedPrepI8(self.gpa, key) catch return error.OutOfMemory;
+        defer self.gpa.free(code);
+        var shader: vk.ShaderModule = .null_handle;
+        try check(self.d.CreateShaderModule(self.device, &.{
+            .code_size = code.len,
+            .p_code = @ptrCast(@alignCast(code.ptr)),
+        }, null, &shader));
+        errdefer self.d.DestroyShaderModule(self.device, shader, null);
+        var pipe: vk.Pipeline = .null_handle;
+        const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
+        if (try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, shader, self.pipeline_layout, null, &pipe)) {
+            self.pipe_cache_dirty = true;
+            std.log.info("vulkan: compiled the int8 prep for {d} columns in {d} ms (first use with this build and driver; cached from now on)", .{ cols, @divTrunc(std.Io.Clock.awake.now(self.io).nanoseconds - t0, std.time.ns_per_ms) });
+        }
+        errdefer self.d.DestroyPipeline(self.device, pipe, null);
+        self.i8_prep.put(self.gpa, key, .{ .shader = shader, .pipe = pipe }) catch return error.OutOfMemory;
+        return pipe;
     }
 
     /// The fused LayerNorm + AdaLN modulation is a dual-target row kernel, present
@@ -4540,7 +5313,8 @@ pub const Context = struct {
     /// `Backend.rmsMod` takes on the CUDA side, so one host-built table serves both
     /// backends. Requires `hasLnModSg()`.
     pub fn opLnModSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
-        try self.opElt(.ln_mod, x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
+        std.debug.assert(x.dt == out.dt);
+        try self.opElt(eltAt("ln_mod", x.dt), x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
     }
 
     /// Fused rmsnorm + AdaLN modulation over `[rows][dim]`, one subgroup per row:
@@ -4549,7 +5323,8 @@ pub const Context = struct {
     /// partials in global memory. `premul` carries the pre-norm weight folded in,
     /// the same convention `Backend.rmsMod` takes.
     pub fn opRmsModSg(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
-        try self.opElt(.rms_mod, x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
+        std.debug.assert(x.dt == out.dt);
+        try self.opElt(eltAt("rms_mod", x.dt), x, out, mod, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .u2 = @intCast(premul_off), .u3 = @intCast(shift_off), .f0 = eps }, rows, 1, 1);
     }
 
     /// `opRmsModSg` writing f16 pairs scaled by `scale`, for the half-precision
@@ -4557,7 +5332,7 @@ pub const Context = struct {
     /// normalized; the rest are zeroed, since their input is uninitialized.
     pub fn opRmsModSgH16(self: *Context, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, real_rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, scale: f32) Error!void {
         std.debug.assert(dim % 2 == 0);
-        try self.opElt(.rms_mod_h16, x, out, mod, null, .{
+        try self.opElt(eltAt("rms_mod_h16", x.dt), x, out, mod, null, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(dim),
             .u2 = @intCast(premul_off),
@@ -4626,7 +5401,7 @@ pub const Context = struct {
         std.debug.assert(pipe != .null_handle);
         try self.opBegin();
         // Binding 3 is the same S buffer viewed as u32 (coalesced copy-out).
-        var set = self.bind4(.{ k16.buf, q16.buf, s.buf, s.buf });
+        var set = self.bindViews(.{ k16, q16, s, s });
         self.d.CmdBindPipeline(self.cmd, .compute, pipe);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
@@ -4655,7 +5430,7 @@ pub const Context = struct {
         };
         std.debug.assert(pipe != .null_handle);
         try self.opBegin();
-        var set = self.bind4(.{ k16.buf, q16.buf, out.buf, v16.buf });
+        var set = self.bindViews(.{ k16, q16, out, v16 });
         self.d.CmdBindPipeline(self.cmd, .compute, pipe);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
@@ -4678,7 +5453,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_attn_out != .null_handle);
         try self.opBegin();
-        var set = self.bind4(.{ s.buf, v16.buf, out.buf, md.buf });
+        var set = self.bindViews(.{ s, v16, out, md });
         self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_attn_out);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
@@ -4688,6 +5463,54 @@ pub const Context = struct {
 
     /// Dispatch one eltwise/attention kernel over device tensors. Buffers
     /// map to bindings a..d; pass null for unused slots.
+    /// The pipeline for `which`, created on its first use: from the cache in milliseconds,
+    /// or compiled (~0.4 s) when a new build or driver left the cache without it.
+    fn eltPipe(self: *Context, which: Elt) Error!vk.Pipeline {
+        const i = @intFromEnum(which);
+        if (self.pipes_e[i] == .null_handle) {
+            const m: EltMaker = .{ .d = &self.d, .device = self.device, .cache = self.pipe_cache, .layout = self.pipeline_layout_e, .spv_e = self.spv_e, .spv_dual = self.spv_dual, .io = self.io, .feedback = self.has_feedback };
+            const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
+            const compiled = try m.create(i, &self.pipes_e[i]);
+            const dt = std.Io.Clock.awake.now(self.io).nanoseconds - t0;
+            if (compiled) {
+                self.pipe_cache_dirty = true;
+                std.log.info("vulkan: compiled GPU kernel {t} in {d} ms (first use with this build and driver; cached from now on)", .{ which, @divTrunc(dt, std.time.ns_per_ms) });
+            }
+        }
+        self.elt_used.set(i);
+        return self.pipes_e[i];
+    }
+
+    /// Write the pipeline cache if a kernel compiled this run, and the used-kernel list if
+    /// it grew. A failure costs the next run its compile time, so it only warns.
+    fn savePipelineCache(self: *Context) void {
+        const p = self.pipe_cache_path orelse return;
+        if (self.pipe_cache_dirty) save: {
+            var size: usize = 0;
+            if (self.d.GetPipelineCacheData(self.device, self.pipe_cache, &size, null) != .success or size == 0) break :save;
+            const buf = self.gpa.alloc(u8, size) catch break :save;
+            defer self.gpa.free(buf);
+            if (self.d.GetPipelineCacheData(self.device, self.pipe_cache, &size, buf.ptr) != .success) break :save;
+            pipe_cache_file.write(self.io, p, buf[0..size]) catch |err| {
+                std.log.warn("vulkan: could not save the pipeline cache to {s}: {t}", .{ p, err });
+                break :save;
+            };
+            std.log.info("vulkan: saved pipeline cache ({d} MB) to {s}", .{ size >> 20, p });
+            if (std.fs.path.dirname(p)) |dir| pipe_cache_file.prune(self.gpa, self.io, dir, keep_pipeline_caches);
+        }
+        if (self.elt_used.eql(self.elt_used_loaded)) return;
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.gpa);
+        var it = self.elt_used.iterator(.{});
+        while (it.next()) |i| {
+            text.appendSlice(self.gpa, @tagName(@as(Elt, @enumFromInt(i)))) catch return;
+            text.append(self.gpa, '\n') catch return;
+        }
+        var buf: [1024]u8 = undefined;
+        const lp = pipe_cache_file.path(&buf, pipe_cache_file.used_list) orelse return;
+        pipe_cache_file.write(self.io, lp, text.items) catch |err| std.log.warn("vulkan: could not save {s}: {t}", .{ lp, err });
+    }
+
     pub fn opElt(
         self: *Context,
         which: Elt,
@@ -4700,16 +5523,17 @@ pub const Context = struct {
         total_y: usize,
         total_z: usize,
     ) Error!void {
+        const pipe = try self.eltPipe(which);
         const dummy = try self.dummyBuf();
         const es = elt_entry_sizes[@intFromEnum(which)];
         try self.opBegin();
-        var set = self.bind4(.{
-            if (a) |t| t.buf else dummy,
-            if (b) |t| t.buf else dummy,
-            if (c) |t| t.buf else dummy,
-            if (dd) |t| t.buf else dummy,
+        var set = self.bindViews(.{
+            a orelse raw(dummy),
+            b orelse raw(dummy),
+            c orelse raw(dummy),
+            dd orelse raw(dummy),
         });
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipes_e[@intFromEnum(which)]);
+        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
         // A row kernel takes its ROW count in total_x, one subgroup per row.
@@ -4730,11 +5554,11 @@ pub const Context = struct {
     /// `bounds` is a device u32[2*total]: bounds[q]=item-start, bounds[total+q]=
     /// item-end (exclusive) for query row q.
     pub fn attnBatchedBind(self: *Context, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, bounds: DeviceBuffer) void {
-        const bufs = [5]vk.Buffer{ q.buf, k.buf, v.buf, out.buf, bounds.buf };
+        const bufs = [5]DeviceBuffer{ q, k, v, out, bounds };
         var bi: [5]vk.DescriptorBufferInfo = undefined;
         var wr: [5]vk.WriteDescriptorSet = undefined;
         for (&bi, &wr, bufs, 0..) |*b_, *w_, buf, i| {
-            b_.* = .{ .buffer = buf, .offset = 0 };
+            b_.* = .{ .buffer = buf.buf, .offset = buf.off };
             w_.* = .{
                 .dst_set = self.desc_set_ab,
                 .dst_binding = @intCast(i),
@@ -4848,13 +5672,39 @@ pub const Context = struct {
     /// full `evictWeights` nuke: used on a VAE-decode OOM so the untouched
     /// weights stay cached instead of being dropped and re-uploaded. Dropped
     /// weights re-upload from their mmap on next use.
+    /// Free the device copy of every weight uploaded from anywhere inside `bytes`, in
+    /// every layout. A LoRA's B factor is uploaded by row ranges, each keyed on its
+    /// inner pointer, so evicting `bytes.ptr` alone would leave those to be served to
+    /// whatever the allocator next hands the address to.
+    pub fn evictWeightRange(self: *Context, bytes: []const u8) void {
+        const lo = @intFromPtr(bytes.ptr);
+        const hi = lo + bytes.len;
+        var waited = false;
+        // Re-scanned per removal: removing during iteration is not allowed, and a
+        // range holds a handful of entries.
+        while (true) {
+            var it = self.weights.keyIterator();
+            const key = while (it.next()) |k| {
+                if (k.ptr >= lo and k.ptr < hi) break k.*;
+            } else return;
+            if (!waited) {
+                // A recorded batch may still read the buffer.
+                _ = self.d.DeviceWaitIdle(self.device);
+                waited = true;
+            }
+            const e = self.weights.fetchRemove(key).?;
+            if (e.value.pinned) self.pinned_bytes -|= e.value.db.size;
+            self.freeDeviceBuffer(e.value.db);
+        }
+    }
+
     pub fn evictToFree(self: *Context, want: u64) u64 {
         if (want == 0) return 0;
         if (self.batching) self.flushBatch() catch {};
         _ = self.d.DeviceWaitIdle(self.device);
         var freed: u64 = 0;
         while (freed < want) {
-            var lru_key: usize = undefined;
+            var lru_key: WeightKey = undefined;
             var lru_use: u64 = std.math.maxInt(u64);
             var it = self.weights.iterator();
             while (it.next()) |e| {
@@ -4965,7 +5815,7 @@ pub const Context = struct {
     /// cache is empty). Any recorded-but-unsubmitted dispatches may still
     /// reference it, so the pending batch is flushed first.
     fn evictOneWeight(self: *Context) bool {
-        var lru_key: usize = undefined;
+        var lru_key: WeightKey = undefined;
         var lru_use: u64 = std.math.maxInt(u64);
         var it = self.weights.iterator();
         while (it.next()) |e| {
@@ -5015,6 +5865,11 @@ pub const Context = struct {
         try check(self.d.BeginCommandBuffer(cb, &.{
             .flags = vk.CommandBufferUsage.one_time_submit,
         }));
+        if (prof) |pf| if (cb == self.cmd) {
+            self.d.CmdResetQueryPool(cb, pf.pool, 0, Prof.cap);
+            self.d.CmdWriteTimestamp(cb, vk.PipelineStage.bottom_of_pipe, pf.pool, 0);
+            pf.n = 1;
+        };
     }
 
     /// DIAGNOSTIC (`TP_VK_STATS`): dispatches recorded, submissions made, and
@@ -5040,6 +5895,7 @@ pub const Context = struct {
         try check(self.d.QueueSubmit(self.queue, 1, @ptrCast(&submit), self.fence));
         try check(self.d.WaitForFences(self.device, 1, @ptrCast(&self.fence), vk.TRUE, std.math.maxInt(u64)));
         try check(self.d.ResetFences(self.device, 1, @ptrCast(&self.fence)));
+        if (prof) |pf| if (cb == self.cmd) self.profHarvest(pf);
     }
 
     fn beginCmd(self: *Context) Error!void {
@@ -5146,9 +6002,67 @@ pub const Context = struct {
                 };
                 self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&bar), 0, null, 0, null);
             }
+            self.profStamp();
             if (self.batch_n >= batch_flush_limit) try self.flushBatch();
         } else {
+            self.profStamp();
             try self.submitAndWait();
+        }
+    }
+
+    fn profStamp(self: *Context) void {
+        const pf = prof orelse return;
+        if (pf.n >= Prof.cap) return;
+        self.d.CmdWriteTimestamp(self.cmd, vk.PipelineStage.bottom_of_pipe, pf.pool, pf.n);
+        pf.pipes[pf.n] = prof_last;
+        pf.n += 1;
+    }
+
+    fn profHarvest(self: *Context, pf: *Prof) void {
+        defer pf.n = 0;
+        if (pf.n < 2) return;
+        var ticks: [Prof.cap]u64 = undefined;
+        if (self.d.GetQueryPoolResults(self.device, pf.pool, 0, pf.n, pf.n * 8, &ticks, 8, vk.query_result_64_wait) != .success) return;
+        for (1..pf.n) |i| {
+            const gop = pf.totals.getOrPut(self.gpa, pf.pipes[i]) catch return;
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.ns += @as(f64, @floatFromInt(ticks[i] -% ticks[i - 1])) * pf.period_ns;
+            gop.value_ptr.count += 1;
+        }
+    }
+
+    /// The name of a pipeline: its `Elt` entry, or the `Context` field holding it.
+    fn pipeName(self: *const Context, p: vk.Pipeline, buf: []u8) []const u8 {
+        for (self.pipes_e, 0..) |e, i| if (e == p) return @tagName(@as(Elt, @enumFromInt(i)));
+        inline for (@typeInfo(Context).@"struct".fields) |f| {
+            if (f.type == vk.Pipeline) {
+                if (@field(self, f.name) == p) return f.name;
+            } else if (@typeInfo(f.type) == .array and @typeInfo(f.type).array.child == vk.Pipeline) {
+                for (@field(self, f.name), 0..) |e, i| if (e == p) return std.fmt.bufPrint(buf, "{s}[{d}]", .{ f.name, i }) catch f.name;
+            }
+        }
+        return "?";
+    }
+
+    fn profReport(self: *Context, pf: *Prof) void {
+        const Row = struct { p: vk.Pipeline, ns: f64, count: u64 };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(self.gpa);
+        var total: f64 = 0;
+        var it = pf.totals.iterator();
+        while (it.next()) |e| {
+            rows.append(self.gpa, .{ .p = e.key_ptr.*, .ns = e.value_ptr.ns, .count = e.value_ptr.count }) catch return;
+            total += e.value_ptr.ns;
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn lt(_: void, a: Row, b: Row) bool {
+                return a.ns > b.ns;
+            }
+        }.lt);
+        std.debug.print("TP_VK_PROFILE: {d:.1} ms of GPU time over the ops of every batch\n", .{total / 1e6});
+        for (rows.items) |r| {
+            var buf: [64]u8 = undefined;
+            std.debug.print("  {s:<28} {d:9.2} ms {d:5.1}%  {d:7} ops  {d:7.2} us/op\n", .{ self.pipeName(r.p, &buf), r.ns / 1e6, 100 * r.ns / total, r.count, r.ns / 1e3 / @as(f64, @floatFromInt(r.count)) });
         }
     }
 
@@ -5262,6 +6176,194 @@ pub const Context = struct {
 // when opted in via the `testdata/gpu-tests` marker: the NVIDIA 580 driver
 // faults on Zig-emitted workgroup-storage kernels (validator-clean; fine on
 // RADV/llvmpipe), which would kill the test process.
+test "gpu typed dual kernels agree with their f32 instance" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    // Each kernel's 16-bit instance against its f32 one on inputs already rounded to
+    // 16 bits: both compute in f32, so an output may differ by one rounding at most.
+    const rows = 4;
+    const dim = 6144;
+    const n = rows * dim;
+    const half = 64;
+    const heads = dim / (2 * half);
+    // A slot: element count, whether it is an activation (the instance's dtype),
+    // whether it is compared, and whether it holds f16 words in both instances.
+    const S = struct { len: usize, act: bool = false, out: bool = false, h16: bool = false };
+    const C = struct { base: []const u8, s: [4]?S, push: EltPush, total: usize };
+    const cases = [_]C{
+        .{ .base = "add", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "gated_add", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = n, .u1 = dim, .u2 = dim }, .total = n },
+        .{ .base = "sigmoid_mul", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "silu_mul", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "add_scaled", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n }, null, null }, .push = .{ .u0 = n, .f0 = 0.0625 }, .total = n },
+        .{ .base = "gated_add_scaled", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = n, .u1 = dim, .u2 = dim, .f0 = 0.0625 }, .total = n },
+        .{ .base = "rope_inter", .s = .{ .{ .len = n, .act = true, .out = true }, null, .{ .len = 2 * rows * half }, null }, .push = .{ .u0 = n / 2, .u1 = half, .u2 = rows * half, .u3 = heads }, .total = n / 2 },
+        .{ .base = "rmsnorm", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .act = true, .out = true }, .{ .len = dim }, null }, .push = .{ .u0 = rows, .u1 = dim, .f0 = 1e-5 }, .total = rows },
+        .{ .base = "rms_mod", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .act = true, .out = true }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = rows, .u1 = dim, .u3 = dim, .f0 = 1e-5 }, .total = rows },
+        .{ .base = "rms_mod_h16", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .out = true, .h16 = true }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = rows, .u1 = dim, .u3 = dim, .u5 = rows, .f0 = 1e-5, .f1 = 0.5 }, .total = rows },
+        .{ .base = "act_steer", .s = .{ .{ .len = n, .act = true, .out = true }, null, .{ .len = dim }, null }, .push = .{ .u0 = rows, .u1 = dim, .u2 = 1, .u3 = 1, .f0 = 0.1 }, .total = rows },
+        .{ .base = "geglu", .s = .{ .{ .len = 2 * n, .act = true }, .{ .len = n, .act = true, .out = true }, null, null }, .push = .{ .u0 = n, .u1 = dim }, .total = n },
+        .{ .base = "copy", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .act = true, .out = true }, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "concat_ch", .s = .{ .{ .len = n / 2, .act = true }, .{ .len = n, .act = true, .out = true }, null, null }, .push = .{ .u0 = n / 2, .u1 = dim / 2, .u2 = dim, .u3 = dim / 2 }, .total = n / 2 },
+        .{ .base = "layernorm", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .act = true, .out = true }, .{ .len = dim }, .{ .len = dim } }, .push = .{ .u0 = rows, .u1 = dim, .f0 = 1e-5 }, .total = rows },
+        .{ .base = "add_bias_rows", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = dim }, null, null }, .push = .{ .u0 = n, .u1 = dim }, .total = n },
+        .{ .base = "bias_compact", .s = .{ .{ .len = rows * (dim + 64) }, .{ .len = dim }, null, .{ .len = n, .act = true, .out = true } }, .push = .{ .u0 = n, .u1 = dim, .u2 = dim + 64, .f0 = 1 }, .total = n },
+        .{ .base = "modulate", .s = .{ .{ .len = n, .act = true, .out = true }, null, .{ .len = 2 * dim }, null }, .push = .{ .u0 = n, .u1 = dim, .u3 = dim }, .total = n },
+        .{ .base = "ln_mod", .s = .{ .{ .len = n, .act = true }, .{ .len = n, .act = true, .out = true }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = rows, .u1 = dim, .u3 = dim, .f0 = 1e-6 }, .total = rows },
+        .{ .base = "gelu", .s = .{ .{ .len = n, .act = true, .out = true }, null, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "gelu_erf", .s = .{ .{ .len = n, .act = true, .out = true }, null, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "compact_acc", .s = .{ .{ .len = rows * (dim + 64) }, null, null, .{ .len = n, .act = true, .out = true } }, .push = .{ .u0 = n, .u1 = dim, .u2 = dim + 64, .f0 = 0.5 }, .total = n },
+    };
+    const round = struct {
+        fn bits(dt: Dt, v: f32) u16 {
+            return if (dt == .f16) @bitCast(@as(f16, @floatCast(v))) else @import("tp_core").dtype.f32ToBf16(v);
+        }
+        fn widen(dt: Dt, b: u16) f32 {
+            return if (dt == .f16) @as(f16, @bitCast(b)) else @bitCast(@as(u32, b) << 16);
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x7e5);
+    const rand = prng.random();
+    inline for (cases) |c| {
+        inline for (.{ Dt.f16, Dt.bf16 }) |dt| {
+            var host: [4][]f32 = undefined;
+            var made: usize = 0;
+            defer for (host[0..made]) |h| gpa.free(h);
+            for (c.s, 0..) |slot, i| {
+                host[i] = try gpa.alloc(f32, if (slot) |sl| sl.len else 1);
+                made += 1;
+                for (host[i]) |*v| v.* = rand.floatNorm(f32) * 2;
+                if (slot) |sl| if (sl.act) for (host[i]) |*v| {
+                    v.* = round.widen(dt, round.bits(dt, v.*));
+                };
+            }
+            var b32: [4]DeviceBuffer = undefined;
+            var b16: [4]DeviceBuffer = undefined;
+            for (0..4) |i| {
+                const sl = c.s[i] orelse S{ .len = 1 };
+                b32[i] = try ctx.tensorCreate(sl.len * 4);
+                b16[i] = try ctx.tensorCreate(sl.len * 4);
+                try ctx.tensorUpload(b32[i], std.mem.sliceAsBytes(host[i]));
+                if (sl.act) {
+                    const w = try gpa.alloc(u16, sl.len);
+                    defer gpa.free(w);
+                    for (w, host[i]) |*o, v| o.* = round.bits(dt, v);
+                    try ctx.tensorUpload(b16[i], std.mem.sliceAsBytes(w));
+                    b16[i].dt = dt;
+                } else try ctx.tensorUpload(b16[i], std.mem.sliceAsBytes(host[i]));
+            }
+            defer for (0..4) |i| {
+                ctx.tensorDestroy(&b32[i]);
+                ctx.tensorDestroy(&b16[i]);
+            };
+            const opt = struct {
+                fn f(s: ?S, b: DeviceBuffer) ?DeviceBuffer {
+                    return if (s != null) b else null;
+                }
+            }.f;
+            try ctx.opElt(eltAt(c.base, .f32), opt(c.s[0], b32[0]), opt(c.s[1], b32[1]), opt(c.s[2], b32[2]), opt(c.s[3], b32[3]), c.push, c.total, 1, 1);
+            try ctx.opElt(eltAt(c.base, dt), opt(c.s[0], b16[0]), opt(c.s[1], b16[1]), opt(c.s[2], b16[2]), opt(c.s[3], b16[3]), c.push, c.total, 1, 1);
+            for (c.s, 0..) |slot, i| {
+                const sl = slot orelse continue;
+                if (!sl.out) continue;
+                const words = if (sl.h16) sl.len else sl.len;
+                const want = try gpa.alloc(u16, words);
+                defer gpa.free(want);
+                const got = try gpa.alloc(u16, words);
+                defer gpa.free(got);
+                if (sl.h16) {
+                    try ctx.tensorDownload(try ctx.view(b32[i], 0, words * 2), std.mem.sliceAsBytes(want));
+                } else {
+                    const w32 = try gpa.alloc(f32, sl.len);
+                    defer gpa.free(w32);
+                    try ctx.tensorDownload(b32[i], std.mem.sliceAsBytes(w32));
+                    for (want, w32) |*o, v| o.* = round.bits(dt, v);
+                }
+                try ctx.tensorDownload(try ctx.view(b16[i], 0, words * 2), std.mem.sliceAsBytes(got));
+                var bad: usize = 0;
+                var first: usize = 0;
+                for (want, got, 0..) |a, b, j| {
+                    const d = @as(i32, a) - @as(i32, b);
+                    if (d > 1 or d < -1) {
+                        if (bad == 0) first = j;
+                        bad += 1;
+                    }
+                }
+                errdefer std.debug.print("{s} at {t}: {d} of {d} outputs off by more than one rounding (first [{d}]: {d} vs {d})\n", .{ c.base, dt, bad, words, first, round.widen(dt, want[first]), round.widen(dt, got[first]) });
+                try std.testing.expectEqual(@as(usize, 0), bad);
+            }
+        }
+    }
+}
+
+test "gpu allFinite catches one inf or nan at every width" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const n = 100_003;
+    var db = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&db);
+    for ([_]Dt{ .f32, .f16, .bf16 }) |dt| {
+        for ([_]?f32{ null, std.math.inf(f32), std.math.nan(f32) }) |bad| {
+            const host = try gpa.alloc(f32, n);
+            defer gpa.free(host);
+            for (host, 0..) |*v, i| v.* = @floatFromInt(i % 977);
+            if (bad) |b| host[n - 2] = b;
+            if (dt == .f32) {
+                try ctx.tensorUpload(db, std.mem.sliceAsBytes(host));
+            } else {
+                const h16 = try gpa.alloc(u16, n);
+                defer gpa.free(h16);
+                for (h16, host) |*o, v| o.* = if (dt == .f16) @bitCast(@as(f16, @floatCast(v))) else @import("tp_core").dtype.f32ToBf16(v);
+                try ctx.tensorUpload(db, std.mem.sliceAsBytes(h16));
+            }
+            errdefer std.debug.print("allFinite at {t} with {?d}\n", .{ dt, bad });
+            try std.testing.expectEqual(bad == null, try ctx.allFinite(db.as(dt), n));
+        }
+    }
+}
+
+test "gpu f32 to 16-bit stores round to nearest even" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    // Values just past and exactly at the midpoint between two neighbouring f16s, of
+    // both signs: truncation rounds every one of them toward zero.
+    const n = 4096;
+    const src = try gpa.alloc(f32, n);
+    defer gpa.free(src);
+    var prng = std.Random.DefaultPrng.init(17);
+    for (src, 0..) |*v, i| {
+        const a: f16 = @floatCast(prng.random().floatNorm(f32) * 100);
+        const b: f16 = @bitCast(@as(u16, @bitCast(a)) + 1);
+        const mid = (@as(f32, a) + @as(f32, b)) / 2;
+        const past = mid + @abs(@as(f32, b) - @as(f32, a)) / 8;
+        v.* = if (i % 2 == 0) past else mid;
+    }
+    var sd = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&sd);
+    try ctx.tensorUpload(sd, std.mem.sliceAsBytes(src));
+    var dd = try ctx.tensorCreate(n * 2);
+    defer ctx.tensorDestroy(&dd);
+    const got = try gpa.alloc(u16, n);
+    defer gpa.free(got);
+    for ([_]Dt{ .f16, .bf16 }) |dt| {
+        try ctx.opElt(eltCopy(.f32, dt), sd, dd.as(dt), null, null, .{ .u0 = n }, n, 1, 1);
+        try ctx.tensorDownload(dd, std.mem.sliceAsBytes(got));
+        var wrong: usize = 0;
+        for (src, got) |v, g| {
+            const want: u16 = if (dt == .f16) @bitCast(@as(f16, @floatCast(v))) else @import("tp_core").dtype.f32ToBf16(v);
+            if (g != want) wrong += 1;
+        }
+        errdefer std.debug.print("{t}: {d} of {d} stores not round-to-nearest-even\n", .{ dt, wrong, n });
+        try std.testing.expectEqual(@as(usize, 0), wrong);
+    }
+}
+
 test "gpu gdn kernels match cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -5520,6 +6622,199 @@ test "gpu dual gemv covers the codebook and low-bit k-quant formats" {
 // all five dequant kernels + the pack kernel + the coop path against a CPU
 // dequant-matmul reference (f16-GEMM tolerance). iq4_nl is covered here (the
 // gemv test above skips it); the Nemo e2e run exercises iq4_nl/q8_0/q5_k.
+test "gpu dual attention rows and the delta chunk match the host" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rand = prng.random();
+
+    // The recurrence, against the same arithmetic in the same order on the host: every
+    // op is correctly rounded (the adds fused), so the two agree bit for bit.
+    {
+        const heads = 4;
+        const kh = 2;
+        const d = 128;
+        const n = 9;
+        const channels = 2 * kh * d + heads * d;
+        const scale = 1.0 / @sqrt(@as(f32, d));
+        const st = try gpa.alloc(f32, heads * d * d);
+        defer gpa.free(st);
+        for (st) |*x| x.* = rand.floatNorm(f32) * 0.1;
+        const conv = try gpa.alloc(f32, n * channels);
+        defer gpa.free(conv);
+        for (conv) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        var gates: [n * 2 * heads]f32 = undefined;
+        for (&gates) |*x| x.* = 0.05 + 0.9 * rand.float(f32);
+        var st_d = try ctx.tensorCreate(st.len * 4);
+        defer ctx.tensorDestroy(&st_d);
+        var conv_d = try ctx.tensorCreate(conv.len * 4);
+        defer ctx.tensorDestroy(&conv_d);
+        var gates_d = try ctx.tensorCreate(gates.len * 4);
+        defer ctx.tensorDestroy(&gates_d);
+        var o_d = try ctx.tensorCreate(n * heads * d * 4);
+        defer ctx.tensorDestroy(&o_d);
+        try ctx.tensorUpload(st_d, std.mem.sliceAsBytes(st));
+        try ctx.tensorUpload(conv_d, std.mem.sliceAsBytes(conv));
+        try ctx.tensorUpload(gates_d, std.mem.sliceAsBytes(&gates));
+        try ctx.opGdnDeltaChunk(st_d, conv_d, gates_d, o_d, heads, d, kh, n, channels, scale);
+        const o_want = try gpa.alloc(f32, n * heads * d);
+        defer gpa.free(o_want);
+        for (0..heads) |h| for (0..d) |j| {
+            var col: [d]f32 = undefined;
+            for (&col, 0..) |*x, i| x.* = st[h * d * d + i * d + j];
+            for (0..n) |t| {
+                const tb = t * channels;
+                const decay = gates[t * 2 * heads + h];
+                const beta = gates[t * 2 * heads + heads + h];
+                var m: f32 = 0;
+                for (&col, 0..) |*x, i| {
+                    x.* = x.* * decay;
+                    m = @mulAdd(f32, x.*, conv[tb + kh * d + (h % kh) * d + i], m);
+                }
+                const dl = (conv[tb + 2 * kh * d + h * d + j] - m) * beta;
+                var o: f32 = 0;
+                for (&col, 0..) |*x, i| {
+                    const qi = conv[tb + (h % kh) * d + i] * scale;
+                    x.* = @mulAdd(f32, conv[tb + kh * d + (h % kh) * d + i], dl, x.*);
+                    o = @mulAdd(f32, x.*, qi, o);
+                }
+                o_want[t * heads * d + h * d + j] = o;
+            }
+            for (col, 0..) |x, i| st[h * d * d + i * d + j] = x;
+        };
+        const o_got = try gpa.alloc(f32, o_want.len);
+        defer gpa.free(o_got);
+        const st_got = try gpa.alloc(f32, st.len);
+        defer gpa.free(st_got);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(o_got));
+        try ctx.tensorDownload(st_d, std.mem.sliceAsBytes(st_got));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(o_want), std.mem.sliceAsBytes(o_got));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(st), std.mem.sliceAsBytes(st_got));
+    }
+
+    // Attention: several queries, a GQA group, against the CPU, plain and under each
+    // span: a window, a ring the keys are laid out in, a bidirectional block end.
+    const spans = [_]Context.AttnSpan{ .{}, .{ .window = 4 }, .{ .window = 4, .ring = 6 }, .{ .bidir_end = 7 }, .{ .window = 4, .ring = 6, .bidir_end = 7 } };
+    for ([_]usize{ 128, 256 }) |hd| for (spans) |sp| {
+        const heads = 4;
+        const kvh = 2;
+        const seq_q = 3;
+        const kv_len0 = 5;
+        const kv_total = kv_len0 + seq_q - 1;
+        const nsplit = 8;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const q = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(q);
+        const kf = try gpa.alloc(f32, kv_total * kvh * hd);
+        defer gpa.free(kf);
+        const vf = try gpa.alloc(f32, kv_total * kvh * hd);
+        defer gpa.free(vf);
+        for (q) |*x| x.* = rand.floatNorm(f32);
+        for (kf) |*x| x.* = rand.floatNorm(f32);
+        for (vf) |*x| x.* = rand.floatNorm(f32);
+        const ref = try gpa.alloc(f32, q.len);
+        defer gpa.free(ref);
+        for (0..seq_q) |t| for (0..heads) |h| {
+            const g = h / (heads / kvh);
+            const len = kv_len0 + t;
+            const lo = if (sp.window != 0 and len > sp.window) len - sp.window else 0;
+            const hi = if (sp.bidir_end != 0) sp.bidir_end else len;
+            var sc: [kv_total]f32 = undefined;
+            var mx: f32 = -std.math.inf(f32);
+            for (lo..hi) |j| {
+                var dot: f32 = 0;
+                for (0..hd) |c| dot += q[(t * heads + h) * hd + c] * kf[(j * kvh + g) * hd + c];
+                sc[j] = dot * scale;
+                mx = @max(mx, sc[j]);
+            }
+            var den: f32 = 0;
+            for (sc[lo..hi]) |*x| {
+                x.* = @exp(x.* - mx);
+                den += x.*;
+            }
+            for (0..hd) |c| {
+                var acc: f32 = 0;
+                for (lo..hi) |j| acc += sc[j] * vf[(j * kvh + g) * hd + c];
+                ref[(t * heads + h) * hd + c] = acc / den;
+            }
+        };
+        // A ring holds key j at row j % ring; the later key wins a shared row.
+        const rows = if (sp.ring != 0) sp.ring else kv_total;
+        const kr = try gpa.alloc(f32, rows * kvh * hd);
+        defer gpa.free(kr);
+        const vr = try gpa.alloc(f32, rows * kvh * hd);
+        defer gpa.free(vr);
+        for (0..kv_total) |j| {
+            const r = if (sp.ring != 0) j % sp.ring else j;
+            @memcpy(kr[r * kvh * hd ..][0 .. kvh * hd], kf[j * kvh * hd ..][0 .. kvh * hd]);
+            @memcpy(vr[r * kvh * hd ..][0 .. kvh * hd], vf[j * kvh * hd ..][0 .. kvh * hd]);
+        }
+        var q_d = try ctx.tensorCreate(q.len * 4);
+        defer ctx.tensorDestroy(&q_d);
+        var k_d = try ctx.tensorCreate(kr.len * 4);
+        defer ctx.tensorDestroy(&k_d);
+        var v_d = try ctx.tensorCreate(vr.len * 4);
+        defer ctx.tensorDestroy(&v_d);
+        var out_d = try ctx.tensorCreate(q.len * 4);
+        defer ctx.tensorDestroy(&out_d);
+        var scratch_d = try ctx.tensorCreate(seq_q * heads * nsplit * (hd + 2) * 4);
+        defer ctx.tensorDestroy(&scratch_d);
+        try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(kr));
+        try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(vr));
+        try ctx.opAttnRows(q_d, k_d, v_d, out_d, scratch_d, kv_len0, seq_q, heads, kvh, hd, nsplit, scale, .f32, sp);
+        const got = try gpa.alloc(f32, q.len);
+        defer gpa.free(got);
+        try ctx.tensorDownload(out_d, std.mem.sliceAsBytes(got));
+        for (ref, got, 0..) |r, g, i| {
+            errdefer std.debug.print("attention hd {d} span {any}: element {d} cpu {d} vulkan {d}\n", .{ hd, sp, i, r, g });
+            try std.testing.expectApproxEqAbs(r, g, 2e-3);
+        }
+    };
+}
+
+test "gpu a buffer view binds, uploads and downloads at its offset" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const n = 1024;
+    const at = 256; // elements, a multiple of every storage alignment in use
+    const len = 128;
+    var host: [n]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @floatFromInt(i);
+    var whole = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&whole);
+    try ctx.tensorUpload(whole, std.mem.sliceAsBytes(&host));
+    var ones: [len]f32 = @splat(1);
+    var one_d = try ctx.tensorCreate(len * 4);
+    defer ctx.tensorDestroy(&one_d);
+    try ctx.tensorUpload(one_d, std.mem.sliceAsBytes(&ones));
+
+    // A kernel through the view touches exactly its range.
+    const v = try ctx.view(whole, at * 4, len * 4);
+    try ctx.opElt(.add, v, one_d, null, null, .{ .u0 = len }, len, 1, 1);
+    var got: [n]f32 = undefined;
+    try ctx.tensorDownload(whole, std.mem.sliceAsBytes(&got));
+    for (got, 0..) |g, i| {
+        const want: f32 = @as(f32, @floatFromInt(i)) + @as(f32, if (i >= at and i < at + len) 1 else 0);
+        errdefer std.debug.print("element {d}: got {d}, want {d}\n", .{ i, g, want });
+        try std.testing.expectEqual(want, g);
+    }
+    // Copies honour it too.
+    var part: [len]f32 = undefined;
+    try ctx.tensorDownload(v, std.mem.sliceAsBytes(&part));
+    try std.testing.expectEqual(@as(f32, at + 1), part[0]);
+    try ctx.tensorUpload(v, std.mem.sliceAsBytes(&ones));
+    try ctx.tensorDownload(whole, std.mem.sliceAsBytes(&got));
+    try std.testing.expectEqual(@as(f32, at - 1), got[at - 1]);
+    try std.testing.expectEqual(@as(f32, 1), got[at]);
+    try std.testing.expectEqual(@as(f32, at + len), got[at + len]);
+    try std.testing.expectError(error.UnalignedView, ctx.view(whole, 4, 4));
+}
+
 test "gpu block-quant prefill GEMM matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -5579,7 +6874,7 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
     defer for (ws) |w| gpa.free(w);
 
     inline for (dts, 0..) |dt, i| {
-        try ctx.opMatmulCoopQuant(dt, y_d, 0, x_d, m, ws[i], rows, cols, 1.0, bias);
+        try ctx.opMatmulCoopQuant(dt, y_d, 0, x_d, m, ws[i], rows, cols, 1.0, bias, false);
         try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
 
         const row_bytes = dt.storageBytes(cols);
@@ -5587,7 +6882,7 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
             quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
             for (0..m) |mi| {
                 // Reference rounds BOTH operands to f16 (as the GPU does: the
-                // pack kernel casts the dequanted weight to f16, f32_to_h16_pad
+                // pack kernel casts the dequanted weight to f16, `pad_h16`
                 // casts x), so only the f32 accumulation ORDER differs, the
                 // dequant math is then checked tightly. (Comparing against a
                 // full-precision dot would fold in f16 input rounding, which on
@@ -5614,27 +6909,57 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
     }
 }
 
-// The int8 dp4a decode GEMV (opGemvDp4a) over the repacked layout: repacks the
-// weight (repack_q8_0 / repack_iq4_nl, LUT pre-applied for iq4_nl), int8-
-// quantizes the activation, and dots via OpSDot. Validates against a reference
-// that dequants the weight and round-trips the activation through the SAME
-// per-block int8 quantization the kernel uses (so only f32 accumulation order
-// differs). q8_0 + iq4_nl (the dp4a formats). Skips without integer dot product.
-// Verifies a Zig-emitted subgroup-scope kernel (OpGroupNonUniformFAdd) runs on
-// the device, the escape hatch from the NVIDIA-hangs-on-Zig-workgroup-memory
-// issue. One 32-lane subgroup sums 32 ones; every lane must read back 32.0.
-// A hang/reject surfaces as DEVICE_LOST (error), not an infinite loop.
-test "subgroup reduce runs on device" {
+test "gpu add + rmsnorm matches the cpu, with and without the add" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
-    const got = ctx.subgroupProbe() catch |e| {
-        std.debug.print("subgroup probe FAILED: {t} (subgroup ops unusable on this device)\n", .{e});
-        return e;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const eps: f32 = 1e-6;
+    for ([_]usize{ 100, 2560, 4100 }) |dim| for ([_]usize{ 1, 3 }) |rows| for ([_]bool{ false, true }) |add| {
+        const x = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(x);
+        const t = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(t);
+        const w = try gpa.alloc(f32, dim);
+        defer gpa.free(w);
+        for (x) |*v| v.* = rand.floatNorm(f32) * 3;
+        for (t) |*v| v.* = rand.floatNorm(f32);
+        for (w) |*v| v.* = 1 + rand.floatNorm(f32) * 0.1;
+        const want_x = try gpa.alloc(f32, x.len);
+        defer gpa.free(want_x);
+        const want = try gpa.alloc(f32, x.len);
+        defer gpa.free(want);
+        for (want_x, x, t) |*o, a, b| o.* = if (add) a + b else a;
+        for (0..rows) |r| {
+            var ss: f64 = 0;
+            for (want_x[r * dim ..][0..dim]) |v| ss += @as(f64, v) * v;
+            const inv: f32 = @floatCast(1.0 / @sqrt(ss / @as(f64, @floatFromInt(dim)) + eps));
+            for (0..dim) |i| want[r * dim + i] = want_x[r * dim + i] * inv * w[i];
+        }
+        var x_d = try ctx.tensorCreate(x.len * 4);
+        defer ctx.tensorDestroy(&x_d);
+        var t_d = try ctx.tensorCreate(t.len * 4);
+        defer ctx.tensorDestroy(&t_d);
+        var w_d = try ctx.tensorCreate(w.len * 4);
+        defer ctx.tensorDestroy(&w_d);
+        var o_d = try ctx.tensorCreate(x.len * 4);
+        defer ctx.tensorDestroy(&o_d);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try ctx.tensorUpload(t_d, std.mem.sliceAsBytes(t));
+        try ctx.tensorUpload(w_d, std.mem.sliceAsBytes(w));
+        try ctx.opAddRmsNorm(x_d, if (add) t_d else null, w_d, o_d, rows, dim, eps);
+        const got_x = try gpa.alloc(f32, x.len);
+        defer gpa.free(got_x);
+        const got = try gpa.alloc(f32, x.len);
+        defer gpa.free(got);
+        try ctx.tensorDownload(x_d, std.mem.sliceAsBytes(got_x));
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+        errdefer std.debug.print("add_rms dim {d} rows {d} add {}\n", .{ dim, rows, add });
+        try std.testing.expectEqualSlices(f32, want_x, got_x);
+        for (want, got) |e, g| try std.testing.expectApproxEqRel(e, g, 1e-5);
     };
-    std.debug.print("subgroup reduce result: {d} (expected 32)\n", .{got});
-    try std.testing.expectEqual(@as(f32, 32.0), got);
 }
 
 test "gpu subgroup rmsnorm matches cpu reference" {
@@ -6276,107 +7601,6 @@ test "flash attention matches reference" {
     }
 }
 
-// Bidirectional image-block attention on Vulkan: opAttnDecodeQ35 is single
-// query, so an image block is prefilled token-by-token but each query gets
-// kv_end = block end (bidirectional forward) while the sliding window still
-// tracks its own position. This validates the u6=kv_end path of
-// attn_dsplit_gemma against a CPU reference for one such query.
-test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
-    const gpa = std.testing.allocator;
-    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
-    defer ctx.deinit();
-
-    const n_heads = 4;
-    const n_kv = 2;
-    const hd = 256; // gemma3 head_dim
-    const window = 24;
-    const kv_len = 61; // this query's causal position + 1 (query at abs pos 60)
-    const kv_end = 100; // block end: query attends forward to here (bidirectional)
-    const scale: f32 = 1.0 / @sqrt(@as(f32, hd));
-    var prng = std.Random.DefaultPrng.init(202);
-    const rand = prng.random();
-
-    const q = try gpa.alloc(f32, n_heads * hd);
-    defer gpa.free(q);
-    const k = try gpa.alloc(f32, kv_end * n_kv * hd);
-    defer gpa.free(k);
-    const v = try gpa.alloc(f32, kv_end * n_kv * hd);
-    defer gpa.free(v);
-    for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
-    for (k) |*x| x.* = rand.floatNorm(f32) * 0.3;
-    for (v) |*x| x.* = rand.floatNorm(f32);
-
-    // Reference: attend [kv_start, kv_end), kv_start windowed off kv_len.
-    const kv_start: usize = if (kv_len > window) kv_len - window else 0;
-    const ref = try gpa.alloc(f32, n_heads * hd);
-    defer gpa.free(ref);
-    const scores = try gpa.alloc(f32, kv_end);
-    defer gpa.free(scores);
-    for (0..n_heads) |h| {
-        const kvh = h / (n_heads / n_kv);
-        var mx: f32 = -std.math.inf(f32);
-        for (kv_start..kv_end) |j| {
-            var s: f32 = 0;
-            for (0..hd) |c| s += q[h * hd + c] * k[(j * n_kv + kvh) * hd + c];
-            scores[j] = s * scale;
-            mx = @max(mx, scores[j]);
-        }
-        var den: f32 = 0;
-        for (kv_start..kv_end) |j| {
-            scores[j] = @exp(scores[j] - mx);
-            den += scores[j];
-        }
-        for (0..hd) |c| {
-            var acc: f32 = 0;
-            for (kv_start..kv_end) |j| acc += scores[j] * v[(j * n_kv + kvh) * hd + c];
-            ref[h * hd + c] = acc / den;
-        }
-    }
-
-    var q_d = try ctx.tensorCreate(q.len * 4);
-    defer ctx.tensorDestroy(&q_d);
-    var k_d = try ctx.tensorCreate(k.len * 4);
-    defer ctx.tensorDestroy(&k_d);
-    var v_d = try ctx.tensorCreate(v.len * 4);
-    defer ctx.tensorDestroy(&v_d);
-    var o_d = try ctx.tensorCreate(q.len * 4);
-    defer ctx.tensorDestroy(&o_d);
-    var s_d = try ctx.tensorCreate(n_heads * Context.attn_decode_nsplit * (hd + 2) * 4);
-    defer ctx.tensorDestroy(&s_d);
-    try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
-    try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(k));
-    try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-
-    try ctx.beginBatch();
-    errdefer if (ctx.batching) ctx.abortBatch();
-    // ring=0 (linear KV); kv_end > kv_len marks the bidirectional block.
-    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, window, 0, kv_end, .f32);
-    try ctx.endBatch();
-
-    const got = try gpa.alloc(f32, q.len);
-    defer gpa.free(got);
-    try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
-    var worst: f32 = 0;
-    for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
-    try std.testing.expect(worst <= 2e-3);
-
-    // Folded path (attn_decode_sg): same CPU reference, no scratch / no merge.
-    if (ctx.hasAttnDecodeSg()) {
-        try ctx.beginBatch();
-        errdefer if (ctx.batching) ctx.abortBatch();
-        try ctx.opAttnDecodeSg(q_d, k_d, v_d, o_d, n_heads, n_kv, hd, kv_len, scale, window, 0, kv_end);
-        try ctx.endBatch();
-        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
-        var worst_sg: f32 = 0;
-        for (ref, got) |e, a| worst_sg = @max(worst_sg, @abs(e - a));
-        std.testing.expect(worst_sg <= 2e-3) catch |e| {
-            std.debug.print("attn_decode_sg worst abs err {d}\n", .{worst_sg});
-            return e;
-        };
-    }
-}
-
 test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -6480,11 +7704,12 @@ test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches refe
     defer ctx.tensorDestroy(&q_d);
     var o_d = try ctx.tensorCreate(q.len * 4);
     defer ctx.tensorDestroy(&o_d);
-    var s_d = try ctx.tensorCreate(n_heads * Context.attn_decode_nsplit * (hd + 2) * 4);
+    const nsplit = 32;
+    var s_d = try ctx.tensorCreate(n_heads * nsplit * (hd + 2) * 4);
     defer ctx.tensorDestroy(&s_d);
     try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try ctx.beginBatch();
-    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, 0, 0, 0, .q8_0);
+    try ctx.opAttnRows(q_d, k_d, v_d, o_d, s_d, kv_len, 1, n_heads, n_kv, hd, nsplit, scale, .q8_0, .{});
     try ctx.endBatch();
 
     const got = try gpa.alloc(f32, q.len);

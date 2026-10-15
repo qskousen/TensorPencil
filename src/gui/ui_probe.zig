@@ -67,14 +67,37 @@ fn noHostSync(name: []const u8) config_view.HostSync {
     // "done" with nothing left to do.
     if (std.mem.eql(u8, name, "lydia")) return .{
         .sending = "qwen3_06b_instruct",
-        .status = "done",
+        .status = "done · 1.1 GiB in 1m42s · 11 MiB/s",
         .missing = "krea2RealVae_v10",
         .missing_count = 2,
     };
+    // A pull: its progress sits in this machine's column of the grid.
+    if (std.mem.eql(u8, name, "cellar")) return .{
+        .sending = "kWALUAN_v08INT8",
+        .status = "71% · 3.6 GiB / 5.1 GiB · 212 MiB/s · 7s left",
+        .running = true,
+        .pull = true,
+        .fraction = 0.71,
+    };
     if (!std.mem.eql(u8, name, "attic")) return .{};
-    return .{ .missing = "krea2CenterSemiraw_v10Int8", .missing_count = 1 };
+    return .{
+        .sending = "sensenovaU158BMot_sft",
+        .status = "retrying (ConnectionResetByPeer) · 38% · 96 MiB / 254 MiB · 11 MiB/s · 14s left",
+        .running = true,
+        .fraction = 0.38,
+        .queued = 1,
+        .missing = "krea2CenterSemiraw_v10Int8",
+        .missing_count = 2,
+    };
 }
-fn noSendModel(_: []const u8) void {}
+fn noSendModel(_: []const u8, _: bool) void {}
+fn noTransferOf(host: []const u8, stem: []const u8, pull: bool) ?config_view.CellTransfer {
+    const h = noHostSync(host);
+    if (h.running and h.pull == pull and std.mem.eql(u8, h.sending, stem)) return .{ .queued = false, .fraction = h.fraction };
+    // attic's queue: the file behind the one it is being sent.
+    if (!pull and std.mem.eql(u8, host, "attic") and std.mem.eql(u8, stem, "Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S")) return .{ .queued = true, .fraction = 0 };
+    return null;
+}
 fn noSendPath(_: []const u8, _: []const u8) void {}
 fn noPullPath(_: []const u8, _: []const u8, _: []const u8) void {}
 fn noTryHost(_: *const config.HostEntry) void {}
@@ -1120,6 +1143,7 @@ fn settingsFrame() void {
         .hostStatus = noHostStatus,
         .hostSync = noHostSync,
         .sendModel = noSendModel,
+        .transferOf = noTransferOf,
         .sendPath = noSendPath,
         .pullPath = noPullPath,
         .tryHost = noTryHost,

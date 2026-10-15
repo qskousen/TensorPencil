@@ -35,6 +35,7 @@
 //! - **The model's `t` is `1 - sigma`**, not the sigma.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const lora_mod = @import("lora.zig");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
@@ -507,6 +508,140 @@ pub fn padCanvas(
     return out;
 }
 
+// --- host halves of the device passes (`sensenova_dev.zig`) -----------------
+
+/// The 16x16 patch embedder's input rows `[gh*gw][patch*patch*c]`, gathered from the
+/// padded planar canvas `xp` `[c][ph][pw]`. Caller frees.
+pub fn patchRows(gpa: std.mem.Allocator, cfg: Config, xp: []const f32, ph: usize, pw: usize) ![]f32 {
+    const ch = latent_channels;
+    const gh = ph / cfg.patch;
+    const gw = pw / cfg.patch;
+    const plen = cfg.patch * cfg.patch * ch;
+    const patch = try gpa.alloc(f32, gh * gw * plen);
+    for (0..gh) |cy| {
+        for (0..gw) |cx| {
+            const dst = patch[(cy * gw + cx) * plen ..][0..plen];
+            for (0..cfg.patch) |dy| {
+                for (0..cfg.patch) |dx| {
+                    const sy = cy * cfg.patch + dy;
+                    const sx = cx * cfg.patch + dx;
+                    for (0..ch) |c| dst[(dy * cfg.patch + dx) * ch + c] = xp[c * ph * pw + sy * pw + sx];
+                }
+            }
+        }
+    }
+    return patch;
+}
+
+/// The head's channel-last x0 prediction `rgb` `[ph][pw][c]` to the planar velocity
+/// `out` `[c][h][w]`, cropped back from the padded canvas.
+pub fn velocityFromRows(cfg: Config, out: []f32, xp: []const f32, rgb: []const f32, t: f32, h: usize, w: usize, ph: usize, pw: usize) void {
+    const ch = latent_channels;
+    const denom = @max(1.0 - t, cfg.velocity_eps);
+    for (0..ch) |c| {
+        const src = xp[c * ph * pw ..];
+        const dst = out[c * h * w ..];
+        for (0..h) |y| {
+            for (0..w) |x| dst[y * w + x] = (src[y * pw + x] - rgb[(y * pw + x) * ch + c]) / denom;
+        }
+    }
+}
+
+/// A rope table flattened as `cos` then `sin`, the layout the device rope kernels read
+/// with `sin_off = rows * half`. Rotate-half over `span`, or with `interleaved` the
+/// vision embedder's pairwise form over `span` channels. Caller frees `data`.
+pub const FlatRope = struct {
+    data: []f32,
+    half: usize,
+    sin_off: usize,
+
+    pub fn init(gpa: std.mem.Allocator, rows: usize, span: usize, theta: f64, interleaved: bool) !FlatRope {
+        var f = if (interleaved) blk: {
+            const pos = try gpa.alloc(f32, rows);
+            defer gpa.free(pos);
+            for (pos, 0..) |*p, i| p.* = @floatFromInt(i);
+            break :blk try ops.rope.fluxFreqs(gpa, pos, &.{span}, theta);
+        } else try ops.rope.rotateHalfFreqs(gpa, rows, span, theta);
+        defer f.deinit(gpa);
+        const data = try gpa.alloc(f32, 2 * rows * f.half);
+        @memcpy(data[0 .. rows * f.half], f.cos[0 .. rows * f.half]);
+        @memcpy(data[rows * f.half ..], f.sin[0 .. rows * f.half]);
+        return .{ .data = data, .half = f.half, .sin_off = rows * f.half };
+    }
+};
+
+/// The u32 positions of the generation pass, one allocation: the three trunk axes per
+/// canvas token (every token at t = `time`, then its row and column), then the vision
+/// embedder's column and row per patch cell.
+pub const CanvasPositions = struct {
+    buf: []u32,
+    n_img: usize,
+    cells: usize,
+
+    pub const Axis = enum { t, h, w, vis_x, vis_y };
+
+    pub fn init(gpa: std.mem.Allocator, time: u32, tw: usize, n_img: usize, gw: usize, cells: usize) !CanvasPositions {
+        const buf = try gpa.alloc(u32, 3 * n_img + 2 * cells);
+        const self: CanvasPositions = .{ .buf = buf, .n_img = n_img, .cells = cells };
+        for (0..n_img) |i| {
+            self.axisMut(.t)[i] = time;
+            self.axisMut(.h)[i] = @intCast(i / tw);
+            self.axisMut(.w)[i] = @intCast(i % tw);
+        }
+        for (0..cells) |i| {
+            self.axisMut(.vis_x)[i] = @intCast(i % gw);
+            self.axisMut(.vis_y)[i] = @intCast(i / gw);
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *CanvasPositions, gpa: std.mem.Allocator) void {
+        gpa.free(self.buf);
+        self.* = undefined;
+    }
+
+    pub fn axis(self: CanvasPositions, a: Axis) []const u32 {
+        return self.axisMut(a);
+    }
+
+    fn axisMut(self: CanvasPositions, a: Axis) []u32 {
+        const n = self.n_img;
+        return switch (a) {
+            .t => self.buf[0..n],
+            .h => self.buf[n..][0..n],
+            .w => self.buf[2 * n ..][0..n],
+            .vis_x => self.buf[3 * n ..][0..self.cells],
+            .vis_y => self.buf[3 * n + self.cells ..][0..self.cells],
+        };
+    }
+};
+
+/// A prompt's three position axes as u32 `[t | h | w]`, each `seq` long, and the
+/// largest position each reaches, which sizes its rope table (1 row for the hw axes of
+/// a prompt with no pictures in it). Caller frees `pos`.
+pub const PromptPositions = struct {
+    pos: []u32,
+    max: [3]usize,
+
+    pub fn init(gpa: std.mem.Allocator, layout: PromptLayout) !PromptPositions {
+        const seq = layout.ids.len;
+        const pos = try gpa.alloc(u32, 3 * seq);
+        var max = [3]usize{ 0, 0, 0 };
+        for ([3][]const usize{ layout.pos_t, layout.pos_h, layout.pos_w }, 0..) |src, a| {
+            for (src, 0..) |v, i| {
+                pos[a * seq + i] = @intCast(v);
+                max[a] = @max(max[a], v);
+            }
+        }
+        return .{ .pos = pos, .max = max };
+    }
+
+    pub fn axis(self: PromptPositions, a: usize) []const u32 {
+        const seq = self.pos.len / 3;
+        return self.pos[a * seq ..][0..seq];
+    }
+};
+
 /// DIAGNOSTIC: stage magnitudes on the CPU path (`TP_SENSENOVA_TRACE`).
 ///
 /// The device twin prints the same lines for the same stages, so a device
@@ -616,6 +751,7 @@ pub const Prefix = struct {
 
 pub const Model = struct {
     arena: std.heap.ArenaAllocator,
+
     cfg: Config,
 
     embed: Weight,
@@ -648,6 +784,23 @@ pub const Model = struct {
     /// looks each weight up as it multiplies it. The turbo LoRAs patch only the
     /// `_mot_gen` copy, but nothing here assumes that.
     lora: ?*const lora_mod.Stack = null,
+
+    /// Repack every checkpoint-order conv to f32 into the model arena, for the Vulkan
+    /// arm, which reads only that and keys it on host addresses. Idempotent.
+    pub fn repackConvs(self: *Model) !void {
+        var convs: [6]?*Conv = .{ &self.vision_gen.patch, &self.vision_gen.dense, &self.fm1, &self.fm2, null, null };
+        if (self.vision) |*v| {
+            convs[4] = &v.patch;
+            convs[5] = &v.dense;
+        }
+        const a = self.arena.allocator();
+        for (convs) |maybe| if (maybe) |cv| if (cv.w == .torch) {
+            // A local first: assigning the union literal in place would switch `cv.w`
+            // before `materialize` reads it.
+            const krsc = try cv.materialize(a);
+            cv.w = .{ .krsc = krsc };
+        };
+    }
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore, cfg: Config) !Model {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1121,7 +1274,7 @@ pub const Model = struct {
         w: Weight,
     ) !void {
         try ops.matmul.matmul(io, gpa, y, x, m, w, null);
-        if (self.lora) |stack| try stack.applyHost(io, gpa, y, w.rows, x, m, w);
+        if (self.lora) |stack| try stack.applyHost(io, gpa, y, w.rows, x, m, w, null);
     }
 
     fn attnBlock(
@@ -1441,10 +1594,8 @@ const Loader = struct {
             std.log.err("sensenova: {s} has {d} elements, expected {d}", .{ nm, view.info.elemCount(), co * ci * k * k });
             return error.ShapeMismatch;
         }
-        const torch_w = try view.toF32Alloc(l.alloc);
-        defer l.alloc.free(torch_w);
         return .{
-            .w = try ops.conv.packWeight(l.alloc, torch_w, co, ci, k),
+            .w = try quant_weight.convWeights(l.alloc, view, co, ci, k),
             .b = try l.vec(prefix ++ ".bias", .{}, co),
             .co = co,
             .ci = ci,
@@ -1919,7 +2070,7 @@ test "the unconditional prompt is not the conditional one with an empty turn" {
 }
 
 const edit_ref_path = "src/models/assets/sensenova_edit_ref.safetensors";
-const u15_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors";
+const u15_ckpt = build_options.model_root ++ "/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors";
 
 test "the edit conditioning matches ComfyUI on a real checkpoint" {
     // Gated and real-weight, because the width-reduced fixture cannot carry this:

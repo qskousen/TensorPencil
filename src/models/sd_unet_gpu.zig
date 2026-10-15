@@ -1,8 +1,8 @@
 //! GPU-resident SD1.5 / SDXL UNet forward (Vulkan), mirroring `sd_unet.forward` with
 //! everything from the latent upload to the eps download on the device.
 //!
-//! Same mapping `vae_gpu` uses for the Wan decoder: activations stay tight channel-last
-//! `[h*w][c]` f32, a 3x3 convolution is a banded `im2col_sd` plus a GEMM, and a 1x1
+//! The VAE decoders share this mapping (`sd_vae_gpu`): activations stay tight channel-last
+//! `[h*w][c]`, a 3x3 convolution is a banded `im2col_sd` plus a GEMM, and a 1x1
 //! convolution or `nn.Linear` is that GEMM with no patch step. What a UNet adds over a
 //! VAE decoder is GroupNorm over 32 channel groups, the SpatialTransformer, and the LIFO
 //! skip stack.
@@ -15,28 +15,37 @@
 //! bias on the host rather than added in a pass of its own. A conv bias is already a
 //! per-channel constant over positions, which is exactly what the projection is, so this
 //! is exact and it removes one read-modify-write of the full activation per ResBlock.
-//! The folded vector changes every forward, hence `opMatmulCoopF16WDev` and one packed
+//! The folded vector changes every forward, hence `conv_gpu.conv2d`'s `bias_dev` and one packed
 //! device buffer instead of the pointer-cached `smallBuffer` path.
 //!
 //! Attention head widths are handled in `selfAttn`. Numerics are f16 tensor cores for
 //! the GEMMs and f32 everywhere else, so this is NOT bit-identical to
 //! `sd_unet.forward`; the CPU path remains the reference.
+//!
+//! The convolution and transformer activations, skips included, are STORED at
+//! `Workspace.act` (`streamDt`); the attention operands stay f32 whatever it is.
 
 const std = @import("std");
 const sd_unet = @import("sd_unet.zig");
+const conv_gpu = @import("conv_gpu.zig");
+const dev = @import("sd_unet_dev.zig");
+const lin_gpu = @import("lin_gpu.zig");
+const lora_gpu = @import("lora_gpu.zig");
+const lora_mod = @import("lora.zig");
 const ops = @import("tp_ops");
 const gpu_context = @import("tp_gpu").context;
 
+const File = @This();
 const Context = gpu_context.Context;
+const dual_table = @import("tp_gpu").dual_table;
 const DeviceBuffer = gpu_context.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 const Conv2d = ops.conv.Conv2d;
 const Config = sd_unet.Config;
+const Dt = gpu_context.Dt;
 
 const none: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 
-/// Cap on the im2col patch band (bytes); bands iterate over output rows.
-const patch_band_bytes: usize = 256 << 20;
 
 /// Column groups per GroupNorm statistics pass. The reduction is over
 /// `positions * channels/32` values per group, so 256 chunks keeps every thread
@@ -56,14 +65,30 @@ const nchunks: u32 = 32;
 /// a single batch.
 const scores_scratch_bytes: usize = 512 << 20;
 
-/// Convolutions at least this wide go to the f16 tensor-core GEMM; below it the
-/// f32 register-tile GEMM wins, because padding `co` out to the 128-wide
-/// cooperative tile would waste more than the tensor cores return. Same
-/// threshold `vae_gpu` measured.
-const coop_min_co: usize = 96;
 
-/// How `im2col_sd` samples its source (must match the kernel's `f0` encoding).
-pub const SampleMode = enum(u2) { stride1 = 0, upsample2x = 1, stride2 = 2 };
+pub const SampleMode = @import("sd_unet_dev.zig").SampleMode;
+
+/// The dtype this UNet's activations are stored at on this device: `UNet.act`, else
+/// f16 where `Config.act_f16` says, else f32.
+pub fn streamDt(ctx: *const Context, u: *const sd_unet.UNet) Dt {
+    return streamDtFor(ctx, if (u.act) |a| switch (a) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => .f32,
+    } else if (u.cfg.act_f16) .f16 else .f32);
+}
+
+/// What the stream would run as if `want` were asked for: a 16-bit one needs the
+/// cooperative GEMM of that width, which every 16-bit convolution takes, and
+/// `conv_gpu.conv2d` asks for the f16 one either way. An activation capture runs f32, as
+/// on cuda (`sd_unet_cuda.streamDt` says why).
+pub fn streamDtFor(ctx: *const Context, want: Dt) Dt {
+    if (ctx.pipe_coop_f16w == .null_handle or ops.matmul.probe != null) return .f32;
+    return switch (want) {
+        .f32, .f16 => want,
+        .bf16 => if (ctx.pipe_coop_bf16w != .null_handle) .bf16 else .f32,
+    };
+}
 
 // --- per-conditioning session ----------------------------------------------
 
@@ -108,10 +133,9 @@ pub const Session = struct {
     /// the other three), and the checkpoint stores them as two tensors.
     norm_cat: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
 
-    /// A zero vector long enough to serve as "no bias" for the attention and
-    /// projection GEMMs, whose weights carry none. Stable, so the Context's
-    /// small-buffer cache uploads it once.
-    zeros: []f32,
+    /// Every linear's dispatch, and what it decided for this checkpoint.
+    lin: lin_gpu.Lin,
+    lin_plan: lin_gpu.Plan,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -137,8 +161,6 @@ pub const Session = struct {
             }
         }
 
-        var max_ch: usize = cfg.model_channels;
-        for (cfg.channel_mult) |m| max_ch = @max(max_ch, cfg.model_channels * m);
 
         // Every allocation happens BEFORE the struct literal. `.arena = arena`
         // copies the arena's state as it stands, so anything a *later* field
@@ -148,10 +170,12 @@ pub const Session = struct {
         const emb = try alloc.alloc(f32, cfg.time_embed_dim);
         const mlp_hidden = try alloc.alloc(f32, cfg.time_embed_dim);
         const mlp_scratch = try alloc.alloc(f32, cfg.time_embed_dim);
-        // Widest "no bias" any GEMM here needs: a feed-forward projection emits
-        // 8x the level's channels.
-        const zeros = try alloc.alloc(f32, max_ch * 8);
-        @memset(zeros, 0);
+        var l = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.maxRows(u.device_lins), 0, 0);
+        errdefer l.deinit();
+        var lp = try lin_gpu.plan(ctx, u.device_lins, .{ .blockq = .auto }, "sd_unet_gpu");
+        // ComfyUI's fp16 UNet: every dense weight on the f16 tensor cores.
+        lp.dense = .f16;
+        lp.lora = u.lora;
 
         var self: Session = .{
             .arena = arena,
@@ -162,7 +186,8 @@ pub const Session = struct {
             .emb = emb,
             .mlp_hidden = mlp_hidden,
             .mlp_scratch = mlp_scratch,
-            .zeros = zeros,
+            .lin = l,
+            .lin_plan = lp,
         };
 
         try ctx.ensureDeviceBuffer(&self.ctx_d, context.len * 4);
@@ -174,6 +199,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, ctx: *Context) void {
         ctx.tensorDestroy(&self.ctx_d);
         ctx.tensorDestroy(&self.bias_d);
+        self.lin.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -238,6 +264,8 @@ pub const Workspace = struct {
     /// Latent in, eps out.
     xin: DeviceBuffer = none,
     eps: DeviceBuffer = none,
+    /// The storage of `cur`, `alt`, `t1`, `t2`, `stream`, `nb`, `ff`, `gated` and the skips.
+    act: Dt = .f32,
 
     gpa: std.mem.Allocator,
 
@@ -252,6 +280,7 @@ pub const Workspace = struct {
         const cfg = u.cfg;
         var self: Workspace = .{
             .gpa = gpa,
+            .act = streamDt(ctx, u),
             .skips = try gpa.alloc(DeviceBuffer, u.input_stages.len + 1),
             .skip_ch = try gpa.alloc(usize, u.input_stages.len + 1),
             .skip_hw = try gpa.alloc([2]usize, u.input_stages.len + 1),
@@ -298,11 +327,12 @@ pub const Workspace = struct {
         // (SD1.5's fourth level).
         sizeAttn(cfg, h * w, cfg.model_channels * cfg.channel_mult[cfg.levels() - 1], ctx_seq, &attn, &ff, &gated, &pad_f32, &pad_f16, &scores, &part, &md);
 
+        const ew = self.act.bytes();
         inline for (.{ "cur", "alt", "t1", "t2" }) |f| {
-            try ctx.ensureDeviceBuffer(&@field(self, f), act * 4);
+            try ctx.ensureDeviceBuffer(&@field(self, f), act * ew);
         }
-        try ctx.ensureDeviceBuffer(&self.stream, attn * 4);
-        try ctx.ensureDeviceBuffer(&self.nb, attn * 4);
+        try ctx.ensureDeviceBuffer(&self.stream, attn * ew);
+        try ctx.ensureDeviceBuffer(&self.nb, attn * ew);
         inline for (.{ "q", "k", "v", "ao" }) |f| {
             try ctx.ensureDeviceBuffer(&@field(self, f), attn * 4);
         }
@@ -310,8 +340,10 @@ pub const Workspace = struct {
             try ctx.ensureDeviceBuffer(&@field(self, f), pad_f16);
         }
         try ctx.ensureDeviceBuffer(&self.apad, pad_f32);
-        try ctx.ensureDeviceBuffer(&self.ff, ff * 4);
-        try ctx.ensureDeviceBuffer(&self.gated, gated * 4);
+        try ctx.ensureDeviceBuffer(&self.ff, ff * ew);
+        try ctx.ensureDeviceBuffer(&self.gated, gated * ew);
+        inline for (.{ "cur", "alt", "t1", "t2", "stream", "nb", "ff", "gated" }) |f| @field(self, f).dt = self.act;
+        for (self.skips) |*sk| sk.dt = self.act;
         try ctx.ensureDeviceBuffer(&self.s, scores);
         try ctx.ensureDeviceBuffer(&self.part, part);
         try ctx.ensureDeviceBuffer(&self.md, md);
@@ -357,12 +389,12 @@ pub const Workspace = struct {
     }
 
     /// Bytes the im2col band needs for a 3x3 convolution of this shape. A pure
-    /// function of it, so `init` and `convInto` cannot disagree about the size,
+    /// function of it, so `init` and `conv_gpu.conv2d` cannot disagree about the size,
     /// which matters because growing the band inside a recording batch would free
     /// memory that already recorded dispatches reference.
     fn sizePatch(n_out: usize, ci: usize) usize {
         const patch_len = 9 * ci;
-        return convBand(n_out, patch_len) * patch_len * 4;
+        return conv_gpu.convBand(n_out, patch_len) * patch_len * 4;
     }
 
     pub fn deinit(self: *Workspace, ctx: *Context) void {
@@ -379,9 +411,6 @@ pub const Workspace = struct {
 
 // --- forward ----------------------------------------------------------------
 
-/// eps = UNet(x, t, context, y), all on the device. `x` and `out` are
-/// channel-last `[lat_h*lat_w][channels]` host buffers, the layout
-/// `Denoiser.predictSd` transposes into.
 pub fn forward(
     u: *const sd_unet.UNet,
     ctx: *Context,
@@ -401,279 +430,118 @@ pub fn forward(
     std.debug.assert(out.len == x.len);
     if ((cfg.adm_channels != null) != (sess.adm != null)) return error.MissingAdmConditioning;
 
-    try embedAndFoldBiases(u, ctx, sess, io, gpa, timestep);
+    // Each ResBlock's timestep projection is folded into its first convolution's bias.
+    try sd_unet.timeProjections(u, io, gpa, timestep, sess.adm, sess.bias_host, sess.bias_off, sess.emb, sess.mlp_hidden, sess.mlp_scratch);
+    var it = sd_unet.ResBlockIter.init(u);
+    var bi: usize = 0;
+    while (it.next()) |rb| : (bi += 1) {
+        for (sess.bias_host[sess.bias_off[bi]..][0..rb.out_ch], rb.in_conv.b.?) |*d, cb| d.* += cb;
+    }
+    if (sess.bias_host.len > 0) try ctx.tensorUpload(sess.bias_d, std.mem.sliceAsBytes(sess.bias_host));
     try ctx.tensorUpload(ws.xin, std.mem.sliceAsBytes(x));
 
     try ctx.beginBatch();
     var batched = true;
     errdefer if (batched) ctx.endBatch() catch {};
-
-    var h = lat_h;
-    var w = lat_w;
-    var ch = cfg.model_channels;
-    // Counts ResBlocks in the order `ResBlockIter` yields them, which is the order
-    // below: the input stages, then the two middle blocks, then the output stages.
-    var rb_ord: usize = 0;
-
-    // --- stem ---
-    try conv(ctx, ws, &ws.cur, &ws.xin, h, w, u.stem, .stride1, null, null);
-    try setSkip(ctx, ws, 0, &ws.cur, h * w * ch, ch, h, w);
-
-    // --- input side ---
-    for (u.input_stages, 0..) |stage, si| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (stage.res) |rb| {
-            try applyRes(ctx, sess, ws, rb, rb_ord, &ws.cur, &ws.alt, h, w, cfg);
-            rb_ord += 1;
-            std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-            ch = rb.out_ch;
-        }
-        if (stage.attn) |st| {
-            try applySpatial(ctx, sess, ws, st, h, w, cfg);
-        }
-        if (stage.sample_kind == .down) {
-            const oh = (h + 1) / 2;
-            const ow = (w + 1) / 2;
-            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .stride2, null, null);
-            std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-            h = oh;
-            w = ow;
-        }
-        try setSkip(ctx, ws, si + 1, &ws.cur, h * w * ch, ch, h, w);
-    }
-
-    // --- middle ---
-    try applyRes(ctx, sess, ws, u.mid_res1, rb_ord, &ws.cur, &ws.alt, h, w, cfg);
-    rb_ord += 1;
-    std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-    ch = u.mid_res1.out_ch;
-    try applySpatial(ctx, sess, ws, u.mid_attn, h, w, cfg);
-    try applyRes(ctx, sess, ws, u.mid_res2, rb_ord, &ws.cur, &ws.alt, h, w, cfg);
-    rb_ord += 1;
-    std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-    ch = u.mid_res2.out_ch;
-
-    // --- output side ---
-    var skip_top = u.input_stages.len + 1;
-    for (u.output_stages) |stage| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        skip_top -= 1;
-        const skip_ch = ws.skip_ch[skip_top];
-        {
-            // Concatenate along channels into `alt`: current first, then the
-            // popped skip. Two strided copies rather than one in-place widening
-            // the source and destination are distinct buffers here, so unlike
-            // the CPU path there is nothing to overwrite.
-            const total = ch + skip_ch;
-            ctx.independent(2);
-            try ctx.opElt(.concat_ch, ws.cur, ws.alt, null, null, .{
-                .u0 = @intCast(h * w * ch),
-                .u1 = @intCast(ch),
-                .u2 = @intCast(total),
-                .u3 = 0,
-            }, h * w * ch, 1, 1);
-            try ctx.opElt(.concat_ch, ws.skips[skip_top], ws.alt, null, null, .{
-                .u0 = @intCast(h * w * skip_ch),
-                .u1 = @intCast(skip_ch),
-                .u2 = @intCast(total),
-                .u3 = @intCast(ch),
-            }, h * w * skip_ch, 1, 1);
-            std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-            ch = total;
-        }
-        const rb = stage.res.?;
-        try applyRes(ctx, sess, ws, rb, rb_ord, &ws.cur, &ws.alt, h, w, cfg);
-        rb_ord += 1;
-        std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-        ch = rb.out_ch;
-        if (stage.attn) |st| {
-            try applySpatial(ctx, sess, ws, st, h, w, cfg);
-        }
-        if (stage.sample_kind == .up) {
-            // LDM's `Upsample`: nearest up then a 3x3 convolution, fused into the
-            // patch gather so the resampled tensor never exists. The target is the grid
-            // the NEXT skip was stored at, not twice this one: the encoder halved
-            // rounding up, so `2 * h` overshoots an odd dimension by a row. The last
-            // output stage is the top level and never upsamples, so there is always a
-            // shallower skip to aim at.
-            std.debug.assert(skip_top > 0);
-            const target = ws.skip_hw[skip_top - 1];
-            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .upsample2x, target, null);
-            std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-            h = target[0];
-            w = target[1];
-        }
-    }
-
-    // --- head ---
-    try groupNorm(ctx, ws, &ws.t1, &ws.cur, h * w, ch, try sess.normCat(u.out_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, &ws.eps, &ws.t1, h, w, u.out_conv, .stride1, null, null);
-
+    try dev.body(Dev{ .u = u, .ctx = ctx, .sess = sess, .ws = ws }, lat_h, lat_w, cancel);
     batched = false;
     try ctx.endBatch();
     try ctx.tensorDownload(ws.eps, std.mem.sliceAsBytes(out));
 }
 
-/// The time embedding (plus SDXL's label embedding), and every ResBlock's
-/// `emb_layers` projection folded into its first convolution's bias. All on the
-/// host: the widest of these is a 1280 x 1280 GEMV, and the whole set is a few
-/// tens of MFLOP against the forward's hundreds of GFLOP.
-fn embedAndFoldBiases(
+/// `sd_unet_dev`'s ops on this backend.
+const Dev = struct {
     u: *const sd_unet.UNet,
     ctx: *Context,
     sess: *Session,
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    timestep: f32,
-) !void {
-    const cfg = u.cfg;
-    const sin = try gpa.alloc(f32, cfg.model_channels);
-    defer gpa.free(sin);
-    sd_unet.timestepEmbedding(sin, timestep);
-    try ops.matmul.matmul(io, gpa, sess.mlp_hidden, sin, 1, u.time_1.w, u.time_1.b);
-    ops.act.silu(sess.mlp_hidden);
-    try ops.matmul.matmul(io, gpa, sess.emb, sess.mlp_hidden, 1, u.time_2.w, u.time_2.b);
-
-    // `emb = time_embed(t) + label_emb(y)`, a sum, not a concatenation, and the
-    // same shape either way, so a missing term would be invisible downstream.
-    if (sess.adm) |y| {
-        try ops.matmul.matmul(io, gpa, sess.mlp_hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
-        ops.act.silu(sess.mlp_hidden);
-        try ops.matmul.matmul(io, gpa, sess.mlp_scratch, sess.mlp_hidden, 1, u.label_2.?.w, u.label_2.?.b);
-        for (sess.emb, sess.mlp_scratch) |*e, v| e.* += v;
-    }
-
-    // emb_layers is [SiLU, Linear] over the SHARED embedding, so the silu is
-    // computed once here rather than per block.
-    @memcpy(sess.mlp_hidden, sess.emb);
-    ops.act.silu(sess.mlp_hidden);
-    var it = sd_unet.ResBlockIter.init(u);
-    var bi: usize = 0;
-    while (it.next()) |rb| : (bi += 1) {
-        const dst = sess.bias_host[sess.bias_off[bi]..][0..rb.out_ch];
-        try ops.matmul.matmul(io, gpa, dst, sess.mlp_hidden, 1, rb.emb.w, rb.emb.b);
-        for (dst, rb.in_conv.b.?) |*d, cb| d.* += cb;
-    }
-    if (sess.bias_host.len > 0) {
-        try ctx.tensorUpload(sess.bias_d, std.mem.sliceAsBytes(sess.bias_host));
-    }
-}
-
-fn setSkip(ctx: *Context, ws: *Workspace, i: usize, src: *const DeviceBuffer, elems: usize, ch: usize, h: usize, w: usize) !void {
-    try ctx.ensureDeviceBuffer(&ws.skips[i], elems * 4);
-    ws.skip_ch[i] = ch;
-    ws.skip_hw[i] = .{ h, w };
-    try ctx.opElt(.copy, src.*, ws.skips[i], null, null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
-}
-
-/// A ResBlock, result guaranteed in `dst` (which the helper may swap with its
-/// own scratch to get there, cheaper than a copy, and `t2` is scratch either
-/// way). `src` must survive to the residual add, so the first norm is
-/// out-of-place.
-fn applyRes(
-    ctx: *Context,
-    sess: *Session,
     ws: *Workspace,
-    rb: sd_unet.ResBlock,
-    /// The block's ordinal in `sd_unet.ResBlockIter`'s order, which `forward`
-    /// visits them in. See `Session.bias_off`.
-    ordinal: usize,
-    src: *DeviceBuffer,
-    dst: *DeviceBuffer,
-    h: usize,
-    w: usize,
-    cfg: Config,
-) !void {
-    const n = h * w;
-    const bias_off = sess.bias_off[ordinal];
 
-    // in_layers: GroupNorm -> SiLU -> conv3x3, with the timestep projection
-    // riding in on the convolution's bias.
-    try groupNorm(ctx, ws, &ws.t1, src, n, rb.in_ch, try sess.normCat(rb.in_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, dst, &ws.t1, h, w, rb.in_conv, .stride1, null, .{ .buf = sess.bias_d, .off = bias_off });
-
-    // out_layers: GroupNorm -> SiLU -> conv3x3.
-    try groupNorm(ctx, ws, &ws.t1, dst, n, rb.out_ch, try sess.normCat(rb.out_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, &ws.t2, &ws.t1, h, w, rb.out_conv, .stride1, null, null);
-
-    const out_n = n * rb.out_ch;
-    if (rb.skip) |sk| {
-        // `dst` held conv1's output, which out_norm has already consumed.
-        try conv(ctx, ws, dst, src, h, w, sk, .stride1, null, null);
-        try ctx.opElt(.add, dst.*, ws.t2, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
-    } else {
-        try ctx.opElt(.add, ws.t2, src.*, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
-        std.mem.swap(DeviceBuffer, &ws.t2, dst);
+    pub fn groupNorm(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, n: usize, ch: usize, nw: sd_unet.GroupNormW, silu: bool) !void {
+        const cfg = d.u.cfg;
+        try groupNormInto(d.ctx, d.ws.gstat, d.ws.gmi, dst, src, n, ch, try d.sess.normCat(nw), cfg.norm_groups, cfg.norm_eps, silu);
     }
-}
 
-/// A SpatialTransformer, in place on `ws.cur` (it ends in an outer residual add).
-fn applySpatial(
-    ctx: *Context,
-    sess: *Session,
-    ws: *Workspace,
-    st: sd_unet.SpatialTransformer,
-    h: usize,
-    w: usize,
-    cfg: Config,
-) !void {
-    const n = h * w;
-    const ch = st.channels;
-    const heads = cfg.headsAt(ch);
-    const hd = ch / heads;
-    const ctx_seq = sess.ctx_seq;
+    pub fn conv(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, h: usize, w: usize, cv: Conv2d, mode: SampleMode, out_hw: ?[2]usize) !void {
+        try conv_gpu.conv2d(d.ctx, &d.ws.patch, dst, src, h, w, cv, mode, out_hw, null, 1.0);
+        try convLora(d.ctx, d.sess, d.ws, dst, src, h, w, cv, mode, out_hw);
+    }
 
-    // GroupNorm -> proj_in, straight into the transformer's residual stream.
-    try groupNorm(ctx, ws, &ws.nb, &ws.cur, n, ch, try sess.normCat(st.norm), cfg.norm_groups, cfg.norm_eps, false);
-    try applyProj(ctx, ws, sess, &ws.stream, &ws.nb, h, w, st.proj_in);
+    /// The timestep projection rides in on the convolution's bias (`forward` folds it).
+    pub fn resConv(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, h: usize, w: usize, rb: sd_unet.ResBlock, ordinal: usize) !void {
+        try conv_gpu.conv2d(d.ctx, &d.ws.patch, dst, src, h, w, rb.in_conv, .stride1, null, .{ .buf = d.sess.bias_d, .off = d.sess.bias_off[ordinal] }, 1.0);
+        try convLora(d.ctx, d.sess, d.ws, dst, src, h, w, rb.in_conv, .stride1, null);
+    }
 
-    for (st.blocks) |b| {
-        // attn1: self-attention over pixels, no mask.
-        try layerNorm(ctx, &ws.nb, &ws.stream, n, ch, b.norm1, cfg.norm_eps);
-        // NOT `ctx.independent(3)`. These three GEMMs look independent, same
-        // input, three disjoint outputs, but a coop GEMM is three dispatches
-        // sharing the Context's `x_h16` / `y_pad` scratch, so removing the
-        // barriers would both let them clobber each other's scratch AND (since
-        // the group counts dispatches, not calls) drop the barriers *inside* the
-        // first one.
-        try gemm(ctx, sess, &ws.q, 0, &ws.nb, n, b.attn1.q, null);
-        try gemm(ctx, sess, &ws.k, 0, &ws.nb, n, b.attn1.k, null);
-        try gemm(ctx, sess, &ws.v, 0, &ws.nb, n, b.attn1.v, null);
-        try selfAttn(ctx, ws, n, heads, hd);
-        try gemm(ctx, sess, &ws.nb, 0, &ws.ao, n, b.attn1.out.w, b.attn1.out.b);
-        try ctx.opElt(.add, ws.stream, ws.nb, null, null, .{ .u0 = @intCast(n * ch) }, n * ch, 1, 1);
+    pub fn add(d: Dev, a: DeviceBuffer, b: DeviceBuffer, n: usize) !void {
+        std.debug.assert(a.dt == b.dt);
+        try d.ctx.opElt(gpu_context.eltAt("add", a.dt), a, b, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
 
-        // attn2: cross-attention onto the text conditioning. The keys and values
-        // come from the context, so they are `ctx_seq` rows, not `n`.
-        try layerNorm(ctx, &ws.nb, &ws.stream, n, ch, b.norm2, cfg.norm_eps);
-        try gemm(ctx, sess, &ws.q, 0, &ws.nb, n, b.attn2.q, null);
-        try gemm(ctx, sess, &ws.k, 0, &sess.ctx_d, ctx_seq, b.attn2.k, null);
-        try gemm(ctx, sess, &ws.v, 0, &sess.ctx_d, ctx_seq, b.attn2.v, null);
-        try ctx.opElt(.attn_cross, ws.q, ws.k, ws.v, ws.ao, .{
+    pub fn concatSkip(d: Dev, dst: DeviceBuffer, a: DeviceBuffer, a_ch: usize, b: DeviceBuffer, b_ch: usize, n: usize) !void {
+        std.debug.assert(a.dt == dst.dt and b.dt == dst.dt);
+        const total = a_ch + b_ch;
+        const op = gpu_context.eltAt("concat_ch", dst.dt);
+        d.ctx.independent(2);
+        try d.ctx.opElt(op, a, dst, null, null, .{ .u0 = @intCast(n * a_ch), .u1 = @intCast(a_ch), .u2 = @intCast(total), .u3 = 0 }, n * a_ch, 1, 1);
+        try d.ctx.opElt(op, b, dst, null, null, .{ .u0 = @intCast(n * b_ch), .u1 = @intCast(b_ch), .u2 = @intCast(total), .u3 = @intCast(a_ch) }, n * b_ch, 1, 1);
+    }
+
+    pub fn setSkip(d: Dev, i: usize, src: *const DeviceBuffer, elems: usize, ch: usize, h: usize, w: usize) !void {
+        const ws = d.ws;
+        std.debug.assert(src.dt == ws.act and ws.skips[i].dt == ws.act);
+        try d.ctx.ensureDeviceBuffer(&ws.skips[i], elems * ws.act.bytes());
+        ws.skip_ch[i] = ch;
+        ws.skip_hw[i] = .{ h, w };
+        try d.ctx.opElt(gpu_context.eltAt("copy", ws.act), src.*, ws.skips[i], null, null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
+    }
+
+    pub fn layerNorm(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, n: usize, ch: usize, nw: sd_unet.LayerNormW) !void {
+        const ctx = d.ctx;
+        std.debug.assert(dst.dt == src.dt);
+        const wbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(nw.w)), .mem = .null_handle, .size = 0 };
+        const bbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(nw.b)), .mem = .null_handle, .size = 0 };
+        try ctx.opElt(gpu_context.eltAt("layernorm", src.dt), src.*, dst.*, wbuf, bbuf, .{ .u0 = @intCast(n), .u1 = @intCast(ch), .f0 = d.u.cfg.norm_eps }, n, 1, 1);
+    }
+
+    /// One linear through the dispatcher; `bias` null means the weight carries none.
+    pub fn gemm(d: Dev, y: *DeviceBuffer, x: *const DeviceBuffer, m: usize, wt: Weight, bias: ?[]const f32) !void {
+        const g = try d.sess.lin.prep(d.sess.lin_plan, x.*, m, wt.cols, &.{wt});
+        try d.sess.lin.gemm(d.sess.lin_plan, g, y.*, wt, .{ .bias = bias });
+    }
+
+    /// One prep per linear, NOT `ctx.independent`: a coop GEMM is three dispatches
+    /// sharing the Context's `x_h16` / `y_pad` scratch, and the group counts
+    /// dispatches, so it would both clobber that scratch and drop the barriers inside
+    /// the first GEMM.
+    pub fn gemms(d: Dev, x: *const DeviceBuffer, m: usize, ys: []const *DeviceBuffer, wts: []const Weight) !void {
+        std.debug.assert(ys.len == wts.len);
+        for (ys, wts) |y, wt| try d.gemm(y, x, m, wt, null);
+    }
+
+    pub fn crossKv(d: Dev, wk: Weight, wv: Weight) !void {
+        try d.gemms(&d.sess.ctx_d, d.sess.ctx_seq, &.{ &d.ws.k, &d.ws.v }, &.{ wk, wv });
+    }
+
+    pub fn selfAttn(d: Dev, n: usize, heads: usize, hd: usize) !void {
+        try File.selfAttn(d.ctx, d.ws, n, heads, hd);
+    }
+
+    pub fn crossAttn(d: Dev, n: usize, heads: usize, hd: usize) !void {
+        const ws = d.ws;
+        try d.ctx.opElt(.attn_cross, ws.q, ws.k, ws.v, ws.ao, .{
             .u0 = @intCast(n),
             .u1 = @intCast(heads),
             .u2 = @intCast(hd),
-            .u3 = @intCast(ctx_seq),
+            .u3 = @intCast(d.sess.ctx_seq),
             .f0 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
         }, n * heads, 1, 1);
-        try gemm(ctx, sess, &ws.nb, 0, &ws.ao, n, b.attn2.out.w, b.attn2.out.b);
-        try ctx.opElt(.add, ws.stream, ws.nb, null, null, .{ .u0 = @intCast(n * ch) }, n * ch, 1, 1);
-
-        // ff: GEGLU. `proj` emits [value | gate] per row, in that order, and the
-        // gate takes the ERF gelu (see the `geglu` kernel).
-        try layerNorm(ctx, &ws.nb, &ws.stream, n, ch, b.norm3, cfg.norm_eps);
-        try gemm(ctx, sess, &ws.ff, 0, &ws.nb, n, b.ff_proj.w, b.ff_proj.b);
-        try ctx.opElt(.geglu, ws.ff, ws.gated, null, null, .{
-            .u0 = @intCast(n * b.inner),
-            .u1 = @intCast(b.inner),
-        }, n * b.inner, 1, 1);
-        try gemm(ctx, sess, &ws.nb, 0, &ws.gated, n, b.ff_out.w, b.ff_out.b);
-        try ctx.opElt(.add, ws.stream, ws.nb, null, null, .{ .u0 = @intCast(n * ch) }, n * ch, 1, 1);
     }
 
-    try applyProj(ctx, ws, sess, &ws.nb, &ws.stream, h, w, st.proj_out);
-    try ctx.opElt(.add, ws.cur, ws.nb, null, null, .{ .u0 = @intCast(n * ch) }, n * ch, 1, 1);
-}
+    pub fn geglu(d: Dev, src: DeviceBuffer, dst: DeviceBuffer, n: usize, inner: usize) !void {
+        std.debug.assert(src.dt == dst.dt);
+        try d.ctx.opElt(gpu_context.eltAt("geglu", src.dt), src, dst, null, null, .{ .u0 = @intCast(n * inner), .u1 = @intCast(inner) }, n * inner, 1, 1);
+    }
+};
 
 /// Self-attention over the latent positions.
 ///
@@ -786,60 +654,7 @@ fn selfAttn(ctx: *Context, ws: *Workspace, n: usize, heads: usize, hd: usize) !v
     }, n * heads * hd, 1, 1);
 }
 
-/// A SpatialTransformer's in/out projection, whichever rank the checkpoint stored
-/// it at, SD1.5 a 1x1 convolution, SDXL an `nn.Linear`. On channel-last
-/// activations both are the same GEMM over pixels.
-fn applyProj(
-    ctx: *Context,
-    ws: *Workspace,
-    sess: *Session,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    h: usize,
-    w: usize,
-    p: sd_unet.Proj,
-) !void {
-    switch (p) {
-        .conv => |cv| try conv(ctx, ws, dst, src, h, w, cv, .stride1, null, null),
-        .linear => |lin| try gemm(ctx, sess, dst, 0, src, h * w, lin.w, lin.b),
-    }
-}
 
-fn layerNorm(
-    ctx: *Context,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    n: usize,
-    ch: usize,
-    nw: sd_unet.LayerNormW,
-    eps: f32,
-) !void {
-    const wbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(nw.w)), .mem = .null_handle, .size = 0 };
-    const bbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(nw.b)), .mem = .null_handle, .size = 0 };
-    try ctx.opElt(.layernorm, src.*, dst.*, wbuf, bbuf, .{
-        .u0 = @intCast(n),
-        .u1 = @intCast(ch),
-        .f0 = eps,
-    }, n, 1, 1);
-}
-
-/// GroupNorm (+ the SiLU that follows it everywhere but a SpatialTransformer's
-/// input norm): chunk statistics, merge per group, apply per element.
-fn groupNorm(
-    ctx: *Context,
-    ws: *Workspace,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    n: usize,
-    ch: usize,
-    /// weight ++ bias, from `Session.normCat`.
-    cat: []const f32,
-    groups: usize,
-    eps: f32,
-    silu: bool,
-) !void {
-    return groupNormInto(ctx, ws.gstat, ws.gmi, dst, src, n, ch, cat, groups, eps, silu, false);
-}
 
 /// GroupNorm with the two statistics buffers passed in, so the SD VAE decoder
 /// (`sd_vae_gpu`) runs the identical three dispatches without a UNet workspace.
@@ -856,15 +671,13 @@ pub fn groupNormInto(
     groups: usize,
     eps: f32,
     silu: bool,
-    /// `src` and `dst` are f16 rather than f32. The statistics, weight and bias
-    /// stay f32 either way, they are per-channel, not per-position.
-    act_f16: bool,
 ) !void {
-    std.debug.assert(cat.len == 2 * ch);
+    // `src` and `dst` at one `dt`; the statistics, weight and bias are f32 whatever it is.
+    std.debug.assert(cat.len == 2 * ch and dst.dt == src.dt);
     const per_group = ch / groups;
     const cbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(cat)), .mem = .null_handle, .size = 0 };
 
-    try ctx.opElt(if (act_f16) .gn_stats_h16 else .gn_stats, src.*, null, null, gstat, .{
+    try ctx.opElt(gpu_context.eltAt("gn_stats", src.dt), src.*, null, null, gstat, .{
         .u0 = @intCast(groups * gn_chunks),
         .u1 = @intCast(ch),
         .u2 = gn_chunks,
@@ -876,7 +689,7 @@ pub fn groupNormInto(
         .u2 = gn_chunks,
         .f0 = eps,
     }, groups, 1, 1);
-    try ctx.opElt(if (act_f16) .gn_apply_h16 else .gn_apply, src.*, dst.*, cbuf, gmi, .{
+    try ctx.opElt(gpu_context.eltAt("gn_apply", src.dt), src.*, dst.*, cbuf, gmi, .{
         .u0 = @intCast(n * ch),
         .u1 = @intCast(ch),
         .u2 = @intCast(per_group),
@@ -893,221 +706,19 @@ fn headsPerBatch(seq_pad: usize, heads: usize) usize {
     return @max(1, @min(heads, scores_scratch_bytes / (seq_pad * seq_pad * 2)));
 }
 
-/// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
-/// `bias` null means the weight carries none (attention q/k/v), which the
-/// bias-adding kernels still need a vector for, hence the session's zeros.
 
-/// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
-/// the SD UNet runs on Vulkan. Mirrors `sd_unet_cuda.probeInput` and
-/// `dit_gpu.probeInput`; see the former for what a capture records without these.
-///
-/// No int8/int4 skip is needed here, unlike the DiT backends: this UNet's dtype
-/// switch is {f32, f16, bf16, q8_0, q4_k, q5_k, q6_k, iq4_nl}, every one of which
-/// leaves the *activation* in f32 and quantizes only the weight. Nothing rotates or
-/// consumes `x` in place, so the buffer always holds what a CPU capture would see.
-fn probeInput(ctx: *Context, x: DeviceBuffer, m: usize, w: Weight) !void {
-    const p = ops.matmul.probe orelse return;
-    if (m == 0 or w.cols == 0) return;
-    const host = try ctx.gpa.alloc(f32, m * w.cols);
-    defer ctx.gpa.free(host);
-    try ctx.tensorDownloadAt(x, 0, std.mem.sliceAsBytes(host));
-    p.input(p.ctx, w, host, m);
-}
 
-/// The `Weight` a convolution's GEMM is equivalent to, `ci` columns for a 1x1 and
-/// the im2col patch (`9*ci`) for a 3x3, matching `ops.conv` exactly.
-fn convWeight(cv: Conv2d, cols: usize) Weight {
-    var w = Weight.fromF32(cv.w, cv.co, cols);
-    w.tag = cv.tag;
-    return w;
-}
-
-fn gemm(
-    ctx: *Context,
-    sess: *Session,
-    y: *DeviceBuffer,
-    y_off_elems: usize,
-    x: *const DeviceBuffer,
-    m: usize,
-    wt: Weight,
-    bias: ?[]const f32,
-) !void {
-    const rows = wt.rows;
-    const cols = wt.cols;
-    // The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
-    // by POINTER and size the device buffer from the FIRST call's length, so a
-    // narrow layer seen first would leave every wider one reading past the end,
-    // which robust-buffer-access hides by returning zeros, i.e. exactly the right
-    // answer for THIS bias and nothing else. The kernels read only `rows`
-    // entries, so handing them a longer slice is free. (Context.smallBuffer)
-    const b = bias orelse sess.zeros;
-    try probeInput(ctx, x.*, m, wt);
-    const coop = ctx.pipe_coop_f16w != .null_handle and rows >= coop_min_co;
-    switch (wt.dtype) {
-        .f32 => {
-            // A safetensors payload is 8-byte aligned as a whole, so an individual
-            // f32 tensor's offset is 4-aligned in practice but not by guarantee.
-            // The coop entry point wants a real `[]f32`; an unaligned weight falls
-            // back to the raw-bytes f32 GEMM, which is correct either way. (Every
-            // weight takes the same branch every time, so the pointer-keyed weight
-            // cache never sees one tensor in two layouts.)
-            if (coop and std.mem.isAligned(@intFromPtr(wt.bytes.ptr), @alignOf(f32))) {
-                const wf: []const f32 = @as([*]const f32, @ptrCast(@alignCast(wt.bytes.ptr)))[0 .. wt.bytes.len / 4];
-                return ctx.opMatmulCoopF16W(y.*, y_off_elems, x.*, m, wf, rows, cols, b);
-            }
-            return ctx.opMatmul(y.*, y_off_elems * 4, x.*, 0, m, wt.bytes, false, rows, cols, 1.0, b);
-        },
-        .f16 => return ctx.opMatmulCoopF16Wh(y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, b),
-        .bf16 => {
-            if (ctx.pipe_coop_bf16w != .null_handle) {
-                return ctx.opMatmulCoopBf16(y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, b);
-            }
-            return ctx.opMatmulCoopF16Wb(y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, b);
-        },
-        .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {
-            // ggufy's quantized SD UNets, the whole reason the loader keeps
-            // weights in their checkpoint dtype.
-            if (!ctx.hasQuantPrefillGemm()) return error.UnsupportedDType;
-            return ctx.opMatmulCoopQuant(wt.dtype, y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, 1.0, b);
-        },
-        else => return error.UnsupportedDType,
-    }
-}
-
-/// A convolution. 1x1 is a plain GEMM over pixels; 3x3 is a banded `im2col_sd`
-/// patch gather followed by the same GEMM, with the source sampling mode
-/// covering stride 1, LDM's stride-2 downsample, and the fused nearest-2x
-/// upsample. `bias_dev` overrides the checkpoint bias with a slice of a device
-/// buffer (the ResBlocks' folded timestep projection).
-fn conv(
-    ctx: *Context,
-    ws: *Workspace,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: SampleMode,
-    /// Output grid override, for the decoder's upsample only: `null` derives it from
-    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
-    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
-    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
-    /// size the whole change (`sd_unet` has the arithmetic).
-    out_hw: ?[2]usize,
-    bias_dev: ?BiasSlice,
-) !void {
-    return convInto(ctx, &ws.patch, dst, src, h, w, cv, mode, out_hw, bias_dev);
-}
-
-/// A slice of a device buffer holding a per-forward convolution bias.
-pub const BiasSlice = struct { buf: DeviceBuffer, off: usize };
-
-/// Output positions per im2col band. A multiple of 4, which keeps the GEMM's `y`
-/// byte offset 16-aligned for any `co`. Public so a caller can pre-size the patch
-/// buffer before opening a command batch.
-pub fn convBand(n_out: usize, patch_len: usize) usize {
-    return @max(4, @min(n_out, patch_band_bytes / (patch_len * 4)) & ~@as(usize, 3));
-}
-
-/// `conv` with the im2col band buffer passed in (grown as needed), so the SD VAE
-/// decoder shares this exact convolution mapping rather than reimplementing it.
-pub fn convInto(
-    ctx: *Context,
-    patch: *DeviceBuffer,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: SampleMode,
-    /// Output grid override, for the decoder's upsample only: `null` derives it from
-    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
-    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
-    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
-    /// size the whole change (`sd_unet` has the arithmetic).
-    out_hw: ?[2]usize,
-    bias_dev: ?BiasSlice,
-) !void {
-    return convIntoScaled(ctx, patch, dst, src, h, w, cv, mode, out_hw, bias_dev, 1.0);
-}
-
-/// `convInto` with the activation divided by `act_div` before the f16 cast (and
-/// the result multiplied back), see `Context.opMatmulCoopF16WScaled` for why f16's
-/// 65504 ceiling is reachable in practice. `act_div = 1.0` is exactly `convInto`.
-///
-/// The non-coop arm ignores it: `opMatmul` never casts to f16, so it has f32's
-/// range already. The device-bias arm (`bias_dev`) does not take it either, that
-/// is the SD UNet's folded timestep projection, whose activations are GroupNorm
-/// outputs, and the VAE decoder (the stage that overflows) never uses it.
-pub fn convIntoScaled(
-    ctx: *Context,
-    patch: *DeviceBuffer,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: SampleMode,
-    /// Output grid override, for the decoder's upsample only: `null` derives it from
-    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
-    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
-    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
-    /// size the whole change (`sd_unet` has the arithmetic).
-    out_hw: ?[2]usize,
-    bias_dev: ?BiasSlice,
-    act_div: f32,
-) !void {
-    return convIntoPrec(ctx, patch, dst, src, h, w, cv, mode, out_hw, bias_dev, act_div, false, false);
-}
-
-/// `convIntoScaled` with f16 activation STORAGE on either side. Mirrors
-/// `sd_unet_cuda.convIntoPrec`; see `sd_vae.Config.act_f16`.
-///
-/// f16 storage FORCES the cooperative path, because the plain f32 GEMM arm has
-/// no f16 form. `coop_min_co` is a PERFORMANCE threshold, not a correctness one,
-/// and not forcing it is a real bug, not a theoretical one: on CUDA it left SD1.5's
-/// 4->4 `post_quant_conv` on the f32 arm writing f32 into an f16 buffer, and every
-/// pixel came out non-finite.
-pub fn convIntoPrec(
-    ctx: *Context,
-    patch: *DeviceBuffer,
-    dst: *DeviceBuffer,
-    src: *const DeviceBuffer,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: SampleMode,
-    /// Output grid override, for the decoder's upsample only: `null` derives it from
-    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
-    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
-    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
-    /// size the whole change (`sd_unet` has the arithmetic).
-    out_hw: ?[2]usize,
-    bias_dev: ?BiasSlice,
-    act_div: f32,
-    src_f16: bool,
-    dst_f16: bool,
-) !void {
-    std.debug.assert(!(src_f16 and act_div != 1.0));
-    const coop = ctx.pipe_coop_f16w != .null_handle and (cv.co >= coop_min_co or src_f16 or dst_f16);
-    // Every convolution in an LDM UNet carries a bias; `Conv2d` models the
-    // general case, so pin the assumption here rather than in five call sites.
-    const cb = cv.b orelse return error.MissingConvBias;
-    if (cv.k == 1) {
-        std.debug.assert(mode == .stride1);
-        const n = h * w;
-        // The capture probe reads f32; an f16 buffer would be filed as noise.
-        if (!src_f16) try probeInput(ctx, src.*, n, convWeight(cv, cv.ci));
-        if (bias_dev) |bd| {
-            std.debug.assert(coop and !src_f16 and !dst_f16);
-            return ctx.opMatmulCoopF16WDev(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, bd.buf, bd.off);
-        }
-        if (coop) return ctx.opMatmulCoopF16WPrec(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, cb, act_div, src_f16, dst_f16);
-        std.debug.assert(!src_f16 and !dst_f16); // unreachable: `coop` covers those
-        return ctx.opMatmul(dst.*, 0, src.*, 0, n, std.mem.sliceAsBytes(cv.w), false, cv.co, cv.ci, 1.0, cb);
-    }
-    std.debug.assert(cv.k == 3);
-
+/// A convolution's LoRA hits, onto its output (`cv`'s bias in it), the twin of
+/// `sd_unet_cuda.convLora`. A DoRA's share of the base product goes first; a 1x1 is then
+/// the dense sidecar over pixels. A 3x3's factor `A` is itself a convolution to `rank`
+/// channels (f16 in the file's order) whose `B` accumulates back out; a LoKr term's
+/// `w2` convolves each input channel group (`kronGroups`); a diff is an extra
+/// convolution.
+fn convLora(ctx: *Context, sess: *const Session, ws: *Workspace, dst: *DeviceBuffer, src: *const DeviceBuffer, h: usize, w: usize, cv: Conv2d, mode: SampleMode, out_hw: ?[2]usize) !void {
+    const stack = sess.lin_plan.lora orelse return;
+    const cw = cv.gemmWeight();
+    const hits = stack.forWeight(cw);
+    if (hits.len == 0) return;
     const oh = if (out_hw) |o| o[0] else switch (mode) {
         .stride1 => h,
         .upsample2x => 2 * h,
@@ -1118,41 +729,116 @@ pub fn convIntoPrec(
         .upsample2x => 2 * w,
         .stride2 => (w + 1) / 2,
     };
-    const n_out = oh * ow;
-    const patch_len = 9 * cv.ci;
-
-    const band = convBand(n_out, patch_len);
-    try ctx.ensureDeviceBuffer(patch, band * patch_len * 4);
-
-    var p0: usize = 0;
-    while (p0 < n_out) : (p0 += band) {
-        const bn = @min(band, n_out - p0);
-        try ctx.opElt(if (src_f16) .im2col_sd_h16 else .im2col_sd, src.*, null, null, patch.*, .{
-            .u0 = @intCast(bn * patch_len),
-            .u1 = @intCast(patch_len),
-            .u2 = @intCast(cv.ci),
-            .u3 = @intCast(w),
-            // The tap extent, not the source height: when upsampling, the taps live in
-            // the OUTPUT grid and that is where the conv pads (see `im2col_sd`).
-            .u4 = @intCast(if (mode == .upsample2x) oh else h),
-            .u5 = @intCast(p0),
-            .u6 = @intCast(ow),
-            .f0 = @floatFromInt(@intFromEnum(mode)),
-        }, bn * patch_len, 1, 1);
-        // Per band; the accumulator sums over rows (see sd_unet_cuda).
-        try probeInput(ctx, patch.*, bn, convWeight(cv, patch_len));
-        if (bias_dev) |bd| {
-            std.debug.assert(coop);
-            try ctx.opMatmulCoopF16WDev(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, bd.buf, bd.off);
-        } else if (coop) {
-            // The patch is f32 whatever `src_f16` said, so only `dst_f16` applies.
-            try ctx.opMatmulCoopF16WPrec(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, cb, act_div, false, dst_f16);
-        } else {
-            std.debug.assert(!dst_f16);
-            try ctx.opMatmul(dst.*, p0 * cv.co * 4, patch.*, 0, bn, std.mem.sliceAsBytes(cv.w), false, cv.co, patch_len, 1.0, cb);
+    const n = oh * ow;
+    const scratch = sess.lin.lora;
+    const zb = sess.lin.zero_bias;
+    for (hits) |hit| {
+        const strength = stack.files.items[hit.file].strength;
+        if (strength == 0) continue;
+        const t = hit.target;
+        if (t.dora) |d| {
+            const ratio = try lora_gpu.hostVec(ctx, d.ratio);
+            if (d.on_out) {
+                const b: ?DeviceBuffer = if (cv.b) |bb| try lora_gpu.hostVec(ctx, bb) else null;
+                try lora_gpu.doraRows(ctx, dst.*, ratio, b, n, cv.co, strength);
+            } else {
+                // W ((d - 1) x): the base convolution, bias-free, on a rescaled input.
+                var xd = try scratch.inPlane(ctx, h * w * cv.ci * 4, .f32);
+                try lora_gpu.doraCols(ctx, xd, src.*, ratio, h * w, cv.ci);
+                var o = try scratch.outPlane(ctx, n * cv.co);
+                var base = cv;
+                // WHOLE, never sliced: `smallBuffer` caches by host pointer.
+                base.b = zb;
+                try conv_gpu.conv2d(ctx, &ws.patch, &o, &xd, h, w, base, mode, out_hw, null, 1.0);
+                try lora_gpu.addPlane(ctx, dst.*, o, n, cv.co, cv.co, 0, strength);
+            }
+        }
+        if (cv.k == 1) {
+            try lora_gpu.applyTarget(ctx, scratch, zb, dst.*, src.*, n, t, strength, 0, cv.co);
+            continue;
+        }
+        for (t.factors) |f| {
+            std.debug.assert(f.a.dtype == .f16 and f.out_off == 0 and f.b.rows == cv.co);
+            const r = f.rank();
+            const a: Conv2d = .{
+                .w = .{ .torch = .{ .w = f.a } },
+                .b = zb,
+                .co = r,
+                .ci = cv.ci,
+                .k = cv.k,
+                .stride = cv.stride,
+                .pad = cv.pad,
+            };
+            try scratch.ensure(ctx, n * r);
+            try conv_gpu.conv2d(ctx, &ws.patch, &scratch.lo, src, h, w, a, mode, out_hw, null, 1.0);
+            try lora_gpu.accumulate(ctx, scratch, dst.*, n, f.b.bytes, cv.co, r, t.scale * strength * f.gain);
+        }
+        for (t.kron) |k| try kronGroups(ctx, sess, ws, dst.*, src, h, w, cv, mode, out_hw, n, k, strength * t.scale * k.gain);
+        for (t.diffs) |df| {
+            std.debug.assert(df.w.dtype == .f16);
+            const dc: Conv2d = .{ .w = .{ .torch = .{ .w = df.w } }, .b = zb, .co = df.w.rows, .ci = cv.ci, .k = cv.k, .stride = cv.stride, .pad = cv.pad };
+            var o = try scratch.outPlane(ctx, n * df.w.rows);
+            try conv_gpu.conv2d(ctx, &ws.patch, &o, src, h, w, dc, mode, out_hw, null, 1.0);
+            try lora_gpu.addPlane(ctx, dst.*, o, n, df.w.rows, cv.co, df.out_off, strength);
         }
     }
 }
+
+/// One LoKr term over a 3x3 convolution, as `sd_unet_cuda.kronGroups`: every group in
+/// one launch over a zero-separated stack where the conv allows it, else each group
+/// into its own slice of one plane, each slice at a storage-aligned offset.
+fn kronGroups(ctx: *Context, sess: *const Session, ws: *Workspace, dst: DeviceBuffer, src: *const DeviceBuffer, h: usize, w: usize, cv: Conv2d, mode: SampleMode, out_hw: ?[2]usize, n: usize, k: lora_mod.Kron, g: f32) !void {
+    std.debug.assert(k.w2.dtype == .f16 and cv.ci % k.im == 0);
+    const scratch = sess.lin.lora;
+    const in_n = cv.ci / k.im;
+    const ok = k.w2.rows;
+    const gc: Conv2d = .{ .w = .{ .torch = .{ .w = k.w2 } }, .b = sess.lin.zero_bias, .co = ok, .ci = in_n, .k = cv.k, .stride = cv.stride, .pad = cv.pad };
+    const w1 = try lora_gpu.hostVec(ctx, k.w1);
+    const eb = src.dt.bytes();
+    if (mode != .stride2 and cv.k == 3 and cv.pad == 1 and out_hw == null) {
+        const hs = k.im * (h + 1) - 1;
+        var st = try scratch.inPlane(ctx, k.im * (h + 1) * w * in_n * eb, src.dt);
+        try lora_gpu.kronStack(ctx, st, src.*, k.im, h, w, in_n, cv.ci, 0);
+        const up: usize = if (mode == .upsample2x) 2 else 1;
+        var out = try scratch.outPlane(ctx, up * hs * up * w * ok);
+        try conv_gpu.conv2d(ctx, &ws.patch, &out, &st, hs, w, gc, mode, null, null, 1.0);
+        // Group j's output starts at row up * j * (h + 1) of an up * w wide plane.
+        return lora_gpu.kronMix(ctx, dst, out, w1, n, k.ol, ok, k.im, cv.co, k.out_off, ok, up * (h + 1) * up * w * ok, g);
+    }
+    const gstride = std.mem.alignForward(usize, n * ok * 4, ctx.storage_align) / 4;
+    const out = try scratch.outPlane(ctx, k.im * gstride);
+    var st = try scratch.inPlane(ctx, (h + 1) * w * in_n * eb, src.dt);
+    for (0..k.im) |j| {
+        try lora_gpu.kronStack(ctx, st, src.*, 1, h, w, in_n, cv.ci, j);
+        var oj = try ctx.view(out, j * gstride * 4, n * ok * 4);
+        try conv_gpu.conv2d(ctx, &ws.patch, &oj, &st, h, w, gc, mode, out_hw, null, 1.0);
+    }
+    try lora_gpu.kronMix(ctx, dst, out, w1, n, k.ol, ok, k.im, cv.co, k.out_off, ok, gstride, g);
+}
+
+/// Whether this context can run the UNet `u` and its LoRA stack. A dense factor is
+/// bf16, which both sidecar GEMMs read; a 3x3 conv's `A` is f16 (`lora_sd`) and runs
+/// as a convolution.
+pub fn supported(ctx: *Context, u: *const sd_unet.UNet) bool {
+    if (!lin_gpu.runs(ctx, u.device_lins, .{ .blockq = .auto }, u.lora, "sd_unet_gpu")) return false;
+    const stack = u.lora orelse return true;
+    for (stack.files.items) |f| {
+        var it = f.side.index.valueIterator();
+        while (it.next()) |t| for (t.factors) |fa| {
+            const dense = fa.a.dtype == .bf16;
+            if (fa.b.dtype != .bf16 or !(dense or fa.a.dtype == .f16)) {
+                std.log.warn("sd_unet_gpu: LoRA {s} has a factor this backend has no GEMM for; the UNet runs on the CPU instead", .{t.tag});
+                return false;
+            }
+        };
+    }
+    return true;
+}
+
+
+
+
+
 
 // --- tests ------------------------------------------------------------------
 //
@@ -1243,7 +929,7 @@ test "gpu group norm matches ops.norm.groupNorm" {
         for (x) |*v| v.* = c.mean + rand.floatNorm(f32);
         try ctx.tensorUpload(src_or(&src, ctx, x), std.mem.sliceAsBytes(x));
         for ([2]bool{ false, true }) |silu| {
-            try groupNorm(ctx, &ws, &dst, &src, n, ch, cat, groups, 1e-5, silu);
+            try groupNormInto(ctx, ws.gstat, ws.gmi, &dst, &src, n, ch, cat, groups, 1e-5, silu);
             const got = try gpa.alloc(f32, n * ch);
             defer gpa.free(got);
             try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));
@@ -1441,96 +1127,7 @@ test "gpu self attention matches ops.attention at every SD head width" {
     }
 }
 
-test "gpu conv matches ops.conv.conv2d at stride 1, stride 2 and fused 2x upsample" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    const ctx = try gpuCtx(gpa, io);
-    defer ctx.deinit();
 
-    var prng = std.Random.DefaultPrng.init(19);
-    const rand = prng.random();
-    // Odd extents so stride 2's ceil(h/2) output size and the pad edges both
-    // matter; co >= 96 puts it on the tensor-core arm, which is what ships.
-    const h: usize = 11;
-    const w: usize = 7;
-    const ci: usize = 32;
-    const co: usize = 128;
-
-    const torch_w = try gpa.alloc(f32, co * ci * 9);
-    defer gpa.free(torch_w);
-    for (torch_w) |*x| x.* = rand.floatNorm(f32) * 0.1;
-    const bias = try gpa.alloc(f32, co);
-    defer gpa.free(bias);
-    for (bias) |*x| x.* = rand.floatNorm(f32);
-    const packed_w = try ops.conv.packWeight(gpa, torch_w, co, ci, 3);
-    defer gpa.free(packed_w);
-    const in = try gpa.alloc(f32, h * w * ci);
-    defer gpa.free(in);
-    for (in) |*x| x.* = rand.floatNorm(f32);
-
-    var ws: Workspace = .{
-        .gpa = gpa,
-        .skips = try gpa.alloc(DeviceBuffer, 0),
-        .skip_ch = try gpa.alloc(usize, 0),
-        .skip_hw = try gpa.alloc([2]usize, 0),
-    };
-    defer ws.deinit(ctx);
-    var src: DeviceBuffer = none;
-    defer ctx.tensorDestroy(&src);
-    var dst: DeviceBuffer = none;
-    defer ctx.tensorDestroy(&dst);
-    try upload(ctx, &src, in);
-
-    for ([3]SampleMode{ .stride1, .stride2, .upsample2x }) |mode| {
-        const oh = switch (mode) {
-            .stride1 => h,
-            .stride2 => (h + 1) / 2,
-            .upsample2x => 2 * h,
-        };
-        const ow = switch (mode) {
-            .stride1 => w,
-            .stride2 => (w + 1) / 2,
-            .upsample2x => 2 * w,
-        };
-        const cv: Conv2d = .{
-            .w = packed_w,
-            .b = bias,
-            .co = co,
-            .ci = ci,
-            .k = 3,
-            .stride = if (mode == .stride2) @as(usize, 2) else 1,
-            .pad = 1,
-        };
-        try ctx.ensureDeviceBuffer(&dst, oh * ow * co * 4);
-        try conv(ctx, &ws, &dst, &src, h, w, cv, mode, null, null);
-        const got = try gpa.alloc(f32, oh * ow * co);
-        defer gpa.free(got);
-        try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));
-
-        // The CPU reference has no fused resample, so the upsample case builds
-        // the doubled tensor explicitly, which is exactly the equivalence the
-        // fused gather claims.
-        const want = try gpa.alloc(f32, oh * ow * co);
-        defer gpa.free(want);
-        if (mode == .upsample2x) {
-            const up = try gpa.alloc(f32, oh * ow * ci);
-            defer gpa.free(up);
-            for (0..oh) |y| {
-                for (0..ow) |xx| {
-                    const s = in[((y / 2) * w + (xx / 2)) * ci ..][0..ci];
-                    @memcpy(up[(y * ow + xx) * ci ..][0..ci], s);
-                }
-            }
-            try ops.conv.conv2d(io, gpa, want, up, oh, ow, cv);
-        } else {
-            try ops.conv.conv2d(io, gpa, want, in, h, w, cv);
-        }
-        const err = relL2(want, got);
-        errdefer std.debug.print("mode={t}: rel L2 {d:.6}\n", .{ mode, err });
-        // f16 tensor cores on a k = 9*ci reduction.
-        try testing.expect(err < 2e-3);
-    }
-}
 
 test "gpu channel concat interleaves two activations by channel" {
     const gpa = testing.allocator;

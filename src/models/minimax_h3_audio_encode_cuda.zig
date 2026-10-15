@@ -32,6 +32,10 @@
 
 const std = @import("std");
 const enc_mod = @import("minimax_h3_audio_encode.zig");
+const conv_cuda = @import("conv_cuda.zig");
+const ops = @import("tp_ops");
+const Weight = ops.matmul.Weight;
+const lin_cuda = @import("lin_cuda.zig");
 const audio = @import("minimax_h3_audio.zig");
 const cuda = @import("tp_gpu").cuda;
 
@@ -71,30 +75,8 @@ pub fn supported(enc: *const AudioEncoder) bool {
 
 // --- session --------------------------------------------------------------
 
-/// A conv ready for the device. Shares `minimax_h3_audio_cuda`'s layout choice
-/// but keeps its own f32-only weight: nothing here runs the f16 arm.
-const DevConv = struct {
-    /// `[out_ch][k * in_ch]` f32.
-    w: []const f32,
-    bias: ?[]const f32,
-    out_ch: usize,
-    in_ch: usize,
-    k: usize,
-    dilation: usize,
-    padding: usize,
-    stride: usize,
-
-    fn plen(self: DevConv) usize {
-        return self.k * self.in_ch;
-    }
-
-    fn outLen(self: DevConv, in_len: usize) usize {
-        const eff = self.dilation * (self.k - 1) + 1;
-        const padded = in_len + 2 * self.padding;
-        if (padded < eff) return 0;
-        return (padded - eff) / self.stride + 1;
-    }
-};
+/// A conv ready for the device: `[out_ch][k * in_ch]` f32, the vocoder's layout.
+const DevConv = ops.conv.Conv1dGemm;
 
 const DevResUnit = struct {
     a1: []const f32,
@@ -109,13 +91,11 @@ const DevStage = struct {
     down: DevConv,
 };
 
-/// A plain `nn.Linear`, `[out][in]` f32 -- already the GEMM's B, so unlike a conv
-/// it needs no permutation.
+/// A plain `nn.Linear`, `[out][in]` f32: already the GEMM's B, so unlike a conv it
+/// needs no permutation.
 const DevLin = struct {
-    w: []const f32,
+    w: Weight,
     bias: ?[]const f32,
-    out: usize,
-    in: usize,
 };
 
 const DevHead = struct {
@@ -201,9 +181,9 @@ pub const Session = struct {
                 .mlp_norm_w = h.mlp_norm.w,
                 .mlp_norm_b = h.mlp_norm.b,
                 .proj = lin(h.proj),
-                .q = .{ .w = h.qkv.w[0 .. din * din], .bias = h.qkv_bias[0..din], .out = din, .in = din },
-                .k = .{ .w = h.qkv.w[din * din ..][0 .. din * din], .bias = h.qkv_bias[din..][0..din], .out = din, .in = din },
-                .v = .{ .w = h.qkv.w[2 * din * din ..][0 .. din * din], .bias = h.qkv_bias[2 * din ..][0..din], .out = din, .in = din },
+                .q = .{ .w = Weight.fromF32(h.qkv.w[0 .. din * din], din, din), .bias = h.qkv_bias[0..din] },
+                .k = .{ .w = Weight.fromF32(h.qkv.w[din * din ..][0 .. din * din], din, din), .bias = h.qkv_bias[din..][0..din] },
+                .v = .{ .w = Weight.fromF32(h.qkv.w[2 * din * din ..][0 .. din * din], din, din), .bias = h.qkv_bias[2 * din ..][0..din] },
                 .attn_proj = lin(h.attn_proj),
                 .w0 = lin(h.w0),
                 .w1 = lin(h.w1),
@@ -215,7 +195,7 @@ pub const Session = struct {
 };
 
 fn lin(l: enc_mod.Lin) DevLin {
-    return .{ .w = l.w, .bias = l.b, .out = l.out, .in = l.in };
+    return .{ .w = Weight.fromF32(l.w, l.out, l.in), .bias = l.b };
 }
 
 /// `[out_ch][in_ch][k]` -> `[out_ch][k][in_ch]`, the column order channel-last
@@ -233,9 +213,8 @@ fn devConv(a: std.mem.Allocator, c: Conv1d) !DevConv {
         }
     }
     return .{
-        .w = w,
+        .w = Weight.fromF32(w, c.out_ch, c.k * c.in_ch),
         .bias = c.b,
-        .out_ch = c.out_ch,
         .in_ch = c.in_ch,
         .k = c.k,
         .dilation = c.dilation,
@@ -353,49 +332,22 @@ fn devBuf(be: *Backend, data: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(data)), .mem = .null_handle, .size = data.len * 4 };
 }
 
-/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`, banded im2col + GEMM.
-///
-/// ⚠️ **`dst` must NOT alias `src`.** The decode side's unbanded conv tolerates it
-/// (its im2col copies the whole input into the patch matrix before the GEMM runs),
-/// but banding interleaves the two: band 0's GEMM writes `dst` before band 1's
-/// im2col reads `src`. Aliasing them is then correct for any clip short enough to
-/// fit one band and wrong for every longer one, which is exactly how it got here.
+/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`, banded by the patch's size.
+/// `dst` must not alias `src` once it takes more than one band (`conv_cuda.conv1d`).
 fn conv(be: *Backend, ws: *Workspace, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
-    std.debug.assert(dst.buf != src.buf);
-    const out_len = c.outLen(in_len);
-    const cols = c.plen();
-    const band = @max(1, @min(out_len, patch_band / cols));
-    std.debug.assert(band * cols <= ws.shapes.patch);
-    var t0: usize = 0;
-    while (t0 < out_len) : (t0 += band) {
-        const nb = @min(band, out_len - t0);
-        try be.opIm2col1d(src, ws.patch, t0, nb, c.k, c.in_ch, in_len, c.dilation, c.padding, c.stride);
-        const out = offsetBuf(dst, t0 * c.out_ch * 4);
-        be.opMatmulF32Lt(out, ws.patch, nb, std.mem.sliceAsBytes(c.w), c.out_ch, cols, c.bias) catch |err| switch (err) {
-            // The hand-PTX arm has no tiled f32 GEMM. Its one-thread-per-output
-            // fallback is correct at about a third of the speed; falling back to
-            // f16 instead would be a silent 50 dB of SNR, which is the measurement
-            // the decode side already paid for.
-            error.UnsupportedKernelArm => try be.opMatmul(out, 0, ws.patch, 0, nb, std.mem.sliceAsBytes(c.w), false, c.out_ch, cols, 1.0, c.bias),
-            else => return err,
-        };
-    }
-    return out_len;
-}
-
-/// A byte offset into a device buffer as its own `Buf`. ⚠️ Only valid on CUDA,
-/// where `buf` is a device pointer; on Vulkan it is an opaque handle and this does
-/// not port.
-fn offsetBuf(b: Buf, off_bytes: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
+    return conv_cuda.conv1d(be, f32_plan, ws.patch, @min(ws.shapes.patch, patch_band), dst, src, c, in_len);
 }
 
 fn gemm(be: *Backend, dst: Buf, src: Buf, rows: usize, l: DevLin) !void {
-    be.opMatmulF32Lt(dst, src, rows, std.mem.sliceAsBytes(l.w), l.out, l.in, l.bias) catch |err| switch (err) {
-        error.UnsupportedKernelArm => try be.opMatmul(dst, 0, src, 0, rows, std.mem.sliceAsBytes(l.w), false, l.out, l.in, 1.0, l.bias),
-        else => return err,
-    };
+    try lin_cuda.linear(be, f32_plan, dst, src, rows, l.w, l.bias);
 }
+
+/// Every conv and linear at its stored f32, as the vocoder runs (BACKEND.md says why).
+const f32_plan: lin_cuda.Plan = blk: {
+    var p = lin_cuda.Plan.tower;
+    p.dense = .native;
+    break :blk p;
+};
 
 /// One `ResidualUnit`, in place on `x`: Snake -> dilated conv -> Snake -> pointwise
 /// conv, plus the residual. Uses `ws.res` to hold the unit's input.
@@ -403,7 +355,7 @@ fn resUnit(be: *Backend, ws: *Workspace, x: Buf, u: DevResUnit, len: usize) !voi
     const ch = u.c1.in_ch;
     const alpha1 = try devBuf(be, u.a1);
     const alpha2 = try devBuf(be, u.a2);
-    try be.opCopyOff(ws.res, 0, x, 0, len * ch, false);
+    try be.opCopyOff(ws.res, 0, x, 0, len * ch);
     try be.opSnake1dCa(x, alpha1, len, ch);
     _ = try conv(be, ws, ws.tmp, x, u.c1, len);
     try be.opSnake1dCa(ws.tmp, alpha2, len, ch);
@@ -422,10 +374,10 @@ fn posterior(be: *Backend, ws: *Workspace, h: DevHead, x: Buf, t: usize) !void {
     const hd = din / h.heads;
 
     // x = proj(norm3(x)) + attn(norm1(x)); norm3 feeds the PROJECTION.
-    try be.opLayerNorm(x, ws.hn, h.norm3_w, h.norm3_b, t, din, ln_eps, false);
+    try be.opLayerNorm(x, ws.hn, h.norm3_w, h.norm3_b, t, din, ln_eps);
     try gemm(be, ws.hy, ws.hn, t, h.proj);
 
-    try be.opLayerNorm(x, ws.hn, h.norm1_w, h.norm1_b, t, din, ln_eps, false);
+    try be.opLayerNorm(x, ws.hn, h.norm1_w, h.norm1_b, t, din, ln_eps);
     try gemm(be, ws.hq, ws.hn, t, h.q);
     try gemm(be, ws.hk, ws.hn, t, h.k);
     try gemm(be, ws.hv, ws.hn, t, h.v);
@@ -438,8 +390,8 @@ fn posterior(be: *Backend, ws: *Workspace, h: DevHead, x: Buf, t: usize) !void {
     try be.opAdd(ws.hy, ws.ht, t * dout);
 
     // x += mlp(norm2(x)), and the MLP carries its own LayerNorm inside.
-    try be.opLayerNorm(ws.hy, ws.hn, h.norm2_w, h.norm2_b, t, dout, ln_eps, false);
-    try be.opLayerNorm(ws.hn, ws.hn, h.mlp_norm_w, h.mlp_norm_b, t, dout, ln_eps, false);
+    try be.opLayerNorm(ws.hy, ws.hn, h.norm2_w, h.norm2_b, t, dout, ln_eps);
+    try be.opLayerNorm(ws.hn, ws.hn, h.mlp_norm_w, h.mlp_norm_b, t, dout, ln_eps);
     try gemm(be, ws.hq, ws.hn, t, h.w0);
     try gemm(be, ws.hk, ws.hn, t, h.w1);
     // GeGLU with the TANH gelu, gate then value.

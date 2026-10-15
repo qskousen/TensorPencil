@@ -33,6 +33,11 @@ pub const is_ptx = builtin.cpu.arch == .nvptx64;
 
 pub const Slot = enum { a, b, c, d };
 
+/// An activation's element type, per slot: `ldT` / `stT` read and write it, so one
+/// body serves f32, f16 and bf16 chains. A 16-bit store is a real 16-bit store (the
+/// module carries StorageBuffer16BitAccess), so a thread owns one element, not a pair.
+pub const Dt = table.Dt;
+
 // ---- SPIR-V prelude ---------------------------------------------------------
 
 const FBuf = extern struct { data: [1 << 28]f32 };
@@ -48,6 +53,17 @@ extern var d: FBuf addrspace(.storage_buffer);
 /// are bound by load instructions.
 const VBuf = extern struct { data: [1 << 26]@Vector(4, f32) };
 extern var bv: VBuf addrspace(.storage_buffer);
+/// 16-bit aliases of every binding, for `ldT` / `stT`: f16 as itself, bf16 as its bits.
+const HBuf = extern struct { data: [1 << 29]f16 };
+const UBuf = extern struct { data: [1 << 29]u16 };
+extern var ah: HBuf addrspace(.storage_buffer);
+extern var bh: HBuf addrspace(.storage_buffer);
+extern var ch: HBuf addrspace(.storage_buffer);
+extern var dh: HBuf addrspace(.storage_buffer);
+extern var au: UBuf addrspace(.storage_buffer);
+extern var bu: UBuf addrspace(.storage_buffer);
+extern var cu: UBuf addrspace(.storage_buffer);
+extern var du: UBuf addrspace(.storage_buffer);
 extern var pc: Push addrspace(.push_constant);
 // Subgroup builtins std.gpu does not declare; the BuiltIn decorations are in
 // `decorate`.
@@ -81,6 +97,26 @@ inline fn decorate() void {
         \\OpMemberDecorate %vt 0 Offset 0
         \\OpDecorate %bv DescriptorSet 0
         \\OpDecorate %bv Binding 1
+        \\OpDecorate %ht Block
+        \\OpMemberDecorate %ht 0 Offset 0
+        \\OpDecorate %ut Block
+        \\OpMemberDecorate %ut 0 Offset 0
+        \\OpDecorate %ah DescriptorSet 0
+        \\OpDecorate %ah Binding 0
+        \\OpDecorate %bh DescriptorSet 0
+        \\OpDecorate %bh Binding 1
+        \\OpDecorate %ch DescriptorSet 0
+        \\OpDecorate %ch Binding 2
+        \\OpDecorate %dh DescriptorSet 0
+        \\OpDecorate %dh Binding 3
+        \\OpDecorate %au DescriptorSet 0
+        \\OpDecorate %au Binding 0
+        \\OpDecorate %bu DescriptorSet 0
+        \\OpDecorate %bu Binding 1
+        \\OpDecorate %cu DescriptorSet 0
+        \\OpDecorate %cu Binding 2
+        \\OpDecorate %du DescriptorSet 0
+        \\OpDecorate %du Binding 3
         \\OpDecorate %ss BuiltIn SubgroupSize
         \\OpDecorate %sl BuiltIn SubgroupLocalInvocationId
         \\OpDecorate %si BuiltIn SubgroupId
@@ -93,10 +129,37 @@ inline fn decorate() void {
           [bd] "" (&d),
           [vt] "t" (VBuf),
           [bv] "" (&bv),
+          [ht] "t" (HBuf),
+          [ut] "t" (UBuf),
+          [ah] "" (&ah),
+          [bh] "" (&bh),
+          [ch] "" (&ch),
+          [dh] "" (&dh),
+          [au] "" (&au),
+          [bu] "" (&bu),
+          [cu] "" (&cu),
+          [du] "" (&du),
           [ss] "" (&sg_size),
           [sl] "" (&sg_lane),
           [si] "" (&sg_id),
     );
+}
+
+/// `body`, which takes the activations' element type, at `dt`, as an entry body.
+fn At2(comptime body: anytype, comptime in: Dt, comptime out: Dt) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            body(e, in, out);
+        }
+    };
+}
+
+fn At(comptime body: anytype, comptime dt: Dt) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            body(e, dt);
+        }
+    };
 }
 
 // ---- PTX prelude ------------------------------------------------------------
@@ -114,6 +177,30 @@ pub const Env = if (is_ptx) struct {
     d: G,
     us: [7]u32,
     fs: [2]f32,
+    inline fn ptr(e: Env, comptime s: Slot) G {
+        return switch (s) {
+            .a => e.a,
+            .b => e.b,
+            .c => e.c,
+            .d => e.d,
+        };
+    }
+    /// Element `i` of slot `s` holding `dt`, as f32.
+    pub inline fn ldT(e: Env, comptime s: Slot, comptime dt: Dt, i: u32) f32 {
+        return switch (dt) {
+            .f32 => e.ptr(s)[i],
+            .f16 => @floatCast(@as([*]addrspace(.global) f16, @ptrCast(e.ptr(s)))[i]),
+            .bf16 => @bitCast(@as(u32, @as([*]addrspace(.global) u16, @ptrCast(e.ptr(s)))[i]) << 16),
+        };
+    }
+    /// Store `v` as element `i` of slot `s` holding `dt`, rounding to nearest even.
+    pub inline fn stT(e: Env, comptime s: Slot, comptime dt: Dt, i: u32, v: f32) void {
+        switch (dt) {
+            .f32 => e.ptr(s)[i] = v,
+            .f16 => @as([*]addrspace(.global) f16, @ptrCast(e.ptr(s)))[i] = @floatCast(v),
+            .bf16 => @as([*]addrspace(.global) u16, @ptrCast(e.ptr(s)))[i] = bf16Bits(v),
+        }
+    }
     pub inline fn ld(e: Env, comptime s: Slot, i: u32) f32 {
         return switch (s) {
             .a => e.a[i],
@@ -206,6 +293,40 @@ pub const Env = if (is_ptx) struct {
         return @workItemId(0) / 32;
     }
 } else struct {
+    pub inline fn ldT(e: Env, comptime s: Slot, comptime dt: Dt, i: u32) f32 {
+        return switch (dt) {
+            .f32 => e.ld(s, i),
+            .f16 => @floatCast(switch (s) {
+                .a => ah.data[i],
+                .b => bh.data[i],
+                .c => ch.data[i],
+                .d => dh.data[i],
+            }),
+            .bf16 => @bitCast(@as(u32, switch (s) {
+                .a => au.data[i],
+                .b => bu.data[i],
+                .c => cu.data[i],
+                .d => du.data[i],
+            }) << 16),
+        };
+    }
+    pub inline fn stT(e: Env, comptime s: Slot, comptime dt: Dt, i: u32, v: f32) void {
+        switch (dt) {
+            .f32 => e.st(s, i, v),
+            .f16 => switch (s) {
+                .a => ah.data[i] = @floatCast(v),
+                .b => bh.data[i] = @floatCast(v),
+                .c => ch.data[i] = @floatCast(v),
+                .d => dh.data[i] = @floatCast(v),
+            },
+            .bf16 => switch (s) {
+                .a => au.data[i] = bf16Bits(v),
+                .b => bu.data[i] = bf16Bits(v),
+                .c => cu.data[i] = bf16Bits(v),
+                .d => du.data[i] = bf16Bits(v),
+            },
+        }
+    }
     pub inline fn ld(_: Env, comptime s: Slot, i: u32) f32 {
         return switch (s) {
             .a => a.data[i],
@@ -480,6 +601,19 @@ pub inline fn sgSum(v: f32) f32 {
     }
 }
 
+/// `v` from lane `lane ^ mask`, every lane of the subgroup participating. PTX only:
+/// the SPIR-V module declares no shuffle capability, and adding one would refuse the
+/// whole module on a device without it.
+pub inline fn sgXor(v: f32, comptime mask: u32) f32 {
+    if (!is_ptx) @compileError("sgXor has no SPIR-V arm");
+    const o: u32 = asm ("shfl.sync.bfly.b32 %[r], %[v], %[o], 0x1f, 0xffffffff;"
+        : [r] "=r" (-> u32),
+        : [v] "r" (@as(u32, @bitCast(v))),
+          [o] "r" (mask),
+    );
+    return @bitCast(o);
+}
+
 /// Max of `v` over the subgroup, in every lane. Same participation rule as `sgSum`.
 pub inline fn sgMax(v: f32) f32 {
     if (is_ptx) {
@@ -510,6 +644,7 @@ pub inline fn sgMax(v: f32) f32 {
 const elt = @import("dual/elt.zig");
 const rows = @import("dual/rows.zig");
 const quant = @import("dual/quant.zig");
+const attn = @import("dual/attn.zig");
 
 fn Entry(comptime body: anytype) type {
     return struct {
@@ -527,34 +662,34 @@ fn Entry(comptime body: anytype) type {
 /// Every body, by the entry name both backends launch it under, in dual_table.zig's
 /// order. One body per name: NVPTX cannot export one kernel twice.
 const bodies = .{
-    .{ "add", elt.add },
+    .{ "add", At(elt.add, .f32).run },
     .{ "add_relu", elt.addRelu },
-    .{ "add_scaled", elt.addScaled },
+    .{ "add_scaled", At(elt.addScaled, .f32).run },
+    .{ "compact_acc", At(elt.compactAcc, .f32).run },
     .{ "relu", elt.relu },
-    .{ "silu", elt.silu },
-    .{ "silu_mul", elt.siluMul },
-    .{ "sigmoid_mul", elt.sigmoidMul },
-    .{ "gelu", elt.gelu },
+    .{ "silu", At(elt.silu, .f32).run },
+    .{ "silu_mul", At(elt.siluMul, .f32).run },
+    .{ "sigmoid_mul", At(elt.sigmoidMul, .f32).run },
+    .{ "gelu", At(elt.gelu, .f32).run },
     .{ "gelu_mul", elt.geluMul },
     .{ "gelu_quick", elt.geluQuick },
     .{ "gelu_quick_mul", elt.geluQuickMul },
-    .{ "gelu_erf", elt.geluErf },
-    .{ "geglu", elt.geglu },
-    .{ "geglu_h16", elt.gegluH16 },
+    .{ "gelu_erf", At(elt.geluErf, .f32).run },
+    .{ "geglu", At(elt.geglu, .f32).run },
     .{ "softplus_gate", elt.softplusGate },
-    .{ "copy", elt.copy },
+    .{ "copy", At2(elt.copy, .f32, .f32).run },
     .{ "scale_f32", elt.scaleF32 },
-    .{ "concat_ch", elt.concatCh },
+    .{ "concat_ch", At(elt.concatCh, .f32).run },
     .{ "scale_concat", elt.scaleConcat },
-    .{ "scale_i32", elt.scaleI32 },
+    .{ "scale_i32", At(elt.scaleI32, .f32).run },
     .{ "quantize_i8", elt.quantizeI8 },
     .{ "rms_apply_w", elt.rmsApplyW },
     .{ "rms_partial", elt.rmsPartial },
     .{ "rms_combine", elt.rmsCombine },
-    .{ "modulate", elt.modulate },
-    .{ "gated_add", elt.gatedAdd },
+    .{ "modulate", At(elt.modulate, .f32).run },
+    .{ "gated_add", At(elt.gatedAdd, .f32).run },
     .{ "gated_add16", elt.gatedAdd16 },
-    .{ "rope_inter", elt.ropeInter },
+    .{ "rope_inter", At(elt.ropeInter, .f32).run },
     .{ "rope_half", elt.ropeHalf },
     .{ "rope_half_pos", elt.ropeHalfPos },
     .{ "rope_half_part", elt.ropeHalfPart },
@@ -582,42 +717,34 @@ const bodies = .{
     .{ "gather_kmajor_h16", elt.gatherKmajorH16 },
     .{ "gather_kmajor16", elt.gatherKmajor16 },
     .{ "f32_to_h16", elt.f32ToH16 },
-    .{ "f32_to_h16_pad", elt.f32ToH16Pad },
-    .{ "f32_to_bf16_pad", elt.f32ToBf16Pad },
-    .{ "h16_to_h16_pad", elt.h16ToH16Pad },
-    .{ "bf16_to_h16_pad", elt.bf16ToH16Pad },
+    .{ "pad_h16", At(elt.padH16, .f32).run },
+    .{ "pad_bf16", At(elt.padBf16, .f32).run },
+    .{ "conv_w_h16", At(elt.convW16, .f16).run },
     .{ "bf16_to_f32", elt.bf16ToF32 },
     .{ "f16_to_f32", elt.f16ToF32 },
-    .{ "add_h16", elt.addH16 },
     .{ "silu_mul_h16", elt.siluMulH16 },
     .{ "sigmoid_mul_h16", elt.sigmoidMulH16 },
     .{ "silu_mul16", elt.siluMul16 },
     .{ "sigmoid_mul_g16", elt.sigmoidMulG16 },
     .{ "kv_store_f16", elt.kvStoreF16 },
-    .{ "pack_h16_kmajor", elt.packH16Kmajor },
-    .{ "bias_compact", elt.biasCompact },
-    .{ "bias_compact_h16", elt.biasCompactH16 },
-    .{ "bias_add_f16", elt.biasAddF16 },
-    .{ "bias_add_h16", elt.biasAddH16 },
-    .{ "add_bias_rows", elt.addBiasRows },
-    .{ "add_bias_rows_h16", elt.addBiasRowsH16 },
-    .{ "gn_apply", elt.gnApply },
-    .{ "gn_apply_h16", elt.gnApplyH16 },
-    .{ "vae_norm", elt.vaeNorm },
+    .{ "transpose_kmajor16", elt.transposeKmajor16 },
+    .{ "bias_compact", At(elt.biasCompact, .f32).run },
+    .{ "bias_add", At2(elt.biasAdd, .f16, .f32).run },
+    .{ "add_bias_rows", At(elt.addBiasRows, .f32).run },
+    .{ "gn_apply", At(elt.gnApply, .f32).run },
     .{ "im2col", elt.im2col },
-    .{ "im2col_sd", elt.im2colSd },
-    .{ "im2col_sd_h16", elt.im2colSdH16 },
+    .{ "im2col_sd", At(elt.im2colSd, .f32).run },
     .{ "gather_rows", elt.gatherRows },
     .{ "scatter_add_rows", elt.scatterAddRows },
     .{ "moe_combine", elt.moeCombine },
     .{ "gemv_combine", elt.gemvCombine },
     .{ "gemv_combine4", elt.gemvCombine4 },
-    .{ "modulate_pr", elt.modulatePerRow },
-    .{ "gated_add_pr", elt.gatedAddPerRow },
-    .{ "dw_conv3", elt.dwConv3 },
-    .{ "col_mean", elt.colMean },
-    .{ "mul_cols_sigmoid", elt.mulColsSigmoid },
-    .{ "nerf_feat", elt.nerfFeat },
+    .{ "modulate_pr", At(elt.modulatePerRow, .f32).run },
+    .{ "gated_add_pr", At(elt.gatedAddPerRow, .f32).run },
+    .{ "dw_conv3", At(elt.dwConv3, .f32).run },
+    .{ "col_mean", At(elt.colMean, .f32).run },
+    .{ "mul_cols_sigmoid", At(elt.mulColsSigmoid, .f32).run },
+    .{ "nerf_feat", At(elt.nerfFeat, .f32).run },
     .{ "patch_scatter", elt.patchScatter },
     .{ "win_gather", elt.winGather },
     .{ "win_scatter", elt.winScatter },
@@ -638,73 +765,78 @@ const bodies = .{
     .{ "mean_heads_pool", elt.meanHeadsPool },
     .{ "dequant_fp8_f16", quant.fp8F16 },
     .{ "dequant_fp8_bf16", quant.fp8Bf16 },
-    .{ "dequant_fp8_f32", quant.fp8F32 },
     .{ "dequant_q8_0_f16", quant.q8_0F16 },
     .{ "dequant_q8_0_bf16", quant.q8_0Bf16 },
-    .{ "dequant_q8_0_f32", quant.q8_0F32 },
     .{ "dequant_q4_0_f16", quant.q4_0F16 },
     .{ "dequant_q4_0_bf16", quant.q4_0Bf16 },
-    .{ "dequant_q4_0_f32", quant.q4_0F32 },
     .{ "dequant_q1_0_f16", quant.q1_0F16 },
     .{ "dequant_q1_0_bf16", quant.q1_0Bf16 },
-    .{ "dequant_q1_0_f32", quant.q1_0F32 },
     .{ "dequant_q2_0_g64_f16", quant.q2_0G64F16 },
     .{ "dequant_q2_0_g64_bf16", quant.q2_0G64Bf16 },
-    .{ "dequant_q2_0_g64_f32", quant.q2_0G64F32 },
     .{ "dequant_q2_0_g128_f16", quant.q2_0G128F16 },
     .{ "dequant_q2_0_g128_bf16", quant.q2_0G128Bf16 },
-    .{ "dequant_q2_0_g128_f32", quant.q2_0G128F32 },
     .{ "dequant_iq4_nl_f16", quant.iq4NlF16 },
     .{ "dequant_iq4_nl_bf16", quant.iq4NlBf16 },
-    .{ "dequant_iq4_nl_f32", quant.iq4NlF32 },
     .{ "dequant_iq4_xs_f16", quant.iq4XsF16 },
     .{ "dequant_iq4_xs_bf16", quant.iq4XsBf16 },
-    .{ "dequant_iq4_xs_f32", quant.iq4XsF32 },
     .{ "dequant_q4_k_f16", quant.q4_kF16 },
     .{ "dequant_q4_k_bf16", quant.q4_kBf16 },
-    .{ "dequant_q4_k_f32", quant.q4_kF32 },
     .{ "dequant_q5_k_f16", quant.q5_kF16 },
     .{ "dequant_q5_k_bf16", quant.q5_kBf16 },
-    .{ "dequant_q5_k_f32", quant.q5_kF32 },
     .{ "dequant_q6_k_f16", quant.q6_kF16 },
     .{ "dequant_q6_k_bf16", quant.q6_kBf16 },
-    .{ "dequant_q6_k_f32", quant.q6_kF32 },
     .{ "dequant_q2_k_f16", quant.q2_kF16 },
     .{ "dequant_q2_k_bf16", quant.q2_kBf16 },
-    .{ "dequant_q2_k_f32", quant.q2_kF32 },
     .{ "dequant_q3_k_f16", quant.q3_kF16 },
     .{ "dequant_q3_k_bf16", quant.q3_kBf16 },
-    .{ "dequant_q3_k_f32", quant.q3_kF32 },
     .{ "dequant_iq2_xxs_f16", quant.iq2XxsF16 },
     .{ "dequant_iq2_xxs_bf16", quant.iq2XxsBf16 },
-    .{ "dequant_iq2_xxs_f32", quant.iq2XxsF32 },
     .{ "dequant_iq2_xs_f16", quant.iq2XsF16 },
     .{ "dequant_iq2_xs_bf16", quant.iq2XsBf16 },
-    .{ "dequant_iq2_xs_f32", quant.iq2XsF32 },
     .{ "dequant_iq3_xxs_f16", quant.iq3XxsF16 },
     .{ "dequant_iq3_xxs_bf16", quant.iq3XxsBf16 },
-    .{ "dequant_iq3_xxs_f32", quant.iq3XxsF32 },
     .{ "dequant_iq3_s_f16", quant.iq3SF16 },
     .{ "dequant_iq3_s_bf16", quant.iq3SBf16 },
-    .{ "dequant_iq3_s_f32", quant.iq3SF32 },
     .{ "gn_combine", elt.gnCombine },
     .{ "softmax_partial", elt.softmaxPartial },
     .{ "softmax_combine", elt.softmaxCombine },
     .{ "rowscale_i8", elt.rowscaleI8 },
-    .{ "qknorm_rope16", elt.qknormRope16 },
-    .{ "qknorm_rope_f32", elt.qknormRopeF32 },
+    .{ "i8row_rot_bf16", quant.i8RowRotBf16 },
+    .{ "i4row_rot_bf16", quant.i4RowRotBf16 },
+    .{ "dequant_i8row_bf16", quant.i8RowBf16 },
+    .{ "i8row_rot_f16", quant.i8RowRotF16 },
+    .{ "i4row_rot_f16", quant.i4RowRotF16 },
+    .{ "dequant_i8row_f16", quant.i8RowF16 },
+    .{ "i8row_rot_f32", quant.i8RowRotF32 },
+    .{ "i4row_rot_f32", quant.i4RowRotF32 },
+    .{ "dequant_i8row_f32", quant.i8RowF32 },
+    .{ "wo_unpack_f32", quant.woUnpackF32 },
+    .{ "transpose_pad_f32", elt.transposePadF32 },
+    .{ "im2col_h16", At(elt.im2colH16, .f32).run },
+    .{ "im2col_h16_f16", At(elt.im2colH16, .f16).run },
+    .{ "im2col_h16_bf16", At(elt.im2colH16, .bf16).run },
+    .{ "im2col_bf16", At(elt.im2colBf16, .f32).run },
+    .{ "im2col_bf16_f16", At(elt.im2colBf16, .f16).run },
+    .{ "im2col_bf16_bf16", At(elt.im2colBf16, .bf16).run },
+    .{ "qknorm_rope", At(elt.qknormRope, .f32).run },
     .{ "l2norm_rows", rows.l2normRows },
     .{ "l2norm_rows_g", rows.l2normRowsG },
-    .{ "act_steer", rows.actSteer },
-    .{ "rmsnorm", rows.rmsnorm },
+    .{ "act_steer", At(rows.actSteer, .f32).run },
+    .{ "attn_rows_f32", attn.attnRowsF32 },
+    .{ "attn_rows_f16", attn.attnRowsF16 },
+    .{ "attn_rows_q8", attn.attnRowsQ8 },
+    .{ "attn_merge", attn.attnMerge },
+    .{ "quantize_q8_1", quant.quantizeQ81 },
+    .{ "gdn_delta_chunk_d64", attn.gdnDeltaChunkD64 },
+    .{ "gdn_delta_chunk_d128", attn.gdnDeltaChunkD128 },
+    .{ "rmsnorm", At(rows.rmsnorm, .f32).run },
+    .{ "qk_norm_rope", rows.qkNormRope },
     .{ "group_rmsnorm", rows.groupRmsnorm },
-    .{ "rms_mod", rows.rmsMod },
-    .{ "rms_mod_h16", rows.rmsModH16 },
-    .{ "layernorm", rows.layernorm },
-    .{ "layernorm_h16", rows.layernormH16 },
-    .{ "ln_mod", rows.lnMod },
-    .{ "gn_stats", rows.gnStats },
-    .{ "gn_stats_h16", rows.gnStatsH16 },
+    .{ "rms_mod", At(rows.rmsMod, .f32).run },
+    .{ "rms_mod_h16", At(rows.rmsModH16, .f32).run },
+    .{ "layernorm", At(rows.layernorm, .f32).run },
+    .{ "ln_mod", At(rows.lnMod, .f32).run },
+    .{ "gn_stats", At(rows.gnStats, .f32).run },
     .{ "rowmax_i8", rows.rowmaxI8 },
     .{ "gemv_dual_q2_k", quant.gemvQ2_k },
     .{ "gemv_dual_q2_k_q8", quant.gemvQ2_kQ8 },
@@ -738,9 +870,136 @@ const bodies = .{
     .{ "gemv_dual_iq3_xxs_q8", quant.gemvIq3XxsQ8 },
     .{ "gemv_dual_iq3_s", quant.gemvIq3S },
     .{ "gemv_dual_iq3_s_q8", quant.gemvIq3SQ8 },
+    .{ "gemv4_dual_q2_k", quant.GemvN(.q2_k).run },
+    .{ "gemv4_dual_q3_k", quant.GemvN(.q3_k).run },
+    .{ "gemv4_dual_q4_k", quant.GemvN(.q4_k).run },
+    .{ "gemv4_dual_q8_0", quant.GemvN(.q8_0).run },
+    .{ "gemv4_dual_q4_0", quant.GemvN(.q4_0).run },
+    .{ "gemv4_dual_iq4_nl", quant.GemvN(.iq4_nl).run },
+    .{ "gemv4_dual_iq4_xs", quant.GemvN(.iq4_xs).run },
+    .{ "gemv4_dual_q5_k", quant.GemvN(.q5_k).run },
+    .{ "gemv4_dual_q6_k", quant.GemvN(.q6_k).run },
+    .{ "gemv4_dual_q1_0", quant.GemvN(.q1_0).run },
+    .{ "gemv4_dual_q2_0_g64", quant.GemvN(.q2_0_g64).run },
+    .{ "gemv4_dual_q2_0_g128", quant.GemvN(.q2_0_g128).run },
+    .{ "gemv4_dual_iq2_xxs", quant.GemvN(.iq2_xxs).run },
+    .{ "gemv4_dual_iq2_xs", quant.GemvN(.iq2_xs).run },
+    .{ "gemv4_dual_iq3_xxs", quant.GemvN(.iq3_xxs).run },
+    .{ "gemv4_dual_iq3_s", quant.GemvN(.iq3_s).run },
+    .{ "attn_rows_g2_f32", attn.AttnRowsG(.f32, 2).run },
+    .{ "attn_rows_g2_f16", attn.AttnRowsG(.f16, 2).run },
+    .{ "attn_rows_g2_q8", attn.AttnRowsG(.q8_0, 2).run },
+    .{ "attn_rows_g4_f32", attn.AttnRowsG(.f32, 4).run },
+    .{ "attn_rows_g4_f16", attn.AttnRowsG(.f16, 4).run },
+    .{ "attn_rows_g4_q8", attn.AttnRowsG(.q8_0, 4).run },
+    .{ "attn_rows_g8_f32", attn.AttnRowsG(.f32, 8).run },
+    .{ "attn_rows_g8_f16", attn.AttnRowsG(.f16, 8).run },
+    .{ "attn_rows_g8_q8", attn.AttnRowsG(.q8_0, 8).run },
+    .{ "add_f16", At(elt.add, .f16).run },
+    .{ "add_bf16", At(elt.add, .bf16).run },
+    .{ "geglu_f16", At(elt.geglu, .f16).run },
+    .{ "geglu_bf16", At(elt.geglu, .bf16).run },
+    .{ "bias_compact_f16", At(elt.biasCompact, .f16).run },
+    .{ "bias_compact_bf16", At(elt.biasCompact, .bf16).run },
+    .{ "add_bias_rows_f16", At(elt.addBiasRows, .f16).run },
+    .{ "add_bias_rows_bf16", At(elt.addBiasRows, .bf16).run },
+    .{ "gn_apply_f16", At(elt.gnApply, .f16).run },
+    .{ "gn_apply_bf16", At(elt.gnApply, .bf16).run },
+    .{ "im2col_sd_f16", At(elt.im2colSd, .f16).run },
+    .{ "im2col_sd_bf16", At(elt.im2colSd, .bf16).run },
+    .{ "qknorm_rope_f16", At(elt.qknormRope, .f16).run },
+    .{ "qknorm_rope_bf16", At(elt.qknormRope, .bf16).run },
+    .{ "layernorm_f16", At(rows.layernorm, .f16).run },
+    .{ "layernorm_bf16", At(rows.layernorm, .bf16).run },
+    .{ "layernorm_f32_f16", At(rows.layernormFrom32, .f16).run },
+    .{ "layernorm_f32_bf16", At(rows.layernormFrom32, .bf16).run },
+    .{ "gn_stats_f16", At(rows.gnStats, .f16).run },
+    .{ "gn_stats_bf16", At(rows.gnStats, .bf16).run },
+    .{ "pad_h16_f16", At(elt.padH16, .f16).run },
+    .{ "pad_h16_bf16", At(elt.padH16, .bf16).run },
+    .{ "pad_bf16_f16", At(elt.padBf16, .f16).run },
+    .{ "pad_bf16_bf16", At(elt.padBf16, .bf16).run },
+    .{ "bias_add_f16", At2(elt.biasAdd, .f16, .f16).run },
+    .{ "bias_add_bf16", At2(elt.biasAdd, .bf16, .bf16).run },
+    .{ "conv_w_bf16", At(elt.convW16, .bf16).run },
+    .{ "bias_add_bf16_f32", At2(elt.biasAdd, .bf16, .f32).run },
+    .{ "scale_i32_f16", At(elt.scaleI32, .f16).run },
+    .{ "scale_i32_bf16", At(elt.scaleI32, .bf16).run },
+    .{ "copy_f16", At2(elt.copy, .f16, .f16).run },
+    .{ "copy_bf16", At2(elt.copy, .bf16, .bf16).run },
+    .{ "copy_f32_f16", At2(elt.copy, .f32, .f16).run },
+    .{ "copy_f32_bf16", At2(elt.copy, .f32, .bf16).run },
+    .{ "copy_f16_f32", At2(elt.copy, .f16, .f32).run },
+    .{ "copy_bf16_f32", At2(elt.copy, .bf16, .f32).run },
+    .{ "concat_ch_f16", At(elt.concatCh, .f16).run },
+    .{ "concat_ch_bf16", At(elt.concatCh, .bf16).run },
+    .{ "compact_acc_f16", At(elt.compactAcc, .f16).run },
+    .{ "compact_acc_bf16", At(elt.compactAcc, .bf16).run },
+    .{ "silu_mul_f16", At(elt.siluMul, .f16).run },
+    .{ "silu_mul_bf16", At(elt.siluMul, .bf16).run },
+    .{ "sigmoid_mul_f16", At(elt.sigmoidMul, .f16).run },
+    .{ "sigmoid_mul_bf16", At(elt.sigmoidMul, .bf16).run },
+    .{ "gated_add_f16", At(elt.gatedAdd, .f16).run },
+    .{ "gated_add_bf16", At(elt.gatedAdd, .bf16).run },
+    .{ "rope_inter_f16", At(elt.ropeInter, .f16).run },
+    .{ "rope_inter_bf16", At(elt.ropeInter, .bf16).run },
+    .{ "act_steer_f16", At(rows.actSteer, .f16).run },
+    .{ "act_steer_bf16", At(rows.actSteer, .bf16).run },
+    .{ "vae_norm", At(rows.vaeNorm, .f32).run },
+    .{ "vae_norm_f16", At(rows.vaeNorm, .f16).run },
+    .{ "vae_norm_bf16", At(rows.vaeNorm, .bf16).run },
+    .{ "rmsnorm_f16", At(rows.rmsnorm, .f16).run },
+    .{ "rmsnorm_bf16", At(rows.rmsnorm, .bf16).run },
+    .{ "rms_mod_f16", At(rows.rmsMod, .f16).run },
+    .{ "rms_mod_bf16", At(rows.rmsMod, .bf16).run },
+    .{ "rms_mod_h16_f16", At(rows.rmsModH16, .f16).run },
+    .{ "rms_mod_h16_bf16", At(rows.rmsModH16, .bf16).run },
+    .{ "modulate_f16", At(elt.modulate, .f16).run },
+    .{ "modulate_bf16", At(elt.modulate, .bf16).run },
+    .{ "kron_mix", At(elt.kronMix, .f32).run },
+    .{ "kron_mix_f16", At(elt.kronMix, .f16).run },
+    .{ "kron_mix_bf16", At(elt.kronMix, .bf16).run },
+    .{ "kron_stack", At(elt.kronStack, .f32).run },
+    .{ "kron_stack_f16", At(elt.kronStack, .f16).run },
+    .{ "kron_stack_bf16", At(elt.kronStack, .bf16).run },
+    .{ "dora_rows", At(elt.doraRows, .f32).run },
+    .{ "dora_rows_f16", At(elt.doraRows, .f16).run },
+    .{ "dora_rows_bf16", At(elt.doraRows, .bf16).run },
+    .{ "dora_cols", At(elt.doraCols, .f32).run },
+    .{ "dora_cols_f16", At(elt.doraCols, .f16).run },
+    .{ "dora_cols_bf16", At(elt.doraCols, .bf16).run },
+    .{ "gelu_erf_f16", At(elt.geluErf, .f16).run },
+    .{ "gelu_erf_bf16", At(elt.geluErf, .bf16).run },
+    .{ "silu_f16", At(elt.silu, .f16).run },
+    .{ "silu_bf16", At(elt.silu, .bf16).run },
+    .{ "modulate_pr_f16", At(elt.modulatePerRow, .f16).run },
+    .{ "modulate_pr_bf16", At(elt.modulatePerRow, .bf16).run },
+    .{ "gated_add_pr_f16", At(elt.gatedAddPerRow, .f16).run },
+    .{ "gated_add_pr_bf16", At(elt.gatedAddPerRow, .bf16).run },
+    .{ "dw_conv3_f16", At(elt.dwConv3, .f16).run },
+    .{ "dw_conv3_bf16", At(elt.dwConv3, .bf16).run },
+    .{ "col_mean_f16", At(elt.colMean, .f16).run },
+    .{ "col_mean_bf16", At(elt.colMean, .bf16).run },
+    .{ "mul_cols_sigmoid_f16", At(elt.mulColsSigmoid, .f16).run },
+    .{ "mul_cols_sigmoid_bf16", At(elt.mulColsSigmoid, .bf16).run },
+    .{ "nerf_feat_f16", At(elt.nerfFeat, .f16).run },
+    .{ "nerf_feat_bf16", At(elt.nerfFeat, .bf16).run },
+    .{ "ln_mod_f16", At(rows.lnMod, .f16).run },
+    .{ "ln_mod_bf16", At(rows.lnMod, .bf16).run },
+    .{ "gelu_f16", At(elt.gelu, .f16).run },
+    .{ "gelu_bf16", At(elt.gelu, .bf16).run },
+    .{ "flag_nonfinite", At(elt.flagNonFinite, .f32).run },
+    .{ "flag_nonfinite_f16", At(elt.flagNonFinite, .f16).run },
+    .{ "flag_nonfinite_bf16", At(elt.flagNonFinite, .bf16).run },
+    .{ "add_scaled_f16", At(elt.addScaled, .f16).run },
+    .{ "add_scaled_bf16", At(elt.addScaled, .bf16).run },
+    .{ "gated_add_scaled", At(elt.gatedAddScaled, .f32).run },
+    .{ "gated_add_scaled_f16", At(elt.gatedAddScaled, .f16).run },
+    .{ "gated_add_scaled_bf16", At(elt.gatedAddScaled, .bf16).run },
 };
 
 comptime {
+    @setEvalBranchQuota(100_000);
     if (bodies.len != table.entries.len) @compileError("dual.zig bodies and dual_table.zig entries differ in count");
     for (bodies, table.entries) |b_, t| {
         if (!std.mem.eql(u8, b_[0], t.name)) @compileError("dual.zig body order differs from dual_table.zig at " ++ b_[0]);

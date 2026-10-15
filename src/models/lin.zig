@@ -14,6 +14,13 @@ const std = @import("std");
 const tp_core = @import("tp_core");
 const ops = @import("tp_ops");
 
+/// The activation storage of a device stream every op of which takes 16 bits, when `want`
+/// is asked for: `want`, except under an activation capture, which reads what the f32
+/// stream holds.
+pub fn streamAct(comptime Dt: type, want: Dt) Dt {
+    return if (ops.matmul.probe != null) .f32 else want;
+}
+
 pub const DType = tp_core.dtype.DType;
 pub const Weight = ops.matmul.Weight;
 
@@ -95,6 +102,26 @@ pub fn prepOf(k: Kind) Prep {
 /// apply it, and one prep serves every GEMM in a group, so a checkpoint that mixes the
 /// two has no prep that is right for all of them. W4A8 is counted: it decodes to a
 /// rotated int8 weight and takes int8's prep.
+/// Whether any of `lins` is an integer convrot weight (int8, int4, W4A8), the storage an
+/// `IntGemm` policy governs.
+pub fn anyInteger(lins: []const Weight) bool {
+    return integerKind(lins) != null;
+}
+
+/// The most common integer convrot kind among `lins`, or null for none.
+pub fn integerKind(lins: []const Weight) ?Kind {
+    var n = [3]usize{ 0, 0, 0 };
+    for (lins) |w| switch (kindOf(w.dtype)) {
+        .i8 => n[0] += 1,
+        .i4 => n[1] += 1,
+        .w4a8 => n[2] += 1,
+        else => {},
+    };
+    const best = std.mem.indexOfMax(usize, &n);
+    if (n[best] == 0) return null;
+    return ([3]Kind{ .i8, .i4, .w4a8 })[best];
+}
+
 pub fn convrot(lins: []const Weight) ?bool {
     var seen: ?bool = null;
     for (lins) |w| {
@@ -171,6 +198,7 @@ pub fn rowSlice(alloc: std.mem.Allocator, w: Weight, row0: usize, nrows: usize) 
     const row_bytes = w.dtype.storageBytes(w.cols);
     var s = w;
     s.rows = nrows;
+    s.row_off = w.row_off + row0;
     s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
     if (w.row_scale) |rs| s.row_scale = rs[row0..][0..nrows];
     if (w.nvfp4) |m| {

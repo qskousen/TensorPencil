@@ -40,6 +40,7 @@
 //! `sd_vae`; the store's mapping need not outlive the model.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
@@ -48,6 +49,7 @@ const ops = @import("tp_ops");
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 const Conv2d = ops.conv.Conv2d;
+const quant_weight = @import("quant_weight.zig");
 
 pub const latent_channels = 128;
 pub const spatial_scale = 16;
@@ -264,6 +266,51 @@ pub const MageVae = struct {
         norm_out: NormW,
         proj_out: Conv2d, // 1x1 hidden -> 2 * latent_channels
     };
+
+    /// Every convolution, decode and encode. Caller frees the list.
+    pub fn convList(self: *MageVae, gpa: std.mem.Allocator) ![]*Conv2d {
+        var out: std.ArrayList(*Conv2d) = .empty;
+        errdefer out.deinit(gpa);
+        const Walk = struct {
+            fn dico(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, bs: []DiCo) !void {
+                for (bs) |*b| try o.appendSlice(a, &.{ &b.conv1, &b.conv3, &b.conv4, &b.conv5 });
+            }
+            fn res(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, r: *Resnet) !void {
+                try o.appendSlice(a, &.{ &r.conv1, &r.conv2 });
+            }
+            fn attn(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, w: *WinAttn) !void {
+                try o.appendSlice(a, &.{ &w.q, &w.k, &w.v, &w.proj });
+            }
+        };
+        const c = &self.cod;
+        try out.appendSlice(gpa, &.{ &c.conv_in, &c.conv_out, &self.s_proj1, &self.s_proj2 });
+        try Walk.res(&out, gpa, &c.r0);
+        try Walk.res(&out, gpa, &c.r1);
+        try Walk.res(&out, gpa, &c.r2);
+        try Walk.attn(&out, gpa, &c.a0);
+        try Walk.attn(&out, gpa, &c.a1);
+        try Walk.dico(&out, gpa, self.blocks);
+        if (self.enc) |*e| {
+            try out.appendSlice(gpa, &.{ &e.patch_cond, &e.proj_down, &e.z_proj, &e.fuse, &e.proj_out });
+            try Walk.dico(&out, gpa, e.head_blocks);
+            try Walk.dico(&out, gpa, e.blocks);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Repack every checkpoint-order conv to f32 into the model arena, for an arm that
+    /// reads only that and keys its weights on host addresses (Vulkan). Idempotent.
+    pub fn repackConvs(self: *MageVae, gpa: std.mem.Allocator) !void {
+        const convs = try self.convList(gpa);
+        defer gpa.free(convs);
+        const a = self.arena.allocator();
+        for (convs) |cv| if (cv.w == .torch) {
+            // A local first: assigning the union literal in place would switch `cv.w`
+            // before `materialize` reads it.
+            const krsc = try cv.materialize(a);
+            cv.w = .{ .krsc = krsc };
+        };
+    }
 
     /// Whether this store holds a Mage-VAE at all.
     pub fn fits(store: WeightStore, prefix: []const u8) bool {
@@ -909,9 +956,10 @@ const Loader = struct {
         return .{ .w = try l.vec(fmt, args, ".weight", ch), .b = try l.vec(fmt, args, ".bias", ch) };
     }
 
-    /// A conv weight as f32 in im2col patch order. `[co, ci]` is accepted for a
-    /// 1x1 because an `nn.Linear` of the same widths is byte-identical.
-    fn convW(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize) !struct { w: []f32, tag: []u8 } {
+    /// A conv weight, kept in checkpoint order where every reader converts it
+    /// (`quant_weight.convWeights`). `[co, ci]` is accepted for a 1x1 because an
+    /// `nn.Linear` of the same widths is byte-identical.
+    fn convW(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize) !struct { w: ops.conv.Weights, tag: []u8 } {
         var buf: [200]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, ".weight");
         const v = try l.view(nm);
@@ -922,9 +970,7 @@ const Loader = struct {
             std.log.err("mage_vae: {s} has shape {any}, expected [{d}, {d}, {d}, {d}]", .{ nm, shape, co, ci, k, k });
             return error.ShapeMismatch;
         }
-        const torch_w = try v.toF32Alloc(l.alloc);
-        defer l.alloc.free(torch_w);
-        return .{ .w = try ops.conv.packWeight(l.alloc, torch_w, co, ci, k), .tag = try l.alloc.dupe(u8, nm) };
+        return .{ .w = try quant_weight.convWeights(l.alloc, v, co, ci, k), .tag = try l.alloc.dupe(u8, nm) };
     }
 
     fn conv(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize, stride: usize, pad: usize) !Conv2d {
@@ -1068,7 +1114,7 @@ const test_gate = @import("../test_gate.zig");
 const SafeTensors = safetensors.SafeTensors;
 
 const ref_path = "src/models/assets/mage_vae_ref.safetensors";
-const vae_ckpt = "/home/qt/genai/comfyui/models/vae/mage_flow_vae_bf16.safetensors";
+const vae_ckpt = build_options.model_root ++ "/vae/mage_flow_vae_bf16.safetensors";
 
 fn relL2(want: []const f32, got: []const f32) f64 {
     std.debug.assert(want.len == got.len);

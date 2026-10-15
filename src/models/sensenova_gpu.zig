@@ -1,6 +1,6 @@
-//! GPU-resident SenseNova U1.5 on Vulkan, the device twin of `models/sensenova.zig`
-//! and the sibling of `sensenova_cuda.zig`, which its stage order follows exactly so
-//! the two can be diffed.
+//! GPU-resident SenseNova U1.5 on Vulkan, the device twin of `models/sensenova.zig`.
+//! The passes themselves are `sensenova_dev.zig`; this is their adapter (`Dev`) and
+//! what the backend owns.
 //!
 //! Both passes run here, and they are different shapes rather than one shape twice:
 //!
@@ -27,7 +27,9 @@
 
 const std = @import("std");
 const sensenova = @import("sensenova.zig");
-const lin = @import("lin.zig");
+const conv_gpu = @import("conv_gpu.zig");
+const lin_gpu = @import("lin_gpu.zig");
+const sensenova_dev = @import("sensenova_dev.zig");
 const sd_unet_gpu = @import("sd_unet_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
@@ -37,11 +39,17 @@ const Config = sensenova.Config;
 const Prefix = sensenova.Prefix;
 const Context = gpu.Context;
 const Buf = gpu.DeviceBuffer;
+const Dt = gpu.Dt;
 const Weight = ops.matmul.Weight;
 
 /// Force the naive one-thread-per-(query, head) attention instead of the flash
 /// pipeline. For A/B and for reproducing a mismatch; the device test runs both.
 pub var force_naive_attn: bool = false;
+
+/// Run integer weights weight-only, so the device check can split a W8A8 forward's
+/// activation noise from everything else. At f16 (`weight_only_f16`): a bf16 expansion
+/// rounds every int8-times-scale weight to 8 bits and read 2x the dense floor at depth.
+pub var force_weight_only: bool = false;
 
 /// The flash pipeline tiles queries 128 at a time and stages keys the same way.
 const flash_tile = 128;
@@ -50,57 +58,32 @@ const flash_tile = 128;
 /// [4096][9216] patch in one allocation.
 const patch_band_bytes: usize = 64 << 20;
 
-/// Widest zero bias any linear here needs (`inter`).
-///
-/// Passed WHOLE, never sliced: `smallBuffer` caches by host POINTER alone and sizes
-/// from the first call, so once a narrow GEMM cached it a wider one would read off
-/// the end. The dispatch reads only `rows` entries, so one full-width buffer serves
-/// every GEMM, the rule `dit_gpu`, `zimage_gpu` and `anima_gpu` all record.
-const zero_bias: [sensenova.u15_8b.inter]f32 = @splat(0);
+/// The generation stream runs as a trunk; the prompt pass is a conditioning, so its
+/// block quants stay on the f16 expansion and its integer weights take the
+/// conditioning policy, both of which keep the activation unquantized.
+const gen_use: lin_gpu.Use = .{ .blockq = .auto };
+fn prefixUse() lin_gpu.Use {
+    return .{ .blockq = .f16, .int8 = lin_gpu.dual_lin.encoderInt8() };
+}
 
-/// Whether this context can run every linear this model has, in BOTH streams.
-///
-/// Both lists, not just the generation one: a checkpoint that quantized the two MoT
-/// copies differently would otherwise build a session and fail inside the encode.
+/// The generation stream's linear plan, without a LoRA.
+pub fn canvasPlan(ctx: *Context, model: *const Model) !lin_gpu.Plan {
+    return lin_gpu.plan(ctx, model.device_lins, gen_use, "sensenova_gpu");
+}
+
+/// Whether this context can run every linear this model has, in BOTH streams: a
+/// checkpoint that quantized the two MoT copies differently would otherwise build a
+/// session and fail inside the encode.
 pub fn supported(ctx: *Context, model: *const Model) bool {
     if (model.layers.len == 0) return false;
-    // This arm has no sidecar apply yet, and rendering the base GEMMs alone is a
-    // different model with no error anywhere. Refusing sends the trunk to the
-    // CPU, which is slow and right.
-    if (model.lora != null) {
-        std.log.warn("sensenova_gpu: no LoRA sidecar path on Vulkan; running the trunk on the CPU instead", .{});
-        return false;
-    }
-    // The generation attention has no non-tensor-core form that is also fast enough
-    // to render with, but it does have a correct one, so a device without the flash
-    // pipeline is not refused here; `Session.tc` records what it got and `attention`
-    // branches on that.
-    const has_i8 = ctx.pipe_coop_i8 != .null_handle;
-    const has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
-    const caps: lin.Caps = .{
-        .f32 = true,
-        .fp8 = true,
-        .bf16 = has_f16w,
-        .f16 = has_f16w,
-        .i8 = has_i8,
-        .i4 = has_i8 and ctx.hasI4Decode(),
-        .w4a8 = has_i8 and ctx.hasW4A8Decode(),
-        .nvfp4 = ctx.hasNvfp4Decode(),
-    };
     // The convolutions are f32 weights through the f16-weight coop GEMM, and there is
-    // no scalar fallback wide enough to be worth offering: without it the patch
-    // embedder and fm_head have no path.
-    if (!has_f16w) {
+    // no scalar fallback wide enough to be worth offering.
+    if (ctx.pipe_coop_bf16w == .null_handle and ctx.pipe_coop_f16w == .null_handle) {
         std.log.err("sensenova_gpu: this device has no f16-weight GEMM, which the convolutions need", .{});
         return false;
     }
-    for ([2][]const Weight{ model.device_lins, model.prefix_lins }) |lins| {
-        if (lin.unsupported(lins, caps)) |bad| {
-            std.log.err("sensenova_gpu: {s} is {t}, which this device has no GEMM for", .{ bad.tag, bad.dtype });
-            return false;
-        }
-    }
-    return true;
+    return lin_gpu.runs(ctx, model.device_lins, gen_use, model.lora, "sensenova_gpu") and
+        lin_gpu.runs(ctx, model.prefix_lins, prefixUse(), model.lora, "sensenova_gpu prefix");
 }
 
 // --- shared pieces ----------------------------------------------------------
@@ -121,37 +104,19 @@ fn uploadU32(ctx: *Context, values: []const u32) !Buf {
     return buf;
 }
 
-/// A rotate-half table flattened as `cos` then `sin`, the layout every rope kernel
-/// here reads with `sin_off = rows * half`.
+/// A `sensenova.FlatRope` on the device.
 const Table = struct {
     buf: Buf,
     half: usize,
     sin_off: usize,
 
-    fn init(ctx: *Context, gpa: std.mem.Allocator, rows: usize, span: usize, theta: f64) !Table {
-        var f = try ops.rope.rotateHalfFreqs(gpa, rows, span, theta);
-        defer f.deinit(gpa);
-        return upload(ctx, gpa, f, rows);
-    }
-
-    fn initInterleaved(ctx: *Context, gpa: std.mem.Allocator, rows: usize, dim: usize, theta: f64) !Table {
-        const pos = try gpa.alloc(f32, rows);
-        defer gpa.free(pos);
-        for (pos, 0..) |*p, i| p.* = @floatFromInt(i);
-        var f = try ops.rope.fluxFreqs(gpa, pos, &.{dim}, theta);
-        defer f.deinit(gpa);
-        return upload(ctx, gpa, f, rows);
-    }
-
-    fn upload(ctx: *Context, gpa: std.mem.Allocator, f: ops.rope.Freqs, rows: usize) !Table {
-        const flat = try gpa.alloc(f32, 2 * rows * f.half);
-        defer gpa.free(flat);
-        @memcpy(flat[0 .. rows * f.half], f.cos[0 .. rows * f.half]);
-        @memcpy(flat[rows * f.half ..], f.sin[0 .. rows * f.half]);
-        var buf = try ctx.tensorCreate(flat.len * 4);
+    fn init(ctx: *Context, gpa: std.mem.Allocator, rows: usize, span: usize, theta: f64, interleaved: bool) !Table {
+        const f = try sensenova.FlatRope.init(gpa, rows, span, theta, interleaved);
+        defer gpa.free(f.data);
+        var buf = try ctx.tensorCreate(f.data.len * 4);
         errdefer ctx.tensorDestroy(&buf);
-        try ctx.tensorUpload(buf, std.mem.sliceAsBytes(flat));
-        return .{ .buf = buf, .half = f.half, .sin_off = rows * f.half };
+        try ctx.tensorUpload(buf, std.mem.sliceAsBytes(f.data));
+        return .{ .buf = buf, .half = f.half, .sin_off = f.sin_off };
     }
 
     fn deinit(self: *Table, ctx: *Context) void {
@@ -175,7 +140,7 @@ fn groupNorm(ctx: *Context, x: Buf, w: Buf, rows: usize, dim: usize, groups: usi
 }
 
 /// The per-head norms and the three-span rope, applied to a q or k buffer in place.
-fn qkPrepare(
+fn qkPrepareAt(
     ctx: *Context,
     cfg: Config,
     x: Buf,
@@ -204,147 +169,22 @@ fn qkPrepare(
     }
 }
 
-/// A non-overlapping k x k stride-k convolution over channel-last `[h][w][ci]`:
-/// gather the patch matrix, then one GEMM. `dst` is `[h/k * w/k][co]`.
-fn convStride(ctx: *Context, patch: *Buf, dst: Buf, src: Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
-    std.debug.assert(h % cv.k == 0 and w % cv.k == 0);
-    const n_out = (h / cv.k) * (w / cv.k);
-    const plen = cv.k * cv.k * cv.ci;
-    const total = n_out * plen;
-    try ctx.ensureDeviceBuffer(patch, total * 4);
-    try ctx.opElt(.im2col_stride, src, patch.*, null, null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(cv.ci),
-        .u2 = @intCast(cv.k),
-        .u3 = @intCast(w),
-    }, total, 1, 1);
-    try ctx.opMatmulCoopF16W(dst, 0, patch.*, n_out, cv.w, cv.co, plen, cv.b.?);
-}
-
-/// A 3x3 pad-1 stride-1 convolution over channel-last `[h][w][ci]`, through the SD
-/// family's banded im2col and the same f16-weight GEMM.
-fn conv3x3(ctx: *Context, patch: *Buf, dst: *Buf, src: *const Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
-    std.debug.assert(cv.k == 3 and cv.stride == 1 and cv.pad == 1);
-    try sd_unet_gpu.convIntoPrec(ctx, patch, dst, src, h, w, cv, .stride1, null, null, 1.0, false, false);
-}
 
 /// Concatenate within the recorded batch: `dst[dst_off..][0..n] = src[src_off..]`.
 ///
 /// `Context.tensorCopy` would do the same bytes, but it runs on the immediate command
 /// buffer and flushes any open batch, which would cut every layer into three
 /// submissions.
+/// Casts when the two dtypes differ, which happens only at the trunk's ends.
 fn copyInto(ctx: *Context, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
-    try ctx.opElt(.copy, src, dst, null, null, .{
+    try ctx.opElt(gpu.eltCopy(src.dt, dst.dt), src, dst, null, null, .{
         .u0 = @intCast(n),
         .u2 = @intCast(dst_off),
         .u3 = @intCast(src_off),
     }, n, 1, 1);
 }
 
-// --- linears ----------------------------------------------------------------
-
-/// Quantize+rotate the activation once for a group of GEMMs that share it, if any
-/// member needs it. Mirrors `anima_gpu.prepGroup`, and see it for why `.i4` takes the
-/// int8 prep on this backend.
-fn prepGroup(ctx: *Context, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
-    var want: lin.Prep = .none;
-    for (group) |w| {
-        const k = lin.prepOf(lin.kindOf(w.dtype));
-        if (k == .none) continue;
-        if (want != .none and want != k) {
-            std.log.err("sensenova_gpu: a linear group mixes {t} and {t} activation preps; one cannot serve both", .{ want, k });
-            return error.UnsupportedCheckpoint;
-        }
-        want = k;
-    }
-    switch (want) {
-        .i8, .i4 => {
-            // Whether the prep rotates is the checkpoint's answer (`lin.convrot`): the
-            // group rotation cancels across the GEMM only when both sides apply it.
-            const rot = lin.convrot(group) orelse {
-                std.log.err("sensenova_gpu: a linear group mixes convrot and plain int8 weights; one activation prep cannot serve both", .{});
-                return error.UnsupportedCheckpoint;
-            };
-            // `i4Decode` emits a weight quantized after the rotation and has no
-            // unrotated build.
-            if (want == .i4 and !rot) {
-                std.log.err("sensenova_gpu: int4 without convrot has no unrotated decode on this backend", .{});
-                return error.UnsupportedCheckpoint;
-            }
-            try ctx.opI8PrepR(x, m, cols, rot);
-        },
-        .none => {},
-    }
-}
-
-/// One trunk linear. A quantized weight reads the prep state and fuses the per-row
-/// rescale; a dense one goes to `gemm`.
-///
-/// `opI8Gemm` wants `rows % 64 == 0`; every linear the device runs here is 1024,
-/// 4096 or 12288.
-fn linear(ctx: *Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    switch (lin.kindOf(w.dtype)) {
-        .i8 => {
-            std.debug.assert(w.rows % 64 == 0);
-            try ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
-        },
-        .i4 => {
-            std.debug.assert(w.rows % 64 == 0);
-            const wbuf = try ctx.i4Decode(w.bytes, w.rows, w.cols);
-            try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, false);
-        },
-        .w4a8 => {
-            std.debug.assert(w.rows % 64 == 0);
-            const meta = w.w4a8.?;
-            const wbuf = try ctx.w4a8Decode(w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.rows, w.cols, meta.group_size);
-            try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, false);
-        },
-        .nvfp4 => {
-            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
-            const meta = w.nvfp4.?;
-            const zeros: []const f32 = &zero_bias;
-            std.debug.assert(w.rows <= zeros.len);
-            try ctx.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
-        },
-        else => try gemm(ctx, y, x, m, w),
-    }
-}
-
-/// A dense linear. Every trunk weight is bias-free, but the f16-weight coop GEMM
-/// always folds one in, so it is handed the FULL zero vector (see `zero_bias`).
-fn gemm(ctx: *Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    const zeros: []const f32 = &zero_bias;
-    std.debug.assert(w.rows <= zeros.len);
-    switch (w.dtype) {
-        .bf16 => {
-            if (ctx.pipe_coop_bf16w != .null_handle) {
-                try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, zeros);
-            } else {
-                try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, zeros);
-            }
-        },
-        .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
-        .f32, .f8_e4m3 => try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null),
-        // `supported` gates this before a session is built, so reaching it is a
-        // programming error rather than a bad checkpoint.
-        else => return error.UnsupportedDType,
-    }
-}
-
 // --- attention --------------------------------------------------------------
-
-/// Everything the two attention forms need that is not a workspace buffer.
-const AttnArgs = struct {
-    /// Rows of `kcat`/`vcat` already filled with the prefix cache; 0 for the prefix
-    /// pass, which attends over itself alone.
-    prefix_rows: usize,
-    scale: f32,
-    /// Per-query key range (`u32[2*rows]`, starts then ends) when the pass is masked.
-    /// Null means unmasked over the whole of `seq_kv`, which is the generation pass.
-    bounds: ?Buf,
-    /// True when the flash pipeline's f16 operands are wanted and sized for.
-    tc: bool,
-};
 
 /// Attention from `b.q` against `b.kcat`/`b.vcat` into `b.attn`.
 ///
@@ -353,14 +193,15 @@ const AttnArgs = struct {
 /// what the prefix pass and a mismatch hunt want; the flash one tiles it on the
 /// tensor cores, which is what a render at 1024 canvas tokens against a 1289-key
 /// context wants.
-fn attention(ctx: *Context, cfg: Config, b: LayerBufs, rows: usize, seq_kv: usize, a: AttnArgs) !void {
+fn attentionAt(ctx: *Context, cfg: Config, b: LayerBufs, rows: usize, seq_kv: usize, tc: bool) !void {
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
     const hd = cfg.head_dim;
     const heads = cfg.n_heads;
     const n_kv = cfg.n_kv_heads;
-    if (!a.tc) {
+    if (!tc) {
         // The bounds buffer is the mask. `Workspace`/`PrefixWs` fill an unmasked one
         // with `[0, seq_kv)` for every row, so this arm never needs a second kernel.
-        return ctx.attnBatchedDispatch(rows, heads, n_kv, hd, a.scale);
+        return ctx.attnBatchedDispatch(rows, heads, n_kv, hd, scale);
     }
     const q_pad = std.mem.alignForward(usize, rows, flash_tile);
     const kv_pad = std.mem.alignForward(usize, seq_kv, flash_tile);
@@ -368,7 +209,7 @@ fn attention(ctx: *Context, cfg: Config, b: LayerBufs, rows: usize, seq_kv: usiz
     try ctx.opElt(.f32_to_h16, b.q, null, null, b.q16, .{
         .u0 = @intCast(q_pad * heads * hd / 2),
         .u1 = @intCast(rows * heads * hd),
-        .f0 = a.scale,
+        .f0 = scale,
     }, q_pad * heads * hd / 2, 1, 1);
     try ctx.opElt(.gather_kmajor_h16, b.kcat, null, null, b.k16, .{
         .u0 = @intCast(n_kv * hd * kv_pad / 2),
@@ -484,6 +325,7 @@ pub fn prefixForward(
     gpa: std.mem.Allocator,
     layout: sensenova.PromptLayout,
     refs: []const sensenova.RefImage,
+    act: Dt,
     cancel: ?*std.atomic.Value(bool),
 ) !Prefix {
     const cfg = model.cfg;
@@ -501,33 +343,26 @@ pub fn prefixForward(
 
     var ws = try PrefixWs.init(ctx, cfg, seq);
     defer ws.deinit(ctx);
-
-    // The position arrays are `usize` on the host and `u32` on the device; the tables
-    // are sized to the largest position each axis actually reaches, which is 1 row for
-    // the hw axes of a prompt with no pictures in it.
-    const pos32 = try gpa.alloc(u32, 3 * seq);
-    defer gpa.free(pos32);
-    var maxpos = [3]usize{ 0, 0, 0 };
-    for ([3][]const usize{ layout.pos_t, layout.pos_h, layout.pos_w }, 0..) |src, axis| {
-        for (src, 0..) |v, i| {
-            pos32[axis * seq + i] = @intCast(v);
-            maxpos[axis] = @max(maxpos[axis], v);
-        }
+    inline for (.{ "x", "nrm", "mg", "mu" }) |name| @field(ws, name).dt = sensenova_dev.streamDtFor(act);
+    var plin = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.maxRows(model.prefix_lins), 0, 0);
+    defer plin.deinit();
+    var pplan = try lin_gpu.plan(ctx, model.prefix_lins, prefixUse(), "sensenova_gpu prefix");
+    try lin_gpu.presize(ctx, pplan, model.prefix_lins);
+    if (model.lora) |st| {
+        pplan.lora = st;
+        try plin.presizeLora(st, model.prefix_lins, std.mem.alignForward(usize, seq, 128));
     }
 
-    var tab_t = try Table.init(ctx, gpa, maxpos[0] + 1, cfg.spanT(), cfg.theta_t);
+    var pp = try sensenova.PromptPositions.init(gpa, layout);
+    defer gpa.free(pp.pos);
+    var tab_t = try Table.init(ctx, gpa, pp.max[0] + 1, cfg.spanT(), cfg.theta_t, false);
     defer tab_t.deinit(ctx);
-    var tab_h = try Table.init(ctx, gpa, maxpos[1] + 1, cfg.spanHw(), cfg.theta_hw);
+    var tab_h = try Table.init(ctx, gpa, pp.max[1] + 1, cfg.spanHw(), cfg.theta_hw, false);
     defer tab_h.deinit(ctx);
-    var tab_w = try Table.init(ctx, gpa, maxpos[2] + 1, cfg.spanHw(), cfg.theta_hw);
+    var tab_w = try Table.init(ctx, gpa, pp.max[2] + 1, cfg.spanHw(), cfg.theta_hw, false);
     defer tab_w.deinit(ctx);
-    var pos_bufs = [3]Buf{
-        try uploadU32(ctx, pos32[0..seq]),
-        try uploadU32(ctx, pos32[seq..][0..seq]),
-        try uploadU32(ctx, pos32[2 * seq ..][0..seq]),
-    };
+    var pos_bufs = [3]Buf{ try uploadU32(ctx, pp.axis(0)), try uploadU32(ctx, pp.axis(1)), try uploadU32(ctx, pp.axis(2)) };
     defer for (&pos_bufs) |*p| ctx.tensorDestroy(p);
-    const tables = [3]Table{ tab_t, tab_h, tab_w };
 
     {
         const pair = try boundsTable(gpa, seq, seq, layout.kv_end);
@@ -539,47 +374,24 @@ pub fn prefixForward(
         // trunk's 8B, and it runs once per conditioning rather than per step.
         const emb = try model.embedPrompt(io, gpa, layout, refs);
         defer gpa.free(emb);
-        try ctx.tensorUpload(ws.x, std.mem.sliceAsBytes(emb));
+        try ctx.tensorUpload(ws.dlt, std.mem.sliceAsBytes(emb));
     }
     // Bound BEFORE the first batch, and once: the five buffers are the same at every
     // layer, and the descriptor set is persistent, so rewriting it mid-batch would
     // touch a set already referenced by recorded commands.
     ctx.attnBatchedBind(ws.q, ws.k, ws.v, ws.attn, ws.bounds);
 
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    for (model.layers, 0..) |*layer, li| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        try ctx.beginBatch();
-        errdefer if (ctx.batching) ctx.abortBatch();
-        try layerForward(ctx, cfg, &layer.base, .{
-            .x = ws.x,
-            .nrm = ws.nrm,
-            .dlt = ws.dlt,
-            .q = ws.q,
-            .k = ws.k,
-            .v = ws.v,
-            .kcat = ws.k,
-            .vcat = ws.v,
-            .attn = ws.attn,
-            .mg = ws.mg,
-            .mu = ws.mu,
-            .q16 = ws.q,
-            .k16 = ws.k,
-            .v16 = ws.v,
-        }, seq, seq, .{
-            .pos = pos_bufs,
-            .tables = tables,
-            .norm_q = try smallBuf(ctx, layer.base.q_norm_pair),
-            .norm_k = try smallBuf(ctx, layer.base.k_norm_pair),
-            .attn = .{ .prefix_rows = 0, .scale = scale, .bounds = ws.bounds, .tc = false },
-        });
-        try ctx.endBatch();
-        // Down per layer rather than at the end: the whole cache is 172 KB per token
-        // per layer, and holding 42 layers of it on the device as well as on the host
-        // would cost the generation stack the room it needs.
-        try ctx.tensorDownloadAt(ws.k, 0, std.mem.sliceAsBytes(pre.kv[(li * 2) * seq * cfg.kvDim() ..][0 .. seq * cfg.kvDim()]));
-        try ctx.tensorDownloadAt(ws.v, 0, std.mem.sliceAsBytes(pre.kv[(li * 2 + 1) * seq * cfg.kvDim() ..][0 .. seq * cfg.kvDim()]));
-    }
+    try sensenova_dev.prefix(Dev{
+        .ctx = ctx,
+        .l = &plin,
+        .plan = pplan,
+        .cfg = cfg,
+        .b = .{ .x = ws.x, .nrm = ws.nrm, .dlt = ws.dlt, .q = ws.q, .k = ws.k, .v = ws.v, .kcat = ws.k, .vcat = ws.v, .attn = ws.attn, .mg = ws.mg, .mu = ws.mu, .q16 = ws.q, .k16 = ws.k, .v16 = ws.v },
+        .pos = pos_bufs,
+        .tables = .{ tab_t, tab_h, tab_w },
+        .tc = false,
+        .kv = pre.kv,
+    }, model, seq, cancel);
     return pre;
 }
 
@@ -615,6 +427,9 @@ pub const Session = struct {
     pos_w: Buf,
     vis_x: Buf,
     vis_y: Buf,
+    /// The generation stream's dispatch, and what it decided for this checkpoint.
+    lin: lin_gpu.Lin,
+    lin_plan: lin_gpu.Plan,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -631,8 +446,18 @@ pub const Session = struct {
         const gw = pw / cfg.patch;
         const th = ph / cfg.tokenPx();
         const tw = pw / cfg.tokenPx();
+        var l = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.maxRows(model.device_lins), 0, 0);
+        errdefer l.deinit();
+        var lp = try canvasPlan(ctx, model);
+        if (force_weight_only) lp.int8 = .weight_only_f16;
+        if (model.lora) |st| {
+            lp.lora = st;
+            try l.presizeLora(st, model.device_lins, std.mem.alignForward(usize, th * tw, 128));
+        }
 
         var self: Session = .{
+            .lin = l,
+            .lin_plan = lp,
             .cfg = cfg,
             .lat_h = lat_h,
             .lat_w = lat_w,
@@ -674,49 +499,21 @@ pub const Session = struct {
         try ctx.tensorUpload(self.prefix_kv, std.mem.sliceAsBytes(pre.kv));
 
         // Every image token takes the same t index, one past the whole prefix.
-        self.tab_t = try Table.init(ctx, gpa, pre.time + 1, cfg.spanT(), cfg.theta_t);
+        self.tab_t = try Table.init(ctx, gpa, pre.time + 1, cfg.spanT(), cfg.theta_t, false);
         made += 1;
-        self.tab_h = try Table.init(ctx, gpa, th, cfg.spanHw(), cfg.theta_hw);
+        self.tab_h = try Table.init(ctx, gpa, th, cfg.spanHw(), cfg.theta_hw, false);
         made += 1;
-        self.tab_w = try Table.init(ctx, gpa, tw, cfg.spanHw(), cfg.theta_hw);
+        self.tab_w = try Table.init(ctx, gpa, tw, cfg.spanHw(), cfg.theta_hw, false);
         made += 1;
-        self.tab_vx = try Table.initInterleaved(ctx, gpa, gw, cfg.vis_dim / 2, cfg.theta_vis);
+        self.tab_vx = try Table.init(ctx, gpa, gw, cfg.vis_dim / 2, cfg.theta_vis, true);
         made += 1;
-        self.tab_vy = try Table.initInterleaved(ctx, gpa, gh, cfg.vis_dim / 2, cfg.theta_vis);
+        self.tab_vy = try Table.init(ctx, gpa, gh, cfg.vis_dim / 2, cfg.theta_vis, true);
         made += 1;
 
-        {
-            const n_img = self.n_img;
-            const t = try gpa.alloc(u32, n_img);
-            defer gpa.free(t);
-            const h = try gpa.alloc(u32, n_img);
-            defer gpa.free(h);
-            const w = try gpa.alloc(u32, n_img);
-            defer gpa.free(w);
-            for (0..n_img) |i| {
-                t[i] = pre.time;
-                h[i] = @intCast(i / tw);
-                w[i] = @intCast(i % tw);
-            }
-            self.pos_t = try uploadU32(ctx, t);
-            made += 1;
-            self.pos_h = try uploadU32(ctx, h);
-            made += 1;
-            self.pos_w = try uploadU32(ctx, w);
-            made += 1;
-        }
-        {
-            const x = try gpa.alloc(u32, gh * gw);
-            defer gpa.free(x);
-            const y = try gpa.alloc(u32, gh * gw);
-            defer gpa.free(y);
-            for (0..gh * gw) |i| {
-                x[i] = @intCast(i % gw);
-                y[i] = @intCast(i / gw);
-            }
-            self.vis_x = try uploadU32(ctx, x);
-            made += 1;
-            self.vis_y = try uploadU32(ctx, y);
+        var cp = try sensenova.CanvasPositions.init(gpa, pre.time, tw, self.n_img, gw, gh * gw);
+        defer cp.deinit(gpa);
+        inline for (.{ "pos_t", "pos_h", "pos_w", "vis_x", "vis_y" }, .{ .t, .h, .w, .vis_x, .vis_y }) |name, axis| {
+            @field(self, name) = try uploadU32(ctx, cp.axis(axis));
             made += 1;
         }
         return self;
@@ -730,6 +527,7 @@ pub const Session = struct {
         self.tab_vx.deinit(ctx);
         self.tab_vy.deinit(ctx);
         inline for (.{ "pos_t", "pos_h", "pos_w", "vis_x", "vis_y" }) |name| ctx.tensorDestroy(&@field(self, name));
+        self.lin.deinit();
         self.* = undefined;
     }
 };
@@ -758,6 +556,8 @@ pub const Workspace = struct {
     v16: Buf,
     /// Per-query key range for the naive path: `[0, seq_kv)` for every canvas row.
     bounds: Buf,
+    /// The canvas stream's storage (`img`, `nrm`, `mg`, `mu`); `sensenova_dev`.
+    act: Dt,
 
     const fields = [_][]const u8{ "patch", "cells", "img", "nrm", "dlt", "q", "k", "v", "kcat", "vcat", "attn", "mg", "mu", "fm_a", "fm_b", "tvec", "q16", "k16", "v16", "bounds" };
 
@@ -766,7 +566,7 @@ pub const Workspace = struct {
     /// different lengths (an edit's negative presents the pictures with no prompt, so
     /// it is shorter; a plain negative is shorter still), and sizing to one of them
     /// writes the other off the end of `kcat`.
-    pub fn init(ctx: *Context, model: *const Model, sess: *const Session, prefix_cap: usize) !Workspace {
+    pub fn init(ctx: *Context, model: *const Model, sess: *const Session, prefix_cap: usize, act: Dt) !Workspace {
         const cfg = model.cfg;
         const rows = std.mem.alignForward(usize, sess.n_img, 128);
         const kv_seq = @max(prefix_cap, sess.prefix_seq) + sess.n_img;
@@ -813,6 +613,8 @@ pub const Workspace = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             made += 1;
         }
+        self.act = act;
+        inline for (.{ "img", "nrm", "mg", "mu" }) |name| @field(self, name).dt = act;
         return self;
     }
 
@@ -844,27 +646,11 @@ pub fn forward(
     const xp = try sensenova.padCanvas(gpa, cfg, x_lat, ch, sess.lat_h, sess.lat_w);
     defer gpa.free(xp);
 
-    // The patch matrix of the 16x16 embedder is built on the host: it reads the
-    // canvas, which arrives on the host anyway, and it is a pure gather that would
-    // otherwise cost an upload of the canvas plus a kernel for the same bytes.
+    // The patch rows are gathered on the host: the canvas arrives there anyway, and on
+    // the device it would cost an upload of the canvas plus a kernel for the same bytes.
     {
-        const plen = cfg.patch * cfg.patch * ch;
-        const patch = try gpa.alloc(f32, sess.gh * sess.gw * plen);
+        const patch = try sensenova.patchRows(gpa, cfg, xp, sess.ph, sess.pw);
         defer gpa.free(patch);
-        for (0..sess.gh) |cy| {
-            for (0..sess.gw) |cx| {
-                const dst = patch[(cy * sess.gw + cx) * plen ..][0..plen];
-                for (0..cfg.patch) |dy| {
-                    for (0..cfg.patch) |dx| {
-                        const sy = cy * cfg.patch + dy;
-                        const sx = cx * cfg.patch + dx;
-                        for (0..ch) |c| {
-                            dst[(dy * cfg.patch + dx) * ch + c] = xp[c * sess.ph * sess.pw + sy * sess.pw + sx];
-                        }
-                    }
-                }
-            }
-        }
         try ctx.ensureDeviceBuffer(&ws.patch, patch.len * 4);
         try ctx.tensorUpload(ws.patch, std.mem.sliceAsBytes(patch));
     }
@@ -875,9 +661,8 @@ pub fn forward(
         defer gpa.free(tvec);
         try ctx.tensorUpload(ws.tvec, std.mem.sliceAsBytes(tvec));
     }
-    const seq_kv = sess.prefix_seq + sess.n_img;
     if (!sess.tc) {
-        const pair = try boundsTable(gpa, sess.n_img, seq_kv, null);
+        const pair = try boundsTable(gpa, sess.n_img, sess.prefix_seq + sess.n_img, null);
         defer gpa.free(pair);
         try ctx.tensorUpload(ws.bounds, std.mem.sliceAsBytes(pair));
         ctx.attnBatchedBind(ws.q, ws.kcat, ws.vcat, ws.attn, ws.bounds);
@@ -885,115 +670,23 @@ pub fn forward(
 
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
-
-    // --- the generation vision tower -----------------------------------------
-    const cells = sess.gh * sess.gw;
-    try ctx.opMatmulCoopF16W(ws.cells, 0, ws.patch, cells, model.vision_gen.patch.w, cfg.vis_dim, cfg.patch * cfg.patch * ch, model.vision_gen.patch.b.?);
-    try ctx.opElt(.gelu_erf, ws.cells, null, null, null, .{ .u0 = @intCast(cells * cfg.vis_dim) }, cells * cfg.vis_dim, 1, 1);
-    const vhalf = cfg.vis_dim / 2;
-    try ropeInterSpan(ctx, ws.cells, sess.vis_x, sess.tab_vx, cells, cfg.vis_dim, 0);
-    try ropeInterSpan(ctx, ws.cells, sess.vis_y, sess.tab_vy, cells, cfg.vis_dim, vhalf);
-    trace(ctx, "cells", 0, ws.cells, cells * cfg.vis_dim);
-    try convStride(ctx, &ws.patch, ws.img, ws.cells, sess.gh, sess.gw, model.vision_gen.dense);
-    trace(ctx, "vision", 0, ws.img, sess.n_img * cfg.dim);
-    try ctx.opElt(.add_bias_rows, ws.img, ws.tvec, null, null, .{
-        .u0 = @intCast(sess.n_img * cfg.dim),
-        .u1 = @intCast(cfg.dim),
-    }, sess.n_img * cfg.dim, 1, 1);
-    trace(ctx, "trunk_in", 0, ws.img, sess.n_img * cfg.dim);
-
-    // --- the trunk ------------------------------------------------------------
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const pos = [3]Buf{ sess.pos_t, sess.pos_h, sess.pos_w };
-    const tables = [3]Table{ sess.tab_t, sess.tab_h, sess.tab_w };
-    const kv_elems = sess.prefix_seq * cfg.kvDim();
-    for (model.layers, 0..) |*layer, li| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        // The prefix half of the concatenated K/V, from the cache uploaded once per
-        // conditioning. Through the copy KERNEL, so it stays in this batch.
-        try copyInto(ctx, ws.kcat, 0, sess.prefix_kv, (li * 2) * kv_elems, kv_elems);
-        try copyInto(ctx, ws.vcat, 0, sess.prefix_kv, (li * 2 + 1) * kv_elems, kv_elems);
-        try layerForward(ctx, cfg, &layer.gen, .{
-            .x = ws.img,
-            .nrm = ws.nrm,
-            .dlt = ws.dlt,
-            .q = ws.q,
-            .k = ws.k,
-            .v = ws.v,
-            .kcat = ws.kcat,
-            .vcat = ws.vcat,
-            .attn = ws.attn,
-            .mg = ws.mg,
-            .mu = ws.mu,
-            .q16 = ws.q16,
-            .k16 = ws.k16,
-            .v16 = ws.v16,
-        }, sess.n_img, seq_kv, .{
-            .pos = pos,
-            .tables = tables,
-            .norm_q = try smallBuf(ctx, layer.gen.q_norm_pair),
-            .norm_k = try smallBuf(ctx, layer.gen.k_norm_pair),
-            .attn = .{ .prefix_rows = sess.prefix_seq, .scale = scale, .bounds = null, .tc = sess.tc },
-        });
-        trace(ctx, "layer", li, ws.img, sess.n_img * cfg.dim);
-    }
-    try ctx.opElt(.rmsnorm, ws.img, ws.img, try smallBuf(ctx, model.norm_gen), null, .{
-        .u0 = @intCast(sess.n_img),
-        .u1 = @intCast(cfg.dim),
-        .f0 = cfg.norm_eps,
-    }, sess.n_img, 1, 1);
-    trace(ctx, "norm", 0, ws.img, sess.n_img * cfg.dim);
-
-    // --- fm_head ---------------------------------------------------------------
-    // The token plane IS the channel-last input the first shuffle reads.
-    try pixelShuffle(ctx, ws.fm_a, ws.img, sess.th, sess.tw, cfg.fmC1(), 2);
-    try conv3x3(ctx, &ws.patch, &ws.fm_b, &ws.fm_a, sess.th * 2, sess.tw * 2, model.fm1);
-    try ctx.opElt(.gelu_erf, ws.fm_b, null, null, null, .{
-        .u0 = @intCast(sess.th * 2 * sess.tw * 2 * cfg.fmC1()),
-    }, sess.th * 2 * sess.tw * 2 * cfg.fmC1(), 1, 1);
-    try pixelShuffle(ctx, ws.fm_a, ws.fm_b, sess.th * 2, sess.tw * 2, cfg.fmC2(), 2);
-    try conv3x3(ctx, &ws.patch, &ws.fm_b, &ws.fm_a, sess.th * 4, sess.tw * 4, model.fm2);
-    try pixelShuffle(ctx, ws.fm_a, ws.fm_b, sess.th * 4, sess.tw * 4, ch, 8);
-    trace(ctx, "pred", 0, ws.fm_a, sess.ph * sess.pw * ch);
+    try sensenova_dev.canvas(Dev{
+        .ctx = ctx,
+        .l = &sess.lin,
+        .plan = sess.lin_plan,
+        .cfg = cfg,
+        .b = .{ .x = ws.img, .nrm = ws.nrm, .dlt = ws.dlt, .q = ws.q, .k = ws.k, .v = ws.v, .kcat = ws.kcat, .vcat = ws.vcat, .attn = ws.attn, .mg = ws.mg, .mu = ws.mu, .q16 = ws.q16, .k16 = ws.k16, .v16 = ws.v16 },
+        .pos = .{ sess.pos_t, sess.pos_h, sess.pos_w },
+        .tables = .{ sess.tab_t, sess.tab_h, sess.tab_w },
+        .tc = sess.tc,
+    }, model, sess, ws, cancel);
     try ctx.endBatch();
+    if (ws.act != .f32 and !try ctx.allFinite(ws.img, sess.n_img * cfg.dim)) return error.NonFiniteActivation;
 
-    // The x0-to-velocity conversion and the crop are three planes of arithmetic; they
-    // ride back with the download rather than costing a kernel.
     const rgb = try gpa.alloc(f32, sess.ph * sess.pw * ch);
     defer gpa.free(rgb);
     try ctx.tensorDownloadAt(ws.fm_a, 0, std.mem.sliceAsBytes(rgb));
-    const denom = @max(1.0 - t, cfg.velocity_eps);
-    for (0..ch) |c| {
-        const src = xp[c * sess.ph * sess.pw ..];
-        const dst = out[c * sess.lat_h * sess.lat_w ..];
-        for (0..sess.lat_h) |y| {
-            for (0..sess.lat_w) |x| {
-                dst[y * sess.lat_w + x] = (src[y * sess.pw + x] - rgb[(y * sess.pw + x) * ch + c]) / denom;
-            }
-        }
-    }
-}
-
-fn ropeInterSpan(ctx: *Context, x: Buf, positions: Buf, tb: Table, rows: usize, row_dim: usize, off: usize) !void {
-    std.debug.assert(off + 2 * tb.half <= row_dim);
-    const total = rows * tb.half;
-    try ctx.opElt(.rope_inter_span_pos, x, positions, tb.buf, null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(tb.half),
-        .u2 = @intCast(tb.sin_off),
-        .u3 = @intCast(row_dim),
-        .u4 = @intCast(off),
-    }, total, 1, 1);
-}
-
-fn pixelShuffle(ctx: *Context, dst: Buf, src: Buf, h: usize, w: usize, co: usize, r: usize) !void {
-    const total = h * w * co * r * r;
-    try ctx.opElt(.pixel_shuffle, src, dst, null, null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(co),
-        .u2 = @intCast(r),
-        .u3 = @intCast(w),
-    }, total, 1, 1);
+    sensenova.velocityFromRows(cfg, out, xp, rgb, t, sess.lat_h, sess.lat_w, sess.ph, sess.pw);
 }
 
 const LayerBufs = struct {
@@ -1013,83 +706,154 @@ const LayerBufs = struct {
     v16: Buf,
 };
 
-const LayerArgs = struct {
+/// The `sensenova_dev` adapter for one pass.
+const Dev = struct {
+    ctx: *Context,
+    l: *const lin_gpu.Lin,
+    plan: lin_gpu.Plan,
+    cfg: Config,
+    b: LayerBufs,
     pos: [3]Buf,
     tables: [3]Table,
-    norm_q: Buf,
-    norm_k: Buf,
-    attn: AttnArgs,
-};
+    /// The flash pipeline; otherwise `attnBatched` over the bound mask.
+    tc: bool,
+    /// The prefix pass's host cache, `[layer][k|v][seq][kv_dim]`.
+    kv: []f32 = &.{},
 
-fn layerForward(
-    ctx: *Context,
-    cfg: Config,
-    s: *const sensenova.Stream,
-    b: LayerBufs,
-    rows: usize,
-    seq_kv: usize,
-    a: LayerArgs,
-) !void {
-    const dim = cfg.dim;
-    const kv_dim = cfg.kvDim();
-
-    try ctx.opElt(.rmsnorm, b.x, b.nrm, try smallBuf(ctx, s.in_norm), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
-    try prepGroup(ctx, b.nrm, rows, dim, &.{ s.q, s.k, s.v });
-    try linear(ctx, b.q, b.nrm, rows, s.q);
-    try linear(ctx, b.k, b.nrm, rows, s.k);
-    try linear(ctx, b.v, b.nrm, rows, s.v);
-
-    try qkPrepare(ctx, cfg, b.q, rows, cfg.n_heads, a.norm_q, a.pos, a.tables);
-    try qkPrepare(ctx, cfg, b.k, rows, cfg.n_kv_heads, a.norm_k, a.pos, a.tables);
-    trace(ctx, "q", 0, b.q, rows * cfg.qDim());
-    trace(ctx, "k", 0, b.k, rows * kv_dim);
-    trace(ctx, "v", 0, b.v, rows * kv_dim);
-
-    // The generation stream attends over the prefix's keys and then its own; the
-    // prefix pass attends over itself alone, so its `kcat` IS its `k`.
-    if (a.attn.prefix_rows != 0) {
-        try copyInto(ctx, b.kcat, a.attn.prefix_rows * kv_dim, b.k, 0, rows * kv_dim);
-        try copyInto(ctx, b.vcat, a.attn.prefix_rows * kv_dim, b.v, 0, rows * kv_dim);
+    pub fn rmsNorm(d: Dev, x: Buf, y: Buf, w: []const f32, rows: usize, eps: f32) !void {
+        std.debug.assert(x.dt == y.dt);
+        try d.ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, y, try smallBuf(d.ctx, w), null, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(d.cfg.dim),
+            .f0 = eps,
+        }, rows, 1, 1);
     }
-    try attention(ctx, cfg, b, rows, seq_kv, a.attn);
 
-    trace(ctx, "attn", 0, b.attn, rows * cfg.qDim());
-    try prepGroup(ctx, b.attn, rows, cfg.qDim(), &.{s.o});
-    try linear(ctx, b.dlt, b.attn, rows, s.o);
-    try ctx.opElt(.add, b.x, b.dlt, null, null, .{ .u0 = @intCast(rows * dim) }, rows * dim, 1, 1);
-    trace(ctx, "attn_res", 0, b.x, rows * dim);
+    pub fn gemms(d: Dev, x: Buf, rows: usize, cols: usize, ws: []const Weight, ys: []const Buf) !void {
+        const g = try d.l.prep(d.plan, x, rows, cols, ws);
+        for (ws, ys) |w, y| try d.l.gemm(d.plan, g, y, w, .{});
+    }
 
-    try ctx.opElt(.rmsnorm, b.x, b.nrm, try smallBuf(ctx, s.post_norm), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
-    try prepGroup(ctx, b.nrm, rows, dim, &.{ s.gate, s.up });
-    try linear(ctx, b.mg, b.nrm, rows, s.gate);
-    try linear(ctx, b.mu, b.nrm, rows, s.up);
-    try ctx.opElt(.silu_mul, b.mg, b.mu, null, null, .{ .u0 = @intCast(rows * cfg.inter) }, rows * cfg.inter, 1, 1);
-    try prepGroup(ctx, b.mg, rows, cfg.inter, &.{s.down});
-    try linear(ctx, b.dlt, b.mg, rows, s.down);
-    try ctx.opElt(.add, b.x, b.dlt, null, null, .{ .u0 = @intCast(rows * dim) }, rows * dim, 1, 1);
-}
+    pub fn linear(d: Dev, y: Buf, x: Buf, rows: usize, w: Weight) !void {
+        try d.l.linear(d.plan, y, 0, x, rows, w);
+    }
+
+    pub fn qkPrepare(d: Dev, x: Buf, rows: usize, heads: usize, norm_pair: []const f32) !void {
+        try qkPrepareAt(d.ctx, d.cfg, x, rows, heads, try smallBuf(d.ctx, norm_pair), d.pos, d.tables);
+    }
+
+    pub fn copy(d: Dev, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        try copyInto(d.ctx, dst, dst_off, src, src_off, n);
+    }
+
+    pub fn attention(d: Dev, rows: usize, seq_kv: usize) !void {
+        try attentionAt(d.ctx, d.cfg, d.b, rows, seq_kv, d.tc);
+    }
+
+    pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
+        std.debug.assert(x.dt == y.dt);
+        try d.ctx.opElt(gpu.eltAt("add", x.dt), x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+        std.debug.assert(g.dt == u.dt);
+        try d.ctx.opElt(gpu.eltAt("silu_mul", g.dt), g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn addScaled(d: Dev, x: Buf, y: Buf, n: usize, s: f32) !void {
+        std.debug.assert(y.dt == .f32);
+        try d.ctx.opElt(gpu.eltAt("add_scaled", x.dt), x, y, null, null, .{ .u0 = @intCast(n), .f0 = s }, n, 1, 1);
+    }
+
+    pub fn scaleBy(d: Dev, x: Buf, s: f32, n: usize) !void {
+        try d.ctx.opElt(.scale_f32, x, x, null, null, .{ .u0 = @intCast(n), .f0 = s }, n, 1, 1);
+    }
+
+    pub fn gelu(d: Dev, x: Buf, n: usize) !void {
+        try d.ctx.opElt(.gelu_erf, x, null, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn prefetch(_: Dev, _: *const sensenova.Stream) void {}
+
+    pub fn beginBatch(d: Dev) !void {
+        try d.ctx.beginBatch();
+    }
+
+    pub fn endBatch(d: Dev) !void {
+        try d.ctx.endBatch();
+    }
+
+    pub fn abortBatch(d: Dev) void {
+        if (d.ctx.batching) d.ctx.abortBatch();
+    }
+
+    pub fn keepKv(d: Dev, li: usize) !void {
+        const n = d.kv.len / (d.cfg.n_layers * 2);
+        try d.ctx.tensorDownloadAt(d.b.k, 0, std.mem.sliceAsBytes(d.kv[(li * 2) * n ..][0..n]));
+        try d.ctx.tensorDownloadAt(d.b.v, 0, std.mem.sliceAsBytes(d.kv[(li * 2 + 1) * n ..][0..n]));
+    }
+
+    pub fn patchEmbed(d: Dev, dst: Buf, src: Buf, rows: usize, cv: sensenova.Conv) !void {
+        try conv_gpu.patchGemm(d.ctx, dst, src, rows, cv);
+    }
+
+    pub fn ropeInter(d: Dev, x: Buf, positions: Buf, tb: Table, rows: usize, row_dim: usize, off: usize) !void {
+        std.debug.assert(off + 2 * tb.half <= row_dim);
+        const total = rows * tb.half;
+        try d.ctx.opElt(.rope_inter_span_pos, x, positions, tb.buf, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(tb.half),
+            .u2 = @intCast(tb.sin_off),
+            .u3 = @intCast(row_dim),
+            .u4 = @intCast(off),
+        }, total, 1, 1);
+    }
+
+    pub fn convStride(d: Dev, patch: *Buf, dst: Buf, src: Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
+        try conv_gpu.convStride(d.ctx, patch, dst, src, h, w, cv);
+    }
+
+    pub fn addBiasRows(d: Dev, x: Buf, bias: Buf, rows: usize, cols: usize) !void {
+        try d.ctx.opElt(.add_bias_rows, x, bias, null, null, .{
+            .u0 = @intCast(rows * cols),
+            .u1 = @intCast(cols),
+        }, rows * cols, 1, 1);
+    }
+
+    pub fn pixelShuffle(d: Dev, dst: Buf, src: Buf, h: usize, w: usize, co: usize, r: usize) !void {
+        const total = h * w * co * r * r;
+        try d.ctx.opElt(.pixel_shuffle, src, dst, null, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(co),
+            .u2 = @intCast(r),
+            .u3 = @intCast(w),
+        }, total, 1, 1);
+    }
+
+    /// Through the SD family's banded im2col and the same f16-weight GEMM.
+    pub fn conv3x3(d: Dev, patch: *Buf, dst: *Buf, src: *Buf, h: usize, w: usize, cv: sensenova.Conv) !void {
+        std.debug.assert(cv.k == 3 and cv.stride == 1 and cv.pad == 1);
+        try conv_gpu.conv2d(d.ctx, patch, dst, src, h, w, cv, .stride1, null, null, 1.0);
+    }
+
+    pub fn trace(d: Dev, what: []const u8, i: usize, buf: Buf, elems: usize) void {
+        traceBuf(d.ctx, what, i, buf, elems);
+    }
+};
 
 /// DIAGNOSTIC: the same stage lines `sensenova.traceActs` prints on the host
 /// (`TP_SENSENOVA_TRACE`), so the two runs diff. Costs a sync and a download per call,
 /// so it is env-gated and never on in a render.
 var trace_on: ?bool = null;
 
-fn trace(ctx: *Context, what: []const u8, i: usize, buf: Buf, elems: usize) void {
+fn traceBuf(ctx: *Context, what: []const u8, i: usize, buf: Buf, elems: usize) void {
     if (trace_on == null) trace_on = std.c.getenv("TP_SENSENOVA_TRACE") != null;
     if (!trace_on.?) return;
     const host = ctx.gpa.alloc(f32, elems) catch return;
     defer ctx.gpa.free(host);
     const batching = ctx.batching;
     if (batching) ctx.endBatch() catch return;
-    ctx.tensorDownloadAt(buf, 0, std.mem.sliceAsBytes(host)) catch return;
+    ctx.downloadF32At(buf, 0, host) catch return;
     var mx: f32 = 0;
     var sum: f64 = 0;
     var bad: usize = 0;

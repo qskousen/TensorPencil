@@ -33,6 +33,51 @@ const Emit = struct {
         try self.w.print(self.gpa, fmt, args);
         try self.w.append(self.gpa, '\n');
     }
+
+    const Loop = struct { head: u32, cont: u32, merge: u32, iv: u32, inx: u32 };
+
+    /// A phi-carried u32 counter loop from 0 while below `count`, entered from block
+    /// `pred`; needs `%u32`, `%bool`, `%cu_0` and `%cu_1`. Emits the header, condition
+    /// and body label; `closeLoop` emits the increment, back-edge and merge.
+    fn openLoop(e: *Emit, count: []const u8, pred: []const u8) !Loop {
+        return (try e.openLoopPhi(count, pred, null, "")).loop;
+    }
+
+    const PhiLoop = struct { loop: Loop, acc: u32, acc_next: u32 };
+
+    /// `openLoop` that also carries one `ty` value, `init` on entry: the body defines
+    /// `acc_next`, and `acc` holds the final value after `closeLoop`.
+    fn openLoopPhi(e: *Emit, count: []const u8, pred: []const u8, ty: ?[]const u8, init: []const u8) !PhiLoop {
+        const head = e.id();
+        const cont = e.id();
+        const merge = e.id();
+        const iv = e.id();
+        const inx = e.id();
+        const cond = e.id();
+        const body = e.id();
+        const acc: u32 = if (ty != null) e.id() else 0;
+        const acc_next: u32 = if (ty != null) e.id() else 0;
+        try e.line("OpBranch %t{d}", .{head});
+        try e.line("%t{d} = OpLabel", .{head});
+        try e.line("%t{d} = OpPhi %u32 %cu_0 {s} %t{d} %t{d}", .{ iv, pred, inx, cont });
+        if (ty) |t| try e.line("%t{d} = OpPhi {s} {s} {s} %t{d} %t{d}", .{ acc, t, init, pred, acc_next, cont });
+        try e.line("OpLoopMerge %t{d} %t{d} None", .{ merge, cont });
+        try e.line("OpBranch %t{d}", .{cond});
+        try e.line("%t{d} = OpLabel", .{cond});
+        const cmp = e.id();
+        try e.line("%t{d} = OpULessThan %bool %t{d} {s}", .{ cmp, iv, count });
+        try e.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, body, merge });
+        try e.line("%t{d} = OpLabel", .{body});
+        return .{ .loop = .{ .head = head, .cont = cont, .merge = merge, .iv = iv, .inx = inx }, .acc = acc, .acc_next = acc_next };
+    }
+
+    fn closeLoop(e: *Emit, L: Loop) !void {
+        try e.line("OpBranch %t{d}", .{L.cont});
+        try e.line("%t{d} = OpLabel", .{L.cont});
+        try e.line("%t{d} = OpIAdd %u32 %t{d} %cu_1", .{ L.inx, L.iv });
+        try e.line("OpBranch %t{d}", .{L.head});
+        try e.line("%t{d} = OpLabel", .{L.merge});
+    }
 };
 
 /// int8 tensor-core GEMM: `C(s32) = A(s8) @ B(s8)` with a 16x16x32 subgroup
@@ -838,31 +883,52 @@ pub fn buildGemmSharedI8(
     return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
-/// Stage B, fused int8 prep: rotate (radix-4 FWHT) + per-row abs-max +
-/// dynamic quantize, all in ONE hand-assembled workgroup kernel (Zig-emitted
-/// workgroup kernels DEVICE_LOST on this NVIDIA driver, so this must be hand-
-/// assembled). Replaces the 3-pass eltwise chain (rotate_fwht -> rowscale_i8 ->
-/// quantize_i8) and its xr(f32) DRAM round-trip; the FWHT runs IN SHARED (no
-/// private-array spill, the measured prep floor). SPECIALIZED for cols=6144
-/// (ng=24 groups of 256); mlp.down (cols=16384, 64 KB row > 48 KB shared) keeps
-/// the 3-pass fallback.
+/// Groups per chunk for `buildFusedPrepI8` at `cols`: the largest divisor of the group
+/// count whose f32 rows fit 48 KB of shared beside the per-lane maxes, with at most four
+/// chunks (each is emitted twice). Null: no build, the 3-pass chain runs.
+pub fn fusedPrepChunk(cols: usize) ?u32 {
+    if (cols == 0 or cols % 256 != 0) return null;
+    const ng: u32 = @intCast(cols / 256);
+    var ch: u32 = ng;
+    while (ch > 0) : (ch -= 1) {
+        if (ng % ch != 0) continue;
+        if ((ch * 257 + prepLanes(ch) + 1) * 4 > 48 * 1024) continue;
+        return if (ng / ch <= 4) ch else null;
+    }
+    return null;
+}
+
+/// Lanes per workgroup at `ch` groups a chunk: 64 times the largest d <= 4 dividing `ch`,
+/// so every loop's trip count (`ch * 64` butterflies a stage, `ch * 64` output words)
+/// divides evenly.
+fn prepLanes(ch: u32) u32 {
+    const d: u32 = if (ch % 4 == 0) 4 else if (ch % 3 == 0) 3 else if (ch % 2 == 0) 2 else 1;
+    return 64 * d;
+}
+
+/// Stage B, fused int8 prep: rotate (radix-4 FWHT over each 256-wide group), per-row
+/// abs-max and quantize in one workgroup per row, so the rotated row never reaches
+/// DRAM. Hand-assembled because Zig-emitted workgroup kernels DEVICE_LOST on the NVIDIA
+/// driver. Bindings: 0=x (f32 [m][cols]), 1=x_i8 (u32 [m][cols/4], 4 per word),
+/// 2=scale (f32 out [m]). Dispatch m workgroups.
 ///
-/// One workgroup (32 threads) per row: (0) coalesced load of the row's 6144 f32
-/// into a padded shared buffer [24 groups][257] (PAD 257 = conflict-free: lane
-/// t hits bank (t*257)%32 = t), (1) threads 0..23 each FWHT + normalize (/16)
-/// their group in shared and emit the group abs-max, (2) thread 0 reduces the
-/// 24 maxes -> per-row scale (=max/127), (3) all 32 threads coalesced-quantize
-/// shared -> packed int8 (4/word). Bindings: 0=x(f32 in [m][6144]),
-/// 1=x_i8(u32 out [m][1536]), 2=scale(f32 out [m]). Dispatch m workgroups.
+/// All f32, which is what keeps it equal to `ops.matmul.emulateActQuant`. Every lane
+/// works every phase: each radix-4 stage spreads its butterflies over the workgroup with
+/// a barrier between stages, the last one normalizes and keeps a running abs-max, and a
+/// tree reduces the lanes' maxes. A row too wide for shared memory at f32 goes in chunks
+/// of groups, twice: once for the abs-max, once to quantize.
 pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     const NG: u32 = cols / 256;
-    const PAD: u32 = 257;
-    const ROT: u32 = NG * PAD;
-    const INV: u32 = ROT + NG; // inv-scale broadcast slot
-    const SH_LEN: u32 = INV + 2;
-    const WG: u32 = if (NG <= 32) 32 else 64;
-    const LOADS: u32 = cols / WG;
-    const WORDS: u32 = (cols / 4) / WG;
+    const PAD: u32 = 257; // lane t hits bank (t*257)%32 = t
+    const CH: u32 = fusedPrepChunk(cols) orelse return error.Unsupported;
+    const NC: u32 = NG / CH;
+    const WG: u32 = prepLanes(CH);
+    const GMAX: u32 = CH * PAD; // [WG] per-lane abs-maxes
+    const INV: u32 = GMAX + WG;
+    const SH_LEN: u32 = INV + 1;
+    const LOADS: u32 = CH * 256 / WG;
+    const WORDS: u32 = CH * 64 / WG;
+    const BF: u32 = CH * 64 / WG;
 
     var t: std.ArrayList(u8) = .empty;
     defer t.deinit(gpa);
@@ -871,16 +937,8 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
     const ar = arena_inst.allocator();
-    const H = struct {
-        fn cst(a2: std.mem.Allocator, v: u32) ![]const u8 {
-            return std.fmt.allocPrint(a2, "%cu_{d}", .{v});
-        }
-        fn tmp(a2: std.mem.Allocator, i: u32) ![]const u8 {
-            return std.fmt.allocPrint(a2, "%t{d}", .{i});
-        }
-    };
 
-    var pool: [80]u32 = undefined;
+    var pool: [96]u32 = undefined;
     var pn: usize = 0;
     const addC = struct {
         fn f(p: []u32, n: *usize, v: u32) void {
@@ -889,47 +947,16 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
             n.* += 1;
         }
     }.f;
-    for ([_]u32{ 0, 1, 2, 3, 4, 8, 12, 15, 16, 24, 32, 48, 63, 64, 128, 192, 255, 256, 257, 0xFF, 0x108, NG, ROT, INV, WG, LOADS, WORDS, cols, cols / 4 }) |v|
+    for ([_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 15, 16, 24, 32, 48, 63, 64, 128, 192, 255, 256, PAD, 264, CH, NG, GMAX, INV, WG, LOADS, WORDS, BF, cols, cols / 4 }) |v|
         addC(&pool, &pn, v);
-
-    // Loop helpers: phi-carried counter loops (open emits the header/cond/body,
-    // close emits the increment/back-edge/merge).
-    const Loop = struct { head: u32, cont: u32, merge: u32, iv: u32, inx: u32 };
-    const openLoop = struct {
-        fn f(e: *Emit, tu: []const u8, tb: []const u8, cz: []const u8, count: []const u8, pred: []const u8) !Loop {
-            const head = e.id();
-            const cont = e.id();
-            const merge = e.id();
-            const iv = e.id();
-            const inx = e.id();
-            const cond = e.id();
-            const body = e.id();
-            try e.line("OpBranch %t{d}", .{head});
-            try e.line("%t{d} = OpLabel", .{head});
-            try e.line("%t{d} = OpPhi {s} {s} {s} %t{d} %t{d}", .{ iv, tu, cz, pred, inx, cont });
-            try e.line("OpLoopMerge %t{d} %t{d} None", .{ merge, cont });
-            try e.line("OpBranch %t{d}", .{cond});
-            try e.line("%t{d} = OpLabel", .{cond});
-            const cmp = e.id();
-            try e.line("%t{d} = OpULessThan {s} %t{d} {s}", .{ cmp, tb, iv, count });
-            try e.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, body, merge });
-            try e.line("%t{d} = OpLabel", .{body});
-            return .{ .head = head, .cont = cont, .merge = merge, .iv = iv, .inx = inx };
-        }
-    }.f;
-    const closeLoop = struct {
-        fn f(e: *Emit, tu: []const u8, one: []const u8, L: Loop) !void {
-            try e.line("OpBranch %t{d}", .{L.cont});
-            try e.line("%t{d} = OpLabel", .{L.cont});
-            try e.line("%t{d} = OpIAdd {s} %t{d} {s}", .{ L.inx, tu, L.iv, one });
-            try e.line("OpBranch %t{d}", .{L.head});
-            try e.line("%t{d} = OpLabel", .{L.merge});
-        }
-    }.f;
+    for ([_]u32{ 1, 2, 4, 8, 16, 32, 64, 128 }) |v| addC(&pool, &pn, v);
+    for (0..NC) |c| {
+        addC(&pool, &pn, @intCast(c * CH * 256));
+        addC(&pool, &pn, @intCast(c * CH * 64));
+    }
 
     // --- header ---
     try em.line("OpCapability Shader", .{});
-    try em.line("OpCapability Float16", .{});
     try em.line("OpCapability VulkanMemoryModel", .{});
     try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
     try em.line("%ext = OpExtInstImport \"GLSL.std.450\"", .{});
@@ -957,7 +984,6 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     try em.line("%u32 = OpTypeInt 32 0", .{});
     try em.line("%s32 = OpTypeInt 32 1", .{});
     try em.line("%f32 = OpTypeFloat 32", .{});
-    try em.line("%f16 = OpTypeFloat 16", .{});
     try em.line("%bool = OpTypeBool", .{});
     try em.line("%v3u = OpTypeVector %u32 3", .{});
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
@@ -979,14 +1005,14 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     try em.line("%ptr_sq_u32 = OpTypePointer StorageBuffer %u32", .{});
     try em.line("%ptr_ss_f32 = OpTypePointer StorageBuffer %f32", .{});
     try em.line("%c_shlen = OpConstant %u32 {d}", .{SH_LEN});
-    try em.line("%sh = OpTypeArray %f16 %c_shlen", .{});
+    try em.line("%sh = OpTypeArray %f32 %c_shlen", .{});
     try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh", .{});
     try em.line("%vsh = OpVariable %ptr_wg_sh Workgroup", .{});
-    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
+    try em.line("%ptr_wg_f32 = OpTypePointer Workgroup %f32", .{});
 
     for (pool[0..pn]) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
-    try em.line("%cf16_inv16 = OpConstant %f16 {d}", .{@as(u32, @as(u16, @bitCast(@as(f16, 1.0 / 16.0))))});
-    try em.line("%cf16_0 = OpConstant %f16 0", .{});
+    try em.line("%cf_inv16 = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1.0 / 16.0)))});
+    try em.line("%cf_0 = OpConstant %f32 0", .{});
     try em.line("%cf_inv127 = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1.0 / 127.0)))});
     try em.line("%cf_tiny = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1e-12)))});
     try em.line("%cf_half = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 0.5)))});
@@ -1007,271 +1033,354 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tid, lidv });
     const rowcols = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ rowcols, row, cols });
-    var cur: []const u8 = "%entry";
 
-    // Phase 0: coalesced load f32 -> f16 into padded shared.
-    {
-        const L = try openLoop(&em, "%u32", "%bool", "%cu_0", try H.cst(ar, LOADS), cur);
-        const iw = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ iw, L.iv, WG });
-        const j = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ j, tid, iw });
+    const P = PrepI8Emit{ .em = &em, .ar = ar, .tid = tid, .row = row, .rowcols = rowcols, .CH = CH, .GMAX = GMAX, .INV = INV, .WG = WG, .LOADS = LOADS, .WORDS = WORDS, .BF = BF, .cols = cols };
+    var cur: []const u8 = "%entry";
+    var acc: []const u8 = "%cf_0";
+    if (NC == 2) {
+        // The first half's rotated values wait in registers, each lane holding the words
+        // it will quantize, so the row is read once.
+        cur = try P.load(cur, 0);
+        try P.barrier();
+        var r = try P.rotate(cur, acc);
+        try P.barrier();
+        const held = try P.hold();
+        try P.barrier();
+        cur = try P.load(r.label, 1);
+        try P.barrier();
+        r = try P.rotate(cur, r.acc);
+        try P.barrier();
+        cur = try P.reduce(r.label, r.acc);
+        try P.barrier();
+        cur = try P.quantize(cur, 1);
+        try P.quantizeHeld(held, 0);
+    } else {
+        for (0..NC) |c| {
+            cur = try P.load(cur, @intCast(c));
+            try P.barrier();
+            const r = try P.rotate(cur, acc);
+            cur = r.label;
+            acc = r.acc;
+            try P.barrier();
+        }
+        cur = try P.reduce(cur, acc);
+        try P.barrier();
+        for (0..NC) |c| {
+            if (NC > 1) {
+                cur = try P.load(cur, @intCast(c));
+                try P.barrier();
+                cur = (try P.rotate(cur, null)).label;
+                try P.barrier();
+            }
+            cur = try P.quantize(cur, @intCast(c));
+            if (c + 1 < NC) try P.barrier();
+        }
+    }
+
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
+
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
+}
+
+/// The phases of `buildFusedPrepI8` over chunk `c` of `CH` groups, each returning the
+/// label it leaves the function in. Every phase runs on every lane.
+const PrepI8Emit = struct {
+    em: *Emit,
+    ar: std.mem.Allocator,
+    tid: u32,
+    row: u32,
+    rowcols: u32,
+    CH: u32,
+    GMAX: u32,
+    INV: u32,
+    WG: u32,
+    LOADS: u32,
+    WORDS: u32,
+    BF: u32,
+    cols: u32,
+
+    fn tmp(p: PrepI8Emit, i: u32) ![]const u8 {
+        return std.fmt.allocPrint(p.ar, "%t{d}", .{i});
+    }
+
+    fn cst(p: PrepI8Emit, v: u32) ![]const u8 {
+        return std.fmt.allocPrint(p.ar, "%cu_{d}", .{v});
+    }
+
+    fn barrier(p: PrepI8Emit) !void {
+        try p.em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+    }
+
+    /// Shared index of chunk element `j` (group-major, 256 per group).
+    fn shIndex(p: PrepI8Emit, j: u32) !u32 {
+        const em = p.em;
         const g = em.id();
         try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_8", .{ g, j });
         const l = em.id();
         try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ l, j });
         const gp = em.id();
         try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ gp, g });
-        const shi = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ shi, gp, l });
+        const i = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ i, gp, l });
+        return i;
+    }
+
+    /// Lane-strided index `iv * WG + tid`.
+    fn strided(p: PrepI8Emit, iv: u32) !u32 {
+        const em = p.em;
+        const iw = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ iw, iv, p.WG });
+        const j = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ j, p.tid, iw });
+        return j;
+    }
+
+    /// Coalesced load of chunk `c` into padded shared.
+    fn load(p: PrepI8Emit, cur: []const u8, c: u32) ![]const u8 {
+        const em = p.em;
+        const L = try em.openLoop(try p.cst(p.LOADS), cur);
+        const j = try p.strided(L.iv);
+        const shi = try p.shIndex(j);
+        const base = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ base, p.rowcols, c * p.CH * 256 });
         const gi = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gi, rowcols, j });
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gi, base, j });
         const xp = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_sx_f32 %vx %cu_0 %t{d}", .{ xp, gi });
-        const valf = em.id();
-        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ valf, xp });
-        const valh = em.id();
-        try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ valh, valf });
+        const v = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ v, xp });
         const sp = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ sp, shi });
-        try em.line("OpStore %t{d} %t{d}", .{ sp, valh });
-        try closeLoop(&em, "%u32", "%cu_1", L);
-        cur = try H.tmp(ar, L.merge);
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ sp, shi });
+        try em.line("OpStore %t{d} %t{d}", .{ sp, v });
+        try em.closeLoop(L);
+        return p.tmp(L.merge);
     }
-    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
-    // Phase 1: FWHT (f16) + normalize (tid < NG).
-    {
-        const sel = em.id();
-        const do = em.id();
-        const cmp = em.id();
-        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ cmp, tid, NG });
-        try em.line("OpSelectionMerge %t{d} None", .{sel});
-        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
-        try em.line("%t{d} = OpLabel", .{do});
-        var cur1: []const u8 = try H.tmp(ar, do);
-        const t257 = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ t257, tid });
-        inline for (.{ 1, 4, 16, 64 }) |s| {
-            const L = try openLoop(&em, "%u32", "%bool", "%cu_0", "%cu_64", cur1);
+    /// The chunk's FWHT, `BF` butterflies a lane a stage with a barrier between stages;
+    /// the last stage also takes the 1/16 normalization and, given `acc`, carries this
+    /// lane's running abs-max on from it.
+    fn rotate(p: PrepI8Emit, cur_in: []const u8, acc: ?[]const u8) !struct { label: []const u8, acc: []const u8 } {
+        const em = p.em;
+        var cur = cur_in;
+        var acc_out: []const u8 = "%cf_0";
+        inline for (.{ 1, 4, 16, 64 }, 0..) |s, si| {
+            const last = si == 3;
+            const want_max = last and acc != null;
+            const PL = try em.openLoopPhi(try p.cst(p.BF), cur, if (want_max) "%f32" else null, if (want_max) acc.? else "");
+            const L = PL.loop;
+            const b = try p.strided(L.iv);
+            const g = em.id();
+            try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_6", .{ g, b });
+            const j = em.id();
+            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_63", .{ j, b });
             var lo: []const u8 = "%cu_0";
+            var hi: []const u8 = try p.tmp(j);
             if (s != 1) {
                 const x = em.id();
-                try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ x, L.iv, s - 1 });
-                lo = try H.tmp(ar, x);
-            }
-            var hi: []const u8 = try H.tmp(ar, L.iv);
-            if (s != 1) {
-                const x = em.id();
-                try em.line("%t{d} = OpISub %u32 %t{d} {s}", .{ x, L.iv, lo });
-                hi = try H.tmp(ar, x);
+                try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ x, j, s - 1 });
+                lo = try p.tmp(x);
+                const y = em.id();
+                try em.line("%t{d} = OpISub %u32 %t{d} {s}", .{ y, j, lo });
+                hi = try p.tmp(y);
             }
             const hi4 = em.id();
             try em.line("%t{d} = OpShiftLeftLogical %u32 {s} %cu_2", .{ hi4, hi });
-            var p0: []const u8 = try H.tmp(ar, hi4);
+            var p0: []const u8 = try p.tmp(hi4);
             if (s != 1) {
                 const x = em.id();
                 try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, hi4, lo });
-                p0 = try H.tmp(ar, x);
+                p0 = try p.tmp(x);
             }
+            const g257 = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ g257, g });
             const base = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ base, t257, p0 });
-            const offs = [_][]const u8{ "%cu_0", try H.cst(ar, s), try H.cst(ar, 2 * s), try H.cst(ar, 3 * s) };
+            try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ base, g257, p0 });
+            var ptr: [4]u32 = undefined;
             var e: [4]u32 = undefined;
-            for (offs, 0..) |off, k| {
-                var idx: []const u8 = try H.tmp(ar, base);
+            for (0..4) |k| {
+                var idx: []const u8 = try p.tmp(base);
                 if (k != 0) {
                     const x = em.id();
-                    try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, base, off });
-                    idx = try H.tmp(ar, x);
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ x, base, k * s });
+                    idx = try p.tmp(x);
                 }
-                const pp = em.id();
-                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
+                ptr[k] = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh {s}", .{ ptr[k], idx });
                 e[k] = em.id();
-                try em.line("%t{d} = OpLoad %f16 %t{d}", .{ e[k], pp });
+                try em.line("%t{d} = OpLoad %f32 %t{d}", .{ e[k], ptr[k] });
             }
             const pq = em.id();
-            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ pq, e[0], e[1] });
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ pq, e[0], e[1] });
             const qd = em.id();
-            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ qd, e[2], e[3] });
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ qd, e[2], e[3] });
             const rd = em.id();
-            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ rd, e[0], e[1] });
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ rd, e[0], e[1] });
             const sd = em.id();
-            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ sd, e[2], e[3] });
-            var nn: [4]u32 = undefined;
-            nn[0] = em.id();
-            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ nn[0], pq, qd });
-            nn[1] = em.id();
-            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ nn[1], pq, qd });
-            nn[2] = em.id();
-            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ nn[2], rd, sd });
-            nn[3] = em.id();
-            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ nn[3], sd, rd });
-            for (offs, 0..) |off, k| {
-                var idx: []const u8 = try H.tmp(ar, base);
-                if (k != 0) {
-                    const x = em.id();
-                    try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, base, off });
-                    idx = try H.tmp(ar, x);
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ sd, e[2], e[3] });
+            const opn = [4][]const u8{ "OpFAdd", "OpFSub", "OpFAdd", "OpFSub" };
+            const lhs = [4]u32{ pq, pq, rd, sd };
+            const rhs = [4]u32{ qd, qd, sd, rd };
+            var m: []const u8 = if (want_max) try p.tmp(PL.acc) else "";
+            for (0..4) |k| {
+                var n = em.id();
+                try em.line("%t{d} = {s} %f32 %t{d} %t{d}", .{ n, opn[k], lhs[k], rhs[k] });
+                if (last) {
+                    const nn = em.id();
+                    try em.line("%t{d} = OpFMul %f32 %t{d} %cf_inv16", .{ nn, n });
+                    n = nn;
                 }
-                const pp = em.id();
-                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
-                try em.line("OpStore %t{d} %t{d}", .{ pp, nn[k] });
+                if (want_max) {
+                    const av = em.id();
+                    try em.line("%t{d} = OpExtInst %f32 %ext 4 %t{d}", .{ av, n });
+                    const mx = if (k == 3) PL.acc_next else em.id();
+                    try em.line("%t{d} = OpExtInst %f32 %ext 40 {s} %t{d}", .{ mx, m, av });
+                    m = try p.tmp(mx);
+                }
+                try em.line("OpStore %t{d} %t{d}", .{ ptr[k], n });
             }
-            try closeLoop(&em, "%u32", "%cu_1", L);
-            cur1 = try H.tmp(ar, L.merge);
+            try em.closeLoop(L);
+            cur = try p.tmp(L.merge);
+            if (want_max) acc_out = try p.tmp(PL.acc);
+            if (!last) try p.barrier();
         }
-        // normalize /16 + abs-max (2-phi loop, f16)
-        const nh = em.id();
-        const ncond = em.id();
-        const nbd = em.id();
-        const nct = em.id();
-        const nmg = em.id();
-        const niv = em.id();
-        const ninx = em.id();
-        const namax = em.id();
-        const namaxn = em.id();
-        try em.line("OpBranch %t{d}", .{nh});
-        try em.line("%t{d} = OpLabel", .{nh});
-        try em.line("%t{d} = OpPhi %u32 %cu_0 {s} %t{d} %t{d}", .{ niv, cur1, ninx, nct });
-        try em.line("%t{d} = OpPhi %f16 %cf16_0 {s} %t{d} %t{d}", .{ namax, cur1, namaxn, nct });
-        try em.line("OpLoopMerge %t{d} %t{d} None", .{ nmg, nct });
-        try em.line("OpBranch %t{d}", .{ncond});
-        try em.line("%t{d} = OpLabel", .{ncond});
-        const ncmp = em.id();
-        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_256", .{ ncmp, niv });
-        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ ncmp, nbd, nmg });
-        try em.line("%t{d} = OpLabel", .{nbd});
-        const nidx = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ nidx, t257, niv });
-        const npp = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ npp, nidx });
-        const raw = em.id();
-        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ raw, npp });
-        const v16 = em.id();
-        try em.line("%t{d} = OpFMul %f16 %t{d} %cf16_inv16", .{ v16, raw });
-        try em.line("OpStore %t{d} %t{d}", .{ npp, v16 });
-        const av = em.id();
-        try em.line("%t{d} = OpExtInst %f16 %ext 4 %t{d}", .{ av, v16 });
-        try em.line("%t{d} = OpExtInst %f16 %ext 40 %t{d} %t{d}", .{ namaxn, namax, av });
-        try em.line("OpBranch %t{d}", .{nct});
-        try em.line("%t{d} = OpLabel", .{nct});
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_1", .{ ninx, niv });
-        try em.line("OpBranch %t{d}", .{nh});
-        try em.line("%t{d} = OpLabel", .{nmg});
-        const gidx = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ gidx, ROT, tid });
-        const gpp = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ gpp, gidx });
-        try em.line("OpStore %t{d} %t{d}", .{ gpp, namax });
-        try em.line("OpBranch %t{d}", .{sel});
-        try em.line("%t{d} = OpLabel", .{sel});
-        cur = try H.tmp(ar, sel);
+        return .{ .label = cur, .acc = acc_out };
     }
-    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
-    // Phase 2: reduce over gmax[0..NG] -> scale[row], inv (tid == 0).
-    {
+    /// The lanes' abs-maxes to the row's scale: folded onto the first 64 lanes, then a
+    /// shared-memory tree; its inverse into shared for `quantize`.
+    fn reduce(p: PrepI8Emit, cur_in: []const u8, acc: []const u8) ![]const u8 {
+        const em = p.em;
+        // No phi follows a selection here, so the entry label is not needed.
+        _ = cur_in;
+        const mi = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ mi, p.GMAX, p.tid });
+        const mp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ mp, mi });
+        try em.line("OpStore %t{d} {s}", .{ mp, acc });
+        if (p.WG > 64) {
+            try p.barrier();
+            const sel = em.id();
+            const do = em.id();
+            const cmp = em.id();
+            try em.line("%t{d} = OpULessThan %bool %t{d} %cu_64", .{ cmp, p.tid });
+            try em.line("OpSelectionMerge %t{d} None", .{sel});
+            try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
+            try em.line("%t{d} = OpLabel", .{do});
+            var m = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ m, mp });
+            var k: u32 = 64;
+            while (k < p.WG) : (k += 64) {
+                const oi = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ oi, mi, k });
+                const op = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ op, oi });
+                const b = em.id();
+                try em.line("%t{d} = OpLoad %f32 %t{d}", .{ b, op });
+                const mm = em.id();
+                try em.line("%t{d} = OpExtInst %f32 %ext 40 %t{d} %t{d}", .{ mm, m, b });
+                m = mm;
+            }
+            try em.line("OpStore %t{d} %t{d}", .{ mp, m });
+            try em.line("OpBranch %t{d}", .{sel});
+            try em.line("%t{d} = OpLabel", .{sel});
+        }
+        var stride: u32 = 32;
+        while (stride > 0) : (stride /= 2) {
+            try p.barrier();
+            const sel = em.id();
+            const do = em.id();
+            const cmp = em.id();
+            try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ cmp, p.tid, stride });
+            try em.line("OpSelectionMerge %t{d} None", .{sel});
+            try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
+            try em.line("%t{d} = OpLabel", .{do});
+            const a = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ a, mp });
+            const oi = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ oi, mi, stride });
+            const op = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ op, oi });
+            const b = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ b, op });
+            const m = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %ext 40 %t{d} %t{d}", .{ m, a, b });
+            try em.line("OpStore %t{d} %t{d}", .{ mp, m });
+            try em.line("OpBranch %t{d}", .{sel});
+            try em.line("%t{d} = OpLabel", .{sel});
+        }
+        try p.barrier();
         const sel = em.id();
         const do = em.id();
         const cmp = em.id();
-        try em.line("%t{d} = OpIEqual %bool %t{d} %cu_0", .{ cmp, tid });
+        try em.line("%t{d} = OpIEqual %bool %t{d} %cu_0", .{ cmp, p.tid });
         try em.line("OpSelectionMerge %t{d} None", .{sel});
         try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
         try em.line("%t{d} = OpLabel", .{do});
-        const mh = em.id();
-        const mcond = em.id();
-        const mbd = em.id();
-        const mct = em.id();
-        const mmg = em.id();
-        const miv = em.id();
-        const minx = em.id();
+        const g0 = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %cu_{d}", .{ g0, p.GMAX });
         const mx = em.id();
-        const mxn = em.id();
-        try em.line("OpBranch %t{d}", .{mh});
-        try em.line("%t{d} = OpLabel", .{mh});
-        try em.line("%t{d} = OpPhi %u32 %cu_0 %t{d} %t{d} %t{d}", .{ miv, do, minx, mct });
-        try em.line("%t{d} = OpPhi %f16 %cf16_0 %t{d} %t{d} %t{d}", .{ mx, do, mxn, mct });
-        try em.line("OpLoopMerge %t{d} %t{d} None", .{ mmg, mct });
-        try em.line("OpBranch %t{d}", .{mcond});
-        try em.line("%t{d} = OpLabel", .{mcond});
-        const mcmp = em.id();
-        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ mcmp, miv, NG });
-        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ mcmp, mbd, mmg });
-        try em.line("%t{d} = OpLabel", .{mbd});
-        const gidx = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ gidx, ROT, miv });
-        const gpp = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ gpp, gidx });
-        const gv = em.id();
-        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ gv, gpp });
-        try em.line("%t{d} = OpExtInst %f16 %ext 40 %t{d} %t{d}", .{ mxn, mx, gv });
-        try em.line("OpBranch %t{d}", .{mct});
-        try em.line("%t{d} = OpLabel", .{mct});
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_1", .{ minx, miv });
-        try em.line("OpBranch %t{d}", .{mh});
-        try em.line("%t{d} = OpLabel", .{mmg});
-        const mxf = em.id();
-        try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ mxf, mx });
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ mx, g0 });
         const sc0 = em.id();
-        try em.line("%t{d} = OpFMul %f32 %t{d} %cf_inv127", .{ sc0, mxf });
+        try em.line("%t{d} = OpFMul %f32 %t{d} %cf_inv127", .{ sc0, mx });
         const sc = em.id();
         try em.line("%t{d} = OpExtInst %f32 %ext 40 %t{d} %cf_tiny", .{ sc, sc0 });
         const scp = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_ss_f32 %vs %cu_0 %t{d}", .{ scp, row });
+        try em.line("%t{d} = OpAccessChain %ptr_ss_f32 %vs %cu_0 %t{d}", .{ scp, p.row });
         try em.line("OpStore %t{d} %t{d}", .{ scp, sc });
-        const invf = em.id();
-        try em.line("%t{d} = OpFDiv %f32 %cf_1 %t{d}", .{ invf, sc });
-        const invh = em.id();
-        try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ invh, invf });
+        const inv = em.id();
+        try em.line("%t{d} = OpFDiv %f32 %cf_1 %t{d}", .{ inv, sc });
         const ip = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %cu_{d}", .{ ip, INV });
-        try em.line("OpStore %t{d} %t{d}", .{ ip, invh });
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %cu_{d}", .{ ip, p.INV });
+        try em.line("OpStore %t{d} %t{d}", .{ ip, inv });
         try em.line("OpBranch %t{d}", .{sel});
         try em.line("%t{d} = OpLabel", .{sel});
-        cur = try H.tmp(ar, sel);
+        return p.tmp(sel);
     }
-    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
-    // Phase 3: coalesced quantize (f16 shared -> f32 math -> packed int8).
-    {
-        const ip = em.id();
-        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %cu_{d}", .{ ip, INV });
-        const invh = em.id();
-        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ invh, ip });
-        const inv = em.id();
-        try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ inv, invh });
-        const roww = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ roww, row, cols / 4 });
-        const L = try openLoop(&em, "%u32", "%bool", "%cu_0", try H.cst(ar, WORDS), cur);
-        const iw = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ iw, L.iv, WG });
-        const word = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ word, tid, iw });
-        const be = em.id();
-        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ be, word });
-        const g = em.id();
-        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_8", .{ g, be });
-        const l = em.id();
-        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ l, be });
-        const gp = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ gp, g });
-        const base = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ base, gp, l });
-        var out: []const u8 = "%cu_0";
-        inline for (0..4) |k| {
-            var idx: []const u8 = try H.tmp(ar, base);
-            if (k != 0) {
-                const x = em.id();
-                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ x, base, k });
-                idx = try H.tmp(ar, x);
+    /// This lane's `WORDS` output words of the chunk in shared, four values each, as SSA
+    /// ids: what `quantizeHeld` writes after shared has been reused.
+    fn hold(p: PrepI8Emit) ![8][4]u32 {
+        const em = p.em;
+        std.debug.assert(p.WORDS <= 8);
+        var out: [8][4]u32 = undefined;
+        for (0..p.WORDS) |wi| {
+            const word = try p.wordOf(@intCast(wi));
+            const be = em.id();
+            try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ be, word });
+            const base = try p.shIndex(be);
+            for (0..4) |k| {
+                var idx: []const u8 = try p.tmp(base);
+                if (k != 0) {
+                    const x = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ x, base, k });
+                    idx = try p.tmp(x);
+                }
+                const pp = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh {s}", .{ pp, idx });
+                out[wi][k] = em.id();
+                try em.line("%t{d} = OpLoad %f32 %t{d}", .{ out[wi][k], pp });
             }
-            const pp = em.id();
-            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
-            const vh = em.id();
-            try em.line("%t{d} = OpLoad %f16 %t{d}", .{ vh, pp });
-            const v = em.id();
-            try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ v, vh });
+        }
+        return out;
+    }
+
+    /// Word `wi` of this lane, `wi * WG + tid`.
+    fn wordOf(p: PrepI8Emit, wi: u32) !u32 {
+        const em = p.em;
+        const iw = em.id();
+        try em.line("%t{d} = OpIMul %u32 %cu_{d} %cu_{d}", .{ iw, wi, p.WG });
+        const w = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ w, p.tid, iw });
+        return w;
+    }
+
+    /// Four values to one packed int8 word, rounding half away.
+    fn packWord(p: PrepI8Emit, inv: u32, vals: [4]u32) !u32 {
+        const em = p.em;
+        var out: []const u8 = "%cu_0";
+        var last: u32 = 0;
+        for (vals, 0..) |v, k| {
             const r = em.id();
             try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ r, v, inv });
             const sgn = em.id();
@@ -1290,25 +1399,627 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
             try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ qb, qub });
             const shk = em.id();
             try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_{d}", .{ shk, qb, 8 * k });
-            const no = em.id();
-            try em.line("%t{d} = OpBitwiseOr %u32 {s} %t{d}", .{ no, out, shk });
-            out = try H.tmp(ar, no);
+            last = em.id();
+            try em.line("%t{d} = OpBitwiseOr %u32 {s} %t{d}", .{ last, out, shk });
+            out = try p.tmp(last);
         }
+        return last;
+    }
+
+    /// The row's inverse scale from shared and chunk `c`'s first output word index.
+    fn quantBase(p: PrepI8Emit, c: u32) !struct { inv: u32, roww: u32 } {
+        const em = p.em;
+        const ip = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %cu_{d}", .{ ip, p.INV });
+        const inv = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ inv, ip });
+        const roww0 = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ roww0, p.row, p.cols / 4 });
+        const roww = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ roww, roww0, c * p.CH * 64 });
+        return .{ .inv = inv, .roww = roww };
+    }
+
+    fn storeWord(p: PrepI8Emit, roww: u32, word: u32, packed_w: u32) !void {
+        const em = p.em;
         const wi = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ wi, roww, word });
         const qp = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_sq_u32 %vq %cu_0 %t{d}", .{ qp, wi });
-        try em.line("OpStore %t{d} {s}", .{ qp, out });
-        try closeLoop(&em, "%u32", "%cu_1", L);
-        cur = try H.tmp(ar, L.merge);
+        try em.line("OpStore %t{d} %t{d}", .{ qp, packed_w });
     }
-    _ = &cur;
+
+    /// Coalesced quantize of chunk `c`, shared to packed int8.
+    fn quantize(p: PrepI8Emit, cur: []const u8, c: u32) ![]const u8 {
+        const em = p.em;
+        const qb = try p.quantBase(c);
+        const L = try em.openLoop(try p.cst(p.WORDS), cur);
+        const word = try p.strided(L.iv);
+        const be = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ be, word });
+        const base = try p.shIndex(be);
+        var vals: [4]u32 = undefined;
+        for (0..4) |k| {
+            var idx: []const u8 = try p.tmp(base);
+            if (k != 0) {
+                const x = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ x, base, k });
+                idx = try p.tmp(x);
+            }
+            const pp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh {s}", .{ pp, idx });
+            vals[k] = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ vals[k], pp });
+        }
+        try p.storeWord(qb.roww, word, try p.packWord(qb.inv, vals));
+        try em.closeLoop(L);
+        return p.tmp(L.merge);
+    }
+
+    /// `quantize` of chunk `c` from the values `hold` kept, no shared read.
+    fn quantizeHeld(p: PrepI8Emit, held: [8][4]u32, c: u32) !void {
+        const qb = try p.quantBase(c);
+        for (0..p.WORDS) |wi| try p.storeWord(qb.roww, try p.wordOf(@intCast(wi)), try p.packWord(qb.inv, held[wi]));
+    }
+};
+/// `x += t` (when u2 != 0), then `out = x * inv * g` with `inv = 1 / sqrt(mean(x^2) +
+/// eps)` over each row: an LLM layer's residual add and hidden-size RMSNorm in one
+/// dispatch. One `wg`-thread workgroup per row, the sum of squares reduced per subgroup
+/// and then across them through shared memory, which Zig-emitted SPIR-V cannot use on
+/// NVIDIA. Bindings (the eltwise
+/// layout): 0 = x [rows][dim], written when adding, 1 = t, 2 = g [dim], 3 = out. Push
+/// (`EltPush`): u1 = dim, u2 = add, f0 = eps. Dispatch `rows` workgroups. A single row
+/// is latency-bound: 256 threads over a 2560-wide row measured 12.1 us, 1024 threads 6.4.
+pub fn buildAddRms(gpa: std.mem.Allocator, wg: u32) ![]align(4) u8 {
+    const WG = wg;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
+
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability GroupNonUniform", .{});
+    try em.line("OpCapability GroupNonUniformArithmetic", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("%ext = OpExtInstImport \"GLSL.std.450\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %sgid %nsg %sgl %va %vb %vc %vd %vpc %vsh", .{});
+    try em.line("OpExecutionMode %main LocalSize {d} 1 1", .{WG});
+
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %sgid BuiltIn SubgroupId", .{});
+    try em.line("OpDecorate %nsg BuiltIn NumSubgroups", .{});
+    try em.line("OpDecorate %sgl BuiltIn SubgroupLocalInvocationId", .{});
+    try em.line("OpDecorate %arr_f32 ArrayStride 4", .{});
+    try em.line("OpDecorate %sbuf Block", .{});
+    try em.line("OpMemberDecorate %sbuf 0 Offset 0", .{});
+    for ([_][]const u8{ "va", "vb", "vc", "vd" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+    }
+    // `EltPush`: u0..u5, f0, f1, u6.
+    try em.line("OpDecorate %pcs Block", .{});
+    for (0..9) |m| try em.line("OpMemberDecorate %pcs {d} Offset {d}", .{ m, m * 4 });
+
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%ptr_in_u32 = OpTypePointer Input %u32", .{});
+    try em.line("%sgid = OpVariable %ptr_in_u32 Input", .{});
+    try em.line("%nsg = OpVariable %ptr_in_u32 Input", .{});
+    try em.line("%sgl = OpVariable %ptr_in_u32 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%sbuf = OpTypeStruct %arr_f32", .{});
+    try em.line("%ptr_sbuf = OpTypePointer StorageBuffer %sbuf", .{});
+    for ([_][]const u8{ "va", "vb", "vc", "vd" }) |v| try em.line("%{s} = OpVariable %ptr_sbuf StorageBuffer", .{v});
+    try em.line("%ptr_sb_f32 = OpTypePointer StorageBuffer %f32", .{});
+    try em.line("%pcs = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %f32 %f32 %u32", .{});
+    try em.line("%ptr_pc = OpTypePointer PushConstant %pcs", .{});
+    try em.line("%vpc = OpVariable %ptr_pc PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%ptr_pc_f32 = OpTypePointer PushConstant %f32", .{});
+    try em.line("%c_wg = OpConstant %u32 {d}", .{WG});
+    try em.line("%sh = OpTypeArray %f32 %c_wg", .{});
+    try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh", .{});
+    try em.line("%vsh = OpVariable %ptr_wg_sh Workgroup", .{});
+    try em.line("%ptr_wg_f32 = OpTypePointer Workgroup %f32", .{});
+    for ([_]u32{ 0, 1, 2, 3, 6, 264 }) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
+    try em.line("%cf_0 = OpConstant %f32 0", .{});
+    try em.line("%cf_1 = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1.0)))});
+
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
+    try em.line("%gidv = OpLoad %v3u %gid", .{});
+    try em.line("%row = OpCompositeExtract %u32 %gidv 0", .{});
+    try em.line("%lidv = OpLoad %v3u %lid", .{});
+    try em.line("%tid = OpCompositeExtract %u32 %lidv 0", .{});
+    try em.line("%p_dim = OpAccessChain %ptr_pc_u32 %vpc %cu_1", .{});
+    try em.line("%dim = OpLoad %u32 %p_dim", .{});
+    try em.line("%p_add = OpAccessChain %ptr_pc_u32 %vpc %cu_2", .{});
+    try em.line("%addu = OpLoad %u32 %p_add", .{});
+    try em.line("%addf = OpINotEqual %bool %addu %cu_0", .{});
+    try em.line("%p_eps = OpAccessChain %ptr_pc_f32 %vpc %cu_6", .{});
+    try em.line("%eps = OpLoad %f32 %p_eps", .{});
+    try em.line("%base = OpIMul %u32 %row %dim", .{});
+
+    // Pass 1: the add, and each thread's sum of squares over its strided elements.
+    try em.line("OpBranch %h1", .{});
+    try em.line("%h1 = OpLabel", .{});
+    try em.line("%j1 = OpPhi %u32 %tid %entry %j1n %c1", .{});
+    try em.line("%ss = OpPhi %f32 %cf_0 %entry %ssn %c1", .{});
+    try em.line("OpLoopMerge %m1 %c1 None", .{});
+    try em.line("OpBranch %k1", .{});
+    try em.line("%k1 = OpLabel", .{});
+    try em.line("%lt1 = OpULessThan %bool %j1 %dim", .{});
+    try em.line("OpBranchConditional %lt1 %b1 %m1", .{});
+    try em.line("%b1 = OpLabel", .{});
+    try em.line("%i1 = OpIAdd %u32 %base %j1", .{});
+    try em.line("%px1 = OpAccessChain %ptr_sb_f32 %va %cu_0 %i1", .{});
+    try em.line("%x0 = OpLoad %f32 %px1", .{});
+    try em.line("OpSelectionMerge %s1 None", .{});
+    try em.line("OpBranchConditional %addf %d1 %s1", .{});
+    try em.line("%d1 = OpLabel", .{});
+    try em.line("%pt1 = OpAccessChain %ptr_sb_f32 %vb %cu_0 %i1", .{});
+    try em.line("%tv = OpLoad %f32 %pt1", .{});
+    try em.line("%x1 = OpFAdd %f32 %x0 %tv", .{});
+    try em.line("OpStore %px1 %x1", .{});
+    try em.line("OpBranch %s1", .{});
+    try em.line("%s1 = OpLabel", .{});
+    try em.line("%xv = OpPhi %f32 %x1 %d1 %x0 %b1", .{});
+    try em.line("%sq = OpFMul %f32 %xv %xv", .{});
+    try em.line("%ssn = OpFAdd %f32 %ss %sq", .{});
+    try em.line("OpBranch %c1", .{});
+    try em.line("%c1 = OpLabel", .{});
+    try em.line("%j1n = OpIAdd %u32 %j1 %c_wg", .{});
+    try em.line("OpBranch %h1", .{});
+    try em.line("%m1 = OpLabel", .{});
+    // Pass 2: each subgroup's sum, then every thread adds the subgroup sums in order.
+    try em.line("%ssr = OpGroupNonUniformFAdd %f32 %cu_3 Reduce %ss", .{});
+    try em.line("%sgi = OpLoad %u32 %sgid", .{});
+    try em.line("%sgn = OpLoad %u32 %nsg", .{});
+    try em.line("%sgla = OpLoad %u32 %sgl", .{});
+    try em.line("%first = OpIEqual %bool %sgla %cu_0", .{});
+    try em.line("OpSelectionMerge %wm None", .{});
+    try em.line("OpBranchConditional %first %wd %wm", .{});
+    try em.line("%wd = OpLabel", .{});
+    try em.line("%psh = OpAccessChain %ptr_wg_f32 %vsh %sgi", .{});
+    try em.line("OpStore %psh %ssr", .{});
+    try em.line("OpBranch %wm", .{});
+    try em.line("%wm = OpLabel", .{});
+    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+    try em.line("OpBranch %h3", .{});
+    try em.line("%h3 = OpLabel", .{});
+    try em.line("%j3 = OpPhi %u32 %cu_0 %wm %j3n %c3", .{});
+    try em.line("%tot = OpPhi %f32 %cf_0 %wm %totn %c3", .{});
+    try em.line("OpLoopMerge %m3 %c3 None", .{});
+    try em.line("OpBranch %k3", .{});
+    try em.line("%k3 = OpLabel", .{});
+    try em.line("%lt3 = OpULessThan %bool %j3 %sgn", .{});
+    try em.line("OpBranchConditional %lt3 %b3 %m3", .{});
+    try em.line("%b3 = OpLabel", .{});
+    try em.line("%pj = OpAccessChain %ptr_wg_f32 %vsh %j3", .{});
+    try em.line("%vj = OpLoad %f32 %pj", .{});
+    try em.line("%totn = OpFAdd %f32 %tot %vj", .{});
+    try em.line("OpBranch %c3", .{});
+    try em.line("%c3 = OpLabel", .{});
+    try em.line("%j3n = OpIAdd %u32 %j3 %cu_1", .{});
+    try em.line("OpBranch %h3", .{});
+    try em.line("%m3 = OpLabel", .{});
+    try em.line("%dimf = OpConvertUToF %f32 %dim", .{});
+    try em.line("%mean = OpFDiv %f32 %tot %dimf", .{});
+    try em.line("%me = OpFAdd %f32 %mean %eps", .{});
+    try em.line("%rt = OpExtInst %f32 %ext 31 %me", .{});
+    try em.line("%inv = OpFDiv %f32 %cf_1 %rt", .{});
+    try em.line("OpBranch %h2", .{});
+
+    // Pass 3: out = x * inv * g.
+    try em.line("%h2 = OpLabel", .{});
+    try em.line("%j2 = OpPhi %u32 %tid %m3 %j2n %c2", .{});
+    try em.line("OpLoopMerge %m2 %c2 None", .{});
+    try em.line("OpBranch %k2", .{});
+    try em.line("%k2 = OpLabel", .{});
+    try em.line("%lt2 = OpULessThan %bool %j2 %dim", .{});
+    try em.line("OpBranchConditional %lt2 %b2 %m2", .{});
+    try em.line("%b2 = OpLabel", .{});
+    try em.line("%i2 = OpIAdd %u32 %base %j2", .{});
+    try em.line("%px2 = OpAccessChain %ptr_sb_f32 %va %cu_0 %i2", .{});
+    try em.line("%xr = OpLoad %f32 %px2", .{});
+    try em.line("%pg = OpAccessChain %ptr_sb_f32 %vc %cu_0 %j2", .{});
+    try em.line("%gv = OpLoad %f32 %pg", .{});
+    try em.line("%xi = OpFMul %f32 %xr %inv", .{});
+    try em.line("%o = OpFMul %f32 %xi %gv", .{});
+    try em.line("%po = OpAccessChain %ptr_sb_f32 %vd %cu_0 %i2", .{});
+    try em.line("OpStore %po %o", .{});
+    try em.line("OpBranch %c2", .{});
+    try em.line("%c2 = OpLabel", .{});
+    try em.line("%j2n = OpIAdd %u32 %j2 %c_wg", .{});
+    try em.line("OpBranch %h2", .{});
+    try em.line("%m2 = OpLabel", .{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
+}
+
+/// Weight-only expansion of an int8 weight in the k-major layout `weightBuffer` and the
+/// 4-bit decodes write (byte (k, row) at k*stride + row) to the padded 16-bit k-major
+/// layout the coop GEMM reads, the per-row scale applied and, when `rotate`, the convrot
+/// rotation undone along k. Hand-assembled for the shared memory: the FWHT a thread
+/// keeps in a private array spills, measured at 2.3 s of a 3.2 s prompt pass.
+///
+/// One workgroup of 256 threads per 32 rows by one 256-wide k group: a coalesced load
+/// into f32 shared [32 rows][257], the radix-4 FWHT with each stage's butterflies spread
+/// over every lane (consecutive lanes take consecutive rows, which the 257 pad puts in
+/// distinct banks), then coalesced 16-bit pairs out. k past `cols`
+/// up to its 64 pad is written as zero, which the GEMM multiplies against a zero
+/// activation. Bindings: 0 = weight words, 1 = out words, 2 = row scale f32. Push:
+/// stride/4, rows, n_pad, cols. Dispatch (ceil(rows/32), ceil(cols/256)).
+pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align(4) u8 {
+    const R: u32 = 32;
+    const LANES: u32 = 256;
+    const PAD: u32 = 257;
+    const SC: u32 = R * PAD;
+    const SH_LEN: u32 = SC + R;
+
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const ar = arena_inst.allocator();
+    const tmp = struct {
+        fn f(a2: std.mem.Allocator, i: u32) ![]const u8 {
+            return std.fmt.allocPrint(a2, "%t{d}", .{i});
+        }
+    }.f;
+
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("%ext = OpExtInstImport \"GLSL.std.450\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vw %vo %vs %vpc %vsh", .{});
+    try em.line("OpExecutionMode %main LocalSize {d} 1 1", .{LANES});
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_f32 ArrayStride 4", .{});
+    try em.line("OpDecorate %arr_u32 ArrayStride 4", .{});
+    for ([_][]const u8{ "sw", "so", "ss" }) |n| {
+        try em.line("OpDecorate %{s} Block", .{n});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{n});
+    }
+    for ([_][]const u8{ "vw", "vo", "vs" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+    }
+    try em.line("OpDecorate %spc Block", .{});
+    for (0..4) |i| try em.line("OpMemberDecorate %spc {d} Offset {d}", .{ i, 4 * i });
+
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%s32 = OpTypeInt 32 1", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%sw = OpTypeStruct %arr_u32", .{});
+    try em.line("%so = OpTypeStruct %arr_u32", .{});
+    try em.line("%ss = OpTypeStruct %arr_f32", .{});
+    try em.line("%ptr_sw = OpTypePointer StorageBuffer %sw", .{});
+    try em.line("%ptr_so = OpTypePointer StorageBuffer %so", .{});
+    try em.line("%ptr_ss = OpTypePointer StorageBuffer %ss", .{});
+    try em.line("%vw = OpVariable %ptr_sw StorageBuffer", .{});
+    try em.line("%vo = OpVariable %ptr_so StorageBuffer", .{});
+    try em.line("%vs = OpVariable %ptr_ss StorageBuffer", .{});
+    try em.line("%ptr_sb_u32 = OpTypePointer StorageBuffer %u32", .{});
+    try em.line("%ptr_sb_f32 = OpTypePointer StorageBuffer %f32", .{});
+    try em.line("%spc = OpTypeStruct %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_pc = OpTypePointer PushConstant %spc", .{});
+    try em.line("%vpc = OpVariable %ptr_pc PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%c_shlen = OpConstant %u32 {d}", .{SH_LEN});
+    try em.line("%sh = OpTypeArray %f32 %c_shlen", .{});
+    try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh", .{});
+    try em.line("%vsh = OpVariable %ptr_wg_sh Workgroup", .{});
+    try em.line("%ptr_wg_f32 = OpTypePointer Workgroup %f32", .{});
+    for ([_]u32{ 0, 1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 24, 31, 32, 48, 63, 64, 128, 192, 256, 264, PAD, SC, 0x7FFF }) |v|
+        try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
+    try em.line("%cu_not63 = OpConstant %u32 {d}", .{~@as(u32, 63)});
+    try em.line("%cf_0 = OpConstant %f32 0", .{});
+    try em.line("%cf_scale = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, if (rotate) 1.0 / 16.0 else 1.0)))});
+
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tile, gidv });
+    const grp = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ grp, gidv });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const tid = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tid, lidv });
+    var pc: [4]u32 = undefined;
+    for (&pc, 0..) |*v, i| {
+        const pp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpc %cu_{d}", .{ pp, i });
+        v.* = em.id();
+        try em.line("%t{d} = OpLoad %u32 %t{d}", .{ v.*, pp });
+    }
+    const sw, const rows, const npad, const cols = pc;
+    const r0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_32", .{ r0, tile });
+    const k0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ k0, grp });
+    const rq0 = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_2", .{ rq0, r0 });
+    const kp63 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_63", .{ kp63, cols });
+    const kpad = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_not63", .{ kpad, kp63 });
+    var cur: []const u8 = "%entry";
+
+    // Load: word w of the tile holds rows 4*(w%8).. +3 at k = k0 + w/8.
+    {
+        const L = try em.openLoop("%cu_8", cur);
+        const w0 = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ w0, L.iv });
+        const w = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ w, w0, tid });
+        const kk = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_3", .{ kk, w });
+        const rq = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_7", .{ rq, w });
+        const k = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ k, k0, kk });
+        const rowq = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ rowq, rq0, rq });
+        const okk = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %t{d}", .{ okk, k, cols });
+        const okr = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %t{d}", .{ okr, rowq, sw });
+        const ok = em.id();
+        try em.line("%t{d} = OpLogicalAnd %bool %t{d} %t{d}", .{ ok, okk, okr });
+        const ks = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %t{d}", .{ ks, k, sw });
+        const gi0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gi0, ks, rowq });
+        const gi = em.id();
+        try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %cu_0", .{ gi, ok, gi0 });
+        const wp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_sb_u32 %vw %cu_0 %t{d}", .{ wp, gi });
+        const raw = em.id();
+        try em.line("%t{d} = OpLoad %u32 %t{d}", .{ raw, wp });
+        const word = em.id();
+        try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %cu_0", .{ word, ok, raw });
+        const ws = em.id();
+        try em.line("%t{d} = OpBitcast %s32 %t{d}", .{ ws, word });
+        const rq4 = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ rq4, rq });
+        for (0..4) |j| {
+            const q = em.id();
+            try em.line("%t{d} = OpBitFieldSExtract %s32 %t{d} %cu_{d} %cu_8", .{ q, ws, 8 * j });
+            const f = em.id();
+            try em.line("%t{d} = OpConvertSToF %f32 %t{d}", .{ f, q });
+            const r = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ r, rq4, j });
+            const rp = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ rp, r, PAD });
+            const si = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ si, rp, kk });
+            const sp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ sp, si });
+            try em.line("OpStore %t{d} %t{d}", .{ sp, f });
+        }
+        try em.closeLoop(L);
+        cur = try tmp(ar, L.merge);
+    }
+
+    // The tile's 32 row scales, before the barrier the FWHT needs anyway.
+    {
+        const sel = em.id();
+        const do = em.id();
+        const lt = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_32", .{ lt, tid });
+        try em.line("OpSelectionMerge %t{d} None", .{sel});
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ lt, do, sel });
+        try em.line("%t{d} = OpLabel", .{do});
+        const row = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ row, r0, tid });
+        const ok = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %t{d}", .{ ok, row, rows });
+        const ri = em.id();
+        try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %cu_0", .{ ri, ok, row });
+        const sp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_sb_f32 %vs %cu_0 %t{d}", .{ sp, ri });
+        const sv = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ sv, sp });
+        const sm = em.id();
+        try em.line("%t{d} = OpFMul %f32 %t{d} %cf_scale", .{ sm, sv });
+        const sz = em.id();
+        try em.line("%t{d} = OpSelect %f32 %t{d} %t{d} %cf_0", .{ sz, ok, sm });
+        const si = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ si, SC, tid });
+        const shp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ shp, si });
+        try em.line("OpStore %t{d} %t{d}", .{ shp, sz });
+        try em.line("OpBranch %t{d}", .{sel});
+        try em.line("%t{d} = OpLabel", .{sel});
+        cur = try tmp(ar, sel);
+    }
+    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+
+    if (rotate) {
+        inline for (.{ 1, 4, 16, 64 }, 0..) |st, si| {
+            // Butterfly b = iv*256 + tid of the tile's 32 x 64: row b%32, slot b/32.
+            const L = try em.openLoop("%cu_8", cur);
+            const b0 = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ b0, L.iv });
+            const b = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b, b0, tid });
+            const brow = em.id();
+            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_31", .{ brow, b });
+            const j = em.id();
+            try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_5", .{ j, b });
+            const tbase = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ tbase, brow, PAD });
+            const lo = em.id();
+            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ lo, j, st - 1 });
+            const hi = em.id();
+            try em.line("%t{d} = OpISub %u32 %t{d} %t{d}", .{ hi, j, lo });
+            const hi4 = em.id();
+            try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ hi4, hi });
+            const p0 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ p0, hi4, lo });
+            const base = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ base, tbase, p0 });
+            var ptr: [4]u32 = undefined;
+            var e: [4]u32 = undefined;
+            for (0..4) |i| {
+                const idx = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ idx, base, i * st });
+                ptr[i] = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ ptr[i], idx });
+                e[i] = em.id();
+                try em.line("%t{d} = OpLoad %f32 %t{d}", .{ e[i], ptr[i] });
+            }
+            const pq = em.id();
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ pq, e[0], e[1] });
+            const qd = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ qd, e[2], e[3] });
+            const rd = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ rd, e[0], e[1] });
+            const sd = em.id();
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ sd, e[2], e[3] });
+            const outs = [4][3]u32{ .{ 0, pq, qd }, .{ 1, pq, qd }, .{ 0, rd, sd }, .{ 1, sd, rd } };
+            for (outs, 0..) |o, i| {
+                const v = em.id();
+                try em.line("%t{d} = {s} %f32 %t{d} %t{d}", .{ v, if (o[0] == 0) "OpFAdd" else "OpFSub", o[1], o[2] });
+                try em.line("OpStore %t{d} %t{d}", .{ ptr[i], v });
+            }
+            try em.closeLoop(L);
+            cur = try tmp(ar, L.merge);
+            if (si < 3) try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+        }
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+    }
+
+    // Out: word w holds rows 2*(w%16), +1 at k = k0 + w/16.
+    {
+        const half = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ half, npad });
+        const rp0 = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ rp0, r0 });
+        const L = try em.openLoop("%cu_16", cur);
+        const w0 = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ w0, L.iv });
+        const w = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ w, w0, tid });
+        const kk = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_4", .{ kk, w });
+        const rp = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_15", .{ rp, w });
+        const k = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ k, k0, kk });
+        const orow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ orow, rp0, rp });
+        const okk = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %t{d}", .{ okk, k, kpad });
+        const okn = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %t{d}", .{ okn, orow, half });
+        const ok = em.id();
+        try em.line("%t{d} = OpLogicalAnd %bool %t{d} %t{d}", .{ ok, okk, okn });
+        const sel = em.id();
+        const do = em.id();
+        try em.line("OpSelectionMerge %t{d} None", .{sel});
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ ok, do, sel });
+        try em.line("%t{d} = OpLabel", .{do});
+        var bits: [2]u32 = undefined;
+        var hv: [2]u32 = undefined;
+        for (0..2) |j| {
+            const r = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ r, rp, rp });
+            const rj = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rj, r, j });
+            const rpad = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ rpad, rj, PAD });
+            const si = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ si, rpad, kk });
+            const sp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ sp, si });
+            const v = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ v, sp });
+            const sci = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ sci, SC, rj });
+            const scp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ scp, sci });
+            const scv = em.id();
+            try em.line("%t{d} = OpLoad %f32 %t{d}", .{ scv, scp });
+            const x = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ x, v, scv });
+            if (bf16) {
+                // Round to nearest even on the top 16 bits.
+                const b = em.id();
+                try em.line("%t{d} = OpBitcast %u32 %t{d}", .{ b, x });
+                const sh16 = em.id();
+                try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_16", .{ sh16, b });
+                const odd = em.id();
+                try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_1", .{ odd, sh16 });
+                const rne = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rne, odd, 0x7FFF });
+                const sum = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ sum, b, rne });
+                bits[j] = em.id();
+                try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_16", .{ bits[j], sum });
+            } else {
+                hv[j] = em.id();
+                try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ hv[j], x });
+            }
+        }
+        const packed_w = em.id();
+        if (bf16) {
+            const hi = em.id();
+            try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_16", .{ hi, bits[1] });
+            try em.line("%t{d} = OpBitwiseOr %u32 %t{d} %t{d}", .{ packed_w, bits[0], hi });
+        } else {
+            const vec = em.id();
+            try em.line("%t{d} = OpCompositeConstruct %v2f16 %t{d} %t{d}", .{ vec, hv[0], hv[1] });
+            try em.line("%t{d} = OpBitcast %u32 %t{d}", .{ packed_w, vec });
+        }
+        const kh = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %t{d}", .{ kh, k, half });
+        const oi = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ oi, kh, orow });
+        const op = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_sb_u32 %vo %cu_0 %t{d}", .{ op, oi });
+        try em.line("OpStore %t{d} %t{d}", .{ op, packed_w });
+        try em.line("OpBranch %t{d}", .{sel});
+        try em.line("%t{d} = OpLabel", .{sel});
+        try em.closeLoop(L);
+    }
 
     try em.line("OpReturn", .{});
     try em.line("OpFunctionEnd", .{});
-
     return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
+
 /// Shared-memory staged variant with fused fp8 decode and double-buffered
 /// k sub-slabs: LocalSize (32,4) = 4 subgroups; each workgroup computes a
 /// 128(m) x 128(n) tile of C, stepping k by 64 as two 32-deep sub-slabs.
@@ -3668,10 +4379,13 @@ test "coop shader emission is byte-stable" {
         });
     }
     for ([_]struct { u32, []const u8, []const u8 }{
-        .{ 2048, "fused_prep_i8 2048", "3c91e5639a4f083fa589cb0473844875f0a4986a3fdf5a778f1568b79f71abc3" },
-        .{ 6144, "fused_prep_i8 6144", "c19a9fc751161c30af8fde5ed5dbec129f2292168455d62ce29b18c41c06a30b" },
-        .{ 8192, "fused_prep_i8 8192", "37cfba81299a8a11a7c63d91df55d4ece33c880c8b36fefe458ba05489c59b90" },
-        .{ 16384, "fused_prep_i8 16384", "4c0ed7117e622d13c65147b17c7f85681988b793c37ed137ca683ccede10559f" },
+        .{ 2048, "fused_prep_i8 2048", "96f313a4f9f4d8e7e8068f4b9990347c8bb7026c5030bb7234f0bdf652ffce8d" },
+        .{ 3072, "fused_prep_i8 3072", "10e988924e34d7c57549af3a72f8288a88d17aae9807bde0c1204445b05cf10d" },
+        .{ 5376, "fused_prep_i8 5376", "ac4f433c5d8eab81805ed67839346503394af5d6fa7d5460b703fe9a4aa69097" },
+        .{ 6144, "fused_prep_i8 6144", "d9f8efb262c3403e1a26db9dba06eec3b8f4fd5de60de0f15a64d6ace9423001" },
+        .{ 8192, "fused_prep_i8 8192", "460776782a523eb305009cb7a2abd5bf8dc47bf6d6bdf58acdcb09238e360f2d" },
+        .{ 12288, "fused_prep_i8 12288", "490843d2e0872249a21ab79ffc357001c465112bd94fdf59739dd8a044d0d6dd" },
+        .{ 16384, "fused_prep_i8 16384", "3558df44130348cc8981ab8e71642eb094436eb9d73a41eb90bcd9d08966f5a7" },
     }) |v| {
         try cases.append(gpa, .{
             .name = v[1],

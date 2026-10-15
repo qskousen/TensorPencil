@@ -17,6 +17,7 @@
 //!   already use bare HF names and pass through.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const dtypes = @import("dtype.zig");
 const filemap = @import("filemap.zig");
 const tensors = @import("tensor.zig");
@@ -1094,7 +1095,7 @@ test "canonical name translation" {
 test "real qwen3-4b gguf headers" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
+    const path = build_options.model_root ++ "/text_encoders/Qwen3-4B-Q4_K_M.gguf";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
     var g = try Gguf.open(gpa, io, path);

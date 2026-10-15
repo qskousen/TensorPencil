@@ -1,17 +1,12 @@
-//! Gemma 3 vision tower (SigLIP + projector) on the Vulkan backend: the 27
-//! encoder blocks run device-side, the cheap projector on the host (like
-//! gemma_vit_cuda). Correctness-first, mirroring the Vulkan LLM path.
-//!
-//! Vulkan has no f16-weight GEMM, so the f16 block weights are dequantized to
-//! f32 once at load (stable host pointers -> the Context weight cache works)
-//! and fed to the f32 `opMatmul` (+bias). Attention is the full non-causal
-//! `attn_full` kernel (arbitrary head_dim 72), LayerNorm the `layernorm`
-//! kernel, GELU the `gelu` kernel, all added for this port. The patch conv
-//! and learned position embedding, and the host projector, are the same as
-//! the CPU/CUDA paths.
+//! Gemma 3 vision tower on the Vulkan backend: the adapter for `gemma_vit_dev.zig`.
+//! Attention is the non-causal `attn_full` at the true 72-wide head, and the linears
+//! run in each weight's storage dtype through `lin_gpu.towerLinear`.
 
 const std = @import("std");
+const lin_gpu = @import("lin_gpu.zig");
+const Weight = @import("tp_ops").matmul.Weight;
 const gemma_vit = @import("gemma_vit.zig");
+const gemma_vit_dev = @import("gemma_vit_dev.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 const safetensors = @import("tp_core").safetensors;
@@ -23,113 +18,153 @@ fn nbuf(ctx: *gpu.Context, w: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
 }
 
-/// A block's projection weights dequantized to f32 (Vulkan opMatmul needs
-/// f32 weights); biases/norms are borrowed from the CPU Vit (already f32).
-const BlockF32 = struct {
-    q: []f32,
-    k: []f32,
-    v: []f32,
-    o: []f32,
-    up: []f32,
-    down: []f32,
-};
-
+/// The tower on Vulkan. Its weights are the CPU `Vit`'s own, in their checkpoint
+/// dtype: `lin_gpu` runs each by its storage.
 pub const VitGpu = struct {
-    arena: std.heap.ArenaAllocator,
     vit: *const Vit,
-    blocks: []BlockF32,
 
     pub fn load(gpa: std.mem.Allocator, vit: *const Vit) !VitGpu {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-        const alloc = arena.allocator();
-        const blocks = try alloc.alloc(BlockF32, vit.blocks.len);
-        for (blocks, vit.blocks) |*dst, *src| {
-            dst.* = .{
-                .q = try deq(alloc, src.q),
-                .k = try deq(alloc, src.k),
-                .v = try deq(alloc, src.v),
-                .o = try deq(alloc, src.out),
-                .up = try deq(alloc, src.up),
-                .down = try deq(alloc, src.down),
-            };
-        }
-        return .{ .arena = arena, .vit = vit, .blocks = blocks };
-    }
-
-    fn deq(alloc: std.mem.Allocator, w: ops.matmul.Weight) ![]f32 {
-        const out = try alloc.alloc(f32, w.rows * w.cols);
-        try safetensors.convertToF32(w.dtype, w.bytes, out);
-        return out;
+        _ = gpa;
+        return .{ .vit = vit };
     }
 
     pub fn deinit(self: *VitGpu) void {
-        self.arena.deinit();
         self.* = undefined;
     }
 
-    /// Encode interleaved RGB pixels to Gemma image-token embeddings on
-    /// Vulkan. Same contract as gemma_vit.Vit.encode.
+    /// Encode interleaved RGB pixels to Gemma image-token embeddings on Vulkan. Same
+    /// contract as `Vit.encode`.
     pub fn encode(self: *const VitGpu, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
-        const vit = self.vit;
-        const cfg = vit.cfg;
-        const dim = cfg.dim;
-        const heads = cfg.n_heads;
-        const hd = cfg.headDim();
-        const side = cfg.side();
-        const np = side * side;
-        const kdim = 3 * cfg.patch * cfg.patch;
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-
-        const patches = try vit.patchMatrix(gpa, rgb, width, height);
-        defer gpa.free(patches);
-
-        var bufs: [7]Buf = @splat(.{ .buf = .null_handle, .mem = .null_handle, .size = 0 });
-        defer for (&bufs) |*b| ctx.tensorDestroy(b);
-        bufs[0] = try ctx.tensorCreate(np * dim * 4); // x
-        bufs[1] = try ctx.tensorCreate(np * dim * 4); // normed
-        bufs[2] = try ctx.tensorCreate(np * dim * 4); // q
-        bufs[3] = try ctx.tensorCreate(np * dim * 4); // k
-        bufs[4] = try ctx.tensorCreate(np * dim * 4); // v
-        bufs[5] = try ctx.tensorCreate(np * @max(dim, cfg.ffn) * 4); // attn / ffn hidden
-        bufs[6] = try ctx.tensorCreate(np * dim * 4); // t (patch upload / residual delta)
-        const x_d = bufs[0];
-        const normed_d = bufs[1];
-        const q_d = bufs[2];
-        const k_d = bufs[3];
-        const v_d = bufs[4];
-        const big_d = bufs[5];
-        const t_d = bufs[6];
-
-        // Patch embed GEMM + learned position embedding.
-        try ctx.tensorUpload(t_d, std.mem.sliceAsBytes(patches[0 .. np * kdim]));
-        try ctx.opMatmul(x_d, 0, t_d, 0, np, std.mem.sliceAsBytes(vit.patch_w), false, dim, kdim, 1.0, vit.patch_b);
-        try ctx.tensorUpload(t_d, std.mem.sliceAsBytes(vit.pos_embd));
-        try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(np * dim) }, np * dim, 1, 1);
-
-        for (vit.blocks, self.blocks) |*blk, *bf| {
-            // --- Attention ---
-            try ctx.opElt(.layernorm, x_d, normed_d, try nbuf(ctx, blk.ln1_w), try nbuf(ctx, blk.ln1_b), .{ .u0 = @intCast(np), .u1 = @intCast(dim), .f0 = cfg.eps }, np, 1, 1);
-            try ctx.opMatmul(q_d, 0, normed_d, 0, np, std.mem.sliceAsBytes(bf.q), false, dim, dim, 1.0, blk.q_b);
-            try ctx.opMatmul(k_d, 0, normed_d, 0, np, std.mem.sliceAsBytes(bf.k), false, dim, dim, 1.0, blk.k_b);
-            try ctx.opMatmul(v_d, 0, normed_d, 0, np, std.mem.sliceAsBytes(bf.v), false, dim, dim, 1.0, blk.v_b);
-            try ctx.opElt(.attn_full, q_d, k_d, v_d, big_d, .{ .u0 = @intCast(np), .u1 = @intCast(heads), .u2 = @intCast(heads), .u3 = @intCast(hd), .f0 = scale }, np * heads, 1, 1);
-            try ctx.opMatmul(t_d, 0, big_d, 0, np, std.mem.sliceAsBytes(bf.o), false, dim, dim, 1.0, blk.out_b);
-            try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(np * dim) }, np * dim, 1, 1);
-
-            // --- MLP (gelu) ---
-            try ctx.opElt(.layernorm, x_d, normed_d, try nbuf(ctx, blk.ln2_w), try nbuf(ctx, blk.ln2_b), .{ .u0 = @intCast(np), .u1 = @intCast(dim), .f0 = cfg.eps }, np, 1, 1);
-            try ctx.opMatmul(big_d, 0, normed_d, 0, np, std.mem.sliceAsBytes(bf.up), false, cfg.ffn, dim, 1.0, blk.up_b);
-            try ctx.opElt(.gelu, big_d, null, null, null, .{ .u0 = @intCast(np * cfg.ffn) }, np * cfg.ffn, 1, 1);
-            try ctx.opMatmul(t_d, 0, big_d, 0, np, std.mem.sliceAsBytes(bf.down), false, dim, cfg.ffn, 1.0, blk.down_b);
-            try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(np * dim) }, np * dim, 1, 1);
-        }
-        try ctx.opElt(.layernorm, x_d, x_d, try nbuf(ctx, vit.post_ln_w), try nbuf(ctx, vit.post_ln_b), .{ .u0 = @intCast(np), .u1 = @intCast(dim), .f0 = cfg.eps }, np, 1, 1);
-
-        // Download post-LN patch states; the projector runs on the host.
-        const x_host = try gpa.alloc(f32, np * dim);
-        defer gpa.free(x_host);
-        try ctx.tensorDownload(x_d, std.mem.sliceAsBytes(x_host));
-        return vit.project(io, gpa, x_host);
+        const cfg = self.vit.cfg;
+        const np = cfg.side() * cfg.side();
+        var d: Dev = .{ .ctx = ctx, .cfg = cfg, .tl = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.tower_max_out, 0, 0) };
+        defer d.deinit();
+        const sizes = [_]usize{ np * cfg.dim, np * cfg.dim, np * @max(cfg.dim, cfg.ffn), np * cfg.dim, np * cfg.dim, np * cfg.dim, np * cfg.dim };
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.q, &d.k, &d.v }, sizes) |b, n| b.* = try ctx.tensorCreate(n * 4);
+        return gemma_vit_dev.encode(&d, self.vit, io, gpa, rgb, width, height);
     }
 };
+
+const none: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+const Bufs = struct { x: Buf = none, normed: Buf = none, big: Buf = none, t: Buf = none };
+
+/// The `gemma_vit_dev` adapter.
+const Dev = struct {
+    ctx: *gpu.Context,
+    cfg: gemma_vit.Config,
+    tl: lin_gpu.Lin,
+    b: Bufs = .{},
+    q: Buf = none,
+    k: Buf = none,
+    v: Buf = none,
+
+    fn deinit(d: *Dev) void {
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.q, &d.k, &d.v }) |b| d.ctx.tensorDestroy(b);
+        d.tl.deinit();
+    }
+
+    pub fn beginBatch(d: *Dev) !void {
+        try d.ctx.beginBatch();
+    }
+
+    pub fn endBatch(d: *Dev) !void {
+        try d.ctx.endBatch();
+    }
+
+    pub fn abortBatch(d: *Dev) void {
+        if (d.ctx.batching) d.ctx.abortBatch();
+    }
+
+    pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {
+        try d.ctx.tensorUpload(b, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: *Dev, b: Buf, dst: []f32) !void {
+        try d.ctx.tensorDownload(b, std.mem.sliceAsBytes(dst));
+    }
+
+    pub fn linear(d: *Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
+        try lin_gpu.towerLinear(&d.tl, y, x, m, w, bias);
+    }
+
+    pub fn layerNorm(d: *Dev, x: Buf, y: Buf, w: []const f32, bias: []const f32, rows: usize) !void {
+        try d.ctx.opElt(.layernorm, x, y, try nbuf(d.ctx, w), try nbuf(d.ctx, bias), .{ .u0 = @intCast(rows), .u1 = @intCast(d.cfg.dim), .f0 = d.cfg.eps }, rows, 1, 1);
+    }
+
+    pub fn add(d: *Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.ctx.opElt(.add, x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn gelu(d: *Dev, x: Buf, n: usize) !void {
+        try d.ctx.opElt(.gelu, x, null, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    /// `attn_full` at the true 72-wide head.
+    pub fn attention(d: *Dev, blk: *const gemma_vit.Block, np: usize) !Buf {
+        const cfg = d.cfg;
+        const hd = cfg.headDim();
+        try d.linear(d.q, d.b.normed, np, blk.q, blk.q_b);
+        try d.linear(d.k, d.b.normed, np, blk.k, blk.k_b);
+        try d.linear(d.v, d.b.normed, np, blk.v, blk.v_b);
+        try d.ctx.opElt(.attn_full, d.q, d.k, d.v, d.b.big, .{
+            .u0 = @intCast(np),
+            .u1 = @intCast(cfg.n_heads),
+            .u2 = @intCast(cfg.n_heads),
+            .u3 = @intCast(hd),
+            .f0 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+        }, np * cfg.n_heads, 1, 1);
+        return d.b.big;
+    }
+};
+
+test "vulkan gemma vit matches cpu encode" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/mnt/watch/models/llm/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/mmproj-F16.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var g = try @import("tp_core").gguf.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var vit = try Vit.load(gpa, &g);
+    defer vit.deinit();
+    var dev = try VitGpu.load(gpa, &vit);
+    defer dev.deinit();
+
+    var pixels: [128 * 96 * 3]u8 = undefined;
+    for (0..96) |y| for (0..128) |x| {
+        const i = (y * 128 + x) * 3;
+        pixels[i] = @intCast((x * 2) & 0xff);
+        pixels[i + 1] = @intCast((y * 2) & 0xff);
+        pixels[i + 2] = 100;
+    };
+
+    var want = try vit.encode(io, gpa, &pixels, 128, 96);
+    defer want.deinit(gpa);
+    var got = try dev.encode(ctx, io, gpa, &pixels, 128, 96);
+    defer got.deinit(gpa);
+
+    try std.testing.expectEqual(want.embeds.len, got.embeds.len);
+    const pd = vit.cfg.proj_dim;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    var min_cos: f64 = 1;
+    var t: usize = 0;
+    while (t * pd < want.embeds.len) : (t += 1) {
+        var dot: f64 = 0;
+        var na: f64 = 0;
+        var nb: f64 = 0;
+        for (want.embeds[t * pd ..][0..pd], got.embeds[t * pd ..][0..pd]) |a, b| {
+            dot += @as(f64, a) * b;
+            na += @as(f64, a) * a;
+            nb += @as(f64, b) * b;
+            num += (@as(f64, a) - b) * (@as(f64, a) - b);
+            den += @as(f64, a) * a;
+        }
+        min_cos = @min(min_cos, dot / (@sqrt(na) * @sqrt(nb)));
+    }
+    errdefer std.debug.print("vulkan gemma vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, @sqrt(num / den) });
+    try std.testing.expect(min_cos > 0.999);
+    try std.testing.expect(@sqrt(num / den) < 0.05);
+}

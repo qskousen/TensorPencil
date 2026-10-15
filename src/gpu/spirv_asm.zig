@@ -108,9 +108,11 @@ const opcodes = std.StaticStringMap(OpInfo).initComptime(.{
     .{ "OpConvertFToU", OpInfo{ .opcode = 109, .result = .typed } },
     .{ "OpConvertFToS", OpInfo{ .opcode = 110, .result = .typed } },
     .{ "OpConvertSToF", OpInfo{ .opcode = 111, .result = .typed } },
+    .{ "OpBitFieldSExtract", OpInfo{ .opcode = 202, .result = .typed } },
     .{ "OpConvertUToF", OpInfo{ .opcode = 112, .result = .typed } },
     .{ "OpUConvert", OpInfo{ .opcode = 113, .result = .typed } },
     .{ "OpSConvert", OpInfo{ .opcode = 114, .result = .typed } },
+    .{ "OpCopyObject", OpInfo{ .opcode = 83, .result = .typed } },
     .{ "OpFConvert", OpInfo{ .opcode = 115, .result = .typed } },
     .{ "OpBitcast", OpInfo{ .opcode = 124, .result = .typed } },
     // Arithmetic
@@ -171,6 +173,7 @@ const opcodes = std.StaticStringMap(OpInfo).initComptime(.{
     .{ "OpUnreachable", OpInfo{ .opcode = 255, .result = .none } },
     // Barriers
     .{ "OpControlBarrier", OpInfo{ .opcode = 224, .result = .none } },
+    .{ "OpGroupNonUniformFAdd", OpInfo{ .opcode = 350, .result = .typed } },
     .{ "OpMemoryBarrier", OpInfo{ .opcode = 225, .result = .none } },
     // Cooperative matrix KHR
     .{ "OpCooperativeMatrixLoadKHR", OpInfo{ .opcode = 4457, .result = .typed } },
@@ -192,6 +195,7 @@ const enum_tokens = std.StaticStringMap(u32).initComptime(.{
     .{ "Int16", 22 },
     .{ "Int8", 39 },
     .{ "GroupNonUniform", 61 },
+    .{ "GroupNonUniformArithmetic", 63 },
     .{ "StorageBuffer16BitAccess", 4433 },
     .{ "StorageBuffer8BitAccess", 4448 },
     .{ "VulkanMemoryModel", 5345 },
@@ -206,6 +210,8 @@ const enum_tokens = std.StaticStringMap(u32).initComptime(.{
     // Memory model
     .{ "GLSL450", 1 },
     .{ "Vulkan", 3 },
+    // Group operation
+    .{ "Reduce", 0 },
     // Execution model
     .{ "GLCompute", 5 },
     .{ "Kernel", 6 },

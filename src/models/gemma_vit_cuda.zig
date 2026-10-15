@@ -1,21 +1,11 @@
-//! Gemma 3 vision tower forward on the CUDA backend: the SigLIP encoder
-//! (patch embed, learned position add, 27 pre-LN blocks) runs device-side;
-//! the cheap projector (4x4 avg-pool -> soft_emb_norm -> input projection)
-//! runs on the host via gemma_vit.Vit.project (256 tokens, negligible next
-//! to the 27 blocks over 4096 patches, the part that made the CPU encode
-//! ~39 s). Mirrors vit35_cuda, minus the vision RoPE (Gemma uses a learned
-//! position embedding) and with separate q/k/v (not fused).
-//!
-//! The 72-dim heads are zero-padded to 128 on device (head_pad) so the
-//! tensor-core attention applies; the pads are exact zeros so scores/outputs
-//! match the CPU path up to the f16 GEMM regime. f16 block weights feed
-//! opMatmulF16 straight from the mmap; the f32 patch kernel and the
-//! (transposed f32) input projection take opConvF16. ViT weights and the
-//! attention/GEMM scratch are scoped and released after encoding, so nothing
-//! image-sized stays resident under the LLM.
+//! Gemma 3 vision tower on the CUDA backend: the adapter for `gemma_vit_dev.zig`. The
+//! 72-dim heads are zero-padded to 128 (head_pad) so the tensor-core attention applies,
+//! and the linears run in each weight's storage dtype through `lin_cuda.towerLinear`.
 
 const std = @import("std");
+const lin_cuda = @import("lin_cuda.zig");
 const gemma_vit = @import("gemma_vit.zig");
+const gemma_vit_dev = @import("gemma_vit_dev.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -24,105 +14,108 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// GEMM in the weight's storage dtype, y[m][w.rows] = x @ Wᵀ + bias.
-fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
-    const b = bias orelse &.{};
-    switch (w.dtype) {
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
-        .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, b),
-        else => return error.UnsupportedDType,
-    }
-}
-
-fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
-}
-
-/// Encode interleaved RGB pixels to Gemma image-token embeddings on CUDA.
-/// Same contract as gemma_vit.Vit.encode; numerics differ by the f16 GEMM
-/// regime (validated cos > 0.999 vs the CPU path).
+/// Encode interleaved RGB pixels to Gemma image-token embeddings on CUDA. Same
+/// contract as `Vit.encode`; numerics differ by the f16 GEMM regime.
 pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
     const cfg = vit.cfg;
-    const dim = cfg.dim;
-    const heads = cfg.n_heads;
-    const hd = cfg.headDim(); // 72
-    const hd_pad = std.mem.alignForward(usize, hd, 128); // 128
-    const side = cfg.side();
-    const np = side * side; // 4096
-    const kdim = 3 * cfg.patch * cfg.patch;
+    const hd_pad = std.mem.alignForward(usize, cfg.headDim(), 128);
+    const np = cfg.side() * cfg.side();
 
-    const patches = try vit.patchMatrix(gpa, rgb, width, height);
-    defer gpa.free(patches);
-
+    // ViT weights and scratch are scoped, so nothing image-sized stays under the LLM.
     be.weightScopeBegin();
     defer {
         be.weightScopeEnd();
         be.freeAttnScratch();
         be.freeConvScratch();
     }
-
-    var bufs: [8]Buf = @splat(.{});
-    defer for (&bufs) |*b| be.tensorDestroy(b);
-    const sizes = [bufs.len]usize{
-        np * dim, // x (residual stream)
-        np * dim, // normed / compacted attn output
-        np * dim, // proj_tmp (raw q/k/v projection before head_pad) / patch upload
-        np * heads * hd_pad, // q (padded heads)
-        np * heads * hd_pad, // k
-        np * heads * hd_pad, // v
-        np * @max(heads * hd_pad, cfg.ffn), // attn out / FFN hidden
-        np * dim, // t (residual delta)
+    var d: Dev = .{ .be = be, .cfg = cfg, .hd_pad = hd_pad };
+    defer d.deinit();
+    const sizes = [_]usize{
+        np * cfg.dim, // x
+        np * cfg.dim, // normed, then the unpadded attention output
+        np * @max(cfg.n_heads * hd_pad, cfg.ffn), // attention output / FFN hidden
+        @max(np * cfg.dim, np * 3 * cfg.patch * cfg.patch), // t: the patches, then each delta
+        np * cfg.dim, // one raw q/k/v projection before head_pad
+        np * cfg.n_heads * hd_pad,
+        np * cfg.n_heads * hd_pad,
+        np * cfg.n_heads * hd_pad,
     };
-    for (&bufs, sizes) |*b, size| b.* = try be.tensorCreate(size * 4);
-    const x_d = bufs[0];
-    const normed_d = bufs[1];
-    const proj_d = bufs[2];
-    const q_d = bufs[3];
-    const k_d = bufs[4];
-    const v_d = bufs[5];
-    const big_d = bufs[6];
-    const t_d = bufs[7];
+    inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.proj, &d.q, &d.k, &d.v }, sizes) |b, n| b.* = try be.tensorCreate(n * 4);
+    return gemma_vit_dev.encode(&d, vit, io, gpa, rgb, width, height);
+}
 
-    try be.beginBatch();
-    errdefer if (be.batching()) be.abortBatch();
+const Bufs = struct { x: Buf = .{}, normed: Buf = .{}, big: Buf = .{}, t: Buf = .{} };
 
-    // Patch embed GEMM (f32 host kernel) + learned position embedding (added
-    // as-is: pos_embd is [np][dim] in the same row-major patch order).
-    try be.tensorUpload(sized(proj_d, 0, np * kdim * 4), std.mem.sliceAsBytes(patches));
-    try gemm(be, x_d, proj_d, np, Weight.fromF32(vit.patch_w, dim, kdim), vit.patch_b);
-    try be.tensorUpload(sized(t_d, 0, np * dim * 4), std.mem.sliceAsBytes(vit.pos_embd));
-    try be.opAdd(x_d, t_d, np * dim);
+/// The `gemma_vit_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    cfg: gemma_vit.Config,
+    hd_pad: usize,
+    b: Bufs = .{},
+    /// The 72-wide heads zero-padded to 128 so the tensor-core attention applies; the
+    /// pads are exact zeros on both sides of the scores.
+    proj: Buf = .{},
+    q: Buf = .{},
+    k: Buf = .{},
+    v: Buf = .{},
 
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    for (vit.blocks) |*blk| {
-        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps, false);
-        try gemm(be, proj_d, normed_d, np, blk.q, blk.q_b);
-        try be.opHeadPad(q_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        try gemm(be, proj_d, normed_d, np, blk.k, blk.k_b);
-        try be.opHeadPad(k_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        try gemm(be, proj_d, normed_d, np, blk.v, blk.v_b);
-        try be.opHeadPad(v_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        try be.opAttnTC(q_d, k_d, v_d, big_d, np, heads, heads, hd_pad, scale);
-        try be.opHeadPad(normed_d, big_d, np, heads, hd, hd_pad, heads * hd_pad, 0);
-        try gemm(be, t_d, normed_d, np, blk.out, blk.out_b);
-        try be.opAdd(x_d, t_d, np * dim);
-
-        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps, false);
-        try gemm(be, big_d, normed_d, np, blk.up, blk.up_b);
-        try be.gelu(big_d, np * cfg.ffn);
-        try gemm(be, t_d, big_d, np, blk.down, blk.down_b);
-        try be.opAdd(x_d, t_d, np * dim);
+    fn deinit(d: *Dev) void {
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.proj, &d.q, &d.k, &d.v }) |b| d.be.tensorDestroy(b);
     }
-    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps, false);
-    try be.endBatch();
 
-    // Download the post-LN patch states; the projector (pool + soft_emb_norm
-    // + input projection) runs on the host, 256 tokens, cheap.
-    const x_host = try gpa.alloc(f32, np * dim);
-    defer gpa.free(x_host);
-    try be.tensorDownload(sized(x_d, 0, np * dim * 4), std.mem.sliceAsBytes(x_host));
-    return vit.project(io, gpa, x_host);
+    pub fn beginBatch(d: *Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: *Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: *Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {
+        try d.be.tensorUpload(sized(b, data.len * 4), std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: *Dev, b: Buf, dst: []f32) !void {
+        try d.be.tensorDownload(sized(b, dst.len * 4), std.mem.sliceAsBytes(dst));
+    }
+
+    /// In the weight's storage dtype.
+    pub fn linear(d: *Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
+        try lin_cuda.towerLinear(d.be, y, x, m, w, bias, null);
+    }
+
+    pub fn layerNorm(d: *Dev, x: Buf, y: Buf, w: []const f32, bias: []const f32, rows: usize) !void {
+        try d.be.opLayerNorm(x, y, w, bias, rows, d.cfg.dim, d.cfg.eps);
+    }
+
+    pub fn add(d: *Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn gelu(d: *Dev, x: Buf, n: usize) !void {
+        try d.be.gelu(x, n);
+    }
+
+    pub fn attention(d: *Dev, blk: *const gemma_vit.Block, np: usize) !Buf {
+        const cfg = d.cfg;
+        const hd = cfg.headDim();
+        const heads = cfg.n_heads;
+        inline for (.{ .{ blk.q, blk.q_b, d.q }, .{ blk.k, blk.k_b, d.k }, .{ blk.v, blk.v_b, d.v } }) |t| {
+            try d.linear(d.proj, d.b.normed, np, t[0], t[1]);
+            try d.be.opHeadPad(t[2], d.proj, np, heads, d.hd_pad, hd, cfg.dim, 0);
+        }
+        try d.be.opAttnTC(d.q, d.k, d.v, d.b.big, np, heads, heads, d.hd_pad, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
+        try d.be.opHeadPad(d.b.normed, d.b.big, np, heads, hd, d.hd_pad, heads * d.hd_pad, 0);
+        return d.b.normed;
+    }
+};
+
+fn sized(b: Buf, size: usize) Buf {
+    return .{ .buf = b.buf, .mem = b.mem, .size = size };
 }
 
 // --- tests -----------------------------------------------------------------
@@ -133,7 +126,7 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
 test "cuda gemma vit matches cpu encode" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/mmproj-F16.gguf";
+    const path = "/mnt/watch/models/llm/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/mmproj-F16.gguf";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -177,7 +170,7 @@ test "cuda gemma vit matches cpu encode" {
         }
         min_cos = @min(min_cos, dot / (@sqrt(na) * @sqrt(nb)));
     }
-    std.debug.print("cuda gemma vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, @sqrt(num / den) });
+    errdefer std.debug.print("cuda gemma vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, @sqrt(num / den) });
     try std.testing.expect(min_cos > 0.999);
     try std.testing.expect(@sqrt(num / den) < 0.05);
 }

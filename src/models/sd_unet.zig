@@ -36,11 +36,13 @@
 //! twins are sd_unet_gpu.zig and sd_unet_cuda.zig.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const lora_mod = @import("lora.zig");
 
 const DType = tp_core.dtype.DType;
 const WeightStore = weights_mod.WeightStore;
@@ -232,6 +234,16 @@ pub const Stage = struct {
 pub const UNet = struct {
     arena: std.heap.ArenaAllocator,
     cfg: Config,
+    /// The LoRA sidecars, or null. Every linear and conv applies its hits through
+    /// `mm` / `conv`, the forward's only GEMM and convolution call sites.
+    lora: ?*const lora_mod.Stack = null,
+    /// A device arm's activation storage (f32, f16 or bf16), null for the
+    /// architecture's (`Config.act_f16`).
+    act: ?DType = null,
+    /// Every linear a GPU arm runs: the transformer blocks' and SDXL's linear
+    /// projections. The timestep and label MLPs run on the host. What a device
+    /// arm plans its GEMM routes over.
+    device_lins: []const Weight = &.{},
     time_1: Linear,
     time_2: Linear,
     /// SDXL's `label_emb.0`, the two-layer MLP projecting the `y` micro-conditioning
@@ -246,6 +258,46 @@ pub const UNet = struct {
     output_stages: []Stage,
     out_norm: GroupNormW,
     out_conv: Conv2d,
+
+    /// Every convolution in the graph, in no particular order. Caller frees the list.
+    pub fn convList(self: *UNet, gpa: std.mem.Allocator) ![]*Conv2d {
+        var out: std.ArrayList(*Conv2d) = .empty;
+        errdefer out.deinit(gpa);
+        const Walk = struct {
+            fn res(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, r: *ResBlock) !void {
+                try o.appendSlice(a, &.{ &r.in_conv, &r.out_conv });
+                if (r.skip) |*c| try o.append(a, c);
+            }
+            fn attn(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, t: *SpatialTransformer) !void {
+                if (t.proj_in == .conv) try o.append(a, &t.proj_in.conv);
+                if (t.proj_out == .conv) try o.append(a, &t.proj_out.conv);
+            }
+        };
+        try out.appendSlice(gpa, &.{ &self.stem, &self.out_conv });
+        for ([_][]Stage{ self.input_stages, self.output_stages }) |stages| for (stages) |*st| {
+            if (st.res) |*r| try Walk.res(&out, gpa, r);
+            if (st.attn) |*t| try Walk.attn(&out, gpa, t);
+            if (st.sample) |*c| try out.append(gpa, c);
+        };
+        try Walk.res(&out, gpa, &self.mid_res1);
+        try Walk.attn(&out, gpa, &self.mid_attn);
+        try Walk.res(&out, gpa, &self.mid_res2);
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Repack every checkpoint-order convolution to f32 patch order, into the model
+    /// arena, for an arm that reads only that (Vulkan). Idempotent.
+    pub fn repackConvs(self: *UNet, gpa: std.mem.Allocator) !void {
+        const convs = try self.convList(gpa);
+        defer gpa.free(convs);
+        const a = self.arena.allocator();
+        for (convs) |c| if (c.w == .torch) {
+            // A local first: `c.w = .{ .krsc = try c.materialize(a) }` would switch
+            // `c.w` to `.krsc` before `materialize` reads it (result location).
+            const repacked = try c.materialize(a);
+            c.w = .{ .krsc = repacked };
+        };
+    }
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore, cfg: Config, prefix: []const u8) !UNet {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -337,7 +389,7 @@ pub const UNet = struct {
                 // innermost-first one, and its member index depends on whether an
                 // attention block preceded it, which is why this is positional.
                 if (level > 0 and j == cfg.layers_per_block) {
-                    st.sample = try l.convMember("output_blocks.{d}.{d}.conv", .{ idx, member }, ch, ch, 3, 1, 1);
+                    st.sample = try l.conv("output_blocks.{d}.{d}.conv", .{ idx, member }, ch, ch, 3, 1, 1);
                     st.sample_kind = .up;
                 }
                 try out_stages.append(alloc, st);
@@ -347,6 +399,12 @@ pub const UNet = struct {
 
         const out_norm = try l.groupNorm("out.0", .{}, cfg.model_channels);
         const out_conv = try l.conv("out.2", .{}, cfg.channels, cfg.model_channels, 3, 1, 1);
+
+        var lins: std.ArrayList(Weight) = .empty;
+        for ([_][]const Stage{ in_stages.items, out_stages.items }) |stages| for (stages) |st| {
+            if (st.attn) |sp| try spatialLins(alloc, &lins, sp);
+        };
+        try spatialLins(alloc, &lins, mid_attn);
 
         return .{
             .arena = arena,
@@ -363,7 +421,17 @@ pub const UNet = struct {
             .output_stages = out_stages.items,
             .out_norm = out_norm,
             .out_conv = out_conv,
+            .device_lins = lins.items,
         };
+    }
+
+    fn spatialLins(alloc: std.mem.Allocator, out: *std.ArrayList(Weight), sp: SpatialTransformer) !void {
+        if (sp.proj_in == .linear) try out.append(alloc, sp.proj_in.linear.w);
+        for (sp.blocks) |b| {
+            for ([_]CrossAttn{ b.attn1, b.attn2 }) |a| try out.appendSlice(alloc, &.{ a.q, a.k, a.v, a.out.w });
+            try out.appendSlice(alloc, &.{ b.ff_proj.w, b.ff_out.w });
+        }
+        if (sp.proj_out == .linear) try out.append(alloc, sp.proj_out.linear.w);
     }
 
     pub fn deinit(self: *UNet) void {
@@ -442,13 +510,9 @@ const Loader = struct {
         };
     }
 
-    /// A k×k convolution. `ops.conv` wants weights packed `[k][k][ci][co]`, so this
-    /// repacks at load, once per weight rather than once per forward.
+    /// A k×k convolution (`quant_weight.convWeights`): a q4_k SDXL's convolutions stay
+    /// at their stored 166 MB instead of 1183 MB of repacked f32.
     fn conv(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize, stride: usize, pad: usize) !Conv2d {
-        return l.convMember(fmt, args, co, ci, k, stride, pad);
-    }
-
-    fn convMember(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize, stride: usize, pad: usize) !Conv2d {
         var buf: [200]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, ".weight");
         const v = try l.view(nm);
@@ -457,14 +521,11 @@ const Loader = struct {
             std.log.err("sd_unet: {s} has shape {any}, expected [{d}, {d}, {d}, {d}]", .{ nm, shape, co, ci, k, k });
             return error.ShapeMismatch;
         }
-        const torch_w = try v.toF32Alloc(l.alloc);
-        defer l.alloc.free(torch_w);
         // The GEMM this convolution becomes carries the checkpoint name, so an
         // activation capture can attribute it (see `ops.conv.Conv2d.tag`).
         const tag = try l.alloc.dupe(u8, nm);
-        const packed_w = try ops.conv.packWeight(l.alloc, torch_w, co, ci, k);
         return .{
-            .w = packed_w,
+            .w = try quant_weight.convWeights(l.alloc, v, co, ci, k),
             .tag = tag,
             .b = try l.vec(fmt, args, ".bias", co),
             .co = co,
@@ -599,6 +660,8 @@ pub const ResBlockIter = struct {
 /// step. A UNet forward touches activations from `[h*w][320]` down to
 /// `[h/8*w/8][1280]`, so the workspace is sized by the largest of them.
 pub const Workspace = struct {
+    /// The forward's LoRA stack, copied from the UNet at the top of `forward`.
+    lora: ?*const lora_mod.Stack = null,
     gpa: std.mem.Allocator,
     /// Two ping-pong activation buffers, each big enough for any stage.
     a: []f32,
@@ -798,6 +861,7 @@ pub fn forward(
     std.debug.assert(x.len == lat_h * lat_w * cfg.channels);
     std.debug.assert(out.len == x.len);
     std.debug.assert(context.len == ctx_seq * cfg.context_dim);
+    ws.lora = u.lora;
     if ((cfg.adm_channels != null) != (adm != null)) return error.MissingAdmConditioning;
     if (adm) |y| std.debug.assert(y.len == cfg.adm_channels.?);
 
@@ -808,18 +872,18 @@ pub fn forward(
         timestepEmbedding(sin, timestep);
         const hidden = try gpa.alloc(f32, cfg.time_embed_dim);
         defer gpa.free(hidden);
-        try ops.matmul.matmul(io, gpa, hidden, sin, 1, u.time_1.w, u.time_1.b);
+        try mm(io, gpa, ws.lora, hidden, sin, 1, u.time_1.w, u.time_1.b);
         ops.act.silu(hidden);
-        try ops.matmul.matmul(io, gpa, ws.emb, hidden, 1, u.time_2.w, u.time_2.b);
+        try mm(io, gpa, ws.lora, ws.emb, hidden, 1, u.time_2.w, u.time_2.b);
 
         // `emb = time_embed(t) + label_emb(y)`, a sum, not a concatenation, and the
         // same shape either way, so a missing term is invisible downstream.
         if (adm) |y| {
-            try ops.matmul.matmul(io, gpa, hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
+            try mm(io, gpa, ws.lora, hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
             ops.act.silu(hidden);
             const lab = try gpa.alloc(f32, cfg.time_embed_dim);
             defer gpa.free(lab);
-            try ops.matmul.matmul(io, gpa, lab, hidden, 1, u.label_2.?.w, u.label_2.?.b);
+            try mm(io, gpa, ws.lora, lab, hidden, 1, u.label_2.?.w, u.label_2.?.b);
             for (ws.emb, lab) |*e, v| e.* += v;
         }
     }
@@ -830,7 +894,7 @@ pub fn forward(
     var cur = ws.a;
     var alt = ws.b;
     var ch = cfg.model_channels;
-    try ops.conv.conv2d(io, gpa, cur[0 .. h * w * ch], x, h, w, u.stem);
+    try conv(io, gpa, ws.lora, cur[0 .. h * w * ch], x, h, w, u.stem);
     try ws.setSkip(0, cur[0 .. h * w * ch], h, w);
 
     // --- input side ---
@@ -846,7 +910,7 @@ pub fn forward(
         if (stage.sample_kind == .down) {
             const oh = (h + 1) / 2;
             const ow = (w + 1) / 2;
-            try ops.conv.conv2d(io, gpa, alt[0 .. oh * ow * ch], cur[0 .. h * w * ch], h, w, stage.sample.?);
+            try conv(io, gpa, ws.lora, alt[0 .. oh * ow * ch], cur[0 .. h * w * ch], h, w, stage.sample.?);
             std.mem.swap([]f32, &cur, &alt);
             h = oh;
             w = ow;
@@ -911,7 +975,7 @@ pub fn forward(
                     @memcpy(up[(y * ow + xx) * ch ..][0..ch], src);
                 }
             }
-            try ops.conv.conv2d(io, gpa, alt[0 .. oh * ow * ch], up, oh, ow, stage.sample.?);
+            try conv(io, gpa, ws.lora, alt[0 .. oh * ow * ch], up, oh, ow, stage.sample.?);
             std.mem.swap([]f32, &cur, &alt);
             h = oh;
             w = ow;
@@ -921,7 +985,7 @@ pub fn forward(
     // --- head ---
     ops.norm.groupNorm(cur[0 .. h * w * ch], cur[0 .. h * w * ch], ch, cfg.norm_groups, u.out_norm.w, u.out_norm.b, cfg.norm_eps);
     ops.act.silu(cur[0 .. h * w * ch]);
-    try ops.conv.conv2d(io, gpa, out, cur[0 .. h * w * ch], h, w, u.out_conv);
+    try conv(io, gpa, ws.lora, out, cur[0 .. h * w * ch], h, w, u.out_conv);
 }
 
 fn applyRes(
@@ -945,7 +1009,7 @@ fn applyRes(
     defer gpa.free(tmp);
     ops.norm.groupNorm(tmp, src[0..in_n], rb.in_ch, cfg.norm_groups, rb.in_norm.w, rb.in_norm.b, cfg.norm_eps);
     ops.act.silu(tmp);
-    try ops.conv.conv2d(io, gpa, dst[0..out_n], tmp, h, w, rb.in_conv);
+    try conv(io, gpa, ws.lora, dst[0..out_n], tmp, h, w, rb.in_conv);
 
     // emb_layers: SiLU on the shared time embedding, then a per-channel bias.
     {
@@ -955,7 +1019,7 @@ fn applyRes(
         ops.act.silu(e);
         const proj = try gpa.alloc(f32, rb.out_ch);
         defer gpa.free(proj);
-        try ops.matmul.matmul(io, gpa, proj, e, 1, rb.emb.w, rb.emb.b);
+        try mm(io, gpa, ws.lora, proj, e, 1, rb.emb.w, rb.emb.b);
         for (0..n) |p| {
             const row = dst[p * rb.out_ch ..][0..rb.out_ch];
             for (row, proj) |*o, pv| o.* += pv;
@@ -969,11 +1033,11 @@ fn applyRes(
     ops.act.silu(tmp2);
     const conved = try gpa.alloc(f32, out_n);
     defer gpa.free(conved);
-    try ops.conv.conv2d(io, gpa, conved, tmp2, h, w, rb.out_conv);
+    try conv(io, gpa, ws.lora, conved, tmp2, h, w, rb.out_conv);
 
     // residual: the skip projection when the width changes, else the input itself.
     if (rb.skip) |sk| {
-        try ops.conv.conv2d(io, gpa, dst[0..out_n], src[0..in_n], h, w, sk);
+        try conv(io, gpa, ws.lora, dst[0..out_n], src[0..in_n], h, w, sk);
         for (dst[0..out_n], conved) |*o, c| o.* += c;
     } else {
         @memcpy(dst[0..out_n], src[0..out_n]);
@@ -987,6 +1051,7 @@ fn applyRes(
 fn applyProj(
     io: std.Io,
     gpa: std.mem.Allocator,
+    lora: ?*const lora_mod.Stack,
     dst: []f32,
     src: []const f32,
     h: usize,
@@ -994,8 +1059,8 @@ fn applyProj(
     p: Proj,
 ) !void {
     switch (p) {
-        .conv => |c| try ops.conv.conv2d(io, gpa, dst, src, h, w, c),
-        .linear => |lin| try ops.matmul.matmul(io, gpa, dst, src, h * w, lin.w, lin.b),
+        .conv => |c| try conv(io, gpa, lora, dst, src, h, w, c),
+        .linear => |lin| try mm(io, gpa, lora, dst, src, h * w, lin.w, lin.b),
     }
 }
 
@@ -1021,7 +1086,7 @@ fn applySpatial(
     ops.norm.groupNorm(stream, x, ch, cfg.norm_groups, st.norm.w, st.norm.b, cfg.norm_eps);
     const projected = try gpa.alloc(f32, n * ch);
     defer gpa.free(projected);
-    try applyProj(io, gpa, projected, stream, h, w, st.proj_in);
+    try applyProj(io, gpa, ws.lora, projected, stream, h, w, st.proj_in);
     @memcpy(stream, projected);
 
     const n_heads = cfg.headsAt(ch);
@@ -1032,9 +1097,9 @@ fn applySpatial(
     for (st.blocks) |b| {
         // attn1: self-attention over pixels, no mask.
         ops.norm.layerNorm(norm_buf, stream, b.norm1.w, b.norm1.b, cfg.norm_eps);
-        try ops.matmul.matmul(io, gpa, ws.q[0 .. n * ch], norm_buf, n, b.attn1.q, null);
-        try ops.matmul.matmul(io, gpa, ws.k[0 .. n * ch], norm_buf, n, b.attn1.k, null);
-        try ops.matmul.matmul(io, gpa, ws.v[0 .. n * ch], norm_buf, n, b.attn1.v, null);
+        try mm(io, gpa, ws.lora, ws.q[0 .. n * ch], norm_buf, n, b.attn1.q, null);
+        try mm(io, gpa, ws.lora, ws.k[0 .. n * ch], norm_buf, n, b.attn1.k, null);
+        try mm(io, gpa, ws.lora, ws.v[0 .. n * ch], norm_buf, n, b.attn1.v, null);
         try ops.attention.attention(io, gpa, ws.attn[0 .. n * ch], ws.q[0 .. n * ch], ws.k[0 .. n * ch], ws.v[0 .. n * ch], .{
             .seq_q = n,
             .seq_kv = n,
@@ -1042,14 +1107,14 @@ fn applySpatial(
             .n_kv_heads = n_heads,
             .head_dim = head_dim,
         });
-        try ops.matmul.matmul(io, gpa, norm_buf, ws.attn[0 .. n * ch], n, b.attn1.out.w, b.attn1.out.b);
+        try mm(io, gpa, ws.lora, norm_buf, ws.attn[0 .. n * ch], n, b.attn1.out.w, b.attn1.out.b);
         for (stream, norm_buf) |*s, r| s.* += r;
 
         // attn2: cross-attention onto the text conditioning.
         ops.norm.layerNorm(norm_buf, stream, b.norm2.w, b.norm2.b, cfg.norm_eps);
-        try ops.matmul.matmul(io, gpa, ws.q[0 .. n * ch], norm_buf, n, b.attn2.q, null);
-        try ops.matmul.matmul(io, gpa, ws.k[0 .. ctx_seq * ch], context, ctx_seq, b.attn2.k, null);
-        try ops.matmul.matmul(io, gpa, ws.v[0 .. ctx_seq * ch], context, ctx_seq, b.attn2.v, null);
+        try mm(io, gpa, ws.lora, ws.q[0 .. n * ch], norm_buf, n, b.attn2.q, null);
+        try mm(io, gpa, ws.lora, ws.k[0 .. ctx_seq * ch], context, ctx_seq, b.attn2.k, null);
+        try mm(io, gpa, ws.lora, ws.v[0 .. ctx_seq * ch], context, ctx_seq, b.attn2.v, null);
         try ops.attention.attention(io, gpa, ws.attn[0 .. n * ch], ws.q[0 .. n * ch], ws.k[0 .. ctx_seq * ch], ws.v[0 .. ctx_seq * ch], .{
             .seq_q = n,
             .seq_kv = ctx_seq,
@@ -1057,14 +1122,14 @@ fn applySpatial(
             .n_kv_heads = n_heads,
             .head_dim = head_dim,
         });
-        try ops.matmul.matmul(io, gpa, norm_buf, ws.attn[0 .. n * ch], n, b.attn2.out.w, b.attn2.out.b);
+        try mm(io, gpa, ws.lora, norm_buf, ws.attn[0 .. n * ch], n, b.attn2.out.w, b.attn2.out.b);
         for (stream, norm_buf) |*s, r| s.* += r;
 
         // ff: GEGLU. `proj` emits [value | gate] per row, in that order, and the gate
         // takes the ERF gelu, diffusers' `GEGLU` uses `F.gelu`'s default.
         ops.norm.layerNorm(norm_buf, stream, b.norm3.w, b.norm3.b, cfg.norm_eps);
         const two = 2 * b.inner;
-        try ops.matmul.matmul(io, gpa, ws.ff[0 .. n * two], norm_buf, n, b.ff_proj.w, b.ff_proj.b);
+        try mm(io, gpa, ws.lora, ws.ff[0 .. n * two], norm_buf, n, b.ff_proj.w, b.ff_proj.b);
         const gated = try gpa.alloc(f32, n * b.inner);
         defer gpa.free(gated);
         for (0..n) |p| {
@@ -1074,12 +1139,12 @@ fn applySpatial(
             const dst = gated[p * b.inner ..][0..b.inner];
             for (dst, value, gate) |*d, val, g| d.* = val * ops.act.geluErfScalar(g);
         }
-        try ops.matmul.matmul(io, gpa, norm_buf, gated, n, b.ff_out.w, b.ff_out.b);
+        try mm(io, gpa, ws.lora, norm_buf, gated, n, b.ff_out.w, b.ff_out.b);
         for (stream, norm_buf) |*s, r| s.* += r;
     }
 
     // proj_out (1x1) and the outer residual.
-    try applyProj(io, gpa, projected, stream, h, w, st.proj_out);
+    try applyProj(io, gpa, ws.lora, projected, stream, h, w, st.proj_out);
     for (x, projected) |*o, p| o.* += p;
 }
 
@@ -1089,9 +1154,60 @@ const testing = std.testing;
 const test_gate = @import("../test_gate.zig");
 
 const ref_path = "src/models/assets/sd15_ref.safetensors";
-const sd15_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
+const sd15_ckpt = build_options.model_root ++ "/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
 
-/// torch planar `[c][h][w]` -> our channel-last `[h*w][c]`.
+/// Every CPU linear: the GEMM, then every LoRA hit against its weight.
+/// Every ResBlock's timestep projection for one forward, the one host part of a device
+/// forward: `emb_layers` over silu(time_embed(t) + label_emb(y)), LoRA hits included,
+/// block `i` (in `ResBlockIter` order) at `proj[off[i]..]`. `emb`, `hidden` and
+/// `scratch` are `time_embed_dim` wide; `emb` is left holding the embedding.
+pub fn timeProjections(
+    u: *const UNet,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    timestep: f32,
+    adm: ?[]const f32,
+    proj: []f32,
+    off: []const usize,
+    emb: []f32,
+    hidden: []f32,
+    scratch: []f32,
+) !void {
+    const sin = try gpa.alloc(f32, u.cfg.model_channels);
+    defer gpa.free(sin);
+    timestepEmbedding(sin, timestep);
+    try mm(io, gpa, u.lora, hidden, sin, 1, u.time_1.w, u.time_1.b);
+    ops.act.silu(hidden);
+    try mm(io, gpa, u.lora, emb, hidden, 1, u.time_2.w, u.time_2.b);
+    // A sum, not a concatenation, and the same shape either way, so a missing term
+    // would be invisible downstream.
+    if (adm) |y| {
+        try mm(io, gpa, u.lora, hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
+        ops.act.silu(hidden);
+        try mm(io, gpa, u.lora, scratch, hidden, 1, u.label_2.?.w, u.label_2.?.b);
+        for (emb, scratch) |*e, v| e.* += v;
+    }
+    // emb_layers is [SiLU, Linear] over the SHARED embedding: the silu runs once.
+    @memcpy(hidden, emb);
+    ops.act.silu(hidden);
+    var it = ResBlockIter.init(u);
+    var bi: usize = 0;
+    while (it.next()) |rb| : (bi += 1) {
+        try mm(io, gpa, u.lora, proj[off[bi]..][0..rb.out_ch], hidden, 1, rb.emb.w, rb.emb.b);
+    }
+}
+
+pub fn mm(io: std.Io, gpa: std.mem.Allocator, lora: ?*const lora_mod.Stack, y: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, y, x, m, w, bias);
+    if (lora) |stack| try stack.applyHost(io, gpa, y, w.rows, x, m, w, bias);
+}
+
+/// Every CPU convolution, then its LoRA hits (`lora.Stack.applyHostConv`).
+fn conv(io: std.Io, gpa: std.mem.Allocator, lora: ?*const lora_mod.Stack, dst: []f32, src: []const f32, h: usize, w: usize, c: Conv2d) !void {
+    try ops.conv.conv2d(io, gpa, dst, src, h, w, c);
+    if (lora) |stack| try stack.applyHostConv(io, gpa, dst, src, h, w, c);
+}
+
 fn plannarToChannelLast(dst: []f32, src: []const f32, c: usize, h: usize, w: usize) void {
     std.debug.assert(dst.len == c * h * w and src.len == dst.len);
     for (0..h * w) |p| {
@@ -1390,7 +1506,7 @@ test "the UNet still matches diffusers at the size images are actually rendered 
 // --- SDXL -------------------------------------------------------------------
 
 const sdxl_ref_path = "src/models/assets/sdxl_ref.safetensors";
-const sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
+const sdxl_ckpt = build_options.model_root ++ "/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
 
 /// Relative L2 of `got` against `want`, for the comparisons below.
 fn relL2(want: []const f32, got: []const f32) f64 {

@@ -23,10 +23,14 @@
 //! read a row at a time.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
+const lora_mod = @import("lora.zig");
+const lin = @import("lin.zig");
+const quant_weight = @import("quant_weight.zig");
 
 const DType = tp_core.dtype.DType;
 const WeightStore = weights_mod.WeightStore;
@@ -136,6 +140,9 @@ pub const TextEncoder = struct {
 
     arena: std.heap.ArenaAllocator,
     cfg: Config,
+    /// The LoRA sidecars for this tower, or null. Each linear applies its hits
+    /// right after its GEMM (`mm`).
+    lora: ?*const lora_mod.Stack = null,
     /// The embedding table, kept as a view: `[vocab][hidden]`, read one row per
     /// token. Materializing it would cost 151 MB of f32 for CLIP-L to serve 77 rows.
     tok_embed: safetensors.TensorView,
@@ -147,6 +154,9 @@ pub const TextEncoder = struct {
     /// CLIP-G's `text_projection`, `[hidden][hidden]` and applied as `x @ T` (see
     /// `projectPooled`). Null unless `cfg.projection`.
     text_projection: ?[]const f32,
+    /// Every linear the device forward runs, checkpoint tags intact (a LoRA hit and
+    /// an int8 sidecar A key on them). What `lin_cuda.plan` scans.
+    device_lins: []const Weight,
 
     /// `prefix` is where the text model sits in the store. For an LDM single-file
     /// checkpoint that is `cond_stage_model.transformer.text_model.`; for a bare
@@ -201,6 +211,11 @@ pub const TextEncoder = struct {
             try l.vec("text_projection", .{}, cfg.hidden * cfg.hidden)
         else
             null;
+        const device_lins = try alloc.alloc(Weight, layers.len * 6);
+        for (layers, 0..) |layer, i| {
+            const ws = [6]Weight{ layer.q, layer.k, layer.v, layer.o, layer.fc1, layer.fc2 };
+            @memcpy(device_lins[i * 6 ..][0..6], &ws);
+        }
 
         return .{
             .arena = arena,
@@ -212,6 +227,7 @@ pub const TextEncoder = struct {
             .final_ln_w = final_ln_w,
             .final_ln_b = final_ln_b,
             .text_projection = text_projection,
+            .device_lins = device_lins,
         };
     }
 
@@ -269,9 +285,9 @@ pub const TextEncoder = struct {
         for (self.layers, 0..) |layer, li| {
             // --- attention block: x = x + o(attn(ln1(x))) ---
             ops.norm.layerNorm(norm_buf, out, layer.ln1_w, layer.ln1_b, cfg.eps);
-            try ops.matmul.matmul(io, gpa, q, norm_buf, seq, layer.q, layer.q_b);
-            try ops.matmul.matmul(io, gpa, k, norm_buf, seq, layer.k, layer.k_b);
-            try ops.matmul.matmul(io, gpa, v, norm_buf, seq, layer.v, layer.v_b);
+            try mm(io, gpa, self.lora, q, norm_buf, seq, layer.q, layer.q_b);
+            try mm(io, gpa, self.lora, k, norm_buf, seq, layer.k, layer.k_b);
+            try mm(io, gpa, self.lora, v, norm_buf, seq, layer.v, layer.v_b);
             try ops.attention.attention(io, gpa, attn_out, q, k, v, .{
                 .seq_q = seq,
                 .seq_kv = seq,
@@ -282,17 +298,17 @@ pub const TextEncoder = struct {
                 // causal LM body used as an encoder.
                 .causal = true,
             });
-            try ops.matmul.matmul(io, gpa, norm_buf, attn_out, seq, layer.o, layer.o_b);
+            try mm(io, gpa, self.lora, norm_buf, attn_out, seq, layer.o, layer.o_b);
             for (out, norm_buf) |*o, r| o.* += r;
 
             // --- mlp block: x = x + fc2(act(fc1(ln2(x)))) ---
             ops.norm.layerNorm(norm_buf, out, layer.ln2_w, layer.ln2_b, cfg.eps);
-            try ops.matmul.matmul(io, gpa, ff, norm_buf, seq, layer.fc1, layer.fc1_b);
+            try mm(io, gpa, self.lora, ff, norm_buf, seq, layer.fc1, layer.fc1_b);
             switch (cfg.act) {
                 .quick_gelu => ops.act.geluQuick(ff),
                 .gelu_erf => ops.act.geluErf(ff),
             }
-            try ops.matmul.matmul(io, gpa, norm_buf, ff, seq, layer.fc2, layer.fc2_b);
+            try mm(io, gpa, self.lora, norm_buf, ff, seq, layer.fc2, layer.fc2_b);
             for (out, norm_buf) |*o, r| o.* += r;
 
             if (capture) |c| if (c.layer == li + 1) @memcpy(c.dst, out);
@@ -548,6 +564,13 @@ pub const TextEncoder = struct {
     }
 };
 
+/// Every CPU linear in the tower: the GEMM, then its LoRA hits. A fused q/k/v
+/// third carries its `row_off`, which is how a hit reads only its own rows.
+fn mm(io: std.Io, gpa: std.mem.Allocator, lora: ?*const lora_mod.Stack, y: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, y, x, m, w, bias);
+    if (lora) |stack| try stack.applyHost(io, gpa, y, w.rows, x, m, w, bias);
+}
+
 const Loader = struct {
     store: WeightStore,
     alloc: std.mem.Allocator,
@@ -603,58 +626,18 @@ const Loader = struct {
         };
     }
 
-    /// Split a `[3*hidden, hidden]` fused projection into q, k, v.
+    /// Split a `[3*hidden, hidden]` fused projection into q, k, v: one load, then a row
+    /// view per block (`lin.rowSlice`), so every per-row sidecar splits with its rows.
     ///
-    /// The three blocks are contiguous rows of one row-major tensor, so this is a view
-    /// per block and copies nothing, the same zero-copy path an unfused checkpoint
-    /// takes. (A quantized store would hand us a dtype the GEMM reads directly too; only
-    /// the dtypes it cannot read are materialized, and then the split is over f32.)
-    ///
-    /// All three carry the fused tensor's name as their probe tag, deliberately: q, k
-    /// and v are three GEMMs over the *same* input, so per-input-column activation
-    /// statistics are identical for all three, and the fused tensor is also the unit
-    /// ggufy quantizes. Three contributions instead of one scales every column of that
-    /// row's importance equally, which a per-row-relative imatrix is unaffected by.
+    /// All three carry the fused tensor's name as their tag: a LoRA keys on it (with
+    /// `row_off` picking the block), and it is the unit ggufy quantizes.
     fn fusedQkv(l: Loader, comptime fmt: []const u8, args: anytype) ![3]Weight {
         var buf: [200]u8 = undefined;
         const nm = try l.name(&buf, fmt, args);
-        const view = l.store.get(nm) orelse {
-            std.log.err("clip_text: missing {s}", .{nm});
-            return error.MissingTensor;
-        };
         const h = l.cfg.hidden;
-        const shape = view.info.shape.slice();
-        if (shape.len != 2 or shape[0] != 3 * h or shape[1] != h) {
-            std.log.err("clip_text: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, view.info.dtype, 3 * h, h });
-            return error.ShapeMismatch;
-        }
-        const tag = try l.alloc.dupe(u8, nm);
+        const w = try l.load(nm, 3 * h, h);
         var out: [3]Weight = undefined;
-        // `!flat_blocks`: a shape-fixed block-quantized tensor's blocks tile its flat
-        // element sequence, so neither the byte split below nor `Weight.init`'s
-        // row-aligned blocking is valid for it, materialize instead.
-        if (ops.matmul.supportsDType(view.info.dtype) and !view.info.flat_blocks) {
-            // A block-quantized tower would put `h*h` elements per third, and the split
-            // is only byte-addressable if that is a whole number of blocks. It is for
-            // every real CLIP (h is a multiple of 64, so h² is a multiple of 256), but
-            // `storageBytes` only *asserts* it, and asserts are gone in ReleaseFast,
-            // where the result would be a silently wrong byte count.
-            if (view.info.dtype.info().block_elems > 1 and (h * h) % view.info.dtype.info().block_elems != 0) {
-                std.log.err("clip_text: {s} is {t} and hidden² ({d}) is not a whole number of blocks", .{ nm, view.info.dtype, h * h });
-                return error.UnsupportedFusedQkvLayout;
-            }
-            const block = view.info.dtype.storageBytes(h * h);
-            for (&out, 0..) |*w, b| {
-                w.* = Weight.init(view.bytes[b * block ..][0..block], view.info.dtype, h, h);
-                w.tag = tag;
-            }
-        } else {
-            const f32s = try view.toF32Alloc(l.alloc);
-            for (&out, 0..) |*w, b| {
-                w.* = Weight.fromF32(f32s[b * h * h ..][0 .. h * h], h, h);
-                w.tag = tag;
-            }
-        }
+        for (&out, 0..) |*o, b| o.* = try lin.rowSlice(l.alloc, w, b * h, h);
         return out;
     }
 
@@ -667,33 +650,13 @@ const Loader = struct {
 
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [200]u8 = undefined;
-        const nm = try l.name(&buf, fmt, args);
-        const view = l.store.get(nm) orelse {
-            std.log.err("clip_text: missing {s}", .{nm});
-            return error.MissingTensor;
-        };
-        const shape = view.info.shape.slice();
-        if (shape.len != 2 or shape[0] != rows or shape[1] != cols) {
-            std.log.err("clip_text: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, view.info.dtype, rows, cols });
-            return error.ShapeMismatch;
-        }
-        // Most checkpoints hand us a dtype the GEMM reads directly (f32/f16/bf16/fp8,
-        // or a quantized text tower). The rest are materialized to f32 once, here:
-        // this SD1.5 merge stores its CLIP linears as f64, which ComfyUI also
-        // casts on load, and discovering that from inside the first forward would
-        // report the problem as far from its cause as possible.
-        var w = if (ops.matmul.supportsDType(view.info.dtype) and !view.info.flat_blocks) blk: {
-            break :blk Weight.init(view.bytes, view.info.dtype, rows, cols);
-        } else blk: {
-            std.log.debug("clip_text: materializing {s} ({t}) to f32", .{ nm, view.info.dtype });
-            const f32s = try view.toF32Alloc(l.alloc);
-            break :blk Weight.fromF32(f32s, rows, cols);
-        };
-        // The checkpoint name travels with the weight so `ops.matmul.probe` can
-        // attribute a GEMM to a layer, which is what makes the text tower
-        // measurable at all.
-        w.tag = try l.alloc.dupe(u8, nm);
-        return w;
+        return l.load(try l.name(&buf, fmt, args), rows, cols);
+    }
+
+    /// Every packed format, its sidecars and the shape check. Materializes what no GEMM
+    /// reads: an SD1.5 merge in the wild stores its CLIP linears as f64.
+    fn load(l: Loader, nm: []const u8, rows: usize, cols: usize) !Weight {
+        return quant_weight.load(l.alloc, l.store, nm, rows, cols, .{ .who = "clip_text", .unsupported = .materialize });
     }
 
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
@@ -720,7 +683,7 @@ const test_gate = @import("../test_gate.zig");
 /// driven through `transformers.CLIPTextModel`. Gated, because it needs the 5 GB
 /// checkpoint the fixture was generated against.
 const ref_path = "src/models/assets/sd15_ref.safetensors";
-const sd15_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
+const sd15_ckpt = build_options.model_root ++ "/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
 
 test "CLIP-L matches transformers.CLIPTextModel on a real SD1.5 checkpoint" {
     const gpa = testing.allocator;
@@ -804,7 +767,7 @@ test "CLIP-L matches transformers.CLIPTextModel on a real SD1.5 checkpoint" {
 }
 
 const sdxl_ref_path = "src/models/assets/sdxl_ref.safetensors";
-const sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
+const sdxl_ckpt = build_options.model_root ++ "/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
 
 test "SDXL's two towers match ComfyUI on a real SDXL checkpoint" {
     // The reference is ComfyUI (`tools/gen_sdxl_fixtures.py`), which is both the
@@ -1055,8 +1018,8 @@ pub const TinyCheckpoint = struct {
 /// half. Both are needed: the ids can be right while the weighting form is wrong, and
 /// that combination is a plausible image with the wrong emphasis everywhere.
 const cond_ref_path = "src/models/assets/clip_cond_ref.safetensors";
-const cond_sd15_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
-const cond_sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/perfectdeliberate_v10.safetensors";
+const cond_sd15_ckpt = build_options.model_root ++ "/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
+const cond_sdxl_ckpt = build_options.model_root ++ "/checkpoints/sdxl/perfectdeliberate_v10.safetensors";
 
 const cond_cases = [_][]const u8{ "real_pos", "real_neg", "plain", "empty", "zero_w", "big_w", "three" };
 

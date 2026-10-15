@@ -16,7 +16,7 @@ running both diffusion and LLM models, giving the ability to converse with an LL
 with it on a prompt or image.
 
 <p align="center">
-  <a href="resources/gui-2026-09-18.png.png"><img src="resources/gui-2026-09-18.png" width="96%" alt="tp-gui"></a>
+  <a href="resources/gui-2026-09-18.png"><img src="resources/gui-2026-09-18.png" width="96%" alt="tp-gui"></a>
 </p>
 
 TensorPencil is written in [Zig](https://ziglang.org), a young C-like language with low-level

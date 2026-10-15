@@ -4,6 +4,7 @@
 //! bounding peak memory to roughly the DiT mapping (~13 GiB) plus activations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const gpu_mod = @import("tp_gpu");
 const mem_tag = @import("tp_gpu").mem_tag;
 pub const MemTag = mem_tag.MemTag;
@@ -60,16 +61,24 @@ const krea2_text = @import("tp_models").models.krea2_text;
 const dit_mod = @import("tp_models").models.dit;
 const sensenova = @import("tp_models").models.sensenova;
 const sensenova_cuda = @import("tp_models").models.sensenova_cuda;
+const lin_cuda = @import("tp_models").models.lin_cuda;
+const models_lin = @import("tp_models").models.lin;
 const sensenova_gpu = @import("tp_models").models.sensenova_gpu;
 const zimage = @import("tp_models").models.zimage;
 const zimage_text = @import("tp_models").models.zimage_text;
 const zimage_gpu = @import("tp_models").models.zimage_gpu;
 const zimage_cuda = @import("tp_models").models.zimage_cuda;
+const zimage_dev = @import("tp_models").models.zimage_dev;
+const sensenova_dev = @import("tp_models").models.sensenova_dev;
+const minimax_h3_dev = @import("tp_models").models.minimax_h3_dev;
+const anima_dev = @import("tp_models").models.anima_dev;
+const mageflow_dev = @import("tp_models").models.mageflow_dev;
 const mageflow = @import("tp_models").models.mageflow;
 const mageflow_text = @import("tp_models").models.mageflow_text;
 const mage_vae = @import("tp_models").models.mage_vae;
 const mageflow_cuda = @import("tp_models").models.mageflow_cuda;
 const mageflow_gpu = @import("tp_models").models.mageflow_gpu;
+const mage_vae_dev = @import("tp_models").models.mage_vae_dev;
 const mage_vae_cuda = @import("tp_models").models.mage_vae_cuda;
 const mage_vae_gpu = @import("tp_models").models.mage_vae_gpu;
 const anima_gpu = @import("tp_models").models.anima_gpu;
@@ -91,6 +100,7 @@ const minimax_h3_gpu = @import("tp_models").models.minimax_h3_gpu;
 const minimax_h3_vae_gpu = @import("tp_models").models.minimax_h3_vae_gpu;
 const minimax_h3_audio_gpu = @import("tp_models").models.minimax_h3_audio_gpu;
 const lora_mod = @import("tp_models").models.lora;
+const lora_sd = @import("tp_models").models.lora_sd;
 const minimax_h3_vae_cuda = @import("tp_models").models.minimax_h3_vae_cuda;
 const dit_gpu = @import("tp_models").models.dit_gpu;
 const dit_cuda = @import("tp_models").models.dit_cuda;
@@ -109,12 +119,11 @@ const sd_unet_gpu = @import("tp_models").models.sd_unet_gpu;
 const sd_unet_cuda = @import("tp_models").models.sd_unet_cuda;
 const sd_vae = @import("tp_models").models.sd_vae;
 const sd_vae_gpu = @import("tp_models").models.sd_vae_gpu;
+const conv_gpu = @import("tp_models").models.conv_gpu;
 const sd_vae_cuda = @import("tp_models").models.sd_vae_cuda;
 const taehv_mod = @import("tp_models").models.taehv;
 const taehv_cuda_mod = @import("tp_models").models.taehv_cuda;
 const taehv_gpu_mod = @import("tp_models").models.taehv_gpu;
-const vae_gpu = @import("tp_models").models.vae_gpu;
-const vae_cuda = @import("tp_models").models.vae_cuda;
 const vae_tiled = @import("tp_models").models.vae_tiled;
 
 /// Compute backend for the diffusion model (and, for Vulkan, the encoder + VAE):
@@ -157,6 +166,10 @@ pub fn detectBackend() Backend {
     if (gpu_mod.context.loaderPresent()) return .vulkan;
     return .cpu;
 }
+
+/// An activation chain's element type (`Options.vae_act`).
+pub const Act = gpu_mod.context.Dt;
+pub const precision = @import("precision.zig");
 
 /// VAE decode-path override (see `Options.vae_decode`). `auto` runs the adaptive
 /// chain; the others force the *starting* strategy but still degrade gracefully
@@ -311,6 +324,12 @@ pub const Options = struct {
     backend: Backend = .cpu,
     /// VAE decode-path override (see `VaeDecode`). Default `auto` (adaptive).
     vae_decode: VaeDecode = .auto,
+    /// The precision dial per component (`precision`): null is `auto`, the family's
+    /// default widened after a non-finite forward; a dtype is run as asked, and a
+    /// non-finite output then fails the render.
+    te_act: ?Act = null,
+    dit_act: ?Act = null,
+    vae_act: ?Act = null,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
     /// A hard ceiling: an allocation past it is refused, not merely discouraged.
@@ -324,9 +343,6 @@ pub const Options = struct {
     /// end of the trade, and it composes with `vram_budget` rather than replacing
     /// it (a ceiling still applies if one is set).
     vram_min_weights: bool = false,
-    /// Run the GPU text encoder's GEMMs on tensor cores (f16). ~0.4s faster
-    /// encode but ~doubles its image-delta contribution; default f32.
-    encoder_f16: bool = false,
     /// Where the conditioner and decoder come from when they are not in the primary
     /// checkpoint. These defaults are krea2's separate files, and they are a
     /// *fallback*, not an override: `resolveComponent` prefers the primary checkpoint's
@@ -431,7 +447,6 @@ pub const Options = struct {
     /// against it.
     pub fn encodeOptions(self: *const Options, pt: PromptType, steps: usize) EncodeOptions {
         return .{
-            .encoder_f16 = self.encoder_f16,
             .prompt_syntax = self.prompt_syntax,
             .emphasis = self.emphasis,
             .steps = steps,
@@ -1009,6 +1024,9 @@ pub const Extras = struct {
     vae_hash: []const u8 = "",
     /// How the denoiser's weights are stored (`Session.weightDtype`).
     weight_dtype: []const u8 = "",
+    /// What each component's activations ran at (`precision.Acts`). Our own field:
+    /// nothing standard records it.
+    act_dtype: []const u8 = "",
     /// The flow shift actually used. Recorded because `--shift` is settable and
     /// a reader that falls back to the family default silently renders a
     /// different image.
@@ -1056,6 +1074,7 @@ pub fn appendExtraParams(gpa: std.mem.Allocator, base: []u8, r: Extras) ![]u8 {
     if (r.vae.len > 0) try out.print(gpa, ", VAE: {s}", .{r.vae});
     if (r.vae_hash.len > 0) try out.print(gpa, ", VAE hash: {s}", .{r.vae_hash});
     if (r.weight_dtype.len > 0) try out.print(gpa, ", Weight dtype: {s}", .{r.weight_dtype});
+    if (r.act_dtype.len > 0) try out.print(gpa, ", Activation dtype: \"{s}\"", .{r.act_dtype});
     if (r.shift) |v| try out.print(gpa, ", Shift: {d:.4}", .{v});
     if (r.denoise) |v| try out.print(gpa, ", Denoise: {d:.4}", .{v});
     if (r.eta) |v| try out.print(gpa, ", Eta: {d:.4}", .{v});
@@ -1292,6 +1311,10 @@ pub const Image = struct {
     /// `Session.weightDtype`, captured here because the session is gone by the
     /// time a caller writes the file. Static storage (`@tagName`).
     weight_dtype: []const u8 = "",
+    /// What each component ran at, after any fallback (`Session.acts`).
+    acts: ?precision.Acts = null,
+    /// `Session.sources`, for the same reason.
+    sources: Sources = .initFill(.none),
 
     pub fn deinit(self: *Image, gpa: std.mem.Allocator) void {
         gpa.free(self.rgb);
@@ -1689,9 +1712,6 @@ pub const CondNoise = struct {
 /// Per-call knobs for `Session.encode`. Defaults match `Options`, so
 /// `encode(gpa, prompt, .{})` is what `generate` does.
 pub const EncodeOptions = struct {
-    /// Run the GPU text encoder's GEMMs on tensor cores (f16). See
-    /// `Options.encoder_f16`.
-    encoder_f16: bool = false,
     /// Which prompt dialect to parse. See `PromptSyntax`.
     prompt_syntax: PromptSyntax = .comfy,
     /// How an attention weight reaches the hidden states. Only read for `.a1111`.
@@ -1840,6 +1860,7 @@ pub const CompatConfig = struct {
 /// stage reads.
 pub const DecodeOptions = struct {
     vae_decode: VaeDecode = .auto,
+    vae_act: ?Act = null,
     cancel: ?*std.atomic.Value(bool) = null,
     reclaim: ?Reclaim = null,
 };
@@ -1861,8 +1882,10 @@ const CudaTile = struct {
     vae: *const wan_vae.Decoder,
     be: *cuda.Backend,
     cancel: ?*std.atomic.Value(bool) = null,
+    act: Act,
     fn call(self: CudaTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return vae_cuda.decode(self.vae, self.be, io, gpa, sub, th, tw, self.cancel);
+        _ = io;
+        return sd_vae_cuda.decodeWan(self.vae, self.be, gpa, sub, th, tw, self.cancel, self.act);
     }
 };
 
@@ -1870,16 +1893,23 @@ const VkTile = struct {
     vae: *const wan_vae.Decoder,
     gc: *gpu_mod.Context,
     cancel: ?*std.atomic.Value(bool) = null,
+    act: Act,
     fn call(self: VkTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return vae_gpu.decode(self.vae, self.gc, io, gpa, sub, th, tw, self.cancel);
+        _ = io;
+        return sd_vae_gpu.decodeWan(self.vae, self.gc, gpa, sub, th, tw, self.cancel, self.act);
     }
 };
 
 const CpuTile = struct {
-    vae: *const wan_vae.Decoder,
+    /// Repacked for this decode, so a tiled decode does not decode every
+    /// checkpoint-order conv once per tile.
+    rep: *wan_vae.Decoder.Repacked,
     cancel: ?*std.atomic.Value(bool) = null,
+    fn deinit(self: CpuTile, gpa: std.mem.Allocator) void {
+        self.rep.deinit(gpa);
+    }
     fn call(self: CpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return self.vae.decode(io, gpa, sub, th, tw, self.cancel);
+        return self.rep.dec.decode(io, gpa, sub, th, tw, self.cancel);
     }
 };
 
@@ -1930,8 +1960,9 @@ const SdCudaTile = struct {
     vae: *const sd_vae.Decoder,
     be: *cuda.Backend,
     cancel: ?*std.atomic.Value(bool) = null,
+    act: ?Act = null,
     fn inner(self: SdCudaTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return sd_vae_cuda.decode(self.vae, self.be, gpa, z, th, tw, self.cancel);
+        return sd_vae_cuda.decode(self.vae, self.be, gpa, z, th, tw, self.cancel, self.act);
     }
     fn call(self: SdCudaTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
         _ = io;
@@ -1943,8 +1974,9 @@ const SdVkTile = struct {
     vae: *const sd_vae.Decoder,
     gc: *gpu_mod.Context,
     cancel: ?*std.atomic.Value(bool) = null,
+    act: ?Act = null,
     fn inner(self: SdVkTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return sd_vae_gpu.decode(self.vae, self.gc, gpa, z, th, tw, self.cancel);
+        return sd_vae_gpu.decode(self.vae, self.gc, gpa, z, th, tw, self.cancel, self.act);
     }
     fn call(self: SdVkTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
         _ = io;
@@ -1953,14 +1985,19 @@ const SdVkTile = struct {
 };
 
 const SdCpuTile = struct {
-    vae: *const sd_vae.Decoder,
+    /// Repacked for this decode, so a tiled decode does not decode every
+    /// checkpoint-order conv once per tile.
+    rep: *sd_vae.Decoder.Repacked,
     io: std.Io,
     cancel: ?*std.atomic.Value(bool) = null,
+    fn deinit(self: SdCpuTile, gpa: std.mem.Allocator) void {
+        self.rep.deinit(gpa);
+    }
     fn inner(self: SdCpuTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
         // The CPU decoder takes no cancel token (unlike wan_vae's), so a stop
         // lands at the next tile boundary rather than mid-tile.
         if (self.cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        return self.vae.decode(self.io, gpa, z, th, tw);
+        return self.rep.dec.decode(self.io, gpa, z, th, tw);
     }
     fn call(self: SdCpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
         _ = io;
@@ -1973,27 +2010,34 @@ const SdCpuTile = struct {
 /// A whole-image decode is just a single tile covering the whole latent, so these
 /// three contexts are all the ladder needs to be written once for both families.
 const KreaVae = struct {
-    vae: *const wan_vae.Decoder,
-    /// 128² latent tiles (~1 MP): caps the mid-block scores plane at 512 MiB.
+    vae: *wan_vae.Decoder,
+    act: Act = .f32,
+    /// 128² latent tiles (~1 MP).
     const tiling: vae_tiled.Params = .{};
+    /// `scores_resident` means "the Vulkan arm", the only backend that
+    /// materializes a band of the scores plane.
     fn estimate(self: KreaVae, zh: usize, zw: usize, scores_resident: bool) u64 {
-        _ = scores_resident; // wan_vae's estimator has no scores-plane term
-        return self.vae.estimatePeakBytes(zh, zw);
+        return self.vae.estimatePeakBytes(zh, zw, scores_resident, self.act != .f32);
     }
     fn cudaCtx(self: KreaVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) CudaTile {
-        return .{ .vae = self.vae, .be = be, .cancel = cancel };
+        return .{ .vae = self.vae, .be = be, .cancel = cancel, .act = self.act };
     }
-    fn vkCtx(self: KreaVae, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) VkTile {
-        return .{ .vae = self.vae, .gc = gc, .cancel = cancel };
+    /// A repack, where the device needs one, is permanent: Vulkan keys weights on host
+    /// addresses.
+    fn vkCtx(self: KreaVae, gpa: std.mem.Allocator, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) !VkTile {
+        if (conv_gpu.needsRepack(gc)) try self.vae.repackConvs(gpa);
+        return .{ .vae = self.vae, .gc = gc, .cancel = cancel, .act = self.act };
     }
-    fn cpuCtx(self: KreaVae, io: std.Io, cancel: ?*std.atomic.Value(bool)) CpuTile {
+    fn cpuCtx(self: KreaVae, gpa: std.mem.Allocator, io: std.Io, cancel: ?*std.atomic.Value(bool)) !CpuTile {
         _ = io;
-        return .{ .vae = self.vae, .cancel = cancel };
+        return .{ .rep = try self.vae.repacked(gpa), .cancel = cancel };
     }
 };
 
 const SdVae = struct {
-    vae: *const sd_vae.Decoder,
+    vae: *sd_vae.Decoder,
+    /// The chain's element type, null for the architecture's (`Options.vae_act`).
+    act: ?Act = null,
     /// HALF krea2's tile, and that is the whole point of tiling here. The SD
     /// decoder's widest activation is 256 channels at FULL image resolution, so a
     /// 128² latent tile (1024² pixels) still needs 3 x 1 GiB, barely under a
@@ -2002,19 +2046,22 @@ const SdVae = struct {
     /// defaults to; overlap 8 keeps its 25% seam ratio.
     const tiling: vae_tiled.Params = .{ .tile = 64, .overlap = 8 };
     /// `scores_resident` means "the Vulkan arm", the only backend that
-    /// materializes a band of the scores plane. Both arms now implement f16
-    /// activation storage, so that follows the config on either.
+    /// materializes a band of the scores plane.
     fn estimate(self: SdVae, zh: usize, zw: usize, scores_resident: bool) u64 {
-        return self.vae.estimatePeakBytes(zh, zw, scores_resident, self.vae.cfg.act_f16);
+        const act16 = if (self.act) |a| a != .f32 else self.vae.cfg.act_f16;
+        return self.vae.estimatePeakBytes(zh, zw, scores_resident, act16);
     }
     fn cudaCtx(self: SdVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) SdCudaTile {
-        return .{ .vae = self.vae, .be = be, .cancel = cancel };
+        return .{ .vae = self.vae, .be = be, .cancel = cancel, .act = self.act };
     }
-    fn vkCtx(self: SdVae, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) SdVkTile {
-        return .{ .vae = self.vae, .gc = gc, .cancel = cancel };
+    /// A repack, where the device needs one, is permanent: Vulkan keys weights on host
+    /// addresses.
+    fn vkCtx(self: SdVae, gpa: std.mem.Allocator, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) !SdVkTile {
+        if (conv_gpu.needsRepack(gc)) try self.vae.repackConvs(gpa);
+        return .{ .vae = self.vae, .gc = gc, .cancel = cancel, .act = self.act };
     }
-    fn cpuCtx(self: SdVae, io: std.Io, cancel: ?*std.atomic.Value(bool)) SdCpuTile {
-        return .{ .vae = self.vae, .io = io, .cancel = cancel };
+    fn cpuCtx(self: SdVae, gpa: std.mem.Allocator, io: std.Io, cancel: ?*std.atomic.Value(bool)) !SdCpuTile {
+        return .{ .rep = try self.vae.repacked(gpa), .io = io, .cancel = cancel };
     }
 };
 
@@ -2047,16 +2094,6 @@ const max_reclaim_rounds: usize = 16;
 /// here, or the decode hard-fails on the `else => return err` arm even though a CPU
 /// tiled decode would have succeeded. `error.Canceled` and any structural error
 /// propagate (we never want to mask those behind a silent CPU fallback).
-/// Why the ladder is stepping down, for the progress log. Not cosmetic: every
-/// rung saying "OOM" is a wrong diagnosis for a decode that came back non-finite, and
-/// sends the next reader hunting for a memory problem that is not there.
-fn decodeStepReason(err: anyerror) []const u8 {
-    return switch (err) {
-        error.GpuDecodeNonFinite => "produced non-finite values",
-        else => "ran out of VRAM",
-    };
-}
-
 fn recoverableDecodeErr(err: anyerror) bool {
     return switch (err) {
         error.DeviceOutOfMemory,
@@ -2064,13 +2101,21 @@ fn recoverableDecodeErr(err: anyerror) bool {
         error.CudaError,
         error.CublasLtError,
         error.CudnnError,
-        // A device decode whose output came back non-finite (`sd_vae_gpu` checks and
-        // reports rather than returning a buffer `planarF32ToRgb8` would clamp to
-        // white). The CPU tier of the ladder is exact, so this must reach it.
         error.GpuDecodeNonFinite,
         => true,
         else => false,
     };
+}
+
+/// A device decode's pixels, or `GpuDecodeNonFinite`: an overflow renders solid
+/// white with no error, since `planarF32ToRgb8` clamps.
+fn finiteDecode(gpa: std.mem.Allocator, r: anyerror![]f32) anyerror![]f32 {
+    const p = try r;
+    for (p) |v| if (!std.math.isFinite(v)) {
+        gpa.free(p);
+        return error.GpuDecodeNonFinite;
+    };
+    return p;
 }
 
 /// One image's denoiser: everything a DiT forward needs that is built once per
@@ -2310,7 +2355,28 @@ pub const Denoiser = struct {
     /// prompt. It is the *sampling* step index, not a sigma, the schedule is defined over
     /// step ordinals, so a teacher-forced off-schedule sigma still needs to say which step
     /// it stands for.
+    /// One forward at `sigma`; `error.NonFiniteActivation` (`Session.last_failure`)
+    /// when the prediction holds a NaN or an inf, which would otherwise render solid
+    /// white with no error.
     pub fn predictAt(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        step: usize,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        // A forward on a 16-bit stream fails itself when its residual overflowed, which
+        // can leave the output finite (`Context.allFinite`).
+        self.predictRaw(gpa, v_out, latent, sigma, step, cancel) catch |err| {
+            if (err == error.NonFiniteActivation) self.sess.last_failure = .{ .component = .denoiser, .act = self.sess.actFor(.denoiser), .step = step };
+            return err;
+        };
+        try self.sess.checkFinite(.denoiser, v_out, step);
+    }
+
+    fn predictRaw(
         self: *Denoiser,
         gpa: std.mem.Allocator,
         v_out: []f32,
@@ -2332,8 +2398,8 @@ pub const Denoiser = struct {
 
         if (s.cu_be) |b| {
             try dit_cuda.forward(dit, b, &self.cu_pos.?, &self.cu_ws.?, io, gpa, v_out, latent, sigma, cancel);
-        } else if (s.gpu_ctx) |gc| {
-            try dit_gpu.forward(dit, gc, &self.vk_pos.?, &self.vk_ws.?, io, gpa, v_out, latent, sigma, cancel);
+        } else if (self.vk_pos) |*vk| {
+            try dit_gpu.forward(dit, s.gpu_ctx.?, vk, &self.vk_ws.?, io, gpa, v_out, latent, sigma, cancel);
         } else {
             try dit.forward(io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, self.cond_pos.data, self.cond_pos.seq, cancel);
         }
@@ -2342,8 +2408,8 @@ pub const Denoiser = struct {
         const v_neg = self.v_neg.?;
         if (s.cu_be) |b| {
             try dit_cuda.forward(dit, b, &self.cu_neg.?, &self.cu_ws.?, io, gpa, v_neg, latent, sigma, cancel);
-        } else if (s.gpu_ctx) |gc| {
-            try dit_gpu.forward(dit, gc, &self.vk_neg.?, &self.vk_ws.?, io, gpa, v_neg, latent, sigma, cancel);
+        } else if (self.vk_neg) |*vk| {
+            try dit_gpu.forward(dit, s.gpu_ctx.?, vk, &self.vk_ws.?, io, gpa, v_neg, latent, sigma, cancel);
         } else {
             try dit.forward(io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
         }
@@ -2657,7 +2723,7 @@ pub const Denoiser = struct {
         if (s.cu_be) |b| {
             return sd_unet_cuda.forward(&m.unet, b, &br.cu.?, &self.sd_cu_ws.?, s.io, gpa, eps, scaled, self.lat_h, self.lat_w, t, cancel);
         }
-        if (s.gpu_ctx) |gc| {
+        if (s.sdVk()) |gc| {
             return sd_unet_gpu.forward(&m.unet, gc, &br.vk.?, &self.sd_vk_ws.?, s.io, gpa, eps, scaled, self.lat_h, self.lat_w, t, cancel);
         }
         // The CPU UNet's cancel hook rides on ops.cancel, like the DiT's.
@@ -2867,6 +2933,21 @@ fn channelLastToPlanar(dst: []f32, src: []const f32, ch: usize, plane: usize) vo
 /// which therefore has a second VAE (the audio one). Asking any other family for
 /// it is `error.NoSuchComponent`, the same as `conditioner2`.
 pub const Component = enum { denoiser, conditioner, conditioner2, decoder, decoder2 };
+
+/// Which file a component's weights came from: none (the family has no such
+/// component), the primary checkpoint, or the side file the options named.
+pub const Source = enum { none, primary, side };
+pub const Sources = std.EnumArray(Component, Source);
+
+/// The file a component was read from, for the metadata block: the checkpoint for a
+/// bundled one, `side` for a side file, "" when the family has none.
+pub fn usedPath(sources: Sources, comp: Component, primary: []const u8, side: []const u8) []const u8 {
+    return switch (sources.get(comp)) {
+        .none => "",
+        .primary => primary,
+        .side => side,
+    };
+}
 
 /// Where a component's weights were found: a store in which it sits at the root
 /// (wrapped in a `weights.Prefixed` view when it was nested), plus the file it came
@@ -3089,6 +3170,7 @@ fn resolveComponent(
             n += 1;
         }
     }
+    const primary_at = n;
     candidates[n] = primary;
     n += 1;
     if (!side_is_explicit) {
@@ -3098,8 +3180,9 @@ fn resolveComponent(
         }
     }
 
-    for (candidates[0..n]) |maybe| {
+    for (candidates[0..n], 0..) |maybe, ci| {
         const store = maybe.?;
+        const from_primary = ci == primary_at;
         for (spec.prefixes) |pfx| {
             var buf: [256]u8 = undefined;
             var hit = false;
@@ -3114,11 +3197,11 @@ fn resolveComponent(
             }
             if (!hit) continue;
 
-            if (pfx.len == 0) return .{ .store = store, .from_primary = false };
+            if (pfx.len == 0) return .{ .store = store, .from_primary = from_primary };
             const view = try gpa.create(weights_mod.Prefixed);
             errdefer gpa.destroy(view);
             view.* = try weights_mod.Prefixed.init(gpa, store, pfx);
-            return .{ .store = view.store(), .view = view, .from_primary = false };
+            return .{ .store = view.store(), .view = view, .from_primary = from_primary };
         }
     }
     // Silent: a resolver that both returns a typed error and logs makes every caller's
@@ -3257,16 +3340,12 @@ pub const Family = enum {
         return self == .sd15 or self == .sdxl;
     }
 
-    /// Whether this architecture has a LoRA sidecar path in THIS build.
-    ///
-    /// The families without one refuse a sidecar at load rather than ignoring
-    /// it (see `Session.attachLoras`, which must stay the same list), so a UI
-    /// that offers the control for them is offering a render that cannot run.
-    /// Ask before drawing it, not after.
+    /// Whether this architecture takes a LoRA sidecar in THIS build. A family
+    /// without one refuses a LoRA at load rather than ignoring it, so a UI asks
+    /// before drawing the control.
     pub fn supportsLora(self: Family) bool {
         return switch (self) {
-            .minimax_h3, .sensenova => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => false,
+            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .sd15, .sdxl => true,
         };
     }
 
@@ -3354,6 +3433,89 @@ pub const SdModels = struct {
     /// lazily, so an unweighted prompt never pays for it at all.
     empty_ref: ?[]f32 = null,
     empty_ref_g: ?[]f32 = null,
+    /// Where each tower was resolved from at load, so a LoRA's key map reaches
+    /// the same tensors: the primary checkpoint, or its own side file.
+    clip_from_primary: bool = true,
+    clip_g_from_primary: bool = true,
+    /// The LoRA sidecars, or null. Heap-held: the models point into it.
+    lora: ?*SdStacks = null,
+};
+
+/// The SD family's LoRA sidecars, one stack per component (UNet, CLIP-L, CLIP-G):
+/// CLIP-L and an HF-named CLIP-G share every tensor name, so one index would
+/// collide. A file sits at the same index in all three, with an empty sidecar where
+/// it patches nothing, so one dial addresses it everywhere.
+const SdStacks = struct {
+    stacks: [3]lora_mod.Stack = .{ .{}, .{}, .{} },
+
+    fn deinit(self: *SdStacks, gpa: std.mem.Allocator) void {
+        for (&self.stacks) |*st| st.deinit(gpa);
+    }
+
+    fn bytes(self: *const SdStacks) usize {
+        var n: usize = 0;
+        for (&self.stacks) |*st| n += st.bytes();
+        return n;
+    }
+};
+
+/// A merged LoRA stack and the component views its overlays read, for
+/// `SdMergeCheck`, the merge kept as a reference the sidecar is checked against.
+const SdLora = struct {
+    merged: lora_sd.Merged,
+    views: [3]?*weights_mod.Prefixed = .{ null, null, null },
+
+    fn deinit(self: *SdLora, gpa: std.mem.Allocator) void {
+        self.merged.deinit(gpa);
+        for (self.views) |v| if (v) |p| {
+            p.deinit(gpa);
+            gpa.destroy(p);
+        };
+        self.* = undefined;
+    }
+};
+
+/// The SD merge straight off a bundled checkpoint, with no model loaded: what
+/// `lora-merge-check` reports coverage and cost from. Every component is taken
+/// from `ck` itself.
+pub const SdMergeCheck = struct {
+    family: Family,
+    lora: SdLora,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, ck: *const Container, files: []const lora_sd.File) !SdMergeCheck {
+        const primary = ck.store();
+        const fam = try detectFamily(primary);
+        if (!fam.isSd()) return error.UnsupportedCheckpoint;
+        var out: SdMergeCheck = .{ .family = fam, .lora = .{ .merged = undefined } };
+        errdefer for (out.lora.views) |v| if (v) |p| {
+            p.deinit(gpa);
+            gpa.destroy(p);
+        };
+        var stores: [3]?weights_mod.WeightStore = .{ null, null, null };
+        for ([_]Component{ .denoiser, .conditioner, .conditioner2 }, 0..) |comp, ci| {
+            if (comp == .conditioner2 and fam != .sdxl) continue;
+            const r = resolveComponent(gpa, fam, comp, primary, null, false) catch |err| switch (err) {
+                error.ComponentNotInCheckpoint => continue,
+                else => return err,
+            };
+            out.lora.views[ci] = r.view;
+            stores[ci] = r.store;
+        }
+        out.lora.merged = try lora_sd.merge(gpa, io, .{
+            .unet = stores[0] orelse return error.ComponentNotInCheckpoint,
+            .unet_cfg = sdConfigs(fam).unet,
+            .clip_l = stores[1],
+            .clip_l_layers = clip_text.clip_l.layers,
+            .clip_g = stores[2],
+            .clip_g_layers = clip_text.clip_g.layers,
+            .clip_g_hidden = clip_text.clip_g.hidden,
+        }, files);
+        return out;
+    }
+
+    pub fn deinit(self: *SdMergeCheck, gpa: std.mem.Allocator) void {
+        self.lora.deinit(gpa);
+    }
 };
 
 /// Z-Image: a denoiser-only checkpoint plus Qwen3-4B and the 16-channel Flux VAE,
@@ -3736,6 +3898,14 @@ pub fn supportsPromptWeights(fam: Family) bool {
 
 pub const Session = struct {
     models: Models,
+    /// The precision dial per component and what `auto` has learned, for this
+    /// session's life (`precision.State`).
+    dials: std.EnumArray(precision.Component, precision.State) = .initFill(.{}),
+    /// What the last `error.NonFiniteActivation` was about.
+    last_failure: ?precision.Failure = null,
+    /// Where each component came from, recorded by `resolve` at load. A defaulted
+    /// side path the checkpoint overrode is not what ran, so metadata asks this.
+    sources: Sources = .initFill(.none),
     /// Which ecosystem's sampling conventions this session's forwards follow. Set from
     /// `Options` at `init` and refreshed at the top of `generate`, so a caller driving the
     /// public stages itself (ggufy's ladder, the GUI's per-image config) gets the same
@@ -3759,19 +3929,28 @@ pub const Session = struct {
     vae_st: safetensors.SafeTensors,
     vae: wan_vae.Decoder,
 
-    /// The LoRA sidecars, for every family. One container per file, which must
-    /// outlive `lora` (its factors are views into the mapping), and `lora` must
-    /// outlive whatever attached to it.
+    /// The LoRA files, one container each, read as sidecars: through `lora`, or on
+    /// SD through `SdModels.lora`. Factors may be views into these mappings, and a
+    /// stack must outlive whatever attached to it.
     lora_sts: []Container = &.{},
+    /// Whether the installed stack runs on the Vulkan UNet; asked once per stack,
+    /// cleared by `detachLoras`.
+    sd_vk_lora_ok: ?bool = null,
     lora: ?lora_mod.Stack = null,
 
-    /// The loaded family. Shorthand for `@as(Family, self.models)`.
+    /// `reportResolve`, recording where the component came from.
+    fn resolve(self: *Session, gpa: std.mem.Allocator, fam: Family, comp: Component, primary: weights_mod.WeightStore, side: ?weights_mod.WeightStore, side_is_explicit: bool, side_path: []const u8) !Resolved {
+        const r = try reportResolve(gpa, fam, comp, primary, side, side_is_explicit, side_path);
+        self.sources.set(comp, if (r.from_primary) .primary else .side);
+        return r;
+    }
+
     /// How the denoiser's block linears are stored, for the block's `Weight dtype`.
     ///
     /// "Most of them", not "all": quantization here is per WEIGHT, so one checkpoint
     /// can mix formats block by block. A reader wants one tag, and the
     /// majority is a truer summary than whichever weight happened to be first.
-    /// Empty for the families with no device linear list (the SD UNets, H3).
+    /// Empty for the families with no device linear list (H3).
     pub fn weightDtype(self: *const Session) []const u8 {
         const lins: []const ops.matmul.Weight = switch (self.models) {
             .krea2 => |*m| m.dit.device_lins,
@@ -3779,7 +3958,8 @@ pub const Session = struct {
             .anima => |*m| m.dit.device_lins,
             .mageflow => |*m| m.dit.device_lins,
             .sensenova => |*m| m.dit.device_lins,
-            .sd15, .sdxl, .minimax_h3 => &.{},
+            .sd15, .sdxl => |*m| m.unet.device_lins,
+            .minimax_h3 => &.{},
         };
         if (lins.len == 0) return "";
         var best = lins[0].dtype;
@@ -3797,8 +3977,229 @@ pub const Session = struct {
         return @tagName(best);
     }
 
+    /// The loaded family. Shorthand for `@as(Family, self.models)`.
     pub fn family(self: *const Session) Family {
         return self.models;
+    }
+
+    /// The family's default for `comp`, what `auto` starts at.
+    pub fn defaultAct(self: *const Session, comp: precision.Component) Act {
+        return switch (comp) {
+            .denoiser => switch (self.models) {
+                .sd15, .sdxl => |*m| if (m.unet.cfg.act_f16) .f16 else .f32,
+                // f16 over ComfyUI's bf16: one forward 1.4e-3 against f32 where bf16 is
+                // 9.5e-3, at the same speed; `auto` widens on a non-finite step.
+                .krea2 => .f16,
+                // f16 only where its range fits unaided: SenseNova and H3 run f16 only
+                // through a scaled residual (`streamDiv`), so they stay f32 unless asked.
+                else => .f32,
+            },
+            .vae => switch (self.models) {
+                // Raw f16 fits: the residual stays under 120 and the mid-block logits
+                // under 50 on krea2 and Anima renders (`wan-vae-test` holds every arm).
+                .krea2, .anima => .f16,
+                // Residual under 20 and the FFN product under 320 on two clips.
+                .minimax_h3 => .f16,
+                .sd15, .sdxl => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
+                .zimage => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
+                .mageflow => |*m| switch (m.vae) {
+                    .anchor => |*v| if (v.cfg.act_f16) .f16 else .f32,
+                    // Every narrowed buffer stays under 210 on real renders; the
+                    // per-pixel residual, which reaches 3e4, stays f32 at every width.
+                    .distilled => .f16,
+                },
+                else => .f32,
+            },
+            .encoder => .f32,
+        };
+    }
+
+    /// How `comp`'s integer convrot weights run: the format's own arithmetic (W8A8, W4A4,
+    /// W4A8) under `auto`, weight-only at an explicit dtype: f16 and bf16 activations as
+    /// W·A16, f32 as W·A32 through a true-f32 GEMM.
+    pub fn intGemmFor(self: *const Session, comp: precision.Component) lin_cuda.IntGemm {
+        return switch (self.dials.get(comp).dial orelse return .w8a8) {
+            .f16 => .weight_only_f16,
+            .bf16 => .weight_only,
+            .f32 => .weight_only_f32,
+        };
+    }
+
+    /// The integer convrot kind `comp` runs on a device arm, the one case its dial's
+    /// integer policy reaches (`intGemmFor`), or null.
+    fn integerKind(self: *const Session, comp: precision.Component) ?models_lin.Kind {
+        if (self.cu_be == null and self.gpu_ctx == null) return null;
+        return switch (comp) {
+            .encoder => switch (self.models) {
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3 => |*m| m.enc.integerKind(),
+                .sd15, .sdxl => |*m| models_lin.integerKind(m.clip.device_lins) orelse if (m.clip_g) |*g| models_lin.integerKind(g.device_lins) else null,
+                .sensenova => |*m| models_lin.integerKind(m.dit.prefix_lins),
+            },
+            .denoiser => switch (self.models) {
+                inline .krea2, .zimage, .anima, .mageflow, .sensenova, .minimax_h3 => |*m| models_lin.integerKind(m.dit.device_lins),
+                .sd15, .sdxl => |*m| models_lin.integerKind(m.unet.device_lins),
+            },
+            .vae => null,
+        };
+    }
+
+    fn encoderIntWeights(self: *const Session) bool {
+        return self.integerKind(.encoder) != null;
+    }
+
+    /// `comp`'s integer GEMM arithmetic as the PNG field names it, or null.
+    fn intArith(self: *const Session, comp: precision.Component) ?precision.IntArith {
+        const kind = self.integerKind(comp) orelse return null;
+        return .{ .w_bits = if (kind == .i8) 8 else 4, .act = switch (self.intGemmFor(comp)) {
+            // int4 meets an int4 activation only where the backend has int4 tensor cores.
+            .w8a8 => if (kind == .i4 and self.cu_be != null) .int4 else .int8,
+            .weight_only_f16 => .f16,
+            .weight_only => .bf16,
+            .weight_only_f32 => .f32,
+        } };
+    }
+
+    /// The dtype `comp` runs when `want` is asked for, which is wider wherever its
+    /// kernels on this backend do not take `want` (or would take it slowly).
+    pub fn effectiveAct(self: *const Session, comp: precision.Component, want: Act) Act {
+        switch (comp) {
+            .denoiser => switch (self.models) {
+                .sd15, .sdxl => |*m| {
+                    if (self.cu_be) |b| return sd_unet_cuda.streamDtFor(b, &m.unet, want);
+                    // `sdVk`, which a const Session cannot cache.
+                    if (self.gpu_ctx) |gc| if (m.unet.lora == null or (self.sd_vk_lora_ok orelse sd_unet_gpu.supported(gc, &m.unet)))
+                        return sd_unet_gpu.streamDtFor(gc, want);
+                },
+                .krea2 => |*m| {
+                    if (self.cu_be) |b| return dit_cuda.streamDtFor(b, want);
+                    if (self.gpu_ctx) |gc| if (dit_gpu.supported(gc, &m.dit)) return dit_gpu.streamDtFor(want);
+                },
+                .zimage => |*m| {
+                    if (self.cu_be != null and zimage_cuda.supported(&m.dit)) return zimage_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (zimage_gpu.supported(gc, &m.dit)) return zimage_dev.streamDtFor(want);
+                },
+                .mageflow => |*m| {
+                    if (self.cu_be != null and mageflow_cuda.supported(&m.dit)) return mageflow_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (mageflow_gpu.supported(gc, &m.dit)) return mageflow_dev.streamDtFor(want);
+                },
+                .anima => |*m| {
+                    if (self.cu_be != null and anima_cuda.supported(&m.dit)) return anima_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (anima_gpu.supported(gc, &m.dit)) return anima_dev.streamDtFor(want);
+                },
+                .minimax_h3 => |*m| {
+                    if (self.cu_be != null and minimax_h3_cuda.supported(&m.dit)) return minimax_h3_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (minimax_h3_gpu.supported(gc, &m.dit)) return minimax_h3_dev.streamDtFor(want);
+                },
+                .sensenova => |*m| {
+                    if (self.cu_be != null and sensenova_cuda.supported(&m.dit)) return sensenova_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (sensenova_gpu.supported(gc, &m.dit)) return sensenova_dev.streamDtFor(want);
+                },
+            },
+            .vae => switch (self.models) {
+                .sd15, .sdxl, .zimage, .krea2, .anima => if (self.cu_be != null or self.gpu_ctx != null) return want,
+                .minimax_h3 => |*m| {
+                    if (self.cu_be != null and minimax_h3_vae_cuda.supported(&m.vae)) return want;
+                    if (self.gpu_ctx != null and minimax_h3_vae_gpu.supported(&m.vae)) return want;
+                },
+                .mageflow => |*m| switch (m.vae) {
+                    .anchor => if (self.cu_be != null or self.gpu_ctx != null) return want,
+                    .distilled => |*v| {
+                        if (self.cu_be != null and mage_vae_cuda.supported(v)) return want;
+                        if (self.gpu_ctx) |gc| if (mage_vae_gpu.supported(gc, v)) return want;
+                    },
+                },
+                else => {},
+            },
+            .encoder => switch (self.models) {
+                // The Qwen3 walk stores its residual, norms and FFN planes at any width
+                // on both backends; the CPU encode is f32.
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3 => |*m| {
+                    if (self.cu_be != null) {
+                        if (qwen3_cuda.supportsWeights(&m.enc)) return want;
+                    } else if (self.gpu_ctx) |gc| if (qwen3_gpu.supportsWeights(gc, &m.enc)) return want;
+                },
+                .sd15, .sdxl => |*m| {
+                    if (self.cu_be != null) return want;
+                    if (self.gpu_ctx) |gc| if (clip_text_gpu.supported(gc, &m.clip)) return want;
+                },
+                .sensenova => |*m| {
+                    if (self.cu_be != null and sensenova_cuda.supported(&m.dit)) return sensenova_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (sensenova_gpu.supported(gc, &m.dit)) return sensenova_dev.streamDtFor(want);
+                    if (want != .f32 and self.encoderIntWeights()) return want;
+                },
+            },
+        }
+        return .f32;
+    }
+
+    /// What `comp` runs this render: its dial, else what `auto` learned, else the
+    /// family default, as this backend runs it.
+    pub fn actFor(self: *const Session, comp: precision.Component) Act {
+        return self.effectiveAct(comp, self.dials.get(comp).current(self.defaultAct(comp)));
+    }
+
+    /// What each component runs now, for the metadata block.
+    pub fn acts(self: *const Session) precision.Acts {
+        return .{ .encoder = self.actFor(.encoder), .denoiser = self.actFor(.denoiser), .vae = self.actFor(.vae), .encoder_int = self.intArith(.encoder), .denoiser_int = self.intArith(.denoiser) };
+    }
+
+    /// Take a render's dials; one that changed drops what `auto` learned for it.
+    pub fn setDials(self: *Session, te: ?Act, dit: ?Act, vae: ?Act) void {
+        self.dials.getPtr(.encoder).setDial(te);
+        self.dials.getPtr(.denoiser).setDial(dit);
+        self.dials.getPtr(.vae).setDial(vae);
+    }
+
+    /// After a non-finite output from `comp` at `ran`: the next wider dtype it runs as
+    /// itself, now remembered, or null (explicit dial, or nothing wider).
+    pub fn widen(self: *Session, comp: precision.Component, ran: Act) ?Act {
+        return self.dials.getPtr(comp).widen(ran, RunsCtx{ .s = self, .comp = comp }, RunsCtx.runs);
+    }
+
+    const RunsCtx = struct {
+        s: *const Session,
+        comp: precision.Component,
+        fn runs(c: @This(), a: Act) bool {
+            return c.s.effectiveAct(c.comp, a) == a;
+        }
+    };
+
+    /// `decodePlanar` under the VAE dial, over an `AutoencoderKL` or the Wan decoder. A
+    /// non-finite GPU decode reruns at the next wider dtype under `auto`, and reaches the
+    /// CPU tier only once there is none; under an explicit dtype it is
+    /// `error.NonFiniteActivation`.
+    fn decodeDialed(self: *Session, vae: anytype, x: []const f32, lat_h: usize, lat_w: usize, o: DecodeOptions, progress: ?*std.Io.Writer) ![]f32 {
+        self.dials.getPtr(.vae).setDial(o.vae_act);
+        while (true) {
+            const act = self.actFor(.vae);
+            const st = self.dials.get(.vae);
+            const cpu_last = st.dial == null and st.next(act, RunsCtx{ .s = self, .comp = .vae }, RunsCtx.runs) == null;
+            const ctx = switch (@TypeOf(vae)) {
+                *sd_vae.Decoder => SdVae{ .vae = vae, .act = act },
+                *wan_vae.Decoder => KreaVae{ .vae = vae, .act = act },
+                else => @compileError("decodeDialed: no VAE context for " ++ @typeName(@TypeOf(vae))),
+            };
+            const planar = self.decodePlanar(ctx, x, lat_h, lat_w, o, progress, cpu_last) catch |err| {
+                if (err != error.GpuDecodeNonFinite) return err;
+                self.last_failure = .{ .component = .vae, .act = act };
+                const wider = self.widen(.vae, act) orelse return error.NonFiniteActivation;
+                try note(progress, "{f}; rerunning the decode at {t}\n", .{ self.last_failure.?, wider });
+                continue;
+            };
+            if (!precision.injected(.vae, act) or cpu_last) return planar;
+            self.gpa.free(planar);
+            self.last_failure = .{ .component = .vae, .act = act };
+            const wider = self.widen(.vae, act) orelse return error.NonFiniteActivation;
+            try note(progress, "{f}; rerunning the decode at {t}\n", .{ self.last_failure.?, wider });
+        }
+    }
+
+    /// `error.NonFiniteActivation` when `xs`, `comp`'s output, holds a NaN or an inf.
+    fn checkFinite(self: *Session, comp: precision.Component, xs: []const f32, step: ?usize) !void {
+        const act = self.actFor(comp);
+        if (precision.allFinite(xs) and !precision.injected(comp, act)) return;
+        self.last_failure = .{ .component = comp, .act = act, .step = step };
+        return error.NonFiniteActivation;
     }
 
     /// krea2's model set, asserting the family, every krea2-only path binds this
@@ -3814,6 +4215,16 @@ pub const Session = struct {
 
     /// The SD-family model set, or null for krea2. Both SD arms hold the same struct
     /// type, so every shared stage binds this once and needs no further family test.
+    /// The Vulkan context the SD UNet runs on, or null to run it on the CPU: a UNet
+    /// whose LoRA this arm cannot apply falls back rather than renders without it.
+    fn sdVk(self: *Session) ?*gpu_mod.Context {
+        const gc = self.gpu_ctx orelse return null;
+        const m = self.sd() orelse return gc;
+        if (m.unet.lora == null) return gc;
+        if (self.sd_vk_lora_ok == null) self.sd_vk_lora_ok = sd_unet_gpu.supported(gc, &m.unet);
+        return if (self.sd_vk_lora_ok.?) gc else null;
+    }
+
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
             .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => null,
@@ -3861,6 +4272,7 @@ pub const Session = struct {
         const gpa = self.gpa;
         if (specs.len == 0) return;
         if (specs.len > lora_mod.max_files) return error.TooManyLoras;
+        if (self.sd() != null) return self.installSdLoras(io, specs, progress);
 
         try note(progress, "loading {d} lora(s)...\n", .{specs.len});
         const sts = try gpa.alloc(Container, specs.len);
@@ -3886,7 +4298,7 @@ pub const Session = struct {
         for (specs, 0..) |spec, i| {
             sts[i] = try Container.openNamed(gpa, io, spec.path);
             opened += 1;
-            _ = try stack.add(gpa, sts[i].store(), spec.strength, spec.path);
+            _ = try stack.add(gpa, sts[i].store(), spec.strength, spec.path, self.loraKeys());
         }
 
         // Install before attaching: the attach stores pointers into the stack,
@@ -3894,35 +4306,66 @@ pub const Session = struct {
         self.lora_sts = sts;
         self.lora = stack;
         const applied = try self.attachLoras();
-        try note(progress, "  lora: {d} sidecars over {d} file(s), {d} MB\n", .{
-            applied, specs.len, self.lora.?.bytes() >> 20,
+        var total: usize = 0;
+        for (self.lora.?.files.items) |f| total += f.side.keyCount();
+        try note(progress, "  lora: {d} of {d} targets applied over {d} file(s), {d} MB\n", .{
+            applied, total, specs.len, self.lora.?.bytes() >> 20,
         });
+    }
+
+    /// How this family's LoRAs name tensors its checkpoint names differently.
+    fn loraKeys(self: *const Session) []const lora_mod.Rename {
+        return switch (self.models) {
+            .zimage => &zimage.lora_keys,
+            else => &.{},
+        };
     }
 
     /// Give back the pointers the models borrowed from the stack.
     fn detachLoras(self: *Session) void {
+        self.sd_vk_lora_ok = null;
         switch (self.models) {
             .minimax_h3 => |*m| m.dit.detachLora(),
             .sensenova => |*m| m.dit.lora = null,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => {},
+            .krea2 => |*m| m.dit.lora = null,
+            .zimage => |*m| m.dit.lora = null,
+            .anima => |*m| m.dit.detachLora(),
+            .mageflow => |*m| m.dit.lora = null,
+            .sd15, .sdxl => |*m| {
+                m.unet.lora = null;
+                m.clip.lora = null;
+                if (m.clip_g) |*g| g.lora = null;
+            },
         }
     }
 
     /// Detach and free the installed stack, if any.
     fn dropLoras(self: *Session) void {
         self.detachLoras();
+        if (self.sd()) |m| if (m.lora) |sl| {
+            if (self.cu_be) |be| for (&sl.stacks) |*st| st.forEachFactorBytes(be, evictFactorBytes);
+            if (self.gpu_ctx) |c| c.evictWeights();
+            sl.deinit(self.gpa);
+            self.gpa.destroy(sl);
+            m.lora = null;
+        };
         if (self.lora) |*stack| {
             // BEFORE the bytes go back to the allocator. The device weight cache
             // is keyed on these exact host pointers, so a recycled address would
             // serve the OLD factors to the next stack (see
             // `lora.Stack.forEachFactorBytes`).
             if (self.cu_be) |be| stack.forEachFactorBytes(be, evictFactorBytes);
+            if (self.gpu_ctx) |gc| stack.forEachFactorBytes(gc, evictFactorBytesVk);
             stack.deinit(self.gpa);
             self.lora = null;
         }
         for (self.lora_sts) |*st| st.deinit();
         if (self.lora_sts.len > 0) self.gpa.free(self.lora_sts);
         self.lora_sts = &.{};
+    }
+
+    fn evictFactorBytesVk(gc: *gpu_mod.Context, bytes: []const u8) void {
+        gc.evictWeightRange(bytes);
     }
 
     fn evictFactorBytes(be: *cuda.Backend, bytes: []const u8) void {
@@ -3945,6 +4388,90 @@ pub const Session = struct {
         try self.installLoras(io, specs, null);
     }
 
+    /// Open the SD files and attach them as sidecars, one stack per component.
+    fn installSdLoras(self: *Session, io: std.Io, specs: []const LoraSpec, progress: ?*std.Io.Writer) !void {
+        const gpa = self.gpa;
+        const m = self.sd().?;
+        try note(progress, "loading {d} lora(s)...\n", .{specs.len});
+        const sts = try gpa.alloc(Container, specs.len);
+        var opened: usize = 0;
+        errdefer {
+            for (sts[0..opened]) |*st| st.deinit();
+            gpa.free(sts);
+        }
+        const sl = try gpa.create(SdStacks);
+        sl.* = .{};
+        errdefer {
+            sl.deinit(gpa);
+            gpa.destroy(sl);
+        }
+
+        // Fresh resolutions from the containers at their final addresses; the
+        // load's pointed into a local that has since been copied.
+        var views: [3]?*weights_mod.Prefixed = .{ null, null, null };
+        defer for (views) |v| if (v) |p| {
+            p.deinit(gpa);
+            gpa.destroy(p);
+        };
+        const model = try self.sdLoraModel(m, &views);
+
+        var applied: usize = 0;
+        for (specs, 0..) |spec, i| {
+            sts[i] = try Container.openNamed(gpa, io, spec.path);
+            opened += 1;
+            var sides = try lora_sd.sidecars(gpa, model, sts[i].store(), spec.path);
+            defer sides.deinit();
+            applied += sides.applied;
+            for (&sides.sides, &sl.stacks) |*side, *st| {
+                const own = side.* orelse lora_mod.Sidecar{ .arena = .init(gpa), .index = .empty, .unclaimed = 0 };
+                side.* = null;
+                _ = try st.addSidecar(gpa, own, spec.strength, spec.path);
+            }
+        }
+
+        self.lora_sts = sts;
+        m.lora = sl;
+        m.unet.lora = if (sl.stacks[0].index.count() > 0) &sl.stacks[0] else null;
+        m.clip.lora = if (sl.stacks[1].index.count() > 0) &sl.stacks[1] else null;
+        if (m.clip_g) |*g| g.lora = if (sl.stacks[2].index.count() > 0) &sl.stacks[2] else null;
+        // The int8 A each device linear's own staged activation can feed.
+        if (self.cu_be != null) {
+            try lin_cuda.quantizeLora(gpa, &sl.stacks[0], m.unet.device_lins, lin_cuda.blockq_gemm, .w8a8);
+            try lin_cuda.quantizeLora(gpa, &sl.stacks[1], m.clip.device_lins, lin_cuda.encoder_gemm, lin_cuda.dual_lin.encoderInt8());
+            if (m.clip_g) |*g| try lin_cuda.quantizeLora(gpa, &sl.stacks[2], g.device_lins, lin_cuda.encoder_gemm, lin_cuda.dual_lin.encoderInt8());
+        }
+        try note(progress, "  lora: {d} keys over {d} file(s), {d} MB\n", .{ applied, specs.len, sl.bytes() >> 20 });
+    }
+
+    /// The component stores a LoRA's key map reads, resolved afresh; `views`
+    /// receives what must be freed once the caller is done reading.
+    fn sdLoraModel(self: *Session, m: *SdModels, views: *[3]?*weights_mod.Prefixed) !lora_sd.Model {
+        const fam = self.family();
+        var stores: [3]?weights_mod.WeightStore = .{ null, null, null };
+        const comps = [_]Component{ .denoiser, .conditioner, .conditioner2 };
+        for (comps, 0..) |comp, ci| {
+            if (comp == .conditioner2 and m.clip_g == null) continue;
+            const from_primary = switch (ci) {
+                0 => true,
+                1 => m.clip_from_primary,
+                else => m.clip_g_from_primary,
+            };
+            const base = if (from_primary) m.unet_st.store() else storeOf(if (ci == 1) &m.enc_st else &m.enc2_st) orelse m.unet_st.store();
+            const r = try resolveComponent(self.gpa, fam, comp, base, null, false);
+            views[ci] = r.view;
+            stores[ci] = r.store;
+        }
+        return .{
+            .unet = stores[0].?,
+            .unet_cfg = m.unet.cfg,
+            .clip_l = stores[1],
+            .clip_l_layers = m.clip.cfg.layers,
+            .clip_g = stores[2],
+            .clip_g_layers = if (m.clip_g) |g| g.cfg.layers else 0,
+            .clip_g_hidden = if (m.clip_g) |g| g.cfg.hidden else 0,
+        };
+    }
+
     /// Resolve the installed stack against the family's linears, refusing a file
     /// that patches nothing or disagrees on a width.
     fn attachLoras(self: *Session) !usize {
@@ -3954,7 +4481,7 @@ pub const Session = struct {
         const stack = &self.lora.?;
         switch (self.models) {
             // H3 resolves a hit list onto each `Lin` during its own walk.
-            .minimax_h3 => |*m| return m.dit.attachLora(stack),
+            .minimax_h3 => |*m| return m.dit.attachLora(self.gpa, stack),
             .sensenova => |*m| {
                 m.dit.lora = stack;
                 // Both copies: the turbo LoRAs patch only `_mot_gen`, but a file
@@ -3963,23 +4490,28 @@ pub const Session = struct {
                 stack.beginAttach();
                 for (m.dit.device_lins) |w| _ = try stack.resolve(w);
                 for (m.dit.prefix_lins) |w| _ = try stack.resolve(w);
-                return stack.finishAttach();
+                const n = try stack.finishAttach(self.gpa);
+                if (self.cu_be != null) try sensenova_cuda.quantizeLora(self.gpa, &m.dit, stack);
+                return n;
             },
-            // These route their GEMMs through `lin_cuda` too, so wiring them is
-            // a `lora` field plus the plan hook; nothing has done it, and the
-            // Vulkan and host arms would still need their own funnels. Refusing
-            // beats a render that ignores the file on three of four backends.
-            // `familySupportsLora` is the same list, and a UI asks it first.
-            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow => {
-                std.log.err("lora: the {t} family has no sidecar path in this build", .{self.family()});
-                return error.UnsupportedCheckpoint;
+            // Each walks every linear it runs; the int8 A is for the device trunk.
+            inline .krea2, .zimage, .anima, .mageflow => |*m| {
+                const n = try m.dit.attachLora(self.gpa, stack);
+                if (self.cu_be != null) try lin_cuda.quantizeLora(self.gpa, stack, m.dit.device_lins, lin_cuda.blockq_gemm, .w8a8);
+                return n;
             },
+            // Three stacks, attached by `installSdLoras`, which `installLoras` routes to.
+            .sd15, .sdxl => unreachable,
         }
     }
 
-    /// Resident factor bytes of the installed stack, 0 when there is none.
-    /// What a restack has to hand back to the device.
+    /// Resident factor bytes of the installed stack, 0 when there is none. What a
+    /// restack has to hand back to the device.
     pub fn loraBytes(self: *const Session) usize {
+        switch (self.models) {
+            .sd15, .sdxl => |*m| return if (m.lora) |sl| sl.bytes() else 0,
+            else => {},
+        }
         const stack = self.lora orelse return 0;
         return stack.bytes();
     }
@@ -3987,6 +4519,13 @@ pub const Session = struct {
     /// Move one file's dial on a live session. Nothing is reloaded: the strength
     /// is read at every apply.
     pub fn setLoraStrength(self: *Session, file: usize, strength: f32) void {
+        if (self.sd()) |m| {
+            const sl = m.lora orelse return;
+            for (&sl.stacks) |*st| if (file < st.files.items.len) {
+                st.files.items[file].strength = strength;
+            };
+            return;
+        }
         if (self.lora == null) return;
         const stack = &self.lora.?;
         if (file < stack.files.items.len) stack.files.items[file].strength = strength;
@@ -4095,7 +4634,7 @@ pub const Session = struct {
                     .enc_view = null,
                     .vae_view = null,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try dit_mod.DiT.load(gpa, den.store);
                 errdefer m.dit.deinit();
                 // The DiT loader detects its own prefix, so the resolver's view is not
@@ -4112,14 +4651,14 @@ pub const Session = struct {
 
                 m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
                 m.enc_view = enc_r.view;
                 m.enc = try qwen3.TextEncoder.load(gpa, enc_r.store);
                 errdefer m.enc.deinit();
 
                 m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
                 m.vae_view = vae_r.view;
                 m.vae = try wan_vae.Decoder.load(gpa, vae_r.store);
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
@@ -4137,7 +4676,7 @@ pub const Session = struct {
                     .enc_view = null,
                     .vae_view = null,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try zimage.DiT.load(gpa, den.store, zimage.z_image);
                 errdefer m.dit.deinit();
                 // The DiT loader detects its own prefix, so the resolver's view is
@@ -4157,7 +4696,7 @@ pub const Session = struct {
                 const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
                 m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
                 m.enc_view = enc_r.view;
                 m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .zimage);
                 errdefer m.enc.deinit();
@@ -4165,7 +4704,7 @@ pub const Session = struct {
                 const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
                 m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
                 m.vae_view = vae_r.view;
                 m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux, "");
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
@@ -4183,7 +4722,7 @@ pub const Session = struct {
                     .enc_view = null,
                     .vae_view = null,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try mageflow.DiT.load(gpa, den.store);
                 errdefer m.dit.deinit();
                 // The DiT loader detects its own prefix, so the resolver's view is
@@ -4202,7 +4741,7 @@ pub const Session = struct {
                 const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
                 m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
                 m.enc_view = enc_r.view;
                 m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .mageflow);
                 errdefer m.enc.deinit();
@@ -4210,7 +4749,7 @@ pub const Session = struct {
                 const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
                 m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
                 m.vae_view = vae_r.view;
                 // Which codec the file holds, not which one the family prefers.
                 m.vae = if (vae_r.store.get(mage_vae.probe) != null)
@@ -4233,7 +4772,7 @@ pub const Session = struct {
                     .enc_view = null,
                     .vae_view = null,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try anima.DiT.load(gpa, den.store, try anima.detectConfig(den.store));
                 errdefer m.dit.deinit();
                 // The DiT loader detects its own prefix, so the resolver's view is
@@ -4258,7 +4797,7 @@ pub const Session = struct {
                 const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
                 m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
                 m.enc_view = enc_r.view;
                 m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .anima);
                 errdefer m.enc.deinit();
@@ -4269,7 +4808,7 @@ pub const Session = struct {
                 const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
                 m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
                 m.vae_view = vae_r.view;
                 m.vae = try wan_vae.Decoder.load(gpa, vae_r.store);
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
@@ -4295,7 +4834,7 @@ pub const Session = struct {
                     .vae_view = null,
                     .audio_view = null,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try minimax_h3.DiT.load(gpa, den.store);
                 errdefer m.dit.deinit();
                 if (den.view) |v| {
@@ -4309,7 +4848,7 @@ pub const Session = struct {
                 errdefer m.tok.deinit();
                 m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
                 m.enc_view = enc_r.view;
                 m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .minimax_h3);
                 errdefer m.enc.deinit();
@@ -4319,14 +4858,14 @@ pub const Session = struct {
                 // other's file.
                 m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
                 m.vae_view = vae_r.view;
                 m.vae = try minimax_h3_vae.VideoDecoder.load(gpa, vae_r.store);
                 errdefer m.vae.deinit();
 
                 m.audio_st = try openIfGiven(gpa, io, opts.vae_2_path, opts.explicit_vae_2);
                 errdefer if (m.audio_st) |*st| st.deinit();
-                const aud_r = try reportResolve(gpa, fam, .decoder2, m.dit_st.store(), storeOf(&m.audio_st), opts.explicit_vae_2, opts.vae_2_path);
+                const aud_r = try self.resolve(gpa, fam, .decoder2, m.dit_st.store(), storeOf(&m.audio_st), opts.explicit_vae_2, opts.vae_2_path);
                 m.audio_view = aud_r.view;
                 m.audio = try minimax_h3_audio.AudioDecoder.load(gpa, aud_r.store);
                 errdefer m.audio.deinit();
@@ -4352,7 +4891,7 @@ pub const Session = struct {
                     .vae_view = null,
                     .sigma_ladder = &.{},
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.unet_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.unet_st.store(), null, false, opts.dit_path);
                 m.unet = try sd_unet.UNet.load(gpa, den.store, cfgs.unet, "");
                 errdefer m.unet.deinit();
                 if (den.view) |v| {
@@ -4367,8 +4906,9 @@ pub const Session = struct {
 
                 m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
                 errdefer if (m.enc_st) |*st| st.deinit();
-                const clip_r = try reportResolve(gpa, fam, .conditioner, m.unet_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                const clip_r = try self.resolve(gpa, fam, .conditioner, m.unet_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
                 m.clip_view = clip_r.view;
+                m.clip_from_primary = clip_r.from_primary;
                 m.clip = try clip_text.TextEncoder.load(gpa, clip_r.store, cfgs.clip, "");
                 errdefer m.clip.deinit();
 
@@ -4383,15 +4923,16 @@ pub const Session = struct {
                 if (fam == .sdxl) m.enc2_st = try openIfGiven(gpa, io, opts.text_encoder_2_path, opts.explicit_text_encoder_2);
                 errdefer if (m.enc2_st) |*st| st.deinit();
                 if (fam == .sdxl) {
-                    const g_r = try reportResolve(gpa, fam, .conditioner2, m.unet_st.store(), storeOf(&m.enc2_st), opts.explicit_text_encoder_2, opts.text_encoder_2_path);
+                    const g_r = try self.resolve(gpa, fam, .conditioner2, m.unet_st.store(), storeOf(&m.enc2_st), opts.explicit_text_encoder_2, opts.text_encoder_2_path);
                     m.clip_g_view = g_r.view;
+                    m.clip_g_from_primary = g_r.from_primary;
                     m.clip_g = try clip_text.TextEncoder.load(gpa, g_r.store, clip_text.clip_g, "");
                 }
                 errdefer if (m.clip_g) |*c| c.deinit();
 
                 m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
-                const vae_r = try reportResolve(gpa, fam, .decoder, m.unet_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.unet_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
                 m.vae_view = vae_r.view;
                 m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, cfgs.vae, "");
                 errdefer m.vae.deinit();
@@ -4414,7 +4955,7 @@ pub const Session = struct {
                     .dit_st = den_st,
                     .dit = undefined,
                 };
-                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try sensenova.Model.load(gpa, den.store, sensenova.u15_8b);
                 errdefer m.dit.deinit();
                 if (den.view) |v| {
@@ -5537,14 +6078,23 @@ pub const Session = struct {
 
     /// Stage 1, text -> conditioning, on the resident encoder. Caller frees the
     /// returned `Cond`. Device allocations are tagged `.te` for the VRAM meter.
+    /// `error.NonFiniteActivation` (`last_failure`) when any of the conditioning is a
+    /// NaN or an inf.
     pub fn encode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         self.setMemTag(.te);
+        lin_cuda.dual_lin.encoder_int8_dial = self.intGemmFor(.encoder);
         // A1111's `[a:b:when]` / `[a|b]` make the prompt a function of the step, so the
         // result is a schedule of conditionings rather than one. `steps == 0` means the
         // caller is not rendering a schedule (a single measurement forward), so the
         // step-0 prompt is all there is.
-        if (o.prompt_syntax == .a1111 and o.steps > 0) return self.encodeScheduled(gpa, text, o);
-        return self.encodeText(gpa, text, o);
+        var c = if (o.prompt_syntax == .a1111 and o.steps > 0) try self.encodeScheduled(gpa, text, o) else try self.encodeText(gpa, text, o);
+        errdefer c.deinit(gpa);
+        for (0..c.entryCount()) |i| {
+            const e = c.entry(i);
+            try self.checkFinite(.encoder, e.data, null);
+            if (e.pooled) |p| try self.checkFinite(.encoder, p, null);
+        }
+        return c;
     }
 
     /// Resolve A1111 scheduling, deduplicate the resulting prompts by text, and encode
@@ -5965,11 +6515,11 @@ pub const Session = struct {
                 var layout = try senseNovaLayout(gpa, &m.dit, ids, o.sn_ref_images, o.prompt_type == .negative);
                 defer layout.deinit(gpa);
                 var pre = if (on_cuda)
-                    try sensenova_cuda.prefixForward(&m.dit, self.cu_be.?, self.io, gpa, layout, o.sn_ref_images, o.cancel)
-                else if (on_vk)
-                    try sensenova_gpu.prefixForward(&m.dit, self.gpu_ctx.?, self.io, gpa, layout, o.sn_ref_images, o.cancel)
-                else
-                    try m.dit.prefixForward(self.io, gpa, layout, o.sn_ref_images, o.cancel);
+                    try sensenova_cuda.prefixForward(&m.dit, self.cu_be.?, self.io, gpa, layout, o.sn_ref_images, self.actFor(.encoder), o.cancel)
+                else if (on_vk) vk: {
+                    if (conv_gpu.needsRepack(self.gpu_ctx.?)) try m.dit.repackConvs();
+                    break :vk try sensenova_gpu.prefixForward(&m.dit, self.gpu_ctx.?, self.io, gpa, layout, o.sn_ref_images, self.actFor(.encoder), o.cancel);
+                } else try m.dit.prefixForward(self.io, gpa, layout, o.sn_ref_images, o.cancel);
                 errdefer pre.deinit(gpa);
                 const t1 = std.Io.Clock.real.now(self.io);
                 // Which stack ran, because the prefix is a SECOND full 8B of
@@ -6011,20 +6561,20 @@ pub const Session = struct {
             // Only when the CUDA arm has a GEMM for every weight; otherwise the CPU
             // encode, never noise from a format read as another.
             if (qwen3_cuda.supportsWeights(enc)) {
-                return qwen3_cuda.encodeVision(enc, b, self.io, gpa, ids, vision, o.cancel) catch |err| {
+                return qwen3_cuda.encodeVision(enc, b, self.io, gpa, ids, vision, self.actFor(.encoder), o.cancel) catch |err| {
                     if (err == error.Canceled) return err;
                     std.log.warn("cuda vision-conditioned encode failed ({t}); falling back to CPU (slow)", .{err});
                     return enc.encodeVision(self.io, gpa, ids, vision, o.cancel);
                 };
             }
         }
-        // Vulkan still has no deepstack or mrope path, so say so rather than
-        // silently producing a conditioning with no vision in it.
-        std.log.warn(
-            "a vision-conditioned encode runs on the CPU ({d} blocks); " ++
-                "only the CUDA encoder has a deepstack/mrope path",
-            .{vision.blocks.len},
-        );
+        if (self.cu_be == null) if (self.gpu_ctx) |gc| {
+            return qwen3_gpu.encodeVision(enc, gc, self.io, gpa, ids, vision, self.actFor(.encoder), o.cancel) catch |err| {
+                if (err == error.Canceled) return err;
+                std.log.warn("vulkan vision-conditioned encode failed ({t}); falling back to CPU (slow)", .{err});
+                return enc.encodeVision(self.io, gpa, ids, vision, o.cancel);
+            };
+        };
         return enc.encodeVision(self.io, gpa, ids, vision, o.cancel);
     }
 
@@ -6033,14 +6583,14 @@ pub const Session = struct {
             // Only when the CUDA arm has a GEMM for every weight; otherwise the CPU
             // encode, never noise from a format read as another.
             if (qwen3_cuda.supportsWeights(enc)) {
-                return qwen3_cuda.encode(enc, b, self.io, gpa, ids, o.cancel) catch |err| {
+                return qwen3_cuda.encode(enc, b, self.io, gpa, ids, self.actFor(.encoder), o.cancel) catch |err| {
                     if (err == error.Canceled) return err;
                     std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
                     return enc.encode(self.io, gpa, ids, o.cancel);
                 };
             }
         } else if (self.gpu_ctx) |gc| {
-            return qwen3_gpu.encode(enc, gc, self.io, gpa, ids, o.encoder_f16, o.cancel) catch |err| {
+            return qwen3_gpu.encode(enc, gc, self.io, gpa, ids, self.actFor(.encoder), o.cancel) catch |err| {
                 if (err == error.Canceled) return err;
                 std.log.warn("vulkan text encode failed ({t}); falling back to CPU (slow)", .{err});
                 return enc.encode(self.io, gpa, ids, o.cancel);
@@ -6168,19 +6718,21 @@ pub const Session = struct {
     ) !void {
         if (o.cancel) |c| if (c.load(.monotonic)) return error.Canceled;
         if (self.cu_be) |b| {
-            return clip_text_cuda.encodePrompt(tower, b, self.io, gpa, out, p, r) catch |err| {
+            return clip_text_cuda.encodePrompt(tower, b, self.io, gpa, out, p, r, self.actFor(.encoder)) catch |err| {
                 if (!clipFallbackOk(err)) return err;
                 std.log.warn("cuda clip encode: {t}; falling back to CPU (slow)", .{err});
                 return tower.encodePrompt(self.io, gpa, out, p, r);
             };
         }
-        if (self.gpu_ctx) |gc| {
-            return clip_text_gpu.encodePrompt(tower, gc, self.io, gpa, out, p, r, o.encoder_f16) catch |err| {
+        // A tower whose LoRA this arm cannot apply encodes on the CPU rather than
+        // without it.
+        if (self.gpu_ctx) |gc| if (clip_text_gpu.supported(gc, tower)) {
+            return clip_text_gpu.encodePrompt(tower, gc, self.io, gpa, out, p, r, self.actFor(.encoder)) catch |err| {
                 if (!clipFallbackOk(err)) return err;
                 std.log.warn("vulkan clip encode: {t}; falling back to CPU (slow)", .{err});
                 return tower.encodePrompt(self.io, gpa, out, p, r);
             };
-        }
+        };
         return tower.encodePrompt(self.io, gpa, out, p, r);
     }
 
@@ -6302,6 +6854,7 @@ pub const Session = struct {
         sigmas: []const f32,
         mf_refs: []const mageflow.Ref,
     ) !Denoiser {
+        lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
         // Not built yet: H3's sampler steps a TWO-STREAM latent
@@ -6327,6 +6880,11 @@ pub const Session = struct {
         // the workspace is device-side and there is one session per conditioning
         // branch; on the CPU it is the host `sd_unet.Workspace`.
         if (self.sd()) |m| {
+            m.unet.act = switch (self.actFor(.denoiser)) {
+                .f32 => .f32,
+                .f16 => .f16,
+                .bf16 => .bf16,
+            };
             const n = m.unet.cfg.channels * lat_h * lat_w;
             if (use_cfg) d.v_neg = try gpa.alloc(f32, n);
             d.sd_scaled = try gpa.alloc(f32, n);
@@ -6374,7 +6932,8 @@ pub const Session = struct {
                         }
                         if (self.cu_be) |b| {
                             br.cu = try sd_unet_cuda.Session.init(gpa, b, &m.unet, ce.data, ce.seq, br.adm);
-                        } else if (self.gpu_ctx) |gc| {
+                        } else if (self.sdVk()) |gc| {
+                            if (conv_gpu.needsRepack(gc)) try m.unet.repackConvs(gpa);
                             br.vk = try sd_unet_gpu.Session.init(gpa, gc, &m.unet, ce.data, ce.seq, br.adm);
                         }
                     }
@@ -6385,7 +6944,7 @@ pub const Session = struct {
                 self.setMemTag(.latent);
                 defer self.setMemTag(.dit);
                 d.sd_cu_ws = try sd_unet_cuda.Workspace.init(gpa, b, &m.unet, lat_h, lat_w, seq_cap_sd);
-            } else if (self.gpu_ctx) |gc| {
+            } else if (self.sdVk()) |gc| {
                 self.setMemTag(.latent);
                 defer self.setMemTag(.dit);
                 d.sd_vk_ws = try sd_unet_gpu.Workspace.init(gpa, gc, &m.unet, lat_h, lat_w, seq_cap_sd);
@@ -6420,7 +6979,7 @@ pub const Session = struct {
                     // Sized for the LONGER of the two text halves, since one
                     // workspace serves both branches.
                     const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
-                    d.mf_cu_ws = try mageflow_cuda.Workspace.init(b, &m.dit, seq_txt_cap, n_tok);
+                    d.mf_cu_ws = try mageflow_cuda.Workspace.init(b, &m.dit, seq_txt_cap, n_tok, self.actFor(.denoiser));
                 } else {
                     std.log.warn("Mage-Flow: this checkpoint's weight dtype has no CUDA GEMM path; " ++
                         "the trunk runs on the CPU. Expect CPU sampling speed.", .{});
@@ -6436,7 +6995,7 @@ pub const Session = struct {
                         d.mf_vk_neg = try mageflow_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn.data, cn.seq, d.mf_refs, sigmas);
                     }
                     const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
-                    d.mf_vk_ws = try mageflow_gpu.Workspace.init(gc, &m.dit, seq_txt_cap, n_tok);
+                    d.mf_vk_ws = try mageflow_gpu.Workspace.init(gc, &m.dit, seq_txt_cap, n_tok, self.actFor(.denoiser));
                 }
             }
             return d;
@@ -6468,7 +7027,7 @@ pub const Session = struct {
                     if (d.zi_cap_neg) |cn| {
                         d.zi_vk_neg = try zimage_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn, d.zi_cap_padded, sigmas);
                     }
-                    d.zi_vk_ws = try zimage_gpu.Workspace.init(gc, &m.dit, lat_h, lat_w, d.zi_cap_padded);
+                    d.zi_vk_ws = try zimage_gpu.Workspace.init(gc, &m.dit, lat_h, lat_w, d.zi_cap_padded, self.actFor(.denoiser));
                 } else {
                     std.log.warn("Z-Image: this device has no tensor-core pipeline for the DiT's " ++
                         "weights; the trunk runs on the CPU. Expect CPU sampling speed.", .{});
@@ -6481,7 +7040,7 @@ pub const Session = struct {
                     if (d.zi_cap_neg) |cn| {
                         d.zi_cu_neg = try zimage_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cn, d.zi_cap_padded, sigmas);
                     }
-                    d.zi_cu_ws = try zimage_cuda.Workspace.init(b, &m.dit, lat_h, lat_w, d.zi_cap_padded);
+                    d.zi_cu_ws = try zimage_cuda.Workspace.init(b, &m.dit, lat_h, lat_w, d.zi_cap_padded, self.actFor(.denoiser));
                 } else {
                     std.log.warn("Z-Image: this checkpoint's weight dtype has no CUDA GEMM path; " ++
                         "the trunk runs on the CPU. Expect CPU sampling speed.", .{});
@@ -6530,7 +7089,7 @@ pub const Session = struct {
                         const cn = cond_neg.?;
                         d.an_cu_neg = try anima_cuda.Session.init(gpa, b, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?);
                     }
-                    d.an_cu_ws = try anima_cuda.Workspace.init(b, dit, lat_h, lat_w);
+                    d.an_cu_ws = try anima_cuda.Workspace.init(b, dit, lat_h, lat_w, self.actFor(.denoiser));
                 } else {
                     warnAnimaCpu();
                 }
@@ -6541,7 +7100,7 @@ pub const Session = struct {
                         const cn = cond_neg.?;
                         d.an_vk_neg = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?);
                     }
-                    d.an_vk_ws = try anima_gpu.Workspace.init(gc, dit, lat_h, lat_w, d.an_vk.?.tc);
+                    d.an_vk_ws = try anima_gpu.Workspace.init(gc, dit, lat_h, lat_w, d.an_vk.?.tc, self.actFor(.denoiser));
                 } else {
                     warnAnimaCpu();
                 }
@@ -6565,19 +7124,20 @@ pub const Session = struct {
                     d.sn_cu = try sensenova_cuda.Session.init(gpa, b, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cond_pos));
                     if (cond_neg) |cn| d.sn_cu_neg = try sensenova_cuda.Session.init(gpa, b, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cn));
                     const cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
-                    d.sn_cu_ws = try sensenova_cuda.Workspace.init(b, &m.dit, &d.sn_cu.?, cap);
+                    d.sn_cu_ws = try sensenova_cuda.Workspace.init(b, &m.dit, &d.sn_cu.?, cap, self.actFor(.denoiser));
                 } else {
                     std.log.warn("SenseNova: this device cannot run the trunk's GEMMs; it runs on the " ++
                         "CPU. Expect CPU sampling speed.", .{});
                 }
             } else if (self.gpu_ctx) |gc| {
                 if (sensenova_gpu.supported(gc, &m.dit)) {
+                    if (conv_gpu.needsRepack(gc)) try m.dit.repackConvs();
                     self.setMemTag(.latent);
                     defer self.setMemTag(.dit);
                     d.sn_vk = try sensenova_gpu.Session.init(gpa, gc, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cond_pos));
                     if (cond_neg) |cn| d.sn_vk_neg = try sensenova_gpu.Session.init(gpa, gc, &m.dit, lat_h, lat_w, senseNovaPrefix(&m.dit, cn));
                     const cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
-                    d.sn_vk_ws = try sensenova_gpu.Workspace.init(gc, &m.dit, &d.sn_vk.?, cap);
+                    d.sn_vk_ws = try sensenova_gpu.Workspace.init(gc, &m.dit, &d.sn_vk.?, cap, self.actFor(.denoiser));
                 } else {
                     std.log.warn("SenseNova: this device cannot run the trunk's GEMMs; it runs on the " ++
                         "CPU. Expect CPU sampling speed.", .{});
@@ -6591,11 +7151,13 @@ pub const Session = struct {
         if (self.cu_be) |b| {
             d.cu_pos = try dit_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
             if (use_cfg) d.cu_neg = try dit_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
-            d.cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, seq_cap);
+            d.cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, seq_cap, self.actFor(.denoiser));
         } else if (self.gpu_ctx) |gc| {
-            d.vk_pos = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
-            if (use_cfg) d.vk_neg = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
-            d.vk_ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_cap);
+            if (dit_gpu.supported(gc, dit)) {
+                d.vk_pos = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+                if (use_cfg) d.vk_neg = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
+                d.vk_ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_cap, self.actFor(.denoiser));
+            }
         }
         return d;
     }
@@ -6631,6 +7193,10 @@ pub const Session = struct {
     /// than accepted and ignored.
     pub const ClipOptions = struct {
         prompt: []const u8,
+        /// The activation dials, as `Options` has them; null is `auto`.
+        te_act: ?Act = null,
+        dit_act: ?Act = null,
+        vae_act: ?Act = null,
         width: usize = 1344,
         height: usize = 768,
         /// Pixel frames at 24 fps. SNAPS to the family's grid; read the result
@@ -6689,7 +7255,7 @@ pub const Session = struct {
     /// Reads the effective budget off the backend rather than taking it as a
     /// parameter: a caller sets `budget_override` / `min_weights` there first, and
     /// those are the values that govern.
-    fn armDenoiserResidency(self: *Session) void {
+    pub fn armDenoiserResidency(self: *Session) void {
         // First-touch pinning, sized to the budget minus a reserve for the encoder
         // and the sampling activations, so it self-limits: a generous budget pins
         // the whole denoiser, a tight one pins part and the rest streams. The
@@ -6809,7 +7375,25 @@ pub const Session = struct {
         }
     }
 
+    /// One clip, rerun one dtype wider on a non-finite output exactly as `generate` is.
     pub fn generateClip(self: *Session, gpa: std.mem.Allocator, o: ClipOptions, progress: ?*std.Io.Writer) !Clip {
+        self.setDials(o.te_act, o.dit_act, o.vae_act);
+        while (true) {
+            return self.generateClipOnce(gpa, o, progress) catch |err| {
+                if (err != error.NonFiniteActivation) return err;
+                const f = self.last_failure.?;
+                const wider = self.widen(f.component, f.act) orelse {
+                    try note(progress, "{f}\n", .{f});
+                    if (progress) |w| w.flush() catch {};
+                    return err;
+                };
+                try note(progress, "{f}; rerunning the clip with the {s} at {t}\n", .{ f, f.component.label(), wider });
+                continue;
+            };
+        }
+    }
+
+    fn generateClipOnce(self: *Session, gpa: std.mem.Allocator, o: ClipOptions, progress: ?*std.Io.Writer) !Clip {
         if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
         const shifts = self.clipShifts(o);
 
@@ -6929,7 +7513,11 @@ pub const Session = struct {
                 // carry's own sigma dependence.
                 if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[i]);
                 _ = step_scratch.reset(.retain_capacity);
-                try den.predict(step_scratch.allocator(), v, x, sigmas[i]);
+                den.predict(step_scratch.allocator(), v, x, sigmas[i]) catch |err| {
+                    if (err == error.NonFiniteActivation) self.last_failure = .{ .component = .denoiser, .act = self.actFor(.denoiser), .step = i };
+                    return err;
+                };
+                try self.checkFinite(.denoiser, v, i);
                 // Euler for flow matching: the trajectory derivative IS the velocity.
                 const dt = sigmas[i + 1] - sigmas[i];
                 for (x, v) |*xi, vi| xi.* += dt * vi;
@@ -7184,6 +7772,7 @@ pub const Session = struct {
     /// Build the per-render state for a clip.
     pub fn clipDenoiser(self: *Session, gpa: std.mem.Allocator, cond: Cond, shape: LatentShape, shifts: minimax_h3.Shifts) !ClipDenoiser {
         if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
+        lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         const m = &self.models.minimax_h3;
         const audio = shape.audio orelse return error.FamilyIsNotVideo;
 
@@ -7217,7 +7806,7 @@ pub const Session = struct {
             if (minimax_h3_cuda.supported(&m.dit)) {
                 self.setMemTag(.dit);
                 d.cu = try minimax_h3_cuda.Session.init(b, gpa, &m.dit, &layout);
-                d.cu_ws = try minimax_h3_cuda.Workspace.init(b, &m.dit, layout.seq_len);
+                d.cu_ws = try minimax_h3_cuda.Workspace.init(b, &m.dit, layout.seq_len, self.actFor(.denoiser));
             } else {
                 std.log.warn("MiniMax H3: this checkpoint's trunk weights have no CUDA path " ++
                     "(int8 convrot only); the trunk runs on the CPU. Expect CPU sampling speed.", .{});
@@ -7225,10 +7814,10 @@ pub const Session = struct {
         }
         if (d.cu == null) {
             if (self.gpu_ctx) |gc| {
-                if (minimax_h3_gpu.supported(&m.dit)) {
+                if (minimax_h3_gpu.supported(gc, &m.dit)) {
                     self.setMemTag(.dit);
                     d.vk = try minimax_h3_gpu.Session.init(gc, gpa, &m.dit, &layout);
-                    d.vk_ws = try minimax_h3_gpu.Workspace.init(gc, &m.dit, layout.seq_len);
+                    d.vk_ws = try minimax_h3_gpu.Workspace.init(gc, &m.dit, layout.seq_len, self.actFor(.denoiser));
                 } else {
                     std.log.warn("MiniMax H3: this checkpoint's trunk weights have no Vulkan path " ++
                         "(int8 convrot only); the trunk runs on the CPU. Expect CPU sampling speed.", .{});
@@ -7256,10 +7845,10 @@ pub const Session = struct {
         sess: minimax_h3_vae_gpu.Session,
         ws: minimax_h3_vae_gpu.Workspace,
 
-        fn init(gc: *gpu_mod.Context, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize) !VkVolume {
+        fn init(gc: *gpu_mod.Context, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize, act: Act) !VkVolume {
             var sess = try minimax_h3_vae_gpu.Session.init(gc, gpa, dec, t, h, w);
             errdefer sess.deinit(gc);
-            const ws = try minimax_h3_vae_gpu.Workspace.init(gc, dec, sess.seq, sess.grid);
+            const ws = try minimax_h3_vae_gpu.Workspace.init(gc, gpa, dec, sess.seq, sess.grid, act);
             return .{ .gc = gc, .dec = dec, .sess = sess, .ws = ws };
         }
 
@@ -7277,7 +7866,8 @@ pub const Session = struct {
             if (t * h * w + self.dec.cfg.n_register + 1 != self.sess.seq) {
                 return minimax_h3_vae.decodeVolume(self.dec, io, gpa, out, z, t, h, w);
             }
-            return minimax_h3_vae_gpu.decodeVolume(self.dec, self.gc, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+            try minimax_h3_vae_gpu.decodeVolume(self.dec, self.gc, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+            if (!precision.allFinite(out)) return error.GpuDecodeNonFinite;
         }
     };
 
@@ -7287,10 +7877,10 @@ pub const Session = struct {
         sess: minimax_h3_vae_cuda.Session,
         ws: minimax_h3_vae_cuda.Workspace,
 
-        fn init(be: *cuda.Backend, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize) !DeviceVolume {
+        fn init(be: *cuda.Backend, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize, act: Act) !DeviceVolume {
             var sess = try minimax_h3_vae_cuda.Session.init(be, gpa, dec, t, h, w);
             errdefer sess.deinit(be);
-            const ws = try minimax_h3_vae_cuda.Workspace.init(be, dec, sess.seq, sess.grid);
+            const ws = try minimax_h3_vae_cuda.Workspace.init(be, dec, sess.seq, sess.grid, act);
             return .{ .be = be, .dec = dec, .sess = sess, .ws = ws };
         }
 
@@ -7311,7 +7901,8 @@ pub const Session = struct {
             if (t * h * w + self.dec.cfg.n_register + 1 != self.sess.seq) {
                 return minimax_h3_vae.decodeVolume(self.dec, io, gpa, out, z, t, h, w);
             }
-            return minimax_h3_vae_cuda.decodeVolume(self.dec, self.be, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+            try minimax_h3_vae_cuda.decodeVolume(self.dec, self.be, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+            if (!precision.allFinite(out)) return error.GpuDecodeNonFinite;
         }
     };
 
@@ -8344,7 +8935,7 @@ pub const Session = struct {
                 return false;
             };
         }
-        var ws = minimax_h3_audio_gpu.Workspace.init(gc, &m.audio, t) catch |err| {
+        var ws = minimax_h3_audio_gpu.Workspace.init(gc, gpa, &m.audio, t) catch |err| {
             std.log.warn("minimax_h3_audio_gpu: workspace failed ({t}), decoding on the CPU", .{err});
             return false;
         };
@@ -8384,12 +8975,34 @@ pub const Session = struct {
         }
     };
 
+    /// A non-finite device window reruns the video decode at the next wider dtype under
+    /// `auto`, and is `error.NonFiniteActivation` under an explicit one.
     pub fn decodeClip(
         self: *Session,
         gpa: std.mem.Allocator,
         latent: []const f32,
         shape: LatentShape,
         progress: ?*std.Io.Writer,
+    ) !Clip {
+        while (true) {
+            const act = self.actFor(.vae);
+            return self.decodeClipAt(gpa, latent, shape, progress, act) catch |err| {
+                if (err != error.GpuDecodeNonFinite) return err;
+                self.last_failure = .{ .component = .vae, .act = act };
+                const wider = self.widen(.vae, act) orelse return error.NonFiniteActivation;
+                try note(progress, "{f}; rerunning the video decode at {t}\n", .{ self.last_failure.?, wider });
+                continue;
+            };
+        }
+    }
+
+    fn decodeClipAt(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        latent: []const f32,
+        shape: LatentShape,
+        progress: ?*std.Io.Writer,
+        act: Act,
     ) !Clip {
         const io = self.io;
         if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
@@ -8431,7 +9044,7 @@ pub const Session = struct {
                 const sp: minimax_h3_vae.Spatial = .{ .ratio = vcfg.patch };
                 const cells = sp.tile / sp.ratio;
                 const win = @min(tp.chunkSize() + tp.tokenOverlap(), shape.t + tp.plan(shape.t).pad_tokens);
-                dev = try DeviceVolume.init(b, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells));
+                dev = try DeviceVolume.init(b, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells), act);
             }
         }
         var vdev: ?VkVolume = null;
@@ -8443,7 +9056,7 @@ pub const Session = struct {
                     const sp: minimax_h3_vae.Spatial = .{ .ratio = vcfg.patch };
                     const cells = sp.tile / sp.ratio;
                     const win = @min(tp.chunkSize() + tp.tokenOverlap(), shape.t + tp.plan(shape.t).pad_tokens);
-                    vdev = try VkVolume.init(gc, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells));
+                    vdev = try VkVolume.init(gc, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells), act);
                 }
             }
         }
@@ -8557,7 +9170,7 @@ pub const Session = struct {
             for (x) |*v| v.* *= inv;
             try note(progress, "decoding latent...\n", .{});
             const dec_start = std.Io.Clock.real.now(io);
-            const planar = try self.decodePlanar(SdVae{ .vae = &m.vae }, x, lat_h, lat_w, o, progress);
+            const planar = try self.decodeDialed(&m.vae, x, lat_h, lat_w, o, progress);
             defer gpa.free(planar);
             try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
             const width = lat_w * 8;
@@ -8598,12 +9211,24 @@ pub const Session = struct {
                 .distilled => |*v| blk: {
                     const z = try planarToInterleaved(gpa, latent, mageflow.channels, lat_h * lat_w);
                     defer gpa.free(z);
-                    const rgb_f32 = if (self.cu_be) |b|
-                        try mage_vae_cuda.decode(v, b, io, gpa, z, lat_h, lat_w, o.cancel)
-                    else if (self.gpu_ctx) |gc|
-                        try mage_vae_gpu.decode(v, gc, io, gpa, z, lat_h, lat_w, o.cancel)
-                    else
-                        try v.decode(io, gpa, z, lat_h, lat_w);
+                    if (std.c.getenv("TP_VAE_MAG") != null) mage_vae_dev.mag.on = true;
+                    self.dials.getPtr(.vae).setDial(o.vae_act);
+                    // A non-finite device decode reruns at the next wider dtype under
+                    // `auto`, and is `error.NonFiniteActivation` under an explicit one.
+                    const rgb_f32 = while (true) {
+                        const act = self.actFor(.vae);
+                        const got = if (self.cu_be) |b|
+                            try mage_vae_cuda.decode(v, b, io, gpa, z, lat_h, lat_w, act, o.cancel)
+                        else if (self.gpu_ctx) |gc| vk: {
+                            if (conv_gpu.needsRepack(gc)) try v.repackConvs(gpa);
+                            break :vk try mage_vae_gpu.decode(v, gc, io, gpa, z, lat_h, lat_w, act, o.cancel);
+                        } else break try v.decode(io, gpa, z, lat_h, lat_w);
+                        if (precision.allFinite(got) and !precision.injected(.vae, act)) break got;
+                        gpa.free(got);
+                        self.last_failure = .{ .component = .vae, .act = act };
+                        const wider = self.widen(.vae, act) orelse return error.NonFiniteActivation;
+                        try note(progress, "{f}; rerunning the decode at {t}\n", .{ self.last_failure.?, wider });
+                    };
                     defer gpa.free(rgb_f32);
                     break :blk .{
                         .rgb = try image.interleavedF32ToRgb8(gpa, rgb_f32, width, height),
@@ -8620,14 +9245,7 @@ pub const Session = struct {
                     const pl = v.packed_latent orelse return error.LatentSizeMismatch;
                     const x = try pl.unpack(gpa, latent, lat_h, lat_w, v.cfg.z_channels);
                     defer gpa.free(x);
-                    const planar = try self.decodePlanar(
-                        SdVae{ .vae = v },
-                        x,
-                        lat_h * sd_vae.PackedLatent.fold,
-                        lat_w * sd_vae.PackedLatent.fold,
-                        o,
-                        progress,
-                    );
+                    const planar = try self.decodeDialed(v, x, lat_h * sd_vae.PackedLatent.fold, lat_w * sd_vae.PackedLatent.fold, o, progress);
                     defer gpa.free(planar);
                     break :blk .{
                         .rgb = try image.planarF32ToRgb8(gpa, planar, width, height),
@@ -8654,7 +9272,7 @@ pub const Session = struct {
             for (x) |*v| v.* = v.* * inv + m.vae.cfg.shift_factor;
             try note(progress, "decoding latent...\n", .{});
             const dec_start = std.Io.Clock.real.now(io);
-            const planar = try self.decodePlanar(SdVae{ .vae = &m.vae }, x, lat_h, lat_w, o, progress);
+            const planar = try self.decodeDialed(&m.vae, x, lat_h, lat_w, o, progress);
             defer gpa.free(planar);
             try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
             const width = lat_w * 8;
@@ -8674,7 +9292,7 @@ pub const Session = struct {
         // Wan 2.1 decoder, and its `latent_format` is `Wan21`, the same
         // `latents_mean`/`latents_std` this denormalization applies. Only the model
         // pointer differs.
-        const wan: *const wan_vae.Decoder = switch (self.models) {
+        const wan: *wan_vae.Decoder = switch (self.models) {
             .krea2 => |*m| &m.vae,
             .anima => |*m| &m.vae,
             else => unreachable,
@@ -8701,7 +9319,7 @@ pub const Session = struct {
         }
         try note(progress, "decoding latent...\n", .{});
         const dec_start = std.Io.Clock.real.now(io);
-        const planar = try self.decodePlanar(KreaVae{ .vae = wan }, x, lat_h, lat_w, o, progress);
+        const planar = try self.decodeDialed(wan, x, lat_h, lat_w, o, progress);
         defer gpa.free(planar);
         try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
 
@@ -8718,6 +9336,8 @@ pub const Session = struct {
     /// peak-VRAM estimate and the tile geometry, a whole-image decode is just a
     /// single tile covering the whole latent, so nothing else here is
     /// family-specific. Caller frees the result.
+    /// `cpu_on_nonfinite` false returns a non-finite GPU decode as
+    /// `error.GpuDecodeNonFinite` rather than rerunning it on the CPU tier.
     fn decodePlanar(
         self: *Session,
         v: anytype,
@@ -8726,6 +9346,7 @@ pub const Session = struct {
         lat_w: usize,
         o: DecodeOptions,
         progress: ?*std.Io.Writer,
+        cpu_on_nonfinite: bool,
     ) ![]f32 {
         const gpa = self.gpa;
         const io = self.io;
@@ -8747,7 +9368,8 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            const ct = v.cpuCtx(io, o.cancel);
+            var ct = try v.cpuCtx(gpa, io, o.cancel);
+            defer ct.deinit(gpa);
             return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
         }
         if (self.cu_be) |b| {
@@ -8809,41 +9431,54 @@ pub const Session = struct {
                     try note(progress, "vae decode: est peak {d}MB, free VRAM unknown → no pre-reclaim\n", .{est >> 20});
                 }
             }
-            // Phase 1: whole-image with incremental eviction.
-            if (!skip_whole) {
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    if (Whole.call(wt, gpa, io, x, lat_h, lat_w)) |p| {
-                        return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
-                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> tile
-                    want *|= 2;
+            // A non-finite decode is an overflow at this dtype, not a memory shortage:
+            // freeing VRAM or tiling reruns it, so it leaves the GPU tiers at once.
+            gpu: {
+                // Phase 1: whole-image with incremental eviction.
+                if (!skip_whole) {
+                    var round: usize = 0;
+                    while (round < max_reclaim_rounds) : (round += 1) {
+                        if (finiteDecode(gpa, Whole.call(wt, gpa, io, x, lat_h, lat_w))) |p| {
+                            return p;
+                        } else |err| if (err == error.GpuDecodeNonFinite) {
+                            try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
+                            if (!cpu_on_nonfinite) return error.GpuDecodeNonFinite;
+                            break :gpu;
+                        } else if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
+                        if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> tile
+                        want *|= 2;
+                    }
                 }
-            }
-            // Phase 2: GPU tiling (bounded) with the same incremental eviction,
-            // after the denoiser is evicted a tile easily fits, and it's far faster
-            // than the CPU floor below.
-            {
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
-                        return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling {s} ({t}) → freeing VRAM\n", .{ decodeStepReason(err), err });
-                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> CPU
-                    want *|= 2;
+                // Phase 2: GPU tiling (bounded) with the same incremental eviction,
+                // after the denoiser is evicted a tile easily fits, and it's far faster
+                // than the CPU floor below.
+                {
+                    var round: usize = 0;
+                    while (round < max_reclaim_rounds) : (round += 1) {
+                        try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
+                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call))) |p| {
+                            return p;
+                        } else |err| if (err == error.GpuDecodeNonFinite) {
+                            try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
+                            if (!cpu_on_nonfinite) return error.GpuDecodeNonFinite;
+                            break :gpu;
+                        } else if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling ran out of VRAM ({t}) → freeing VRAM\n", .{err});
+                        if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> CPU
+                        want *|= 2;
+                    }
                 }
             }
             // Phase 3: CPU tiling, the guaranteed VRAM-can't-OOM floor (slow).
-            try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
+            try note(progress, "vae decode: CPU tiled decode (exact, slow)\n", .{});
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            const ct = v.cpuCtx(io, o.cancel);
+            var ct = try v.cpuCtx(gpa, io, o.cancel);
+            defer ct.deinit(gpa);
             return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
         }
         if (self.gpu_ctx) |gc| {
-            const wt = v.vkCtx(gc, o.cancel);
+            const wt = try v.vkCtx(gpa, gc, o.cancel);
             const Whole = @TypeOf(wt);
             // Whole-image decode first. The Vulkan mid-block attention is now
             // query-tiled (flash), so this OOMs only when the conv activation
@@ -8868,44 +9503,54 @@ pub const Session = struct {
                     if (o.reclaim) |r| _ = r.call(r.ctx, target -| gc.liveVram());
                 }
             }
-            if (!skip_whole) {
-                var want: u64 = reclaim_chunk;
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    if (Whole.call(wt, gpa, io, x, lat_h, lat_w)) |p| {
-                        return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
-                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
-                    const from_self = gc.evictToFree(want); // own resident weights first
-                    var got = from_self;
-                    if (got < want) if (o.reclaim) |r| {
-                        got += r.call(r.ctx, want - got); // then the chat LLM
-                    };
-                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
-                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
-                    if (got == 0) break; // nothing left to free -> tile
-                    want *|= 2; // escalate so a big deficit converges fast
+            gpu: {
+                if (!skip_whole) {
+                    var want: u64 = reclaim_chunk;
+                    var round: usize = 0;
+                    while (round < max_reclaim_rounds) : (round += 1) {
+                        if (finiteDecode(gpa, Whole.call(wt, gpa, io, x, lat_h, lat_w))) |p| {
+                            return p;
+                        } else |err| if (err == error.GpuDecodeNonFinite) {
+                            try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
+                            if (!cpu_on_nonfinite) return error.GpuDecodeNonFinite;
+                            break :gpu;
+                        } else if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
+                        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                        const from_self = gc.evictToFree(want); // own resident weights first
+                        var got = from_self;
+                        if (got < want) if (o.reclaim) |r| {
+                            got += r.call(r.ctx, want - got); // then the chat LLM
+                        };
+                        const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                        try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
+                        if (got == 0) break; // nothing left to free -> tile
+                        want *|= 2; // escalate so a big deficit converges fast
+                    }
                 }
-            }
-            // Phase 2: GPU tiling (bounded) with the same incremental eviction.
-            {
-                var wnt: u64 = reclaim_chunk;
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
-                        return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling {s} ({t}) -> CPU tier\n", .{ decodeStepReason(err), err });
-                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
-                    const from_self = gc.evictToFree(wnt);
-                    var got = from_self;
-                    if (got < wnt) if (o.reclaim) |r| {
-                        got += r.call(r.ctx, wnt - got);
-                    };
-                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
-                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
-                    if (got == 0) break; // nothing left -> CPU
-                    wnt *|= 2;
+                // Phase 2: GPU tiling (bounded) with the same incremental eviction.
+                {
+                    var wnt: u64 = reclaim_chunk;
+                    var round: usize = 0;
+                    while (round < max_reclaim_rounds) : (round += 1) {
+                        try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
+                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call))) |p| {
+                            return p;
+                        } else |err| if (err == error.GpuDecodeNonFinite) {
+                            try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
+                            if (!cpu_on_nonfinite) return error.GpuDecodeNonFinite;
+                            break :gpu;
+                        } else if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling ran out of VRAM ({t}) -> freeing VRAM\n", .{err});
+                        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                        const from_self = gc.evictToFree(wnt);
+                        var got = from_self;
+                        if (got < wnt) if (o.reclaim) |r| {
+                            got += r.call(r.ctx, wnt - got);
+                        };
+                        const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                        try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
+                        if (got == 0) break; // nothing left -> CPU
+                        wnt *|= 2;
+                    }
                 }
             }
             // Phase 3: CPU tiling, the guaranteed VRAM-can't-OOM floor (slow).
@@ -8913,20 +9558,43 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            const ct = v.cpuCtx(io, o.cancel);
+            var ct = try v.cpuCtx(gpa, io, o.cancel);
+            defer ct.deinit(gpa);
             return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
         }
         // CPU-only: tile once the whole-image scores plane (f32) gets large,
         // so a big image doesn't try to allocate tens of GB of host RAM.
         // (skip_whole, e.g. gpu_tiled with no GPU, forces tiling.)
-        const ct = v.cpuCtx(io, o.cancel);
+        var ct = try v.cpuCtx(gpa, io, o.cancel);
+        defer ct.deinit(gpa);
         if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
             return @TypeOf(ct).call(ct, gpa, io, x, lat_h, lat_w);
         try note(progress, "vae decode: tiling on CPU\n", .{});
         return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
     }
 
+    /// One image. A non-finite output under an `auto` dial reruns the render with
+    /// that component one dtype wider (remembered for the session); otherwise it is
+    /// `error.NonFiniteActivation`, with `last_failure` saying which, at what and when.
     pub fn generate(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
+        self.setDials(opts.te_act, opts.dit_act, opts.vae_act);
+        while (true) {
+            return self.generateOnce(opts, progress) catch |err| {
+                if (err != error.NonFiniteActivation) return err;
+                const f = self.last_failure.?;
+                const wider = self.widen(f.component, f.act) orelse {
+                    try note(progress, "{f}\n", .{f});
+                    // The caller is about to fail, and a buffered writer would drop this.
+                    if (progress) |w| w.flush() catch {};
+                    return err;
+                };
+                try note(progress, "{f}; rerunning the render with the {s} at {t}\n", .{ f, f.component.label(), wider });
+                continue;
+            };
+        }
+    }
+
+    fn generateOnce(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
         const gpa = self.gpa;
         const io = self.io;
         // Set from `opts` every render, including back to off: a session outlives one
@@ -9331,12 +9999,15 @@ pub const Session = struct {
 
         var img = try self.decode(x, lat_h, lat_w, .{
             .vae_decode = opts.vae_decode,
+            .vae_act = opts.vae_act,
             .cancel = opts.cancel,
             .reclaim = opts.reclaim,
         }, progress);
         errdefer img.deinit(gpa);
         img.shift = self.resolvedShift(opts);
         img.weight_dtype = self.weightDtype();
+        img.acts = self.acts();
+        img.sources = self.sources;
         try note(progress, "total time {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - total_start.nanoseconds)) / 1e9});
         return img;
     }
@@ -9402,6 +10073,15 @@ fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !voi
         try w.print(fmt, args);
         try w.flush();
     }
+}
+
+test "metadata names the file a component was read from, not the side path it was offered" {
+    var src: Sources = .initFill(.none);
+    src.set(.conditioner, .primary);
+    src.set(.decoder, .side);
+    try std.testing.expectEqualStrings("ckpt.safetensors", usedPath(src, .conditioner, "ckpt.safetensors", "qwen3.safetensors"));
+    try std.testing.expectEqualStrings("vae.safetensors", usedPath(src, .decoder, "ckpt.safetensors", "vae.safetensors"));
+    try std.testing.expectEqualStrings("", usedPath(src, .conditioner2, "ckpt.safetensors", "clip_g.safetensors"));
 }
 
 test "a created session starts with the fields deinit frees defaulted" {
@@ -9592,6 +10272,20 @@ test "the SD tile adapter transposes both ways at every latent width" {
     }
 }
 
+test "finiteDecode passes finite pixels and refuses any non-finite one" {
+    const gpa = std.testing.allocator;
+    const ok = try gpa.dupe(f32, &.{ 0, -1, 1e30 });
+    const got = try finiteDecode(gpa, ok);
+    defer gpa.free(got);
+    try std.testing.expectEqual(ok.ptr, got.ptr);
+    for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |bad| {
+        // The allocator's leak check is what proves the refused buffer was freed.
+        const p = try gpa.dupe(f32, &.{ 0.5, bad, 0.25 });
+        try std.testing.expectError(error.GpuDecodeNonFinite, finiteDecode(gpa, p));
+    }
+    try std.testing.expectError(error.DeviceOutOfMemory, finiteDecode(gpa, error.DeviceOutOfMemory));
+}
+
 test "recoverableDecodeErr classifies VAE-decode fallbacks" {
     // Every way a GPU decode can run out of VRAM must trigger the reclaim +
     // tiling ladder, including the cuBLASLt / cuDNN out-of-workspace errors and
@@ -9616,8 +10310,8 @@ const test_gate = @import("tp_models").test_gate;
 /// the standard `models/` layout runs it and any other self-skips.
 const test_paths = struct {
     const dit = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
-    const te = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    const vae = "models/vae/krea2RealVae_v10.safetensors";
+    const te = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const vae = build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors";
 };
 
 test "generate composed from the public stages is bit-identical to Session.generate" {
@@ -10651,7 +11345,7 @@ test "a video latent's preview reads the temporal stride, not the plane" {
 /// `minimax_h3.zig`'s copy because this is the *resolver's* view of it: the
 /// question is whether `detectFamily` and `resolveComponent` agree with the file
 /// on disk, which synthetic headers cannot answer.
-const h3_dit_path = "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
+const h3_dit_path = build_options.model_root ++ "/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
 
 test "the real H3 checkpoint detects and resolves as MiniMax H3" {
     // The synthetic-header cases above pin the detection RULES; this pins that

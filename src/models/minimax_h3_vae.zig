@@ -31,6 +31,7 @@
 //! Reference is ComfyUI `comfy/ldm/minimax/vae.py`.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
@@ -399,6 +400,52 @@ pub fn decode(
     finalizePixels(out, dec.cfg.out_channels, s.frames * s.height * s.width);
 }
 
+/// A window's latent `[c][t][h][w]` as the transformer's input rows `[seq][dim]`:
+/// denormalized and transposed to token-major, through `post_quant_conv` (1x1x1, so a
+/// GEMM) and the embedder, then the register tokens and one ZERO token that
+/// `proj_out` drops. Allocated from `a`.
+pub fn embedWindow(a: std.mem.Allocator, io: std.Io, gpa: std.mem.Allocator, dec: *const VideoDecoder, z: []const f32, grid: usize) ![]f32 {
+    const cfg = dec.cfg;
+    const c_in = cfg.in_channels;
+    const dim = cfg.dim;
+    std.debug.assert(z.len == c_in * grid);
+    const rows = try a.alloc(f32, grid * c_in);
+    for (0..grid) |i| {
+        for (0..c_in) |c| rows[i * c_in + c] = z[c * grid + i] * dec.latents_std[c] + dec.latents_mean[c];
+    }
+    const pq = try a.alloc(f32, grid * c_in);
+    try ops.matmul.matmul(io, gpa, pq, rows, grid, dec.post_quant, dec.post_quant_bias);
+    const x = try a.alloc(f32, (grid + cfg.n_register + 1) * dim);
+    try ops.matmul.matmul(io, gpa, x[0 .. grid * dim], pq, grid, dec.x_embedder, dec.x_embedder_bias);
+    @memcpy(x[grid * dim ..][0 .. cfg.n_register * dim], dec.register_tokens);
+    @memset(x[(grid + cfg.n_register) * dim ..][0..dim], 0);
+    return x;
+}
+
+/// Both LayerScale vectors of every block, `[block][2][dim]`, as the device arms
+/// upload them once per window. Allocated from `a`.
+pub fn layerScales(a: std.mem.Allocator, dec: *const VideoDecoder) ![]f32 {
+    const dim = dec.cfg.dim;
+    const out = try a.alloc(f32, dec.blocks.len * 2 * dim);
+    for (dec.blocks, 0..) |*b, i| {
+        @memcpy(out[(i * 2) * dim ..][0..dim], b.scale1);
+        @memcpy(out[(i * 2 + 1) * dim ..][0..dim], b.scale2);
+    }
+    return out;
+}
+
+/// A contiguous row range of a row-major weight, as its own `Weight`: `ff.w1`, whose
+/// two halves ARE row ranges, where `to_qkv`'s per-head planes are not.
+pub fn rowSlice(w: Weight, from: usize, n: usize) Weight {
+    std.debug.assert(from + n <= w.rows);
+    const stride = w.dtype.storageBytes(w.cols);
+    var out = w;
+    out.bytes = w.bytes[from * stride ..][0 .. n * stride];
+    out.rows = n;
+    if (w.row_scale) |rs| out.row_scale = rs[from..][0..n];
+    return out;
+}
+
 /// The raw whole-volume decode: no latent denormalization is skipped, but the
 /// ImageNet finalize is NOT applied. `decodeTemporal` needs the raw field.
 pub fn decodeVolume(
@@ -427,22 +474,7 @@ pub fn decodeVolume(
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Denormalize and transpose planar [c][t][h][w] to token-major [n][c] in one
-    // pass; `post_quant_conv` is a 1x1x1 conv, so it is a plain GEMM over that.
-    const rows = try a.alloc(f32, grid * c_in);
-    for (0..grid) |i| {
-        for (0..c_in) |c| {
-            rows[i * c_in + c] = z[c * grid + i] * dec.latents_std[c] + dec.latents_mean[c];
-        }
-    }
-    const pq = try a.alloc(f32, grid * c_in);
-    try ops.matmul.matmul(io, gpa, pq, rows, grid, dec.post_quant, dec.post_quant_bias);
-
-    // Embed, then append the register tokens and the trailing zero token.
-    const x = try a.alloc(f32, seq * dim);
-    try ops.matmul.matmul(io, gpa, x[0 .. grid * dim], pq, grid, dec.x_embedder, dec.x_embedder_bias);
-    @memcpy(x[grid * dim ..][0 .. cfg.n_register * dim], dec.register_tokens);
-    @memset(x[(grid + cfg.n_register) * dim ..][0..dim], 0);
+    const x = try embedWindow(a, io, gpa, dec, z, grid);
 
     var freqs = try ropeFreqs(gpa, cfg, t, h, w, n_suffix);
     defer freqs.deinit(gpa);
@@ -706,7 +738,7 @@ test "the video decode matches the reference at a toy width" {
 }
 
 const test_gate = @import("../test_gate.zig");
-const real_video_vae = "/home/qt/genai/comfyui/models/vae/minimax_h3_video_vae_fp16.safetensors";
+const real_video_vae = build_options.model_root ++ "/vae/minimax_h3_video_vae_fp16.safetensors";
 
 test "the real video VAE loads and its config matches the checkpoint" {
     // The toy-width test pins the MATH; this pins the constants `Config.detect`

@@ -951,44 +951,64 @@ pub const Hosts = struct {
         field.set(catalog.idText(e.id(), &buf));
     }
 
-    /// The image model file `cfg` names that this machine has and `s` does
-    /// not: what the settings row offers to send. Null for a local host, a
-    /// host that is down or has not sent its catalog, or when nothing is missing.
-    pub fn missingModel(self: *Hosts, s: *Slot, cfg: *const config.Config) ?[]const u8 {
+    /// The model file `cfg` names that this machine has and `s` does not: what
+    /// the settings row offers to send. Null for a local host, a host that is
+    /// down or has not sent its catalog, or when nothing is missing.
+    pub fn missingModel(self: *Hosts, s: *Slot, cfg: *const config.Config, claims: Claims) ?[]const u8 {
         const e = s.entry orelse return null;
         if (!e.remote() or !s.up()) return null;
-        if (!s.mirror.scannedOnce()) return null;
-        // EVERY model the settings name, not just the render's: a host carrying
-        // the chat needs the chat model and its vision tower as much as a host
-        // rendering needs the VAE, and `model_ref_fields` is the list the
-        // engine itself reads.
-        inline for (config.model_ref_fields) |name| {
-            if (@field(cfg, name).opt()) |ref| {
-                if (catalog.parseId(ref) == null) {
-                    if (self.local().mirror.catalog.find(ref)) |mine| {
-                        if (s.mirror.catalog.byId(mine.id()) == null) return ref;
-                    }
-                }
-            }
-        }
-        return null;
+        return self.missing(s, cfg, claims).first;
     }
 
-    /// How many models the settings name that this host does not hold, of
-    /// every kind. `missingFiles` answers the narrower question a RENDER asks.
-    pub fn missingAll(self: *Hosts, s: *Slot, cfg: *const config.Config) usize {
-        if (!s.mirror.scannedOnce()) return 0;
-        var n: usize = 0;
-        inline for (config.model_ref_fields) |name| {
+    /// How many models the settings name that this host does not hold and
+    /// would read. `missingFiles` answers the narrower question a RENDER asks.
+    pub fn missingAll(self: *Hosts, s: *Slot, cfg: *const config.Config, claims: Claims) usize {
+        return self.missing(s, cfg, claims).count;
+    }
+
+    /// Files already on their way to a host, by this machine's path. The
+    /// catalog cannot say so: a file is in it only once it has landed and the
+    /// host has looked again.
+    pub const Claims = struct {
+        ctx: *const anyopaque = undefined,
+        has: *const fn (ctx: *const anyopaque, host: []const u8, path: []const u8) bool = noClaims,
+
+        pub const none: Claims = .{};
+
+        fn noClaims(_: *const anyopaque, _: []const u8, _: []const u8) bool {
+            return false;
+        }
+    };
+
+    const Missing = struct { first: ?[]const u8 = null, count: usize = 0 };
+
+    /// The chat model and its vision tower count only on the host carrying the
+    /// chat; every image file counts on every host, since any may be handed a
+    /// render. Only a path this machine's catalog knows can be offered.
+    fn missing(self: *Hosts, s: *Slot, cfg: *const config.Config, claims: Claims) Missing {
+        var out: Missing = .{};
+        if (!s.mirror.scannedOnce()) return out;
+        if (s == self.chatSlot()) self.missingIn(&config.chat_ref_fields, s, cfg, claims, &out);
+        self.missingIn(&config.image_ref_fields, s, cfg, claims, &out);
+        return out;
+    }
+
+    fn missingIn(self: *Hosts, comptime fields: []const []const u8, s: *Slot, cfg: *const config.Config, claims: Claims, out: *Missing) void {
+        inline for (fields) |name| {
             if (@field(cfg, name).opt()) |ref| {
                 if (catalog.parseId(ref) == null) {
                     if (self.local().mirror.catalog.find(ref)) |mine| {
-                        if (s.mirror.catalog.byId(mine.id()) == null) n += 1;
+                        // Either spelling: the settings row sends `ref`, the
+                        // library grid the catalog's own path.
+                        const claimed = claims.has(claims.ctx, s.name, ref) or claims.has(claims.ctx, s.name, mine.path);
+                        if (!claimed and s.mirror.catalog.byId(mine.id()) == null) {
+                            if (out.first == null) out.first = ref;
+                            out.count += 1;
+                        }
                     }
                 }
             }
         }
-        return n;
     }
 
     /// Every file an image render needs. The preview decoder is left out:
@@ -1987,17 +2007,17 @@ test "a remote host is told model ids, a local one paths, and only a remote host
     try testing.expectEqualStrings(translated.diffusion_model.slice(), twice.diffusion_model.slice());
 
     // Nothing to offer while the host is down, and nothing for the local one.
-    try testing.expect(h.missingModel(b, &cfg) == null);
+    try testing.expect(h.missingModel(b, &cfg, .none) == null);
     var r = fakeRemote();
     b.remote = &r;
     defer b.remote = null;
-    try testing.expectEqualStrings("/home/me/models/dream.safetensors", h.missingModel(b, &cfg).?);
-    try testing.expect(h.missingModel(a, &cfg) == null);
+    try testing.expectEqualStrings("/home/me/models/dream.safetensors", h.missingModel(b, &cfg, .none).?);
+    try testing.expect(h.missingModel(a, &cfg, .none) == null);
     try setCatalog(b, &.{
         .{ .path = "id:x", .name = "vae", .size = 300, .mtime_ns = 9 },
         .{ .path = "id:y", .name = "dream", .size = 2000, .mtime_ns = 9 },
     });
-    try testing.expect(h.missingModel(b, &cfg) == null);
+    try testing.expect(h.missingModel(b, &cfg, .none) == null);
 
     // Holding the checkpoint but not the text encoder loads nothing: neither
     // a candidate nor silent about it, and offered the file it lacks.
@@ -2008,7 +2028,7 @@ test "a remote host is told model ids, a local one paths, and only a remote host
     });
     cfg.text_encoder.set("/home/me/models/te.safetensors");
     ready(b);
-    try testing.expectEqualStrings("/home/me/models/te.safetensors", h.missingModel(b, &cfg).?);
+    try testing.expectEqualStrings("/home/me/models/te.safetensors", h.missingModel(b, &cfg, .none).?);
     try testing.expectEqualStrings("does not have every file this model needs", h.whyNotRender(b, &cfg).?.long);
     try testing.expectEqualStrings("missing files", h.whyNotRender(b, &cfg).?.short);
     var ids: [4]catalog.ModelId = undefined;
@@ -2018,9 +2038,63 @@ test "a remote host is told model ids, a local one paths, and only a remote host
         .{ .path = "id:y", .name = "dream", .size = 2000, .mtime_ns = 9 },
         .{ .path = "id:z", .name = "te", .size = 700, .mtime_ns = 9 },
     });
-    try testing.expect(h.missingModel(b, &cfg) == null);
+    try testing.expect(h.missingModel(b, &cfg, .none) == null);
     try testing.expect(h.whyNotRender(b, &cfg) == null);
     try testing.expect(Hosts.holdsAll(b, h.imageIds(&cfg, &ids)));
+}
+
+test "a host is short of the chat model only while it carries the chat" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    try setCatalog(h.local(), &.{
+        .{ .path = "/home/me/models/dream.safetensors", .size = 2000, .mtime_ns = 1 },
+        .{ .path = "/home/me/models/chat.gguf", .size = 900, .mtime_ns = 1 },
+    });
+    var remote_entry: config.HostEntry = .{ .spawn = false };
+    remote_entry.name.set("far");
+    remote_entry.socket.set("lydia:7777");
+    remote_entry.cert.set("AA");
+    remote_entry.token.set(&[_]u8{'0'} ** 64);
+    const b = try h.addSlot("far", remote_entry);
+    var r = fakeRemote();
+    b.remote = &r;
+    defer b.remote = null;
+    try setCatalog(b, &.{.{ .path = "id:y", .name = "dream", .size = 2000, .mtime_ns = 9 }});
+
+    var cfg: config.Config = .{};
+    cfg.diffusion_model.set("/home/me/models/dream.safetensors");
+    cfg.llm_model.set("/home/me/models/chat.gguf");
+
+    try testing.expect(h.chatSlot() != b);
+    try testing.expect(h.missingModel(b, &cfg, .none) == null);
+    try testing.expectEqual(@as(usize, 0), h.missingAll(b, &cfg, .none));
+    h.chat = b.id;
+    try testing.expectEqualStrings("/home/me/models/chat.gguf", h.missingModel(b, &cfg, .none).?);
+    try testing.expectEqual(@as(usize, 1), h.missingAll(b, &cfg, .none));
+    // Off the chat again, an image file it lacks still counts: any host may
+    // be handed a render.
+    h.chat = h.local().id;
+    try setCatalog(h.local(), &.{
+        .{ .path = "/home/me/models/dream.safetensors", .size = 2000, .mtime_ns = 1 },
+        .{ .path = "/home/me/models/chat.gguf", .size = 900, .mtime_ns = 1 },
+        .{ .path = "/home/me/models/vae.safetensors", .size = 300, .mtime_ns = 1 },
+    });
+    cfg.vae.set("/home/me/models/vae.safetensors");
+    try testing.expectEqualStrings("/home/me/models/vae.safetensors", h.missingModel(b, &cfg, .none).?);
+    try testing.expectEqual(@as(usize, 1), h.missingAll(b, &cfg, .none));
+
+    // Once on its way there it is neither named nor counted: the row must
+    // not offer the file it is already sending.
+    const Sending = struct {
+        fn has(_: *const anyopaque, host: []const u8, path: []const u8) bool {
+            return std.mem.eql(u8, host, "far") and std.mem.eql(u8, path, "/home/me/models/vae.safetensors");
+        }
+    };
+    const claims: Hosts.Claims = .{ .has = Sending.has };
+    try testing.expect(h.missingModel(b, &cfg, claims) == null);
+    try testing.expectEqual(@as(usize, 0), h.missingAll(b, &cfg, claims));
 }
 
 test "the queue is pulled from as hosts free up, and an unplaceable job does not block it" {

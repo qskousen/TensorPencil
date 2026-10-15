@@ -4,7 +4,9 @@
 pub const vk = @import("gpu/vk.zig");
 pub const spv = @import("gpu/spv.zig");
 pub const context = @import("gpu/context.zig");
+pub const dual_table = @import("gpu/kernels/dual_table.zig");
 pub const mem_tag = @import("gpu/mem_tag.zig");
+pub const pipe_cache = @import("gpu/pipe_cache.zig");
 pub const Context = context.Context;
 
 /// Experimental CUDA Driver-API backend (pure Zig: dlopen'd libcuda + hand-
@@ -15,5 +17,6 @@ test {
     _ = vk;
     _ = spv;
     _ = context;
+    _ = pipe_cache;
     _ = cuda;
 }

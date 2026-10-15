@@ -46,6 +46,7 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
         .model_hash = info.model_hash,
         .vae_hash = info.vae_hash,
         .weight_dtype = info.weight_dtype,
+        .act_dtype = info.act_dtype,
         .shift = if (info.shift > 0) info.shift else null,
         // `opts` borrows the curve from `info.params`, which outlives this call.
         .cond_noise = opts.cond_noise.curve,
@@ -363,6 +364,7 @@ test "appendExtraParams writes the A1111/Civitai field names" {
         .model_hash = "0123456789",
         .vae_hash = "abcdef0123",
         .weight_dtype = "bf16",
+        .act_dtype = "text encoder f32, denoiser bf16, VAE f16",
         .shift = 6.0,
         .loras = &.{.{ .name = "style", .hash = "9999888877", .strength = 0.8 }},
     });
@@ -374,10 +376,13 @@ test "appendExtraParams writes the A1111/Civitai field names" {
         ", VAE: mage_flow_vae",
         ", VAE hash: abcdef0123",
         ", Weight dtype: bf16",
+        ", Activation dtype: \"text encoder f32, denoiser bf16, VAE f16\"",
         ", Shift: 6.0000",
         ", Lora hashes: \"style: 9999888877\"",
         ", Lora strengths: \"style: 0.80\"",
     }) |want| try std.testing.expect(std.mem.indexOf(u8, out, want) != null);
+    // The quoted, comma-carrying value does not swallow the fields after it.
+    try std.testing.expectEqual(@as(?f32, 6.0), parseA1111Params(out).shift);
     // The Civitai map is built from the same values, so it cannot disagree.
     try std.testing.expect(std.mem.indexOf(u8, out,
         ", Hashes: {\"model\":\"0123456789\",\"vae\":\"abcdef0123\",\"lora:style\":\"9999888877\"}") != null);

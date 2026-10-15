@@ -19,7 +19,7 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Growable = Backend.GrowableTensor;
 const Weight = ops.matmul.Weight;
-const lin_cuda = @import("lin_llm_cuda.zig");
+const lin_cuda = @import("lin_cuda.zig");
 
 pub const CpuSplitPolicy = enum { tail, attn };
 
@@ -56,10 +56,6 @@ const HybridProfile = struct {
         self.ffn_ns = 0;
     }
 };
-
-fn offsetBuf(b: Buf, off: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = b.mem, .size = size };
-}
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
@@ -334,6 +330,8 @@ test "packRoutes matches the expert-major scan" {
 
 pub const CudaLM = struct {
     lm: *const k2.Model,
+    /// What `lin_cuda.plan` decided for this checkpoint, passed to every linear.
+    lin_plan: lin_cuda.Plan,
     be: *Backend,
     gpa: std.mem.Allocator,
     cfg: k2.Config,
@@ -380,13 +378,14 @@ pub const CudaLM = struct {
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const k2.Model, cap: kvmod.Capacity) !CudaLM {
         const c = lm.cfg;
         const rows = prefillRows(cap.max);
-        {
+        const lin_plan = blk: {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            try lin_cuda.plan(try lm.deviceLins(arena.allocator()), rows, "k2-horizon cuda");
-        }
+            break :blk try lin_cuda.plan(try lm.deviceLins(arena.allocator()), lin_cuda.Use.llm(rows), "k2-horizon cuda");
+        };
         var self: CudaLM = undefined;
         self.lm = lm;
+        self.lin_plan = lin_plan;
         self.be = be;
         self.gpa = gpa;
         self.cfg = c;
@@ -618,7 +617,7 @@ pub const CudaLM = struct {
         const x = try self.gpa.alloc(f32, seq * c.hidden);
         defer self.gpa.free(x);
         try qwen3.embedTokens(self.lm.embed, ids, x);
-        try self.be.tensorUpload(offsetBuf(b.x, 0, x.len * 4), std.mem.sliceAsBytes(x));
+        try self.be.tensorUpload(b.x.slice(0, x.len * 4), std.mem.sliceAsBytes(x));
         if (seq > cpu_small_max and self.stage != null)
             if (self.nextStagedLayer(0)) |l| try self.stageQueue(l, null);
 
@@ -637,7 +636,7 @@ pub const CudaLM = struct {
             });
         }
         try self.be.groupRmsNorm(
-            offsetBuf(b.x, (seq - 1) * c.hidden * 4, c.hidden * 4),
+            b.x.slice((seq - 1) * c.hidden * 4, c.hidden * 4),
             b.tmp,
             try nbuf(self.be, self.lm.final_norm),
             1,
@@ -645,8 +644,8 @@ pub const CudaLM = struct {
             c.norm_groups,
             c.rms_eps,
         );
-        try lin_cuda.linear(self.be, b.logits, b.tmp, 1, self.lm.head);
-        if (logits) |out| try self.be.tensorDownload(offsetBuf(b.logits, 0, c.vocab * 4), std.mem.sliceAsBytes(out[0..c.vocab]));
+        try lin_cuda.linear(self.be, self.lin_plan, b.logits, b.tmp, 1, self.lm.head, null);
+        if (logits) |out| try self.be.tensorDownload(b.logits.slice(0, c.vocab * 4), std.mem.sliceAsBytes(out[0..c.vocab]));
         self.len += seq;
     }
 
@@ -675,8 +674,8 @@ pub const CudaLM = struct {
         const b = &self.bufs;
         const pos0 = self.len;
         try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.attn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
-        try lin_cuda.linear(self.be, b.q, b.normed, seq, layer.q);
-        try lin_cuda.linear(self.be, b.k, b.normed, seq, layer.k);
+        try lin_cuda.linear(self.be, self.lin_plan, b.q, b.normed, seq, layer.q, null);
+        try lin_cuda.linear(self.be, self.lin_plan, b.k, b.normed, seq, layer.k, null);
         const staged = seq > cpu_small_max and self.stagedLayer(l);
         if (staged) self.stageWait(l);
         if (layer.values) |values| {
@@ -686,17 +685,17 @@ pub const CudaLM = struct {
                 try self.cpuRoutedValues(values, seq, b.v)
             else
                 try self.routedValues(values, b.normed, seq, b.v, null);
-        } else try lin_cuda.linear(self.be, b.v, b.normed, seq, layer.v.?);
+        } else try lin_cuda.linear(self.be, self.lin_plan, b.v, b.normed, seq, layer.v.?, null);
         try self.be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, c.head_dim / 2, self.sin_off, pos0);
         try self.be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, c.head_dim / 2, self.sin_off, pos0);
         try self.storeKv(self.k_cache[l].buf, pos0 * c.kvDim(), b.k, seq * c.kvDim());
         try self.storeKv(self.v_cache[l].buf, pos0 * c.kvDim(), b.v, seq * c.kvDim());
         try self.attention(l, seq, pos0);
         if (layer.attn_gate) |gate| {
-            try lin_cuda.linear(self.be, b.gate, b.normed, seq, gate);
+            try lin_cuda.linear(self.be, self.lin_plan, b.gate, b.normed, seq, gate, null);
             try self.be.opSoftplusGate(b.attn, b.gate, seq * c.qDim());
         }
-        try lin_cuda.linear(self.be, b.tmp, b.attn, seq, layer.o);
+        try lin_cuda.linear(self.be, self.lin_plan, b.tmp, b.attn, seq, layer.o, null);
         try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
 
         try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.ffn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
@@ -710,10 +709,10 @@ pub const CudaLM = struct {
             else
                 try self.routedFfn(experts, b.normed, seq, b.tmp, null);
         } else {
-            try lin_cuda.linear(self.be, b.expert_a, b.normed, seq, layer.dense_gate.?);
-            try lin_cuda.linear(self.be, b.expert_b, b.normed, seq, layer.dense_up.?);
+            try lin_cuda.linear(self.be, self.lin_plan, b.expert_a, b.normed, seq, layer.dense_gate.?, null);
+            try lin_cuda.linear(self.be, self.lin_plan, b.expert_b, b.normed, seq, layer.dense_up.?, null);
             try self.be.siluMul(b.expert_a, b.expert_b, seq * c.intermediate);
-            try lin_cuda.linear(self.be, b.tmp, b.expert_a, seq, layer.dense_down.?);
+            try lin_cuda.linear(self.be, self.lin_plan, b.tmp, b.expert_a, seq, layer.dense_down.?, null);
         }
         try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
     }
@@ -730,10 +729,10 @@ pub const CudaLM = struct {
             while (t0 < seq) {
                 const n = @min(tile, seq - t0);
                 try self.be.opAttnTCCausal(
-                    offsetBuf(b.q, t0 * c.qDim() * 4, n * c.qDim() * 4),
+                    b.q.slice(t0 * c.qDim() * 4, n * c.qDim() * 4),
                     self.k_cache[l].buf,
                     self.v_cache[l].buf,
-                    offsetBuf(b.attn, t0 * c.qDim() * 4, n * c.qDim() * 4),
+                    b.attn.slice(t0 * c.qDim() * 4, n * c.qDim() * 4),
                     n,
                     pos0 + t0 + n,
                     c.n_heads,
@@ -764,11 +763,11 @@ pub const CudaLM = struct {
         const x = self.cpu_scratch.normed[0 .. seq * c.hidden];
         const y = self.cpu_scratch.v[0 .. seq * c.kvDim()];
         var started = self.hybrid_profile.tic();
-        try lin_cuda.linear(self.be, self.bufs.route_logits, self.bufs.normed, seq, values.router);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.route_logits, self.bufs.normed, seq, values.router, null);
         try self.selectRoutes(self.bufs.route_logits, values.bias, seq, c.n_value_experts, c.n_value_experts_used);
         self.hybrid_profile.toc(started, &self.hybrid_profile.route_ns);
         started = self.hybrid_profile.tic();
-        try self.be.tensorDownload(offsetBuf(self.bufs.normed, 0, x.len * 4), std.mem.sliceAsBytes(x));
+        try self.be.tensorDownload(self.bufs.normed.slice(0, x.len * 4), std.mem.sliceAsBytes(x));
         self.hybrid_profile.toc(started, &self.hybrid_profile.transfer_ns);
         started = self.hybrid_profile.tic();
         try k2.routedValuesSelected(
@@ -785,7 +784,7 @@ pub const CudaLM = struct {
         );
         self.hybrid_profile.toc(started, &self.hybrid_profile.values_ns);
         started = self.hybrid_profile.tic();
-        try self.be.tensorUpload(offsetBuf(out, 0, y.len * 4), std.mem.sliceAsBytes(y));
+        try self.be.tensorUpload(out.slice(0, y.len * 4), std.mem.sliceAsBytes(y));
         self.hybrid_profile.toc(started, &self.hybrid_profile.transfer_ns);
     }
 
@@ -796,11 +795,11 @@ pub const CudaLM = struct {
         const x = self.cpu_scratch.normed[0 .. seq * c.hidden];
         const y = self.cpu_scratch.tmp[0 .. seq * c.hidden];
         var started = self.hybrid_profile.tic();
-        try lin_cuda.linear(self.be, self.bufs.route_logits, self.bufs.normed, seq, experts.router);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.route_logits, self.bufs.normed, seq, experts.router, null);
         try self.selectRoutes(self.bufs.route_logits, experts.bias, seq, c.n_experts, c.n_experts_used);
         self.hybrid_profile.toc(started, &self.hybrid_profile.route_ns);
         started = self.hybrid_profile.tic();
-        try self.be.tensorDownload(offsetBuf(self.bufs.normed, 0, x.len * 4), std.mem.sliceAsBytes(x));
+        try self.be.tensorDownload(self.bufs.normed.slice(0, x.len * 4), std.mem.sliceAsBytes(x));
         self.hybrid_profile.toc(started, &self.hybrid_profile.transfer_ns);
         started = self.hybrid_profile.tic();
         try k2.routedFfnSparseSelected(
@@ -817,20 +816,20 @@ pub const CudaLM = struct {
         );
         self.hybrid_profile.toc(started, &self.hybrid_profile.ffn_ns);
         started = self.hybrid_profile.tic();
-        try self.be.tensorUpload(offsetBuf(out, 0, y.len * 4), std.mem.sliceAsBytes(y));
+        try self.be.tensorUpload(out.slice(0, y.len * 4), std.mem.sliceAsBytes(y));
         self.hybrid_profile.toc(started, &self.hybrid_profile.transfer_ns);
         if (experts.shared_gate) |gate| {
-            try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.normed, seq, gate);
-            try lin_cuda.linear(self.be, self.bufs.expert_b, self.bufs.normed, seq, experts.shared_up.?);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_a, self.bufs.normed, seq, gate, null);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_b, self.bufs.normed, seq, experts.shared_up.?, null);
             try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, seq * c.shared_intermediate);
-            try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?, null);
             try self.be.opAdd(out, self.bufs.expert_out, seq * c.hidden);
         }
     }
 
     fn selectRoutes(self: *CudaLM, logits_d: Buf, bias: []const f32, seq: usize, n_experts: usize, n_used: usize) !void {
         const logits = self.route_logits[0 .. seq * n_experts];
-        try self.be.tensorDownload(offsetBuf(logits_d, 0, logits.len * 4), std.mem.sliceAsBytes(logits));
+        try self.be.tensorDownload(logits_d.slice(0, logits.len * 4), std.mem.sliceAsBytes(logits));
         for (0..seq) |t| {
             const row = logits[t * n_experts ..][0..n_experts];
             switch (self.cfg.gating) {
@@ -890,8 +889,8 @@ pub const CudaLM = struct {
             n += 1;
         };
         if (n == 0) return .{ .rows = 0, .groups = 0 };
-        try self.be.tensorUpload(offsetBuf(self.bufs.route_pack, 0, 2 * cap * 4), std.mem.sliceAsBytes(self.route_pack[0 .. 2 * cap]));
-        const routes: GroupedRoutes = .{ .rows = n, .groups = 0, .ids = offsetBuf(self.bufs.route_pack, 0, n * 4), .scales = offsetBuf(self.bufs.route_pack, cap * 4, n * 4) };
+        try self.be.tensorUpload(self.bufs.route_pack.slice(0, 2 * cap * 4), std.mem.sliceAsBytes(self.route_pack[0 .. 2 * cap]));
+        const routes: GroupedRoutes = .{ .rows = n, .groups = 0, .ids = self.bufs.route_pack.slice(0, n * 4), .scales = self.bufs.route_pack.slice(cap * 4, n * 4) };
         try self.be.opGatherRows(self.bufs.expert_in, x, routes.ids, n, self.cfg.hidden);
         return routes;
     }
@@ -943,14 +942,14 @@ pub const CudaLM = struct {
         });
         const n = 2 * R + S + pk.groups;
         const d = self.bufs.route_pack;
-        try self.be.tensorUpload(offsetBuf(d, 0, n * 4), std.mem.sliceAsBytes(pack[0..n]));
+        try self.be.tensorUpload(d.slice(0, n * 4), std.mem.sliceAsBytes(pack[0..n]));
         const routes: GroupedRoutes = .{
             .rows = pk.rows,
             .groups = pk.groups,
-            .ids = offsetBuf(d, 0, pk.rows * 4),
-            .scales = offsetBuf(d, R * 4, pk.rows * 4),
-            .slots = offsetBuf(d, 2 * R * 4, S * 4),
-            .groups_d = offsetBuf(d, (2 * R + S) * 4, pk.groups * 4),
+            .ids = d.slice(0, pk.rows * 4),
+            .scales = d.slice(R * 4, pk.rows * 4),
+            .slots = d.slice(2 * R * 4, S * 4),
+            .groups_d = d.slice((2 * R + S) * 4, pk.groups * 4),
         };
         try self.be.opGatherRows(self.bufs.expert_in, x, routes.ids, routes.rows, self.cfg.hidden);
         return routes;
@@ -1012,7 +1011,7 @@ pub const CudaLM = struct {
 
     fn routedValues(self: *CudaLM, values: k2.Values, x: Buf, seq: usize, out: Buf, dev: ?Buf) !void {
         const c = self.cfg;
-        try lin_cuda.linear(self.be, self.bufs.route_logits, x, seq, values.router);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.route_logits, x, seq, values.router, null);
         const selected = self.selected[0 .. seq * c.n_value_experts_used];
         const weights = self.selected_weights[0 .. seq * c.n_value_experts_used];
         try self.selectRoutes(self.bufs.route_logits, values.bias, seq, c.n_value_experts, c.n_value_experts_used);
@@ -1022,11 +1021,11 @@ pub const CudaLM = struct {
             var t0: usize = 0;
             while (t0 < seq) : (t0 += routed_chunk) {
                 const n = @min(routed_chunk, seq - t0);
-                const xs = offsetBuf(x, t0 * c.hidden * 4, n * c.hidden * 4);
+                const xs = x.slice(t0 * c.hidden * 4, n * c.hidden * 4);
                 const routes = try self.prepareGroupedRoutes(kind, xs, n, selected[t0 * used ..][0 .. n * used], weights[t0 * used ..][0 .. n * used], used, c.n_value_experts);
                 try self.groupedExpertLinear(kind, self.bufs.expert_a, self.bufs.expert_in, values.weights, dev, c.kvDim(), c.hidden, routes);
                 try self.be.opSilu(self.bufs.expert_a, routes.rows * c.kvDim());
-                try self.be.opMoeCombine(offsetBuf(out, t0 * c.kvDim() * 4, n * c.kvDim() * 4), self.bufs.expert_a, routes.slots, routes.scales, n, used, c.kvDim());
+                try self.be.opMoeCombine(out.slice(t0 * c.kvDim() * 4, n * c.kvDim() * 4), self.bufs.expert_a, routes.slots, routes.scales, n, used, c.kvDim());
             }
             return;
         }
@@ -1036,7 +1035,7 @@ pub const CudaLM = struct {
             const routes = try self.gatherForExpert(x, seq, selected, weights, used, expert);
             if (routes.rows == 0) continue;
             self.prefetchValueExpert(values, selected, expert + 1);
-            try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.expert_in, routes.rows, weight);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_a, self.bufs.expert_in, routes.rows, weight, null);
             try self.be.opSilu(self.bufs.expert_a, routes.rows * c.kvDim());
             try self.be.opScatterAddRows(out, self.bufs.expert_a, routes.ids, routes.scales, routes.rows, c.kvDim());
         }
@@ -1044,7 +1043,7 @@ pub const CudaLM = struct {
 
     fn routedFfn(self: *CudaLM, experts: k2.Experts, x: Buf, seq: usize, out: Buf, dev: ?[3]Buf) !void {
         const c = self.cfg;
-        try lin_cuda.linear(self.be, self.bufs.route_logits, x, seq, experts.router);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.route_logits, x, seq, experts.router, null);
         const selected = self.selected[0 .. seq * c.n_experts_used];
         const weights = self.selected_weights[0 .. seq * c.n_experts_used];
         try self.selectRoutes(self.bufs.route_logits, experts.bias, seq, c.n_experts, c.n_experts_used);
@@ -1058,13 +1057,13 @@ pub const CudaLM = struct {
             var t0: usize = 0;
             while (t0 < seq) : (t0 += routed_chunk) {
                 const n = @min(routed_chunk, seq - t0);
-                const xs = offsetBuf(x, t0 * c.hidden * 4, n * c.hidden * 4);
+                const xs = x.slice(t0 * c.hidden * 4, n * c.hidden * 4);
                 const routes = try self.prepareGroupedRoutes(kind, xs, n, selected[t0 * used ..][0 .. n * used], weights[t0 * used ..][0 .. n * used], used, c.n_experts);
                 try self.groupedExpertLinear(kind, self.bufs.expert_a, self.bufs.expert_in, experts.gate, if (dev) |d| d[0] else null, c.expert_intermediate, c.hidden, routes);
                 try self.groupedExpertLinear(kind, self.bufs.expert_b, self.bufs.expert_in, experts.up, if (dev) |d| d[1] else null, c.expert_intermediate, c.hidden, routes);
                 try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, routes.rows * c.expert_intermediate);
                 try self.groupedExpertLinear(kind, self.bufs.expert_out, self.bufs.expert_a, experts.down, if (dev) |d| d[2] else null, c.hidden, c.expert_intermediate, routes);
-                try self.be.opMoeCombine(offsetBuf(out, t0 * c.hidden * 4, n * c.hidden * 4), self.bufs.expert_out, routes.slots, routes.scales, n, used, c.hidden);
+                try self.be.opMoeCombine(out.slice(t0 * c.hidden * 4, n * c.hidden * 4), self.bufs.expert_out, routes.slots, routes.scales, n, used, c.hidden);
             }
         } else {
             try self.be.tensorZero(out, seq * c.hidden * 4);
@@ -1073,18 +1072,18 @@ pub const CudaLM = struct {
                 const routes = try self.gatherForExpert(x, seq, selected, weights, used, expert);
                 if (routes.rows == 0) continue;
                 self.prefetchFfnExpert(experts, selected, expert + 1);
-                try lin_cuda.linear(self.be, self.bufs.expert_a, self.bufs.expert_in, routes.rows, gate);
-                try lin_cuda.linear(self.be, self.bufs.expert_b, self.bufs.expert_in, routes.rows, up);
+                try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_a, self.bufs.expert_in, routes.rows, gate, null);
+                try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_b, self.bufs.expert_in, routes.rows, up, null);
                 try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, routes.rows * c.expert_intermediate);
-                try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, routes.rows, down);
+                try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_out, self.bufs.expert_a, routes.rows, down, null);
                 try self.be.opScatterAddRows(out, self.bufs.expert_out, routes.ids, routes.scales, routes.rows, c.hidden);
             }
         }
         if (experts.shared_gate) |gate| {
-            try lin_cuda.linear(self.be, self.bufs.expert_a, x, seq, gate);
-            try lin_cuda.linear(self.be, self.bufs.expert_b, x, seq, experts.shared_up.?);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_a, x, seq, gate, null);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_b, x, seq, experts.shared_up.?, null);
             try self.be.siluMul(self.bufs.expert_a, self.bufs.expert_b, seq * c.shared_intermediate);
-            try lin_cuda.linear(self.be, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?);
+            try lin_cuda.linear(self.be, self.lin_plan, self.bufs.expert_out, self.bufs.expert_a, seq, experts.shared_down.?, null);
             try self.be.opAdd(out, self.bufs.expert_out, seq * c.hidden);
         }
     }

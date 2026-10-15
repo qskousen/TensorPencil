@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dynlib = @import("tp_core").dynlib;
 const cu = @import("cu.zig");
+const Dt = @import("../kernels/dual_table.zig").Dt;
 
 pub const Handle = ?*anyopaque;
 pub const BackendDescriptor = ?*anyopaque; // cudnnBackendDescriptor_t = void*
@@ -435,7 +436,8 @@ pub const ConvPlan = struct {
     conv: ConvDescriptor = null,
     workspace_bytes: usize = 0,
 
-    pub fn build(api: *const Api, handle: Handle, h: usize, w: usize, ci: usize, co: usize) Error!ConvPlan {
+    /// `bf16` picks bf16 X, W and Y over f16.
+    pub fn build(api: *const Api, handle: Handle, h: usize, w: usize, ci: usize, co: usize, bf16: bool) Error!ConvPlan {
         var self: ConvPlan = .{};
         errdefer self.deinit(api);
         try api.check(api.cudnnCreateTensorDescriptor(&self.x), "CreateTensor(x)");
@@ -446,10 +448,11 @@ pub const ConvPlan = struct {
         const wi: c_int = @intCast(w);
         const cii: c_int = @intCast(ci);
         const coi: c_int = @intCast(co);
-        // X/Y are NHWC f16 (N=1); W is [co][3][3][ci] NHWC f16.
-        try api.check(api.cudnnSetTensor4dDescriptor(self.x, b.TENSOR_NHWC, b.DATA_HALF, 1, cii, hi, wi), "SetTensor(x)");
-        try api.check(api.cudnnSetTensor4dDescriptor(self.y, b.TENSOR_NHWC, b.DATA_HALF, 1, coi, hi, wi), "SetTensor(y)");
-        try api.check(api.cudnnSetFilter4dDescriptor(self.w, b.DATA_HALF, b.TENSOR_NHWC, coi, cii, 3, 3), "SetFilter");
+        // X/Y are NHWC (N=1); W is [co][3][3][ci] NHWC.
+        const dt = if (bf16) b.DATA_BFLOAT16 else b.DATA_HALF;
+        try api.check(api.cudnnSetTensor4dDescriptor(self.x, b.TENSOR_NHWC, dt, 1, cii, hi, wi), "SetTensor(x)");
+        try api.check(api.cudnnSetTensor4dDescriptor(self.y, b.TENSOR_NHWC, dt, 1, coi, hi, wi), "SetTensor(y)");
+        try api.check(api.cudnnSetFilter4dDescriptor(self.w, dt, b.TENSOR_NHWC, coi, cii, 3, 3), "SetFilter");
         try api.check(api.cudnnSetConvolution2dDescriptor(self.conv, 1, 1, 1, 1, 1, 1, b.CONV_CROSS_CORRELATION, b.DATA_FLOAT), "SetConv2d");
         try api.check(api.cudnnSetConvolutionMathType(self.conv, b.MATH_TENSOR_OP), "SetMathType");
         var ws: usize = 0;
@@ -603,13 +606,17 @@ pub const MatmulDequantPlan = struct {
         return op;
     }
 
-    pub fn build(api: *const Api, handle: Handle, m: usize, n: usize, k: usize, d_f16: bool) Error!MatmulDequantPlan {
+    pub fn build(api: *const Api, handle: Handle, m: usize, n: usize, k: usize, out: Dt) Error!MatmulDequantPlan {
         var self: MatmulDequantPlan = .{};
         errdefer self.deinit(api);
         const M: i64 = @intCast(m);
         const N: i64 = @intCast(n);
         const K: i64 = @intCast(k);
-        const d_type: c_int = if (d_f16) b.DATA_HALF else b.DATA_FLOAT;
+        const d_type: c_int = switch (out) {
+            .f32 => b.DATA_FLOAT,
+            .f16 => b.DATA_HALF,
+            .bf16 => b.DATA_BFLOAT16,
+        };
         // A [1,m,k] row-major; B [1,k,n] = weight[n][k] viewed transposed
         // (k-stride 1, n-stride k); C/S1/D [1,m,n] row-major; scales broadcast.
         const a = try self.tensor3(api, uid_a, b.DATA_INT8, &.{ 1, M, K }, &.{ M * K, K, 1 }, false);

@@ -643,6 +643,9 @@ pub const Session = struct {
     /// regenerate, which re-runs an already-measured prompt) and consumed by
     /// `poll` into the user message.
     user_stats: ?TurnStats = null,
+    /// Whether this turn's prompt left the thought open, set by the worker once
+    /// the template is rendered and stamped onto the variant by `poll`.
+    primed_pub: ?bool = null,
     /// `poll` keeps folding `turn_stats` into the last assistant variant while
     /// this is set; it clears it after applying the final numbers of a finished
     /// turn, so a later frame can't overwrite a variant the user navigated away
@@ -1037,6 +1040,7 @@ pub const Session = struct {
         self.progress = .{};
         self.turn_stats = .{};
         self.user_stats = null;
+        self.primed_pub = null;
         self.stats_live = false;
         self.fresh_user_turn = false;
         self.turn_prompt_tokens = 0;
@@ -1158,6 +1162,7 @@ pub const Session = struct {
         // The transcript those footer numbers described is gone.
         self.turn_stats = .{};
         self.user_stats = null;
+        self.primed_pub = null;
         self.stats_live = false;
         self.mu.unlock(self.io);
         self.progress.reset();
@@ -2024,6 +2029,7 @@ pub const Session = struct {
         self.progress.reset();
         self.mu.lockUncancelable(self.io);
         self.turn_stats = .{};
+        self.primed_pub = null;
         self.stats_live = true;
         self.mu.unlock(self.io);
         self.cancel.store(false, .release);
@@ -2939,10 +2945,13 @@ pub const Session = struct {
         const base = self.turn_stats;
         const user = self.user_stats;
         self.user_stats = null;
+        const primed = self.primed_pub;
+        self.primed_pub = null;
         const generating = self.busy();
         if (live and !generating) self.stats_live = false;
         self.mu.unlock(self.io);
 
+        if (primed) |p| self.stampVariant(p);
         if (user) |u| self.applyUserStats(u);
         if (live) self.applyTurnStats(base, generating);
 
@@ -3045,26 +3054,37 @@ pub const Session = struct {
         return if (s2.think) |t| std.mem.trim(u8, t, " \t\r\n").len else 0;
     }
 
-    /// Record on the in-flight assistant variant whether `prompt` ends inside an
-    /// open reasoning block, so the display and the tool-call scanner know the
-    /// generated text starts *inside* the thought (see `toolcall.splitThought`).
+    /// Publish whether `prompt` ends inside an open reasoning block, so the
+    /// display and the tool-call scanner know the generated text starts *inside*
+    /// the thought (see `toolcall.splitThought`). Worker thread; `poll` stamps it.
     ///
     /// Only the last few tokens are decoded: the generation prompt's block marker
     /// sits at the very end, and scanning the whole transcript would let an earlier
     /// turn that quoted `</think>` flip the answer.
     fn recordThoughtPrimed(self: *Session, prompt: []const u32) void {
+        const tail_n = @min(prompt.len, 16);
+        const tail = self.tok.decodeAlloc(self.gpa, prompt[prompt.len - tail_n ..]) catch return;
+        defer self.gpa.free(tail);
+        const primed = toolcall.endsInsideThought(tail, liveReasoning());
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.primed_pub = primed;
+    }
+
+    fn liveReasoning() ?toolcall.Reasoning {
+        const r = chat.reasoning() orelse return null;
+        return .{ .open = r.open, .close = r.close };
+    }
+
+    /// Stamp what produced the in-flight assistant variant: whether its text
+    /// starts inside the thought, the markers and the model. All are properties
+    /// of the generating model, and a stored turn has to be splittable without
+    /// it. UI thread.
+    fn stampVariant(self: *Session, primed: bool) void {
         const n = self.messages.items.len;
         if (n == 0 or self.messages.items[n - 1].role != .assistant) return;
         const v = self.messages.items[n - 1].active();
-        const live: ?toolcall.Reasoning = if (chat.reasoning()) |r|
-            .{ .open = r.open, .close = r.close }
-        else
-            null;
-
-        // Stamp what is producing this turn, right where `thought_primed` is
-        // already recorded: all three are properties of the model that generates
-        // the text, and a stored turn has to be splittable without it.
-        if (v.reason_open.len == 0) if (live) |r| {
+        if (v.reason_open.len == 0) if (liveReasoning()) |r| {
             if (self.gpa.dupe(u8, r.open)) |o| {
                 if (self.gpa.dupe(u8, r.close)) |c| {
                     v.reason_open = o;
@@ -3075,11 +3095,7 @@ pub const Session = struct {
         if (v.gen_model.len == 0 and self.model_name.len > 0) {
             v.gen_model = self.gpa.dupe(u8, self.model_name) catch "";
         }
-
-        const tail_n = @min(prompt.len, 16);
-        const tail = self.tok.decodeAlloc(self.gpa, prompt[prompt.len - tail_n ..]) catch return;
-        defer self.gpa.free(tail);
-        v.thought_primed = toolcall.endsInsideThought(tail, live);
+        v.thought_primed = primed;
     }
 
 };

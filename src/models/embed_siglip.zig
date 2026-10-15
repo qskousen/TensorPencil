@@ -30,7 +30,7 @@ const Weight = ops.matmul.Weight;
 pub const embed_dim: usize = 768;
 
 /// In-place L2 normalization (shared by the per-item and batched paths).
-fn l2normalize(v: []f32) void {
+pub fn l2normalize(v: []f32) void {
     var ss: f32 = 0;
     for (v) |x| ss += x * x;
     const norm = @sqrt(ss);

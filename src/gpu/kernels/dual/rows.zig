@@ -5,6 +5,7 @@
 //! reductions see every lane.
 
 const k = @import("../dual.zig");
+const Dt = k.Dt;
 const Env = k.Env;
 
 /// Row iteration shared by every body here.
@@ -15,18 +16,18 @@ inline fn Rows(e: Env) struct { row: u32, step: u32, lane: u32, lanes: u32 } {
 /// Lanes-strided sum over a row with `unroll` independent accumulators, so each
 /// lane keeps that many loads in flight: one load per iteration is latency-bound
 /// on a single wide row (an LLM decode norm). `f` maps the loaded value.
-inline fn stridedSum(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: bool, comptime f: anytype) f32 {
+inline fn stridedSum(e: Env, r: anytype, base: u32, dim: u32, comptime dt: Dt, comptime f: anytype) f32 {
     const unroll = 8;
     var acc: [unroll]f32 = @splat(0);
     var i = r.lane;
     while (i + (unroll - 1) * r.lanes < dim) : (i += unroll * r.lanes) {
         inline for (0..unroll) |u_| {
             const u: u32 = @intCast(u_);
-            const v = if (f16_in) e.h16(.a, base + i + u * r.lanes) else e.ld(.a, base + i + u * r.lanes);
+            const v = e.ldT(.a, dt, base + i + u * r.lanes);
             acc[u] += f(v);
         }
     }
-    while (i < dim) : (i += r.lanes) acc[0] += f(if (f16_in) e.h16(.a, base + i) else e.ld(.a, base + i));
+    while (i < dim) : (i += r.lanes) acc[0] += f(e.ldT(.a, dt, base + i));
     var s: f32 = 0;
     inline for (0..unroll) |u| s += acc[u];
     return s;
@@ -52,9 +53,27 @@ pub inline fn l2normRows(e: Env) void {
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = row * dim;
-        const scale = 1.0 / @max(@sqrt(k.sgSum(stridedSum(e, r, base, dim, false, sq))), e.f(0));
+        const scale = 1.0 / @max(@sqrt(k.sgSum(stridedSum(e, r, base, dim, .f32, sq))), e.f(0));
         var i = r.lane;
         while (i < dim) : (i += r.lanes) e.st(.a, base + i, e.ld(.a, base + i) * scale);
+    }
+}
+
+/// The Wan VAE's channel norm: b[row] = a[row] * sqrt(dim) / max(|a[row]|, f0) * c,
+/// then silu when u2. a and b in `dt`. u0 = rows, u1 = dim.
+pub inline fn vaeNorm(e: Env, comptime dt: Dt) void {
+    const r = Rows(e);
+    const dim = e.u(1);
+    var row = r.row;
+    while (row < e.u(0)) : (row += r.step) {
+        const base = row * dim;
+        const inv = @sqrt(@as(f32, @floatFromInt(dim))) / @max(@sqrt(k.sgSum(stridedSum(e, r, base, dim, dt, sq))), e.f(0));
+        var i = r.lane;
+        while (i < dim) : (i += r.lanes) {
+            var v = e.ldT(.a, dt, base + i) * inv * e.ld(.c, i);
+            if (e.u(2) != 0) v = k.silu(v);
+            e.stT(.b, dt, base + i, v);
+        }
     }
 }
 
@@ -67,68 +86,94 @@ pub inline fn l2normRowsG(e: Env) void {
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = (row / e.u(2)) * e.u(3) + (row % e.u(2)) * dim;
-        const scale = 1.0 / @max(@sqrt(k.sgSum(stridedSum(e, r, base, dim, false, sq))), e.f(0));
+        const scale = 1.0 / @max(@sqrt(k.sgSum(stridedSum(e, r, base, dim, .f32, sq))), e.f(0));
         var i = r.lane;
         while (i < dim) : (i += r.lanes) e.st(.a, base + i, e.ld(.a, base + i) * scale);
     }
 }
 
-inline fn rmsInv(e: Env, r: anytype, base: u32, dim: u32) f32 {
-    return 1.0 / @sqrt(k.sgSum(stridedSum(e, r, base, dim, false, sq)) / @as(f32, @floatFromInt(dim)) + e.f(0));
+inline fn rmsInv(e: Env, r: anytype, base: u32, dim: u32, comptime dt: Dt) f32 {
+    return 1.0 / @sqrt(k.sgSum(stridedSum(e, r, base, dim, dt, sq)) / @as(f32, @floatFromInt(dim)) + e.f(0));
 }
 
-/// b[row] = a[row] * rsqrt(mean(a[row]^2) + f0) * c. u0 = rows, u1 = dim.
-pub inline fn rmsnorm(e: Env) void {
+/// b[row] = a[row] * rsqrt(mean(a[row]^2) + f0) * c, a and b in `dt`. u0 = rows, u1 = dim.
+pub inline fn rmsnorm(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = row * dim;
-        const inv = rmsInv(e, r, base, dim);
+        const inv = rmsInv(e, r, base, dim, dt);
         var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.b, base + i, e.ld(.a, base + i) * inv * e.ld(.c, i));
+        while (i < dim) : (i += r.lanes) e.stT(.b, dt, base + i, e.ldT(.a, dt, base + i) * inv * e.ld(.c, i));
+    }
+}
+
+/// `rmsnorm` then `ropeHalf` on each head row in place, the normed values kept in
+/// registers, so a row is bit-identical to the two kernels in turn.
+/// a = x [rows][dim], b = norm weight [dim], c = freqs (cos, then sin at u2).
+/// u0 = rows (positions * heads), u1 = dim, u2 = sin_off, u3 = heads, u4 = position of
+/// row 0. f0 = eps.
+pub inline fn qkNormRope(e: Env) void {
+    const r = Rows(e);
+    const dim = e.u(1);
+    const half = dim / 2;
+    var row = r.row;
+    while (row < e.u(0)) : (row += r.step) {
+        const base = row * dim;
+        const inv = rmsInv(e, r, base, dim, .f32);
+        const pos = row / e.u(3) + e.u(4);
+        var p = r.lane;
+        while (p < half) : (p += r.lanes) {
+            const lo = e.ld(.a, base + p) * inv * e.ld(.b, p);
+            const hi = e.ld(.a, base + p + half) * inv * e.ld(.b, p + half);
+            const cos_v = e.ld(.c, pos * half + p);
+            const sin_v = e.ld(.c, e.u(2) + pos * half + p);
+            e.st(.a, base + p, lo * cos_v - hi * sin_v);
+            e.st(.a, base + p + half, hi * cos_v + lo * sin_v);
+        }
     }
 }
 
 /// Residual-stream steering: move each row along a unit direction.
 ///
-/// a = rows, c = the direction (u4 offset, dim wide). u0 = rows, u1 = dim,
+/// a = rows in `dt`, c = the direction (u4 offset, dim wide). u0 = rows, u1 = dim,
 /// u2 = op (0 scales the component already there, 1 injects the direction),
 /// u3 = keep the row's length, u4 = direction offset, u5 = first row. f0 = scale.
 ///
-/// The first row is a parameter rather than an offset buffer: a Vulkan buffer is a
-/// handle, so it cannot be offset the way a CUDA pointer can.
-pub inline fn actSteer(e: Env) void {
+/// The first row is a parameter rather than a view: a Vulkan view's offset must meet the
+/// storage alignment, and a row offset need not.
+pub inline fn actSteer(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     const doff = e.u(4);
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = (e.u(5) + row) * dim;
-        const before = if (e.u(3) != 0) k.sgSum(stridedSum(e, r, base, dim, false, sq)) else 0;
+        const before = if (e.u(3) != 0) k.sgSum(stridedSum(e, r, base, dim, dt, sq)) else 0;
 
         // gain needs the row's component along the direction; add needs its length.
         var acc: f32 = 0;
         if (e.u(2) == 0) {
             var i = r.lane;
-            while (i < dim) : (i += r.lanes) acc += e.ld(.a, base + i) * e.ld(.c, doff + i);
+            while (i < dim) : (i += r.lanes) acc += e.ldT(.a, dt, base + i) * e.ld(.c, doff + i);
         } else {
             var i = r.lane;
-            while (i < dim) : (i += r.lanes) acc += sq(e.ld(.a, base + i));
+            while (i < dim) : (i += r.lanes) acc += sq(e.ldT(.a, dt, base + i));
         }
         const m = k.sgSum(acc);
         // gain SUBTRACTS the component, add ADDS the direction.
         const step = if (e.u(2) == 0) -e.f(0) * m else e.f(0) * @sqrt(m);
 
         var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.a, base + i, e.ld(.a, base + i) + step * e.ld(.c, doff + i));
+        while (i < dim) : (i += r.lanes) e.stT(.a, dt, base + i, e.ldT(.a, dt, base + i) + step * e.ld(.c, doff + i));
 
         if (e.u(3) != 0) {
-            const after = k.sgSum(stridedSum(e, r, base, dim, false, sq));
+            const after = k.sgSum(stridedSum(e, r, base, dim, dt, sq));
             if (after > 0 and before > 0) {
                 const renorm = @sqrt(before / after);
                 var j = r.lane;
-                while (j < dim) : (j += r.lanes) e.st(.a, base + j, e.ld(.a, base + j) * renorm);
+                while (j < dim) : (j += r.lanes) e.stT(.a, dt, base + j, e.ldT(.a, dt, base + j) * renorm);
             }
         }
     }
@@ -143,7 +188,7 @@ pub inline fn groupRmsnorm(e: Env) void {
     while (row < e.u(0)) : (row += r.step) {
         const base = row * width;
         const wbase = (row % e.u(2)) * width;
-        const inv = rmsInv(e, r, base, width);
+        const inv = rmsInv(e, r, base, width, .f32);
         var i = r.lane;
         while (i < width) : (i += r.lanes) e.st(.b, base + i, e.ld(.a, base + i) * inv * e.ld(.c, wbase + i));
     }
@@ -152,8 +197,8 @@ pub inline fn groupRmsnorm(e: Env) void {
 /// Fused rmsnorm + AdaLN: b = a * inv * c[premul + col] + c[shift + col], the
 /// pre-norm weight already folded into premul. Offsets are u2 and u3, or per row
 /// u2 + d[row]*u4 and u3 + d[row]*u4 when u4 != 0 (d holds u32 row labels, a
-/// denoise mask). u0 = rows, u1 = dim, f0 = eps.
-pub inline fn rmsMod(e: Env) void {
+/// denoise mask). a and b in `dt`. u0 = rows, u1 = dim, f0 = eps.
+pub inline fn rmsMod(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     // Row offsets into a, b and the index buffer, so a caller can drive a row RANGE
@@ -173,9 +218,9 @@ pub inline fn rmsMod(e: Env) void {
             pre += lab;
             sh += lab;
         }
-        const inv = rmsInv(e, r, src, dim);
+        const inv = rmsInv(e, r, src, dim, dt);
         var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.b, dst + i, e.ld(.a, src + i) * inv * e.ld(.c, pre + i) + e.ld(.c, sh + i));
+        while (i < dim) : (i += r.lanes) e.stT(.b, dt, dst + i, e.ldT(.a, dt, src + i) * inv * e.ld(.c, pre + i) + e.ld(.c, sh + i));
     }
 }
 
@@ -183,8 +228,8 @@ pub inline fn rmsMod(e: Env) void {
 /// Rows at or past u5 are real padding (a tile-aligned batch), so they are zeroed
 /// rather than normalized: their input is uninitialized and an rms over it would
 /// be an inf. b = out words, dim even. u0 = rows, u1 = dim, u2 = premul offset,
-/// u3 = shift offset, u5 = real rows, f0 = eps, f1 = scale.
-pub inline fn rmsModH16(e: Env) void {
+/// u3 = shift offset, u5 = real rows, f0 = eps, f1 = scale. a in `dt`.
+pub inline fn rmsModH16(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     var row = r.row;
@@ -195,11 +240,11 @@ pub inline fn rmsModH16(e: Env) void {
             while (z < dim) : (z += r.lanes * 2) e.stW(.b, (base + z) >> 1, 0);
             continue;
         }
-        const inv = rmsInv(e, r, base, dim);
+        const inv = rmsInv(e, r, base, dim, dt);
         var i = r.lane * 2;
         while (i < dim) : (i += r.lanes * 2) {
-            const lo = (e.ld(.a, base + i) * inv * e.ld(.c, e.u(2) + i) + e.ld(.c, e.u(3) + i)) * e.f(1);
-            const hi = (e.ld(.a, base + i + 1) * inv * e.ld(.c, e.u(2) + i + 1) + e.ld(.c, e.u(3) + i + 1)) * e.f(1);
+            const lo = (e.ldT(.a, dt, base + i) * inv * e.ld(.c, e.u(2) + i) + e.ld(.c, e.u(3) + i)) * e.f(1);
+            const hi = (e.ldT(.a, dt, base + i + 1) * inv * e.ld(.c, e.u(2) + i + 1) + e.ld(.c, e.u(3) + i + 1)) * e.f(1);
             e.stW(.b, (base + i) >> 1, k.packH16(lo, hi));
         }
     }
@@ -207,9 +252,9 @@ pub inline fn rmsModH16(e: Env) void {
 
 /// Two-pass mean and inverse deviation of a row (deviation-based variance, since
 /// the shifted E[x^2]-E[x]^2 form cancels once the mean is large).
-inline fn lnStats(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: bool) [2]f32 {
+inline fn lnStats(e: Env, r: anytype, base: u32, dim: u32, comptime dt: Dt) [2]f32 {
     const dimf: f32 = @floatFromInt(dim);
-    const mean = k.sgSum(stridedSum(e, r, base, dim, f16_in, id)) / dimf;
+    const mean = k.sgSum(stridedSum(e, r, base, dim, dt, id)) / dimf;
     // Deviations need the mean, so this pass is written out.
     const unroll = 8;
     var acc: [unroll]f32 = @splat(0);
@@ -217,12 +262,12 @@ inline fn lnStats(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: bool
     while (i + (unroll - 1) * r.lanes < dim) : (i += unroll * r.lanes) {
         inline for (0..unroll) |u_| {
             const u: u32 = @intCast(u_);
-            const dv = (if (f16_in) e.h16(.a, base + i + u * r.lanes) else e.ld(.a, base + i + u * r.lanes)) - mean;
+            const dv = e.ldT(.a, dt, base + i + u * r.lanes) - mean;
             acc[u] += dv * dv;
         }
     }
     while (i < dim) : (i += r.lanes) {
-        const dv = (if (f16_in) e.h16(.a, base + i) else e.ld(.a, base + i)) - mean;
+        const dv = e.ldT(.a, dt, base + i) - mean;
         acc[0] += dv * dv;
     }
     var v: f32 = 0;
@@ -230,48 +275,40 @@ inline fn lnStats(e: Env, r: anytype, base: u32, dim: u32, comptime f16_in: bool
     return .{ mean, 1.0 / @sqrt(k.sgSum(v) / dimf + e.f(0)) };
 }
 
-/// LayerNorm with weight and bias: b = (a - mean) * inv * c + d. u0 = rows,
-/// u1 = dim, f0 = eps.
-pub inline fn layernorm(e: Env) void {
-    const r = Rows(e);
-    const dim = e.u(1);
-    var row = r.row;
-    while (row < e.u(0)) : (row += r.step) {
-        const base = row * dim;
-        const st = lnStats(e, r, base, dim, false);
-        var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.b, base + i, (e.ld(.a, base + i) - st[0]) * st[1] * e.ld(.c, i) + e.ld(.d, i));
-    }
+/// LayerNorm with weight and bias: b = (a - mean) * inv * c + d, a and b `dt`.
+/// u0 = rows, u1 = dim, f0 = eps.
+pub inline fn layernorm(e: Env, comptime dt: Dt) void {
+    layernormIo(e, dt, dt);
 }
 
-/// `layernorm` over f16 activations (a, b f16; c, d f32), lanes on pairs; dim even.
-pub inline fn layernormH16(e: Env) void {
+/// `layernorm` from an f32 a into b at `out`.
+pub inline fn layernormFrom32(e: Env, comptime out: Dt) void {
+    layernormIo(e, .f32, out);
+}
+
+inline fn layernormIo(e: Env, comptime in: Dt, comptime out: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = row * dim;
-        const st = lnStats(e, r, base, dim, true);
-        var i = r.lane * 2;
-        while (i < dim) : (i += r.lanes * 2) {
-            const lo = (e.h16(.a, base + i) - st[0]) * st[1] * e.ld(.c, i) + e.ld(.d, i);
-            const hi = (e.h16(.a, base + i + 1) - st[0]) * st[1] * e.ld(.c, i + 1) + e.ld(.d, i + 1);
-            e.stW(.b, (base + i) >> 1, k.packH16(lo, hi));
-        }
+        const st = lnStats(e, r, base, dim, in);
+        var i = r.lane;
+        while (i < dim) : (i += r.lanes) e.stT(.b, out, base + i, (e.ldT(.a, in, base + i) - st[0]) * st[1] * e.ld(.c, i) + e.ld(.d, i));
     }
 }
 
 /// Fused weightless LayerNorm + AdaLN: b = (a - mean) * inv * c[u2 + col] + c[u3 +
 /// col], the (1 + scale) fold already in premul. u0 = rows, u1 = dim, f0 = eps.
-pub inline fn lnMod(e: Env) void {
+pub inline fn lnMod(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = row * dim;
-        const st = lnStats(e, r, base, dim, false);
+        const st = lnStats(e, r, base, dim, dt);
         var i = r.lane;
-        while (i < dim) : (i += r.lanes) e.st(.b, base + i, (e.ld(.a, base + i) - st[0]) * st[1] * e.ld(.c, e.u(2) + i) + e.ld(.c, e.u(3) + i));
+        while (i < dim) : (i += r.lanes) e.stT(.b, dt, base + i, (e.ldT(.a, dt, base + i) - st[0]) * st[1] * e.ld(.c, e.u(2) + i) + e.ld(.c, e.u(3) + i));
     }
 }
 
@@ -279,10 +316,10 @@ pub inline fn lnMod(e: Env) void {
 /// slice of the group's positions x channels and write {count, mean, m2} to
 /// d[partial*3]. Shifted sums about the group's first element, then one merge
 /// across lanes, so the cancellation the plain sum-of-squares form suffers at a
-/// large mean stays bounded by the spread. a = x [n][c] (f16 when `h16`).
+/// large mean stays bounded by the spread. a = x [n][c] (`dt`).
 /// u0 = groups*chunks (partials), u1 = channels, u2 = chunks per group,
 /// u3 = per_group, u4 = positions.
-inline fn gnStatsImpl(e: Env, comptime h16: bool) void {
+pub inline fn gnStats(e: Env, comptime dt: Dt) void {
     const r = Rows(e);
     const nch = e.u(2);
     const per_group = e.u(3);
@@ -292,14 +329,14 @@ inline fn gnStatsImpl(e: Env, comptime h16: bool) void {
         const chunk = p % nch;
         const total = e.u(4) * per_group;
         const c0 = g * per_group;
-        const shift = if (h16) e.h16(.a, c0) else e.ld(.a, c0);
+        const shift = e.ldT(.a, dt, c0);
         var n: f32 = 0;
         var s1: f32 = 0;
         var s2: f32 = 0;
         var i = chunk * r.lanes + r.lane;
         while (i < total) : (i += nch * r.lanes) {
             const at = (i / per_group) * e.u(1) + c0 + i % per_group;
-            const dv = (if (h16) e.h16(.a, at) else e.ld(.a, at)) - shift;
+            const dv = e.ldT(.a, dt, at) - shift;
             n += 1;
             s1 += dv;
             s2 += dv * dv;
@@ -322,13 +359,6 @@ inline fn gnStatsImpl(e: Env, comptime h16: bool) void {
     }
 }
 
-pub inline fn gnStats(e: Env) void {
-    gnStatsImpl(e, false);
-}
-
-pub inline fn gnStatsH16(e: Env) void {
-    gnStatsImpl(e, true);
-}
 
 /// Per-row dynamic int8 scale = max|a[row]| / 127, clamped off zero, to b[row].
 /// u0 = rows, u1 = cols.

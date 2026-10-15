@@ -1,21 +1,31 @@
 //! Elementwise dual-target kernel bodies (see ../dual.zig for the prelude).
 //!
-//! One thread per element, or per PAIR of f16 elements: an f16 store must own its
-//! whole u32 word on SPIR-V, so every body that writes f16 indexes pairs, on both
-//! targets, and its host launches `elems / 2` threads (`dualPairs` on CUDA).
+//! One thread per element. A typed body (`ldT` / `stT`) stores one 16-bit element per
+//! thread (the SPIR-V module carries StorageBuffer16BitAccess); the older f16 bodies
+//! that index PAIRS of words are launched with `elems / 2` threads (`dualPairs` on
+//! CUDA).
 //! Layouts are the Vulkan push layouts, since Vulkan model files carry them at
 //! the call site; the CUDA wrappers in gpu/cuda/backend.zig remap their arguments.
 //! Each body's doc names the slots and scalars it reads.
 
 const k = @import("../dual.zig");
+const Dt = k.Dt;
 const Env = k.Env;
 
 // ---- activations ------------------------------------------------------------
 
-/// a += b. u0 = n.
-pub inline fn add(e: Env) void {
+/// a += b, both `dt`. u0 = n.
+pub inline fn add(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, e.ld(.a, i) + e.ld(.b, i));
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) + e.ldT(.b, dt, i));
+}
+
+/// d[0] = 1 when any of a[0..u0) (`dt`) is not finite, else d is left as it was: the
+/// caller zeroes it. Every writer stores the same word, so the race is benign.
+pub inline fn flagNonFinite(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const bits: u32 = @bitCast(e.ldT(.a, dt, i));
+    if (bits & 0x7f80_0000 == 0x7f80_0000) e.stW(.d, 0, 1);
 }
 
 /// a = max(0, a + b). u0 = n.
@@ -24,10 +34,20 @@ pub inline fn addRelu(e: Env) void {
     e.st(.a, i, @max(0.0, e.ld(.a, i) + e.ld(.b, i)));
 }
 
-/// a += f0 * b. u0 = n.
-pub inline fn addScaled(e: Env) void {
+/// Row-major f32 `[u3][u1]` into `[u1][u2]`, rows past u3 zeroed: the transposed,
+/// padded layout the f32 GEMM reads its weight in. u0 = u1 * u2.
+pub inline fn transposePadF32(e: Env) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, e.ld(.a, i) + e.f(0) * e.ld(.b, i));
+    const stride = e.u(2);
+    const c = i / stride;
+    const r = i % stride;
+    e.st(.b, i, if (r < e.u(3)) e.ld(.a, r * e.u(1) + c) else 0);
+}
+
+/// a += f0 * b, a `dt` and b f32. u0 = n.
+pub inline fn addScaled(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) + e.f(0) * e.ld(.b, i));
 }
 
 /// a = max(0, a). u0 = n.
@@ -36,28 +56,28 @@ pub inline fn relu(e: Env) void {
     e.st(.a, i, @max(0.0, e.ld(.a, i)));
 }
 
-/// a = silu(a). u0 = n.
-pub inline fn silu(e: Env) void {
+/// a = silu(a), `dt`. u0 = n.
+pub inline fn silu(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, k.silu(e.ld(.a, i)));
+    e.stT(.a, dt, i, k.silu(e.ldT(.a, dt, i)));
 }
 
-/// a = silu(a) * b. u0 = n.
-pub inline fn siluMul(e: Env) void {
+/// a = silu(a) * b, both `dt`. u0 = n.
+pub inline fn siluMul(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, k.silu(e.ld(.a, i)) * e.ld(.b, i));
+    e.stT(.a, dt, i, k.silu(e.ldT(.a, dt, i)) * e.ldT(.b, dt, i));
 }
 
-/// a *= sigmoid(b). u0 = n.
-pub inline fn sigmoidMul(e: Env) void {
+/// a *= sigmoid(b), both `dt`. u0 = n.
+pub inline fn sigmoidMul(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, e.ld(.a, i) * k.sigmoid(e.ld(.b, i)));
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) * k.sigmoid(e.ldT(.b, dt, i)));
 }
 
 /// a = geluTanh(a). u0 = n.
-pub inline fn gelu(e: Env) void {
+pub inline fn gelu(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, k.geluTanh(e.ld(.a, i)));
+    e.stT(.a, dt, i, k.geluTanh(e.ldT(.a, dt, i)));
 }
 
 /// a = geluTanh(a) * b. u0 = n.
@@ -80,33 +100,18 @@ pub inline fn geluQuickMul(e: Env) void {
 }
 
 /// a = geluErf(a). u0 = n.
-pub inline fn geluErf(e: Env) void {
+pub inline fn geluErf(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, k.geluErf(e.ld(.a, i)));
+    e.stT(.a, dt, i, k.geluErf(e.ldT(.a, dt, i)));
 }
 
 /// GEGLU: b[p][j] = a[p][j] * geluErf(a[p][inner + j]), value then gate in that
-/// order. a = src [n][2*u1], b = dst [n][u1]. u0 = n*u1, u1 = inner.
-pub inline fn geglu(e: Env) void {
+/// order. a = src [n][2*u1], b = dst [n][u1], both `dt`. u0 = n*u1, u1 = inner.
+pub inline fn geglu(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const inner = e.u(1);
     const base = (i / inner) * 2 * inner + i % inner;
-    e.st(.b, i, e.ld(.a, base) * k.geluErf(e.ld(.a, base + inner)));
-}
-
-/// `geglu` over f16 activations, one thread per output pair (inner is even).
-pub inline fn gegluH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    const inner = e.u(1);
-    const base = (e0 / inner) * 2 * inner + e0 % inner;
-    var out: [2]f32 = undefined;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        out[j] = e.h16(.a, base + j) * k.geluErf(e.h16(.a, base + inner + j));
-    }
-    e.stW(.b, w, k.packH16(out[0], out[1]));
+    e.stT(.b, dt, i, e.ldT(.a, dt, base) * k.geluErf(e.ldT(.a, dt, base + inner)));
 }
 
 /// a *= softplus(gate*ln2)/ln2, as log2(1 + 2^gate), stable on both signs. u0 = n.
@@ -119,10 +124,10 @@ pub inline fn softplusGate(e: Env) void {
 
 // ---- copies, scales, concatenation ------------------------------------------
 
-/// b[u2 + i] = a[u3 + i]. u0 = n.
-pub inline fn copy(e: Env) void {
+/// b[u2 + i] = a[u3 + i], a in `in` and b in `out`. u0 = n.
+pub inline fn copy(e: Env, comptime in: Dt, comptime out: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.b, e.u(2) + i, e.ld(.a, e.u(3) + i));
+    e.stT(.b, out, e.u(2) + i, e.ldT(.a, in, e.u(3) + i));
 }
 
 /// b[u2 + i] = a[u3 + i] * f0, in place when a and b are one buffer. u0 = n.
@@ -133,10 +138,10 @@ pub inline fn scaleF32(e: Env) void {
 
 /// Channel concatenation, one thread per SOURCE element: b[p][u3 + j] = a[p][j].
 /// u0 = n*u1, u1 = src channels, u2 = dst channels, u3 = dst channel offset.
-pub inline fn concatCh(e: Env) void {
+pub inline fn concatCh(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const j = i % e.u(1);
-    e.st(.b, (i / e.u(1)) * e.u(2) + e.u(3) + j, e.ld(.a, i));
+    e.stT(.b, dt, (i / e.u(1)) * e.u(2) + e.u(3) + j, e.ldT(.a, dt, i));
 }
 
 /// Fused int8 GEMM scale buffer = [act(m_pad) | weight(rows)]. a = act scales
@@ -152,12 +157,12 @@ pub inline fn scaleConcat(e: Env) void {
     }
 }
 
-/// y = s32_acc * act_scale[row] * weight_scale[col]. a = acc (s32 bits),
+/// y = s32_acc * act_scale[row] * weight_scale[col], y in `dt`. a = acc (s32 bits),
 /// c = weight_scale [u1], d = act_scale [rows], b = y. u0 = rows*u1, u1 = nout.
-pub inline fn scaleI32(e: Env) void {
+pub inline fn scaleI32(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const acc: i32 = @bitCast(e.ldW(.a, i));
-    e.st(.b, i, @as(f32, @floatFromInt(acc)) * e.ld(.d, i / e.u(1)) * e.ld(.c, i % e.u(1)));
+    e.stT(.b, dt, i, @as(f32, @floatFromInt(acc)) * e.ld(.d, i / e.u(1)) * e.ld(.c, i % e.u(1)));
 }
 
 /// Pack 4 int8 per word: q = clamp(round(a/scale[row]), -127, 127). a = x,
@@ -184,16 +189,16 @@ pub inline fn quantizeI8(e: Env) void {
 // ---- modulation, residual gates, rms epilogues -------------------------------
 
 /// a = (1 + c[u2 + col]) * a + c[u3 + col]. u0 = n, u1 = dim.
-pub inline fn modulate(e: Env) void {
+pub inline fn modulate(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const col = i % e.u(1);
-    e.st(.a, i, (1.0 + e.ld(.c, e.u(2) + col)) * e.ld(.a, i) + e.ld(.c, e.u(3) + col));
+    e.stT(.a, dt, i, (1.0 + e.ld(.c, e.u(2) + col)) * e.ldT(.a, dt, i) + e.ld(.c, e.u(3) + col));
 }
 
 /// a += c[gate + col] * b, gate = u2, or per row u2 + d[row]*u3 when u3 != 0
 /// (d holds one u32 label per row: a denoise mask relabels rows inside a segment).
-/// u0 = n, u1 = dim, u2 = gate_off, u3 = label stride (0 = uniform).
-pub inline fn gatedAdd(e: Env) void {
+/// a and b in `dt`. u0 = n, u1 = dim, u2 = gate_off, u3 = label stride (0 = uniform).
+pub inline fn gatedAdd(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const dim = e.u(1);
     const col = i % dim;
@@ -201,7 +206,18 @@ pub inline fn gatedAdd(e: Env) void {
     if (e.u(3) != 0) off += e.ldW(.d, e.u(6) + i / dim) * e.u(3);
     // u4/u5 are ELEMENT offsets into a and b, u6 a ROW offset into the index buffer,
     // for the same reason `rmsMod` takes them. Zero for a whole-buffer caller.
-    e.st(.a, e.u(4) + i, e.ld(.a, e.u(4) + i) + e.ld(.c, off + col) * e.ld(.b, e.u(5) + i));
+    e.stT(.a, dt, e.u(4) + i, e.ldT(.a, dt, e.u(4) + i) + e.ld(.c, off + col) * e.ldT(.b, dt, e.u(5) + i));
+}
+
+/// a += f0 * gate * b, a `dt` and b f32: `gatedAdd` into a narrower residual than the
+/// delta, `f0` the residual's storage scale. Same pushes as `gatedAdd`.
+pub inline fn gatedAddScaled(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const dim = e.u(1);
+    const col = i % dim;
+    var off = e.u(2);
+    if (e.u(3) != 0) off += e.ldW(.d, e.u(6) + i / dim) * e.u(3);
+    e.stT(.a, dt, e.u(4) + i, e.ldT(.a, dt, e.u(4) + i) + e.f(0) * e.ld(.c, off + col) * e.ld(.b, e.u(5) + i));
 }
 
 /// `gatedAdd` with an f16 delta. a = x (f32), b = delta words, c = vectors.
@@ -254,8 +270,9 @@ pub inline fn rmsCombine(e: Env) void {
 // ---- rope -------------------------------------------------------------------
 
 /// Interleaved RoPE in place, one thread per (pos, head, pair). a = qk, c = freqs
-/// (cos then sin at u2). u0 = total pairs, u1 = half, u2 = sin_off, u3 = n_heads.
-pub inline fn ropeInter(e: Env) void {
+/// (cos then sin at u2), qk in `dt`. u0 = total pairs, u1 = half, u2 = sin_off,
+/// u3 = n_heads.
+pub inline fn ropeInter(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const half = e.u(1);
     const pair = i % half;
@@ -263,10 +280,10 @@ pub inline fn ropeInter(e: Env) void {
     const cos_v = e.ld(.c, pos * half + pair);
     const sin_v = e.ld(.c, e.u(2) + pos * half + pair);
     const at = i * 2;
-    const x0 = e.ld(.a, at);
-    const x1 = e.ld(.a, at + 1);
-    e.st(.a, at, x0 * cos_v - x1 * sin_v);
-    e.st(.a, at + 1, x0 * sin_v + x1 * cos_v);
+    const x0 = e.ldT(.a, dt, at);
+    const x1 = e.ldT(.a, dt, at + 1);
+    e.stT(.a, dt, at, x0 * cos_v - x1 * sin_v);
+    e.stT(.a, dt, at + 1, x0 * sin_v + x1 * cos_v);
 }
 
 inline fn rotateHalf(e: Env, base: u32, half: u32, cos_v: f32, sin_v: f32) void {
@@ -442,22 +459,27 @@ pub inline fn argmaxReduce(e: Env) void {
     e.st(.d, lane, @floatFromInt(best_i));
 }
 
-/// Argmax pass 2, one thread: the lane winners to the global argmax, lowest index
+/// Argmax pass 2, one subgroup: the lane winners to the global argmax, lowest index
 /// on ties. a = vals [L], b = idx [L], d = out [1]. u0 = L.
 pub inline fn argmaxFinal(e: Env) void {
-    if (e.gid() != 0) return;
-    var best_v: f32 = e.ld(.a, 0);
-    var best_i: u32 = @intFromFloat(e.ld(.b, 0));
-    var i: u32 = 1;
-    while (i < e.u(0)) : (i += 1) {
+    if (k.sgGlobal(e) != 0) return;
+    const lane = e.sgLane();
+    // -inf, so an all -inf row still yields its lowest index.
+    var best_v: f32 = @bitCast(@as(u32, 0xff800000));
+    var best_i: f32 = 3.0e38;
+    var i = lane;
+    while (i < e.u(0)) : (i += e.sgSize()) {
         const v = e.ld(.a, i);
-        const idx: u32 = @intFromFloat(e.ld(.b, i));
+        const idx = e.ld(.b, i);
         if (v > best_v or (v == best_v and idx < best_i)) {
             best_v = v;
             best_i = idx;
         }
     }
-    e.st(.d, 0, @floatFromInt(best_i));
+    const top = k.sgMax(best_v);
+    // The lowest index among the lanes holding the max, as a max of negations.
+    const lowest = -k.sgMax(if (best_v == top) -best_i else -3.0e38);
+    if (lane == 0) e.st(.d, 0, lowest);
 }
 
 /// Lanes per top-k launch on both hosts.
@@ -715,63 +737,60 @@ pub inline fn f32ToH16(e: Env) void {
     e.stW(.d, w, out);
 }
 
-/// Tight [rows][u1] f32 -> [*][u2] f16 rows (u2 >= u1, even), zero in the column
-/// tail and past u3 rows, scaled by f0. a = src, d = words. u0 = out words.
-pub inline fn f32ToH16Pad(e: Env) void {
+/// x [m][cols] (`dt`, rows u4 apart, or cols when u4 = 0) to a GEMM operand
+/// [m_pad][k_pad] scaled by f0, zeros in both pads, two elements a thread: f16 for
+/// `padH16`, bf16 for `padBf16`. u0 = output words, u1 = cols, u2 = k_pad, u3 = m.
+pub inline fn padH16(e: Env, comptime dt: Dt) void {
+    padTo(e, dt, false);
+}
+
+pub inline fn padBf16(e: Env, comptime dt: Dt) void {
+    padTo(e, dt, true);
+}
+
+inline fn padTo(e: Env, comptime dt: Dt, comptime bf: bool) void {
     const w = k.elem(e) orelse return;
     const e0 = w * 2;
     const row = e0 / e.u(2);
     const col = e0 % e.u(2);
+    const ld = if (e.u(4) != 0) e.u(4) else e.u(1);
     var out: u32 = 0;
     inline for (0..2) |j_| {
         const j: u32 = @intCast(j_);
         const cc = col + j;
-        if (cc < e.u(1) and row < e.u(3)) out |= @as(u32, k.f16Bits(e.ld(.a, row * e.u(1) + cc) * e.f(0))) << (16 * j);
+        if (cc < e.u(1) and row < e.u(3)) {
+            const v = e.ldT(.a, dt, row * ld + cc) * e.f(0);
+            out |= @as(u32, if (bf) k.bf16Bits(v) else k.f16Bits(v)) << @intCast(16 * j);
+        }
     }
     e.stW(.d, w, out);
 }
 
-/// `f32ToH16Pad` emitting bf16 (round to nearest even).
-pub inline fn f32ToBf16Pad(e: Env) void {
+/// A weight to `dt` (f16 or bf16) in conv patch order `[co][kk][ci]`, two elements per thread. `a`
+/// holds f32 (u3 = 0), f16 (1) or bf16 (2), in patch order (u4 = 0) or torch's
+/// `[co][ci][kt][kk]` (1), read at temporal slice `kt - 1` (u6 = kt, 1 for a plain
+/// conv). u0 = pairs, u1 = ci, u2 = kk, u5 = elements. A linear is `kk = 1`, where
+/// the two orders coincide.
+pub inline fn convW16(e: Env, comptime dt: Dt) void {
+    if (dt == .f32) @compileError("convW16 writes a 16-bit weight");
     const w = k.elem(e) orelse return;
-    const e0 = w * 2;
-    const row = e0 / e.u(2);
-    const col = e0 % e.u(2);
+    const ci = e.u(1);
+    const kk = e.u(2);
     var out: u32 = 0;
     inline for (0..2) |j_| {
         const j: u32 = @intCast(j_);
-        const cc = col + j;
-        if (cc < e.u(1) and row < e.u(3)) out |= @as(u32, k.bf16Bits(e.ld(.a, row * e.u(1) + cc) * e.f(0))) << @intCast(16 * j);
-    }
-    e.stW(.d, w, out);
-}
-
-/// `f32ToH16Pad` whose source is already f16 (a = f16 elements).
-pub inline fn h16ToH16Pad(e: Env) void {
-    const w = k.elem(e) orelse return;
-    const e0 = w * 2;
-    const row = e0 / e.u(2);
-    const col = e0 % e.u(2);
-    var out: u32 = 0;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const cc = col + j;
-        if (cc < e.u(1) and row < e.u(3)) out |= @as(u32, k.f16Bits(e.h16(.a, row * e.u(1) + cc) * e.f(0))) << (16 * j);
-    }
-    e.stW(.d, w, out);
-}
-
-/// `h16ToH16Pad` from a bf16 source (a = bf16 elements).
-pub inline fn bf16ToH16Pad(e: Env) void {
-    const w = k.elem(e) orelse return;
-    const e0 = w * 2;
-    const row = e0 / e.u(2);
-    const col = e0 % e.u(2);
-    var out: u32 = 0;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const cc = col + j;
-        if (cc < e.u(1) and row < e.u(3)) out |= @as(u32, k.f16Bits(e.bf16(.a, row * e.u(1) + cc) * e.f(0))) << (16 * j);
+        const d = w * 2 + j;
+        if (d < e.u(5)) {
+            const s = if (e.u(4) == 0) d else blk: {
+                const i = d % ci;
+                const t = (d / ci) % kk;
+                const o = d / (ci * kk);
+                const kt = e.u(6);
+                break :blk ((o * ci + i) * kt + (kt - 1)) * kk + t;
+            };
+            const v = if (e.u(3) == 0) e.ld(.a, s) else if (e.u(3) == 1) e.h16(.a, s) else e.bf16(.a, s);
+            out |= @as(u32, if (dt == .bf16) k.bf16Bits(v) else k.f16Bits(v)) << (16 * j);
+        }
     }
     e.stW(.d, w, out);
 }
@@ -787,14 +806,6 @@ pub inline fn f16ToF32(e: Env) void {
 pub inline fn bf16ToF32(e: Env) void {
     const i = k.elem(e) orelse return;
     e.st(.b, i, e.bf16(.a, i));
-}
-
-/// Two f16 activations summed in f32, in place. u0 = n (even).
-pub inline fn addH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    e.stW(.a, w, k.packH16(e.h16(.a, e0) + e.h16(.b, e0), e.h16(.a, e0 + 1) + e.h16(.b, e0 + 1)));
 }
 
 /// d = f16(silu(a) * b * f0) pairs, zero past u1 real elements. u0 = out words.
@@ -857,138 +868,79 @@ pub inline fn kvStoreF16(e: Env) void {
     e.stW(.b, e.u(2) + w, k.packH16(e.ld(.a, e.u(3) + 2 * w), e.ld(.a, e.u(3) + 2 * w + 1)));
 }
 
-/// f32 row-major [rows][cols] -> f16 k-major [k_pad][n_pad] (element (k, row) at
-/// k*n_pad + row), zeros in both pads; one thread per output word holding two
-/// adjacent rows. a = src, d = words. u0 = words, u1 = rows, u2 = cols, u3 = n_pad.
-pub inline fn packH16Kmajor(e: Env) void {
-    const w = k.elem(e) orelse return;
-    const base = w * 2;
-    const kk = base / e.u(3);
-    const row0 = base % e.u(3);
-    var out: u32 = 0;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const row = row0 + j;
-        if (kk < e.u(2) and row < e.u(1)) out |= @as(u32, k.f16Bits(e.ld(.a, row * e.u(2) + kk))) << @intCast(16 * j);
+/// 16-bit rows [rows][cols] in a -> k-major [k_pad][n_pad] in d (element (k, row) at
+/// k*n_pad + row), zeros in both pads. A thread takes one row pair and 16 k: it reads a
+/// 32-byte run of each row and writes 16 words, one per output row, its neighbours
+/// beside it, so both sides move whole sectors with no shared memory. u0 = threads,
+/// u1 = rows, u2 = cols, u3 = n_pad / 2.
+pub inline fn transposeKmajor16(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const rp = t % e.u(3);
+    const kc = t / e.u(3);
+    const r0 = 2 * rp;
+    const half = e.u(2) / 2;
+    // cols % 32 == 0, so a chunk is wholly inside the row or wholly in the k pad, and
+    // both of its 16-byte halves are aligned.
+    var w: [2][8]u32 = @splat(@splat(0));
+    if (kc * 8 < half) {
+        inline for (0..2) |r_| {
+            const r: u32 = @intCast(r_);
+            if (r0 + r < e.u(1)) inline for (0..2) |h_| {
+                const h: u32 = @intCast(h_);
+                const v = e.ld4(.a, (r0 + r) * half + kc * 8 + 4 * h);
+                inline for (0..4) |q| w[r][4 * h + q] = @bitCast(v[q]);
+            };
+        }
     }
-    e.stW(.d, w, out);
+    inline for (0..8) |j_| {
+        const j: u32 = @intCast(j_);
+        const kw = kc * 8 + j;
+        e.stW(.d, (2 * kw) * e.u(3) + rp, (w[0][j] & 0xFFFF) | (w[1][j] << 16));
+        e.stW(.d, (2 * kw + 1) * e.u(3) + rp, (w[0][j] >> 16) | (w[1][j] & 0xFFFF0000));
+    }
 }
 
 // ---- bias, groupnorm apply, VAE norm ---------------------------------------
 
-/// After a column-padded GEMM: d[u3 + i] = f0*a[(i/u1)*u2 + i%u1] + b[u4 + i%u1].
-/// f0 is the GEMM output scale and must be 1.0 for the plain case. u0 = rows*u1,
-/// u1 = co, u2 = padded row stride, u3 = dst offset, u4 = bias offset.
-pub inline fn biasCompact(e: Env) void {
+/// After a column-padded GEMM: d[u3 + i] = f0*a[(i/u1)*u2 + i%u1] + b[u4 + i%u1],
+/// d in `dt`. f0 is the GEMM output scale and must be 1.0 for the plain case.
+/// u0 = rows*u1, u1 = co, u2 = padded row stride, u3 = dst offset, u4 = bias offset.
+pub inline fn biasCompact(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const cc = i % e.u(1);
-    e.st(.d, e.u(3) + i, e.ld(.a, (i / e.u(1)) * e.u(2) + cc) * e.f(0) + e.ld(.b, e.u(4) + cc));
+    e.stT(.d, dt, e.u(3) + i, e.ld(.a, (i / e.u(1)) * e.u(2) + cc) * e.f(0) + e.ld(.b, e.u(4) + cc));
 }
 
-/// `biasCompact` writing f16 pairs; u3 must be even. u0 = elements.
-pub inline fn biasCompactH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    var out: [2]f32 = undefined;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const idx = e0 + j;
-        const cc = idx % e.u(1);
-        out[j] = e.ld(.a, (idx / e.u(1)) * e.u(2) + cc) * e.f(0) + e.ld(.b, e.u(4) + cc);
-    }
-    e.stW(.d, (e.u(3) + e0) >> 1, k.packH16(out[0], out[1]));
-}
-
-/// c[u2 + i] = f32(a[i] as f16) + b[i % u1], the cuDNN conv output plus its bias.
-/// u0 = n*co, u1 = co.
-pub inline fn biasAddF16(e: Env) void {
+/// `biasCompact` accumulating, bias-free: d[i] += f0*a[(i/u1)*u2 + i%u1], d in `dt`.
+/// u0 = rows*u1.
+pub inline fn compactAcc(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.c, e.u(2) + i, e.h16(.a, i) + e.ld(.b, i % e.u(1)));
+    e.stT(.d, dt, i, e.ldT(.d, dt, i) + e.f(0) * e.ld(.a, (i / e.u(1)) * e.u(2) + i % e.u(1)));
 }
 
-/// `biasAddF16` writing f16 pairs; u2 and co even.
-pub inline fn biasAddH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    var out: [2]f32 = undefined;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        out[j] = e.h16(.a, e0 + j) + e.ld(.b, (e0 + j) % e.u(1));
-    }
-    e.stW(.c, (e.u(2) + e0) >> 1, k.packH16(out[0], out[1]));
-}
-
-/// a[p][c] += b[u3 + c]. u0 = n*ch, u1 = ch.
-pub inline fn addBiasRows(e: Env) void {
+/// c[u2 + i] = a[i] + b[i % u1], a in `in` and c in `out`: the cuDNN conv output
+/// plus its bias. u0 = n*co, u1 = co.
+pub inline fn biasAdd(e: Env, comptime in: Dt, comptime out: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, e.ld(.a, i) + e.ld(.b, e.u(3) + i % e.u(1)));
+    e.stT(.c, out, e.u(2) + i, e.ldT(.a, in, i) + e.ld(.b, i % e.u(1)));
 }
 
-/// `addBiasRows` over an f16 activation (ch even).
-pub inline fn addBiasRowsH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    var out: [2]f32 = undefined;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        out[j] = e.h16(.a, e0 + j) + e.ld(.b, e.u(3) + (e0 + j) % e.u(1));
-    }
-    e.stW(.a, w, k.packH16(out[0], out[1]));
+/// a[p][c] += b[u3 + c], a in `dt`. u0 = n*ch, u1 = ch.
+pub inline fn addBiasRows(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) + e.ld(.b, e.u(3) + i % e.u(1)));
 }
 
 /// GroupNorm apply: b = (a - mean[g])*inv[g]*w[ch] + bias[ch], then silu when u5.
 /// c = weight ++ bias (bias at u4), d = mean ++ inv (inv at u3). u0 = n*ch,
-/// u1 = ch, u2 = per_group, u3 = groups, u4 = bias offset, u5 = silu.
-pub inline fn gnApply(e: Env) void {
+/// u1 = ch, u2 = per_group, u3 = groups, u4 = bias offset, u5 = silu. a and b `dt`.
+pub inline fn gnApply(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const ch = i % e.u(1);
     const g = ch / e.u(2);
-    var v = (e.ld(.a, i) - e.ld(.d, g)) * e.ld(.d, e.u(3) + g) * e.ld(.c, ch) + e.ld(.c, e.u(4) + ch);
+    var v = (e.ldT(.a, dt, i) - e.ld(.d, g)) * e.ld(.d, e.u(3) + g) * e.ld(.c, ch) + e.ld(.c, e.u(4) + ch);
     if (e.u(5) != 0) v = k.silu(v);
-    e.st(.b, i, v);
-}
-
-/// `gnApply` reading and writing f16; the two halves of a pair may fall in
-/// different groups, so the lookup is per element.
-pub inline fn gnApplyH16(e: Env) void {
-    const w = e.gid();
-    const e0 = w * 2;
-    if (e0 >= e.u(0)) return;
-    var out: [2]f32 = undefined;
-    inline for (0..2) |j_| {
-        const j: u32 = @intCast(j_);
-        const idx = e0 + j;
-        const ch = idx % e.u(1);
-        const g = ch / e.u(2);
-        var v = (e.h16(.a, idx) - e.ld(.d, g)) * e.ld(.d, e.u(3) + g) * e.ld(.c, ch) + e.ld(.c, e.u(4) + ch);
-        if (e.u(5) != 0) v = k.silu(v);
-        out[j] = v;
-    }
-    e.stW(.b, w, k.packH16(out[0], out[1]));
-}
-
-/// Per-position channel L2 norm, x * sqrt(c)/max(|x|, f0) * gamma, then silu when
-/// u2. One thread per position. a = x [n][c], b = out, c = gamma. u0 = n, u1 = c.
-pub inline fn vaeNorm(e: Env) void {
-    const row = k.elem(e) orelse return;
-    const dim = e.u(1);
-    const base = row * dim;
-    var sum: f32 = 0;
-    var i: u32 = 0;
-    while (i < dim) : (i += 1) {
-        const v = e.ld(.a, base + i);
-        sum += v * v;
-    }
-    const inv = @sqrt(@as(f32, @floatFromInt(dim))) / @max(@sqrt(sum), e.f(0));
-    i = 0;
-    while (i < dim) : (i += 1) {
-        var v = e.ld(.a, base + i) * inv * e.ld(.c, i);
-        if (e.u(2) != 0) v = k.silu(v);
-        e.st(.b, base + i, v);
-    }
+    e.stT(.b, dt, i, v);
 }
 
 // ---- im2col -----------------------------------------------------------------
@@ -1016,7 +968,11 @@ pub inline fn im2col(e: Env) void {
     e.st(.d, i, v);
 }
 
-inline fn im2colSdImpl(e: Env, comptime src_f16: bool) void {
+/// The SD family's 3x3 patch matrix, with stride-2 convolutions. a = src (`dt`), d =
+/// patches (f32). u0 = bn*u1, u1 = 9*ci, u2 = ci, u3 = src w, u4 = grid extent (rows),
+/// u5 = band start, u6 = OUT width, f0 = 0 stride 1 / 1 fused 2x upsample / 2
+/// stride 2.
+pub inline fn im2colSd(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const plen = e.u(1);
     const ci = e.u(2);
@@ -1037,22 +993,81 @@ inline fn im2colSdImpl(e: Env, comptime src_f16: bool) void {
     var v: f32 = 0;
     if (yk >= 1 and yk <= gh and xk >= 1 and xk <= gw) {
         const src = (((yk - 1) >> up) * sw + ((xk - 1) >> up)) * ci + col % ci;
-        v = if (src_f16) e.h16(.a, src) else e.ld(.a, src);
+        v = e.ldT(.a, dt, src);
     }
     e.st(.d, i, v);
 }
 
-/// The SD family's 3x3 patch matrix, with stride-2 convolutions. a = src, d =
-/// patches. u0 = bn*u1, u1 = 9*ci, u2 = ci, u3 = src w, u4 = grid extent (rows),
-/// u5 = band start, u6 = OUT width, f0 = 0 stride 1 / 1 fused 2x upsample / 2
-/// stride 2.
-pub inline fn im2colSd(e: Env) void {
-    im2colSdImpl(e, false);
+/// `im2colSd` written straight into a coop GEMM operand `[m_pad][k_pad]`, f16 for
+/// `im2colH16` and bf16 for `im2colBf16`, scaled by f1, zeros in both pads, eight
+/// elements (four words) a thread. a = src (`dt`), d = operand. u0 = threads, u1 = 9*ci,
+/// u2 = ci | k_pad << 16, u3 = src w | grid extent << 16, u4 = OUT width, u5 = band
+/// start, u6 = band rows; f0 as `im2colSd`. k_pad is a multiple of 8.
+pub inline fn im2colH16(e: Env, comptime dt: Dt) void {
+    im2colTo(e, dt, false);
 }
 
-/// `im2colSd` reading an f16 source; the patch stays f32.
-pub inline fn im2colSdH16(e: Env) void {
-    im2colSdImpl(e, true);
+pub inline fn im2colBf16(e: Env, comptime dt: Dt) void {
+    im2colTo(e, dt, true);
+}
+
+inline fn im2colTo(e: Env, comptime dt: Dt, comptime bf: bool) void {
+    const t = k.elem(e) orelse return;
+    const plen = e.u(1);
+    const ci = e.u(2) & 0xffff;
+    const kp = e.u(2) >> 16;
+    const e0 = t * 8;
+    const row = e0 / kp;
+    const col0 = e0 % kp;
+    const w0 = t * 4;
+    var words: [4]u32 = @splat(0);
+    if (row < e.u(6) and col0 < plen) {
+        const p = e.u(5) + row;
+        if (ci % 8 == 0) {
+            // All eight from one tap: one address, and a straight word copy when the
+            // source is already the operand's type.
+            if (im2colSrc(e, p, col0 / ci)) |base| {
+                const at = base * ci + col0 % ci;
+                if (comptime dt == (if (bf) Dt.bf16 else Dt.f16)) {
+                    if (e.f(1) == 1.0) {
+                        inline for (0..4) |q| words[q] = e.ldW(.a, at / 2 + @as(u32, q));
+                        inline for (0..4) |q| e.stW(.d, w0 + @as(u32, q), words[q]);
+                        return;
+                    }
+                }
+                inline for (0..8) |j| {
+                    const v = e.ldT(.a, dt, at + @as(u32, j)) * e.f(1);
+                    words[j / 2] |= @as(u32, if (bf) k.bf16Bits(v) else k.f16Bits(v)) << @intCast(16 * (j % 2));
+                }
+            }
+        } else {
+            inline for (0..8) |j_| {
+                const j: u32 = @intCast(j_);
+                const col = col0 + j;
+                if (col < plen) {
+                    if (im2colSrc(e, p, col / ci)) |base| {
+                        const v = e.ldT(.a, dt, base * ci + col % ci) * e.f(1);
+                        words[j_ / 2] |= @as(u32, if (bf) k.bf16Bits(v) else k.f16Bits(v)) << @intCast(16 * (j_ % 2));
+                    }
+                }
+            }
+        }
+    }
+    inline for (0..4) |q| e.stW(.d, w0 + @as(u32, q), words[q]);
+}
+
+/// The source pixel output position `p` reads at `tap`, or null in the conv's padding.
+inline fn im2colSrc(e: Env, p: u32, tap: u32) ?u32 {
+    const sw = e.u(3) & 0xffff;
+    const gh = e.u(3) >> 16;
+    const ow = e.u(4);
+    const up: u5 = if (e.f(0) == 1) 1 else 0;
+    const stride: u32 = if (e.f(0) == 2) 2 else 1;
+    const gw = if (up == 1) ow else sw;
+    const yk = (p / ow) * stride + tap / 3;
+    const xk = (p % ow) * stride + tap % 3;
+    if (yk < 1 or yk > gh or xk < 1 or xk > gw) return null;
+    return ((yk - 1) >> up) * sw + ((xk - 1) >> up);
 }
 
 // ---- MoE / row routing ------------------------------------------------------
@@ -1529,38 +1544,10 @@ pub inline fn gnCombine(e: Env) void {
     e.st(.d, e.u(0) + g, 1.0 / @sqrt(m2 / count + e.f(0)));
 }
 
-/// Fused per-head rmsnorm + interleaved rope + output scale, in place on f16 pair
-/// words, one thread per (pos, head) row. a = qk words, b = norm weight,
-/// c = freqs. u0 = rows, u1 = half, u2 = sin_off, u3 = n_heads, f0 = scale, f1 = eps.
-pub inline fn qknormRope16(e: Env) void {
-    const row = k.elem(e) orelse return;
-    const half = e.u(1);
-    const pos = row / e.u(3);
-    const base_w = row * half;
-    var sum: f32 = 0;
-    var w: u32 = 0;
-    while (w < half) : (w += 1) {
-        const word = e.ldW(.a, base_w + w);
-        inline for (0..2) |j_| {
-            const j: u32 = @intCast(j_);
-            const v = k.h16(word >> (16 * j));
-            sum += v * v;
-        }
-    }
-    const inv = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(half * 2)) + e.f(1));
-    w = 0;
-    while (w < half) : (w += 1) {
-        const word = e.ldW(.a, base_w + w);
-        const x0 = k.h16(word) * inv * e.ld(.b, w * 2);
-        const x1 = k.h16(word >> 16) * inv * e.ld(.b, w * 2 + 1);
-        const cos_v = e.ld(.c, pos * half + w);
-        const sin_v = e.ld(.c, e.u(2) + pos * half + w);
-        e.stW(.a, base_w + w, k.packH16((x0 * cos_v - x1 * sin_v) * e.f(0), (x0 * sin_v + x1 * cos_v) * e.f(0)));
-    }
-}
-
-/// `qknormRope16` entirely in f32, in place. a = x [rows][2*half].
-pub inline fn qknormRopeF32(e: Env) void {
+/// Fused per-head rmsnorm + interleaved rope + output scale, in place, one thread per
+/// (pos, head) row. a = x [rows][2*half] (`dt`), b = norm weight, c = freqs.
+/// u0 = rows, u1 = half, u2 = sin_off, u3 = n_heads, f0 = scale, f1 = eps.
+pub inline fn qknormRope(e: Env, comptime dt: Dt) void {
     const row = k.elem(e) orelse return;
     const half = e.u(1);
     const pos = row / e.u(3);
@@ -1568,18 +1555,18 @@ pub inline fn qknormRopeF32(e: Env) void {
     var sum: f32 = 0;
     var w: u32 = 0;
     while (w < half * 2) : (w += 1) {
-        const v = e.ld(.a, base + w);
+        const v = e.ldT(.a, dt, base + w);
         sum += v * v;
     }
     const inv = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(half * 2)) + e.f(1));
     w = 0;
     while (w < half) : (w += 1) {
-        const x0 = e.ld(.a, base + w * 2) * inv * e.ld(.b, w * 2);
-        const x1 = e.ld(.a, base + w * 2 + 1) * inv * e.ld(.b, w * 2 + 1);
+        const x0 = e.ldT(.a, dt, base + w * 2) * inv * e.ld(.b, w * 2);
+        const x1 = e.ldT(.a, dt, base + w * 2 + 1) * inv * e.ld(.b, w * 2 + 1);
         const cos_v = e.ld(.c, pos * half + w);
         const sin_v = e.ld(.c, e.u(2) + pos * half + w);
-        e.st(.a, base + w * 2, (x0 * cos_v - x1 * sin_v) * e.f(0));
-        e.st(.a, base + w * 2 + 1, (x0 * sin_v + x1 * cos_v) * e.f(0));
+        e.stT(.a, dt, base + w * 2, (x0 * cos_v - x1 * sin_v) * e.f(0));
+        e.stT(.a, dt, base + w * 2 + 1, (x0 * sin_v + x1 * cos_v) * e.f(0));
     }
 }
 
@@ -1591,8 +1578,8 @@ pub inline fn qknormRopeF32(e: Env) void {
 /// Not an im2col GEMM, because each output channel reads only its own input
 /// channel: the patch matrix a GEMM needs would be block-diagonal and almost all
 /// zero. The innermost index is the CHANNEL, so a warp covers consecutive memory.
-/// u0 = h*w*ch, u1 = h, u2 = w, u3 = ch.
-pub inline fn dwConv3(e: Env) void {
+/// u0 = h*w*ch, u1 = h, u2 = w, u3 = ch. a and b `dt`.
+pub inline fn dwConv3(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const ch = e.u(3);
     const w = e.u(2);
@@ -1609,31 +1596,33 @@ pub inline fn dwConv3(e: Env) void {
         while (kx < 3) : (kx += 1) {
             if (x + kx < 1 or x + kx - 1 >= w) continue;
             const sx = x + kx - 1;
-            acc += e.ld(.b, (sy * w + sx) * ch + c) * e.ld(.c, (c * 3 + ky) * 3 + kx);
+            acc += e.ldT(.b, dt, (sy * w + sx) * ch + c) * e.ld(.c, (c * 3 + ky) * 3 + kx);
         }
     }
-    e.st(.a, i, acc);
+    e.stT(.a, dt, i, acc);
 }
 
-/// Column means of a `[rows][dim]` activation: `a[c] = mean over rows of b[r][c]`.
-/// One thread per COLUMN, striding the rows, which is the shape Mage-VAE's
-/// channel attention wants (`AdaptiveAvgPool2d(1)` over the spatial grid).
-/// u0 = dim, u1 = rows.
-pub inline fn colMean(e: Env) void {
-    const c = k.elem(e) orelse return;
-    const dim = e.u(0);
-    const rows = e.u(1);
+/// Column sums of a `[u1][u3]` activation over row chunks of `u2`, times f0: thread i
+/// takes column `i % u3` of chunk `i / u3`, so a warp reads a row contiguously. a =
+/// `[chunks][u3]` f32, b `dt`. u0 = chunks * u3. Run twice, a mean over many rows is a
+/// pass over chunks and one over the partials (`AdaptiveAvgPool2d(1)` in Mage-VAE).
+pub inline fn colMean(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const dim = e.u(3);
+    const c = i % dim;
+    const r0 = (i / dim) * e.u(2);
+    const r1 = @min(r0 + e.u(2), e.u(1));
     var acc: f32 = 0;
-    var r: u32 = 0;
-    while (r < rows) : (r += 1) acc += e.ld(.b, r * dim + c);
-    e.st(.a, c, acc / @as(f32, @floatFromInt(rows)));
+    var r = r0;
+    while (r < r1) : (r += 1) acc += e.ldT(.b, dt, r * dim + c);
+    e.st(.a, i, acc * e.f(0));
 }
 
 /// `a[i] *= sigmoid(b[i % u1])`: a per-column gate broadcast over rows, which is
-/// the second half of the channel attention. u0 = total, u1 = dim.
-pub inline fn mulColsSigmoid(e: Env) void {
+/// the second half of the channel attention. u0 = total, u1 = dim. a `dt`, b f32.
+pub inline fn mulColsSigmoid(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
-    e.st(.a, i, e.ld(.a, i) * k.sigmoid(e.ld(.b, i % e.u(1))));
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) * k.sigmoid(e.ld(.b, i % e.u(1))));
 }
 
 /// Build the per-pixel MLP's input rows for Mage-VAE's decode:
@@ -1645,7 +1634,8 @@ pub inline fn mulColsSigmoid(e: Env) void {
 /// The first three are the image pixel, which decode's zero noise makes zero; the
 /// next `H` are that patch's own channels for this pixel; the rest are the fixed
 /// cosine position table. u0 = total, u1 = W (3+H+D), u2 = P, u3 = H, u4 = D.
-pub inline fn nerfFeat(e: Env) void {
+/// a and b `dt`, c f32.
+pub inline fn nerfFeat(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const wide = e.u(1);
     const p_area = e.u(2);
@@ -1656,12 +1646,70 @@ pub inline fn nerfFeat(e: Env) void {
     const p = row % p_area;
     const t = row / p_area;
     if (f < 3) {
-        e.st(.a, i, 0);
+        e.stT(.a, dt, i, 0);
     } else if (f < 3 + hx) {
-        e.st(.a, i, e.ld(.b, t * hx * p_area + (f - 3) * p_area + p));
+        e.stT(.a, dt, i, e.ldT(.b, dt, t * hx * p_area + (f - 3) * p_area + p));
     } else {
-        e.st(.a, i, e.ld(.c, p * dct + (f - 3 - hx)));
+        e.stT(.a, dt, i, e.ld(.c, p * dct + (f - 3 - hx)));
     }
+}
+
+/// LoKr's cross-group mix: `a[p * u4 + u5 + i * u2 + q] += f0 * sum_j c[i * u3 + j] *
+/// b[p * f1 + j * u6 + q]` over `i < u1`, `q < u2`, `j < u3`, `a` at `dt` and `b`, `c` f32.
+/// `f1` is the per-row stride of `b` as a u32's bits: `[rows][im][ok]` for a linear,
+/// `ok` beside a group stride `u6` for a conv's stacked groups. With `u1 = u3 = 1` and
+/// `c = [1]` it is a strided scaled add. u0 = rows * u1 * u2.
+pub inline fn kronMix(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const ok = e.u(2);
+    const ol = e.u(1);
+    const im = e.u(3);
+    const q = i % ok;
+    const row = (i / ok) % ol;
+    const p = i / (ok * ol);
+    const hp: u32 = @bitCast(e.f(1));
+    var acc: f32 = 0;
+    var j: u32 = 0;
+    while (j < im) : (j += 1) acc += e.ld(.c, row * im + j) * e.ld(.b, p * hp + j * e.u(6) + q);
+    const o = p * e.u(4) + e.u(5) + row * ok + q;
+    e.stT(.a, dt, o, e.ldT(.a, dt, o) + e.f(0) * acc);
+}
+
+/// LoKr's channel groups stacked as images with one zero row between: `a` is
+/// `[u5][u2 + 1][u1][u3]`, group `j`'s row `y` the source's channels
+/// `[(u6 + j) * u3, +u3)` of row `y` (`b` `[u2][u1][u4]`), row `u2` zero. A 3x3 conv
+/// with padding 1 over the stack is then each group's conv alone. Both `dt`.
+/// u0 = u5 * (u2 + 1) * u1 * u3.
+pub inline fn kronStack(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const in_n = e.u(3);
+    const w = e.u(1);
+    const h = e.u(2);
+    const n = i % in_n;
+    const x = (i / in_n) % w;
+    const r = i / (in_n * w);
+    const j = r / (h + 1);
+    const y = r % (h + 1);
+    const v: f32 = if (y == h) 0 else e.ldT(.b, dt, (y * w + x) * e.u(4) + (e.u(6) + j) * in_n + n);
+    e.stT(.a, dt, i, v);
+}
+
+/// An output-axis DoRA's rescale of the base product: `a[p][o] += f0 * (b[o] - 1) *
+/// (a[p][o] - c[o])`, `c` the bias the base added (read only when u2 != 0). `a` `dt`.
+/// u0 = rows * u1, u1 = width.
+pub inline fn doraRows(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const o = i % e.u(1);
+    const y = e.ldT(.a, dt, i);
+    const bias: f32 = if (e.u(2) != 0) e.ld(.c, o) else 0;
+    e.stT(.a, dt, i, y + e.f(0) * (e.ld(.b, o) - 1) * (y - bias));
+}
+
+/// An input-axis DoRA's share of the base product's input: `a[p][j] = (c[j] - 1) *
+/// b[p][j]`, `a` f32 and `b` `dt`. u0 = rows * u1, u1 = width.
+pub inline fn doraCols(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    e.st(.a, i, (e.ld(.c, i % e.u(1)) - 1) * e.ldT(.b, dt, i));
 }
 
 /// Scatter per-patch pixels back to the image: patch `t` of a `u1`-wide latent
@@ -1731,21 +1779,21 @@ pub inline fn winScatter(e: Env) void {
 ///
 /// Mage-VAE's per-pixel MLP conditions each PIXEL on its own patch vector, which
 /// is what makes this per-row where every transformer's AdaLN here is per-column.
-/// u0 = rows*D, u1 = D.
-pub inline fn modulatePerRow(e: Env) void {
+/// u0 = rows*D, u1 = D. a and c `dt`.
+pub inline fn modulatePerRow(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const d = e.u(1);
     const r = i / d;
     const j = i % d;
-    e.st(.a, i, e.ld(.a, i) * (1.0 + e.ld(.c, r * 3 * d + d + j)) + e.ld(.c, r * 3 * d + j));
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) * (1.0 + e.ldT(.c, dt, r * 3 * d + d + j)) + e.ldT(.c, dt, r * 3 * d + j));
 }
 
 /// The gated residual half of `modulatePerRow`: `a[r][j] += c[r][2D+j] * b[r][j]`.
-/// u0 = rows*D, u1 = D.
-pub inline fn gatedAddPerRow(e: Env) void {
+/// u0 = rows*D, u1 = D. The residual a is f32 at every `dt`; b and c are `dt`.
+pub inline fn gatedAddPerRow(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
     const d = e.u(1);
     const r = i / d;
     const j = i % d;
-    e.st(.a, i, e.ld(.a, i) + e.ld(.c, r * 3 * d + 2 * d + j) * e.ld(.b, i));
+    e.st(.a, i, e.ld(.a, i) + e.ldT(.c, dt, r * 3 * d + 2 * d + j) * e.ldT(.b, dt, i));
 }

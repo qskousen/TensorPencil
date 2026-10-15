@@ -1217,7 +1217,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
         const e = &cat.entries[ci];
         if (hasLora(e.path)) continue;
         const info = e.lora.?.info;
-        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} linears, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
         paths.append(arena, e.path) catch return;
     }
     if (labels.items.len == 0) return;

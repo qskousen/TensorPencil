@@ -8,12 +8,14 @@
 //! chunks of `--batch`, so batch=1 reproduces the per-item loop and larger
 //! batches exercise whatever batched path the façade routes to.
 //!
-//!   --backend cpu|vulkan|cuda   compute backend (default cpu)
+//!   --backend cpu|vulkan|cuda|cuda-libs   compute backend (default cpu)
 //!   --model all|snowflake|gemma|siglip-text|siglip-visual  (default all)
 //!   --count N                   total items to encode (default 64)
 //!   --batch B                   items per batched forward (default 1)
 //!   --seq S                     approx target token count for text (default ~16)
 //!   --reps R                    timed repetitions, best-of reported (default 3)
+//!   --hash                      also print an FNV hash of every item's embedding, so
+//!                               two builds can be compared byte for byte
 
 const std = @import("std");
 const tp = @import("TensorPencil");
@@ -40,6 +42,7 @@ const Args = struct {
     seq: usize = 16,
     reps: usize = 3,
     prof: bool = false,
+    hash: bool = false,
 };
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -66,6 +69,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--reps")) {
             a.reps = try std.fmt.parseInt(usize, next, 10);
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--hash")) {
+            a.hash = true;
         } else if (std.mem.eql(u8, arg, "--prof")) {
             a.prof = true;
         }
@@ -78,11 +83,10 @@ fn parseArgs(argv: []const []const u8) !Args {
 // count, the count reveals how the per-item attention/RoPE loop inflates the
 // attn/elt categories with batch size).
 fn dumpCudaProf(be: *tp.gpu.cuda.Backend) void {
-    const names = [_][]const u8{ "matmul", "prep", "attn", "elt", "attn_scores", "attn_softmax", "attn_pv" };
     var tot: f64 = 0;
     for (be.prof.ms) |ms| tot += ms;
     p("  [cuda per-op profile, sync-per-op] total {d:.2} ms over one batch\n", .{tot});
-    for (names, be.prof.ms, be.prof.n) |name, ms, n| {
+    for (std.meta.fieldNames(tp.gpu.cuda.Backend.ProfCat), be.prof.ms, be.prof.n) |name, ms, n| {
         if (n == 0) continue;
         const per = ms / @as(f64, @floatFromInt(n));
         const pct = if (tot > 0) 100.0 * ms / tot else 0;
@@ -135,6 +139,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, a.backend_name, "cuda")) {
             const be = try tp.gpu.cuda.Backend.init(gpa);
+            break :blk .{ .cuda = be };
+        }
+        if (std.mem.eql(u8, a.backend_name, "cuda-libs")) {
+            const be = try tp.gpu.cuda.Backend.initLibs(gpa);
             break :blk .{ .cuda = be };
         }
         return error.UnknownBackend;
@@ -200,6 +208,21 @@ fn benchText(gpa: std.mem.Allocator, io: std.Io, which: Which, backend: embed.Ba
         best = @min(best, nowNs(io) - t0);
     }
     report(@tagName(which), best, a);
+    if (a.hash) {
+        var h: std.hash.Fnv1a_64 = .init();
+        var off: usize = 0;
+        while (off < a.count) {
+            const end = @min(off + a.batch, a.count);
+            const vecs = try enc.embedTextBatch(gpa, texts[off..end], opts);
+            for (vecs) |v| {
+                h.update(std.mem.sliceAsBytes(v));
+                gpa.free(v);
+            }
+            gpa.free(vecs);
+            off = end;
+        }
+        p("{s:<16} hash {x:0>16}\n", .{ @tagName(which), h.final() });
+    }
 
     // Optional: one profiled batch on CUDA (per-category device timing).
     if (a.prof) switch (backend) {
@@ -246,6 +269,21 @@ fn benchImage(gpa: std.mem.Allocator, io: std.Io, backend: embed.Backend, a: Arg
         best = @min(best, nowNs(io) - t0);
     }
     report("siglip-visual", best, a);
+    if (a.hash) {
+        var h: std.hash.Fnv1a_64 = .init();
+        var off: usize = 0;
+        while (off < a.count) {
+            const end = @min(off + a.batch, a.count);
+            const vecs = try enc.embedImageBatch(gpa, imgs[off..end]);
+            for (vecs) |v| {
+                h.update(std.mem.sliceAsBytes(v));
+                gpa.free(v);
+            }
+            gpa.free(vecs);
+            off = end;
+        }
+        p("{s:<16} hash {x:0>16}\n", .{ "siglip-visual", h.final() });
+    }
 
     if (a.prof) switch (backend) {
         .cuda => |be| {

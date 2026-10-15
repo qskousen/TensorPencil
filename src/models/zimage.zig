@@ -22,12 +22,14 @@
 //! tools/gen_zimage_fixtures.py; GPU twins are zimage_gpu.zig and zimage_cuda.zig.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
 const lin = @import("lin.zig");
+const lora_mod = @import("lora.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -232,6 +234,9 @@ pub const DiT = struct {
     device_lins: []const Weight,
     final_ada: LinearW, // mod_dim -> dim
     final_linear: LinearW, // dim -> patchDim
+    /// The LoRA sidecars every host linear applies (`mm`), and the device arms
+    /// read. Set by `attachLora`, owned by the caller.
+    lora: ?*const lora_mod.Stack = null,
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore, cfg: Config) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -291,6 +296,43 @@ pub const DiT = struct {
         self.* = undefined;
     }
 
+    /// Resolve `stack` against every linear this model runs, host and device, and
+    /// hold it. Returns the file keys that apply. The fused `qkv` is resolved
+    /// whole (the host GEMM, and where its shape is checked) and as the device's
+    /// three row views.
+    pub fn attachLora(self: *DiT, gpa: std.mem.Allocator, stack: *lora_mod.Stack) !usize {
+        self.lora = stack;
+        stack.beginAttach();
+        try stack.resolveAll(self.device_lins);
+        for ([_][]Block{ self.context_refiner, self.noise_refiner, self.layers }) |group| for (group) |*b| {
+            try stack.resolveAll(&blockLins(b));
+            _ = try stack.resolve(b.attn.qkv);
+            if (b.ada) |a| _ = try stack.resolve(a.w);
+        };
+        try stack.resolveAll(&.{ self.x_embedder.w, self.cap_embedder.w, self.t_mlp0.w, self.t_mlp2.w, self.final_ada.w, self.final_linear.w });
+        return stack.finishAttach(gpa);
+    }
+
+    /// `final_layer.linear` with its sidecar, for a device arm that runs the final
+    /// layer on the host.
+    pub fn finalLinear(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usize) !void {
+        try linear(io, gpa, self.lora, out, x, m, self.final_linear);
+    }
+
+    /// A device forward's final layer, on the host: `img_rows` `[m][dim]` (the image rows
+    /// of the joint sequence) unit-layernormed and scaled by `1 + scale` in place, then
+    /// the final linear into `out` `[m][patchDim]`. Row-wise, so running it on the image
+    /// rows alone is exactly running it on the sequence and slicing, as the reference does.
+    pub fn finalLayer(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, out: []f32, img_rows: []f32, scale: []const f32, m: usize) !void {
+        const dim = self.cfg.dim;
+        ops.norm.layerNormUnit(img_rows, img_rows, dim, self.cfg.final_eps);
+        var row: usize = 0;
+        while (row < img_rows.len) : (row += dim) {
+            for (img_rows[row..][0..dim], scale) |*v, sc| v.* = (1.0 + sc) * v.*;
+        }
+        try self.finalLinear(io, gpa, out, img_rows, m);
+    }
+
     // --- stages ------------------------------------------------------------
     //
     // Split the way krea2's DiT is, and for the same reason: `pipeline.Denoiser`
@@ -314,12 +356,12 @@ pub const DiT = struct {
 
         const hidden = try gpa.alloc(f32, cfg.t_hidden);
         defer gpa.free(hidden);
-        try linear(io, gpa, hidden, freq, 1, self.t_mlp0);
+        try linear(io, gpa, self.lora, hidden, freq, 1, self.t_mlp0);
         ops.act.silu(hidden);
 
         const out = try gpa.alloc(f32, cfg.mod_dim);
         errdefer gpa.free(out);
-        try linear(io, gpa, out, hidden, 1, self.t_mlp2);
+        try linear(io, gpa, self.lora, out, hidden, 1, self.t_mlp2);
         return out;
     }
 
@@ -355,7 +397,7 @@ pub const DiT = struct {
         for ([_][]Block{ self.noise_refiner, self.layers }) |group| {
             for (group) |*blk| {
                 const dst = out[i * 4 * cfg.dim ..][0 .. 4 * cfg.dim];
-                try linear(io, gpa, dst, adaln, 1, blk.ada.?);
+                try linear(io, gpa, self.lora, dst, adaln, 1, blk.ada.?);
                 // The two gate chunks, `gate_msa` and `gate_mlp`, in the order
                 // `scale_msa, gate_msa, scale_mlp, gate_mlp`.
                 for (dst[1 * cfg.dim ..][0..cfg.dim]) |*g| g.* = std.math.tanh(g.*);
@@ -434,7 +476,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
         ops.act.silu(gated);
         const out = try gpa.alloc(f32, cfg.dim);
         errdefer gpa.free(out);
-        try linear(io, gpa, out, gated, 1, self.final_ada);
+        try linear(io, gpa, self.lora, out, gated, 1, self.final_ada);
         return out;
     }
 
@@ -459,7 +501,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
             const normed = try gpa.alloc(f32, ctx.len);
             defer gpa.free(normed);
             ops.norm.rmsNorm(normed, ctx, self.cap_norm, cfg.norm_eps);
-            try linear(io, gpa, out[0 .. seq_txt * cfg.dim], normed, seq_txt, self.cap_embedder);
+            try linear(io, gpa, self.lora, out[0 .. seq_txt * cfg.dim], normed, seq_txt, self.cap_embedder);
         }
         for (seq_txt..n) |i| @memcpy(out[i * cfg.dim ..][0..cfg.dim], self.cap_pad_token);
 
@@ -555,7 +597,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
         {
             const patches = try patchify(gpa, cfg, x_lat, lat_h, lat_w);
             defer gpa.free(patches);
-            try linear(io, gpa, out[0 .. n_img * cfg.dim], patches, n_img, self.x_embedder);
+            try linear(io, gpa, self.lora, out[0 .. n_img * cfg.dim], patches, n_img, self.x_embedder);
         }
         for (n_img..n) |i| @memcpy(out[i * cfg.dim ..][0..cfg.dim], self.x_pad_token);
 
@@ -679,14 +721,14 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
             defer gpa.free(gated);
             @memcpy(gated, adaln);
             ops.act.silu(gated); // the final layer keeps Lumina's SiLU; blocks do not
-            try linear(io, gpa, scale, gated, 1, self.final_ada);
+            try linear(io, gpa, self.lora, scale, gated, 1, self.final_ada);
         }
         ops.norm.layerNormUnit(img_rows, img_rows, cfg.dim, cfg.final_eps);
         modulate(img_rows, scale);
 
         const patches = try gpa.alloc(f32, n_img * cfg.patchDim());
         defer gpa.free(patches);
-        try linear(io, gpa, patches, img_rows, n_img, self.final_linear);
+        try linear(io, gpa, self.lora, patches, img_rows, n_img, self.final_linear);
         unpatchify(cfg, out, patches, lat_h, lat_w);
     }
 
@@ -711,7 +753,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
         defer if (mv.len != 0) gpa.free(mv);
         if (blk.ada) |ada| {
             mv = try gpa.alloc(f32, 4 * cfg.dim);
-            try linear(io, gpa, mv, adaln.?, 1, ada);
+            try linear(io, gpa, self.lora, mv, adaln.?, 1, ada);
             // The gates are tanh'd; do it once here rather than per row.
             for (mv[1 * cfg.dim ..][0..cfg.dim]) |*g| g.* = std.math.tanh(g.*);
             for (mv[3 * cfg.dim ..][0..cfg.dim]) |*g| g.* = std.math.tanh(g.*);
@@ -756,7 +798,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
 
         const fused = try gpa.alloc(f32, seq * fused_dim);
         defer gpa.free(fused);
-        try ops.matmul.matmul(io, gpa, fused, x, seq, attn.qkv, null);
+        try mm(io, gpa, self.lora, fused, x, seq, attn.qkv, null);
 
         const q = try gpa.alloc(f32, seq * q_dim);
         defer gpa.free(q);
@@ -787,7 +829,7 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
             .n_kv_heads = cfg.n_kv_heads,
             .head_dim = cfg.head_dim,
         });
-        try ops.matmul.matmul(io, gpa, out, attn_out, seq, attn.out, null);
+        try mm(io, gpa, self.lora, out, attn_out, seq, attn.out, null);
     }
 
     fn ffnForward(
@@ -804,10 +846,10 @@ pub fn traceActs(what: []const u8, i: usize, x: []const f32) void {
         defer gpa.free(gate);
         const up = try gpa.alloc(f32, seq * inner);
         defer gpa.free(up);
-        try ops.matmul.matmul(io, gpa, gate, x, seq, ffn.w1, null);
-        try ops.matmul.matmul(io, gpa, up, x, seq, ffn.w3, null);
+        try mm(io, gpa, self.lora, gate, x, seq, ffn.w1, null);
+        try mm(io, gpa, self.lora, up, x, seq, ffn.w3, null);
         ops.act.siluMul(gate, up);
-        try ops.matmul.matmul(io, gpa, out, gate, seq, ffn.w2, null);
+        try mm(io, gpa, self.lora, out, gate, seq, ffn.w2, null);
     }
 };
 
@@ -894,9 +936,27 @@ pub fn unpatchify(cfg: Config, out: []f32, patches: []const f32, lat_h: usize, l
     }
 }
 
-fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usize, lw: LinearW) !void {
-    try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
+fn linear(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, out: []f32, x: []const f32, m: usize, lw: LinearW) !void {
+    try mm(io, gpa, stack, out, x, m, lw.w, lw.b);
 }
+
+/// Every host GEMM on a model weight goes through here, so a LoRA cannot be
+/// missed at one call site. A fused `qkv` output is `[m][qkv.rows]`, which is the
+/// stride its merged sidecar writes each slot at.
+fn mm(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, out: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, out, x, m, w, bias);
+    if (stack) |s| try s.applyHost(io, gpa, out, w.rows, x, m, w, bias);
+}
+
+/// How Z-Image's LoRAs name what its checkpoint does not, ComfyUI's
+/// `z_image_to_diffusers`: split q/k/v onto row blocks of the fused `qkv`, and
+/// `to_out.0` onto `out`. The native spellings need no entry.
+pub const lora_keys = [_]lora_mod.Rename{
+    .{ .from = ".attention.to_q", .to = ".attention.qkv", .slot = 0, .slots = 3 },
+    .{ .from = ".attention.to_k", .to = ".attention.qkv", .slot = 1, .slots = 3 },
+    .{ .from = ".attention.to_v", .to = ".attention.qkv", .slot = 2, .slots = 3 },
+    .{ .from = ".attention.to_out.0", .to = ".attention.out" },
+};
 
 /// The seven linears one block's device forward runs.
 pub fn blockLins(b: *const Block) [7]Weight {
@@ -987,7 +1047,7 @@ const testing = std.testing;
 const test_gate = @import("../test_gate.zig");
 
 const ref_path = "src/models/assets/zimage_ref.safetensors";
-const zit_ckpt = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
+const zit_ckpt = build_options.model_root ++ "/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
 /// How many trunk blocks the fp32 reference keeps, see the generator's docstring.
 /// A full 30-layer comparison would need a 24.6 GB fp32 torch model.
 const ref_layers = 8;
@@ -1193,4 +1253,33 @@ test "the Z-Image DiT loads every weight with a tag and the right shapes" {
     // The two projections materialized to f32 at load must keep their tags.
     try testing.expectEqualStrings("model.diffusion_model.x_embedder.weight", model.x_embedder.w.tag.?);
     try testing.expectEqualStrings("model.diffusion_model.final_layer.linear.weight", model.final_linear.w.tag.?);
+}
+
+test "Z-Image LoRA keys land on the checkpoint's fused qkv and out" {
+    // The spellings the Z-Image LoRAs on disk use (`to_v`, `to_out.0`), read
+    // through the family's map as ComfyUI's `z_image_to_diffusers` reads them.
+    const gpa = testing.allocator;
+    const r: usize = 32;
+    const d: usize = 64;
+    const a = [_]u8{0} ** (r * d * 2);
+    const b = [_]u8{0} ** (d * r * 2);
+    const blob = try lora_mod.safetensorsBlob(gpa, &.{
+        .{ "diffusion_model.layers.3.attention.to_v.lora_A.weight", "BF16", &.{ r, d }, &a },
+        .{ "diffusion_model.layers.3.attention.to_v.lora_B.weight", "BF16", &.{ d, r }, &b },
+        .{ "diffusion_model.layers.3.attention.to_out.0.lora_A.weight", "BF16", &.{ r, d }, &a },
+        .{ "diffusion_model.layers.3.attention.to_out.0.lora_B.weight", "BF16", &.{ d, r }, &b },
+        .{ "diffusion_model.layers.3.feed_forward.w2.lora_A.weight", "BF16", &.{ r, d }, &a },
+        .{ "diffusion_model.layers.3.feed_forward.w2.lora_B.weight", "BF16", &.{ d, r }, &b },
+    });
+    defer gpa.free(blob);
+    var st = try safetensors.SafeTensors.initFromSlice(gpa, blob);
+    defer st.deinit();
+    var side = try lora_mod.Sidecar.load(gpa, .{ .safetensors = &st }, &lora_keys);
+    defer side.deinit();
+    const qkv = side.index.getPtr("layers.3.attention.qkv.weight").?;
+    try testing.expectEqual(3 * d, qkv.out_dim);
+    try testing.expectEqual(2 * d, qkv.factors[0].out_off);
+    try testing.expect(side.index.getPtr("layers.3.attention.out.weight") != null);
+    try testing.expect(side.index.getPtr("layers.3.feed_forward.w2.weight") != null);
+    try testing.expectEqual(@as(usize, 3), side.keyCount());
 }

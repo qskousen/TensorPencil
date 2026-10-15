@@ -155,7 +155,7 @@ pub const Host = struct {
 
     // What was last sent, so an iteration emits only changes.
     last_state: []u8 = &.{},
-    /// Hash of the transcript's shape (message count, variants, cur, images).
+    /// Hash of the transcript's shape (message count, variants, cur, images) and each variant's stamp.
     tx_shape: u64 = 0,
     /// Emitted text length per variant, in (message, variant) order.
     tx_lens: std.ArrayList(usize) = .empty,
@@ -995,7 +995,16 @@ pub const Host = struct {
             h.update(std.mem.asBytes(&m.variants.items.len));
             h.update(std.mem.asBytes(&m.cur));
             h.update(std.mem.asBytes(&m.attachments.items.len));
-            for (m.variants.items) |*v| h.update(std.mem.asBytes(&v.images.items.len));
+            // The stamp lands after the variant was already sent empty, and
+            // deltas carry only text: without it the mirror splits a primed
+            // reply as all answer.
+            for (m.variants.items) |*v| {
+                h.update(std.mem.asBytes(&v.images.items.len));
+                h.update(std.mem.asBytes(&v.thought_primed));
+                h.update(v.reason_open);
+                h.update(v.reason_close);
+                h.update(v.gen_model);
+            }
         }
         const shape = h.final();
 
@@ -1100,6 +1109,7 @@ pub const Host = struct {
             .model_hash = gi.meta.model_hash,
             .vae_hash = gi.meta.vae_hash,
             .weight_dtype = gi.meta.weight_dtype,
+            .act_dtype = gi.meta.actDtype(),
             .shift = gi.meta.shift,
             .loras = gi.meta.loras,
         };
@@ -1614,6 +1624,34 @@ test "the image a tool call produced lands on the variant that asked, and a stal
             defer h.drv.carry_mu.unlock(h.io);
             const c2 = h.drv.carry orelse return error.NothingCarried;
             try testing.expectEqualSlices(wire.ImageId, &.{78}, c2.items[1].variants.items[1].images.items);
+        }
+    }.body);
+}
+
+// The worker stamps the reply after its empty variant already went out, and a
+// delta carries only text.
+test "stamping a variant that was already sent sends the transcript again" {
+    try TestHost.run(.{}, struct {
+        fn body(h: *Host) !void {
+            try TestHost.expectOk(h, .{ .chat_adopt = .{ .messages = &.{
+                .{ .role = .user, .variants = &.{.{ .text = "hi" }} },
+                .{ .role = .assistant, .variants = &.{.{ .text = "weighing it" }} },
+            } } });
+            var arena = std.heap.ArenaAllocator.init(h.gpa);
+            defer arena.deinit();
+            _ = try TestHost.events(h, arena.allocator());
+            {
+                h.drv.carry_mu.lockUncancelable(h.io);
+                defer h.drv.carry_mu.unlock(h.io);
+                const c = h.drv.carry orelse return error.NothingCarried;
+                c.items[1].variants.items[0].thought_primed = true;
+            }
+            h.runOnce();
+            for (try TestHost.events(h, arena.allocator())) |e| if (e == .transcript) {
+                try testing.expect(e.transcript.messages[1].variants[0].thought_primed);
+                return;
+            };
+            return error.NoTranscriptEvent;
         }
     }.body);
 }

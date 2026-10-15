@@ -161,24 +161,57 @@ fn freeStr(gpa: std.mem.Allocator, s: []const u8) void {
     if (s.len > 0) gpa.free(s);
 }
 
-/// Copies every string of an `ImageInfo` so it outlives the frame it came in.
+/// Copies every slice an `ImageInfo` reaches (`dupeDeep`), so it outlives the frame it
+/// was parsed from. A field copied by hand is how a new one dangles: the LoRA names a
+/// saved PNG records read freed memory once.
 fn dupeInfo(gpa: std.mem.Allocator, i: wire.ImageInfo) wire.ImageInfo {
-    var out = i;
-    out.prompt = dupeStr(gpa, i.prompt);
-    out.negative = dupeStr(gpa, i.negative);
-    out.failure = dupeStr(gpa, i.failure);
-    out.family = dupeStr(gpa, i.family);
-    out.model_stem = dupeStr(gpa, i.model_stem);
-    return out;
+    return dupeDeep(gpa, wire.ImageInfo, i);
 }
 
 fn freeInfo(gpa: std.mem.Allocator, i: *wire.ImageInfo) void {
-    freeStr(gpa, i.prompt);
-    freeStr(gpa, i.negative);
-    freeStr(gpa, i.failure);
-    freeStr(gpa, i.family);
-    freeStr(gpa, i.model_stem);
+    freeDeep(gpa, wire.ImageInfo, i.*);
     i.* = .{};
+}
+
+/// `v` with every slice it reaches, through structs, arrays and slice elements,
+/// duplicated into `gpa`. A slice that cannot be copied comes back empty rather than
+/// borrowed. `freeDeep` releases the copy.
+fn dupeDeep(gpa: std.mem.Allocator, comptime T: type, v: T) T {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice) @compileError("dupeDeep: " ++ @typeName(T) ++ " is not a slice");
+            if (v.len == 0) return v[0..0];
+            const out = gpa.alloc(p.child, v.len) catch return v[0..0];
+            for (out, v) |*o, e| o.* = dupeDeep(gpa, p.child, e);
+            return out;
+        },
+        .@"struct" => |st| {
+            var out = v;
+            inline for (st.fields) |f| @field(out, f.name) = dupeDeep(gpa, f.type, @field(v, f.name));
+            return out;
+        },
+        .array => |a| {
+            var out = v;
+            for (&out, v) |*o, e| o.* = dupeDeep(gpa, a.child, e);
+            return out;
+        },
+        .optional => |o| return if (v) |x| dupeDeep(gpa, o.child, x) else null,
+        else => return v,
+    }
+}
+
+fn freeDeep(gpa: std.mem.Allocator, comptime T: type, v: T) void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (v.len == 0) return;
+            for (v) |e| freeDeep(gpa, p.child, e);
+            gpa.free(v);
+        },
+        .@"struct" => |st| inline for (st.fields) |f| freeDeep(gpa, f.type, @field(v, f.name)),
+        .array => |a| for (v) |e| freeDeep(gpa, a.child, e),
+        .optional => |o| if (v) |x| freeDeep(gpa, o.child, x),
+        else => {},
+    }
 }
 
 /// A short human explanation of a generation failure, from the error NAME the
@@ -1167,6 +1200,42 @@ test "the oldest pictures already on disk keep only their thumbnails" {
     try testing.expectEqual(wire.ImageStatus.failed, m.byId(ids[2]).?.status());
     try testing.expect(m.byId(ids[2]).?.missing);
     try testing.expect(!m.byId(ids[2]).?.restorable());
+}
+
+test "an image's every string and LoRA record outlives the frame it came in" {
+    var m = Mirror.init(testing.allocator);
+    defer m.deinit();
+    const loras = [_]wire.LoraInfo{ .{ .name = "ink", .hash = "0123456789", .strength = 0.7 }, .{ .name = "fox", .hash = "9876543210", .strength = -0.5 } };
+    const info: wire.ImageInfo = .{
+        .id = 7,
+        .status = .done,
+        .prompt = "a lighthouse",
+        .family = "sdxl",
+        .clip1_stem = "clip_l",
+        .clip2_stem = "clip_g",
+        .vae_stem = "sdxl_vae",
+        .model_hash = "abcdef0123",
+        .vae_hash = "3210fedcba",
+        .weight_dtype = "f16",
+        .act_dtype = "VAE f16",
+        .loras = &loras,
+    };
+    // Twice, so the second replaces the first's copies (freed, not leaked).
+    for (0..2) |_| {
+        try feed(&m, .{ .img = info });
+        const got = m.byId(7).?.info;
+        for ([_][2][]const u8{
+            .{ got.clip1_stem, "clip_l" },  .{ got.clip2_stem, "clip_g" },     .{ got.vae_stem, "sdxl_vae" },
+            .{ got.model_hash, "abcdef0123" }, .{ got.vae_hash, "3210fedcba" }, .{ got.weight_dtype, "f16" },
+            .{ got.act_dtype, "VAE f16" },  .{ got.prompt, "a lighthouse" },
+        }) |pair| try testing.expectEqualStrings(pair[1], pair[0]);
+        try testing.expectEqual(@as(usize, 2), got.loras.len);
+        for (loras, got.loras) |want, l| {
+            try testing.expectEqualStrings(want.name, l.name);
+            try testing.expectEqualStrings(want.hash, l.hash);
+            try testing.expectEqual(want.strength, l.strength);
+        }
+    }
 }
 
 test "state strings are owned copies and errors are taken once" {

@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const vae = @import("minimax_h3_vae.zig");
+const minimax_h3_vae_dev = @import("minimax_h3_vae_dev.zig");
+const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -29,18 +31,6 @@ const nullBuf: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 /// A/B the CUDA arm carries: this VAE attends over thousands of keys at a
 /// 2048-wide dim, which is where f16 scores start to matter.
 pub var force_naive_attn: bool = false;
-
-/// A contiguous row range of a row-major weight, as its own `Weight`. For `ff.w1`,
-/// whose two halves ARE row ranges.
-fn rowSlice(w: Weight, from: usize, n: usize) Weight {
-    std.debug.assert(from + n <= w.rows);
-    const stride = w.dtype.storageBytes(w.cols);
-    var out = w;
-    out.bytes = w.bytes[from * stride ..][0 .. n * stride];
-    out.rows = n;
-    if (w.row_scale) |rs| out.row_scale = rs[from..][0..n];
-    return out;
-}
 
 pub fn supported(dec: *const vae.VideoDecoder) bool {
     for (dec.blocks) |b| {
@@ -107,7 +97,12 @@ fn attnHd(hd: usize) usize {
 }
 
 pub const Workspace = struct {
+    /// The linear dispatcher, its zero bias sized for the widest projection.
+    lin: lin_gpu.Lin,
     x_d: Buf = nullBuf,
+    /// The attention output, f32 (see `minimax_h3_vae_dev`); also the f32 staging an
+    /// upload into a 16-bit `x_d` goes through.
+    ao_d: Buf = nullBuf,
     hn_d: Buf = nullBuf,
     qkv_d: Buf = nullBuf,
     q_d: Buf = nullBuf,
@@ -132,19 +127,21 @@ pub const Workspace = struct {
 
     pub const nchunks: usize = 8;
 
-    pub fn init(ctx: *Context, dec: *const vae.VideoDecoder, seq: usize, grid: usize) !Workspace {
+    /// `act` is the dial's width for the buffers `minimax_h3_vae_dev` names.
+    pub fn init(ctx: *Context, gpa: std.mem.Allocator, dec: *const vae.VideoDecoder, seq: usize, grid: usize, act: gpu.Dt) !Workspace {
         const cfg = dec.cfg;
-        var ws: Workspace = .{};
+        var ws: Workspace = .{ .lin = try lin_gpu.Lin.init(gpa, ctx, @max(3 * cfg.dim, cfg.ff, cfg.patchDim()), 0, 0) };
         errdefer ws.deinit(ctx);
-        ws.x_d = try ctx.tensorCreate(seq * cfg.dim * 4);
-        ws.hn_d = try ctx.tensorCreate(seq * cfg.dim * 4);
+        const ab = act.bytes();
+        inline for (.{ .{ "x_d", cfg.dim }, .{ "hn_d", cfg.dim }, .{ "proj_d", cfg.dim }, .{ "gate_d", cfg.ff }, .{ "up_d", cfg.ff } }) |f| {
+            @field(ws, f[0]) = try ctx.tensorCreate(seq * f[1] * ab);
+            @field(ws, f[0]).dt = act;
+        }
+        ws.ao_d = try ctx.tensorCreate(seq * cfg.dim * 4);
         ws.qkv_d = try ctx.tensorCreate(seq * cfg.dim * 3 * 4);
         ws.q_d = try ctx.tensorCreate(seq * cfg.dim * 4);
         ws.k_d = try ctx.tensorCreate(seq * cfg.dim * 4);
         ws.v_d = try ctx.tensorCreate(seq * cfg.dim * 4);
-        ws.proj_d = try ctx.tensorCreate(seq * cfg.dim * 4);
-        ws.gate_d = try ctx.tensorCreate(seq * cfg.ff * 4);
-        ws.up_d = try ctx.tensorCreate(seq * cfg.ff * 4);
         ws.scale_d = try ctx.tensorCreate(dec.blocks.len * 2 * cfg.dim * 4);
         ws.patch_d = try ctx.tensorCreate(grid * cfg.patchDim() * 4);
 
@@ -175,35 +172,16 @@ pub const Workspace = struct {
         inline for (@typeInfo(Workspace).@"struct".fields) |f| {
             if (f.type == Buf) ctx.tensorDestroy(&@field(self, f.name));
         }
+        self.lin.deinit();
     }
 };
-
-/// Widest zero bias any GEMM here needs. Passed WHOLE, never sliced: `smallBuffer`
-/// caches by host POINTER, so a slice would map every width to the first length.
-var zero_bias: [8192]f32 = @splat(0);
-
-fn gemm(ctx: *Context, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
-    const b: []const f32 = bias orelse zero_bias[0..w.rows];
-    std.debug.assert(w.rows <= zero_bias.len);
-    switch (w.dtype) {
-        .bf16 => {
-            if (ctx.pipe_coop_bf16w != .null_handle) {
-                try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, b);
-            } else {
-                try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, b);
-            }
-        },
-        .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, b),
-        .f32 => try ctx.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, bias),
-        else => return error.UnsupportedDType,
-    }
-}
 
 /// Weighted RMS over the last dim, `x -> out` (may alias). At rows=seq, dim=dim it
 /// IS a block's pre-norm; at rows=seq*heads, dim=head_dim with a unit weight it is
 /// the weightless q/k norm.
-fn rmsNorm(ctx: *Context, x: Buf, out: Buf, w: Buf, rows: usize, dim: usize, eps: f32) !void {
-    try ctx.opElt(.rmsnorm, x, out, w, null, .{
+fn rmsNormAt(ctx: *Context, x: Buf, out: Buf, w: Buf, rows: usize, dim: usize, eps: f32) !void {
+    std.debug.assert(x.dt == out.dt);
+    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, out, w, null, .{
         .u0 = @intCast(rows),
         .u1 = @intCast(dim),
         .f0 = eps,
@@ -214,10 +192,10 @@ fn normBuf(ctx: *Context, w: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = w.len * 4 };
 }
 
-/// Attention at the padded head width, result into `hn_d`.
-fn attention(ctx: *Context, ws: *Workspace, seq: usize, heads: usize, hd: usize, scale: f32) !void {
+/// Attention at the padded head width, result into `ao_d`.
+fn attentionAt(ctx: *Context, ws: *Workspace, seq: usize, heads: usize, hd: usize, scale: f32) !void {
     if (force_naive_attn or ctx.pipe_scores == .null_handle) {
-        return ctx.opElt(.attn_full, ws.q_d, ws.k_d, ws.v_d, ws.hn_d, .{
+        return ctx.opElt(.attn_full, ws.q_d, ws.k_d, ws.v_d, ws.ao_d, .{
             .u0 = @intCast(seq),
             .u1 = @intCast(heads),
             .u2 = @intCast(heads),
@@ -238,7 +216,7 @@ fn attention(ctx: *Context, ws: *Workspace, seq: usize, heads: usize, hd: usize,
     }
     try tcAttention(ctx, ws, seq, heads, hp, scale);
     // `head_unpad` takes the head count in u4, where `head_pad` takes it in u5.
-    try ctx.opElt(.head_unpad, ws.op_d, ws.hn_d, null, null, .{
+    try ctx.opElt(.head_unpad, ws.op_d, ws.ao_d, null, null, .{
         .u0 = @intCast(seq * heads * hd),
         .u1 = @intCast(hd),
         .u2 = @intCast(hp),
@@ -324,100 +302,99 @@ pub fn decodeVolume(
     w: usize,
 ) !void {
     const cfg = dec.cfg;
-    const dim = cfg.dim;
-    const hd = cfg.head_dim;
-    const heads = cfg.heads;
     const grid = t * h * w;
     const seq = grid + cfg.n_register + 1;
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     std.debug.assert(sess.seq == seq and sess.grid == grid);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-
-    // Host: denormalize and transpose planar [c][t][h][w] to token-major [n][c],
-    // then the two small projections.
-    const c_in = cfg.in_channels;
-    const rows = try a.alloc(f32, grid * c_in);
-    for (0..grid) |i| {
-        for (0..c_in) |c| rows[i * c_in + c] = z[c * grid + i] * dec.latents_std[c] + dec.latents_mean[c];
-    }
-    const pq = try a.alloc(f32, grid * c_in);
-    try ops.matmul.matmul(io, gpa, pq, rows, grid, dec.post_quant, dec.post_quant_bias);
-    const emb = try a.alloc(f32, seq * dim);
-    try ops.matmul.matmul(io, gpa, emb[0 .. grid * dim], pq, grid, dec.x_embedder, dec.x_embedder_bias);
-    @memcpy(emb[grid * dim ..][0 .. cfg.n_register * dim], dec.register_tokens);
-    @memset(emb[(grid + cfg.n_register) * dim ..][0..dim], 0);
-
-    const scales = try a.alloc(f32, dec.blocks.len * 2 * dim);
-    for (dec.blocks, 0..) |*b, i| {
-        @memcpy(scales[(i * 2) * dim ..][0..dim], b.scale1);
-        @memcpy(scales[(i * 2 + 1) * dim ..][0..dim], b.scale2);
-    }
+    const emb = try vae.embedWindow(a, io, gpa, dec, z, grid);
+    const scales = try vae.layerScales(a, dec);
 
     try ctx.beginBatch();
-    errdefer ctx.abortBatch();
+    errdefer if (ctx.batching) ctx.abortBatch();
     try ctx.tensorUpload(ws.scale_d, std.mem.sliceAsBytes(scales));
-    try ctx.tensorUpload(ws.x_d, std.mem.sliceAsBytes(emb));
-
-    for (dec.blocks, 0..) |*b, bi| {
-        // --- attention half ---
-        try rmsNorm(ctx, ws.x_d, ws.hn_d, try normBuf(ctx, b.norm1), seq, dim, cfg.eps);
-        try gemm(ctx, ws.qkv_d, ws.hn_d, seq, b.qkv, b.qkv_bias);
-        try ctx.opElt(.deinterleave3, ws.qkv_d, ws.q_d, ws.k_d, ws.v_d, .{
-            .u0 = @intCast(seq * dim),
-            .u1 = @intCast(hd),
-        }, seq * dim, 1, 1);
-        // WEIGHTLESS q/k norms: a unit weight vector.
-        try rmsNorm(ctx, ws.q_d, ws.q_d, sess.ones_d, seq * heads, hd, cfg.eps);
-        try rmsNorm(ctx, ws.k_d, ws.k_d, sess.ones_d, seq * heads, hd, cfg.eps);
-        inline for (.{ "q_d", "k_d" }) |f| {
-            const total = seq * heads * sess.pairs;
-            try ctx.opElt(.rope_half_part, @field(ws, f), null, sess.freqs_d, null, .{
-                .u0 = @intCast(total),
-                .u1 = @intCast(sess.pairs),
-                .u2 = @intCast(sess.sinOff()),
-                .u3 = @intCast(heads),
-                .u4 = 0,
-                .u5 = @intCast(hd),
-            }, total, 1, 1);
-        }
-        try attention(ctx, ws, seq, heads, hd, attn_scale);
-        try gemm(ctx, ws.proj_d, ws.hn_d, seq, b.out, b.out_bias);
-        // LayerScale: `gated_add` with the learned scale where a DiT has a gate.
-        try ctx.opElt(.gated_add, ws.x_d, ws.proj_d, ws.scale_d, null, .{
-            .u0 = @intCast(seq * dim),
-            .u1 = @intCast(dim),
-            .u2 = @intCast((bi * 2) * dim),
-        }, seq * dim, 1, 1);
-
-        // --- feed-forward half ---
-        try rmsNorm(ctx, ws.x_d, ws.hn_d, try normBuf(ctx, b.norm2), seq, dim, cfg.eps);
-        try gemm(ctx, ws.gate_d, ws.hn_d, seq, rowSlice(b.w1, 0, cfg.ff), b.w1_bias[0..cfg.ff]);
-        try gemm(ctx, ws.up_d, ws.hn_d, seq, rowSlice(b.w1, cfg.ff, cfg.ff), b.w1_bias[cfg.ff..]);
-        try ctx.opElt(.silu_mul, ws.gate_d, ws.up_d, null, null, .{
-            .u0 = @intCast(seq * cfg.ff),
-        }, seq * cfg.ff, 1, 1);
-        try gemm(ctx, ws.proj_d, ws.gate_d, seq, b.w2, b.w2_bias);
-        try ctx.opElt(.gated_add, ws.x_d, ws.proj_d, ws.scale_d, null, .{
-            .u0 = @intCast(seq * dim),
-            .u1 = @intCast(dim),
-            .u2 = @intCast((bi * 2 + 1) * dim),
-        }, seq * dim, 1, 1);
+    if (ws.x_d.dt == .f32) {
+        try ctx.tensorUpload(ws.x_d, std.mem.sliceAsBytes(emb));
+    } else {
+        try ctx.tensorUpload(ws.ao_d, std.mem.sliceAsBytes(emb));
+        const n = seq * cfg.dim;
+        try ctx.opElt(gpu.eltCopy(.f32, ws.x_d.dt), ws.ao_d, ws.x_d, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
     }
-
-    // Head: a LayerNorm WITH bias, where every other norm here is RMS. Only the
-    // GRID tokens are projected; the register/zero suffix is dropped.
-    try ctx.opElt(.layernorm, ws.x_d, ws.hn_d, try normBuf(ctx, dec.norm_out_w), try normBuf(ctx, dec.norm_out_b), .{
-        .u0 = @intCast(seq),
-        .u1 = @intCast(dim),
-        .f0 = cfg.eps,
-    }, seq, 1, 1);
-    try gemm(ctx, ws.patch_d, ws.hn_d, grid, dec.proj_out, dec.proj_out_bias);
+    try minimax_h3_vae_dev.body(Dev{ .ctx = ctx, .sess = sess, .ws = ws, .cfg = cfg }, dec, seq, grid);
     try ctx.endBatch();
 
     const patches = try a.alloc(f32, grid * cfg.patchDim());
     try ctx.tensorDownload(ws.patch_d, std.mem.sliceAsBytes(patches));
     vae.unpatchify(cfg, out, patches, t, h, w);
 }
+
+/// The `minimax_h3_vae_dev` adapter.
+const Dev = struct {
+    ctx: *Context,
+    sess: *const Session,
+    ws: *Workspace,
+    cfg: vae.Config,
+
+    pub fn rmsNorm(d: Dev, x: Buf, y: Buf, w: []const f32, rows: usize, dim: usize) !void {
+        try rmsNormAt(d.ctx, x, y, try normBuf(d.ctx, w), rows, dim, d.cfg.eps);
+    }
+
+    pub fn unitNorm(d: Dev, x: Buf, seq: usize) !void {
+        try rmsNormAt(d.ctx, x, x, d.sess.ones_d, seq * d.cfg.heads, d.cfg.head_dim, d.cfg.eps);
+    }
+
+    pub fn gemm(d: Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
+        try lin_gpu.towerLinear(&d.ws.lin, y, x, m, w, bias);
+    }
+
+    pub fn deinterleave3(d: Dev, seq: usize) !void {
+        const n = seq * d.cfg.dim;
+        try d.ctx.opElt(.deinterleave3, d.ws.qkv_d, d.ws.q_d, d.ws.k_d, d.ws.v_d, .{
+            .u0 = @intCast(n),
+            .u1 = @intCast(d.cfg.head_dim),
+        }, n, 1, 1);
+    }
+
+    pub fn rope(d: Dev, x: Buf, seq: usize) !void {
+        const total = seq * d.cfg.heads * d.sess.pairs;
+        try d.ctx.opElt(.rope_half_part, x, null, d.sess.freqs_d, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(d.sess.pairs),
+            .u2 = @intCast(d.sess.sinOff()),
+            .u3 = @intCast(d.cfg.heads),
+            .u4 = 0,
+            .u5 = @intCast(d.cfg.head_dim),
+        }, total, 1, 1);
+    }
+
+    pub fn attention(d: Dev, seq: usize) !void {
+        try attentionAt(d.ctx, d.ws, seq, d.cfg.heads, d.cfg.head_dim, 1.0 / @sqrt(@as(f32, @floatFromInt(d.cfg.head_dim))));
+    }
+
+    pub fn layerScale(d: Dev, x: Buf, y: Buf, total: usize, off: usize) !void {
+        std.debug.assert(x.dt == y.dt);
+        try d.ctx.opElt(gpu.eltAt("gated_add", x.dt), x, y, d.ws.scale_d, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(d.cfg.dim),
+            .u2 = @intCast(off),
+        }, total, 1, 1);
+    }
+
+    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+        std.debug.assert(g.dt == u.dt);
+        try d.ctx.opElt(gpu.eltAt("silu_mul", g.dt), g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn layerNorm(d: Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize, dim: usize) !void {
+        std.debug.assert(x.dt == y.dt);
+        try d.ctx.opElt(gpu.eltAt("layernorm", x.dt), x, y, try normBuf(d.ctx, w), try normBuf(d.ctx, b), .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(dim),
+            .f0 = d.cfg.eps,
+        }, rows, 1, 1);
+    }
+
+    pub fn blockDone(_: Dev, _: usize, _: usize) !void {}
+};

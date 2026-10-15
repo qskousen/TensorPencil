@@ -36,10 +36,12 @@
 //! minimax_h3_gpu.zig.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const lora_mod = @import("lora.zig");
+const lin_mod = @import("lin.zig");
 const quant_weight = @import("quant_weight.zig");
 
 const WeightStore = weights_mod.WeightStore;
@@ -918,6 +920,13 @@ pub const Lin = struct {
     lora: []const lora_mod.Stack.Hit = &.{},
 };
 
+/// `matLin` for a plain `Weight` (an adaLN projection, a patch embedder, a head):
+/// a hit on one of those is as real as one on a block linear.
+fn matW(io: std.Io, gpa: std.mem.Allocator, stack: ?*const lora_mod.Stack, y: []f32, x: []const f32, m: usize, w: Weight, bias: ?[]const f32) !void {
+    try ops.matmul.matmul(io, gpa, y, x, m, w, bias);
+    if (stack) |st| try st.applyHost(io, gpa, y, w.rows, x, m, w, bias);
+}
+
 /// `y = W x (+ bias) + sidecars`. The one host path through a `Lin`, so a
 /// sidecar cannot be forgotten at a call site.
 ///
@@ -1021,6 +1030,26 @@ pub const DiT = struct {
     /// The LoRA stack `attachLora` resolved against, borrowed. Every `Lin.lora`
     /// holds indexes into its file list, so the two are read together.
     lora: ?*const lora_mod.Stack = null,
+    /// Every linear the device trunks run, as they run it: per block `lins_per_block`
+    /// entries in `DeviceLin` order, the fused qkv and fc1 split by rows
+    /// (`lin.rowSlice`, which keeps the tag and sets `row_off`, so a LoRA hit on the
+    /// fused weight applies to its own rows of each view).
+    device_lins: []const Weight = &.{},
+
+    pub const lins_per_block = @typeInfo(DeviceLin).@"enum".fields.len;
+    pub const DeviceLin = enum { q, k, v, out, gate, up, fc2 };
+
+    /// Keep blocks `[lo, hi)` only, for a test that runs part of the trunk. The device
+    /// linears are indexed by block, so they are cut with them.
+    pub fn sliceBlocks(self: *DiT, lo: usize, hi: usize) void {
+        self.blocks = self.blocks[lo..hi];
+        self.device_lins = self.device_lins[lo * lins_per_block .. hi * lins_per_block];
+    }
+
+    /// Block `bi`'s linear `which`, as the device trunks run it.
+    pub fn deviceLin(self: *const DiT, bi: usize, which: DeviceLin) Weight {
+        return self.device_lins[bi * lins_per_block + @intFromEnum(which)];
+    }
 
     pub fn deinit(self: *DiT) void {
         self.arena.deinit();
@@ -1034,12 +1063,17 @@ pub const DiT = struct {
     /// Returns how many (linear, file) pairs will apply. `Stack.check` is the
     /// authority on whether the stack is usable at all; this is the resolution
     /// that keeps the forward path off the name index.
-    pub fn attachLora(self: *DiT, stack: *lora_mod.Stack) !usize {
+    pub fn attachLora(self: *DiT, gpa: std.mem.Allocator, stack: *lora_mod.Stack) !usize {
         self.lora = stack;
         stack.beginAttach();
-        for (self.blocks) |*b| try attachBlockLora(&b.attn, &b.mlp, stack);
+        for (self.blocks) |*b| {
+            try attachBlockLora(&b.attn, &b.mlp, stack);
+            _ = try stack.resolve(b.adaln);
+        }
         for (self.refiner) |*b| try attachBlockLora(&b.attn, &b.mlp, stack);
-        return stack.finishAttach();
+        // The plain weights `matW` and the device heads apply hits to by tag.
+        inline for (.{ self.video_patch, self.audio_patch, self.condition_proj, self.final.adaln, self.final.video_out, self.final.audio_out }) |w| _ = try stack.resolve(w);
+        return stack.finishAttach(gpa);
     }
 
     fn attachBlockLora(a: *Attn, m: *Mlp, stack: *lora_mod.Stack) !void {
@@ -1117,10 +1151,21 @@ pub const DiT = struct {
             .audio_out = try l.mat("final_layer.audio_out.weight", .{}, audio_latent_channels, hidden),
             .audio_bias = try l.vec("final_layer.audio_out.bias", .{}, audio_latent_channels),
         };
-        _ = inner;
+        const device_lins = try alloc.alloc(Weight, blocks.len * DiT.lins_per_block);
+        for (blocks, 0..) |b, bi| {
+            const d = device_lins[bi * DiT.lins_per_block ..][0..DiT.lins_per_block];
+            d[0] = try lin_mod.rowSlice(alloc, b.attn.qkv.w, 0, inner);
+            d[1] = try lin_mod.rowSlice(alloc, b.attn.qkv.w, inner, inner);
+            d[2] = try lin_mod.rowSlice(alloc, b.attn.qkv.w, 2 * inner, inner);
+            d[3] = b.attn.out.w;
+            d[4] = try lin_mod.rowSlice(alloc, b.mlp.fc1.w, 0, cfg.ffn);
+            d[5] = try lin_mod.rowSlice(alloc, b.mlp.fc1.w, cfg.ffn, cfg.ffn);
+            d[6] = b.mlp.fc2.w;
+        }
 
         return .{
             .arena = arena,
+            .device_lins = device_lins,
             .cfg = cfg,
             .video_patch = video_patch,
             .video_patch_bias = video_patch_bias,
@@ -1748,7 +1793,7 @@ pub fn refineText(
     const cfg = dit.cfg;
     std.debug.assert(states.len == text_len * cfg.text_dim);
     std.debug.assert(out.len == text_len * cfg.hidden);
-    try ops.matmul.matmul(io, gpa, out, states, text_len, dit.condition_proj, dit.condition_bias);
+    try matW(io, gpa, dit.lora, out, states, text_len, dit.condition_proj, dit.condition_bias);
 
     const inner = cfg.n_heads * cfg.head_dim;
     const hn = try gpa.alloc(f32, text_len * cfg.hidden);
@@ -1926,11 +1971,11 @@ pub fn embedPacked(
             @memcpy(dst, in.text[sg.start * hidden ..][0 .. n * hidden]);
         } else if (sg.kind.isVideoRow()) {
             const src = video_rows[v_off * patch_dim ..][0 .. n * patch_dim];
-            try ops.matmul.matmul(io, gpa, dst, src, n, dit.video_patch, dit.video_patch_bias);
+            try matW(io, gpa, dit.lora, dst, src, n, dit.video_patch, dit.video_patch_bias);
             v_off += n;
         } else {
             const src = audio_rows[a_off * audio_latent_channels ..][0 .. n * audio_latent_channels];
-            try ops.matmul.matmul(io, gpa, dst, src, n, dit.audio_patch, dit.audio_patch_bias);
+            try matW(io, gpa, dit.lora, dst, src, n, dit.audio_patch, dit.audio_patch_bias);
             a_off += n;
         }
     }
@@ -1975,7 +2020,7 @@ pub fn buildFinalModTable(
     std.debug.assert(out.len == labels * 2 * hidden);
     const raw = try gpa.alloc(f32, labels * 2 * hidden);
     defer gpa.free(raw);
-    try ops.matmul.matmul(io, gpa, raw, t_emb, labels, dit.final.adaln, dit.final.adaln_bias);
+    try matW(io, gpa, dit.lora, raw, t_emb, labels, dit.final.adaln, dit.final.adaln_bias);
     for (0..labels) |r| {
         const shift = raw[r * 2 * hidden ..][0..hidden];
         const scale = raw[r * 2 * hidden + hidden ..][0..hidden];
@@ -1986,12 +2031,82 @@ pub fn buildFinalModTable(
     }
 }
 
+/// The host half of one device step, for both device arms: the packed sequence, the
+/// step's timesteps, every block's modulation, the final layer's, and the per-row
+/// label tables. Its buffers back uploads queued inside the step's batch, so it must
+/// outlive that batch: freed early, the upload reads freed memory, which hung the
+/// device two steps into a render rather than at the copy.
+pub const DeviceStep = struct {
+    packed_h: []f32,
+    ts: Timesteps,
+    t_emb: []f32,
+    /// `[block][label][tag][slot][hidden]`, premul folded; see `buildModTable`.
+    mod: []f32,
+    /// `[label][2][hidden]`, norm folded; see `buildFinalModTable`.
+    fmod: []f32,
+    /// Per-row modulation labels of the two target segments as the device's u32,
+    /// empty unless a denoise mask relabels rows inside them.
+    video_idx: []u32,
+    audio_idx: []u32,
+
+    pub fn init(dit: *const DiT, io: std.Io, gpa: std.mem.Allocator, layout: *const PackedLayout, in: Inputs) !DeviceStep {
+        const cfg = dit.cfg;
+        const h = cfg.hidden;
+        const packed_h = try gpa.alloc(f32, layout.seq_len * h);
+        errdefer gpa.free(packed_h);
+        var ts = try embedPacked(dit, io, gpa, packed_h, layout, in);
+        errdefer ts.deinit(gpa);
+        const n_labels = ts.labels().len;
+
+        const t_emb = try gpa.alloc(f32, n_labels * cfg.time_embed_dim);
+        errdefer gpa.free(t_emb);
+        timeEmbed(t_emb, dit.adaln_t_table, cfg.adaln_curve_grid.?, cfg.time_embed_dim, ts.labels());
+        const mod = try gpa.alloc(f32, dit.blocks.len * n_labels * 3 * 6 * h);
+        errdefer gpa.free(mod);
+        try buildModTable(dit, io, gpa, mod, t_emb, n_labels);
+        const fmod = try gpa.alloc(f32, n_labels * 2 * h);
+        errdefer gpa.free(fmod);
+        try buildFinalModTable(dit, io, gpa, fmod, t_emb, n_labels);
+
+        const video_idx = try widen(gpa, ts.rowsFor(.video));
+        errdefer gpa.free(video_idx);
+        const audio_idx = try widen(gpa, ts.rowsFor(.audio));
+        return .{ .packed_h = packed_h, .ts = ts, .t_emb = t_emb, .mod = mod, .fmod = fmod, .video_idx = video_idx, .audio_idx = audio_idx };
+    }
+
+    fn widen(gpa: std.mem.Allocator, src: []const u8) ![]u32 {
+        const out = try gpa.alloc(u32, src.len);
+        for (out, src) |*o, v| o.* = v;
+        return out;
+    }
+
+    pub fn deinit(self: *DeviceStep, gpa: std.mem.Allocator) void {
+        gpa.free(self.packed_h);
+        self.ts.deinit(gpa);
+        gpa.free(self.t_emb);
+        gpa.free(self.mod);
+        gpa.free(self.fmod);
+        gpa.free(self.video_idx);
+        gpa.free(self.audio_idx);
+        self.* = undefined;
+    }
+
+    /// The two heads' rows to the sampler's planar velocities: unpack, then NEGATE,
+    /// the reference's last act and invisible in every norm.
+    pub fn finish(layout: *const PackedLayout, out_video: []f32, out_audio: []f32, v_rows: []const f32, a_rows: []const f32) void {
+        unpatchifyVideo(out_video, v_rows, layout.latent_t, layout.latent_h, layout.latent_w);
+        for (out_video) |*x| x.* = -x.*;
+        unpackAudio(out_audio, a_rows, layout.audio_t);
+        for (out_audio) |*x| x.* = -x.*;
+    }
+};
+
 /// The output heads: norm + modulate each target segment, project, unpack, negate.
 ///
-/// `trunk` is the packed sequence after the last block, on the host. The CPU and
-/// Vulkan paths finish here; the CUDA path runs the same arithmetic on the device
-/// (`minimax_h3_cuda.finalHeadDev`) off `buildFinalModTable`, because downloading
-/// the trunk to reach a 96-row projection costs more than the projection does.
+/// `trunk` is the packed sequence after the last block, on the host. The CPU path
+/// finishes here; the device arms run the same arithmetic on the device
+/// (`minimax_h3_dev.finalHead`) off `buildFinalModTable`, because downloading the
+/// trunk to reach a 96-row projection costs more than the projection does.
 pub fn finalHeads(
     dit: *const DiT,
     io: std.Io,
@@ -2014,7 +2129,7 @@ pub fn finalHeads(
     // The final layer's adaLN has ONE modality, so its modulation row is the
     // timestep row itself rather than `t_row * 3 + tag`.
     const fmod = try a.alloc(f32, labels.len * 2 * hidden);
-    try ops.matmul.matmul(io, gpa, fmod, t_emb, labels.len, dit.final.adaln, dit.final.adaln_bias);
+    try matW(io, gpa, dit.lora, fmod, t_emb, labels.len, dit.final.adaln, dit.final.adaln_bias);
 
     const video_seg = layout.segmentOf(.video).?;
     const audio_seg = layout.segmentOf(.audio).?;
@@ -2065,7 +2180,7 @@ pub fn forward(
     for (dit.blocks) |*b| {
         // adaLN reads the curve coordinates directly: curve-form checkpoints fold
         // the silu the non-curve form applies into the table itself.
-        try ops.matmul.matmul(io, gpa, ws.mod[0 .. mod_rows * 6 * hidden], t_emb, labels.len, b.adaln, b.adaln_bias);
+        try matW(io, gpa, dit.lora, ws.mod[0 .. mod_rows * 6 * hidden], t_emb, labels.len, b.adaln, b.adaln_bias);
 
         ops.norm.rmsNorm(ws.hn, ws.h, b.norm1, cfg.norm_eps);
         modScaleShift(ws.hn, ws.mod, layout, &ts, hidden, 0, 1);
@@ -2121,7 +2236,7 @@ fn finalHead(
         const row = dst[i * hidden ..][0..hidden];
         for (row, scale, shift) |*x, sc, sh| x.* = x.* * (1.0 + sc) + sh;
     }
-    try ops.matmul.matmul(io, gpa, rows_out, dst, n, w, bias);
+    try matW(io, gpa, dit.lora, rows_out, dst, n, w, bias);
 }
 
 /// `h[a:b] = h[a:b] * (1 + scale[row]) + shift[row]`, per segment.
@@ -3254,7 +3369,7 @@ test "the forward matches the reference at a toy width" {
 const test_gate = @import("../test_gate.zig");
 const SafeTensors = tp_core.safetensors.SafeTensors;
 
-const h3_dit = "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
+const h3_dit = build_options.model_root ++ "/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
 
 test "config is read off the checkpoint's own shapes" {
     const gpa = std.testing.allocator;
@@ -3724,7 +3839,7 @@ pub fn buildModTable(
     defer gpa.free(raw);
 
     for (dit.blocks, 0..) |*b, bi| {
-        try ops.matmul.matmul(io, gpa, raw, t_emb, n_labels, b.adaln, b.adaln_bias);
+        try matW(io, gpa, dit.lora, raw, t_emb, n_labels, b.adaln, b.adaln_bias);
         // `raw` is [n_labels][tag][slot][hidden] with slots
         // (shift, scale, gate) x2, which is the reference's chunk order.
         for (0..n_labels) |t_row| {

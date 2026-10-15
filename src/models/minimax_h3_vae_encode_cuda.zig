@@ -28,13 +28,14 @@
 //! 4. `Downsample3D`'s asymmetric `(0, 1, 0, 1)` reflect pre-pad is folded into the
 //!    im2col's per-axis low pad rather than materialized.
 //!
-//! ⚠️ **The GEMMs run in f32.** The vendor-library arm has a tiled f32 GEMM; the
-//! hand-PTX arm does not, and falls back to a correct one-thread-per-output kernel
-//! that is roughly a third the speed. Dropping to f16 there instead would put
-//! noise into a latent that then rides through every sampling step.
+//! ⚠️ **The GEMMs run in f32** (`conv_cuda.conv3d` under a native plan). Dropping to
+//! f16 would put noise into a latent that then rides through every sampling step.
 
 const std = @import("std");
 const enc_mod = @import("minimax_h3_vae_encode.zig");
+const conv_cuda = @import("conv_cuda.zig");
+const Weight = @import("tp_ops").matmul.Weight;
+const lin_cuda = @import("lin_cuda.zig");
 const vae = @import("minimax_h3_vae.zig");
 const cuda = @import("tp_gpu").cuda;
 
@@ -71,22 +72,7 @@ pub fn supported(enc: *const VideoEncoder) bool {
 // --- session --------------------------------------------------------------
 
 /// A conv ready for the device: `[out_ch][kt * kh * kw * in_ch]` f32.
-const DevConv = struct {
-    w: []const f32,
-    bias: ?[]const f32,
-    out_ch: usize,
-    in_ch: usize,
-    kt: usize,
-    kh: usize,
-    kw: usize,
-    stride_t: usize,
-    stride_s: usize,
-    pad_t: usize,
-
-    fn cols(self: DevConv) usize {
-        return self.kt * self.kh * self.kw * self.in_ch;
-    }
-};
+const DevConv = conv_cuda.Conv3dGemm;
 
 const DevResBlock = struct {
     norm1: []const f32,
@@ -174,9 +160,8 @@ fn devConv(a: std.mem.Allocator, c: Conv3d) !DevConv {
         }
     }
     return .{
-        .w = w,
+        .w = Weight.fromF32(w, c.out_ch, taps * c.in_ch),
         .bias = c.b,
-        .out_ch = c.out_ch,
         .in_ch = c.in_ch,
         .kt = c.kt,
         .kh = c.kh,
@@ -321,92 +306,25 @@ pub const Workspace = struct {
 // --- forward --------------------------------------------------------------
 
 /// A channel-last volume on the device.
-const DevVol = struct {
-    buf: Buf,
-    ch: usize,
-    t: usize,
-    h: usize,
-    w: usize,
-
-    fn elems(self: DevVol) usize {
-        return self.ch * self.t * self.h * self.w;
-    }
-    fn positions(self: DevVol) usize {
-        return self.t * self.h * self.w;
-    }
-};
-
-fn offsetBuf(b: Buf, off_bytes: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
-}
+const DevVol = conv_cuda.Vol3;
 
 fn devBuf(be: *Backend, data: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(data)), .mem = .null_handle, .size = data.len * 4 };
 }
 
-/// `dst = conv3d(src)`, banded im2col + GEMM.
-///
-/// ⚠️ **`dst` must not alias `src`**, for the same reason the audio port's does not:
-/// banding interleaves the two, so band 0's GEMM would overwrite input band 1 has
-/// not read yet. That is correct for any volume small enough to fit one band and
-/// wrong for every larger one.
-fn conv(
-    be: *Backend,
-    ws: *Workspace,
-    dst: Buf,
-    src: DevVol,
-    c: DevConv,
-    /// Spatial pads as (low, high) per axis. They are separate because
-    /// `Downsample3D`'s pre-pad is asymmetric `(0, 1)`, and because only the LOW
-    /// pad shifts the gather -- the high one just extends the output.
-    ///
-    /// ⚠️ **The high pad must NOT be folded into the input extent.** Telling the
-    /// kernel the volume is one row taller so it can reflect into the pad reads a
-    /// row the buffer does not have: an illegal access, not a wrong number. The
-    /// reflect is always against the REAL extent, which is also what the reference
-    /// does (its pre-pad reflects against the unpadded height and the conv that
-    /// follows pads not at all).
-    pad_h: [2]usize,
-    pad_w: [2]usize,
-) !DevVol {
-    std.debug.assert(dst.buf != src.buf.buf);
-    const front = 2 * c.pad_t;
-    const t_pad = src.t + front;
-    const out_t = if (t_pad >= c.kt) (t_pad - c.kt) / c.stride_t + 1 else 0;
-    const out_h = (src.h + pad_h[0] + pad_h[1] - c.kh) / c.stride_s + 1;
-    const out_w = (src.w + pad_w[0] + pad_w[1] - c.kw) / c.stride_s + 1;
-    const out: DevVol = .{ .buf = dst, .ch = c.out_ch, .t = out_t, .h = out_h, .w = out_w };
-    if (out_t == 0) return out;
-
-    const cols = c.cols();
-    const rows = out_t * out_h * out_w;
-    const band = @max(1, @min(rows, patch_band / cols));
-    std.debug.assert(band * cols <= ws.shapes.patch);
-
-    // The shape is the same for every band, so it is uploaded ONCE and only the
-    // band's first row moves, as a launch scalar. The staging slot must still
-    // outlive the batch: an upload inside one is queued on the stream.
-    const stage = try ws.stage(be, 1);
-    stage[0] = [16]u32{
-        @intCast(cols),        @intCast(c.in_ch),   @intCast(c.kt),       @intCast(c.kh),
-        @intCast(c.kw),        @intCast(out_h),     @intCast(out_w),      @intCast(src.t),
-        @intCast(src.h),       @intCast(src.w),     @intCast(c.stride_t), @intCast(c.stride_s),
-        @intCast(front),       @intCast(pad_h[0]),  @intCast(pad_w[0]),   0,
-    };
-    try be.tensorUpload(ws.prm, std.mem.sliceAsBytes(stage[0..1]));
-    var t0: usize = 0;
-    while (t0 < rows) : (t0 += band) {
-        const nb = @min(band, rows - t0);
-        try be.opIm2col3d(src.buf, ws.patch, ws.prm, t0, nb, cols);
-        const wb = std.mem.sliceAsBytes(c.w);
-        const gout = offsetBuf(dst, t0 * c.out_ch * 4);
-        be.opMatmulF32Lt(gout, ws.patch, nb, wb, c.out_ch, cols, c.bias) catch |err| switch (err) {
-            error.UnsupportedKernelArm => try be.opMatmul(gout, 0, ws.patch, 0, nb, wb, false, c.out_ch, cols, 1.0, c.bias),
-            else => return err,
-        };
-    }
-    return out;
+/// `dst = conv3d(src)` through `conv_cuda.conv3d`, its parameter block in this
+/// workspace's staging slot.
+fn conv(be: *Backend, ws: *Workspace, dst: Buf, src: DevVol, c: DevConv, pad_h: [2]usize, pad_w: [2]usize) !DevVol {
+    const st = try ws.stage(be, 1);
+    return conv_cuda.conv3d(be, f32_plan, ws.patch, @min(ws.shapes.patch, patch_band), ws.prm, &st[0], dst, src, c, pad_h, pad_w);
 }
+
+/// Every conv at its stored f32.
+const f32_plan: lin_cuda.Plan = blk: {
+    var p = lin_cuda.Plan.tower;
+    p.dense = .native;
+    break :blk p;
+};
 
 /// GroupNorm + the SiLU that follows it, PER FRAME and in place.
 ///
@@ -417,8 +335,8 @@ fn normSilu(be: *Backend, ws: *Workspace, x: DevVol, cat: Buf, groups: usize, ep
     const per_frame = x.h * x.w;
     for (0..x.t) |f| {
         const off = f * per_frame * x.ch * 4;
-        const v = offsetBuf(x.buf, off);
-        try be.opGroupNorm(v, v, cat, ws.gstat, ws.gmi, per_frame, x.ch, groups, gn_chunks, eps, true, false);
+        const v = x.buf.viewBytes(off);
+        try be.opGroupNorm(v, v, cat, ws.gstat, ws.gmi, per_frame, x.ch, groups, gn_chunks, eps, true);
     }
 }
 
@@ -429,7 +347,7 @@ fn resBlock(be: *Backend, ws: *Workspace, dst: Buf, x: DevVol, rb: DevResBlock, 
     const skip: DevVol = if (rb.shortcut) |sc|
         try conv(be, ws, ws.skip, x, sc, .{ 0, 0 }, .{ 0, 0 })
     else blk: {
-        try be.opCopyOff(ws.skip, 0, x.buf, 0, x.elems(), false);
+        try be.opCopyOff(ws.skip, 0, x.buf, 0, x.elems());
         break :blk .{ .buf = ws.skip, .ch = x.ch, .t = x.t, .h = x.h, .w = x.w };
     };
 

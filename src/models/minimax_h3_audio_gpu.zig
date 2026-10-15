@@ -15,13 +15,17 @@
 
 const std = @import("std");
 const audio = @import("minimax_h3_audio.zig");
+const conv_gpu = @import("conv_gpu.zig");
+const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
+const minimax_h3_audio_dev = @import("minimax_h3_audio_dev.zig");
 
 const Context = gpu.Context;
 const Buf = gpu.DeviceBuffer;
 const AudioDecoder = audio.AudioDecoder;
 const DevConv = audio.DevConv;
 const DevAct = audio.DevAct;
+const DevConvT = audio.DevConvT;
 pub const Session = audio.DevSession;
 
 const nullBuf: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
@@ -29,6 +33,8 @@ const nullBuf: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 pub const supported = audio.deviceSupported;
 
 pub const Workspace = struct {
+    /// The conv GEMMs' dispatcher.
+    lin: lin_gpu.Lin,
     /// The stage's upsampled signal, read by all three of its resblocks.
     up: Buf = nullBuf,
     /// The AMPBlock residual chain's ping-pong pair.
@@ -42,9 +48,9 @@ pub const Workspace = struct {
     patch: Buf = nullBuf,
     shapes: audio.Shapes = undefined,
 
-    pub fn init(ctx: *Context, dec: *const AudioDecoder, t: usize) !Workspace {
+    pub fn init(ctx: *Context, gpa: std.mem.Allocator, dec: *const AudioDecoder, t: usize) !Workspace {
         const s = audio.Shapes.of(dec, t);
-        var ws: Workspace = .{ .shapes = s };
+        var ws: Workspace = .{ .shapes = s, .lin = try lin_gpu.Lin.init(gpa, ctx, @max(dec.dec_in.out_ch, dec.conv_pre.out_ch), 0, 0) };
         errdefer ws.deinit(ctx);
         ws.up = try ctx.tensorCreate(s.sig * 4);
         ws.blk0 = try ctx.tensorCreate(s.sig * 4);
@@ -57,6 +63,7 @@ pub const Workspace = struct {
 
     pub fn deinit(self: *Workspace, ctx: *Context) void {
         inline for (.{ &self.up, &self.blk0, &self.blk1, &self.acc, &self.aa, &self.patch }) |b| ctx.tensorDestroy(b);
+        self.lin.deinit();
     }
 };
 
@@ -66,89 +73,19 @@ fn devBuf(ctx: *Context, data: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(data)), .mem = .null_handle, .size = data.len * 4 };
 }
 
-/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`, im2col + f32 GEMM.
-/// `dst` may alias `src`: the GEMM reads only the patch matrix.
-fn conv(ctx: *Context, ws: *Workspace, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
-    const out_len = in_len; // every conv here is stride 1 and same-padded
-    std.debug.assert(out_len * c.plen() <= ws.shapes.patch);
-    const plen = c.plen();
-    const total = out_len * plen;
-    try ctx.opElt(.im2col1d, src, ws.patch, null, null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(plen),
-        .u2 = @intCast(c.in_ch),
-        .u3 = @intCast(in_len),
-        .u4 = @intCast(c.dilation),
-        .u5 = @intCast(c.padding),
-        .f0 = @floatFromInt(c.stride),
-        .f1 = 0,
-    }, total, 1, 1);
-    const w32 = std.mem.sliceAsBytes(c.w32);
-    try ctx.opMatmul(dst, 0, ws.patch, 0, out_len, w32, false, c.out_ch, plen, 1.0, c.bias);
-    return out_len;
+/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`, its GEMM f32 like the CUDA
+/// arm's; `dst` may alias `src` (the patch holds the whole input, one band).
+fn convAt(ws: *Workspace, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
+    return conv_gpu.conv1d(&ws.lin, f32_plan, ws.patch, ws.shapes.patch, dst, src, c, in_len);
 }
 
-/// `aa_up_snake` then `aa_down`: the anti-aliased activation, in place.
-fn aaUp(ctx: *Context, ws: *Workspace, src: Buf, act: DevAct, len: usize) !void {
-    const total = 2 * len * act.channels;
-    try ctx.opElt(.aa_up_snake, src, ws.aa, try devBuf(ctx, act.up_filter), try devBuf(ctx, act.snake), .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(act.channels),
-        .u2 = @intCast(len),
-        .u3 = @intCast(act.k),
-        .u4 = @intCast(act.upPad()),
-        .u5 = @intCast(act.upSlice()),
-    }, total, 1, 1);
-}
+const f32_plan: lin_gpu.Plan = blk: {
+    var p = lin_gpu.Plan.tower;
+    p.dense = .native;
+    break :blk p;
+};
 
-fn aaDown(ctx: *Context, ws: *Workspace, out: Buf, act: DevAct, len: usize) !void {
-    const total = len * act.channels;
-    try ctx.opElt(.aa_down, ws.aa, out, try devBuf(ctx, act.down_filter), null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(act.channels),
-        .u2 = @intCast(2 * len),
-        .u3 = @intCast(act.k),
-        .u4 = @intCast(act.downPad()),
-    }, total, 1, 1);
-}
-
-fn aaSnake(ctx: *Context, ws: *Workspace, x: Buf, act: DevAct, len: usize) !void {
-    std.debug.assert(act.channels * len <= ws.shapes.aa);
-    try aaUp(ctx, ws, x, act, len);
-    try aaDown(ctx, ws, x, act, len);
-}
-
-fn add(ctx: *Context, a: Buf, b: Buf, total: usize) !void {
-    try ctx.opElt(.add, a, b, null, null, .{ .u0 = @intCast(total) }, total, 1, 1);
-}
-
-/// One `AMPBlock1` over `src`, which is NOT modified. Returns the buffer holding
-/// the result (one of the ping-pong pair).
-fn ampBlock(ctx: *Context, ws: *Workspace, src: Buf, blk: *const Session.DevBlock, ch: usize, len: usize) !Buf {
-    var cur = src;
-    var dst = ws.blk0;
-    var other = ws.blk1;
-    for (blk.convs1, blk.convs2, 0..) |c1, c2, i| {
-        // activations[::2] pairs with convs1 and [1::2] with convs2: six distinct
-        // activations per block, not three reused.
-        try aaUp(ctx, ws, cur, blk.acts[2 * i], len);
-        try aaDown(ctx, ws, dst, blk.acts[2 * i], len);
-        _ = try conv(ctx, ws, dst, dst, c1, len);
-        try aaSnake(ctx, ws, dst, blk.acts[2 * i + 1], len);
-        _ = try conv(ctx, ws, dst, dst, c2, len);
-        try add(ctx, dst, cur, ch * len);
-        cur = dst;
-        // Ping-pong, so the next iteration's residual source stays intact.
-        const tmp = dst;
-        dst = other;
-        other = tmp;
-    }
-    return cur;
-}
-
-/// Decode normalized stereo latents `[32][2][t]` (planar, the sampler's layout)
-/// to interleaved samples in [-1, 1], `[len][2]`. Same signature as
-/// `minimax_h3_audio.decode`, so the two are drop-in alternatives.
+/// Same signature as `minimax_h3_audio.decode`, so the two are drop-in alternatives.
 pub fn decode(
     dec: *const AudioDecoder,
     sess: *const Session,
@@ -160,73 +97,83 @@ pub fn decode(
     t: usize,
     cancel: ?*std.atomic.Value(bool),
 ) !void {
-    const c_lat = dec.dec_in.in_ch;
-    const samples = ws.shapes.samples;
-    std.debug.assert(z.len == c_lat * audio.stereo * t);
-    std.debug.assert(out.len == samples * audio.stereo);
-    std.debug.assert(samples == t * dec.upsampleFactor());
-
-    // Channel-last from here on, so the denormalize doubles as the transpose.
-    const lat = try gpa.alloc(f32, t * c_lat);
-    defer gpa.free(lat);
-    const tail = try gpa.alloc(f32, samples);
-    defer gpa.free(tail);
-
-    for (0..audio.stereo) |s| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-
-        for (0..t) |i| {
-            for (0..c_lat) |c| {
-                lat[i * c_lat + c] = z[(c * audio.stereo + s) * t + i] * dec.latents_std[c] + dec.latents_mean[c];
-            }
-        }
-
-        try ctx.beginBatch();
-        errdefer ctx.abortBatch();
-        try ctx.tensorUpload(ws.blk0, std.mem.sliceAsBytes(lat));
-        _ = try conv(ctx, ws, ws.blk1, ws.blk0, sess.dec_in, t);
-        _ = try conv(ctx, ws, ws.acc, ws.blk1, sess.conv_pre, t);
-
-        var len = t;
-        for (sess.ups, 0..) |u, i| {
-            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-            const up_len = (len - 1) * u.stride + u.k - 2 * u.padding;
-            const total = up_len * u.out_ch;
-            try ctx.opElt(.convt1d_ca, ws.acc, ws.up, try devBuf(ctx, u.w), try devBuf(ctx, u.bias), .{
-                .u0 = @intCast(total),
-                .u1 = @intCast(u.out_ch),
-                .u2 = @intCast(u.in_ch),
-                .u3 = @intCast(len),
-                .u4 = @intCast(u.k),
-                .u5 = @intCast(u.stride),
-                .f0 = @floatFromInt(u.padding),
-            }, total, 1, 1);
-            len = up_len;
-
-            // The stage's resblocks are SUMMED and averaged, not chained, so each
-            // reads the SAME `up` and the sum lands in `acc`.
-            for (0..dec.n_kernels) |j| {
-                const r = try ampBlock(ctx, ws, ws.up, &sess.blocks[i * dec.n_kernels + j], u.out_ch, len);
-                if (j == 0) {
-                    try ctx.opElt(.copy, r, ws.acc, null, null, .{ .u0 = @intCast(u.out_ch * len) }, u.out_ch * len, 1, 1);
-                } else {
-                    try add(ctx, ws.acc, r, u.out_ch * len);
-                }
-            }
-            try ctx.opElt(.scale_f32, ws.acc, ws.acc, null, null, .{
-                .u0 = @intCast(u.out_ch * len),
-                .f0 = 1.0 / @as(f32, @floatFromInt(dec.n_kernels)),
-            }, u.out_ch * len, 1, 1);
-        }
-
-        try aaSnake(ctx, ws, ws.acc, sess.act_post, len);
-        const post_len = try conv(ctx, ws, ws.blk0, ws.acc, sess.conv_post, len);
-        std.debug.assert(sess.conv_post.out_ch == 1 and post_len == samples);
-        try ctx.endBatch();
-
-        try ctx.tensorDownload(ws.blk0, std.mem.sliceAsBytes(tail));
-        // Clamped to [-1, 1], no tanh and no final bias. The interleave happens
-        // only here, because that is what a container wants.
-        for (0..samples) |i| out[i * audio.stereo + s] = std.math.clamp(tail[i], -1.0, 1.0);
-    }
+    try minimax_h3_audio_dev.decode(Dev{ .ctx = ctx, .ws = ws }, dec, sess, gpa, out, z, t, cancel);
 }
+
+/// The `minimax_h3_audio_dev` adapter.
+const Dev = struct {
+    ctx: *Context,
+    ws: *Workspace,
+
+    pub fn beginBatch(d: Dev) !void {
+        try d.ctx.beginBatch();
+    }
+
+    pub fn endBatch(d: Dev) !void {
+        try d.ctx.endBatch();
+    }
+
+    pub fn abortBatch(d: Dev) void {
+        if (d.ctx.batching) d.ctx.abortBatch();
+    }
+
+    pub fn upload(d: Dev, b: Buf, data: []const f32) !void {
+        try d.ctx.tensorUpload(b, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: Dev, b: Buf, data: []f32) !void {
+        try d.ctx.tensorDownload(b, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn conv(d: Dev, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
+        return convAt(d.ws, dst, src, c, in_len);
+    }
+
+    pub fn convT(d: Dev, dst: Buf, src: Buf, u: DevConvT, len: usize, up_len: usize) !void {
+        const total = up_len * u.out_ch;
+        try d.ctx.opElt(.convt1d_ca, src, dst, try devBuf(d.ctx, u.w), try devBuf(d.ctx, u.bias), .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(u.out_ch),
+            .u2 = @intCast(u.in_ch),
+            .u3 = @intCast(len),
+            .u4 = @intCast(u.k),
+            .u5 = @intCast(u.stride),
+            .f0 = @floatFromInt(u.padding),
+        }, total, 1, 1);
+    }
+
+    pub fn aaUp(d: Dev, src: Buf, act: DevAct, len: usize) !void {
+        const total = 2 * len * act.channels;
+        try d.ctx.opElt(.aa_up_snake, src, d.ws.aa, try devBuf(d.ctx, act.up_filter), try devBuf(d.ctx, act.snake), .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(act.channels),
+            .u2 = @intCast(len),
+            .u3 = @intCast(act.k),
+            .u4 = @intCast(act.upPad()),
+            .u5 = @intCast(act.upSlice()),
+        }, total, 1, 1);
+    }
+
+    pub fn aaDown(d: Dev, dst: Buf, act: DevAct, len: usize) !void {
+        const total = len * act.channels;
+        try d.ctx.opElt(.aa_down, d.ws.aa, dst, try devBuf(d.ctx, act.down_filter), null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(act.channels),
+            .u2 = @intCast(2 * len),
+            .u3 = @intCast(act.k),
+            .u4 = @intCast(act.downPad()),
+        }, total, 1, 1);
+    }
+
+    pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.ctx.opElt(.add, x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn copy(d: Dev, dst: Buf, src: Buf, n: usize) !void {
+        try d.ctx.opElt(.copy, src, dst, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn scale(d: Dev, x: Buf, f: f32, n: usize) !void {
+        try d.ctx.opElt(.scale_f32, x, x, null, null, .{ .u0 = @intCast(n), .f0 = f }, n, 1, 1);
+    }
+};

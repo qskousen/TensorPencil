@@ -19,6 +19,103 @@ const addressing_logical: u32 = 0;
 
 pub const Error = error{ InvalidSpirv, EntryPointNotFound, OutOfMemory };
 
+const op_name: u16 = 5;
+const op_member_name: u16 = 6;
+const op_function: u16 = 54;
+const op_function_end: u16 = 56;
+const op_function_call: u16 = 57;
+const op_execution_mode_id: u16 = 331;
+
+/// A copy of `spv` holding one entry point: its function and every function it reaches,
+/// all module-scope declarations, and no debug names. A driver processes the whole
+/// module it is handed for each pipeline, so one kernel then costs that kernel.
+/// Decorations on removed functions go with them; nothing else may target an id
+/// inside a removed function (Zig emits no such decoration; `forEntry`'s test checks).
+pub fn forEntry(gpa: std.mem.Allocator, spv: []align(4) const u8, entry_name: []const u8) Error![]align(4) u8 {
+    if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
+    const w = std.mem.bytesAsSlice(u32, spv);
+    if (w[0] != magic) return error.InvalidSpirv;
+
+    // Each function's word range and the functions it calls.
+    const Fn = struct { start: usize, end: usize };
+    var fns: std.AutoHashMapUnmanaged(u32, Fn) = .empty;
+    defer fns.deinit(gpa);
+    var calls: std.ArrayList([2]u32) = .empty; // caller, callee
+    defer calls.deinit(gpa);
+    var entry: ?u32 = null;
+    var cur: ?u32 = null;
+    var i: usize = 5;
+    while (i < w.len) {
+        const wc: usize = w[i] >> 16;
+        const op: u16 = @truncate(w[i]);
+        if (wc == 0 or i + wc > w.len) return error.InvalidSpirv;
+        switch (op) {
+            op_entry_point => if (wc >= 4 and std.mem.eql(u8, wordString(w[i + 3 .. i + wc]), entry_name)) {
+                entry = w[i + 2];
+            },
+            op_function => {
+                cur = w[i + 2];
+                try fns.put(gpa, w[i + 2], .{ .start = i, .end = 0 });
+            },
+            op_function_call => try calls.append(gpa, .{ cur orelse return error.InvalidSpirv, w[i + 3] }),
+            op_function_end => {
+                fns.getPtr(cur orelse return error.InvalidSpirv).?.end = i + wc;
+                cur = null;
+            },
+            else => {},
+        }
+        i += wc;
+    }
+    const root = entry orelse return error.EntryPointNotFound;
+
+    var keep: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer keep.deinit(gpa);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, root);
+    while (stack.pop()) |f| {
+        if ((try keep.getOrPut(gpa, f)).found_existing) continue;
+        for (calls.items) |c| if (c[0] == f) try stack.append(gpa, c[1]);
+    }
+
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, w[0..5]);
+    i = 5;
+    while (i < w.len) {
+        const wc: usize = w[i] >> 16;
+        const op: u16 = @truncate(w[i]);
+        const insn = w[i .. i + wc];
+        const drop = switch (op) {
+            op_name, op_member_name => true,
+            op_entry_point => insn[2] != root,
+            op_execution_mode, op_execution_mode_id => insn[1] != root,
+            op_decorate => fns.contains(insn[1]) and !keep.contains(insn[1]),
+            op_function => {
+                const f = fns.get(insn[2]).?;
+                if (!keep.contains(insn[2])) {
+                    i = f.end;
+                    continue;
+                }
+                try out.appendSlice(gpa, w[f.start..f.end]);
+                i = f.end;
+                continue;
+            },
+            else => false,
+        };
+        if (!drop) try out.appendSlice(gpa, insn);
+        i += wc;
+    }
+    const words = try out.toOwnedSlice(gpa);
+    return std.mem.sliceAsBytes(words);
+}
+
+/// A literal string operand: bytes up to the first NUL.
+fn wordString(ws: []const u32) []const u8 {
+    const bytes = std.mem.sliceAsBytes(ws);
+    return bytes[0 .. std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len];
+}
+
 /// Return a copy of `spv` with `OpExecutionMode <entry> LocalSize x y z`
 /// inserted after the OpEntryPoint whose name matches `entry_name`.
 pub fn withLocalSize(gpa: std.mem.Allocator, spv: []const u8, entry_name: []const u8, x: u32, y: u32, z: u32) Error![]align(4) u8 {
@@ -290,4 +387,49 @@ test "patches local size after entry point" {
     try std.testing.expectEqual(@as(u32, 2), words[13]);
 
     try std.testing.expectError(error.EntryPointNotFound, withLocalSize(gpa, module.items, "other", 1, 1, 1));
+}
+
+test "forEntry cuts each dual entry point to a module that resolves" {
+    const gpa = std.testing.allocator;
+    const raw = @embedFile("dual_spv");
+    const full = try gpa.alignedAlloc(u8, .of(u32), raw.len);
+    defer gpa.free(full);
+    @memcpy(full, raw);
+    const fw = std.mem.bytesAsSlice(u32, full);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    var i: usize = 5;
+    while (i < fw.len) : (i += fw[i] >> 16) {
+        if (@as(u16, @truncate(fw[i])) == op_entry_point) try names.append(gpa, wordString(fw[i + 3 .. i + (fw[i] >> 16)]));
+    }
+    try std.testing.expect(names.items.len > 100);
+    for (names.items) |name| {
+        const one = try forEntry(gpa, full, name);
+        defer gpa.free(one);
+        errdefer std.debug.print("forEntry({s})\n", .{name});
+        try std.testing.expect(one.len < full.len);
+        const w = std.mem.bytesAsSlice(u32, one);
+        // Every id a call or a decoration names is still defined here.
+        var defined: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer defined.deinit(gpa);
+        var entries: usize = 0;
+        i = 5;
+        while (i < w.len) : (i += w[i] >> 16) {
+            const op: u16 = @truncate(w[i]);
+            const wc = w[i] >> 16;
+            if (op == op_entry_point) entries += 1;
+            // Result ids: a type's is word 1, a typed result's word 2.
+            if (op >= 19 and op <= 39) try defined.put(gpa, w[i + 1], {});
+            if ((op >= 41 and op <= 46) or op == 54 or op == 59 or op == 55) try defined.put(gpa, w[i + 2], {});
+            _ = wc;
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries);
+        i = 5;
+        while (i < w.len) : (i += w[i] >> 16) {
+            const op: u16 = @truncate(w[i]);
+            if (op == op_function_call) try std.testing.expect(defined.contains(w[i + 3]));
+            if (op == op_decorate) try std.testing.expect(defined.contains(w[i + 1]));
+        }
+    }
+    try std.testing.expectError(error.EntryPointNotFound, forEntry(gpa, full, "no_such_kernel"));
 }

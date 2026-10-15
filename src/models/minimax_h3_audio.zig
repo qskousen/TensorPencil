@@ -27,6 +27,7 @@
 //! descript-audio-codec (MIT) and NVIDIA BigVGAN (MIT).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
@@ -790,7 +791,7 @@ test "the audio decode matches the reference at a toy width" {
 }
 
 const test_gate = @import("../test_gate.zig");
-const real_audio_vae = "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+const real_audio_vae = build_options.model_root ++ "/vae/minimax_h3_audio_vae_fp32.safetensors";
 
 // ── Device preparation ────────────────────────────────────────────────────────
 // Every weight permuted, exponentiated and converted once, plus the shape walk
@@ -831,28 +832,9 @@ fn actSupported(a: Activation) bool {
 
 // --- session --------------------------------------------------------------
 
-/// A conv ready for the device: the permuted f16 weight plus the shape the
-/// im2col and the GEMM need. Host memory, uploaded on first use through the
-/// backend's pointer-keyed weight cache.
-pub const DevConv = struct {
-    /// `[out_ch][k * in_ch]` f16.
-    w16: []const u8,
-    /// The same weight in f32, for the `f32_gemm` diagnostic only.
-    w32: []const f32,
-    bias: ?[]const f32,
-    out_ch: usize,
-    in_ch: usize,
-    k: usize,
-    dilation: usize,
-    padding: usize,
-    /// 1 for every conv in the vocoder; the ENCODER's downsampling convs are the
-    /// only strided ones, and they share this type through `minimax_h3_audio_encode`.
-    stride: usize = 1,
-
-    pub fn plen(self: DevConv) usize {
-        return self.k * self.in_ch;
-    }
-};
+/// A conv ready for the device: its weight permuted to `[out_ch][k * in_ch]` f32 (see
+/// `devConv`). f32 because the vocoder's GEMMs are, and that is measured (BACKEND.md).
+pub const DevConv = ops.conv.Conv1dGemm;
 
 /// A transposed conv ready for the device: `[k][in_ch][out_ch]` f32, plus a bias
 /// that is always present here (the reference's `ups` all carry one).
@@ -898,6 +880,23 @@ pub const DevAct = struct {
 ///
 /// Built once per session rather than per decode: the permute reads ~250 MB of
 /// f32 conv weights, which is far more than a decode's own traffic.
+/// Stereo channel `s` of the normalized latents `[c][2][t]` as denormalized
+/// channel-last rows `[t][c]`, the device arms' input: the denormalize doubles as the
+/// transpose.
+pub fn channelLatent(dec: *const AudioDecoder, lat: []f32, z: []const f32, t: usize, s: usize) void {
+    const c_lat = dec.dec_in.in_ch;
+    for (0..t) |i| {
+        for (0..c_lat) |c| lat[i * c_lat + c] = z[(c * stereo + s) * t + i] * dec.latents_std[c] + dec.latents_mean[c];
+    }
+}
+
+/// One channel's samples into the interleaved `[len][2]` output, clamped to [-1, 1]
+/// with no tanh and no final bias. The interleave happens only here, because that is
+/// what a container wants.
+pub fn storeChannel(out: []f32, tail: []const f32, s: usize) void {
+    for (tail, 0..) |v, i| out[i * stereo + s] = std.math.clamp(v, -1.0, 1.0);
+}
+
 pub const DevSession = struct {
     arena: std.heap.ArenaAllocator,
     dec_in: DevConv,
@@ -953,24 +952,20 @@ pub const DevSession = struct {
         self.* = undefined;
     }
 
-    /// Host bytes the permuted weights hold, which is also what they cost
-    /// resident on the device (f16 for the convs, f32 for the transposed ones).
+    /// Host bytes the permuted weights hold, which is also what they cost resident on
+    /// the device: every one is f32.
     pub fn bytes(self: *const DevSession) usize {
-        var n: usize = self.dec_in.w16.len + self.conv_pre.w16.len + self.conv_post.w16.len;
+        var n: usize = self.dec_in.w.bytes.len + self.conv_pre.w.bytes.len + self.conv_post.w.bytes.len;
         for (self.ups) |u| n += u.w.len * 4;
         for (self.blocks) |b| {
-            for (b.convs1) |c| n += c.w16.len;
-            for (b.convs2) |c| n += c.w16.len;
+            for (b.convs1) |c| n += c.w.bytes.len;
+            for (b.convs2) |c| n += c.w.bytes.len;
         }
         return n;
     }
 };
 
-fn f32ToF16(v: f32) u16 {
-    return @bitCast(@as(f16, @floatCast(v)));
-}
-
-/// `[out_ch][in_ch][k]` f32 -> `[out_ch][k][in_ch]` f16.
+/// `[out_ch][in_ch][k]` -> `[out_ch][k][in_ch]`.
 ///
 /// The permutation is what lets the im2col write its columns in the coalesced
 /// `(tap, in_ch)` order. Pairing the two the other way is finite and wrong: every
@@ -979,25 +974,17 @@ pub fn devConv(a: std.mem.Allocator, c: Conv1d) !DevConv {
     std.debug.assert(c.groups == 1 and c.stride == 1);
     const n = c.out_ch * c.in_ch * c.k;
     std.debug.assert(c.w.len == n);
-    const w16 = try a.alloc(u16, n);
     const w32 = try a.alloc(f32, n);
     for (0..c.out_ch) |oc| {
         const src = c.w[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
-        const d16 = w16[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
         const d32 = w32[oc * c.in_ch * c.k ..][0 .. c.in_ch * c.k];
         for (0..c.in_ch) |ic| {
-            for (0..c.k) |j| {
-                const v = src[ic * c.k + j];
-                d16[j * c.in_ch + ic] = f32ToF16(v);
-                d32[j * c.in_ch + ic] = v;
-            }
+            for (0..c.k) |j| d32[j * c.in_ch + ic] = src[ic * c.k + j];
         }
     }
     return .{
-        .w16 = std.mem.sliceAsBytes(w16),
-        .w32 = w32,
+        .w = Weight.fromF32(w32, c.out_ch, c.k * c.in_ch),
         .bias = c.b,
-        .out_ch = c.out_ch,
         .in_ch = c.in_ch,
         .k = c.k,
         .dilation = c.dilation,

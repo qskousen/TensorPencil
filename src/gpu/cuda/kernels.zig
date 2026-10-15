@@ -7,6 +7,7 @@ const std = @import("std");
 const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const elt = @import("elt.zig"); // KvFmt only (elt reaches no further than wnoise/ptx, so no cycle)
+const Dt = @import("../kernels/dual_table.zig").Dt;
 const Context = ctxmod.Context;
 
 /// Whether an environment variable is set, for the kernel-shape A/B switches. Its own
@@ -600,6 +601,8 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const r_k = try b.reg(.b32);
     const rd_as = try b.reg(.b64);
     const rd_ws = try b.reg(.b64);
+    const rd_bias = try b.reg(.b64);
+    const p_bias = try b.reg(.pred);
     try b.linef("ld.param.u64 {s}, [p_a];", .{rd_a});
     try b.linef("ld.param.u64 {s}, [p_b];", .{rd_b});
     try b.linef("ld.param.u64 {s}, [p_c];", .{rd_c});
@@ -613,6 +616,10 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
         try b.linef("ld.param.u64 {s}, [p_ws];", .{rd_ws});
         try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_as, rd_as });
         try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_ws, rd_ws });
+        // A null bias adds nothing; the adds are predicated so -0 stays -0.
+        try b.linef("ld.param.u64 {s}, [p_bias];", .{rd_bias});
+        try b.linef("setp.ne.u64 {s}, {s}, 0;", .{ p_bias, rd_bias });
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_bias, rd_bias });
     }
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_a, rd_a });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_b, rd_b });
@@ -913,7 +920,10 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const f_ws0 = try b.reg(.f32);
     const f_ws1 = try b.reg(.f32);
     const f_y = try b.reg(.f32);
+    const f_b0 = try b.reg(.f32);
+    const f_b1 = try b.reg(.f32);
     const rd_sc = try b.reg(.b64);
+    const rd_bsc = try b.reg(.b64);
     var mi2: usize = 0;
     while (mi2 < MT) : (mi2 += 1) {
         try b.linef("add.u32 {s}, {s}, {d};", .{ r_row_mi, r_crow, mi2 * 16 });
@@ -941,26 +951,33 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
                 // weight_scale[col] and [col+1], col = r_ccol + nj*8
                 try b.linef("add.u32 {s}, {s}, {d};", .{ r_idx, r_ccol, nj * 8 });
                 try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_sc, r_idx });
+                try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bsc, rd_bias, rd_sc });
                 try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sc, rd_ws, rd_sc });
                 try b.linef("ld.global.f32 {s}, [{s}];", .{ f_ws0, rd_sc });
                 try b.linef("ld.global.f32 {s}, [{s}+4];", .{ f_ws1, rd_sc });
+                try b.linef("@{s} ld.global.f32 {s}, [{s}];", .{ p_bias, f_b0, rd_bsc });
+                try b.linef("@{s} ld.global.f32 {s}, [{s}+4];", .{ p_bias, f_b1, rd_bsc });
                 // y = f32(acc) * act_scale[row] * weight_scale[col]
                 try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[0] });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as0 });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws0 });
+                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b0 });
                 try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp, f_y });
                 try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[1] });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as0 });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws1 });
+                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b1 });
                 try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp, f_y });
                 try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp2, rd_cp, rd_8n4 });
                 try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[2] });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as8 });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws0 });
+                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b0 });
                 try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp2, f_y });
                 try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[3] });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as8 });
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws1 });
+                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b1 });
                 try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp2, f_y });
             }
         }
@@ -969,7 +986,7 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
     const params = if (fuse)
-        "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws"
+        "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias"
     else
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k";
     const entry = if (bits == 8)
@@ -1057,16 +1074,16 @@ pub fn prepButterflyIters(cols: usize) usize {
     return (nbut + 255) / 256;
 }
 
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool, block: PrepBlock, chunk: usize, rotate: bool, stage_global: bool) ![:0]u8 {
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_dt: Dt, block: PrepBlock, chunk: usize, rotate: bool, stage_global: bool) ![:0]u8 {
     const bq = block != .none; // a packed weight input, whatever its format
     std.debug.assert(bits == 8 or bits == 4);
-    std.debug.assert(!bq or !in_f16);
+    std.debug.assert(!bq or in_dt == .f32);
     std.debug.assert(!bq or cols % 256 == 0);
     std.debug.assert(chunk == 0 or (bq and cols % chunk == 0 and chunk % 1024 == 0));
     // Everything below sizes off the per-block WORK, which is the chunk when chunked.
     const work = if (chunk != 0) chunk else cols;
     const nchunk = if (chunk != 0) cols / chunk else 1;
-    const in_bytes: usize = if (in_f16) 2 else 4; // activation elem width (f16 chain)
+    const in_bytes: usize = in_dt.bytes();
     const row_bytes: usize = if (bq) block.bytesFor(cols) else cols * in_bytes;
     const per_word = 32 / bits; // s8: 4 elements/u32 ; s4: 8 elements/u32
     const per_word_log2 = std.math.log2_int(usize, per_word);
@@ -1375,17 +1392,25 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         }
     } else {
         try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_t });
-        try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, if (in_f16) @as(usize, 1) else 2 });
+        try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, std.math.log2_int(usize, in_bytes) });
         try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
         {
-            const r_h = if (in_f16) try b.reg(.b16) else "";
+            const r_h = if (in_dt == .f16) try b.reg(.b16) else "";
+            const r_w = if (in_dt == .bf16) try b.reg(.b32) else "";
             var i: usize = 0;
             while (i < load_iters) : (i += 1) {
-                if (in_f16) {
-                    try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ r_h, rd_g, i * 256 * 2 });
-                    try b.linef("cvt.f32.f16 {s}, {s};", .{ r_ftmp, r_h });
-                } else {
-                    try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
+                switch (in_dt) {
+                    .f16 => {
+                        try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ r_h, rd_g, i * 256 * 2 });
+                        try b.linef("cvt.f32.f16 {s}, {s};", .{ r_ftmp, r_h });
+                    },
+                    // bf16 is the top half of an f32: widen by shifting, no cvt needed.
+                    .bf16 => {
+                        try b.linef("ld.global.u16 {s}, [{s}+{d}];", .{ r_w, rd_g, i * 256 * 2 });
+                        try b.linef("shl.b32 {s}, {s}, 16;", .{ r_w, r_w });
+                        try b.linef("mov.b32 {s}, {s};", .{ r_ftmp, r_w });
+                    },
+                    .f32 => try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 }),
                 }
                 try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sh, i * 256 * 4, r_ftmp });
             }
@@ -1639,115 +1664,96 @@ pub fn prepNeedsGlobalStage(cols: usize, shared_limit: usize) bool {
     return prepSharedBytes(cols, false) > shared_limit;
 }
 
-/// int8 rescale: y[i][j] = f32(acc_s32[i][j]) * act_scale[i] * weight_scale[j].
-/// acc is [m][rows] s32; grid ceil(total/256), block 256. Entry `irescale`.
-pub const irescale_ptx: [:0]const u8 = ptx.preamble ++
-    \\.visible .entry irescale(
-    \\    .param .u64 p_acc,
-    \\    .param .u64 p_y,
-    \\    .param .u64 p_as,
-    \\    .param .u64 p_ws,
-    \\    .param .u32 p_rows,
-    \\    .param .u32 p_total
-    \\)
-    \\{
-    \\    .reg .pred %p<2>;
-    \\    .reg .b32 %r<12>;
-    \\    .reg .f32 %f<5>;
-    \\    .reg .b64 %rd<16>;
-    \\    ld.param.u64 %rd1, [p_acc];
-    \\    ld.param.u64 %rd2, [p_y];
-    \\    ld.param.u64 %rd3, [p_as];
-    \\    ld.param.u64 %rd4, [p_ws];
-    \\    ld.param.u32 %r1, [p_rows];
-    \\    ld.param.u32 %r2, [p_total];
-    \\    mov.u32 %r3, %ctaid.x;
-    \\    mov.u32 %r4, %ntid.x;
-    \\    mov.u32 %r5, %tid.x;
-    \\    mad.lo.s32 %r6, %r3, %r4, %r5;
-    \\    setp.ge.u32 %p1, %r6, %r2;
-    \\    @%p1 bra DONE;
-    \\    div.u32 %r7, %r6, %r1;
-    \\    rem.u32 %r8, %r6, %r1;
-    \\    cvta.to.global.u64 %rd1, %rd1;
-    \\    cvta.to.global.u64 %rd2, %rd2;
-    \\    cvta.to.global.u64 %rd3, %rd3;
-    \\    cvta.to.global.u64 %rd4, %rd4;
-    \\    mul.wide.u32 %rd5, %r6, 4;
-    \\    add.s64 %rd6, %rd1, %rd5;
-    \\    ld.global.s32 %r9, [%rd6];
-    \\    cvt.rn.f32.s32 %f1, %r9;
-    \\    mul.wide.u32 %rd7, %r7, 4;
-    \\    add.s64 %rd8, %rd3, %rd7;
-    \\    ld.global.f32 %f2, [%rd8];
-    \\    mul.wide.u32 %rd9, %r8, 4;
-    \\    add.s64 %rd10, %rd4, %rd9;
-    \\    ld.global.f32 %f3, [%rd10];
-    \\    mul.f32 %f4, %f1, %f2;
-    \\    mul.f32 %f4, %f4, %f3;
-    \\    add.s64 %rd11, %rd2, %rd5;
-    \\    st.global.f32 [%rd11], %f4;
-    \\DONE:
-    \\    ret;
-    \\}
-;
-
-/// f16-output int8 rescale (the c16 chain): y[i][j] (f16) = f32(acc_s32[i][j]) *
-/// act_scale[i] * weight_scale[j]. acc is [m][rows] s32 (×4), y is f16 (×2).
-/// grid ceil(total/256), block 256. Entry `irescale_h16`.
-pub const irescale_h16_ptx: [:0]const u8 = ptx.preamble ++
-    \\.visible .entry irescale_h16(
-    \\    .param .u64 p_acc,
-    \\    .param .u64 p_y,
-    \\    .param .u64 p_as,
-    \\    .param .u64 p_ws,
-    \\    .param .u32 p_rows,
-    \\    .param .u32 p_total
-    \\)
-    \\{
-    \\    .reg .pred %p<2>;
-    \\    .reg .b32 %r<12>;
-    \\    .reg .f32 %f<5>;
-    \\    .reg .b16 %h<2>;
-    \\    .reg .b64 %rd<16>;
-    \\    ld.param.u64 %rd1, [p_acc];
-    \\    ld.param.u64 %rd2, [p_y];
-    \\    ld.param.u64 %rd3, [p_as];
-    \\    ld.param.u64 %rd4, [p_ws];
-    \\    ld.param.u32 %r1, [p_rows];
-    \\    ld.param.u32 %r2, [p_total];
-    \\    mov.u32 %r3, %ctaid.x;
-    \\    mov.u32 %r4, %ntid.x;
-    \\    mov.u32 %r5, %tid.x;
-    \\    mad.lo.s32 %r6, %r3, %r4, %r5;
-    \\    setp.ge.u32 %p1, %r6, %r2;
-    \\    @%p1 bra DONE;
-    \\    div.u32 %r7, %r6, %r1;
-    \\    rem.u32 %r8, %r6, %r1;
-    \\    cvta.to.global.u64 %rd1, %rd1;
-    \\    cvta.to.global.u64 %rd2, %rd2;
-    \\    cvta.to.global.u64 %rd3, %rd3;
-    \\    cvta.to.global.u64 %rd4, %rd4;
-    \\    mul.wide.u32 %rd5, %r6, 4;
-    \\    add.s64 %rd6, %rd1, %rd5;
-    \\    ld.global.s32 %r9, [%rd6];
-    \\    cvt.rn.f32.s32 %f1, %r9;
-    \\    mul.wide.u32 %rd7, %r7, 4;
-    \\    add.s64 %rd8, %rd3, %rd7;
-    \\    ld.global.f32 %f2, [%rd8];
-    \\    mul.wide.u32 %rd9, %r8, 4;
-    \\    add.s64 %rd10, %rd4, %rd9;
-    \\    ld.global.f32 %f3, [%rd10];
-    \\    mul.f32 %f4, %f1, %f2;
-    \\    mul.f32 %f4, %f4, %f3;
-    \\    cvt.rn.f16.f32 %h0, %f4;
-    \\    mul.wide.u32 %rd12, %r6, 2;
-    \\    add.s64 %rd11, %rd2, %rd12;
-    \\    st.global.b16 [%rd11], %h0;
-    \\DONE:
-    \\    ret;
-    \\}
-;
+/// int8 rescale: y[i][j] = f32(acc_s32[i][j]) * act_scale[i] * weight_scale[j] (+ bias[j]),
+/// y stored at `out`, the bias added before the one rounding. acc is [m][rows] s32; a
+/// null `p_bias` adds nothing. grid ceil(total/256), block 256. Entry `irescale`.
+pub fn irescalePtx(comptime out: Dt) [:0]const u8 {
+    const store = switch (out) {
+        .f32 =>
+        \\    add.s64 %rd11, %rd2, %rd5;
+        \\    st.global.f32 [%rd11], %f4;
+        ,
+        .f16 =>
+        \\    cvt.rn.f16.f32 %h0, %f4;
+        \\    mul.wide.u32 %rd12, %r6, 2;
+        \\    add.s64 %rd11, %rd2, %rd12;
+        \\    st.global.b16 [%rd11], %h0;
+        ,
+        // Round to nearest even by integer add, as `dual.bf16Bits` does.
+        .bf16 =>
+        \\    mov.b32 %r10, %f4;
+        \\    shr.u32 %r11, %r10, 16;
+        \\    and.b32 %r11, %r11, 1;
+        \\    add.u32 %r11, %r11, 32767;
+        \\    add.u32 %r10, %r10, %r11;
+        \\    mov.b32 {%h1, %h0}, %r10;
+        \\    mul.wide.u32 %rd12, %r6, 2;
+        \\    add.s64 %rd11, %rd2, %rd12;
+        \\    st.global.b16 [%rd11], %h0;
+        ,
+    };
+    return ptx.preamble ++
+        \\.visible .entry irescale(
+        \\    .param .u64 p_acc,
+        \\    .param .u64 p_y,
+        \\    .param .u64 p_as,
+        \\    .param .u64 p_ws,
+        \\    .param .u32 p_rows,
+        \\    .param .u32 p_total,
+        \\    .param .u64 p_bias
+        \\)
+        \\{
+        \\    .reg .pred %p<2>;
+        \\    .reg .b32 %r<12>;
+        \\    .reg .f32 %f<5>;
+        \\    .reg .b16 %h<2>;
+        \\    .reg .b64 %rd<16>;
+        \\    ld.param.u64 %rd1, [p_acc];
+        \\    ld.param.u64 %rd2, [p_y];
+        \\    ld.param.u64 %rd3, [p_as];
+        \\    ld.param.u64 %rd4, [p_ws];
+        \\    ld.param.u32 %r1, [p_rows];
+        \\    ld.param.u32 %r2, [p_total];
+        \\    mov.u32 %r3, %ctaid.x;
+        \\    mov.u32 %r4, %ntid.x;
+        \\    mov.u32 %r5, %tid.x;
+        \\    mad.lo.s32 %r6, %r3, %r4, %r5;
+        \\    setp.ge.u32 %p1, %r6, %r2;
+        \\    @%p1 bra DONE;
+        \\    div.u32 %r7, %r6, %r1;
+        \\    rem.u32 %r8, %r6, %r1;
+        \\    cvta.to.global.u64 %rd1, %rd1;
+        \\    cvta.to.global.u64 %rd2, %rd2;
+        \\    cvta.to.global.u64 %rd3, %rd3;
+        \\    cvta.to.global.u64 %rd4, %rd4;
+        \\    mul.wide.u32 %rd5, %r6, 4;
+        \\    add.s64 %rd6, %rd1, %rd5;
+        \\    ld.global.s32 %r9, [%rd6];
+        \\    cvt.rn.f32.s32 %f1, %r9;
+        \\    mul.wide.u32 %rd7, %r7, 4;
+        \\    add.s64 %rd8, %rd3, %rd7;
+        \\    ld.global.f32 %f2, [%rd8];
+        \\    mul.wide.u32 %rd9, %r8, 4;
+        \\    add.s64 %rd10, %rd4, %rd9;
+        \\    ld.global.f32 %f3, [%rd10];
+        \\    mul.f32 %f4, %f1, %f2;
+        \\    mul.f32 %f4, %f4, %f3;
+        \\    ld.param.u64 %rd13, [p_bias];
+        \\    setp.eq.u64 %p0, %rd13, 0;
+        \\    @%p0 bra SCALED;
+        \\    cvta.to.global.u64 %rd13, %rd13;
+        \\    add.s64 %rd14, %rd13, %rd9;
+        \\    ld.global.f32 %f3, [%rd14];
+        \\    add.rn.f32 %f4, %f4, %f3;
+        \\SCALED:
+        \\
+    ++ store ++ "\n" ++
+        \\DONE:
+        \\    ret;
+        \\}
+        \\
+    ;
+}
 
 /// f16 tensor-core GEMM: C[m][n] (f32) = A(f16)[m][k] @ B(f16)[n][k]^T. The
 /// attention building block (scores = Q@K^T; P@V with V pre-transposed). Same
@@ -2968,7 +2974,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 4, false, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, 4, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3022,7 +3028,8 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var pk: u32 = @intCast(cols);
         var pas2 = as_d.ptr;
         var pws2 = ws_d.ptr;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas2), @ptrCast(&pws2) };
+        var no_bias: u64 = 0;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas2), @ptrCast(&pws2), @ptrCast(&no_bias) };
         try ctx.launch(f_gemm, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pg);
 
         const yg = try gpa.alloc(u8, m * rows * 4);
@@ -3088,7 +3095,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     defer gmod.unload(ctx);
     const f_gemm = try gmod.getFunction(ctx, "igemm_pipe");
 
-    var rmod = try ctx.loadModule(irescale_ptx);
+    var rmod = try ctx.loadModule(irescalePtx(.f32));
     defer rmod.unload(ctx);
     const f_rescale = try rmod.getFunction(ctx, "irescale");
 
@@ -3115,7 +3122,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, 8, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3173,7 +3180,8 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var rws = ws_d.ptr;
         var rrows: u32 = @intCast(rows);
         var rtot: u32 = total;
-        var pr = [_]?*anyopaque{ @ptrCast(&racc), @ptrCast(&ry), @ptrCast(&ras), @ptrCast(&rws), @ptrCast(&rrows), @ptrCast(&rtot) };
+        var no_bias: u64 = 0;
+        var pr = [_]?*anyopaque{ @ptrCast(&racc), @ptrCast(&ry), @ptrCast(&ras), @ptrCast(&rws), @ptrCast(&rrows), @ptrCast(&rtot), @ptrCast(&no_bias) };
         try ctx.launch(f_rescale, .{ (total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, 0, &pr);
 
         const yg = try gpa.alloc(u8, m * rows * 4);
@@ -3232,7 +3240,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var fk2: u32 = @intCast(cols);
         var fas = as_d.ptr;
         var fws = ws_d.ptr;
-        var pf = [_]?*anyopaque{ @ptrCast(&fa2), @ptrCast(&fb2), @ptrCast(&fc2), @ptrCast(&fn2), @ptrCast(&fk2), @ptrCast(&fas), @ptrCast(&fws) };
+        var pf = [_]?*anyopaque{ @ptrCast(&fa2), @ptrCast(&fb2), @ptrCast(&fc2), @ptrCast(&fn2), @ptrCast(&fk2), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias) };
         try ctx.launch(f_fused, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pf);
         try ctx.download(y_d, yg);
         var num_fused: f64 = 0;
@@ -3241,9 +3249,37 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
             num_fused += d * d;
         }
         const rel_fused = @sqrt(num_fused / den);
-        try stdout.print("i8 linear {d}x{d}x{d}: rel vs cpu-sim {d:.6} (wiring), rel vs f32 {d:.4} (int8 acc), fused {d:.6}\n", .{ m, rows, cols, rel_sim, rel_truth, rel_fused });
+
+        // Both epilogues again with a bias at the output's own RMS.
+        const rms: f64 = @sqrt(den / @as(f64, @floatFromInt(m * rows)));
+        const bias = try gpa.alloc(f32, rows);
+        defer gpa.free(bias);
+        for (bias, 0..) |*v, j| v.* = @floatCast(rms * @sin(@as(f64, @floatFromInt(j)) * 0.37));
+        var bias_d = try ctx.alloc(rows * 4);
+        defer ctx.free(&bias_d);
+        try ctx.upload(bias_d, std.mem.sliceAsBytes(bias));
+        var rel_bias = [2]f64{ 0, 0 };
+        for (&rel_bias, 0..) |*rel, pass| {
+            no_bias = bias_d.ptr;
+            defer no_bias = 0;
+            if (pass == 0)
+                try ctx.launch(f_fused, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pf)
+            else
+                try ctx.launch(f_rescale, .{ (total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, 0, &pr);
+            try ctx.download(y_d, yg);
+            var num: f64 = 0;
+            var den_b: f64 = 0;
+            for (0..m) |i| for (0..rows) |j| {
+                const want = sim_arr[i * rows + j] + bias[j];
+                const d = @as(f64, y_gpu[i * rows + j]) - want;
+                num += d * d;
+                den_b += want * want;
+            };
+            rel.* = @sqrt(num / den_b);
+        }
+        try stdout.print("i8 linear {d}x{d}x{d}: rel vs cpu-sim {d:.6} (wiring), rel vs f32 {d:.4} (int8 acc), fused {d:.6}, +bias fused {d:.6} irescale {d:.6}\n", .{ m, rows, cols, rel_sim, rel_truth, rel_fused, rel_bias[0], rel_bias[1] });
         try stdout.flush();
-        if (rel_sim > 1e-3 or rel_truth > 0.03 or rel_fused > 1e-3) return error.CudaError;
+        if (rel_sim > 1e-3 or rel_truth > 0.03 or rel_fused > 1e-3 or rel_bias[0] > 1e-3 or rel_bias[1] > 1e-3) return error.CudaError;
     }
     _ = io;
 
@@ -3260,7 +3296,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, 8, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3300,12 +3336,13 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var rws = ws_d.ptr;
         var rrows: u32 = @intCast(rows);
         var rtot: u32 = total;
-        var pr = [_]?*anyopaque{ @ptrCast(&racc), @ptrCast(&ry), @ptrCast(&ras), @ptrCast(&rws), @ptrCast(&rrows), @ptrCast(&rtot) };
+        var no_bias: u64 = 0;
+        var pr = [_]?*anyopaque{ @ptrCast(&racc), @ptrCast(&ry), @ptrCast(&ras), @ptrCast(&rws), @ptrCast(&rrows), @ptrCast(&rtot), @ptrCast(&no_bias) };
 
         // fused GEMM params (rescale in C-store; writes y_d directly)
         var fas = as_d.ptr;
         var fws = ws_d.ptr;
-        var pfz = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&ry), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&fas), @ptrCast(&fws) };
+        var pfz = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&ry), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias) };
         const gg = [3]u32{ @intCast(rows / 128), @intCast(m / 128), 1 };
         const gb = [3]u32{ 128, 1, 1 };
 
@@ -3645,81 +3682,99 @@ pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     try stdout.print("cuda attention OK\n", .{});
 }
 
-/// Naive f32 register GEMM: y[m][rows] = scale*(x[m][cols] @ W(f32)[rows][cols]^T)
-/// (+bias[rows]); y_off/x_off are ELEMENT offsets to the first row. One thread
-/// per output element. For the non-int8 first/last DiT linears (small). Entry
-/// `f32gemm`. grid ceil(m*rows/256), block 256.
-pub const f32gemm_ptx: [:0]const u8 = ptx.preamble ++
-    \\.visible .entry f32gemm(
-    \\    .param .u64 p_y, .param .u64 p_x, .param .u64 p_w, .param .u64 p_bias,
-    \\    .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_total,
-    \\    .param .f32 p_scale, .param .u32 p_yoff, .param .u32 p_xoff, .param .u32 p_hasbias
-    \\)
-    \\{
-    \\    .reg .pred %p<3>;
-    \\    .reg .b32 %r<20>;
-    \\    .reg .f32 %f<6>;
-    \\    .reg .b64 %rd<16>;
-    \\    mov.u32 %r1, %ctaid.x;
-    \\    mov.u32 %r2, %ntid.x;
-    \\    mov.u32 %r3, %tid.x;
-    \\    mad.lo.s32 %r4, %r1, %r2, %r3;
-    \\    ld.param.u32 %r5, [p_total];
-    \\    setp.ge.u32 %p1, %r4, %r5;
-    \\    @%p1 bra DONE;
-    \\    ld.param.u32 %r6, [p_rows];
-    \\    ld.param.u32 %r7, [p_cols];
-    \\    ld.param.f32 %f1, [p_scale];
-    \\    ld.param.u32 %r8, [p_yoff];
-    \\    ld.param.u32 %r9, [p_xoff];
-    \\    ld.param.u32 %r10, [p_hasbias];
-    \\    ld.param.u64 %rd1, [p_y];
-    \\    ld.param.u64 %rd2, [p_x];
-    \\    ld.param.u64 %rd3, [p_w];
-    \\    ld.param.u64 %rd4, [p_bias];
-    \\    cvta.to.global.u64 %rd1, %rd1;
-    \\    cvta.to.global.u64 %rd2, %rd2;
-    \\    cvta.to.global.u64 %rd3, %rd3;
-    \\    cvta.to.global.u64 %rd4, %rd4;
-    \\    div.u32 %r11, %r4, %r6;
-    \\    mul.lo.s32 %r12, %r11, %r6;
-    \\    sub.s32 %r13, %r4, %r12;
-    \\    mad.lo.s32 %r14, %r11, %r7, %r9;
-    \\    mul.lo.s32 %r15, %r13, %r7;
-    \\    mul.wide.u32 %rd5, %r14, 4;
-    \\    add.s64 %rd6, %rd2, %rd5;
-    \\    mul.wide.u32 %rd7, %r15, 4;
-    \\    add.s64 %rd8, %rd3, %rd7;
-    \\    mov.f32 %f2, 0f00000000;
-    \\    mov.u32 %r16, 0;
-    \\LOOP:
-    \\    setp.ge.u32 %p2, %r16, %r7;
-    \\    @%p2 bra ENDL;
-    \\    ld.global.f32 %f3, [%rd6];
-    \\    ld.global.f32 %f4, [%rd8];
-    \\    fma.rn.f32 %f2, %f3, %f4, %f2;
-    \\    add.s64 %rd6, %rd6, 4;
-    \\    add.s64 %rd8, %rd8, 4;
-    \\    add.u32 %r16, %r16, 1;
-    \\    bra LOOP;
-    \\ENDL:
-    \\    mul.f32 %f2, %f2, %f1;
-    \\    setp.eq.u32 %p2, %r10, 0;
-    \\    @%p2 bra NOBIAS;
-    \\    mul.wide.u32 %rd9, %r13, 4;
-    \\    add.s64 %rd10, %rd4, %rd9;
-    \\    ld.global.f32 %f5, [%rd10];
-    \\    add.f32 %f2, %f2, %f5;
-    \\NOBIAS:
-    \\    mad.lo.s32 %r17, %r11, %r6, %r13;
-    \\    add.s32 %r18, %r17, %r8;
-    \\    mul.wide.u32 %rd11, %r18, 4;
-    \\    add.s64 %rd12, %rd1, %rd11;
-    \\    st.global.f32 [%rd12], %f2;
-    \\DONE:
-    \\    ret;
-    \\}
-;
+/// `y[yoff + r*n + c] = scale * (x[xoff + r*k ..] . w[c*k ..]) (+ bias[c])` in true f32:
+/// a 16x16 block owns a 64x64 tile of y, each thread a 4x4 of it at rows `ty + 16i`,
+/// columns `tx + 16j`, with x and w staged through shared memory 16 of k at a time
+/// (`As[k][m]`, `Bs[k][n]`, so a k step is one broadcast and one conflict-free read a
+/// thread). Grid (ceil(n/64), ceil(m/64)), block (16, 16).
+pub fn buildSgemm(alloc: std.mem.Allocator) ![:0]u8 {
+    var t: std.ArrayList(u8) = .empty;
+    errdefer t.deinit(alloc);
+    const w = struct {
+        fn f(l: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+            try l.print(a, fmt ++ "\n", args);
+        }
+    }.f;
+    try t.appendSlice(alloc, ptx.preamble);
+    try w(&t, alloc,
+        \\.visible .entry sgemm(.param .u64 p_y, .param .u64 p_x, .param .u64 p_w, .param .u64 p_bias,
+        \\  .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_scale,
+        \\  .param .u32 p_yoff, .param .u32 p_xoff, .param .u32 p_hasbias)
+        \\{{
+        \\  .shared .align 16 .f32 As[1024];
+        \\  .shared .align 16 .f32 Bs[1024];
+        \\  .reg .pred %p<8>;
+        \\  .reg .b32 %r<64>;
+        \\  .reg .f32 %f<48>;
+        \\  .reg .b64 %rd<16>;
+        \\  ld.param.u64 %rd1, [p_y]; cvta.to.global.u64 %rd1, %rd1;
+        \\  ld.param.u64 %rd2, [p_x]; cvta.to.global.u64 %rd2, %rd2;
+        \\  ld.param.u64 %rd3, [p_w]; cvta.to.global.u64 %rd3, %rd3;
+        \\  ld.param.u64 %rd4, [p_bias]; cvta.to.global.u64 %rd4, %rd4;
+        \\  ld.param.u32 %r1, [p_m]; ld.param.u32 %r2, [p_n]; ld.param.u32 %r3, [p_k];
+        \\  ld.param.f32 %f40, [p_scale];
+        \\  ld.param.u32 %r4, [p_yoff]; ld.param.u32 %r5, [p_xoff]; ld.param.u32 %r6, [p_hasbias];
+        \\  mov.u32 %r7, %tid.x; mov.u32 %r8, %tid.y;
+        \\  mov.u32 %r9, %ctaid.x; mov.u32 %r10, %ctaid.y;
+        \\  shl.b32 %r11, %r10, 6;
+        \\  shl.b32 %r12, %r9, 6;
+        \\  shl.b32 %r13, %r8, 4; add.u32 %r13, %r13, %r7;
+        \\  mov.u32 %r15, As; mov.u32 %r16, Bs;
+        \\  shl.b32 %r17, %r8, 2; add.u32 %r17, %r17, %r15;
+        \\  shl.b32 %r18, %r7, 2; add.u32 %r18, %r18, %r16;
+        \\  mov.u32 %r14, 0;
+    , .{});
+    for (0..16) |a| try w(&t, alloc, "  mov.f32 %f{d}, 0f00000000;", .{a});
+    try w(&t, alloc, "KLOOP:\n  setp.ge.u32 %p1, %r14, %r3; @%p1 bra KEND;", .{});
+    // Each thread stages 4 of the 1024 elements of each tile: e = t + 256q, row e/16,
+    // k e%16, zero past the matrix.
+    for (0..4) |q| {
+        try w(&t, alloc,
+            \\  add.u32 %r20, %r13, {d};
+            \\  shr.u32 %r21, %r20, 4; and.b32 %r22, %r20, 15;
+            \\  add.u32 %r23, %r14, %r22; setp.lt.u32 %p2, %r23, %r3;
+            \\  shl.b32 %r24, %r22, 6; add.u32 %r24, %r24, %r21; shl.b32 %r24, %r24, 2;
+            \\  add.u32 %r25, %r11, %r21; setp.lt.u32 %p3, %r25, %r1; and.pred %p3, %p3, %p2;
+            \\  mov.f32 %f41, 0f00000000;
+            \\  mad.lo.u32 %r26, %r25, %r3, %r23; add.u32 %r26, %r26, %r5;
+            \\  mul.wide.u32 %rd5, %r26, 4; add.s64 %rd6, %rd2, %rd5;
+            \\  @%p3 ld.global.f32 %f41, [%rd6];
+            \\  add.u32 %r27, %r15, %r24; st.shared.f32 [%r27], %f41;
+            \\  add.u32 %r28, %r12, %r21; setp.lt.u32 %p4, %r28, %r2; and.pred %p4, %p4, %p2;
+            \\  mov.f32 %f42, 0f00000000;
+            \\  mad.lo.u32 %r29, %r28, %r3, %r23;
+            \\  mul.wide.u32 %rd7, %r29, 4; add.s64 %rd8, %rd3, %rd7;
+            \\  @%p4 ld.global.f32 %f42, [%rd8];
+            \\  add.u32 %r30, %r16, %r24; st.shared.f32 [%r30], %f42;
+        , .{256 * q});
+    }
+    try w(&t, alloc, "  bar.sync 0;", .{});
+    for (0..16) |kk| {
+        for (0..4) |i| try w(&t, alloc, "  ld.shared.f32 %f{d}, [%r17+{d}];", .{ 16 + i, (kk * 64 + 16 * i) * 4 });
+        for (0..4) |j| try w(&t, alloc, "  ld.shared.f32 %f{d}, [%r18+{d}];", .{ 20 + j, (kk * 64 + 16 * j) * 4 });
+        for (0..4) |i| for (0..4) |j| try w(&t, alloc, "  fma.rn.f32 %f{d}, %f{d}, %f{d}, %f{d};", .{ i * 4 + j, 16 + i, 20 + j, i * 4 + j });
+    }
+    try w(&t, alloc, "  bar.sync 0;\n  add.u32 %r14, %r14, 16;\n  bra KLOOP;\nKEND:", .{});
+    for (0..4) |i| for (0..4) |j| {
+        try w(&t, alloc,
+            \\  add.u32 %r31, %r11, %r8; add.u32 %r31, %r31, {d};
+            \\  add.u32 %r32, %r12, %r7; add.u32 %r32, %r32, {d};
+            \\  setp.lt.u32 %p5, %r31, %r1; setp.lt.u32 %p6, %r32, %r2; and.pred %p5, %p5, %p6;
+            \\  @!%p5 bra SKIP{d};
+            \\  mul.f32 %f43, %f{d}, %f40;
+            \\  setp.ne.u32 %p7, %r6, 0;
+            \\  mul.wide.u32 %rd9, %r32, 4; add.s64 %rd10, %rd4, %rd9;
+            \\  @%p7 ld.global.f32 %f44, [%rd10];
+            \\  @%p7 add.f32 %f43, %f43, %f44;
+            \\  mad.lo.u32 %r33, %r31, %r2, %r32; add.u32 %r33, %r33, %r4;
+            \\  mul.wide.u32 %rd11, %r33, 4; add.s64 %rd12, %rd1, %rd11;
+            \\  st.global.f32 [%rd12], %f43;
+            \\SKIP{d}:
+        , .{ 16 * i, 16 * j, i * 4 + j, i * 4 + j, i * 4 + j });
+    };
+    try w(&t, alloc, "  ret;\n}}", .{});
+    return t.toOwnedSliceSentinel(alloc, 0);
+}
 
 // ---------------------------------------------------------------------------
 // MMQ, q4_k weight x q8_1 activation on the s8 tensor cores, with the
@@ -7083,14 +7138,14 @@ pub fn blockQDecodeTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         defer ctx.free(&ds);
 
         const shb = prepSharedBytes(c.cols, false);
-        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, .f32, c.blk, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, if (c.bits == 4) "bqprep4" else "bqprep");
         try ctx.setMaxDynamicShared(f_prep, shb);
 
-        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, chunk, true, false);
+        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, .f32, c.blk, chunk, true, false);
         defer gpa.free(dec_ptx);
         var dmod = try ctx.loadModule(dec_ptx);
         defer dmod.unload(ctx);
@@ -7205,9 +7260,9 @@ test "the prep's global row staging is a drop-in for the shared one" {
     var prev_shared: usize = 0;
     for ([_]usize{ 1024, 5120, 8192, 25600 }) |cols| {
         errdefer std.debug.print("cols {d}\n", .{cols});
-        const shared = try buildPrep(ta, cols, 8, false, .none, 0, true, false);
+        const shared = try buildPrep(ta, cols, 8, .f32, .none, 0, true, false);
         defer ta.free(shared);
-        const global = try buildPrep(ta, cols, 8, false, .none, 0, true, true);
+        const global = try buildPrep(ta, cols, 8, .f32, .none, 0, true, true);
         defer ta.free(global);
 
         // The extra parameter exists on one and not the other.

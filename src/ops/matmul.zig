@@ -171,6 +171,10 @@ pub const Weight = struct {
     /// profiling breakdowns, and error messages. Owned by whoever built the
     /// Weight (model loaders allocate it in the model arena).
     tag: ?[]const u8 = null,
+    /// This weight is rows `[row_off, row_off + rows)` of the tensor `tag` names,
+    /// for a row view of a fused tensor (`lin.rowSlice`). A LoRA sidecar reads it
+    /// to patch only the view's rows.
+    row_off: usize = 0,
 
     pub fn init(bytes: []const u8, dtype: DType, rows: usize, cols: usize) Weight {
         std.debug.assert(bytes.len == dtype.storageBytes(rows * cols));
@@ -305,7 +309,53 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
 }
 
 /// y[m, w.rows] = x[m, w.cols] @ w^T + bias.
+/// What a device's integer GEMM does to the activation before it: rotated when
+/// `rotate`, then quantized per row to `bits` (0: left alone).
+pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false };
+
+/// A device check's reference: called per linear, so the CPU carries the activation
+/// quantization of the route the device takes for that weight, and the check measures
+/// the device rather than the format. Single-threaded, like `probe`.
+pub const ActQuantHook = struct { ctx: *const anyopaque, of: *const fn (ctx: *const anyopaque, w: Weight, m: usize) ActQuant };
+pub var act_quant: ?ActQuantHook = null;
+
+/// `row` as the device's prep leaves it: scale `max(absmax / qmax, 1e-12)`, round half
+/// away, the device's clamp, dequantized and rotated back.
+pub fn emulateActQuant(row: []f32, q: ActQuant) void {
+    std.debug.assert(q.bits == 8 or q.bits == 4);
+    if (q.rotate) convrot_mod.rotate(row);
+    const qmax: f32 = if (q.bits == 8) 127 else 7;
+    const qmin: f32 = if (q.bits == 8) -127 else -8;
+    var amax: f32 = 0;
+    for (row) |v| amax = @max(amax, @abs(v));
+    const s = @max(amax / qmax, 1e-12);
+    for (row) |*v| v.* = std.math.clamp(@round(v.* / s), qmin, qmax) * s;
+    if (q.rotate) convrot_mod.rotate(row);
+}
+
 pub fn matmul(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w: Weight,
+    bias: ?[]const f32,
+) Error!void {
+    if (act_quant) |h| {
+        const q = h.of(h.ctx, w, m);
+        if (q.bits != 0) {
+            std.debug.assert(x.len == m * w.cols);
+            const xq = try gpa.dupe(f32, x);
+            defer gpa.free(xq);
+            for (0..m) |i| emulateActQuant(xq[i * w.cols ..][0..w.cols], q);
+            return matmulExact(io, gpa, y, xq, m, w, bias);
+        }
+    }
+    return matmulExact(io, gpa, y, x, m, w, bias);
+}
+
+fn matmulExact(
     io: std.Io,
     gpa: std.mem.Allocator,
     y: []f32,
@@ -1823,4 +1873,30 @@ test "matmul rejects unsupported dtype" {
     const wb = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     const w = Weight.init(&wb, .i64, 1, 2);
     try std.testing.expectError(error.UnsupportedDType, matmul(io, gpa, &y, &x, 1, w, null));
+}
+
+test "emulateActQuant lands on the device grid and is idempotent" {
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    var row: [512]f32 = undefined;
+    for (&row) |*v| v.* = rnd.floatNorm(f32);
+    row[7] = 9.0;
+    var plain = row;
+    emulateActQuant(&plain, .{ .bits = 8 });
+    const s: f32 = 9.0 / 127.0;
+    for (plain, row) |q, v| {
+        errdefer std.debug.print("{d} -> {d}\n", .{ v, q });
+        try std.testing.expectApproxEqAbs(@round(v / s) * s, q, 1e-6);
+    }
+    for ([_]u4{ 8, 4 }) |bits| {
+        var once = row;
+        emulateActQuant(&once, .{ .bits = bits, .rotate = true });
+        var twice = once;
+        emulateActQuant(&twice, .{ .bits = bits, .rotate = true });
+        for (once, twice) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4);
+        var diff: f32 = 0;
+        for (once, row) |a, v| diff = @max(diff, @abs(a - v));
+        errdefer std.debug.print("bits {d}: max change {d}\n", .{ bits, diff });
+        try std.testing.expect(diff > 0);
+    }
 }

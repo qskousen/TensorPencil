@@ -19,6 +19,7 @@
 //! conditioning the DiT sees without changing its shape.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const tokenizer_mod = tp_core.tokenizer;
 const image = tp_core.image;
@@ -299,7 +300,7 @@ const test_gate = @import("../test_gate.zig");
 const safetensors = tp_core.safetensors;
 
 const ref_path = "src/models/assets/mageflow_te_ref.safetensors";
-const te_ckpt = "/home/qt/genai/comfyui/models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+const te_ckpt = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
 
 fn relL2(want: []const f32, got: []const f32) f64 {
     std.debug.assert(want.len == got.len);

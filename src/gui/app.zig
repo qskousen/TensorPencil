@@ -158,7 +158,7 @@ fn hostStatus(name: []const u8, e: *const config.HostEntry) config_view.HostStat
 }
 
 var g_sync: sync.Syncer = undefined;
-var g_sync_status: [64]u8 = undefined;
+var g_sync_status: [160]u8 = undefined;
 
 fn hostSync(name: []const u8) config_view.HostSync {
     var out: config_view.HostSync = .{};
@@ -167,21 +167,46 @@ fn hostSync(name: []const u8) config_view.HostSync {
     if (g_sync.forHost(name)) |j| {
         out.sending = j.stem;
         out.status = j.status(&g_sync_status);
+        out.running = j.running();
+        out.pull = j.way == .pull;
+        out.fraction = j.fraction();
     }
+    out.queued = g_sync.queuedFor(name);
     const s = g_hosts.slotByName(name) orelse return out;
-    // What is still missing, transfer or no transfer: a finished send that
-    // hides the next file is why a host stays short after one was sent.
-    if (g_hosts.missingModel(s, &g_config)) |path| {
+    // What is still missing past what is already on its way: a finished send
+    // that hides the next file is why a host stays short after one was sent.
+    if (g_hosts.missingModel(s, &g_config, syncClaims())) |path| {
         out.missing = g_models.cat.refName(path);
-        out.missing_count = g_hosts.missingAll(s, &g_config);
+        out.missing_count = g_hosts.missingAll(s, &g_config, syncClaims());
     }
     return out;
 }
 
-fn sendModel(name: []const u8) void {
+fn syncClaims() hosts.Hosts.Claims {
+    return .{ .ctx = &g_sync, .has = struct {
+        fn has(ctx: *const anyopaque, host: []const u8, path: []const u8) bool {
+            const sy: *const sync.Syncer = @ptrCast(@alignCast(ctx));
+            return sy.claims(host, path);
+        }
+    }.has };
+}
+
+/// The next file the host is short of, or every one. Each lands in the host's
+/// queue, and a queued file is not missing, so the loop ends.
+fn sendModel(name: []const u8, all: bool) void {
     const s = g_hosts.slotByName(name) orelse return;
-    const path = g_hosts.missingModel(s, &g_config) orelse return;
-    sendPath(name, path);
+    for (0..config.model_ref_fields.len) |_| {
+        const path = g_hosts.missingModel(s, &g_config, syncClaims()) orelse return;
+        sendPath(name, path);
+        if (!all) return;
+    }
+}
+
+/// A grid cell's transfer: `host` is where a push goes, or where a pull
+/// comes from.
+fn transferOf(host: []const u8, stem: []const u8, pull: bool) ?config_view.CellTransfer {
+    const j = g_sync.find(host, if (pull) .pull else .push, stem) orelse return null;
+    return .{ .queued = j.queued, .fraction = j.fraction() };
 }
 
 /// One named file to one host, from the library grid. `path` is this machine's:
@@ -1120,6 +1145,7 @@ fn frame() void {
             .hostStatus = hostStatus,
             .hostSync = hostSync,
             .sendModel = sendModel,
+            .transferOf = transferOf,
             .sendPath = sendPath,
             .pullPath = pullPath,
             .tryHost = tryHost,

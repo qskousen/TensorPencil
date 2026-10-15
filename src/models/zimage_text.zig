@@ -17,6 +17,7 @@
 //!    separate thing and uses a *learned* pad embedding, not a pad token id.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const tokenizer_mod = @import("tp_core").tokenizer;
 
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -49,7 +50,7 @@ const safetensors = @import("tp_core").safetensors;
 const qwen3 = @import("qwen3.zig");
 
 const ref_path = "src/models/assets/zimage_ref.safetensors";
-const te_ckpt = "/home/qt/genai/comfyui/models/text_encoders/qwen_3_4b.safetensors";
+const te_ckpt = build_options.model_root ++ "/text_encoders/qwen_3_4b.safetensors";
 
 test "the Z-Image template tokenizes exactly like ComfyUI's ZImageTokenizer" {
     // Ungated: needs only the fixture's stored ids, not the 8 GB encoder. Worth
@@ -174,7 +175,7 @@ test "the Vulkan text encoder matches the CPU one on Z-Image's bf16 weights" {
 
     const want = try enc.encode(io, gpa, ids.items, null);
     defer gpa.free(want);
-    const got = try qwen3_gpu.encode(&enc, ctx, io, gpa, ids.items, false, null);
+    const got = try qwen3_gpu.encode(&enc, ctx, io, gpa, ids.items, .f32, null);
     defer gpa.free(got);
     try testing.expectEqual(want.len, got.len);
 

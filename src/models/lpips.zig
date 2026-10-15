@@ -110,7 +110,7 @@ pub const Lpips = struct {
             if (bias.len != co) return error.ShapeMismatch;
 
             convs[i] = .{
-                .w = packed_w,
+                .w = .{ .krsc = packed_w },
                 .b = bias,
                 .co = co,
                 .ci = ci,

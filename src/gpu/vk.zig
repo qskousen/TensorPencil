@@ -75,6 +75,7 @@ pub const CommandBuffer = enum(usize) { null_handle = 0, _ };
 pub const Buffer = enum(u64) { null_handle = 0, _ };
 pub const DeviceMemory = enum(u64) { null_handle = 0, _ };
 pub const Fence = enum(u64) { null_handle = 0, _ };
+pub const QueryPool = enum(u64) { null_handle = 0, _ };
 pub const Semaphore = enum(u64) { null_handle = 0, _ };
 pub const ShaderModule = enum(u64) { null_handle = 0, _ };
 pub const Pipeline = enum(u64) { null_handle = 0, _ };
@@ -143,8 +144,10 @@ pub const StructureType = enum(i32) {
     memory_allocate_info = 5,
     mapped_memory_range = 6,
     fence_create_info = 8,
+    query_pool_create_info = 11,
     buffer_create_info = 12,
     shader_module_create_info = 16,
+    pipeline_cache_create_info = 17,
     pipeline_shader_stage_create_info = 18,
     compute_pipeline_create_info = 29,
     pipeline_layout_create_info = 30,
@@ -164,6 +167,7 @@ pub const StructureType = enum(i32) {
     physical_device_memory_properties_2 = 1000059006,
     memory_allocate_flags_info = 1000060000,
     physical_device_memory_budget_properties_ext = 1000237000,
+    pipeline_creation_feedback_create_info = 1000192000,
     physical_device_properties_2 = 1000059001,
     physical_device_subgroup_properties = 1000094000,
     physical_device_subgroup_size_control_properties = 1000225000,
@@ -779,6 +783,26 @@ pub const ShaderModuleCreateInfo = extern struct {
     p_code: [*]const u32,
 };
 
+/// VK_EXT_pipeline_creation_feedback (core in 1.3).
+pub const PipelineCreationFeedback = extern struct { flags: u32 = 0, duration: u64 = 0 };
+pub const pipeline_creation_feedback_valid: u32 = 0x1;
+pub const pipeline_creation_feedback_cache_hit: u32 = 0x2;
+pub const PipelineCreationFeedbackCreateInfo = extern struct {
+    s_type: StructureType = .pipeline_creation_feedback_create_info,
+    p_next: ?*const anyopaque = null,
+    p_pipeline_creation_feedback: *PipelineCreationFeedback,
+    pipeline_stage_creation_feedback_count: u32 = 0,
+    p_pipeline_stage_creation_feedbacks: ?[*]PipelineCreationFeedback = null,
+};
+
+pub const PipelineCacheCreateInfo = extern struct {
+    s_type: StructureType = .pipeline_cache_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: u32 = 0,
+    initial_data_size: usize = 0,
+    p_initial_data: ?*const anyopaque = null,
+};
+
 pub const DescriptorSetLayoutBinding = extern struct {
     binding: u32,
     descriptor_type: DescriptorType,
@@ -949,6 +973,19 @@ pub const SubmitInfo = extern struct {
     p_signal_semaphores: ?[*]const Semaphore = null,
 };
 
+/// `query_type` 2 is VK_QUERY_TYPE_TIMESTAMP.
+pub const QueryPoolCreateInfo = extern struct {
+    s_type: StructureType = .query_pool_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: u32 = 0,
+    query_type: u32 = 2,
+    query_count: u32,
+    pipeline_statistics: u32 = 0,
+};
+
+/// VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT.
+pub const query_result_64_wait: u32 = 0x1 | 0x2;
+
 pub const FenceCreateInfo = extern struct {
     s_type: StructureType = .fence_create_info,
     p_next: ?*const anyopaque = null,
@@ -1027,6 +1064,9 @@ pub const PfnCreateDescriptorSetLayout = *const fn (Device, *const DescriptorSet
 pub const PfnDestroyDescriptorSetLayout = *const fn (Device, DescriptorSetLayout, ?*const AllocationCallbacks) callconv(.c) void;
 pub const PfnCreatePipelineLayout = *const fn (Device, *const PipelineLayoutCreateInfo, ?*const AllocationCallbacks, *PipelineLayout) callconv(.c) Result;
 pub const PfnDestroyPipelineLayout = *const fn (Device, PipelineLayout, ?*const AllocationCallbacks) callconv(.c) void;
+pub const PfnCreatePipelineCache = *const fn (Device, *const PipelineCacheCreateInfo, ?*const AllocationCallbacks, *PipelineCache) callconv(.c) Result;
+pub const PfnDestroyPipelineCache = *const fn (Device, PipelineCache, ?*const AllocationCallbacks) callconv(.c) void;
+pub const PfnGetPipelineCacheData = *const fn (Device, PipelineCache, *usize, ?*anyopaque) callconv(.c) Result;
 pub const PfnCreateComputePipelines = *const fn (Device, PipelineCache, u32, [*]const ComputePipelineCreateInfo, ?*const AllocationCallbacks, [*]Pipeline) callconv(.c) Result;
 pub const PfnDestroyPipeline = *const fn (Device, Pipeline, ?*const AllocationCallbacks) callconv(.c) void;
 
@@ -1056,6 +1096,11 @@ pub const PfnCmdPushConstants = *const fn (CommandBuffer, PipelineLayout, Shader
 pub const PfnQueueSubmit = *const fn (Queue, u32, ?[*]const SubmitInfo, Fence) callconv(.c) Result;
 pub const PfnQueueWaitIdle = *const fn (Queue) callconv(.c) Result;
 pub const PfnDeviceWaitIdle = *const fn (Device) callconv(.c) Result;
+pub const PfnCreateQueryPool = *const fn (Device, *const QueryPoolCreateInfo, ?*const AllocationCallbacks, *QueryPool) callconv(.c) Result;
+pub const PfnDestroyQueryPool = *const fn (Device, QueryPool, ?*const AllocationCallbacks) callconv(.c) void;
+pub const PfnCmdResetQueryPool = *const fn (CommandBuffer, QueryPool, u32, u32) callconv(.c) void;
+pub const PfnCmdWriteTimestamp = *const fn (CommandBuffer, PipelineStageFlags, QueryPool, u32) callconv(.c) void;
+pub const PfnGetQueryPoolResults = *const fn (Device, QueryPool, u32, u32, usize, *anyopaque, DeviceSize, u32) callconv(.c) Result;
 pub const PfnCreateFence = *const fn (Device, *const FenceCreateInfo, ?*const AllocationCallbacks, *Fence) callconv(.c) Result;
 pub const PfnDestroyFence = *const fn (Device, Fence, ?*const AllocationCallbacks) callconv(.c) void;
 pub const PfnWaitForFences = *const fn (Device, u32, [*]const Fence, Bool32, u64) callconv(.c) Result;

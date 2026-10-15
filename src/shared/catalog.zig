@@ -737,9 +737,7 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
         if (e.tower) |t| {
             if (t.arch == null) e.note = try std.fmt.allocPrint(a, "vision projector '{s}' has no tower here", .{t.projector});
         } else if (e.lora) |l| {
-            e.note = try std.fmt.allocPrint(a, "lora ({d} linears, rank {d}) matches no architecture here", .{ l.info.targets, l.info.rank });
-        } else if (model_spec.loraForeignDialect(store)) {
-            e.note = "lora in a key dialect this build does not map (kohya lora_unet_* / lora_te_*)";
+            e.note = try std.fmt.allocPrint(a, "lora ({d} weights, rank {d}) matches no architecture here", .{ l.info.targets, l.info.rank });
         } else if (unsupported_arch) |arch| {
             e.note = try std.fmt.allocPrint(a, "architecture '{s}' is not supported", .{arch});
         } else {

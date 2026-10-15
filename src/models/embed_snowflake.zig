@@ -61,7 +61,7 @@ pub const config_m_v2: Config = .{
 pub const embed_dim: usize = 768;
 
 /// In-place L2 normalization (shared by `embed` / `embedBatch`).
-fn l2normalize(v: []f32) void {
+pub fn l2normalize(v: []f32) void {
     var ss: f32 = 0;
     for (v) |x| ss += x * x;
     const norm = @sqrt(ss);

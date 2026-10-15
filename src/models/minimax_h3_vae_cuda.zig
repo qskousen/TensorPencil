@@ -22,25 +22,14 @@
 
 const std = @import("std");
 const vae = @import("minimax_h3_vae.zig");
+const minimax_h3_vae_dev = @import("minimax_h3_vae_dev.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
-
-/// A contiguous row range of a row-major weight, as its own `Weight`. Used for
-/// `ff.w1`, whose two halves ARE row ranges; see the header for why `to_qkv` is
-/// not.
-fn rowSlice(w: Weight, from: usize, n: usize) Weight {
-    std.debug.assert(from + n <= w.rows);
-    const stride = w.dtype.storageBytes(w.cols);
-    var out = w;
-    out.bytes = w.bytes[from * stride ..][0 .. n * stride];
-    out.rows = n;
-    if (w.row_scale) |rs| out.row_scale = rs[from..][0..n];
-    return out;
-}
 
 pub fn supported(dec: *const vae.VideoDecoder) bool {
     for (dec.blocks) |b| {
@@ -104,6 +93,9 @@ pub const Session = struct {
 
 pub const Workspace = struct {
     x_d: Buf = .{},
+    /// The attention output, f32 (see `minimax_h3_vae_dev`); also the f32 staging an
+    /// upload into a 16-bit `x_d` goes through.
+    ao_d: Buf = .{},
     hn_d: Buf = .{},
     qkv_d: Buf = .{},
     q_d: Buf = .{},
@@ -121,19 +113,21 @@ pub const Workspace = struct {
     vp_d: Buf = .{},
     op_d: Buf = .{},
 
-    pub fn init(be: *Backend, dec: *const vae.VideoDecoder, seq: usize, grid: usize) !Workspace {
+    /// `act` is the dial's width for the buffers `minimax_h3_vae_dev` names.
+    pub fn init(be: *Backend, dec: *const vae.VideoDecoder, seq: usize, grid: usize, act: cuda.backend.Dt) !Workspace {
         const cfg = dec.cfg;
         var ws: Workspace = .{};
         errdefer ws.deinit(be);
-        ws.x_d = try be.tensorCreate(seq * cfg.dim * 4);
-        ws.hn_d = try be.tensorCreate(seq * cfg.dim * 4);
+        const ab = act.bytes();
+        inline for (.{ .{ "x_d", cfg.dim }, .{ "hn_d", cfg.dim }, .{ "proj_d", cfg.dim }, .{ "gate_d", cfg.ff }, .{ "up_d", cfg.ff } }) |f| {
+            @field(ws, f[0]) = try be.tensorCreate(seq * f[1] * ab);
+            @field(ws, f[0]).dt = act;
+        }
+        ws.ao_d = try be.tensorCreate(seq * cfg.dim * 4);
         ws.qkv_d = try be.tensorCreate(seq * cfg.dim * 3 * 4);
         ws.q_d = try be.tensorCreate(seq * cfg.dim * 4);
         ws.k_d = try be.tensorCreate(seq * cfg.dim * 4);
         ws.v_d = try be.tensorCreate(seq * cfg.dim * 4);
-        ws.proj_d = try be.tensorCreate(seq * cfg.dim * 4);
-        ws.gate_d = try be.tensorCreate(seq * cfg.ff * 4);
-        ws.up_d = try be.tensorCreate(seq * cfg.ff * 4);
         // Both LayerScale vectors of every block, uploaded once per window.
         ws.scale_d = try be.tensorCreate(dec.blocks.len * 2 * cfg.dim * 4);
         ws.patch_d = try be.tensorCreate(grid * cfg.patchDim() * 4);
@@ -149,24 +143,10 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        inline for (.{
-            &self.x_d,     &self.hn_d,  &self.qkv_d, &self.q_d,
-            &self.k_d,     &self.v_d,   &self.proj_d, &self.gate_d,
-            &self.up_d,    &self.scale_d, &self.patch_d, &self.qp_d,
-            &self.kp_d,    &self.vp_d,  &self.op_d,
-        }) |b| be.tensorDestroy(b);
+        inline for (@typeInfo(Workspace).@"struct".fields) |f| be.tensorDestroy(&@field(self, f.name));
         self.* = undefined;
     }
 };
-
-fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
-    switch (w.dtype) {
-        .f16 => try be.opMatmulF16(y, x, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .bf16 => try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .f32 => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, bias),
-        else => return error.UnsupportedDType,
-    }
-}
 
 /// Head width the tensor-core attention runs at.
 ///
@@ -187,23 +167,33 @@ fn attnHd(be: *const Backend, hd: usize) usize {
 /// where f16's 65504 ceiling starts to bite. This is the A/B for that.
 pub var force_naive_attn: bool = false;
 
-/// Report the residual stream's magnitude per block (`TP_VAE_MAG`).
+/// Report the residual stream's and the FFN product's magnitude per block (`TP_VAE_MAG`).
 pub var dbg_mag: bool = false;
+var dbg_ffn: f32 = 0;
+
+fn maxAbs(be: *Backend, a: std.mem.Allocator, b: Buf, n: usize) !f32 {
+    const h = try a.alloc(f32, n);
+    defer a.free(h);
+    try be.tensorDownload(b, std.mem.sliceAsBytes(h));
+    var mx: f32 = 0;
+    for (h) |v| mx = if (std.math.isFinite(v)) @max(mx, @abs(v)) else std.math.inf(f32);
+    return mx;
+}
 
 /// Attention, padding the head width when the backend needs it. The padding is
 /// exact: the extra columns are zero on both sides, so they contribute nothing to
 /// the scores and `opHeadUnpad` drops them again.
-fn attention(be: *Backend, ws: *Workspace, seq: usize, heads: usize, hd: usize, scale: f32) !void {
+fn attentionAt(be: *Backend, ws: *Workspace, seq: usize, heads: usize, hd: usize, scale: f32) !void {
     if (force_naive_attn) {
-        return be.attn(ws.q_d, ws.k_d, ws.v_d, ws.hn_d, seq, seq, heads, heads, hd, scale, false);
+        return be.attn(ws.q_d, ws.k_d, ws.v_d, ws.ao_d, seq, seq, heads, heads, hd, scale, false);
     }
     const hp = attnHd(be, hd);
-    if (hp == hd) return be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.hn_d, seq, heads, heads, hd, scale);
+    if (hp == hd) return be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.ao_d, seq, heads, heads, hd, scale);
     inline for (.{ .{ "q_d", "qp_d" }, .{ "k_d", "kp_d" }, .{ "v_d", "vp_d" } }) |pair| {
         try be.opHeadPad(@field(ws, pair[1]), @field(ws, pair[0]), seq, heads, hp, hd, heads * hd, 0);
     }
     try be.opAttnTC(ws.qp_d, ws.kp_d, ws.vp_d, ws.op_d, seq, heads, heads, hp, scale);
-    try be.opHeadUnpad(ws.op_d, ws.hn_d, seq, heads, hd, hp);
+    try be.opHeadUnpad(ws.op_d, ws.ao_d, seq, heads, hd, hp);
 }
 
 fn normBuf(be: *Backend, w: []const f32) !Buf {
@@ -227,99 +217,105 @@ pub fn decodeVolume(
     w: usize,
 ) !void {
     const cfg = dec.cfg;
-    const dim = cfg.dim;
-    const hd = cfg.head_dim;
-    const heads = cfg.heads;
     const grid = t * h * w;
     const seq = grid + cfg.n_register + 1;
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     std.debug.assert(sess.seq == seq and sess.grid == grid);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-
-    // Host: denormalize and transpose planar [c][t][h][w] to token-major [n][c],
-    // then the two small projections. 24 channels in, so this is memory traffic
-    // rather than arithmetic.
-    const c_in = cfg.in_channels;
-    const rows = try a.alloc(f32, grid * c_in);
-    for (0..grid) |i| {
-        for (0..c_in) |c| rows[i * c_in + c] = z[c * grid + i] * dec.latents_std[c] + dec.latents_mean[c];
-    }
-    const pq = try a.alloc(f32, grid * c_in);
-    try ops.matmul.matmul(io, gpa, pq, rows, grid, dec.post_quant, dec.post_quant_bias);
-    const emb = try a.alloc(f32, seq * dim);
-    try ops.matmul.matmul(io, gpa, emb[0 .. grid * dim], pq, grid, dec.x_embedder, dec.x_embedder_bias);
-    // Four register tokens then one ZERO token, dropped after `proj_out`.
-    @memcpy(emb[grid * dim ..][0 .. cfg.n_register * dim], dec.register_tokens);
-    @memset(emb[(grid + cfg.n_register) * dim ..][0..dim], 0);
-
-    const scales = try a.alloc(f32, dec.blocks.len * 2 * dim);
-    for (dec.blocks, 0..) |*b, i| {
-        @memcpy(scales[(i * 2) * dim ..][0..dim], b.scale1);
-        @memcpy(scales[(i * 2 + 1) * dim ..][0..dim], b.scale2);
-    }
+    const emb = try vae.embedWindow(a, io, gpa, dec, z, grid);
+    const scales = try vae.layerScales(a, dec);
 
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
     try be.tensorUpload(ws.scale_d, std.mem.sliceAsBytes(scales));
-    try be.tensorUpload(ws.x_d, std.mem.sliceAsBytes(emb));
-
-    for (dec.blocks, 0..) |*b, bi| {
-        // --- attention half ---
-        // `qkNorm` is a weighted RMS over its last dim, so at rows=seq, dim=dim
-        // it IS the block's pre-norm.
-        try be.qkNorm(ws.x_d, ws.hn_d, try normBuf(be, b.norm1), seq, dim, cfg.eps);
-        try gemm(be, ws.qkv_d, ws.hn_d, seq, b.qkv, b.qkv_bias);
-        try be.opDeinterleave3(ws.qkv_d, ws.q_d, ws.k_d, ws.v_d, seq * dim, hd);
-        // WEIGHTLESS q/k norms: feed `qkNorm` ones.
-        try be.qkNorm(ws.q_d, ws.q_d, sess.ones_d, seq * heads, hd, cfg.eps);
-        try be.qkNorm(ws.k_d, ws.k_d, sess.ones_d, seq * heads, hd, cfg.eps);
-        try be.opRopeHalfPart(ws.q_d, sess.freqs_d, seq, heads, sess.pairs, sess.sinOff(), 0, hd);
-        try be.opRopeHalfPart(ws.k_d, sess.freqs_d, seq, heads, sess.pairs, sess.sinOff(), 0, hd);
-        try attention(be, ws, seq, heads, hd, attn_scale);
-        try gemm(be, ws.proj_d, ws.hn_d, seq, b.out, b.out_bias);
-        // LayerScale: `gatedAdd` with the learned scale where a DiT has a gate.
-        try be.gatedAdd(ws.x_d, ws.proj_d, ws.scale_d, seq * dim, dim, (bi * 2) * dim);
-
-        // --- feed-forward half ---
-        try be.qkNorm(ws.x_d, ws.hn_d, try normBuf(be, b.norm2), seq, dim, cfg.eps);
-        // `w1` IS `[gate; value]` by rows, so two GEMMs rather than a strided
-        // silu-mul over one fused output.
-        try gemm(be, ws.gate_d, ws.hn_d, seq, rowSlice(b.w1, 0, cfg.ff), b.w1_bias[0..cfg.ff]);
-        try gemm(be, ws.up_d, ws.hn_d, seq, rowSlice(b.w1, cfg.ff, cfg.ff), b.w1_bias[cfg.ff..]);
-        try be.siluMul(ws.gate_d, ws.up_d, seq * cfg.ff);
-        try gemm(be, ws.proj_d, ws.gate_d, seq, b.w2, b.w2_bias);
-        try be.gatedAdd(ws.x_d, ws.proj_d, ws.scale_d, seq * dim, dim, (bi * 2 + 1) * dim);
-
-        // `TP_VAE_MAG`: the residual stream's magnitude per block. The device
-        // GEMMs narrow activations to f16 (`halfActivation`), and f16's 65504
-        // ceiling is a limit real VAE checkpoints do reach, so this is the
-        // measurement rather than the assumption. Costs a full sync per block.
-        if (dbg_mag) {
-            try be.endBatch();
-            const probe = try a.alloc(f32, seq * dim);
-            try be.tensorDownload(ws.x_d, std.mem.sliceAsBytes(probe));
-            var mx: f32 = 0;
-            var nonfinite: usize = 0;
-            for (probe) |v| {
-                if (!std.math.isFinite(v)) nonfinite += 1 else mx = @max(mx, @abs(v));
-            }
-            std.debug.print("vae block {d:>2}: max|x| {d:.1}{s}\n", .{
-                bi, mx, if (nonfinite != 0) " NONFINITE" else "",
-            });
-            try be.beginBatch();
-        }
+    if (ws.x_d.dt == .f32) {
+        try be.tensorUpload(ws.x_d, std.mem.sliceAsBytes(emb));
+    } else {
+        try be.tensorUpload(ws.ao_d, std.mem.sliceAsBytes(emb));
+        try be.opCast(ws.ao_d, ws.x_d, seq * cfg.dim, 0);
     }
-
-    // Head: a LayerNorm WITH bias, where every other norm here is RMS. Only the
-    // GRID tokens are projected; the register/zero suffix is dropped.
-    try be.opLayerNorm(ws.x_d, ws.hn_d, dec.norm_out_w, dec.norm_out_b, seq, dim, cfg.eps, false);
-    try gemm(be, ws.patch_d, ws.hn_d, grid, dec.proj_out, dec.proj_out_bias);
+    try minimax_h3_vae_dev.body(Dev{ .be = be, .sess = sess, .ws = ws, .cfg = cfg, .a = a }, dec, seq, grid);
     try be.endBatch();
 
     const patches = try a.alloc(f32, grid * cfg.patchDim());
     try be.tensorDownload(ws.patch_d, std.mem.sliceAsBytes(patches));
     vae.unpatchify(cfg, out, patches, t, h, w);
 }
+
+/// The `minimax_h3_vae_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    sess: *const Session,
+    ws: *Workspace,
+    cfg: vae.Config,
+    a: std.mem.Allocator,
+
+    /// `qkNorm` is a weighted RMS over its last dim, so at rows=seq, dim=dim it IS a
+    /// block's pre-norm.
+    pub fn rmsNorm(d: Dev, x: Buf, y: Buf, w: []const f32, rows: usize, dim: usize) !void {
+        try d.be.qkNorm(x, y, try normBuf(d.be, w), rows, dim, d.cfg.eps);
+    }
+
+    /// `qkNorm` always multiplies a weight, so the weightless norm is fed ones.
+    pub fn unitNorm(d: Dev, x: Buf, seq: usize) !void {
+        try d.be.qkNorm(x, x, d.sess.ones_d, seq * d.cfg.heads, d.cfg.head_dim, d.cfg.eps);
+    }
+
+    pub fn gemm(d: Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
+        try lin_cuda.towerLinear(d.be, y, x, m, w, bias, null);
+    }
+
+    pub fn deinterleave3(d: Dev, seq: usize) !void {
+        try d.be.opDeinterleave3(d.ws.qkv_d, d.ws.q_d, d.ws.k_d, d.ws.v_d, seq * d.cfg.dim, d.cfg.head_dim);
+    }
+
+    pub fn rope(d: Dev, x: Buf, seq: usize) !void {
+        try d.be.opRopeHalfPart(x, d.sess.freqs_d, seq, d.cfg.heads, d.sess.pairs, d.sess.sinOff(), 0, d.cfg.head_dim);
+    }
+
+    pub fn attention(d: Dev, seq: usize) !void {
+        try attentionAt(d.be, d.ws, seq, d.cfg.heads, d.cfg.head_dim, 1.0 / @sqrt(@as(f32, @floatFromInt(d.cfg.head_dim))));
+    }
+
+    pub fn layerScale(d: Dev, x: Buf, y: Buf, total: usize, off: usize) !void {
+        try d.be.gatedAdd(x, y, d.ws.scale_d, total, d.cfg.dim, off);
+    }
+
+    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+        try d.be.siluMul(g, u, n);
+        if (dbg_mag and g.dt == .f32) {
+            try d.be.endBatch();
+            dbg_ffn = try maxAbs(d.be, d.a, g, n);
+            try d.be.beginBatch();
+        }
+    }
+
+    pub fn layerNorm(d: Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize, dim: usize) !void {
+        try d.be.opLayerNorm(x, y, w, b, rows, dim, d.cfg.eps);
+    }
+
+    /// `TP_VAE_MAG`: the residual stream's magnitude per block. The device GEMMs
+    /// narrow activations to f16, and f16's 65504 ceiling is a limit real VAE
+    /// checkpoints do reach, so this is the measurement rather than the assumption.
+    /// Costs a full sync per block.
+    pub fn blockDone(d: Dev, bi: usize, seq: usize) !void {
+        if (!dbg_mag) return;
+        // `ao_d` is dead between blocks, so it can hold an f32 copy of a 16-bit stream.
+        const x32 = if (d.ws.x_d.dt == .f32) d.ws.x_d else blk: {
+            try d.be.opCast(d.ws.x_d, d.ws.ao_d, seq * d.cfg.dim, 0);
+            break :blk d.ws.ao_d;
+        };
+        try d.be.endBatch();
+        const probe = try d.a.alloc(f32, seq * d.cfg.dim);
+        try d.be.tensorDownload(x32.slice(0, probe.len * 4), std.mem.sliceAsBytes(probe));
+        var mx: f32 = 0;
+        var nonfinite: usize = 0;
+        for (probe) |v| {
+            if (!std.math.isFinite(v)) nonfinite += 1 else mx = @max(mx, @abs(v));
+        }
+        std.debug.print("vae block {d:>2}: max|x| {d:.1}  max|ffn| {d:.1}{s}\n", .{ bi, mx, dbg_ffn, if (nonfinite != 0) " NONFINITE" else "" });
+        try d.be.beginBatch();
+    }
+};

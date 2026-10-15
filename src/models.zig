@@ -12,8 +12,6 @@ pub const wan_vae = @import("models/wan_vae.zig");
 pub const taehv = @import("models/taehv.zig");
 pub const taehv_cuda = @import("models/taehv_cuda.zig");
 pub const taehv_gpu = @import("models/taehv_gpu.zig");
-pub const vae_gpu = @import("models/vae_gpu.zig");
-pub const vae_cuda = @import("models/vae_cuda.zig");
 pub const vae_tiled = @import("models/vae_tiled.zig");
 pub const qwen3 = @import("models/qwen3.zig");
 pub const k2_horizon = @import("models/k2_horizon.zig");
@@ -46,6 +44,8 @@ pub const clip_text_cuda = @import("models/clip_text_cuda.zig");
 /// SD-family denoiser, the LDM UNet.
 pub const sd_unet = @import("models/sd_unet.zig");
 pub const sd_unet_gpu = @import("models/sd_unet_gpu.zig");
+pub const conv_gpu = @import("models/conv_gpu.zig");
+pub const conv_cuda = @import("models/conv_cuda.zig");
 pub const sd_unet_cuda = @import("models/sd_unet_cuda.zig");
 /// SD-family VAE decoder (AutoencoderKL).
 pub const sd_vae = @import("models/sd_vae.zig");
@@ -62,13 +62,13 @@ pub const embed_siglip = @import("models/embed_siglip.zig");
 pub const embed_siglip_gpu = @import("models/embed_siglip_gpu.zig");
 pub const embed_siglip_cuda = @import("models/embed_siglip_cuda.zig");
 pub const quant_weight = @import("models/quant_weight.zig");
-/// What a block linear is and what a device arm can run (`lin`), and the one CUDA GEMM
-/// dispatcher every diffusion family's device forward goes through (`lin_cuda`).
+/// What a block linear is (`lin`), the one linear dispatcher's routing for every
+/// backend and caller (`dual_lin`), and the CUDA dispatcher every device forward on
+/// either CUDA arm goes through (`lin_cuda`).
 pub const lin = @import("models/lin.zig");
+pub const dual_lin = @import("models/dual_lin.zig");
 pub const lin_cuda = @import("models/lin_cuda.zig");
-/// The one CUDA linear dispatcher every LLM stepper's device forward goes through.
-pub const lin_llm_cuda = @import("models/lin_llm_cuda.zig");
-pub const lin_llm_gpu = @import("models/lin_llm_gpu.zig");
+pub const lin_gpu = @import("models/lin_gpu.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
@@ -82,6 +82,11 @@ pub const zimage = @import("models/zimage.zig");
 pub const zimage_text = @import("models/zimage_text.zig");
 pub const zimage_gpu = @import("models/zimage_gpu.zig");
 pub const zimage_cuda = @import("models/zimage_cuda.zig");
+pub const zimage_dev = @import("models/zimage_dev.zig");
+pub const sensenova_dev = @import("models/sensenova_dev.zig");
+pub const minimax_h3_dev = @import("models/minimax_h3_dev.zig");
+pub const anima_dev = @import("models/anima_dev.zig");
+pub const mageflow_dev = @import("models/mageflow_dev.zig");
 /// Anima, a Cosmos-Predict2 `MiniTrainDIT` plus an `llm_adapter` that fuses a T5
 /// tokenization of the prompt with a Qwen3-0.6B encode of it.
 pub const anima = @import("models/anima.zig");
@@ -97,6 +102,7 @@ pub const mageflow_cuda = @import("models/mageflow_cuda.zig");
 pub const mage_vae = @import("models/mage_vae.zig");
 pub const mage_vae_gpu = @import("models/mage_vae_gpu.zig");
 pub const mage_vae_cuda = @import("models/mage_vae_cuda.zig");
+pub const mage_vae_dev = @import("models/mage_vae_dev.zig");
 /// MiniMax H3, a joint audio-video DiT: video and stereo audio denoised in one
 /// packed token sequence, on two different sigma schedules.
 pub const minimax_h3 = @import("models/minimax_h3.zig");
@@ -134,10 +140,16 @@ pub const minimax_h3_audio_cuda = @import("models/minimax_h3_audio_cuda.zig");
 /// into the weight. Architecture-independent: it keys on `Weight.tag`.
 pub const lora = @import("models/lora.zig");
 pub const lora_cuda = @import("models/lora_cuda.zig");
+pub const lora_gpu = @import("models/lora_gpu.zig");
+pub const lora_sd = @import("models/lora_sd.zig");
+pub const lora_adapter = @import("models/lora_adapter.zig");
 
 test {
     _ = lora;
     _ = lora_cuda;
+    _ = lora_gpu;
+    _ = lora_sd;
+    _ = lora_adapter;
     _ = minimax_h3_audio_cuda;
     _ = minimax_h3_audio_encode_cuda;
     _ = minimax_h3_vae_encode;
@@ -148,14 +160,16 @@ test {
     _ = quant_weight;
     _ = lin;
     _ = lin_cuda;
-    _ = lin_llm_cuda;
-    _ = lin_llm_gpu;
+    _ = dual_lin;
+    _ = lin_gpu;
     _ = loader;
     _ = clip_text;
     _ = clip_text_gpu;
     _ = clip_text_cuda;
     _ = sd_unet;
     _ = sd_unet_gpu;
+    _ = conv_gpu;
+    _ = conv_cuda;
     _ = sd_unet_cuda;
     _ = sd_vae;
     _ = sd_vae_gpu;
@@ -165,8 +179,6 @@ test {
     _ = transformer_gpu;
     _ = wan_vae;
     _ = taehv_gpu;
-    _ = vae_gpu;
-    _ = vae_cuda;
     _ = vae_tiled;
     _ = qwen3;
     _ = qwen35;

@@ -37,11 +37,14 @@
 
 const std = @import("std");
 const mageflow = @import("mageflow.zig");
+const mageflow_dev = @import("mageflow_dev.zig");
 const lin = @import("lin.zig");
+const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
 const DiT = mageflow.DiT;
+const File = @This();
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
@@ -65,13 +68,13 @@ const nchunks = 32;
 /// faster than another.
 const s_bytes_cap: usize = 256 << 20;
 
-/// See the header, and `mageflow_cuda.v_div` for the measurements.
-const v_div_log2: u5 = 7;
-const v_div: f32 = 1.0 / @as(f32, 1 << v_div_log2);
-
 /// Force `attn_full` even where the tensor-core pipeline exists. For A/B and for
 /// reproducing a mismatch; the device test runs both.
 pub var force_attn_full: bool = false;
+
+/// Run integer weights weight-only, so the device check can split a W8A8 forward's
+/// activation noise from everything else.
+pub var force_weight_only: bool = false;
 
 /// Record the forward as ONE submission (the default). Off, every op is its own
 /// submit-and-wait, which is what this arm did before batching and what the A/B in
@@ -122,7 +125,7 @@ fn trace(ctx: *gpu.Context, what: []const u8, b: Buf, n: usize) void {
     const cap = 1 << 21;
     var buf: [cap]f32 = undefined;
     const take = @min(n, buf.len);
-    ctx.tensorDownload(b, std.mem.sliceAsBytes(buf[0..take])) catch return;
+    ctx.downloadF32At(b, 0, buf[0..take]) catch return;
     var bad: usize = 0;
     var peak: f32 = 0;
     var sum: f64 = 0;
@@ -190,6 +193,9 @@ pub const Session = struct {
     sigmas: []f32,
     mods: []f32,
     mod_stride: usize,
+    /// Every block linear's dispatch, and what it decided for this checkpoint.
+    lin: lin_gpu.Lin,
+    lin_plan: lin_gpu.Plan,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -207,8 +213,18 @@ pub const Session = struct {
         const n_img = lat_h * lat_w;
         var n_tok = n_img;
         for (refs) |r| n_tok += r.h * r.w;
+        var l = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.maxRows(model.device_lins), 0, 0);
+        errdefer l.deinit();
+        var lp = try linPlan(ctx, model);
+        if (force_weight_only) lp.int8 = .weight_only;
+        if (model.lora) |st| {
+            lp.lora = st;
+            try l.presizeLora(st, model.device_lins, std.mem.alignForward(usize, @max(seq_txt, n_tok), 128));
+        }
 
         var self: Session = .{
+            .lin = l,
+            .lin_plan = lp,
             .lat_h = lat_h,
             .lat_w = lat_w,
             .seq_txt = seq_txt,
@@ -279,6 +295,7 @@ pub const Session = struct {
         gpa.free(self.tokens);
         gpa.free(self.sigmas);
         gpa.free(self.mods);
+        self.lin.deinit();
         self.* = undefined;
     }
 
@@ -332,7 +349,7 @@ pub const Workspace = struct {
         "qh_d",  "kh_d",   "v16_d",  "s_d",     "part_d", "md_d",
     };
 
-    pub fn init(ctx: *gpu.Context, model: *const DiT, seq_txt: usize, n_tok: usize) !Workspace {
+    pub fn init(ctx: *gpu.Context, model: *const DiT, seq_txt: usize, n_tok: usize, act: gpu.Dt) !Workspace {
         const tp = std.mem.alignForward(usize, seq_txt, 128);
         const ip = std.mem.alignForward(usize, n_tok, 128);
         const seq_pad = std.mem.alignForward(usize, seq_txt + n_tok, 128);
@@ -376,6 +393,8 @@ pub const Workspace = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             made += 1;
         }
+        // The attention block stays f32 (`mageflow_dev.streamDtFor`).
+        inline for (.{ "xt_d", "xi_d", "ntxt_d", "nimg_d", "dtxt_d", "dimg_d", "mt_d", "mi_d" }) |name| @field(self, name).dt = act;
         return self;
     }
 
@@ -385,22 +404,23 @@ pub const Workspace = struct {
     }
 };
 
+// The MLP down projection reads past f16 at sigma 1.
+const lin_use: lin_gpu.Use = .{ .blockq = .auto, .act16 = .bf16 };
+
+/// The block linears' plan, without a LoRA.
+pub fn linPlan(ctx: *gpu.Context, model: *const DiT) !lin_gpu.Plan {
+    return lin_gpu.plan(ctx, model.device_lins, lin_use, "mageflow_gpu");
+}
+
 /// Whether this context can run every block linear this checkpoint has.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.blocks.len == 0) return false;
     if (!ctx.hasLnModSg()) {
-        std.log.warn("mageflow_gpu: this device has no fused LayerNorm+modulate kernel — " ++
+        std.log.warn("mageflow_gpu: this device has no fused LayerNorm+modulate kernel; " ++
             "the trunk runs on the CPU. Expect CPU sampling speed.", .{});
         return false;
     }
-    const has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
-    const caps: lin.Caps = .{ .f32 = true, .fp8 = true, .bf16 = has_f16w, .f16 = has_f16w, .nvfp4 = ctx.hasNvfp4Decode() };
-    if (lin.unsupported(model.device_lins, caps)) |bad| {
-        std.log.warn("mageflow_gpu: {s} is {t}, which this device has no GEMM for — the trunk " ++
-            "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
-        return false;
-    }
-    return true;
+    return lin_gpu.runs(ctx, model.device_lins, lin_use, model.lora, "mageflow_gpu");
 }
 
 /// One denoiser forward. `out`/`x_lat` are planar `[channels][lat_h][lat_w]`.
@@ -418,8 +438,6 @@ pub fn forward(
 ) !void {
     std.debug.assert(x_lat.len == channels * sess.lat_h * sess.lat_w);
     std.debug.assert(out.len == x_lat.len);
-    const seq_txt = sess.seq_txt;
-    const n_tok = sess.n_tok;
 
     var owned: ?[]f32 = null;
     defer if (owned) |b| gpa.free(b);
@@ -427,7 +445,6 @@ pub fn forward(
         owned = try model.modulationTable(io, gpa, sigma);
         break :blk owned.?;
     };
-
     mageflow.interleaveChannels(sess.tokens[0 .. sess.n_img * channels], x_lat, sess.n_img);
     if (profile) p_last = std.Io.Clock.real.now(io);
     try ctx.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(mods));
@@ -439,31 +456,10 @@ pub fn forward(
     const batched = !profile and !force_unbatched;
     if (batched) try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
-
-    try ctx.opElt(.copy, sess.txt_d, ws.xt_d, null, null, .{ .u0 = @intCast(seq_txt * F) }, seq_txt * F, 1, 1);
-    try ctx.opMatmul(ws.xi_d, 0, ws.imgin_d, 0, n_tok, model.img_in.w.bytes, false, F, channels, model.img_in.w.scale, model.img_in.b);
-    lap(io, &prof.gemm_ns);
-    trace(ctx, "img_in", ws.xi_d, n_tok * F);
-    trace(ctx, "txt_in", ws.xt_d, seq_txt * F);
-
-    for (model.blocks, 0..) |*blk, i| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        try blockForward(ctx, io, sess, ws, blk, i);
-        trace(ctx, "blk.img", ws.xi_d, n_tok * F);
-        trace(ctx, "blk.txt", ws.xt_d, seq_txt * F);
-    }
-
-    // The final layer, on the canvas rows alone: it is row-wise, so running it on
-    // them is what ComfyUI's "whole stream, then slice" computes.
-    const fin: u32 = @intCast(model.blocks.len * 12 * F);
-    try ctx.opLnModSg(ws.xi_d, ws.xi_d, ws.mod_d, sess.n_img, F, fin, fin + F, eps);
-    lap(io, &prof.norm_ns);
-    trace(ctx, "fin_x", ws.xi_d, sess.n_img * F);
-    try ctx.opMatmul(ws.out_d, 0, ws.xi_d, 0, sess.n_img, model.proj_out.w.bytes, false, channels, F, model.proj_out.w.scale, model.proj_out.b);
-    lap(io, &prof.gemm_ns);
-    trace(ctx, "proj_out", ws.out_d, sess.n_img * channels);
-
+    try mageflow_dev.body(Dev{ .model = model, .ctx = ctx, .io = io, .sess = sess, .ws = ws }, model, cancel);
     if (batched) try ctx.endBatch();
+    // A 16-bit stream that overflowed can leave the output finite (`allFinite`).
+    if (ws.xt_d.dt != .f32 and !(try ctx.allFinite(ws.xt_d, sess.seq_txt * F) and try ctx.allFinite(ws.xi_d, sess.n_tok * F))) return error.NonFiniteActivation;
 
     const final = try gpa.alloc(f32, sess.n_img * channels);
     defer gpa.free(final);
@@ -473,112 +469,158 @@ pub fn forward(
     lap(io, &prof.cpu_ns);
 }
 
+/// `mageflow_dev`'s ops on this backend: a buffer per stream, the joint q/k/v assembled
+/// by copies (see the header's note 3 for why a copy and not a view), and the attention
+/// output split back the same way.
+const Dev = struct {
+    model: *const DiT,
+    ctx: *gpu.Context,
+    io: std.Io,
+    sess: *Session,
+    ws: *Workspace,
+
+    fn gemmBucket(stream: mageflow_dev.Stream) *i128 {
+        return if (stream == .txt) &prof.gemm_txt_ns else &prof.gemm_ns;
+    }
+
+    pub fn streams(d: Dev) Streams {
+        const ws = d.ws;
+        return .{
+            .seq_txt = d.sess.seq_txt,
+            .n_tok = d.sess.n_tok,
+            .txt_x = ws.xt_d,
+            .img_x = ws.xi_d,
+            .tq = ws.qt_d,
+            .tk = ws.kt_d,
+            .tv = ws.vt_d,
+            .iq = ws.qi_d,
+            .ik = ws.ki_d,
+            .iv = ws.vi_d,
+        };
+    }
+    const Streams = struct { seq_txt: usize, n_tok: usize, txt_x: Buf, img_x: Buf, tq: Buf, tk: Buf, tv: Buf, iq: Buf, ik: Buf, iv: Buf };
+
+    pub fn embed(d: Dev) !void {
+        const ws = d.ws;
+        const n = d.sess.n_tok;
+        try copyInto(d.ctx, d.sess.txt_d, 0, ws.xt_d, 0, d.sess.seq_txt * F);
+        try d.sess.lin.linearAt(d.sess.lin_plan, ws.xi_d, 0, ws.imgin_d, 0, n, d.model.img_in.w, d.model.img_in.b);
+        lap(d.io, &prof.gemm_ns);
+        File.trace(d.ctx, "img_in", ws.xi_d, n * F);
+        File.trace(d.ctx, "txt_in", ws.xt_d, d.sess.seq_txt * F);
+    }
+
+    pub fn blockBegin(_: Dev, _: usize) !void {}
+
+    pub fn trace(d: Dev, what: []const u8, _: usize, buf: Buf, elems: usize) void {
+        File.trace(d.ctx, what, buf, elems);
+    }
+
+    pub fn traceBlock(d: Dev, _: usize) void {
+        File.trace(d.ctx, "blk.img", d.ws.xi_d, d.sess.n_tok * F);
+        File.trace(d.ctx, "blk.txt", d.ws.xt_d, d.sess.seq_txt * F);
+    }
+
+    pub fn lnMod(d: Dev, src: Buf, dst: Buf, premul: usize, shift: usize, n: usize) !void {
+        try d.ctx.opLnModSg(src, dst, d.ws.mod_d, n, F, @intCast(premul), @intCast(shift), eps);
+        lap(d.io, &prof.norm_ns);
+    }
+
+    pub fn gemms(d: Dev, stream: mageflow_dev.Stream, x: Buf, m: usize, lws: []const mageflow.LinearW, ys: []const Buf) !void {
+        var w: [3]Weight = undefined;
+        for (lws, 0..) |lw, k| w[k] = lw.w;
+        const g = try prep(d.sess, x, m, w[0..lws.len]);
+        for (lws, ys) |lw, y| try gemm(d.sess, g, y, lw);
+        lap(d.io, gemmBucket(stream));
+    }
+
+    pub fn linear(d: Dev, stream: mageflow_dev.Stream, y: Buf, x: Buf, m: usize, lw: mageflow.LinearW) !void {
+        try File.linear(d.sess, y, x, m, lw);
+        lap(d.io, gemmBucket(stream));
+    }
+
+    /// Per-head QK-norm with each stream's own weight; RoPE on the image stream only
+    /// (the text rows sit at position 0, whose rotation is the identity); then the
+    /// joint operands `[text | image]`.
+    pub fn qkPrepare(d: Dev, blk: *const mageflow.Block) !void {
+        const ctx = d.ctx;
+        const ws = d.ws;
+        const seq_txt = d.sess.seq_txt;
+        const n = d.sess.n_tok;
+        try rmsNorm(ctx, ws.qt_d, ws.qt_d, blk.attn.txt_qnorm, seq_txt * heads, hd, eps);
+        try rmsNorm(ctx, ws.kt_d, ws.kt_d, blk.attn.txt_knorm, seq_txt * heads, hd, eps);
+        try rmsNorm(ctx, ws.qi_d, ws.qi_d, blk.attn.qnorm, n * heads, hd, eps);
+        try rmsNorm(ctx, ws.ki_d, ws.ki_d, blk.attn.knorm, n * heads, hd, eps);
+        lap(d.io, &prof.norm_ns);
+        const rope: gpu.EltPush = .{ .u0 = @intCast(n * heads * half), .u1 = half, .u2 = @intCast(n * half), .u3 = heads };
+        try ctx.opElt(.rope_inter, ws.qi_d, null, d.sess.img_freqs_d, null, rope, n * heads * half, 1, 1);
+        try ctx.opElt(.rope_inter, ws.ki_d, null, d.sess.img_freqs_d, null, rope, n * heads * half, 1, 1);
+        lap(d.io, &prof.elt_ns);
+        const img_off = seq_txt * F;
+        try copyInto(ctx, ws.qt_d, 0, ws.q_d, 0, seq_txt * F);
+        try copyInto(ctx, ws.kt_d, 0, ws.k_d, 0, seq_txt * F);
+        try copyInto(ctx, ws.vt_d, 0, ws.v_d, 0, seq_txt * F);
+        try copyInto(ctx, ws.qi_d, 0, ws.q_d, img_off, n * F);
+        try copyInto(ctx, ws.ki_d, 0, ws.k_d, img_off, n * F);
+        try copyInto(ctx, ws.vi_d, 0, ws.v_d, img_off, n * F);
+        lap(d.io, &prof.copy_ns);
+    }
+
+    pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {
+        try d.ctx.opElt(.scale_f32, buf, buf, null, null, .{ .u0 = @intCast(n), .f0 = f }, n, 1, 1);
+        lap(d.io, &prof.elt_ns);
+    }
+
+    pub fn attention(d: Dev, seq: usize) !void {
+        try File.attention(d.ctx, d.ws, seq);
+        lap(d.io, &prof.attn_ns);
+    }
+
+    pub fn attnSplit(d: Dev) !struct { txt: Buf, img: Buf } {
+        const ws = d.ws;
+        const seq_txt = d.sess.seq_txt;
+        try copyInto(d.ctx, ws.attn_d, 0, ws.ntxt_d, 0, seq_txt * F);
+        try copyInto(d.ctx, ws.attn_d, seq_txt * F, ws.nimg_d, 0, d.sess.n_tok * F);
+        lap(d.io, &prof.copy_ns);
+        return .{ .txt = ws.ntxt_d, .img = ws.nimg_d };
+    }
+
+    pub fn gatedAdd(d: Dev, x: Buf, t: Buf, n: usize, off: usize) !void {
+        try File.gatedAdd(d.ctx, x, t, d.ws.mod_d, n, @intCast(off));
+        lap(d.io, &prof.elt_ns);
+    }
+
+    pub fn gelu(d: Dev, buf: Buf, n: usize) !void {
+        try d.ctx.opElt(gpu.eltAt("gelu", buf.dt), buf, null, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+        lap(d.io, &prof.elt_ns);
+    }
+
+    pub fn final(d: Dev, fin: usize) !void {
+        const ws = d.ws;
+        const n = d.sess.n_img;
+        try d.ctx.opLnModSg(ws.xi_d, ws.xi_d, ws.mod_d, n, F, @intCast(fin), @intCast(fin + F), eps);
+        lap(d.io, &prof.norm_ns);
+        File.trace(d.ctx, "fin_x", ws.xi_d, n * F);
+        try d.sess.lin.linearAt(d.sess.lin_plan, ws.out_d, 0, ws.xi_d, 0, n, d.model.proj_out.w, d.model.proj_out.b);
+        lap(d.io, &prof.gemm_ns);
+        File.trace(d.ctx, "proj_out", ws.out_d, n * channels);
+    }
+};
+
+/// Elements `[src_off, src_off + n)` of `src` into `dst` from `dst_off`, each at its
+/// own dtype.
 fn copyInto(ctx: *gpu.Context, src: Buf, src_off: usize, dst: Buf, dst_off: usize, n: usize) !void {
-    try ctx.opElt(.copy, src, dst, null, null, .{
+    try ctx.opElt(gpu.eltCopy(src.dt, dst.dt), src, dst, null, null, .{
         .u0 = @intCast(n),
         .u2 = @intCast(dst_off),
         .u3 = @intCast(src_off),
     }, n, 1, 1);
 }
 
-fn blockForward(ctx: *gpu.Context, io: std.Io, sess: *Session, ws: *Workspace, blk: *const mageflow.Block, block_i: usize) !void {
-    const seq_txt = sess.seq_txt;
-    const n_tok = sess.n_tok;
-    const seq = sess.seq;
-    const img_m: u32 = @intCast(block_i * 12 * F);
-    const txt_m: u32 = img_m + 6 * F;
-
-    // --- attention half -----------------------------------------------------
-    try ctx.opLnModSg(ws.xt_d, ws.ntxt_d, ws.mod_d, seq_txt, F, txt_m + 0 * F, txt_m + 1 * F, eps);
-    try ctx.opLnModSg(ws.xi_d, ws.nimg_d, ws.mod_d, n_tok, F, img_m + 0 * F, img_m + 1 * F, eps);
-    lap(io, &prof.norm_ns);
-
-    try gemm(ctx, ws.qt_d, 0, ws.ntxt_d, seq_txt, blk.attn.txt_q);
-    try gemm(ctx, ws.kt_d, 0, ws.ntxt_d, seq_txt, blk.attn.txt_k);
-    try gemm(ctx, ws.vt_d, 0, ws.ntxt_d, seq_txt, blk.attn.txt_v);
-    lap(io, &prof.gemm_txt_ns);
-    try gemm(ctx, ws.qi_d, 0, ws.nimg_d, n_tok, blk.attn.q);
-    try gemm(ctx, ws.ki_d, 0, ws.nimg_d, n_tok, blk.attn.k);
-    try gemm(ctx, ws.vi_d, 0, ws.nimg_d, n_tok, blk.attn.v);
-    lap(io, &prof.gemm_ns);
-
-    // Per-head QK-norm, each stream with its own weight. RoPE is IMAGE-ONLY: the
-    // text rows sit at position 0, whose rotation is the identity.
-    try rmsNorm(ctx, ws.qt_d, ws.qt_d, blk.attn.txt_qnorm, seq_txt * heads, hd, eps);
-    try rmsNorm(ctx, ws.kt_d, ws.kt_d, blk.attn.txt_knorm, seq_txt * heads, hd, eps);
-    try rmsNorm(ctx, ws.qi_d, ws.qi_d, blk.attn.qnorm, n_tok * heads, hd, eps);
-    try rmsNorm(ctx, ws.ki_d, ws.ki_d, blk.attn.knorm, n_tok * heads, hd, eps);
-    lap(io, &prof.norm_ns);
-
-    const rope: gpu.EltPush = .{
-        .u0 = @intCast(n_tok * heads * half),
-        .u1 = half,
-        .u2 = @intCast(n_tok * half),
-        .u3 = heads,
-    };
-    try ctx.opElt(.rope_inter, ws.qi_d, null, sess.img_freqs_d, null, rope, n_tok * heads * half, 1, 1);
-    try ctx.opElt(.rope_inter, ws.ki_d, null, sess.img_freqs_d, null, rope, n_tok * heads * half, 1, 1);
-    lap(io, &prof.elt_ns);
-
-    // Assemble the joint operands: see the header's note 3 for why this is a copy
-    // and not a view.
-    const img_off = seq_txt * F;
-    try copyInto(ctx, ws.qt_d, 0, ws.q_d, 0, seq_txt * F);
-    try copyInto(ctx, ws.kt_d, 0, ws.k_d, 0, seq_txt * F);
-    try copyInto(ctx, ws.vt_d, 0, ws.v_d, 0, seq_txt * F);
-    try copyInto(ctx, ws.qi_d, 0, ws.q_d, img_off, n_tok * F);
-    try copyInto(ctx, ws.ki_d, 0, ws.k_d, img_off, n_tok * F);
-    try copyInto(ctx, ws.vi_d, 0, ws.v_d, img_off, n_tok * F);
-    lap(io, &prof.copy_ns);
-
-    trace(ctx, "  q", ws.q_d, seq * F);
-    trace(ctx, "  v", ws.v_d, seq * F);
-    // See `v_div`: V is unnormed and outgrows f16 on a real conditioning.
-    try ctx.opElt(.scale_f32, ws.v_d, ws.v_d, null, null, .{ .u0 = @intCast(seq * F), .f0 = v_div }, seq * F, 1, 1);
-    lap(io, &prof.elt_ns);
-    try attention(ctx, ws, seq);
-    lap(io, &prof.attn_ns);
-    try ctx.opElt(.scale_f32, ws.attn_d, ws.attn_d, null, null, .{ .u0 = @intCast(seq * F), .f0 = 1.0 / v_div }, seq * F, 1, 1);
-    lap(io, &prof.elt_ns);
-
-    trace(ctx, "  attn", ws.attn_d, seq * F);
-    try copyInto(ctx, ws.attn_d, 0, ws.ntxt_d, 0, seq_txt * F);
-    try copyInto(ctx, ws.attn_d, img_off, ws.nimg_d, 0, n_tok * F);
-    lap(io, &prof.copy_ns);
-    try gemm(ctx, ws.dtxt_d, 0, ws.ntxt_d, seq_txt, blk.attn.txt_o);
-    lap(io, &prof.gemm_txt_ns);
-    try gemm(ctx, ws.dimg_d, 0, ws.nimg_d, n_tok, blk.attn.o);
-    lap(io, &prof.gemm_ns);
-    try gatedAdd(ctx, ws.xt_d, ws.dtxt_d, ws.mod_d, seq_txt, txt_m + 2 * F);
-    try gatedAdd(ctx, ws.xi_d, ws.dimg_d, ws.mod_d, n_tok, img_m + 2 * F);
-    lap(io, &prof.elt_ns);
-
-    // --- MLP half -----------------------------------------------------------
-    try ctx.opLnModSg(ws.xt_d, ws.ntxt_d, ws.mod_d, seq_txt, F, txt_m + 3 * F, txt_m + 4 * F, eps);
-    try ctx.opLnModSg(ws.xi_d, ws.nimg_d, ws.mod_d, n_tok, F, img_m + 3 * F, img_m + 4 * F, eps);
-    lap(io, &prof.norm_ns);
-
-    try gemm(ctx, ws.mt_d, 0, ws.ntxt_d, seq_txt, blk.txt_mlp.in);
-    lap(io, &prof.gemm_txt_ns);
-    try ctx.opElt(.gelu, ws.mt_d, null, null, null, .{ .u0 = @intCast(seq_txt * mlp_dim) }, seq_txt * mlp_dim, 1, 1);
-    lap(io, &prof.elt_ns);
-    try gemm(ctx, ws.dtxt_d, 0, ws.mt_d, seq_txt, blk.txt_mlp.out);
-    lap(io, &prof.gemm_txt_ns);
-
-    try gemm(ctx, ws.mi_d, 0, ws.nimg_d, n_tok, blk.img_mlp.in);
-    lap(io, &prof.gemm_ns);
-    try ctx.opElt(.gelu, ws.mi_d, null, null, null, .{ .u0 = @intCast(n_tok * mlp_dim) }, n_tok * mlp_dim, 1, 1);
-    lap(io, &prof.elt_ns);
-    try gemm(ctx, ws.dimg_d, 0, ws.mi_d, n_tok, blk.img_mlp.out);
-    lap(io, &prof.gemm_ns);
-
-    try gatedAdd(ctx, ws.xt_d, ws.dtxt_d, ws.mod_d, seq_txt, txt_m + 5 * F);
-    try gatedAdd(ctx, ws.xi_d, ws.dimg_d, ws.mod_d, n_tok, img_m + 5 * F);
-    lap(io, &prof.elt_ns);
-}
 
 fn gatedAdd(ctx: *gpu.Context, x: Buf, delta: Buf, mod: Buf, rows: usize, gate_off: u32) !void {
-    try ctx.opElt(.gated_add, x, delta, mod, null, .{
+    std.debug.assert(x.dt == delta.dt);
+    try ctx.opElt(gpu.eltAt("gated_add", x.dt), x, delta, mod, null, .{
         .u0 = @intCast(rows * F),
         .u1 = F,
         .u2 = gate_off,
@@ -664,37 +706,19 @@ fn attention(ctx: *gpu.Context, ws: *Workspace, rows: usize) !void {
     }
 }
 
-/// One block linear, dispatched by weight dtype, writing at `y_off` FLOATS into
-/// `y`. Unlike krea2's and Z-Image's, every linear here carries a bias, and the
-/// coop GEMMs fold one in, so there is no separate bias pass.
-fn gemm(ctx: *gpu.Context, y: Buf, y_off: u32, x: Buf, m: usize, lw: anytype) !void {
-    const w: Weight = lw.w;
-    const bias: []const f32 = lw.b orelse &zero_bias;
-    std.debug.assert(w.rows <= zero_bias.len);
-    switch (w.dtype) {
-        .bf16 => {
-            if (ctx.pipe_coop_bf16w != .null_handle) {
-                try ctx.opMatmulCoopBf16(y, y_off, x, m, w.bytes, w.rows, w.cols, bias);
-            } else {
-                try ctx.opMatmulCoopF16Wb(y, y_off, x, m, w.bytes, w.rows, w.cols, bias);
-            }
-        },
-        .f16 => try ctx.opMatmulCoopF16Wh(y, y_off, x, m, w.bytes, w.rows, w.cols, bias),
-        .nvfp4 => {
-            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
-            const meta = w.nvfp4.?;
-            try ctx.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, bias);
-        },
-        .f32, .f8_e4m3 => try ctx.opMatmul(y, y_off, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, lw.b),
-        // `supported` gates this before a session is built.
-        else => return error.UnsupportedDType,
-    }
+/// Every linear here carries a bias, folded into the GEMM where its kernel takes one.
+fn prep(sess: *const Session, x: Buf, m: usize, group: []const Weight) !lin_gpu.Group {
+    return sess.lin.prep(sess.lin_plan, x, m, F, group);
 }
 
-/// Widest zero bias any Mage-Flow GEMM needs, for the dtypes whose kernel always
-/// folds one. Passed WHOLE, never sliced: `smallBuffer` caches by host POINTER, so
-/// a sliced one would map every width to whichever length was uploaded first.
-const zero_bias: [mlp_dim]f32 = @splat(0);
+fn gemm(sess: *const Session, g: lin_gpu.Group, y: Buf, lw: anytype) !void {
+    return sess.lin.gemm(sess.lin_plan, g, y, lw.w, .{ .bias = lw.b });
+}
+
+fn linear(sess: *const Session, y: Buf, x: Buf, m: usize, lw: anytype) !void {
+    const g = try sess.lin.prep(sess.lin_plan, x, m, lw.w.cols, &.{lw.w});
+    return gemm(sess, g, y, lw);
+}
 
 /// Weighted RMSNorm over `[rows][dim]`, `x -> out` (may alias). The subgroup
 /// kernel wherever it exists, for `zimage_gpu`'s measured reason.

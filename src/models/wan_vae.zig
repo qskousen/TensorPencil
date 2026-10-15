@@ -14,8 +14,11 @@
 //! torch-style planar [c][h][w].
 
 const std = @import("std");
+const build_options = @import("build_options");
 const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
+const quant_weight = @import("quant_weight.zig");
+const sd_vae = @import("sd_vae.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const weights_mod = @import("tp_core").weights;
@@ -74,13 +77,27 @@ pub fn latentPreviewInto(rgb_out: []u8, z: []const f32, zh: usize, zw: usize) vo
 }
 
 pub const Conv2d = struct {
-    /// Repacked [co][kh][kw][ci] to match im2col patch layout.
-    w: []const f32,
+    /// Repacked `[co][kh][kw][ci]` (the im2col patch layout), or the checkpoint's own
+    /// tensor (`ops.conv.Weights.torch`, `kt` its causal temporal axis).
+    w: ops.conv.Weights,
     b: []const f32,
     co: usize,
     ci: usize,
     k: usize, // 1 or 3, padding (k-1)/2
+
+    pub fn asOps(self: Conv2d) ops.conv.Conv2d {
+        return .{ .w = self.w, .b = self.b, .co = self.co, .ci = self.ci, .k = self.k, .pad = (self.k - 1) / 2 };
+    }
+
+    /// The repacked weights, for a reader that takes only those (`ops.conv.Conv2d.krsc`).
+    pub fn krsc(self: Conv2d) []const f32 {
+        return self.asOps().krsc();
+    }
 };
+
+/// Whether a loaded conv keeps the checkpoint's own tensor or is repacked to f32 at
+/// load. A conv some reader slices as f32 (the attention's fused qkv) is repacked.
+pub const Form = enum { keep, repack };
 
 pub const ResBlock = struct {
     norm1: []const f32, // gamma [ci]
@@ -113,6 +130,67 @@ pub const Decoder = struct {
     head_norm: []const f32,
     head_conv: Conv2d, // 96 -> 3
 
+    /// Every convolution in the decoder. Caller frees the list.
+    pub fn convList(self: *Decoder, gpa: std.mem.Allocator) ![]*Conv2d {
+        var out: std.ArrayList(*Conv2d) = .empty;
+        errdefer out.deinit(gpa);
+        const Walk = struct {
+            fn res(o: *std.ArrayList(*Conv2d), a: std.mem.Allocator, r: *ResBlock) !void {
+                try o.appendSlice(a, &.{ &r.conv1, &r.conv2 });
+                if (r.shortcut) |*c| try o.append(a, c);
+            }
+        };
+        try out.appendSlice(gpa, &.{ &self.post_quant, &self.conv_in, &self.head_conv, &self.mid_attn.qkv, &self.mid_attn.proj });
+        try Walk.res(&out, gpa, &self.mid_res1);
+        try Walk.res(&out, gpa, &self.mid_res2);
+        for (self.ups) |*l| switch (l.*) {
+            .res => |*r| try Walk.res(&out, gpa, r),
+            .up => |*c| try out.append(gpa, c),
+        };
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Repack every checkpoint-order conv to f32 into the model arena, for an arm that
+    /// reads only that and keys its weights on host addresses (Vulkan). Idempotent.
+    pub fn repackConvs(self: *Decoder, gpa: std.mem.Allocator) !void {
+        try repackInto(self, gpa, self.arena.allocator());
+    }
+
+    /// A copy with every conv repacked to f32, for a CPU decode that runs once per
+    /// tile. Only `ups` and the repacked weights are its own; the rest is borrowed, so
+    /// `dec` must not outlive this decoder and is never `deinit`ed.
+    pub const Repacked = struct {
+        arena: std.heap.ArenaAllocator,
+        dec: Decoder,
+
+        pub fn deinit(self: *Repacked, gpa: std.mem.Allocator) void {
+            self.arena.deinit();
+            gpa.destroy(self);
+        }
+    };
+
+    pub fn repacked(self: *const Decoder, gpa: std.mem.Allocator) !*Repacked {
+        const r = try gpa.create(Repacked);
+        errdefer gpa.destroy(r);
+        r.arena = .init(gpa);
+        errdefer r.arena.deinit();
+        r.dec = self.*;
+        r.dec.ups = try r.arena.allocator().dupe(Layer, self.ups);
+        try repackInto(&r.dec, gpa, r.arena.allocator());
+        return r;
+    }
+
+    fn repackInto(self: *Decoder, gpa: std.mem.Allocator, into: std.mem.Allocator) !void {
+        const convs = try self.convList(gpa);
+        defer gpa.free(convs);
+        for (convs) |c| if (c.w == .torch) {
+            // A local first: assigning the union literal in place would switch `c.w`
+            // before `materialize` reads it.
+            const krsc = try c.asOps().materialize(into);
+            c.w = .{ .krsc = krsc };
+        };
+    }
+
     /// `store` may be a `weights.Prefixed` view of a bundled checkpoint, this loader
     /// always sees the VAE at the root. See `weights.Prefixed`.
     pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !Decoder {
@@ -141,7 +219,7 @@ pub const Decoder = struct {
             }
             if (stage.up) {
                 const name = try std.fmt.allocPrint(alloc, "decoder.upsamples.{d}.resample.1", .{idx});
-                ups[idx] = .{ .up = try loadConv(alloc, store, name, stage.out, stage.out / 2, 3) };
+                ups[idx] = .{ .up = try loadConvAs(.keep, alloc, store, name, stage.out, stage.out / 2, 3) };
                 idx += 1;
             }
         }
@@ -150,7 +228,7 @@ pub const Decoder = struct {
         // All arena allocations must happen before `arena` is copied into the
         // result, chunks allocated afterwards would be missed by deinit.
         const post_quant = try loadConv(alloc, store, "conv2", 16, 16, 1);
-        const conv_in = try loadConv(alloc, store, "decoder.conv1", 16, 384, 3);
+        const conv_in = try loadConvAs(.keep, alloc, store, "decoder.conv1", 16, 384, 3);
         const mid_res1 = try loadRes(alloc, store, "decoder.middle", 0, 384, 384);
         const mid_attn: AttnBlock = .{
             .norm = try loadGamma(alloc, store, "decoder.middle.1.norm.gamma", 384),
@@ -179,34 +257,41 @@ pub const Decoder = struct {
         self.* = undefined;
     }
 
-    /// Rough upper bound on the PEAK device VRAM (bytes) a whole-image GPU decode
-    /// of a [16][zh][zw] latent needs for its ACTIVATIONS: the three grow-and-keep
-    /// ping-pong buffers (x/t/u in vae_cuda / vae_gpu, each sized to the largest
-    /// activation `max(h*w*ch)`) plus the capped im2col patch band. Mirrors
-    /// decode()'s resolution/channel walk (res keeps resolution; up doubles h,w).
-    /// Deliberately approximate, it can't see the opaque cuBLASLt/cuDNN conv
-    /// workspace, so callers pre-free with a margin and keep a reactive fallback.
-    /// (For a tiled decode, call with the tile side to bound a single tile.)
-    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize) u64 {
-        var h = zh;
-        var w = zw;
-        var max_act: u64 = @as(u64, zh) * zw * self.conv_in.co; // latent res, 384ch
+    /// The device walk's activation sizes in elements: `wide` bounds `x` and `t`, `out`
+    /// bounds `u`, which only ever receives a residual block's convolution outputs.
+    pub fn activationElems(self: *const Decoder, zh: usize, zw: usize) sd_vae.ActWidths {
+        var n: u64 = @as(u64, zh) * zw;
+        var wide: u64 = n * self.conv_in.co;
+        var out: u64 = n * self.mid_res1.conv2.co;
         for (self.ups) |layer| switch (layer) {
             .res => |rb| {
-                const e = @as(u64, h) * w * @max(rb.conv1.ci, rb.conv2.co);
-                if (e > max_act) max_act = e;
+                wide = @max(wide, n * @max(rb.conv1.ci, rb.conv2.co));
+                out = @max(out, n * rb.conv2.co);
             },
             .up => |cv| {
-                h *= 2; // fused nearest-2x upsample: output lands at the doubled res
-                w *= 2;
-                const e = @as(u64, h) * w * cv.co;
-                if (e > max_act) max_act = e;
+                n *= 4;
+                wide = @max(wide, n * cv.co);
             },
         };
-        const head_in = @as(u64, h) * w * self.head_conv.ci; // full res, 96ch
-        if (head_in > max_act) max_act = head_in;
-        const patch_band: u64 = 256 << 20; // vae_cuda patch_band_bytes cap
-        return 3 * max_act * 4 + patch_band;
+        return .{ .wide = @max(wide, n * self.head_conv.ci), .out = out };
+    }
+
+    /// Upper bound on the PEAK device bytes a whole-image GPU decode of a [16][zh][zw]
+    /// latent needs beyond the weights: the activation buffers at the chain's width,
+    /// the f32 staging buffer, and the mid-block attention at latent resolution
+    /// (`scores_resident` is the Vulkan arm, which also keeps k-major copies of Q and K
+    /// and one query band of the f32 scores plane). It cannot see cuDNN's or cuBLASLt's
+    /// own workspace, so callers pre-free with a margin and keep a reactive fallback.
+    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize, scores_resident: bool, act16: bool) u64 {
+        const a = self.activationElems(zh, zw);
+        const seq: u64 = @as(u64, zh) * zw;
+        const c: u64 = self.mid_attn.proj.co;
+        const attn = 4 * seq * c * 4 +
+            if (scores_resident) 2 * seq * c * 4 + @as(u64, sd_vae.scoresBand(@intCast(seq))) * seq * 4 else 0;
+        const stage: u64 = @max(seq * latent_channels, seq * 64 * 3) * 4;
+        const abytes: u64 = if (act16) 2 else 4;
+        const patch_band: u64 = 256 << 20;
+        return (2 * a.wide + a.out) * abytes + attn + stage + patch_band;
     }
 
     /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized)
@@ -331,7 +416,7 @@ pub const Decoder = struct {
         const v = try gpa.alloc(f32, n * c);
         defer gpa.free(v);
         inline for (.{ q, k_, v }, 0..) |dst, part| {
-            const wslice = ab.qkv.w[part * c * c ..][0 .. c * c];
+            const wslice = ab.qkv.krsc()[part * c * c ..][0 .. c * c];
             const bslice = ab.qkv.b[part * c ..][0..c];
             try ops.matmul.matmul(io, gpa, dst, t, n, Weight.fromF32(wslice, c, c), bslice);
         }
@@ -349,7 +434,7 @@ pub const Decoder = struct {
 
         const out = try gpa.alloc(f32, n * c);
         errdefer gpa.free(out);
-        try ops.matmul.matmul(io, gpa, out, attn_out, n, Weight.fromF32(ab.proj.w, c, c), ab.proj.b);
+        try ops.matmul.matmul(io, gpa, out, attn_out, n, Weight.fromF32(ab.proj.krsc(), c, c), ab.proj.b);
         for (out, x) |*o, s| o.* += s;
         gpa.free(x);
         return out;
@@ -379,13 +464,25 @@ pub fn conv2d(io: std.Io, gpa: std.mem.Allocator, out: []f32, in: []const f32, h
     std.debug.assert(in.len == h * w * ci);
     std.debug.assert(out.len == h * w * conv.co);
 
+    // A checkpoint-order weight is repacked per call (the same f32 values a load-time
+    // repack gives, so the parity bytes do not move).
+    var owned: ?[]f32 = null;
+    defer if (owned) |o| gpa.free(o);
+    const wk: []const f32 = switch (conv.w) {
+        .krsc => |s| s,
+        .torch => blk: {
+            owned = try conv.asOps().materialize(gpa);
+            break :blk owned.?;
+        },
+    };
+
     if (conv.k == 1) {
-        return ops.matmul.matmul(io, gpa, out, in, h * w, Weight.fromF32(conv.w, conv.co, ci), conv.b);
+        return ops.matmul.matmul(io, gpa, out, in, h * w, Weight.fromF32(wk, conv.co, ci), conv.b);
     }
     std.debug.assert(conv.k == 3);
 
     const patch_len = 9 * ci;
-    const weight = Weight.fromF32(conv.w, conv.co, patch_len);
+    const weight = Weight.fromF32(wk, conv.co, patch_len);
     const max_rows = @max(1, (16 << 20) / (w * patch_len * 4));
     const buf = try gpa.alloc(f32, @min(h, max_rows) * w * patch_len);
     defer gpa.free(buf);
@@ -428,6 +525,12 @@ pub fn nearest2x(gpa: std.mem.Allocator, x: []const f32, h: usize, w: usize, c: 
     return out;
 }
 
+/// Rows `part` (0 q, 1 k, 2 v) of the repacked fused `to_qkv` 1x1 as a conv of its own.
+pub fn qkvPart(qkv: Conv2d, part: usize) ops.conv.Conv2d {
+    const c = qkv.ci;
+    return .{ .w = .{ .krsc = qkv.krsc()[part * c * c ..][0 .. c * c] }, .b = qkv.b[part * c ..][0..c], .co = c, .ci = c, .k = 1, .pad = 0 };
+}
+
 pub fn planarToRows(gpa: std.mem.Allocator, planar: []const f32, c: usize, n: usize) ![]f32 {
     const out = try gpa.alloc(f32, planar.len);
     for (0..n) |i| {
@@ -455,6 +558,12 @@ fn loadGamma(alloc: std.mem.Allocator, st: weights_mod.WeightStore, name: []cons
 /// Load a conv weight (+bias), collapsing a causal temporal axis if present
 /// (last kt slice) and repacking to [co][kh][kw][ci].
 pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
+    return loadConvAs(.repack, alloc, st, prefix, ci, co, k);
+}
+
+/// `loadConv` with the weight kept in checkpoint order where every reader converts it
+/// (`quant_weight.convWeights`) under `.keep`.
+pub fn loadConvAs(form: Form, alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
     const wname = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
     const bname = try std.fmt.allocPrint(alloc, "{s}.bias", .{prefix});
     const wview = st.get(wname) orelse return error.MissingTensor;
@@ -467,6 +576,18 @@ pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: [
     };
     if (shape[0] != co or shape[1] != ci or shape[shape.len - 2] != k or shape[shape.len - 1] != k)
         return error.ShapeMismatch;
+
+    // Bias may be absent (bias=False convs, e.g. TAEHV's TGrow/stage convs),
+    // synthesize zeros then.
+    const bias = if (st.get(bname)) |bv| blk: {
+        if (bv.info.elemCount() != co) return error.ShapeMismatch;
+        break :blk try bv.toF32Alloc(alloc);
+    } else blk: {
+        const z = try alloc.alloc(f32, co);
+        @memset(z, 0);
+        break :blk z;
+    };
+    if (form == .keep) return .{ .w = try quant_weight.convWeights(alloc, wview, co, ci, k), .b = bias, .co = co, .ci = ci, .k = k };
 
     const raw = try wview.toF32Alloc(alloc);
     defer alloc.free(raw);
@@ -483,17 +604,7 @@ pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: [
         }
     }
 
-    // Bias may be absent (bias=False convs, e.g. TAEHV's TGrow/stage convs),
-    // synthesize zeros then.
-    const bias = if (st.get(bname)) |bv| blk: {
-        if (bv.info.elemCount() != co) return error.ShapeMismatch;
-        break :blk try bv.toF32Alloc(alloc);
-    } else blk: {
-        const z = try alloc.alloc(f32, co);
-        @memset(z, 0);
-        break :blk z;
-    };
-    return .{ .w = packed_w, .b = bias, .co = co, .ci = ci, .k = k };
+    return .{ .w = .{ .krsc = packed_w }, .b = bias, .co = co, .ci = ci, .k = k };
 }
 
 fn loadRes(alloc: std.mem.Allocator, st: weights_mod.WeightStore, base: []const u8, idx: usize, ci: usize, co: usize) !ResBlock {
@@ -505,10 +616,10 @@ fn loadRes(alloc: std.mem.Allocator, st: weights_mod.WeightStore, base: []const 
     const sc = try std.fmt.allocPrint(alloc, "{s}.shortcut", .{p});
     return .{
         .norm1 = try loadGamma(alloc, st, n1, ci),
-        .conv1 = try loadConv(alloc, st, c1, ci, co, 3),
+        .conv1 = try loadConvAs(.keep, alloc, st, c1, ci, co, 3),
         .norm2 = try loadGamma(alloc, st, n2, co),
-        .conv2 = try loadConv(alloc, st, c2, co, co, 3),
-        .shortcut = if (ci != co) try loadConv(alloc, st, sc, ci, co, 1) else null,
+        .conv2 = try loadConvAs(.keep, alloc, st, c2, co, co, 3),
+        .shortcut = if (ci != co) try loadConvAs(.keep, alloc, st, sc, ci, co, 1) else null,
     };
 }
 
@@ -542,7 +653,7 @@ fn dumpDecodeOutput(io: std.Io, out: []const f32) void {
 test "decode matches comfyui reference" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const vae_path = "models/vae/krea2RealVae_v10.safetensors";
+    const vae_path = build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors";
     std.Io.Dir.cwd().access(io, vae_path, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, "testdata/vae_z_8x8.bin", .{}) catch return error.SkipZigTest;
 
@@ -609,12 +720,12 @@ fn checkStage(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []cons
 test "decode stage parity" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    std.Io.Dir.cwd().access(io, "models/vae/krea2RealVae_v10.safetensors", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, "testdata/vae_stage_postquant.bin", .{}) catch return error.SkipZigTest;
 
     const z = try readF32File(gpa, io, "testdata/vae_z_8x8.bin", 16 * 8 * 8);
     defer gpa.free(z);
-    var st = try SafeTensors.open(gpa, io, "models/vae/krea2RealVae_v10.safetensors");
+    var st = try SafeTensors.open(gpa, io, build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors");
     defer st.deinit();
     var dec = try Decoder.load(gpa, .{ .safetensors = &st });
     defer dec.deinit();
@@ -676,7 +787,7 @@ test "conv2d identity kernel" {
     var w: [9]f32 = @splat(0);
     w[4] = 1; // [ky=1][kx=1][ci=0]
     const b = [_]f32{0};
-    const conv: Conv2d = .{ .w = &w, .b = &b, .co = 1, .ci = 1, .k = 3 };
+    const conv: Conv2d = .{ .w = .{ .krsc = &w }, .b = &b, .co = 1, .ci = 1, .k = 3 };
     const in = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     var out: [12]f32 = undefined;
     try conv2d(io, gpa, &out, &in, 3, 4, conv);
@@ -690,7 +801,7 @@ test "conv2d zero padding at borders" {
     var w: [9]f32 = @splat(0);
     w[0] = 1;
     const b = [_]f32{0};
-    const conv: Conv2d = .{ .w = &w, .b = &b, .co = 1, .ci = 1, .k = 3 };
+    const conv: Conv2d = .{ .w = .{ .krsc = &w }, .b = &b, .co = 1, .ci = 1, .k = 3 };
     const in = [_]f32{ 1, 2, 3, 4 };
     var out: [4]f32 = undefined;
     try conv2d(io, gpa, &out, &in, 2, 2, conv);

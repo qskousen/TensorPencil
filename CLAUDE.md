@@ -59,6 +59,11 @@ from a checkpoint, match what ComfyUI does.
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
 | `TODO.md` | open work |
 
+**Every `*-test` command runs its CPU side with `ops.matmul.exact_activations`** (set in
+`main`'s dispatch): below 16 rows the CPU block-quant GEMM otherwise quantizes the
+activation too, and on SenseNova that made the REFERENCE 3% wrong. Each also takes
+`--act f32|f16|bf16` (`test_act`), the width its device forwards store activations at.
+
 **A device check pinned to one shape answers about one shape.** The diffusion device
 commands take the axes a defect rides (`--layers`, `--lat`, `--cap`, `--sigma`), and
 `--dequant-at-load` runs a quantized file through the dense path; BACKEND.md 2C says what
@@ -76,6 +81,10 @@ each has caught.
   self-skip when their device or file is absent. **`-Dintegration` defaults the build to
   ReleaseSafe** (Debug makes it ~6x slower and buys nothing: these tests are real models
   and real kernels, and ReleaseSafe keeps every assert). An explicit `-Doptimize=` wins.
+- `-Dmodel-root=<dir>` — where the real-model tests and device-command defaults find
+  checkpoints (default `/mnt/watch/models/diffusion`, the `checkpoints/`, `vae/`,
+  `text_encoders/` ... layout). A test that only checks the file exists runs in the
+  fast suite when it does.
 - `zig build test -Dtest-filter="<substring>"` — one test. **The `=` is required**, and
   only one filter substring per run.
 - `zig build test -Dintegration -Dtest-timing` — same suite through
@@ -92,7 +101,7 @@ each has caught.
   model, GPU or engine. `--hosts` goes through the REAL `status_bar.render`, which is
   what shows that two bars do not share a history ring, a widget id or a handle. The GUI's
   failure modes are visual; this is how you see them. `--studio --lora` draws the
-  studio over a SenseNova selection, the only family with a LoRA section. `--reopened`
+  studio over a SenseNova selection, which has a LoRA section. `--reopened`
   draws a run whose files have since gone: ghost slots, no toast and no retry anywhere.
 - `zig build catalog-probe -- <folder>...` — scan model folders as tp-gui does and print
   what each file was taken for. The answer to "why is my model not in the menu".
@@ -139,15 +148,21 @@ no rows for).
 **Device validation is CLI commands, not unit tests**, because the test binary brings up no
 CUDA context. Each checks kernels against their CPU ops and then a whole forward against the
 CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
-(each block-quant weight decode against its CPU replica), `cuda-vae-test`, `mageflow-cuda-test`, `mage-vae-cuda-test`,
+(each block-quant weight decode against its CPU replica), `wan-vae-test` (the Wan decoder on every arm at every activation width), `taehv-test` and `gemma-vit-test`
+(every GPU arm against the CPU, with a hash per arm for comparing two builds; `embed-bench
+--hash` does the same for the embedders), `mageflow-cuda-test`, `mage-vae-cuda-test`,
 `mageflow-vk-test`, `mage-vae-vk-test`,
 `zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
 `minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `sensenova-cuda-test`
 (and `sensenova-vk-test`, the same checks over the Vulkan arm), `lora-cuda-test` (needs no
-checkpoint), `lora-restack-test` (a LoRA stack swapped on a live session: the
+checkpoint), `lin-cuda-test` (every `lin_cuda` route, bias included, and every conv weight form
+through `conv_cuda.conv2d`, against the CPU; no checkpoint), `lin-vk-test` and `lora-vk-test`
+(the same for `lin_gpu` and the Vulkan sidecar), `lora-restack-test [--backend]` (a LoRA stack swapped on a live session: the
 image must come back bit-identical AND the factors' VRAM must be handed back),
 plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`,
 `vk-gemv-bench` (every Vulkan block-quant decode GEMV per format, a weight copy per route),
+`vk-prep-bench` (the Vulkan int8 activation prep per width, fused against the 3-pass chain),
+`vk-wo-bench` (an int8 linear as W8A8, W8A16 and a dense f16 weight on the same GEMM),
 `zimage-cuda-bench`, `mageflow-bench`). ⚠️ **This box's GPU is shared with the desktop
 and its clock drifts ~3% between runs**, so a speed change is measured by an
 INTERLEAVED same-binary A/B (both variants alternating in one process), never by
@@ -156,7 +171,9 @@ comparing two invocations; check `nvidia-smi` for other users first.
 **A quantized checkpoint that renders is not a quantized checkpoint that works.** A
 conditioning that is gone renders a clean picture that ignores the prompt, so a
 quantized file is checked against its dense source on an INTERMEDIATE, not on an
-image: two prompts through both checkpoints, comparing conditioning and velocity.
+image: two prompts through both checkpoints, comparing conditioning and velocity
+(`cond-diff <dense> <quant>` does the conditioning half for any family; `velocity-diff
+<ckpt>` holds one checkpoint's device denoiser against its CPU one from one conditioning).
 `weights.Overlay` then attributes the damage by taking one weight kind from the dense
 file (BACKEND.md 2G, where this found a single tensor that cannot be q4_k).
 
@@ -291,7 +308,7 @@ file by the host's catalog id, because a machine that lacks a file has no path f
 must not touch the live catalog, and only a file in the scanned folders is nameable.
 `client/sync.zig` runs one transfer per host on its own thread with its own links, and
 the Settings model library offers both (`Hosts.missingModel` covers every
-`config.model_ref_fields` entry, not just the render's). The host rescans when a file
+image file on every host, and the chat model only on the chat host). The host rescans when a file
 lands and the client rescans the local host after a pull; the client re-pushes settings
 whenever a host's catalog moves, which is what makes the just-moved model resolve.
 Every queue row cancels on its own: a render still waiting here is dropped from
@@ -344,16 +361,34 @@ A model architecture is normally three files: `foo.zig` (CPU reference and the l
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path
 and differ only in whether GEMM/attention route to the vendor libraries).
 
+**Vulkan pipelines compile once per build and driver, not per run** (`gpu/pipe_cache.zig`):
+an eltwise kernel is created on first use from a module cut down to it (`spv.forEntry`; the
+driver processes the whole module it is handed, ~0.7 s per kernel against the full one),
+through a `VkPipelineCache` under the user's cache dir; init's other pipelines are created
+as one batch on every core (`PipeBatch`). Every compile is logged with its time.
+
 **A plain elementwise kernel is written once, in `src/gpu/kernels/dual.zig`**, which compiles
 to SPIR-V and to PTX and so reaches every GPU arm; only kernels needing shared memory or a
 subgroup reduce still live per backend (`gpu/kernels/eltwise.zig`, `gpu/cuda/elt.zig`).
 
-**An LLM stepper names no weight dtype.** `models/lin_llm_cuda.zig` and
-`models/lin_llm_gpu.zig` are the one linear dispatcher per backend, routing each weight by
-storage, shape and row count (decode GEMV, grouped GEMV, MMQ, dequant GEMM). Every `Model`
+**Every convolution goes through `models/conv_cuda.zig` / `conv_gpu.zig`** (2-D, 1-D, 3-D,
+stride-k patch embeds): a gather, then the GEMM; never an im2col or a GEMM in a model file.
+**A device forward names no weight dtype.** `models/dual_lin.zig` routes each linear by
+storage, shape, row count and the caller's plan (decode GEMV, grouped GEMV, MMQ, dequant
+GEMM, int8 convrot) over each backend's `Caps`; `models/lin_cuda.zig` and
+`models/lin_gpu.zig` execute those routes for every caller, diffusion and LLM alike, so a
+format one arm of a backend runs, every arm of it runs. Every `Model`
 exposes `deviceLins`, and the stepper `plan`s that list at init so a format with no kernel
 is refused by tensor name, never met as `unreachable` mid-forward. A kernel wired in the
 dispatcher reaches every architecture; a kernel wired in one stepper is a regression.
+**A model's device forward is written once** (every `models/*_dev.zig`: each diffusion
+family, its VAEs and encoders, the embedders and the hybrid LLM;
+`transformer_gpu.decoderLayer` for the dense transformers) over a per-backend `Dev`
+adapter that replays its backend's own dispatch sequence (the embedders share one,
+`tower_cuda` / `tower_gpu`); a backend's fast paths live in the plans its adapter returns (which
+buffer, at which dtype; `lin_gpu.prepStaged` for an f16 operand a fused kernel wrote). A
+Vulkan buffer slices through `Context.view`, which every binding honours, and a Vulkan LLM's
+KV cache is `kv_gpu.Kv`.
 
 ## The diffusion pipeline
 
@@ -380,6 +415,19 @@ var img = try sess.decode(x, lat_h, lat_w, .{}, null);   // latent -> RGB8
   renders with.
 - Each stage tags its VRAM (`encode` → `.te`, `denoiser` → `.latent`/`.dit`, `decode` →
   `.vae`) so the GUI meter stays meaningful.
+- **Activation precision is a per-component dial** (`src/precision.zig`; `Options.te_act` /
+  `dit_act` / `vae_act`, null = `auto`). `Session.actFor` resolves it as the component
+  actually runs it (`effectiveAct`), every forward's output is finite-checked, and `auto`
+  widens f16 -> f32 (bf16 only when asked for) and remembers it; an explicit dtype fails instead
+  (`error.NonFiniteActivation`, `Session.last_failure`). A walk that gains a dtype says so
+  in `effectiveAct`, or the dial never reaches it. `lin_cuda` / `lin_gpu` take any
+  activation dtype on every route (a route with no 16-bit form stages through f32), so a
+  walk only has to store its buffers at `act`. Integer weights run the format's own
+  arithmetic (W8A8, W4A4, W4A8) under `auto` and weight-only at an explicit dtype (W8A16,
+  W8A32; `Session.intGemmFor`), and the saved field names which. Judge a dtype by `diffusion-profile --ab
+  act:D` against `--ab perturb` (the same forward on a nudged latent) and against the
+  CPU (`velocity-diff --dit-act`): a W8A8 route, an f16 score plane or f16 GEMM accumulators re-roll their own
+  noise on ANY input change, so f32-vs-16 alone reads that noise as the dtype's cost.
 - `Session.decodePlanar` is the one VAE-decode ladder for every family: whole-image → free
   VRAM and retry → GPU-tiled → CPU-tiled. A whole-image decode is a single tile covering
   the whole latent. `--vae-decode auto|whole|gpu_tiled|cpu_tiled` overrides it.
@@ -471,10 +519,12 @@ wrong — only the image is different. Pin each direction with its own test.
   `--text-encoder` / `--vae` flag wins, then the primary checkpoint's own copy under any
   known prefix, then a *defaulted* side path, else `error.ComponentNotInCheckpoint`. A
   defaulted path that does not exist is not an error; an explicit one that fails to open is.
-- **`weights.WeightStore` has four arms**: safetensors, GGUF, `Prefixed` (a base plus a
-  prefix, so no loader takes a prefix parameter) and `Overlay` (a base plus a name→view
-  patch map, for substituting one tensor without rewriting a checkpoint). `Overlay.mapping()`
-  returns null, since a patched tensor's bytes are outside the base mapping.
+- **`weights.WeightStore` has five arms**: safetensors, GGUF, `Prefixed` (a base plus a
+  prefix, so no loader takes a prefix parameter), `Overlay` (a base plus a name→view
+  patch map, for substituting one tensor without rewriting a checkpoint) and `Mix` (each
+  layer, sidecars included, taken whole from one of two stores; `quant-attrib <dense>
+  <quant>` ranks a quantized file's layers by the velocity error each costs). `Overlay`
+  and `Mix` return a null `mapping()`, since their bytes are outside any one mapping.
 - `safetensors.initFromSlice` requires the tensor ranges to **cover** the payload exactly.
   Per-tensor bounds checks pass on a corrupt file; only the aggregate shows it.
 - **GGUF**: dims are stored reversed, and `comfy.gguf.orig_shape.<name>` must be restored at
@@ -501,7 +551,7 @@ they support** — a new reader belongs in that shared module the day it is writ
 | int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan has no `sint4`, so it decodes per GEMM to int8 |
 | `asym_w4a8_int8` | 4-bit codebook indices + fp8 per-group scales | decodes to int8 convrot, per GEMM |
 | NVFP4 | E2M1 nibbles + fp8 block scales, swizzled | decodes to bf16, feeds the bf16 GEMM |
-| GGUF block quants (q4_k, q8_0, …) | ggml blocks | decodes per GEMM to int8 convrot or f16 (`--dit-gguf-gemm`), CUDA arms only |
+| GGUF block quants (q4_k, q8_0, …) | ggml blocks | decodes per GEMM to int8 convrot or bf16/f16 (`--dit-gguf-gemm`); Vulkan to f16 or bf16 |
 
 - Packed weights stay packed and each consumer decodes on demand; materializing at load
   gives back the memory the format saved.
@@ -515,24 +565,32 @@ they support** — a new reader belongs in that shared module the day it is writ
   rotated, so leaving it out of the scan pairs them with an unrotated activation and renders
   uncorrelated noise. Both sides rotate or neither.
 - ⚠️ **Weight storage must gate every GEMM call site, not just the main one.** Fast paths
-  that key on "not int8 and not bf16" happily read a packed 4-bit weight as fp8 bytes.
-- **A LoRA is a runtime sidecar, never a merge**: `models/lora.zig` (loader + host apply)
-  and `models/lora_cuda.zig` (device), keyed on `Weight.tag`, so it is
+  that key on "not int8 and not bf16" happily read a packed 4-bit weight as fp8 bytes, so a
+  fused path asks for the dispatcher's route positively (`dit_gpu.allRoute`).
+- **A LoRA is a runtime sidecar, never a merge**, on every family and every adapter form ComfyUI reads
+  (LoRA, LoCon, LoHa, LoKr, DoRA, diffs; one reader, `models/lora_adapter.zig`): `models/lora.zig` (loader + host apply)
+  and `models/lora_cuda.zig` / `models/lora_gpu.zig` (device, applied inside each
+  backend's linear dispatcher), keyed on `Weight.tag`, so it is
   architecture-independent. `y = W x + s B (A x)` leaves an int8 base untouched and
   `strength` a runtime dial. The stack is swappable on a LIVE session
   (`Session.setLoras`, between forwards only), since nothing about a sidecar reads
   the checkpoint; ⚠️ it must evict each outgoing factor from the pointer-keyed
   device weight cache BEFORE freeing it, or the next stack is served the old
   copies and the swap leaks a whole stack. `Family.supportsLora` is the list of
-  architectures with a sidecar arm at all, and a UI asks it before offering one. Same call-site hazard as above, and `minimax_h3.Lin` is the
+  architectures that take one, and a UI asks it before offering one. Same call-site hazard as above, and `minimax_h3.Lin` is the
   answer to it: the weight is reachable only as `.w`, so the sidecar is in every grep.
-- ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met four times here
+  The SD family's key map and adapter reading are `models/lora_sd.zig`, whose
+  ComfyUI-exact `merge` renders nothing and is the oracle a sidecar is checked against.
+- ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met five times here
   (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk
-  activations, and Z-Image's unnormed attention V, which only overflows at DEPTH on a
-  checkpoint whose residual is large enough). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
-  f16, an f32 scores plane, and `residual_act_div` (an exact power-of-two scale across the
-  cast). `sd_vae.Config.act_f16` and `sd_unet.Config.act_f16` pick f16 activation storage per
-  architecture, and it is **range** that gates it, not precision. With f16 storage on, every
+  activations, Z-Image's unnormed attention V, which only overflows at DEPTH on a
+  checkpoint whose residual is large enough, and SenseNova's residual and down projection
+  at the LAST step). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
+  f16, an f32 scores plane, `residual_act_div` (an exact power-of-two scale across the
+  cast), and a residual stored divided by a power of two with the RMSNorm eps scaled to
+  match and the delta kept f32 (`sensenova_dev.streamDiv`). `sd_vae.Config.act_f16` and `sd_unet.Config.act_f16` pick f16 activation storage per
+  architecture, and `lin_cuda.Plan.act16` the width a narrowing route stages at (an fp8
+  Z-Image rendered white until it said bf16); it is **range** that gates it, not precision. With f16 storage on, every
   buffer a GEMM reads must be at that width, including ones that are not activations (the SD
   UNet's text conditioning is a cross-attention GEMM source, so `Session.ctx_d` narrows too).
 

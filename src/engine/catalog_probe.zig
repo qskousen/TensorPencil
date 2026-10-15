@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
             if (e.preview.has(fam)) try out.print("    preview {t}\n", .{fam});
         }
         if (e.lora) |l| {
-            try out.print("    lora   {d} linears, rank {d}, depth {d}\n", .{ l.info.targets, l.info.rank, l.info.depth });
+            try out.print("    lora   {d} weights, rank {d}, depth {d}\n", .{ l.info.targets, l.info.rank, l.info.depth });
             inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
                 if (l.has(@enumFromInt(ff.value))) try out.print("    lora   fits {s}\n", .{ff.name});
             }

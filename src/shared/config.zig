@@ -420,6 +420,20 @@ pub const VaeDecode = enum(u8) {
     }
 };
 
+/// One component's activation-precision dial (`pipeline.precision`): `auto` starts at
+/// the family's dtype and widens after a non-finite forward; a dtype is run as chosen,
+/// and a non-finite forward then fails the render.
+pub const Precision = enum(u8) {
+    auto,
+    f32,
+    f16,
+    bf16,
+
+    fn fromStr(s: []const u8) ?Precision {
+        return std.meta.stringToEnum(Precision, s);
+    }
+};
+
 /// LLM sampling controls, mirroring the library's `llm.sample.Params` field
 /// for field (kept engine-free here, `chat.samplingParams` maps it across).
 /// Applied LIVE: a change (or a loaded preset) takes effect on the next chat
@@ -796,7 +810,11 @@ pub const HostList = FixedList(HostEntry, max_hosts);
 /// The settings fields naming a model file, plus each `loras[].path`. A host
 /// resolves an id text in any of them (`catalog.parseId`) against its own
 /// catalog before the engine sees it.
-pub const model_ref_fields = [_][]const u8{ "llm_model", "vision_tower", "diffusion_model", "text_encoder", "text_encoder_2", "vae", "taesd" };
+pub const model_ref_fields = chat_ref_fields ++ image_ref_fields;
+/// What only the host carrying the chat reads.
+pub const chat_ref_fields = [_][]const u8{ "llm_model", "vision_tower" };
+/// What any host may read, since a render can be placed anywhere.
+pub const image_ref_fields = [_][]const u8{ "diffusion_model", "text_encoder", "text_encoder_2", "vae", "taesd" };
 
 /// Host fields that describe the machine, not the user's wishes: a remote
 /// host keeps its own values when a client's settings arrive (the client's
@@ -942,6 +960,11 @@ pub const Config = struct {
     diff_backend: Backend = .zig_cuda,
     /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
     vae_decode: VaeDecode = .auto,
+    /// The precision dial of the text encoder, the denoiser and the VAE. Per render:
+    /// a change reloads nothing.
+    te_act: Precision = .auto,
+    dit_act: Precision = .auto,
+    vae_act: Precision = .auto,
     /// Compute a model's AutoV2 hash for the saved PNG when it has no
     /// `<path>.sha256` sidecar, writing one so it is paid once. Off omits the
     /// `Model hash` / `VAE hash` / `Hashes` fields; a sidecar that already exists
@@ -1655,6 +1678,12 @@ pub const Config = struct {
             if (Backend.fromStr(val)) |b| self.diff_backend = b;
         } else if (std.mem.eql(u8, key, "vae_decode")) {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
+        } else if (std.mem.eql(u8, key, "te_act")) {
+            if (Precision.fromStr(val)) |v| self.te_act = v;
+        } else if (std.mem.eql(u8, key, "dit_act")) {
+            if (Precision.fromStr(val)) |v| self.dit_act = v;
+        } else if (std.mem.eql(u8, key, "vae_act")) {
+            if (Precision.fromStr(val)) |v| self.vae_act = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "reasoning_effort")) {
@@ -1771,7 +1800,8 @@ pub const host_fields = [_][]const u8{
     "qwen35_fixed_template",     "weight_noise",              "weight_noise_curve",
     "weight_noise_amount",       "kv_dtype",                  "weight_read",
     "vision_budget",             "regen_cache_mb",            "max_new_tokens",
-    "sampling",
+    "sampling",                  "te_act",                    "dit_act",
+    "vae_act",
 };
 
 /// `Config` cut down to `host_fields`, each with the type and default it has
@@ -2760,6 +2790,9 @@ test "HostSettings carries every host field and none of the client's" {
     cfg.llm_backend = .cpu;
     cfg.diff_backend = .vulkan;
     cfg.vae_decode = .cpu_tiled;
+    cfg.te_act = .f32;
+    cfg.dit_act = .bf16;
+    cfg.vae_act = .f16;
     cfg.hash_models = false;
     cfg.system_prompt.set("be brief");
     cfg.reasoning = false;

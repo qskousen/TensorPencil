@@ -25,7 +25,8 @@
 //! 2. **bf16 factors only.** `opGemmBf16` reads the raw 16-bit weight as its B
 //!    operand. `supported` refuses anything else by name rather than at a
 //!    launch, and the host path still works, so a non-bf16 LoRA is slow, not
-//!    broken.
+//!    broken. The one exception is `How.a_i8`: an int8 copy of A made at attach,
+//!    which runs on the int8 activation a base GEMM already staged.
 
 const std = @import("std");
 const lora = @import("lora.zig");
@@ -47,23 +48,47 @@ pub var bench_skip_add: bool = false;
 /// both. Correct either way; only the traffic differs.
 pub var bench_no_fuse: bool = false;
 
+/// DIAGNOSTIC, renders garbage: skip the A GEMM everywhere, or only on the SD linears
+/// a shared A GEMM would absorb (attn1's k and v, attn2's v, one A left per input).
+/// The second is the ceiling on what sharing can save.
+pub var bench_skip_a: enum { none, all, shared } = .none;
+
+fn skipA(tag: []const u8) bool {
+    return switch (bench_skip_a) {
+        .none => false,
+        .all => true,
+        .shared => for ([_][]const u8{ "attn1.to_k.weight", "attn1.to_v.weight", "attn2.to_v.weight" }) |s| {
+            if (std.mem.endsWith(u8, tag, s)) break true;
+        } else false,
+    };
+}
+
 /// Whether every factor of `t` can run here.
 ///
-/// `opGemmBf16` takes the raw weight as its GEMM B operand, which fixes the tile
-/// alignment: the output width must be a multiple of 128 and the contracted
-/// width a multiple of 32. Every real LoRA shape clears both (rank 128 or 384
-/// against widths that are already multiples of 128), but a rank-64 or rank-96
-/// factor would not, and it must fall back rather than launch a GEMM whose tiles
-/// read past the weight.
+/// Both GEMMs go through `opGemmBf16`, which needs every width a multiple of 32
+/// and pads a narrow output to its 128 tile itself. The rank is the A GEMM's
+/// output and the B GEMM's contraction, and `Sidecar.load` pads it to
+/// `lora.rank_align`, so every file rank clears it; a hand-built target may not.
+/// B's output width must be a multiple of 128, which is the base linear's own
+/// width: SD1.5's 320-wide linears miss it, and that belongs to the SD sidecar
+/// when there is one.
 pub fn supported(t: *const Target) bool {
+    for (t.kron) |k| if (k.w2.dtype != .bf16 and k.w2.dtype != .f16) return false;
+    for (t.diffs) |d| if (d.w.dtype != .bf16 and d.w.dtype != .f16) return false;
     for (t.factors) |f| {
         if (f.a.dtype != .bf16 or f.b.dtype != .bf16) return false;
-        const rank = f.a.rows;
-        if (rank % 128 != 0) return false; // A's output width, B's contraction
+        if (f.a.rows % lora.rank_align != 0) return false;
         if (f.a.cols % 32 != 0) return false; // A's contraction
-        if (f.b.rows % 128 != 0) return false; // B's output width
+        if (f.b.rows % 32 != 0) return false; // B's output width
     }
     return true;
+}
+
+/// `lo` elements one apply of a rank-`rank` factor over `m` rows needs. The int8 A
+/// GEMM stores `align(m, 128)` rows of `align(rank, 128)` columns, its A padded to
+/// the tile by `lora.quantizeA`; the bf16 one writes less.
+pub fn loElems(m: usize, rank: usize) usize {
+    return std.mem.alignForward(usize, m, 128) * std.mem.alignForward(usize, rank, 128);
 }
 
 /// Scratch for one apply. Sized from the largest shape a render will ask for,
@@ -127,11 +152,19 @@ pub fn borrowed(be: *Backend, lo_elems: usize, hi_elems: usize) !Workspace {
     };
 }
 
+/// How `apply` reads its input and writes its output.
+pub const How = struct {
+    /// The factor's A as int8 (`lora.quantizeA`) in the basis of the int8 activation
+    /// the backend has staged for `x`. The A GEMM then reads that prep, not `x`.
+    a_i8: ?Weight = null,
+};
+
 /// `dst[m][n] += strength * t.scale * B[row0 .. row0+n] (A x)`.
 ///
-/// `x` is `[m][t.in_dim]` f32 (the SAME activation the base GEMM reads, before
-/// any int8 prep: the sidecar is in the unrotated space). `dst` is `[m][n]` f32,
-/// already holding the base GEMM's output.
+/// `x` is `[m][t.in_dim]` (the SAME activation the base GEMM reads, before any int8
+/// prep: the sidecar is in the unrotated space), and `dst` is `[m][n]` already holding
+/// the base GEMM's output, each at its own dtype. A 16-bit `dst` is accumulated in
+/// place by the GEMM on `libs`, through the f32 plane and a scaled add elsewhere.
 ///
 /// `[row0, row0 + n)` must sit inside one factor. It always does in practice:
 /// the ranges a trunk asks for are the fused linear's own pieces, and a
@@ -147,8 +180,23 @@ pub fn applyRange(
     row0: usize,
     n: usize,
 ) !void {
+    return apply(be, ws, dst, x, m, t, strength, row0, n, .{});
+}
+
+pub fn apply(
+    be: *Backend,
+    ws: *Workspace,
+    dst: Buf,
+    x: Buf,
+    m: usize,
+    t: *const Target,
+    strength: f32,
+    row0: usize,
+    n: usize,
+    how: How,
+) !void {
     std.debug.assert(row0 + n <= t.out_dim);
-    const f = factorFor(t, row0, n) orelse {
+    const f = t.factorAt(row0, n) orelse {
         std.log.err("lora: {s} output rows [{d},{d}) straddle a factor boundary", .{ t.tag, row0, row0 + n });
         return error.Unsupported;
     };
@@ -159,29 +207,87 @@ pub fn applyRange(
     std.debug.assert(m * rank <= ws.lo_elems);
     std.debug.assert(ws.fused or m * n <= ws.hi_elems);
 
-    // A: lo[m][rank] = x[m][in] @ A^T.
-    try be.opGemmBf16(ws.lo, x, m, f.a.bytes, rank, t.in_dim, null);
+    // A: lo[m][lo_ld] = x[m][in] @ A^T, of which the first `rank` columns are read.
+    var lo_ld = rank;
+    if (skipA(t.tag)) {} else if (how.a_i8) |aq| {
+        // `quantizeA` pads A to the int8 GEMM's 128-row tile with zero rows, so
+        // `lo` comes back that wide and the B GEMM reads it at that stride.
+        std.debug.assert(aq.rows == std.mem.alignForward(usize, rank, 128) and aq.cols == t.in_dim);
+        std.debug.assert(be.i8_cols == t.in_dim and be.i8_m == m and be.i8_mpad * aq.rows <= ws.lo_elems);
+        try be.opI8Gemm(ws.lo, aq.bytes, aq.row_scale.?, aq.rows, null);
+        lo_ld = aq.rows;
+    } else if (x.dt != .f32 and be.kernels != .libs) {
+        try be.opMatmulBf16(ws.lo, x, m, f.a.bytes, rank, t.in_dim, null);
+    } else if (x.dt == .f16) {
+        try be.opGemmHalfIn(ws.lo, x, m, f.a.bytes, rank, t.in_dim);
+    } else try be.opGemmBf16(ws.lo, x, m, f.a.bytes, rank, t.in_dim, null);
     // B: dst[m][n] += scale * lo @ B[row0 - f.out_off ..][n]^T. Rows of a
     // row-major weight are contiguous, so the slice is a view.
     const b_off = (row0 - f.out_off) * rank * 2;
     const b_rows = f.b.bytes[b_off..][0 .. n * rank * 2];
-    const scale = t.scale * strength;
-    if (ws.fused) {
-        try be.opGemmBf16Acc(dst, ws.lo, m, b_rows, n, rank, scale);
-        return;
-    }
-    try be.opGemmBf16(ws.hi, ws.lo, m, b_rows, n, rank, null);
-    if (bench_skip_add) return;
-    try be.opAddScaled(dst, ws.hi, m * n, scale);
+    return accumulate(be, ws, dst, ws.lo, lo_ld, m, b_rows, n, rank, t.scale * strength * f.gain);
 }
 
-/// The factor whose output range contains `[row0, row0 + n)`, or null if it
-/// spans two.
-fn factorFor(t: *const Target, row0: usize, n: usize) ?lora.Factor {
-    for (t.factors) |f| {
-        if (row0 >= f.out_off and row0 + n <= f.out_off + f.b.rows) return f;
+/// `dst[m][n] += strength * delta x` for every term of `t` in output rows
+/// `[row0, row0 + n)`: its factor (`apply`), its LoKr terms and its diffs. A DoRA's
+/// base share is the caller's, which holds the base weight.
+pub fn applyTarget(be: *Backend, ws: *Workspace, dst: Buf, x: Buf, m: usize, t: *const Target, strength: f32, row0: usize, n: usize, how: How) !void {
+    if (t.factorAt(row0, n) != null or (t.kron.len == 0 and t.diffs.len == 0)) {
+        try apply(be, ws, dst, x, m, t, strength, row0, n, how);
     }
-    return null;
+    for (t.kron) |k| {
+        if (k.out_off < row0 or k.out_off + k.outRows() > row0 + n) continue;
+        const ok = k.w2.rows;
+        // `x` read as `[m * im][in_n]` is w2's own input.
+        const h = try outPlane(be, m * k.im * ok);
+        try be.opMatmulBf16(h, x, m * k.im, k.w2.bytes, ok, k.w2.cols, null);
+        try be.opKronMix(dst, h, try hostVec(be, k.w1), m, k.ol, ok, k.im, n, k.out_off - row0, k.im * ok, ok, strength * t.scale * k.gain);
+    }
+    for (t.diffs) |d| {
+        if (d.out_off < row0 or d.out_off + d.w.rows > row0 + n) continue;
+        const h = try outPlane(be, m * d.w.rows);
+        try be.opMatmulBf16(h, x, m, d.w.bytes, d.w.rows, d.w.cols, null);
+        try addPlane(be, dst, h, m, d.w.rows, n, d.out_off - row0, strength);
+    }
+}
+
+/// `dst[p][off + o] += g * h[p][o]` over `rows` channels of an `[m][stride]` `dst`.
+pub fn addPlane(be: *Backend, dst: Buf, h: Buf, m: usize, rows: usize, stride: usize, off: usize, g: f32) !void {
+    try be.opKronMix(dst, h, try hostVec(be, &one), m, 1, rows, 1, stride, off, rows, 0, g);
+}
+
+const one = [_]f32{1};
+
+/// `be.lora_out` as `elems` f32, grown if a caller did not presize it.
+pub fn outPlane(be: *Backend, elems: usize) !Buf {
+    try be.ensureDeviceBuffer(&be.lora_out, elems * 4);
+    return be.lora_out.as(.f32);
+}
+
+/// `be.lora_in` as `bytes`, at dtype `dt`.
+pub fn inPlane(be: *Backend, bytes: usize, dt: cuda.backend.Dt) !Buf {
+    try be.ensureDeviceBuffer(&be.lora_in, bytes);
+    return be.lora_in.as(dt);
+}
+
+/// A host f32 vector on the device, cached by pointer (`forEachFactorBytes` evicts it).
+pub fn hostVec(be: *Backend, v: []const f32) !Buf {
+    return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(v)), .size = v.len * 4 };
+}
+
+/// The B half alone: `dst[m][n] += scale * lo[m][..rank] @ b_rowsᵀ`, `lo` f32 read at
+/// stride `lo_ld`, `dst` at its own dtype. For a caller that made `lo` itself, a 3x3
+/// conv's A being a convolution rather than a GEMM.
+pub fn accumulate(be: *Backend, ws: *Workspace, dst: Buf, lo: Buf, lo_ld: usize, m: usize, b_rows: []const u8, n: usize, rank: usize, scale: f32) !void {
+    std.debug.assert(b_rows.len == n * rank * 2);
+    if (ws.fused) return if (dst.dt != .f32)
+        be.opGemmHalfAcc(dst, lo, lo_ld, m, b_rows, n, rank, scale)
+    else
+        be.opGemmBf16Acc(dst, lo, lo_ld, m, b_rows, n, rank, scale);
+    std.debug.assert(m * n <= ws.hi_elems);
+    try be.opGemmBf16Ld(ws.hi, lo, lo_ld, m, b_rows, n, rank, null);
+    if (bench_skip_add) return;
+    try be.opAddScaled(dst, ws.hi, m * n, scale);
 }
 
 // --- tests -----------------------------------------------------------------
@@ -208,19 +314,18 @@ test "a range resolves to the factor that contains it, and a straddle does not" 
     };
     const t: Target = .{ .factors = &factors, .in_dim = 32, .out_dim = 192, .scale = 0.0625, .tag = "qkv" };
 
-    try testing.expectEqual(@as(usize, 0), factorFor(&t, 0, 64).?.out_off);
-    try testing.expectEqual(@as(usize, 64), factorFor(&t, 64, 64).?.out_off);
-    try testing.expectEqual(@as(usize, 128), factorFor(&t, 128, 64).?.out_off);
+    try testing.expectEqual(@as(usize, 0), t.factorAt(0, 64).?.out_off);
+    try testing.expectEqual(@as(usize, 64), t.factorAt(64, 64).?.out_off);
+    try testing.expectEqual(@as(usize, 128), t.factorAt(128, 64).?.out_off);
     // A sub-range of one factor is fine (that is the fc1 gate/value split).
-    try testing.expectEqual(@as(usize, 64), factorFor(&t, 96, 32).?.out_off);
+    try testing.expectEqual(@as(usize, 64), t.factorAt(96, 32).?.out_off);
     // Straddling two is not.
-    try testing.expectEqual(@as(?lora.Factor, null), factorFor(&t, 32, 64));
+    try testing.expectEqual(@as(?lora.Factor, null), t.factorAt(32, 64));
 }
 
 test "device support is refused by shape rather than discovered at a launch" {
-    // `opGemmBf16` reads the raw weight as its GEMM B operand, so a rank that is
-    // not a multiple of 128 makes its tiles read past the factor. Refusing here
-    // keeps that a fallback instead of a bad device access.
+    // A width off the GEMM's slab makes its tiles read past the factor. Refusing
+    // here keeps that a fallback instead of a bad device access.
     const ok_a = [_]u8{0} ** (128 * 64 * 2);
     const ok_b = [_]u8{0} ** (256 * 128 * 2);
     var f: lora.Factor = .{
@@ -231,10 +336,22 @@ test "device support is refused by shape rather than discovered at a launch" {
     var t: Target = .{ .factors = &.{f}, .in_dim = 64, .out_dim = 256, .scale = 1.0, .tag = "ok" };
     try testing.expect(supported(&t));
 
-    // rank 64: A's output width and B's contraction both miss the tile.
-    const r64_a = [_]u8{0} ** (64 * 64 * 2);
-    const r64_b = [_]u8{0} ** (256 * 64 * 2);
-    f = .{ .a = bf16Weight(&r64_a, 64, 64), .b = bf16Weight(&r64_b, 256, 64), .out_off = 0 };
+    // Any rank on the 32 slab runs, 64 and 96 included.
+    for ([_]usize{ 32, 64, 96 }) |r| {
+        f = .{ .a = bf16Weight(ok_a[0 .. r * 64 * 2], r, 64), .b = bf16Weight(ok_b[0 .. 256 * r * 2], 256, r), .out_off = 0 };
+        t.factors = &.{f};
+        try testing.expect(supported(&t));
+    }
+    // An unpadded rank 8 does not; `Sidecar.load` never hands one over.
+    f = .{ .a = bf16Weight(ok_a[0 .. 8 * 64 * 2], 8, 64), .b = bf16Weight(ok_b[0 .. 256 * 8 * 2], 256, 8), .out_off = 0 };
+    t.factors = &.{f};
+    try testing.expect(!supported(&t));
+    // SD1.5's 320-wide output runs: both B GEMMs take any multiple of 32.
+    f = .{ .a = bf16Weight(ok_a[0 .. 32 * 64 * 2], 32, 64), .b = bf16Weight(ok_b[0 .. 320 * 32 * 2], 320, 32), .out_off = 0 };
+    t.factors = &.{f};
+    try testing.expect(supported(&t));
+    // A width off 32 does not.
+    f = .{ .a = bf16Weight(ok_a[0 .. 32 * 64 * 2], 32, 64), .b = bf16Weight(ok_b[0 .. 300 * 32 * 2], 300, 32), .out_off = 0 };
     t.factors = &.{f};
     try testing.expect(!supported(&t));
 

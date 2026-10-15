@@ -18,7 +18,7 @@ const c = @import("ggml").c;
 const Backend = tp.gpu.cuda.Backend;
 const DeviceBuffer = tp.gpu.cuda.backend.DeviceBuffer;
 const Cat = Backend.ProfCat;
-const lin_llm = tp.models.lin_llm_cuda;
+const lin_llm = tp.models.lin_cuda;
 
 const p = std.debug.print;
 var rnd_state = std.Random.DefaultPrng.init(0x0B0A710C);
@@ -69,17 +69,12 @@ fn tops(rows: usize, cols: usize, n: usize, ms: f64) f64 {
     return ops / (ms * 1e-3) / 1e12;
 }
 
-/// DeviceBuffer sub-view (mirrors qwen*_cuda.zig's private offsetBufSized).
-fn offBuf(b: DeviceBuffer, off_bytes: usize, size: u64) DeviceBuffer {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = size };
-}
-
 fn grouped(be: *Backend, dt: tp.DType, x_d: DeviceBuffer, y_d: DeviceBuffer, q: []const u8, n: usize, rows: usize, cols: usize) void {
     be.opGemvQuantizeX(x_d, n * cols) catch @panic("quantizeX");
     var off: usize = 0;
     while (off < n) : (off += 8) {
         const ng: usize = @min(8, n - off); // usize annotation: @min range-narrows
-        be.opGemvQuantQ8N(dt, offBuf(y_d, off * rows * 4, ng * rows * 4), q, 1.0, rows, cols, ng, off, n) catch @panic("q8n");
+        be.opGemvQuantQ8N(dt, y_d.slice(off * rows * 4, ng * rows * 4), q, 1.0, rows, cols, ng, off, n) catch @panic("q8n");
     }
 }
 
@@ -134,7 +129,7 @@ fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
             // several of these formats take the dp4a GEMV at m=1, not opGemvQuant.
             var w = lin_llm.Weight.init(q, dt, rows, cols);
             w.tag = @tagName(dt);
-            const route = lin_llm.routeOf(w, 1) orelse {
+            const route = lin_llm.routeAt(.llm, w, 1) orelse {
                 p("  {s:<9} {s:>9}\n", .{ @tagName(dt), "no route" });
                 continue;
             };
@@ -144,25 +139,25 @@ fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
             // body, which is the isolation for "is the int8 dot worth it".
             var ms: [2]f64 = .{ 0, 0 };
             for (0..2) |pass| {
-                lin_llm.decode_dp4a = pass == 0;
-                for (0..warmup) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("gemv");
+                tp.models.dual_lin.decode_dp4a = pass == 0;
+                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("gemv");
                 be.prof.reset();
-                for (0..iters) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("gemv");
+                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("gemv");
                 ms[pass] = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
             }
-            lin_llm.decode_dp4a = true;
+            tp.models.dual_lin.decode_dp4a = true;
 
             // A format with BOTH a hand kernel and a dual one (q4_k) gets the
             // head-to-head that says whether the hand kernel still earns its
             // maintenance. Same weight, same process, alternating.
             var dual_ms: f64 = 0;
             if (Backend.dualGemvSupported(dt) and !Backend.dualGemvOnly(dt)) {
-                lin_llm.dual_decode = true;
-                for (0..warmup) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("dual");
+                tp.models.dual_lin.dual_decode = true;
+                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("dual");
                 be.prof.reset();
-                for (0..iters) |_| lin_llm.linear(be, y_d, x_d, 1, w) catch @panic("dual");
+                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("dual");
                 dual_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
-                lin_llm.dual_decode = false;
+                tp.models.dual_lin.dual_decode = false;
             }
             const gbs = @as(f64, @floatFromInt(q.len)) / (ms[0] * 1e-3) / 1e9;
             const gels = @as(f64, @floatFromInt(rows * cols)) / (ms[0] * 1e-3) / 1e9;

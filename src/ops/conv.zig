@@ -11,8 +11,9 @@
 //!
 //! Layout, everywhere here: activations are `[h][w][c]` (channel-last, the
 //! layout that makes an im2col patch a contiguous GEMM row), and conv weights
-//! are pre-packed `[co][kh][kw][ci]` to match. `packWeight` converts from
-//! PyTorch's `[co][ci][kh][kw]`.
+//! are `[co][kh][kw][ci]` to match: pre-packed (`packWeight` converts from
+//! PyTorch's `[co][ci][kh][kw]`), or kept in the checkpoint's own order and dtype
+//! and converted by whoever reads them (`Weights.torch`).
 
 const std = @import("std");
 const matmul = @import("matmul.zig");
@@ -23,9 +24,50 @@ const Weight = matmul.Weight;
 /// rows; `conv2dBanded` takes it explicitly so a test can force a split.
 pub const default_band_bytes = 16 << 20;
 
+/// A convolution's weights.
+pub const Weights = union(enum) {
+    /// f32 `[co][kh][kw][ci]`, the im2col patch order. See `packWeight`.
+    krsc: []const f32,
+    /// The checkpoint's own tensor in its stored dtype. A block quant here may tile the
+    /// FLAT sequence (`flat_blocks`), so its rows are not block-aligned and only a
+    /// whole-tensor decode reads it.
+    torch: Torch,
+
+    /// `[co][ci][kt][kh][kw]`, `co` rows of `ci*kt*kh*kw`, of which only temporal slice
+    /// `kt - 1` is read: a causal video kernel run on one frame. `kt = 1` is a plain
+    /// `[co][ci][kh][kw]` conv.
+    pub const Torch = struct { w: Weight, kt: usize = 1 };
+};
+
+/// How a device conv's gather samples its source; one enum for every backend, since
+/// it is the im2col kernels' `f0` encoding.
+pub const SampleMode = enum(u2) { stride1 = 0, upsample2x = 1, stride2 = 2 };
+
+/// A 1-D convolution as the GEMM its device gather feeds: `w` is `[out_ch][k * in_ch]`,
+/// taps outer, the column order `im2col1d` writes.
+pub const Conv1dGemm = struct {
+    w: Weight,
+    bias: ?[]const f32,
+    in_ch: usize,
+    k: usize,
+    dilation: usize = 1,
+    padding: usize = 0,
+    stride: usize = 1,
+
+    pub fn outCh(c: Conv1dGemm) usize {
+        return c.w.rows;
+    }
+
+    pub fn outLen(c: Conv1dGemm, in_len: usize) usize {
+        const eff = c.dilation * (c.k - 1) + 1;
+        const padded = in_len + 2 * c.padding;
+        if (padded < eff) return 0;
+        return (padded - eff) / c.stride + 1;
+    }
+};
+
 pub const Conv2d = struct {
-    /// `[co][kh][kw][ci]`, i.e. im2col patch order. See `packWeight`.
-    w: []const f32,
+    w: Weights,
     /// `[co]`, or null for a bias-free conv.
     b: ?[]const f32 = null,
     co: usize,
@@ -47,6 +89,47 @@ pub const Conv2d = struct {
 
     pub fn patchLen(self: Conv2d) usize {
         return self.k * self.k * self.ci;
+    }
+
+    /// The repacked weights, for a reader that takes only those. A checkpoint-order
+    /// conv reaching one is a missing repack, and must not be a silent misread in
+    /// ReleaseFast, where an inactive union field is not checked.
+    pub fn krsc(self: Conv2d) []const f32 {
+        return switch (self.w) {
+            .krsc => |s| s,
+            .torch => @panic("ops.conv: a checkpoint-order conv reached a reader of repacked f32; repack it first"),
+        };
+    }
+
+    /// The `Weight` this convolution's GEMM is: `co` rows over the im2col patch, tagged.
+    /// A LoRA target is keyed and width-checked against it, and a probe files under it.
+    /// For a `torch` conv it carries no bytes, so no GEMM can be handed it by mistake.
+    pub fn gemmWeight(self: Conv2d) Weight {
+        var w = switch (self.w) {
+            .krsc => |s| Weight.fromF32(s, self.co, self.patchLen()),
+            .torch => |t| Weight{ .bytes = &.{}, .dtype = t.w.dtype, .rows = self.co, .cols = self.patchLen() },
+        };
+        w.tag = self.tag;
+        return w;
+    }
+
+    /// f32 `[co][kh][kw][ci]` in `gpa`, decoded and repacked from a `torch` conv or
+    /// copied from a `krsc` one. Caller owns it.
+    pub fn materialize(self: Conv2d, gpa: std.mem.Allocator) ![]f32 {
+        switch (self.w) {
+            .krsc => |s| return gpa.dupe(f32, s),
+            .torch => |t| {
+                const kk = self.k * self.k;
+                const flat = try gpa.alloc(f32, self.co * self.ci * t.kt * kk);
+                defer gpa.free(flat);
+                try @import("tp_core").safetensors.convertToF32(t.w.dtype, t.w.bytes, flat);
+                const out = try gpa.alloc(f32, self.co * self.patchLen());
+                for (0..self.co) |o| for (0..self.ci) |i| for (0..kk) |tap| {
+                    out[(o * kk + tap) * self.ci + i] = flat[((o * self.ci + i) * t.kt + (t.kt - 1)) * kk + tap];
+                };
+                return out;
+            },
+        }
     }
 
     pub fn outH(self: Conv2d, h: usize) usize {
@@ -116,15 +199,27 @@ pub fn conv2dBanded(
     std.debug.assert(out.len == oh * ow * conv.co);
     if (oh == 0 or ow == 0) return;
 
+    // A checkpoint-order weight is decoded and repacked per call: this is the
+    // reference path, and keeping it packed is what keeps a quantized file small.
+    var owned: ?[]f32 = null;
+    defer if (owned) |o| gpa.free(o);
+    const wk: []const f32 = switch (conv.w) {
+        .krsc => |s| s,
+        .torch => blk: {
+            owned = try conv.materialize(gpa);
+            break :blk owned.?;
+        },
+    };
+
     // 1x1 stride-1 unpadded is a plain GEMM over positions, no patch buffer.
     if (conv.k == 1 and conv.stride == 1 and conv.pad == 0) {
-        var w1: Weight = Weight.fromF32(conv.w, conv.co, conv.ci);
+        var w1: Weight = Weight.fromF32(wk, conv.co, conv.ci);
         w1.tag = conv.tag;
         return matmul.matmul(io, gpa, out, in, h * w, w1, conv.b);
     }
 
     const patch_len = conv.patchLen();
-    var weight: Weight = Weight.fromF32(conv.w, conv.co, patch_len);
+    var weight: Weight = Weight.fromF32(wk, conv.co, patch_len);
     weight.tag = conv.tag;
     const max_rows = @max(1, band_bytes / (ow * patch_len * 4));
     const buf = try gpa.alloc(f32, @min(oh, max_rows) * ow * patch_len);
@@ -298,7 +393,7 @@ test "conv2d matches torch conv2d on the LPIPS-AlexNet shapes" {
         const packed_w = try packWeight(gpa, c.weight, c.co, c.ci, c.k);
         defer gpa.free(packed_w);
         const conv: Conv2d = .{
-            .w = packed_w,
+            .w = .{ .krsc = packed_w },
             .b = c.bias,
             .co = c.co,
             .ci = c.ci,
@@ -360,7 +455,7 @@ test "the patch band cap changes the result only in the last bits" {
     for (in) |*v| v.* = r.float(f32) * 2 - 1;
     for (wt) |*v| v.* = r.float(f32) * 2 - 1;
 
-    const conv: Conv2d = .{ .w = wt, .co = co, .ci = ci, .k = k, .stride = 4, .pad = 2 };
+    const conv: Conv2d = .{ .w = .{ .krsc = wt }, .co = co, .ci = ci, .k = k, .stride = 4, .pad = 2 };
     const oh = conv.outH(h);
     const ow = conv.outW(w);
     try std.testing.expect(oh > 4); // enough output rows for the cap to split
@@ -427,7 +522,7 @@ test "depthwise conv equals a dense conv with a block-diagonal weight" {
 
     const want = try gpa.alloc(f32, h * w * c);
     defer gpa.free(want);
-    try conv2d(io, gpa, want, in, h, w, .{ .w = packed_w, .b = bias, .co = c, .ci = c, .k = k, .pad = pad });
+    try conv2d(io, gpa, want, in, h, w, .{ .w = .{ .krsc = packed_w }, .b = bias, .co = c, .ci = c, .k = k, .pad = pad });
 
     const got = try gpa.alloc(f32, h * w * c);
     defer gpa.free(got);
@@ -437,4 +532,47 @@ test "depthwise conv equals a dense conv with a block-diagonal weight" {
     for (want, got) |a, b| maxd = @max(maxd, @abs(@as(f64, a) - b));
     errdefer std.debug.print("depthwise vs dense: max abs {d}\n", .{maxd});
     try std.testing.expect(maxd < 1e-6);
+}
+
+test "a checkpoint-order conv computes exactly what its repacked twin does" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const h = 9;
+    const w = 7;
+    const ci = 5;
+    const co = 6;
+    const k = 3;
+    var rng = std.Random.DefaultPrng.init(11);
+    const r = rng.random();
+    const in = try gpa.alloc(f32, h * w * ci);
+    defer gpa.free(in);
+    for (in) |*v| v.* = r.float(f32) * 2 - 1;
+    // f16-representable, so the f16 copy below holds the same values.
+    const torch_w = try gpa.alloc(f32, co * ci * k * k);
+    defer gpa.free(torch_w);
+    for (torch_w) |*v| v.* = @as(f16, @floatCast(r.float(f32) * 2 - 1));
+    const half = try gpa.alloc(f16, torch_w.len);
+    defer gpa.free(half);
+    for (half, torch_w) |*d, v| d.* = @floatCast(v);
+    const packed_w = try packWeight(gpa, torch_w, co, ci, k);
+    defer gpa.free(packed_w);
+
+    const base: Conv2d = .{ .w = .{ .krsc = packed_w }, .co = co, .ci = ci, .k = k, .stride = 2, .pad = 1 };
+    const n = base.outH(h) * base.outW(w) * co;
+    const want = try gpa.alloc(f32, n);
+    defer gpa.free(want);
+    try conv2d(io, gpa, want, in, h, w, base);
+
+    const got = try gpa.alloc(f32, n);
+    defer gpa.free(got);
+    for ([_]Weight{
+        Weight.init(std.mem.sliceAsBytes(torch_w), .f32, co, ci * k * k),
+        Weight.init(std.mem.sliceAsBytes(half), .f16, co, ci * k * k),
+    }) |tw| {
+        var c = base;
+        c.w = .{ .torch = .{ .w = tw } };
+        try conv2d(io, gpa, got, in, h, w, c);
+        errdefer std.debug.print("{t} torch-order conv differs from the repacked one\n", .{tw.dtype});
+        try std.testing.expectEqualSlices(f32, want, got);
+    }
 }

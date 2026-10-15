@@ -900,3 +900,24 @@ Two things that keep it cheap:
   under a redirected or wrapped stderr, so a diagnostic added to find the
   problem can become the reported frame. A print that survives is one the
   caller already has (a return value, a field on a struct the test prints).
+
+## A union literal assigned in place is built in place: its tag changes before its payload is computed
+
+`x.u = .{ .a = f(x) };` writes through `x.u` as the literal's result location, so the
+active field becomes `.a` BEFORE `f(x)` runs. If `f` reads `x.u` (switching on it, say),
+it sees the new tag over the old payload's bytes: a `.b` slice reinterpreted as `.a`.
+In Debug that showed up as a memcpy fault inside `f`, with the switch having taken the
+branch for the tag that had not been assigned yet. Compute into a local, then assign:
+
+```zig
+const v = try c.materialize(alloc); // reads c.w
+c.w = .{ .krsc = v };
+```
+
+## An `inline fn` does not coerce to a function value
+
+A comptime generator returning `struct { inline fn run(...) void {...} }.run` as
+`fn (Env) void` fails: `calling convention 'inline' cannot cast into calling convention
+'auto'`. Return the struct TYPE and name `.run` where the body is wanted; a comptime
+parameter that takes a function accepts an inline one that way (the dual kernel table's
+`quant.GemvN(.q4_k).run`).

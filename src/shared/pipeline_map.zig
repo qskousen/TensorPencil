@@ -34,6 +34,15 @@ pub fn toPipelineVae(v: config.VaeDecode) pipeline.VaeDecode {
     };
 }
 
+pub fn toPipelineAct(p: config.Precision) ?pipeline.Act {
+    return switch (p) {
+        .auto => null,
+        .f32 => .f32,
+        .f16 => .f16,
+        .bf16 => .bf16,
+    };
+}
+
 pub fn toPipelineSyntax(s: config.PromptSyntax) pipeline.PromptSyntax {
     return switch (s) {
         .comfy => .comfy,

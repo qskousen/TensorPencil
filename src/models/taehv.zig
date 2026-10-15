@@ -160,9 +160,9 @@ fn firstHalfInput(a: std.mem.Allocator, cv: Conv2d) !Conv2d {
     const ci = ci2 / 2;
     const w = try a.alloc(f32, cv.co * cv.k * cv.k * ci);
     for (0..cv.co * cv.k * cv.k) |blk| {
-        @memcpy(w[blk * ci ..][0..ci], cv.w[blk * ci2 ..][0..ci]);
+        @memcpy(w[blk * ci ..][0..ci], cv.krsc()[blk * ci2 ..][0..ci]);
     }
-    return .{ .w = w, .b = cv.b, .co = cv.co, .ci = ci, .k = cv.k };
+    return .{ .w = .{ .krsc = w }, .b = cv.b, .co = cv.co, .ci = ci, .k = cv.k };
 }
 
 /// Keep only the first `n` output channels of a conv (w is [co][k][k][ci]
@@ -172,7 +172,7 @@ fn firstHalfInput(a: std.mem.Allocator, cv: Conv2d) !Conv2d {
 fn firstNOutput(cv: Conv2d, n: usize) Conv2d {
     std.debug.assert(n <= cv.co);
     const per_out = cv.k * cv.k * cv.ci;
-    return .{ .w = cv.w[0 .. n * per_out], .b = cv.b[0..n], .co = n, .ci = cv.ci, .k = cv.k };
+    return .{ .w = .{ .krsc = cv.krsc()[0 .. n * per_out] }, .b = cv.b[0..n], .co = n, .ci = cv.ci, .k = cv.k };
 }
 
 fn loadSub(a: std.mem.Allocator, st: @import("tp_core").weights.WeightStore, base: usize, sub: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
@@ -187,13 +187,13 @@ test "firstNOutput keeps the Weight length rule for the TGrow slice" {
     const n = 3;
     const w = [_]f32{0} ** (2 * n * n); // [2n][1][1][n]
     const b = [_]f32{0} ** (2 * n);
-    const full: Conv2d = .{ .w = &w, .b = &b, .co = 2 * n, .ci = n, .k = 1 };
+    const full: Conv2d = .{ .w = .{ .krsc = &w }, .b = &b, .co = 2 * n, .ci = n, .k = 1 };
 
     const sliced = firstNOutput(full, n);
     try std.testing.expectEqual(@as(usize, n), sliced.co);
-    try std.testing.expectEqual(@as(usize, n * n), sliced.w.len);
+    try std.testing.expectEqual(@as(usize, n * n), sliced.krsc().len);
     try std.testing.expectEqual(@as(usize, n), sliced.b.len);
     // The sliced weight must satisfy the matmul Weight length rule
     // (bytes == storageBytes(co*ci)); violating it asserts inside the preview decode.
-    _ = Weight.fromF32(sliced.w, sliced.co, sliced.ci);
+    _ = Weight.fromF32(sliced.krsc(), sliced.co, sliced.ci);
 }

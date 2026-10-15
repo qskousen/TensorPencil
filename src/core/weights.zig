@@ -3,9 +3,10 @@
 //! checkpoint ships in. Both containers resolve HF-style tensor names
 //! (GGUF llama.cpp names are canonicalized at parse time; see gguf.zig).
 //!
-//! The third arm is an `Overlay`: a base store with a few tensors substituted
-//! from caller-owned memory. It exists so an experiment can change one weight
-//! without rewriting the checkpoint, see the doc comment on `Overlay`.
+//! Three arms wrap another store: `Prefixed` (one component of a bundled file),
+//! `Overlay` (a few tensors substituted from caller-owned memory, so an experiment
+//! can change one weight without rewriting the checkpoint) and `Mix` (each layer
+//! taken whole from one of two stores).
 
 const std = @import("std");
 const safetensors = @import("safetensors.zig");
@@ -19,6 +20,7 @@ pub const WeightStore = union(enum) {
     gguf: *const gguf.Gguf,
     overlay: *const Overlay,
     prefixed: *const Prefixed,
+    mix: *const Mix,
 
     pub fn get(self: WeightStore, name: []const u8) ?TensorView {
         return switch (self) {
@@ -26,6 +28,7 @@ pub const WeightStore = union(enum) {
             .gguf => |g| g.get(name),
             .overlay => |o| o.get(name),
             .prefixed => |pfx| pfx.get(name),
+            .mix => |m| m.get(name),
         };
     }
 
@@ -40,6 +43,7 @@ pub const WeightStore = union(enum) {
             .gguf => |g| g.count(),
             .overlay => |o| o.base.count(),
             .prefixed => |pfx| pfx.stripped.len,
+            .mix => |m| m.name_list.items.len,
         };
     }
 
@@ -55,6 +59,7 @@ pub const WeightStore = union(enum) {
             // enumerates a prefixed view and then looks the results up must get the
             // same namespace back, or every lookup misses.
             .prefixed => |pfx| pfx.stripped,
+            .mix => |m| m.name_list.items,
         };
     }
 
@@ -75,26 +80,12 @@ pub const WeightStore = union(enum) {
             // Losing the streaming fast path is a slowdown; that would be a silent
             // wrong answer.
             .overlay => null,
+            // Two mappings, so no single one is right for every tensor.
+            .mix => null,
         };
     }
 };
 
-/// A base store with a few tensors substituted from caller-owned memory.
-///
-/// Exists for per-layer attribution: quantize exactly ONE tensor and run the whole
-/// model. Writing a modified checkpoint per data point costs a full copy of the file
-/// (tens of GB); here it costs one tensor's worth of memory. Being a plain read-through
-/// map it also serves merged LoRA/delta weights, per-layer dtype experiments and a GUI
-/// hot-swap.
-///
-/// Two lifetime rules, both because model loaders keep VIEWS into the store rather than
-/// copies: the patch bytes must outlive the model, and the `Overlay` must stay at a
-/// stable address for as long as a `WeightStore` refers to it.
-///
-/// A patch may change a tensor's dtype (f32 for the base's bf16 is the normal case,
-/// since f32 holds a dequantized round-trip exactly) but not its shape, which is
-/// checked. A differently-shaped substitution is a bug every time, and catching it here
-/// beats a puzzling `ShapeMismatch` from a loader 200 weights later.
 /// A view of one component inside a larger container: `get("decoder.conv_in.weight")`
 /// resolves `prefix ++ "decoder.conv_in.weight"` in the base.
 ///
@@ -144,6 +135,22 @@ pub const Prefixed = struct {
     }
 };
 
+/// A base store with a few tensors substituted from caller-owned memory.
+///
+/// Exists for per-layer attribution: quantize exactly ONE tensor and run the whole
+/// model. Writing a modified checkpoint per data point costs a full copy of the file
+/// (tens of GB); here it costs one tensor's worth of memory. Being a plain read-through
+/// map it also serves merged LoRA/delta weights, per-layer dtype experiments and a GUI
+/// hot-swap.
+///
+/// Two lifetime rules, both because model loaders keep VIEWS into the store rather than
+/// copies: the patch bytes must outlive the model, and the `Overlay` must stay at a
+/// stable address for as long as a `WeightStore` refers to it.
+///
+/// A patch may change a tensor's dtype (f32 for the base's bf16 is the normal case,
+/// since f32 holds a dequantized round-trip exactly) but not its shape, which is
+/// checked. A differently-shaped substitution is a bug every time, and catching it here
+/// beats a puzzling `ShapeMismatch` from a loader 200 weights later.
 pub const Overlay = struct {
     base: WeightStore,
     patch: std.StringHashMapUnmanaged(TensorView) = .empty,
@@ -206,6 +213,65 @@ pub const Overlay = struct {
     /// A store view of this overlay. Takes a pointer for rule 2 above.
     pub fn store(self: *const Overlay) WeightStore {
         return .{ .overlay = self };
+    }
+};
+
+/// Two stores with each layer taken whole from one of them, `a` unless the layer is
+/// listed in `from_b`.
+///
+/// A layer is a tensor name minus its last component, so a quantized layer's weight,
+/// scales and `comfy_quant` move together. That is what an `Overlay` cannot do: a
+/// dense and a quantized checkpoint differ in shape and in namespace, not just bytes.
+///
+/// Both stores and every listed layer name are borrowed. The `Mix` must stay at a
+/// stable address while a model loaded through it is alive, as with `Overlay`.
+pub const Mix = struct {
+    a: WeightStore,
+    b: WeightStore,
+    from_b: std.StringHashMapUnmanaged(void) = .empty,
+    name_list: std.ArrayList([]const u8) = .empty,
+
+    /// `a`'s namespace, before any layer is taken from `b`.
+    pub fn init(gpa: std.mem.Allocator, a: WeightStore, b: WeightStore) !Mix {
+        var m: Mix = .{ .a = a, .b = b };
+        try m.rebuild(gpa);
+        return m;
+    }
+
+    pub fn deinit(self: *Mix, gpa: std.mem.Allocator) void {
+        self.from_b.deinit(gpa);
+        self.name_list.deinit(gpa);
+        self.* = undefined;
+    }
+
+    pub fn layerOf(name: []const u8) []const u8 {
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+        return name[0..dot];
+    }
+
+    /// Serve exactly `layers` from `b` and everything else from `a`.
+    pub fn select(self: *Mix, gpa: std.mem.Allocator, layers: []const []const u8) !void {
+        self.from_b.clearRetainingCapacity();
+        for (layers) |l| try self.from_b.put(gpa, l, {});
+        try self.rebuild(gpa);
+    }
+
+    fn fromB(self: *const Mix, name: []const u8) bool {
+        return self.from_b.contains(layerOf(name));
+    }
+
+    fn rebuild(self: *Mix, gpa: std.mem.Allocator) !void {
+        self.name_list.clearRetainingCapacity();
+        for (self.a.names()) |n| if (!self.fromB(n)) try self.name_list.append(gpa, n);
+        for (self.b.names()) |n| if (self.fromB(n)) try self.name_list.append(gpa, n);
+    }
+
+    pub fn get(self: *const Mix, name: []const u8) ?TensorView {
+        return if (self.fromB(name)) self.b.get(name) else self.a.get(name);
+    }
+
+    pub fn store(self: *const Mix) WeightStore {
+        return .{ .mix = self };
     }
 };
 
@@ -346,4 +412,61 @@ test "an overlay withholds the base mapping" {
     var ov: Overlay = .{ .base = base };
     defer ov.deinit(gpa);
     try std.testing.expect(ov.store().mapping() == null);
+}
+
+/// A safetensors file of f32 tensors in a caller-owned buffer.
+fn f32File(buf: []u8, comptime header: []const u8, vals: []const f32) ![]u8 {
+    std.mem.writeInt(u64, buf[0..8], header.len, .little);
+    @memcpy(buf[8..][0..header.len], header);
+    const data = std.mem.sliceAsBytes(vals);
+    @memcpy(buf[8 + header.len ..][0..data.len], data);
+    return buf[0 .. 8 + header.len + data.len];
+}
+
+test "mix moves a layer whole, sidecars included, and back" {
+    const gpa = std.testing.allocator;
+    // `a` is dense; `b` stores layer `l` at a different shape plus a scale `a` lacks.
+    var fa: [256]u8 = undefined;
+    var st_a = try safetensors.SafeTensors.initFromSlice(gpa, try f32File(&fa,
+        \\{"k.weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"l.weight":{"dtype":"F32","shape":[2],"data_offsets":[8,16]}}
+    , &.{ 1, 2, 3, 4 }));
+    defer st_a.deinit();
+    var fb: [256]u8 = undefined;
+    var st_b = try safetensors.SafeTensors.initFromSlice(gpa, try f32File(&fb,
+        \\{"k.weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"l.weight":{"dtype":"F32","shape":[1],"data_offsets":[8,12]},"l.weight_scale":{"dtype":"F32","shape":[1],"data_offsets":[12,16]}}
+    , &.{ 9, 9, 5, 6 }));
+    defer st_b.deinit();
+
+    var mix = try Mix.init(gpa, .{ .safetensors = &st_a }, .{ .safetensors = &st_b });
+    defer mix.deinit(gpa);
+    const store = mix.store();
+    try std.testing.expectEqual(@as(usize, 2), store.count());
+    try std.testing.expect(store.get("l.weight_scale") == null);
+    try std.testing.expectEqual(@as(usize, 2), store.get("l.weight").?.info.elemCount());
+
+    try mix.select(gpa, &.{"l"});
+    try std.testing.expectEqual(@as(usize, 3), store.count());
+    try std.testing.expectEqual(@as(usize, 1), store.get("l.weight").?.info.elemCount());
+    const scale = try (try store.require("l.weight_scale")).toF32Alloc(gpa);
+    defer gpa.free(scale);
+    try std.testing.expectEqualSlices(f32, &.{6}, scale);
+    // An unselected layer still reads from `a`, even though `b` has it too.
+    const k = try (try store.require("k.weight")).toF32Alloc(gpa);
+    defer gpa.free(k);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, k);
+    for (store.names()) |n| try std.testing.expect(store.get(n) != null);
+    try std.testing.expect(store.mapping() == null);
+
+    try mix.select(gpa, &.{});
+    try std.testing.expectEqual(@as(usize, 2), store.count());
+    try std.testing.expect(store.get("l.weight_scale") == null);
+    const l = try (try store.require("l.weight")).toF32Alloc(gpa);
+    defer gpa.free(l);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, l);
+}
+
+test "mix layer is the name minus its last component" {
+    try std.testing.expectEqualStrings("blocks.3.attn.wq", Mix.layerOf("blocks.3.attn.wq.weight_s_rel"));
+    try std.testing.expectEqualStrings("blocks.0.mod", Mix.layerOf("blocks.0.mod.lin"));
+    try std.testing.expectEqualStrings("bare", Mix.layerOf("bare"));
 }

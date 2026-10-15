@@ -123,8 +123,7 @@ pub fn kvDtypeSupported(backend: BackendKind, dt: kv_cache.KvDtype) bool {
         // non-graph paths). qwen3's EAGLE-tap/tree speculative paths stay
         // f32-only and reject other dtypes at enable time.
         .cuda, .@"zig-cuda" => true,
-        // Vulkan: f16 + q8_0 on gemma3/qwen35 (hd256, attn_dsplit_gemma_f16/_q8).
-        // qwen3 Vulkan rejects non-f32 in its builder (hd128 path, broken gen).
+        // Vulkan: every stepper stores and attends all three (`kv_gpu.Kv`).
         .vulkan => true,
         // CPU: f16 packs 2/f32-slot and q8_0 packs ggml 34-byte blocks in
         // KvCache/PerLayerKvCache, expanded on read. All CPU archs support both.

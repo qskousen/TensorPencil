@@ -27,6 +27,7 @@
 //! working set must not survive under the DiT that follows it.
 
 const std = @import("std");
+const lin_cuda = @import("lin_cuda.zig");
 const h3vit = @import("minimax_h3_vit.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -62,12 +63,7 @@ fn okDtype(w: Weight) bool {
 }
 
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32) !void {
-    switch (w.dtype) {
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
-        .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, bias),
-        else => return error.UnsupportedDType,
-    }
+    try lin_cuda.towerLinear(be, dst, src, m, w, bias, null);
 }
 
 /// A sized sub-view of a device buffer (raw pointer arithmetic, CUDA only).
@@ -187,7 +183,7 @@ pub fn encode(
     // The scale is over the REAL head width, not the padded one.
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     for (v.blocks, 0..) |*b, bi| {
-        try be.opLayerNorm(x_d, normed_d, b.norm1_w, b.norm1_b, np, dim, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, b.norm1_w, b.norm1_b, np, dim, cfg.eps);
         try gemm(be, qkv_d, normed_d, np, b.qkv, b.qkv_b);
         // The projection emits [t][3][heads][hd]; attention wants three planes,
         // and the 72-wide heads pad to 128 so the tensor-core PV GEMM applies.
@@ -202,7 +198,7 @@ pub fn encode(
         try gemm(be, t_d, normed_d, np, b.proj, b.proj_b);
         try be.opAdd(x_d, t_d, np * dim);
 
-        try be.opLayerNorm(x_d, normed_d, b.norm2_w, b.norm2_b, np, dim, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, b.norm2_w, b.norm2_b, np, dim, cfg.eps);
         try gemm(be, big_d, normed_d, np, b.fc1, b.fc1_b);
         try be.gelu(big_d, np * cfg.ffn); // tanh here; the mergers use erf
         try gemm(be, t_d, big_d, np, b.fc2, b.fc2_b);
@@ -259,10 +255,10 @@ fn runMerger(
 ) !void {
     if (m.post_merge_norm) {
         // Merge first, then normalize the full merged width.
-        try be.opLayerNorm(x_d, normed_d, m.norm_w, m.norm_b, tokens, md, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, m.norm_w, m.norm_b, tokens, md, cfg.eps);
     } else {
         // Normalize each pre-merge token, then merge (a reinterpret).
-        try be.opLayerNorm(x_d, normed_d, m.norm_w, m.norm_b, np, cfg.dim, cfg.eps, false);
+        try be.opLayerNorm(x_d, normed_d, m.norm_w, m.norm_b, np, cfg.dim, cfg.eps);
     }
     try gemm(be, t_d, normed_d, tokens, m.fc1, m.fc1_b);
     try be.geluErf(t_d, tokens * md);

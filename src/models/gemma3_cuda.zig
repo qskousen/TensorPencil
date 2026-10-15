@@ -1,6 +1,6 @@
 //! Gemma 3 LM on the CUDA backend (tp-llm --backend zig-cuda / cuda): the
 //! text stack runs device-resident. Prefill is batched chunks; every
-//! projection goes through lin_llm_cuda, which picks the kernel per weight
+//! projection goes through lin_cuda, which picks the kernel per weight
 //! and row count.
 //!
 //! Gemma-specific vs qwen3_cuda: FOUR RMSNorms per layer (input, post-attn,
@@ -20,7 +20,7 @@
 const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 const gemma3 = @import("gemma3.zig");
-const lin_cuda = @import("lin_llm_cuda.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -123,10 +123,6 @@ fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
 }
 
-fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
-}
-
 /// Which layers a hybrid CPU/GPU split pushes to the host. Gemma3 is uniform
 /// attention, so both policies reduce to a descending-layer order (last layer
 /// migrates first); kept for interface parity with qwen35_cuda.
@@ -134,6 +130,8 @@ pub const CpuSplitPolicy = enum { tail, attn };
 
 pub const CudaLM = struct {
     lm: *const gemma3.Model,
+    /// What `lin_cuda.plan` decided for this checkpoint, passed to every linear.
+    lin_plan: lin_cuda.Plan,
     be: *Backend,
     gpa: std.mem.Allocator,
     cfg: gemma3.Config,
@@ -230,10 +228,11 @@ pub const CudaLM = struct {
 
         // Every linear the device forwards run, refused by name here rather than as
         // `unreachable` in a forward (an IQ4_XS GGUF used to segfault that way).
-        try lin_cuda.plan(try lm.deviceLins(alloc), max_batch, "gemma3 cuda");
+        const lin_plan = try lin_cuda.plan(try lm.deviceLins(alloc), lin_cuda.Use.llm(max_batch), "gemma3 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
         self.lm = lm;
+        self.lin_plan = lin_plan;
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
@@ -443,11 +442,11 @@ pub const CudaLM = struct {
             const on_gpu = if (self.split) |*sp| sp.on_gpu[l] else true;
             if (on_gpu) {
                 if (comptime dir == .save) {
-                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, ring_bytes), bk);
-                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, ring_bytes), bv);
+                    try self.be.tensorDownload(self.k_cache[l].buf.slice(0, ring_bytes), bk);
+                    try self.be.tensorDownload(self.v_cache[l].buf.slice(0, ring_bytes), bv);
                 } else {
-                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, ring_bytes), bk);
-                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, ring_bytes), bv);
+                    try self.be.tensorUpload(self.k_cache[l].buf.slice(0, ring_bytes), bk);
+                    try self.be.tensorUpload(self.v_cache[l].buf.slice(0, ring_bytes), bv);
                 }
             } else {
                 // Host-resident: the linear shadow stores the same dtype as
@@ -511,12 +510,12 @@ pub const CudaLM = struct {
                 // translating ring rows (pos%ring) to absolute host rows.
                 for (ringSegments(self.len, localRingRows(cfg))) |seg| {
                     if (seg.n == 0) continue;
-                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
-                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorDownload(self.k_cache[l].buf.slice(dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorDownload(self.v_cache[l].buf.slice(dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
                 }
             } else {
-                try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
-                try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
+                try self.be.tensorDownload(self.k_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+                try self.be.tensorDownload(self.v_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
             }
         }
         self.be.growableDestroy(&self.k_cache[l]);
@@ -623,12 +622,12 @@ pub const CudaLM = struct {
                 // Linear host shadow -> LOCAL ring: reverse of migrateLayer.
                 for (ringSegments(self.len, localRingRows(cfg))) |seg| {
                     if (seg.n == 0) continue;
-                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
-                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorUpload(self.k_cache[l].buf.slice(dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorUpload(self.v_cache[l].buf.slice(dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
                 }
             } else {
-                try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
-                try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
+                try self.be.tensorUpload(self.k_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+                try self.be.tensorUpload(self.v_cache[l].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
             }
         }
         sp.on_gpu[l] = true;
@@ -906,8 +905,8 @@ pub const CudaLM = struct {
         try self.forwardDecode(io, ids, null);
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        try be.opArgmax(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var idf: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
         return @intFromFloat(idf[0]);
@@ -932,8 +931,8 @@ pub const CudaLM = struct {
         try self.forwardDecode(io, ids, null);
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        const count = try be.opTopK(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
         var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
@@ -1019,10 +1018,10 @@ pub const CudaLM = struct {
     pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // gemma3: uniform geometry
         const b = &self.bufs;
-        const g = try lin_cuda.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
-        try lin_cuda.gemm(self.be, g, b.q, layer.q);
-        try lin_cuda.gemm(self.be, g, b.k, layer.k);
-        try lin_cuda.gemm(self.be, g, b.v, layer.v);
+        const g = try lin_cuda.prep(self.be, self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.q, layer.k, layer.v });
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.q, layer.q, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.k, layer.k, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.v, layer.v, null);
     }
     pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -1071,7 +1070,7 @@ pub const CudaLM = struct {
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
-        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.attn, seq, layer.o);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.t, self.bufs.attn, seq, layer.o, null);
     }
     pub fn postAttnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1086,9 +1085,9 @@ pub const CudaLM = struct {
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
         const b = &self.bufs;
-        const g = try lin_cuda.prep(self.be, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
-        try lin_cuda.gemm(self.be, g, b.gate, layer.gate);
-        try lin_cuda.gemm(self.be, g, b.up, layer.up);
+        const g = try lin_cuda.prep(self.be, self.lin_plan, b.normed, seq, self.cfg.hidden, &.{ layer.gate, layer.up });
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.gate, layer.gate, null);
+        try lin_cuda.gemm(self.be, self.lin_plan, g, b.up, layer.up, null);
     }
     pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
         const n = seq * self.cfg.intermediate;
@@ -1098,7 +1097,7 @@ pub const CudaLM = struct {
         }
     }
     pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
-        try lin_cuda.linear(self.be, self.bufs.t, self.bufs.gate, seq, layer.down);
+        try lin_cuda.linear(self.be, self.lin_plan, self.bufs.t, self.bufs.gate, seq, layer.down, null);
     }
     pub fn postFfnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -1114,7 +1113,7 @@ pub const CudaLM = struct {
         const pos0 = self.len;
         std.debug.assert(n >= 1 and n <= self.buf_rows and n <= self.remaining());
 
-        try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
+        try be.tensorUpload(b.x.slice(0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
         // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
         be.weight_noise.tick();
@@ -1131,7 +1130,7 @@ pub const CudaLM = struct {
             if (self.split) |*sp| {
                 if (!sp.on_gpu[l]) {
                     if (!sp.on_host) {
-                        try be.tensorDownload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+                        try be.tensorDownload(b.x.slice(0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
                         sp.on_host = true;
                     }
                     const host_io = self.io orelse return error.SplitIoUnset;
@@ -1140,7 +1139,7 @@ pub const CudaLM = struct {
                     continue;
                 }
                 if (sp.on_host) {
-                    try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+                    try be.tensorUpload(b.x.slice(0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
                     sp.on_host = false;
                 }
             }
@@ -1151,19 +1150,19 @@ pub const CudaLM = struct {
         // the last layers first, so this is the common case), bring the final
         // hidden back to the device for the LM head.
         if (self.split) |*sp| if (sp.on_host) {
-            try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+            try be.tensorUpload(b.x.slice(0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
             sp.on_host = false;
         };
 
         if (want_head) {
             const h = cfg.hidden;
-            try be.qkNorm(offsetBufSized(b.x, (n - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
+            try be.qkNorm(b.x.slice((n - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
             try self.lmHead(b.logits, b.t);
             try be.endBatch();
             self.len += n;
             if (self.split) |*sp| sp.cache.commit(n); // keep host len == device len
             // `dl` null leaves logits resident (stepArgmax/stepSelect sample them).
-            if (dl) |out| try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
+            if (dl) |out| try be.tensorDownload(b.logits.slice(0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
         } else {
             try be.endBatch();
             self.len += n;
@@ -1174,7 +1173,7 @@ pub const CudaLM = struct {
     /// LM head over one normed hidden row: y[vocab] = head @ x.
     fn lmHead(self: *CudaLM, y: Buf, x: Buf) !void {
         self.be.weight_noise.atHead();
-        try lin_cuda.linear(self.be, y, x, 1, self.lm.head);
+        try lin_cuda.linear(self.be, self.lin_plan, y, x, 1, self.lm.head, null);
     }
 
     /// Which layer the coming launches belong to, for the weight-noise curve.

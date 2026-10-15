@@ -19,13 +19,14 @@
 
 const k = @import("../dual.zig");
 const grid = @import("../iq_grid.zig");
+const rot = @import("convrot.zig");
 const Env = k.Env;
 const Slot = k.Slot;
 
-pub const Out = enum { f16, bf16, f32 };
+pub const Out = enum { f16, bf16 };
 
 /// The value of element `e` of the weight, per format.
-const Fmt = enum {
+pub const Fmt = enum {
     fp8,
     q8_0,
     q4_0,
@@ -304,17 +305,10 @@ inline fn value(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, idx: u
 }
 
 inline fn dequant(e: Env, comptime fmt: Fmt, comptime out: Out) void {
-    if (out == .f32) {
-        const i = k.elem(e) orelse return;
-        e.st(.b, i, value(e, fmt, .c, 0, i));
-        return;
-    }
     const w = e.gid();
     const e0 = w * 2;
     if (e0 >= e.u(0)) return;
-    const lo = value(e, fmt, .c, 0, e0);
-    const hi = value(e, fmt, .c, 0, e0 + 1);
-    e.stW(.b, w, if (out == .f16) k.packH16(lo, hi) else @as(u32, k.bf16Bits(lo)) | (@as(u32, k.bf16Bits(hi)) << 16));
+    e.stW(.b, w, pack16(out, value(e, fmt, .c, 0, e0), value(e, fmt, .c, 0, e0 + 1)));
 }
 // ---- fused GEMV -------------------------------------------------------------
 //
@@ -608,21 +602,6 @@ inline fn group(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, g: u32
     return r;
 }
 
-/// `dot(group, x[x0 .. x0+8])` against the f32 activation in slot b.
-inline fn dotF32(e: Env, comptime fmt: Fmt, gr: Group, x0: u32) f32 {
-    var acc: f32 = 0;
-    var sx: f32 = 0;
-    inline for (0..2) |wi| {
-        const xs = e.ld4(.b, x0 + @as(u32, @intCast(wi)) * 4);
-        inline for (0..4) |bi| {
-            const cv: f32 = @floatFromInt(k.sext8(gr.w[wi] >> @intCast(bi * 8)));
-            acc += cv * xs[bi];
-            if (comptime hasMin(fmt)) sx += xs[bi];
-        }
-    }
-    return if (comptime hasMin(fmt)) gr.d * acc - gr.m * sx else gr.d * acc;
-}
-
 /// The same dot against the q8_1 activation in slot b, four products per
 /// instruction. The layout is the one `quantize_q8_1` writes: `d[nblk]` f32, then
 /// one int8 per element, then a per-block sum this does not read (it needs the sum
@@ -642,6 +621,127 @@ inline fn dotQ8(e: Env, comptime fmt: Fmt, gr: Group, g: u32, nblk: u32) f32 {
     return r * e.ld(.b, g >> 2);
 }
 
+/// A decode activation as the q8_1 blocks the q8 GEMVs read: x (f32, a) to `d[nblk]`
+/// f32, then one int8 per element, then `s[nblk]` = Σq, in b. llama.cpp's quantize_q8_1:
+/// d = amax / 127, q = round-half-even(x * 127 / amax). One thread per 32-element
+/// block; u0 = nblk.
+pub inline fn quantizeQ81(e: Env) void {
+    const blk = k.elem(e) orelse return;
+    const nblk = e.u(0);
+    var v: [32]f32 = undefined;
+    var amax: f32 = 0;
+    inline for (0..32) |i_| {
+        v[i_] = e.ld(.a, blk * 32 + @as(u32, @intCast(i_)));
+        amax = @max(amax, @abs(v[i_]));
+    }
+    const id: f32 = if (amax != 0) 127.0 / amax else 0;
+    var sum: i32 = 0;
+    inline for (0..8) |w_| {
+        var word: u32 = 0;
+        inline for (0..4) |j_| {
+            const q = roundHalfEven(v[w_ * 4 + j_] * id);
+            sum += q;
+            word |= (@as(u32, @bitCast(q)) & 0xFF) << @intCast(8 * j_);
+        }
+        e.stW(.b, nblk + blk * 8 + @as(u32, @intCast(w_)), word);
+    }
+    e.st(.b, blk, amax / 127.0);
+    e.st(.b, nblk * 9 + blk, @floatFromInt(sum));
+}
+
+/// Elements a lane decodes at once in the f32 GEMVs: a group, or for the k-quants two,
+/// which share one scale decode and one load of `d` (their scales cover 16 or 32).
+inline fn unitElems(comptime fmt: Fmt) u32 {
+    return if (fmt == .q4_k or fmt == .q5_k or fmt == .q6_k) 16 else group_elems;
+}
+
+const Unit = struct { w: [4]u32, d: f32, m: f32 };
+
+/// The low byte of `b` as a signed int8, as f32, through the exponent: 2^23 plus the
+/// biased byte, less 2^23 + 128. Exact for every int8, so equal to the conversion, which
+/// NVIDIA's SPIR-V compiler issues at a fraction of the FMA rate.
+inline fn i8f(b: u32) f32 {
+    return @as(f32, @bitCast(0x4B000000 | ((b & 0xFF) ^ 0x80))) - 8388736.0;
+}
+
+/// Unit `u` of the weight whose bytes start at `base`.
+inline fn unit(e: Env, comptime fmt: Fmt, base: u32, u: u32) Unit {
+    if (fmt == .q6_k) {
+        const blk = base + (u >> 4) * 210;
+        const j = (u & 15) * 16;
+        var r: Unit = .{ .w = undefined, .d = 0, .m = 0 };
+        r.d = e.f16At(.a, blk + 208) * @as(f32, @floatFromInt(k.sext8(e.byte(.a, blk + 192 + (j >> 4)))));
+        const half = j >> 7;
+        const lshift: u5 = @intCast(((j >> 6) & 1) * 4);
+        const hshift: u5 = @intCast(((j >> 5) & 3) * 2);
+        const lbase = blk + half * 64 + ((j >> 5) & 1) * 32 + (j & 31);
+        const hbase = blk + 128 + half * 32 + (j & 31);
+        inline for (0..4) |i| {
+            const o: u32 = @as(u32, @intCast(i)) * 4;
+            const lo = (u32At2(e, lbase + o) >> lshift) & 0x0F0F0F0F;
+            const hi = (u32At2(e, hbase + o) >> hshift) & 0x03030303;
+            r.w[i] = k.subBytes(lo | (hi << 4), 0x20202020);
+        }
+        return r;
+    }
+    if (fmt != .q4_k and fmt != .q5_k) {
+        const g = group(e, fmt, .d, base, u);
+        return .{ .w = .{ g.w[0], g.w[1], 0, 0 }, .d = g.d, .m = g.m };
+    }
+    // q4_k and q5_k: d and dmin share the block's first word, q5_k's fifth bits follow.
+    const q5 = fmt == .q5_k;
+    const blk = base + (u >> 4) * @as(u32, if (q5) 176 else 144);
+    const j = (u & 15) * 16;
+    const is = j >> 5;
+    const sm = scaleMinK4(e, blk + 4, is);
+    const dm = e.ldW(.a, blk >> 2);
+    var r: Unit = .{ .w = undefined, .d = 0, .m = 0 };
+    r.d = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm)))))) * @as(f32, @floatFromInt(sm[0]));
+    r.m = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm >> 16)))))) * @as(f32, @floatFromInt(sm[1]));
+    const shift: u5 = @intCast((is & 1) * 4);
+    const qw = (blk + @as(u32, if (q5) 48 else 16) + ((j >> 6) << 5) + (j & 31)) >> 2;
+    const hw = (blk + 16 + (j & 31)) >> 2;
+    inline for (0..4) |i| {
+        const lo = (e.ldW(.a, qw + @as(u32, @intCast(i))) >> shift) & 0x0F0F0F0F;
+        r.w[i] = if (q5) lo | (((e.ldW(.a, hw + @as(u32, @intCast(i))) >> @intCast(is & 7)) & 0x01010101) << 4) else lo;
+    }
+    return r;
+}
+
+/// A unit's activation: `unitElems` floats from x0 in slot b.
+inline fn unitX(e: Env, comptime fmt: Fmt, x0: u32) [unitElems(fmt) / 4][4]f32 {
+    var xs: [unitElems(fmt) / 4][4]f32 = undefined;
+    inline for (0..unitElems(fmt) / 4) |wi| xs[wi] = e.ld4(.b, x0 + @as(u32, @intCast(wi)) * 4);
+    return xs;
+}
+
+/// `dot(unit, x)` against its loaded activation.
+inline fn unitDotX(comptime fmt: Fmt, un: Unit, xs: [unitElems(fmt) / 4][4]f32) f32 {
+    var acc: f32 = 0;
+    var sx: f32 = 0;
+    inline for (0..unitElems(fmt) / 4) |wi| {
+        inline for (0..4) |bi| {
+            acc += i8f(un.w[wi] >> @intCast(bi * 8)) * xs[wi][bi];
+            if (comptime hasMin(fmt)) sx += xs[wi][bi];
+        }
+    }
+    return if (comptime hasMin(fmt)) un.d * acc - un.m * sx else un.d * acc;
+}
+
+/// From exact primitives (floor and the fraction compare are exact at these
+/// magnitudes): GPU compilers fold away the 2^23 magic-add form.
+inline fn roundHalfEven(x: f32) i32 {
+    const fl = @floor(x);
+    const fr = x - fl;
+    var q: i32 = @intFromFloat(fl);
+    if (fr > 0.5) {
+        q += 1;
+    } else if (fr == 0.5) {
+        q += q & 1;
+    }
+    return q;
+}
+
 /// Fused block-quant GEMV: `y[u2 + row] = f0 * dot(W[row], x)`, one subgroup per
 /// row, lanes strided over the row's groups. Slot a is the packed weight, b the
 /// activation, c the f32 output, d the codebook tables. u0 = rows, u1 = cols,
@@ -654,9 +754,10 @@ inline fn dotQ8(e: Env, comptime fmt: Fmt, gr: Group, g: u32, nblk: u32) f32 {
 /// `cols` must be a whole number of super-blocks, and `rows * rowBytes` must fit
 /// u32.
 inline fn gemvQ(e: Env, comptime fmt: Fmt, comptime q8: bool) void {
+    if (!q8) return gemvQ2(e, fmt);
     const rows = e.u(0);
     const cols = e.u(1);
-    const groups = cols / group_elems;
+    const units = cols / group_elems;
     const nblk = cols >> 5;
     const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
     const lane = e.sgLane();
@@ -667,13 +768,203 @@ inline fn gemvQ(e: Env, comptime fmt: Fmt, comptime q8: bool) void {
         const base = row * row_bytes;
         var acc: f32 = 0;
         var g = lane;
-        while (g < groups) : (g += lanes) {
-            const gr = group(e, fmt, .d, base, g);
-            acc += if (q8) dotQ8(e, fmt, gr, g, nblk) else dotF32(e, fmt, gr, g * group_elems);
-        }
+        while (g < units) : (g += lanes) acc += dotQ8(e, fmt, group(e, fmt, .d, base, g), g, nblk);
         const total = k.sgSum(acc);
         if (lane == 0) e.st(.c, e.u(2) + row, total * e.f(0));
     }
+}
+
+/// `gemvQ` over the f32 activation, two rows a subgroup: each lane loads a unit's x
+/// once for both, which halves the activation reads that bound it (every format ran at
+/// the same element rate). A row's sum runs in the one-row order, unit by unit.
+/// The host launches ceil(rows / 2) subgroups.
+inline fn gemvQ2(e: Env, comptime fmt: Fmt) void {
+    const rows = e.u(0);
+    const cols = e.u(1);
+    const ue = unitElems(fmt);
+    const units = cols / ue;
+    const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    var row = 2 * k.sgGlobal(e);
+    const step = 2 * k.sgTotal(e);
+    while (row < rows) : (row += step) {
+        const pair = row + 1 < rows;
+        const base0 = row * row_bytes;
+        const base1 = base0 + row_bytes;
+        var acc0: f32 = 0;
+        var acc1: f32 = 0;
+        var g = lane;
+        while (g < units) : (g += lanes) {
+            const xs = unitX(e, fmt, g * ue);
+            acc0 += unitDotX(fmt, unit(e, fmt, base0, g), xs);
+            if (pair) acc1 += unitDotX(fmt, unit(e, fmt, base1, g), xs);
+        }
+        const t0 = k.sgSum(acc0);
+        if (lane == 0) e.st(.c, e.u(2) + row, t0 * e.f(0));
+        if (pair) {
+            const t1 = k.sgSum(acc1);
+            if (lane == 0) e.st(.c, e.u(2) + row + 1, t1 * e.f(0));
+        }
+    }
+}
+
+/// `gemvQ` over up to four activation rows, each weight group decoded once:
+/// `y[u2 + t * u4 + row] = f0 * dot(W[row], x[t])` for t < u3, the rows of x `cols`
+/// apart. A row's sum runs in `gemvQ`'s order, so it is bit-identical to a one-row
+/// launch, which is what lets a speculative verify match decode.
+inline fn gemvQN(e: Env, comptime fmt: Fmt) void {
+    const rows = e.u(0);
+    const cols = e.u(1);
+    const n = e.u(3);
+    const ue = unitElems(fmt);
+    const units = cols / ue;
+    const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    var row = k.sgGlobal(e);
+    const step = k.sgTotal(e);
+    while (row < rows) : (row += step) {
+        const base = row * row_bytes;
+        var acc: [4]f32 = @splat(0);
+        var g = lane;
+        while (g < units) : (g += lanes) {
+            const un = unit(e, fmt, base, g);
+            inline for (0..4) |t| {
+                if (t < n) acc[t] += unitDotX(fmt, un, unitX(e, fmt, @as(u32, t) * cols + g * ue));
+            }
+        }
+        inline for (0..4) |t| {
+            if (t < n) {
+                const total = k.sgSum(acc[t]);
+                if (lane == 0) e.st(.c, e.u(2) + @as(u32, t) * e.u(4) + row, total * e.f(0));
+            }
+        }
+    }
+}
+
+/// The `gemv4_dual_<fmt>` entry body, as `.run`.
+pub fn GemvN(comptime fmt: Fmt) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            gemvQN(e, fmt);
+        }
+    };
+}
+
+// ---- weight-only convrot (lin_cuda's `*_wo` routes) -------------------------
+//
+// An integer convrot weight expands to bf16 or f16 in the checkpoint's own basis: its
+// rows times their scale, rotated back (convrot.zig's split). The 16-bit GEMM then
+// multiplies the plain activation, as it would a dense weight.
+
+/// Rows of an int8 (`bits` 8) or nibble-packed int4 weight in a, times their per-row
+/// scale in c, rotated back, as 16-bit pairs in b. u0 = threads = elements / 16, u1 =
+/// cols. One lane holds 16 contiguous values and 16 lanes a whole group, so every
+/// lane of the launch must reach the shuffles; threads past u0 are whole groups and
+/// only skip the store.
+///
+/// PTX only (`sgXor`): the SPIR-V build of these entries is empty, and no Vulkan
+/// table names them.
+inline fn pack16(comptime out: Out, lo: f32, hi: f32) u32 {
+    return if (out == .f16) k.packH16(lo, hi) else @as(u32, k.bf16Bits(lo)) | (@as(u32, k.bf16Bits(hi)) << 16);
+}
+
+/// The widths an integer row decode writes: 16-bit pairs, or f32 for a W8A32 GEMM.
+pub const RowOut = enum { f16, bf16, f32 };
+
+inline fn intRowRot(e: Env, comptime bits: u32, comptime out: RowOut) void {
+    if (k.is_ptx) {
+        const t = e.gid();
+        const live = t < e.u(0);
+        const tt = if (live) t else 0;
+        const s = e.ld(.c, (tt * 16) / e.u(1));
+        var v: [16]f32 = undefined;
+        const per = 32 / bits;
+        inline for (0..16 / per) |wi| {
+            const w = e.ldW(.a, tt * (16 / per) + @as(u32, wi));
+            inline for (0..per) |j| {
+                const q = if (bits == 8) rot.sext8(w >> (8 * j)) else rot.sext4(w >> (4 * j));
+                v[wi * per + j] = @as(f32, @floatFromInt(q)) * s;
+            }
+        }
+        rot.radix16(&v);
+        inline for (.{ 1, 4 }) |m| {
+            inline for (0..16) |j| {
+                const x1 = k.sgXor(v[j], m);
+                const x2 = k.sgXor(v[j], 2 * m);
+                const x3 = k.sgXor(v[j], 3 * m);
+                v[j] = rot.bfly4(v[j], x1, x2, x3);
+            }
+        }
+        if (!live) return;
+        if (out == .f32) {
+            inline for (0..16) |j| e.stW(.b, t * 16 + @as(u32, j), @bitCast(v[j] * (1.0 / 16.0)));
+        } else inline for (0..8) |j|
+            e.stW(.b, t * 8 + @as(u32, j), pack16(if (out == .f16) .f16 else .bf16, v[2 * j] * (1.0 / 16.0), v[2 * j + 1] * (1.0 / 16.0)));
+    }
+}
+
+pub inline fn i8RowRotF32(e: Env) void {
+    intRowRot(e, 8, .f32);
+}
+
+pub inline fn i4RowRotF32(e: Env) void {
+    intRowRot(e, 4, .f32);
+}
+
+pub inline fn i8RowRotBf16(e: Env) void {
+    intRowRot(e, 8, .bf16);
+}
+
+pub inline fn i4RowRotBf16(e: Env) void {
+    intRowRot(e, 4, .bf16);
+}
+
+pub inline fn i8RowRotF16(e: Env) void {
+    intRowRot(e, 8, .f16);
+}
+
+pub inline fn i4RowRotF16(e: Env) void {
+    intRowRot(e, 4, .f16);
+}
+
+/// An UNROTATED int8 weight (`int8_tensorwise`): rows `[rows][u1]` in a, per-row f32
+/// scale in c -> 16-bit pairs b. u0 = elements / 4.
+inline fn i8Row(e: Env, comptime out: RowOut) void {
+    const t = k.elem(e) orelse return;
+    const q = rot.i8Quad(e.ldW(.a, t), e.ld(.c, (t * 4) / e.u(1)));
+    if (out == .f32) {
+        inline for (0..4) |j| e.stW(.b, t * 4 + @as(u32, j), @bitCast(q[j]));
+        return;
+    }
+    const o16: Out = if (out == .f16) .f16 else .bf16;
+    e.stW(.b, t * 2, pack16(o16, q[0], q[1]));
+    e.stW(.b, t * 2 + 1, pack16(o16, q[2], q[3]));
+}
+
+pub inline fn i8RowF32(e: Env) void {
+    i8Row(e, .f32);
+}
+
+/// A byte-transposed int8 weight (`weightBuffer`'s `[cols][u2]`) times its per-row
+/// scale, as row-major f32 `[rows][u1]`: the W·A32 weight-only GEMM's operand before
+/// its rotation is undone. a = int8 words, c = scale, b = out. u0 = rows * cols.
+pub inline fn woUnpackF32(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const cols = e.u(1);
+    const r = i / cols;
+    const j = (i % cols) * e.u(2) + r;
+    const q = rot.sext8(e.ldW(.a, j / 4) >> @as(u5, @intCast((j % 4) * 8)));
+    e.stW(.b, i, @bitCast(@as(f32, @floatFromInt(q)) * e.ld(.c, r)));
+}
+
+pub inline fn i8RowBf16(e: Env) void {
+    i8Row(e, .bf16);
+}
+
+pub inline fn i8RowF16(e: Env) void {
+    i8Row(e, .f16);
 }
 
 // One body per (format, width); the table names them dequant_<fmt>_<width>.
@@ -683,17 +974,11 @@ pub inline fn fp8F16(e: Env) void {
 pub inline fn fp8Bf16(e: Env) void {
     dequant(e, .fp8, .bf16);
 }
-pub inline fn fp8F32(e: Env) void {
-    dequant(e, .fp8, .f32);
-}
 pub inline fn q8_0F16(e: Env) void {
     dequant(e, .q8_0, .f16);
 }
 pub inline fn q8_0Bf16(e: Env) void {
     dequant(e, .q8_0, .bf16);
-}
-pub inline fn q8_0F32(e: Env) void {
-    dequant(e, .q8_0, .f32);
 }
 pub inline fn q4_0F16(e: Env) void {
     dequant(e, .q4_0, .f16);
@@ -701,17 +986,11 @@ pub inline fn q4_0F16(e: Env) void {
 pub inline fn q4_0Bf16(e: Env) void {
     dequant(e, .q4_0, .bf16);
 }
-pub inline fn q4_0F32(e: Env) void {
-    dequant(e, .q4_0, .f32);
-}
 pub inline fn q1_0F16(e: Env) void {
     dequant(e, .q1_0, .f16);
 }
 pub inline fn q1_0Bf16(e: Env) void {
     dequant(e, .q1_0, .bf16);
-}
-pub inline fn q1_0F32(e: Env) void {
-    dequant(e, .q1_0, .f32);
 }
 pub inline fn q2_0G64F16(e: Env) void {
     dequant(e, .q2_0_g64, .f16);
@@ -719,17 +998,11 @@ pub inline fn q2_0G64F16(e: Env) void {
 pub inline fn q2_0G64Bf16(e: Env) void {
     dequant(e, .q2_0_g64, .bf16);
 }
-pub inline fn q2_0G64F32(e: Env) void {
-    dequant(e, .q2_0_g64, .f32);
-}
 pub inline fn q2_0G128F16(e: Env) void {
     dequant(e, .q2_0_g128, .f16);
 }
 pub inline fn q2_0G128Bf16(e: Env) void {
     dequant(e, .q2_0_g128, .bf16);
-}
-pub inline fn q2_0G128F32(e: Env) void {
-    dequant(e, .q2_0_g128, .f32);
 }
 pub inline fn iq4NlF16(e: Env) void {
     dequant(e, .iq4_nl, .f16);
@@ -737,17 +1010,11 @@ pub inline fn iq4NlF16(e: Env) void {
 pub inline fn iq4NlBf16(e: Env) void {
     dequant(e, .iq4_nl, .bf16);
 }
-pub inline fn iq4NlF32(e: Env) void {
-    dequant(e, .iq4_nl, .f32);
-}
 pub inline fn iq4XsF16(e: Env) void {
     dequant(e, .iq4_xs, .f16);
 }
 pub inline fn iq4XsBf16(e: Env) void {
     dequant(e, .iq4_xs, .bf16);
-}
-pub inline fn iq4XsF32(e: Env) void {
-    dequant(e, .iq4_xs, .f32);
 }
 pub inline fn q4_kF16(e: Env) void {
     dequant(e, .q4_k, .f16);
@@ -755,17 +1022,11 @@ pub inline fn q4_kF16(e: Env) void {
 pub inline fn q4_kBf16(e: Env) void {
     dequant(e, .q4_k, .bf16);
 }
-pub inline fn q4_kF32(e: Env) void {
-    dequant(e, .q4_k, .f32);
-}
 pub inline fn q5_kF16(e: Env) void {
     dequant(e, .q5_k, .f16);
 }
 pub inline fn q5_kBf16(e: Env) void {
     dequant(e, .q5_k, .bf16);
-}
-pub inline fn q5_kF32(e: Env) void {
-    dequant(e, .q5_k, .f32);
 }
 pub inline fn q6_kF16(e: Env) void {
     dequant(e, .q6_k, .f16);
@@ -773,17 +1034,11 @@ pub inline fn q6_kF16(e: Env) void {
 pub inline fn q6_kBf16(e: Env) void {
     dequant(e, .q6_k, .bf16);
 }
-pub inline fn q6_kF32(e: Env) void {
-    dequant(e, .q6_k, .f32);
-}
 pub inline fn q2_kF16(e: Env) void {
     dequant(e, .q2_k, .f16);
 }
 pub inline fn q2_kBf16(e: Env) void {
     dequant(e, .q2_k, .bf16);
-}
-pub inline fn q2_kF32(e: Env) void {
-    dequant(e, .q2_k, .f32);
 }
 pub inline fn q3_kF16(e: Env) void {
     dequant(e, .q3_k, .f16);
@@ -791,17 +1046,11 @@ pub inline fn q3_kF16(e: Env) void {
 pub inline fn q3_kBf16(e: Env) void {
     dequant(e, .q3_k, .bf16);
 }
-pub inline fn q3_kF32(e: Env) void {
-    dequant(e, .q3_k, .f32);
-}
 pub inline fn iq2XxsF16(e: Env) void {
     dequant(e, .iq2_xxs, .f16);
 }
 pub inline fn iq2XxsBf16(e: Env) void {
     dequant(e, .iq2_xxs, .bf16);
-}
-pub inline fn iq2XxsF32(e: Env) void {
-    dequant(e, .iq2_xxs, .f32);
 }
 pub inline fn iq2XsF16(e: Env) void {
     dequant(e, .iq2_xs, .f16);
@@ -809,26 +1058,17 @@ pub inline fn iq2XsF16(e: Env) void {
 pub inline fn iq2XsBf16(e: Env) void {
     dequant(e, .iq2_xs, .bf16);
 }
-pub inline fn iq2XsF32(e: Env) void {
-    dequant(e, .iq2_xs, .f32);
-}
 pub inline fn iq3XxsF16(e: Env) void {
     dequant(e, .iq3_xxs, .f16);
 }
 pub inline fn iq3XxsBf16(e: Env) void {
     dequant(e, .iq3_xxs, .bf16);
 }
-pub inline fn iq3XxsF32(e: Env) void {
-    dequant(e, .iq3_xxs, .f32);
-}
 pub inline fn iq3SF16(e: Env) void {
     dequant(e, .iq3_s, .f16);
 }
 pub inline fn iq3SBf16(e: Env) void {
     dequant(e, .iq3_s, .bf16);
-}
-pub inline fn iq3SF32(e: Env) void {
-    dequant(e, .iq3_s, .f32);
 }
 
 // The fused GEMVs, named gemv_<fmt> over the f32 activation and gemv_<fmt>_q8

@@ -1040,6 +1040,9 @@ test "a model crosses the link in chunks, survives a cut mid-chunk, and lands in
     // One connection lost one chunk in flight: at most that chunk went twice.
     try testing.expect(prog.puts.load(.acquire) <= chunks + 1);
     try testing.expectEqual(@as(u64, total), prog.bytes_done.load(.acquire));
+    // The chunk cut in half never landed, and the reconnect's reseed of
+    // `bytes_done` moved nothing: every byte counted once.
+    try testing.expectEqual(@as(u64, total), prog.bytes_moved.load(.acquire));
 
     const final = try std.fs.path.join(gpa, &.{ store_dir, "sent.safetensors" });
     defer gpa.free(final);
@@ -1099,6 +1102,7 @@ test "a model comes BACK over the link, checked the same way, and a file the hos
     errdefer std.debug.print("pull ended {t}: {s}\n", .{ prog.phase.load(.acquire), prog.errName() });
     try testing.expectEqual(blob.Phase.done, prog.phase.load(.acquire));
     try testing.expectEqual(@as(u64, total), prog.bytes_done.load(.acquire));
+    try testing.expectEqual(@as(u64, total), prog.bytes_moved.load(.acquire));
 
     // The file that landed is the file the host holds, byte for byte, under the
     // name the host called it: a puller names nothing itself.

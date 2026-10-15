@@ -13,6 +13,7 @@
 //! drafts are nearly free tokens.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const qwen3 = @import("../models/qwen3.zig");
 const test_gate = @import("../test_gate.zig");
 const tokenizer_mod = @import("tp_core").tokenizer;
@@ -1167,7 +1168,7 @@ test "spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -1214,7 +1215,7 @@ test "tree spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -1260,8 +1261,8 @@ test "model drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    const draft_path = "models/text_encoders/qwen_3_06b_base.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const draft_path = build_options.model_root ++ "/text_encoders/qwen_3_06b_base.safetensors";
     try test_gate.requireModelFile(io, te_path);
     try test_gate.requireModelFile(io, draft_path);
 

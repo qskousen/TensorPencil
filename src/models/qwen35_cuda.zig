@@ -1,6 +1,6 @@
 //! Qwen3.5/3.6 hybrid LM on the CUDA backend (tp-llm --backend zig-cuda /
 //! cuda): the 64-layer gated-DeltaNet + gated-attention stack runs
-//! device-resident. Every projection goes through lin_llm_cuda, which picks the
+//! device-resident. Every projection goes through lin_cuda, which picks the
 //! kernel per weight and row count; after the first decode step the whole
 //! forward replays as one captured CUDA graph (stepDecodeGraph). Prefill runs
 //! batched chunks (stepBatch).
@@ -11,7 +11,8 @@ const std = @import("std");
 const init_defaults = @import("tp_core").init_defaults;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const qwen35 = @import("qwen35.zig");
-const lin_cuda = @import("lin_llm_cuda.zig");
+const qwen35_dev = @import("qwen35_dev.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
@@ -36,10 +37,6 @@ const Growable = Backend.GrowableTensor;
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
-}
-
-fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
 }
 
 /// Whether the captured-decode-graph path is available for this embedding dtype
@@ -72,18 +69,9 @@ const nsplit_prefill = 8;
 /// GDN uses to place `beta` after `alpha` in `Bufs.ab_n`.
 const pad_rows = std.mem.alignForward(usize, prefill_chunk, 128);
 
-/// How a GDN layer's chunk runs: `chunk` batches the gates, conv, L2 norm and the
-/// state recurrence over the whole chunk; `stacked` says alpha/beta come from one GEMM
-/// over the row-padded [alpha | beta] weight (`ab_cat`) instead of two skinny linears.
-/// Which kernel two skinny linears take is the dispatcher's question, not this one's:
-/// the recurrence and the gates read f32 and care only about the head dim.
-const GdnRoute = struct {
-    chunk: bool,
-    stacked: bool,
-};
-
-fn gdnRoute(d: usize, n: usize, stacked: bool) GdnRoute {
-    return .{ .chunk = n > 1 and d % 32 == 0 and d <= 256, .stacked = stacked }; // opGdnDeltaChunk's limits
+/// `opGdnDeltaChunk`'s limits: a chunk of more than one row, a head dim it tiles.
+fn gdnChunkOk(d: usize, n: usize) bool {
+    return n > 1 and d % 32 == 0 and d <= 256;
 }
 
 /// Which layers a hybrid CPU/GPU split pushes to the host, once the count is
@@ -92,7 +80,14 @@ fn gdnRoute(d: usize, n: usize, stacked: bool) GdnRoute {
 /// first (frees the most device memory as context grows, but interleaves).
 pub const CpuSplitPolicy = enum { tail, attn };
 
+/// DIAGNOSTIC: run the recurrence and the non-graph attention through the dual kernels
+/// Vulkan runs (`dual/attn.zig`) instead of this backend's own, for the A/B that decides
+/// which this arm keeps. `tp-llm --bench` alternates it per round (`bench_toggle`).
+pub var dual_kernels = false;
+
 pub const CudaLM = struct {
+    pub const bench_toggle = &dual_kernels;
+
     /// The prefill batch this stepper wants the engine to hand it. Tied to
     /// `prefill_chunk` so the two cannot drift: the engine's old hardcoded 256 capped
     /// this silently, and the mismatch cost a measured 31% on the matmul bucket
@@ -100,6 +95,8 @@ pub const CudaLM = struct {
     pub const prefill_batch = prefill_chunk;
 
     lm: *const qwen35.Model,
+    /// What `lin_cuda.plan` decided for this checkpoint, passed to every linear.
+    lin_plan: lin_cuda.Plan,
     be: *Backend,
     gpa: std.mem.Allocator,
     cfg: qwen35.Config,
@@ -213,10 +210,11 @@ pub const CudaLM = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
-        try lin_cuda.plan(try lm.deviceLins(alloc), prefill_chunk, "qwen35 cuda");
+        const lin_plan = try lin_cuda.plan(try lm.deviceLins(alloc), lin_cuda.Use.llm(prefill_chunk), "qwen35 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
         self.lm = lm;
+        self.lin_plan = lin_plan;
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
@@ -498,8 +496,8 @@ pub const CudaLM = struct {
             const kvd = cfg.kvDim();
             if (self.len > 0) {
                 const dt = self.kv_dtype;
-                try self.be.tensorDownload(offsetBufSized(self.k_cache[s].buf, 0, dt.sizeBytes(self.len * kvd)), sp.state.kv.kRowBytes(s, 0, self.len));
-                try self.be.tensorDownload(offsetBufSized(self.v_cache[s].buf, 0, dt.sizeBytes(self.len * kvd)), sp.state.kv.vRowBytes(s, 0, self.len));
+                try self.be.tensorDownload(self.k_cache[s].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.state.kv.kRowBytes(s, 0, self.len));
+                try self.be.tensorDownload(self.v_cache[s].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.state.kv.vRowBytes(s, 0, self.len));
             }
             self.be.growableDestroy(&self.k_cache[s]);
             self.be.growableDestroy(&self.v_cache[s]);
@@ -510,8 +508,8 @@ pub const CudaLM = struct {
             const ssm_n = cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim;
             const hc = sp.state.conv[lin_idx * conv_n ..][0..conv_n];
             const hs = sp.state.ssm[lin_idx * ssm_n ..][0..ssm_n];
-            try self.be.tensorDownload(offsetBufSized(self.conv_state, lin_idx * conv_n * 4, conv_n * 4), std.mem.sliceAsBytes(hc));
-            try self.be.tensorDownload(offsetBufSized(self.ssm_state, lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
+            try self.be.tensorDownload(self.conv_state.slice(lin_idx * conv_n * 4, conv_n * 4), std.mem.sliceAsBytes(hc));
+            try self.be.tensorDownload(self.ssm_state.slice(lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
         }
         // Free the migrated layer's device weights (ggml reads them from host
         // now), this is the bulk of the reclaimed VRAM.
@@ -797,8 +795,8 @@ pub const CudaLM = struct {
             self.k_cache[s] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
             self.v_cache[s] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
             if (self.len > 0) {
-                try self.be.tensorUpload(offsetBufSized(self.k_cache[s].buf, 0, dt.sizeBytes(self.len * kvd)), sp.state.kv.kRowBytes(s, 0, self.len));
-                try self.be.tensorUpload(offsetBufSized(self.v_cache[s].buf, 0, dt.sizeBytes(self.len * kvd)), sp.state.kv.vRowBytes(s, 0, self.len));
+                try self.be.tensorUpload(self.k_cache[s].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.state.kv.kRowBytes(s, 0, self.len));
+                try self.be.tensorUpload(self.v_cache[s].buf.slice(0, dt.sizeBytes(self.len * kvd)), sp.state.kv.vRowBytes(s, 0, self.len));
             }
         } else {
             const lin_idx = l - l / cfg.full_attn_interval;
@@ -806,8 +804,8 @@ pub const CudaLM = struct {
             const ssm_n = cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim;
             const hc = sp.state.conv[lin_idx * conv_n ..][0..conv_n];
             const hs = sp.state.ssm[lin_idx * ssm_n ..][0..ssm_n];
-            try self.be.tensorUpload(offsetBufSized(self.conv_state, lin_idx * conv_n * 4, conv_n * 4), std.mem.sliceAsBytes(hc));
-            try self.be.tensorUpload(offsetBufSized(self.ssm_state, lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
+            try self.be.tensorUpload(self.conv_state.slice(lin_idx * conv_n * 4, conv_n * 4), std.mem.sliceAsBytes(hc));
+            try self.be.tensorUpload(self.ssm_state.slice(lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
@@ -932,8 +930,8 @@ pub const CudaLM = struct {
             const bs = ssm_all[lin_idx * ssm_n * 4 ..][0 .. ssm_n * 4];
             const on_gpu = if (self.split) |*sp| sp.on_gpu[l] else true;
             if (on_gpu) {
-                const dc = offsetBufSized(self.conv_state, lin_idx * conv_n * 4, conv_n * 4);
-                const ds = offsetBufSized(self.ssm_state, lin_idx * ssm_n * 4, ssm_n * 4);
+                const dc = self.conv_state.slice(lin_idx * conv_n * 4, conv_n * 4);
+                const ds = self.ssm_state.slice(lin_idx * ssm_n * 4, ssm_n * 4);
                 if (comptime dir == .save) {
                     try self.be.tensorDownload(dc, bc);
                     try self.be.tensorDownload(ds, bs);
@@ -964,7 +962,7 @@ pub const CudaLM = struct {
     pub fn step(self: *CudaLM, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         std.debug.assert(logits.len == self.cfg.vocab);
         try self.forwardDecode(io, ids_new);
-        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
+        try self.be.tensorDownload(self.bufs.logits.slice(0, self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
     /// The decode forward, leaving the last position's logits resident in
@@ -1002,8 +1000,8 @@ pub const CudaLM = struct {
         try self.forwardDecode(io, ids_new);
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        try be.opArgmax(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var idf: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
         return @intFromFloat(idf[0]);
@@ -1028,8 +1026,8 @@ pub const CudaLM = struct {
         try self.forwardDecode(io, ids_new);
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
-        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
+        try be.opPenalize(b.logits.slice(0, self.cfg.vocab * 4), pen, sp);
+        const count = try be.opTopK(b.logits.slice(0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
         var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
@@ -1074,25 +1072,13 @@ pub const CudaLM = struct {
         std.debug.assert(embeds.len == grid_w * grid_h * cfg.hidden);
         std.debug.assert(grid_w * grid_h <= self.remaining());
         const pos0: u32 = @intCast(self.pos_next);
-        if (debug_seq_image) {
-            for (0..grid_w * grid_h) |i| {
-                const pos3 = [3]u32{
-                    pos0,
-                    pos0 + @as(u32, @intCast(i / grid_w)),
-                    pos0 + @as(u32, @intCast(i % grid_w)),
-                };
-                try self.stepHidden(embeds[i * cfg.hidden ..][0..cfg.hidden], pos3, false);
-            }
-            self.pos_next = pos0 + @max(grid_w, grid_h);
-            return;
-        }
         var pos3s: [prefill_chunk * 3]u32 = undefined;
         var off: usize = 0;
         const total = grid_w * grid_h;
         while (off < total) {
             try bnd.check(self);
             // usize annotation: see prefill (@min narrows its result type).
-            const n: usize = @min(@min(debug_image_chunk, prefill_chunk), total - off);
+            const n: usize = @min(prefill_chunk, total - off);
             for (0..n) |t| {
                 const i = off + t;
                 pos3s[t * 3 + 0] = pos0;
@@ -1114,271 +1100,23 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const b = &self.bufs;
         const n = pos3s.len / 3;
-        const hd = cfg.head_dim;
-        const eps = cfg.rms_eps;
         std.debug.assert(n >= 1 and n <= prefill_chunk and x_host.len == n * cfg.hidden);
         std.debug.assert(n <= self.remaining());
 
-        try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
-        try be.tensorUpload(offsetBufSized(self.pos3s_d, 0, n * 3 * 4), std.mem.sliceAsBytes(pos3s));
+        try be.tensorUpload(b.x.slice(0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
+        try be.tensorUpload(self.pos3s_d.slice(0, n * 3 * 4), std.mem.sliceAsBytes(pos3s));
 
         // One perturbation per forward; no-op while sigma is 0 (cuda/wnoise.zig).
         be.weight_noise.tick();
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
-
-        // Hybrid split: each chunk begins with n rows on the device (bufs.x).
-        if (self.split) |*sp| sp.on_host = false;
-
-        // Cancel granularity: between LAYERS, not between batches. A 512-token
-        // forward is ~0.5 s, far too long to sit on a cancel; the `errdefer` above
-        // aborts the recording batch and `self.len` is only advanced after
-        // `endBatch`, so an unwind here commits nothing and leaves `cached()` truthful.
-        // Pause deliberately does NOT park here, see `ops/pause.zig` and the engine.
-        const ctok = ops.cancel.token;
-        for (self.lm.layers, 0..) |*layer, l| {
-            if (ops.cancel.canceled(ctok)) return error.Canceled;
-            self.noiseAtLayer(l);
-            if (self.split) |*sp| {
-                if (!sp.on_gpu[l]) {
-                    if (!sp.on_host) {
-                        try be.tensorDownload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
-                        sp.on_host = true;
-                    }
-                    const host_io = self.io orelse return error.SplitIoUnset;
-                    try self.lm.cpuLayer(host_io, self.gpa, l, sp.hx[0 .. n * cfg.hidden], n, sp.freqs, &sp.state, &sp.scratch);
-                    continue;
-                }
-                if (sp.on_host) {
-                    try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
-                    sp.on_host = false;
-                }
-            }
-            switch (layer.*) {
-                .attn => |*al| {
-                    const slot = l / cfg.full_attn_interval;
-                    if (skipMask() & 32 == 0) try be.qkNorm(b.x, b.normed, try nbuf(be, al.input_norm), n, cfg.hidden, eps);
-                    if (skipMask() & 16 == 0) {
-                        const g = try lin_cuda.prep(be, b.normed, n, cfg.hidden, &.{ al.qg, al.k, al.v });
-                        try lin_cuda.gemm(be, g, b.qg, al.qg);
-                        try lin_cuda.gemm(be, g, b.k, al.k);
-                        try lin_cuda.gemm(be, g, b.v, al.v);
-                    }
-                    if (skipMask() & 64 == 0) try be.opDeinterleave2(b.qg, b.q, b.gate, n * cfg.qDim(), hd);
-                    if (skipMask() & 32 == 0) {
-                        try be.qkNorm(b.q, b.q, try nbuf(be, al.q_norm), n * cfg.n_heads, hd, eps);
-                        try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), n * cfg.n_kv_heads, hd, eps);
-                    }
-                    if (skipMask() & 64 == 0) {
-                        try be.opRopeImropePos(b.q, self.pos3s_d, self.freqs_d, n, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                        try be.opRopeImropePos(b.k, self.pos3s_d, self.freqs_d, n, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    }
-                    if (skipMask() & 128 == 0) {
-                        try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, n * cfg.kvDim());
-                        try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, n * cfg.kvDim());
-                    }
-                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    if (debug_seq_attn) {
-                        for (0..n) |t| {
-                            try be.opAttnDecode(
-                                offsetBufSized(b.q, t * cfg.qDim() * 4, cfg.qDim() * 4),
-                                self.k_cache[slot].buf,
-                                self.v_cache[slot].buf,
-                                offsetBufSized(b.attn, t * cfg.qDim() * 4, cfg.qDim() * 4),
-                                b.attn_scratch,
-                                self.len + 1 + t,
-                                1,
-                                cfg.n_heads,
-                                cfg.n_kv_heads,
-                                hd,
-                                nsplit,
-                                scale,
-                                0,
-                                0,
-                                false,
-                                kvFmt(self.kv_dtype),
-                            );
-                        }
-                    } else {
-                        if (skipMask() & 8 == 0)
-                            try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, false, kvFmt(self.kv_dtype));
-                    }
-                    if (skipMask() & 256 == 0) try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
-                    if (skipMask() & 16 == 0) try lin_cuda.linear(be, b.t, b.attn, n, al.o);
-                    if (skipMask() & 256 == 0) try be.opAdd(b.x, b.t, n * cfg.hidden);
-                },
-                .linear => |*ll| {
-                    const lin_idx = l - l / cfg.full_attn_interval;
-                    const channels = cfg.convChannels();
-                    const d = cfg.lin_head_dim;
-                    const heads = cfg.lin_v_heads;
-                    if (skipMask() & 32 == 0) try be.qkNorm(b.x, b.normed, try nbuf(be, ll.input_norm), n, cfg.hidden, eps);
-                    if (self.op_dump) |od| {
-                        if (l == 0) try be.tensorDownload(offsetBufSized(b.normed, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(od[0 .. n * cfg.hidden]));
-                    }
-                    if (skipMask() & 2 == 0) {
-                        const g = try lin_cuda.prep(be, b.normed, n, cfg.hidden, &.{ ll.qkv, ll.z });
-                        try lin_cuda.gemm(be, g, b.lin_qkv, ll.qkv);
-                        try lin_cuda.gemm(be, g, b.lin_z, ll.z);
-                    }
-                    const conv_off = lin_idx * channels * (cfg.conv_kernel - 1) * 4;
-                    const conv_state = offsetBufSized(self.conv_state, conv_off, channels * (cfg.conv_kernel - 1) * 4);
-                    const ssm_off = lin_idx * heads * d * d * 4;
-                    const ssm = offsetBufSized(self.ssm_state, ssm_off, heads * d * d * 4);
-                    // Everything except the state recurrence is batched over the
-                    // chunk. Measured on Bonsai-27B: running all seven of these
-                    // per token cost 46% of prefill (333 -> 614 tok/s with the
-                    // loop removed entirely), and only `opGdnDeltaStep` is
-                    // genuinely sequential, the conv is a convolution, and the
-                    // gates / L2-norm / alpha / beta are per-token independent.
-                    // Batching the other six is worth 333 -> 411 tok/s.
-                    //
-                    const route = gdnRoute(d, n, n > 1 and self.ab_cat[lin_idx] != null);
-                    const batched = skipMask() & 4 == 0 and !noGdnChunk() and route.chunk;
-                    if (batched) {
-                        // One GEMM over the stacked [alpha | beta] weight when it
-                        // exists, so the gates read two views of ONE padded output
-                        // instead of two tight buffers; see `ab_cat`.
-                        const cat = if (route.stacked) self.ab_cat[lin_idx].? else undefined;
-                        const ab_pitch: usize = if (route.stacked) cat.rows else heads;
-                        const alpha_n = if (route.stacked)
-                            offsetBufSized(b.ab_n, 0, n * ab_pitch * 4)
-                        else
-                            offsetBufSized(b.ab_n, 0, n * heads * 4);
-                        const beta_n = if (route.stacked)
-                            offsetBufSized(b.ab_n, heads * 4, n * ab_pitch * 4 - heads * 4)
-                        else
-                            offsetBufSized(b.ab_n, pad_rows * heads * 4, n * heads * 4);
-                        if (route.stacked) {
-                            try lin_cuda.linear(be, b.ab_n, b.normed, n, cat);
-                        } else {
-                            const g = try lin_cuda.prep(be, b.normed, n, cfg.hidden, &.{ ll.alpha, ll.beta });
-                            try lin_cuda.gemm(be, g, alpha_n, ll.alpha);
-                            try lin_cuda.gemm(be, g, beta_n, ll.beta);
-                        }
-                        try be.opGdnGatesBatch(alpha_n, beta_n, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads, n, ab_pitch);
-                        try be.opGdnConvBatch(conv_state, b.lin_qkv, try nbuf(be, ll.conv_w), b.lin_conv, channels, n);
-                        // The q/k slice is NOT contiguous across tokens (the v part
-                        // sits between them), hence the grouped form.
-                        try be.opL2NormRowsGrouped(b.lin_conv, n * 2 * cfg.lin_k_heads, d, 2 * cfg.lin_k_heads, channels, eps);
-                        // The recurrence itself, state resident in registers for the
-                        // whole chunk, bit-identical to the per-token form below.
-                        try be.opGdnDeltaChunk(
-                            ssm,
-                            b.lin_conv,
-                            b.gates,
-                            b.lin_o,
-                            heads,
-                            d,
-                            cfg.lin_k_heads,
-                            n,
-                            channels,
-                            1.0 / @sqrt(@as(f32, @floatFromInt(d))),
-                        );
-                    }
-                    // Unbatched fallback: n == 1 (decode), or a head dim the chunk
-                    // kernel cannot take. Same math, one token per launch set.
-                    for (0..if (batched or skipMask() & 4 != 0) 0 else n) |t| {
-                        const normed_t = offsetBufSized(b.normed, t * cfg.hidden * 4, cfg.hidden * 4);
-                        const g = try lin_cuda.prep(be, normed_t, 1, cfg.hidden, &.{ ll.alpha, ll.beta });
-                        try lin_cuda.gemm(be, g, offsetBufSized(b.ab, 0, heads * 4), ll.alpha);
-                        try lin_cuda.gemm(be, g, offsetBufSized(b.ab, heads * 4, heads * 4), ll.beta);
-                        try be.opGdnGates(b.ab, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads);
-                        try be.opGdnConvStep(
-                            conv_state,
-                            offsetBufSized(b.lin_qkv, t * channels * 4, channels * 4),
-                            try nbuf(be, ll.conv_w),
-                            b.lin_conv,
-                            channels,
-                        );
-                        try be.opL2NormRows(offsetBufSized(b.lin_conv, 0, 2 * cfg.linQKDim() * 4), 2 * cfg.lin_k_heads, d, eps);
-                        try be.opGdnDeltaStep(
-                            ssm,
-                            b.lin_conv,
-                            b.gates,
-                            offsetBufSized(b.lin_o, t * cfg.linVDim() * 4, cfg.linVDim() * 4),
-                            heads,
-                            d,
-                            cfg.lin_k_heads,
-                            1.0 / @sqrt(@as(f32, @floatFromInt(d))),
-                        );
-                    }
-                    if (skipMask() & 32 == 0) try be.qkNorm(b.lin_o, b.lin_o, try nbuf(be, ll.ssm_norm), n * heads, d, eps);
-                    if (skipMask() & 256 == 0) try be.siluMul(b.lin_z, b.lin_o, n * cfg.linVDim());
-                    if (skipMask() & 2 == 0) try lin_cuda.linear(be, b.t, b.lin_z, n, ll.out);
-                    if (skipMask() & 256 == 0) try be.opAdd(b.x, b.t, n * cfg.hidden);
-                },
-            }
-            const mlp = switch (layer.*) {
-                .attn => |*al| &al.mlp,
-                .linear => |*ll| &ll.mlp,
-            };
-            if (skipMask() & 1 == 0) {
-                try be.qkNorm(b.x, b.normed, try nbuf(be, mlp.post_norm), n, cfg.hidden, eps);
-                const g = try lin_cuda.prep(be, b.normed, n, cfg.hidden, &.{ mlp.gate, mlp.up });
-                try lin_cuda.gemm(be, g, b.mlp_gate, mlp.gate);
-                try lin_cuda.gemm(be, g, b.mlp_up, mlp.up);
-                try be.siluMul(b.mlp_gate, b.mlp_up, n * cfg.intermediate);
-                try lin_cuda.linear(be, b.t, b.mlp_gate, n, mlp.down);
-                try be.opAdd(b.x, b.t, n * cfg.hidden);
-            }
-            if (self.layer_dump) |dump| {
-                try be.tensorDownload(
-                    offsetBufSized(b.x, (n - 1) * cfg.hidden * 4, cfg.hidden * 4),
-                    std.mem.sliceAsBytes(dump[l * cfg.hidden ..][0..cfg.hidden]),
-                );
-            }
-        }
-        // Split: advance the host KV in lockstep (the residual stream itself is
-        // discarded, prefill reads no logits; the next chunk re-embeds anew).
-        if (self.split) |*sp| {
-            sp.state.kv.commit(n);
-            sp.state.len += n;
-        }
+        // A cancel unwinds between layers: the errdefer aborts the recording and `len`
+        // only moves after `endBatch`, so nothing is committed.
+        var dev: Dev = .of(self);
+        try qwen35_dev.batch(&dev, n);
         try be.endBatch();
         self.len += n;
     }
-
-    /// `TP_SKIP`, prefill BUDGET bitmask: each bit removes one component from
-    /// `stepBatch`, so a run measures the prefill cost of everything *except* it.
-    ///
-    /// The output is garbage by construction; this is a stopwatch, not a mode. Its
-    /// value is that the removed costs must sum to the baseline, which is what
-    /// makes the resulting budget trustworthy, a per-component `--profile` number
-    /// cannot be checked that way (and its timings are distorted by added syncs).
-    ///
-    ///   1 MLP (gate/up/down + silu)      8 attention op
-    ///   2 GDN qkv/z/out GEMMs           16 attn qkv/o GEMMs
-    ///   4 GDN recurrence + batched ops   32 norms (input/q/k/ssm; post_norm is in 1)
-    ///  64 rope + deinterleave           128 KV store
-    /// 256 residual adds + gating (mulSigmoid, GDN siluMul)
-    fn skipMask() u32 {
-        if (skip_cache) |v| return v;
-        const s = getenv("TP_SKIP") orelse return blk: { skip_cache = 0; break :blk 0; };
-        var v: u32 = 0;
-        for (std.mem.span(s)) |c| if (c >= '0' and c <= '9') {
-            v = v * 10 + (c - '0');
-        };
-        skip_cache = v;
-        return v;
-    }
-    var skip_cache: ?u32 = null;
-
-    /// Force the per-token GDN fallback even where the chunk recurrence applies.
-    /// The two are meant to be bit-identical, and this is the only way to check
-    /// that on a real checkpoint: same binary, same prompt, greedy, diff.
-    fn noGdnChunk() bool {
-        if (no_chunk_cache) |v| return v;
-        const v = getenv("TP_NO_GDN_CHUNK") != null;
-        no_chunk_cache = v;
-        return v;
-    }
-    var no_chunk_cache: ?bool = null;
-
-    /// Debug escape hatches for bisecting the batched-prefill path.
-    const debug_seq_attn = false;
-    const debug_seq_image = false;
-    const debug_image_chunk: usize = prefill_chunk;
 
     /// Debug: one sequential token step (no logits).
     pub fn debugStepOne(self: *CudaLM, id: u32) !void {
@@ -1398,7 +1136,7 @@ pub const CudaLM = struct {
     /// (t, h, w) M-RoPE positions.
     fn stepHidden(self: *CudaLM, x_host: []const f32, pos3: [3]u32, want_logits: bool) !void {
         const be = self.be;
-        try be.tensorUpload(offsetBufSized(self.bufs.x, 0, self.cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
+        try be.tensorUpload(self.bufs.x.slice(0, self.cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
         try be.tensorUpload(self.pos3_d, std.mem.sliceAsBytes(&pos3));
 
         be.weight_noise.tick();
@@ -1415,146 +1153,8 @@ pub const CudaLM = struct {
     /// length via g_state[1] (the M-RoPE triple comes from pos3_d either
     /// way), and skips the host-download debug taps. Does not bump len.
     fn decodeBody(self: *CudaLM, comptime graph: bool, want_logits: bool) !void {
-        const be = self.be;
-        const cfg = self.cfg;
-        const b = &self.bufs;
-        const hd = cfg.head_dim;
-        const eps = cfg.rms_eps;
-
-        // Hybrid split: the hidden begins on the device (bufs.x). A CPU-resident
-        // layer pulls it to the host once, runs there, and the next device layer
-        // (if any) pushes it back, see enableCpuSplit. on_host tracks where the
-        // live residual stream currently sits.
-        if (self.split) |*sp| sp.on_host = false;
-
-        for (self.lm.layers, 0..) |*layer, l| {
-            self.noiseAtLayer(l);
-            if (self.split) |*sp| {
-                if (!sp.on_gpu[l]) {
-                    if (!sp.on_host) {
-                        try be.tensorDownload(offsetBufSized(b.x, 0, cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0..cfg.hidden]));
-                        sp.on_host = true;
-                    }
-                    const host_io = self.io orelse return error.SplitIoUnset;
-                    try self.lm.cpuLayer(host_io, self.gpa, l, sp.hx[0..cfg.hidden], 1, sp.freqs, &sp.state, &sp.scratch);
-                    continue;
-                }
-                if (sp.on_host) {
-                    try be.tensorUpload(offsetBufSized(b.x, 0, cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0..cfg.hidden]));
-                    sp.on_host = false;
-                }
-            }
-            switch (layer.*) {
-                .attn => |*al| {
-                    const slot = l / cfg.full_attn_interval;
-                    try be.qkNorm(b.x, b.normed, try nbuf(be, al.input_norm), 1, cfg.hidden, eps);
-                    const g = try lin_cuda.prep(be, b.normed, 1, cfg.hidden, &.{ al.qg, al.k, al.v });
-                    try lin_cuda.gemm(be, g, b.qg, al.qg);
-                    try lin_cuda.gemm(be, g, b.k, al.k);
-                    try lin_cuda.gemm(be, g, b.v, al.v);
-                    try be.opDeinterleave2(b.qg, b.q, b.gate, cfg.qDim(), hd);
-                    try be.qkNorm(b.q, b.q, try nbuf(be, al.q_norm), cfg.n_heads, hd, eps);
-                    try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), cfg.n_kv_heads, hd, eps);
-                    try be.opRopeImrope(b.q, self.pos3_d, self.freqs_d, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try be.opRopeImrope(b.k, self.pos3_d, self.freqs_d, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    if (graph) {
-                        const fmt = kvFmt(self.kv_dtype);
-                        try be.opKvAppendS(self.k_cache[slot].buf, b.k, cfg.kvDim(), cfg.kvDim(), 0, fmt);
-                        try be.opKvAppendS(self.v_cache[slot].buf, b.v, cfg.kvDim(), cfg.kvDim(), 0, fmt);
-                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, fmt);
-                    } else {
-                        try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, cfg.kvDim());
-                        try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, cfg.kvDim());
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0, 0, false, kvFmt(self.kv_dtype));
-                    }
-                    try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
-                    try lin_cuda.linear(be, b.t, b.attn, 1, al.o);
-                    try be.opAdd(b.x, b.t, cfg.hidden);
-                },
-                .linear => |*ll| {
-                    const lin_idx = l - l / cfg.full_attn_interval;
-                    const channels = cfg.convChannels();
-                    const d = cfg.lin_head_dim;
-                    const heads = cfg.lin_v_heads;
-                    try be.qkNorm(b.x, b.normed, try nbuf(be, ll.input_norm), 1, cfg.hidden, eps);
-                    if (!graph) {
-                        if (self.op_dump) |od| {
-                            if (l == 0) {
-                                try be.tensorDownload(offsetBufSized(b.normed, 0, cfg.hidden * 4), std.mem.sliceAsBytes(od[self.op_dump_row * cfg.hidden ..][0..cfg.hidden]));
-                                self.op_dump_row += 1;
-                            }
-                        }
-                    }
-                    const g = try lin_cuda.prep(be, b.normed, 1, cfg.hidden, &.{ ll.qkv, ll.z, ll.alpha, ll.beta });
-                    try lin_cuda.gemm(be, g, b.lin_qkv, ll.qkv);
-                    try lin_cuda.gemm(be, g, b.lin_z, ll.z);
-                    try lin_cuda.gemm(be, g, offsetBufSized(b.ab, 0, heads * 4), ll.alpha);
-                    try lin_cuda.gemm(be, g, offsetBufSized(b.ab, heads * 4, heads * 4), ll.beta);
-                    try be.opGdnGates(b.ab, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads);
-                    const conv_off = lin_idx * channels * (cfg.conv_kernel - 1) * 4;
-                    try be.opGdnConvStep(
-                        offsetBufSized(self.conv_state, conv_off, channels * (cfg.conv_kernel - 1) * 4),
-                        b.lin_qkv,
-                        try nbuf(be, ll.conv_w),
-                        b.lin_conv,
-                        channels,
-                    );
-                    try be.opL2NormRows(offsetBufSized(b.lin_conv, 0, 2 * cfg.linQKDim() * 4), 2 * cfg.lin_k_heads, d, eps);
-                    const ssm_off = lin_idx * heads * d * d * 4;
-                    try be.opGdnDeltaStep(
-                        offsetBufSized(self.ssm_state, ssm_off, heads * d * d * 4),
-                        b.lin_conv,
-                        b.gates,
-                        b.lin_o,
-                        heads,
-                        d,
-                        cfg.lin_k_heads,
-                        1.0 / @sqrt(@as(f32, @floatFromInt(d))),
-                    );
-                    try be.qkNorm(b.lin_o, b.lin_o, try nbuf(be, ll.ssm_norm), heads, d, eps);
-                    try be.siluMul(b.lin_z, b.lin_o, cfg.linVDim());
-                    try lin_cuda.linear(be, b.t, b.lin_z, 1, ll.out);
-                    try be.opAdd(b.x, b.t, cfg.hidden);
-                },
-            }
-            const mlp = switch (layer.*) {
-                .attn => |*al| &al.mlp,
-                .linear => |*ll| &ll.mlp,
-            };
-            try be.qkNorm(b.x, b.normed, try nbuf(be, mlp.post_norm), 1, cfg.hidden, eps);
-            const g = try lin_cuda.prep(be, b.normed, 1, cfg.hidden, &.{ mlp.gate, mlp.up });
-            try lin_cuda.gemm(be, g, b.mlp_gate, mlp.gate);
-            try lin_cuda.gemm(be, g, b.mlp_up, mlp.up);
-            try be.siluMul(b.mlp_gate, b.mlp_up, cfg.intermediate);
-            try lin_cuda.linear(be, b.t, b.mlp_gate, 1, mlp.down);
-            try be.opAdd(b.x, b.t, cfg.hidden);
-            if (!graph) {
-                if (self.layer_dump) |dump| {
-                    try be.tensorDownload(
-                        offsetBufSized(b.x, 0, cfg.hidden * 4),
-                        std.mem.sliceAsBytes(dump[l * cfg.hidden ..][0..cfg.hidden]),
-                    );
-                }
-            }
-        }
-
-        // Split: the LM head runs on the device, so bring the hidden back if a
-        // CPU tail left it on the host, and advance the host KV in lockstep.
-        if (self.split) |*sp| {
-            if (sp.on_host) {
-                try be.tensorUpload(offsetBufSized(b.x, 0, cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0..cfg.hidden]));
-                sp.on_host = false;
-            }
-            sp.state.kv.commit(1);
-            sp.state.len += 1;
-        }
-
-        if (want_logits) {
-            try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), 1, cfg.hidden, eps);
-            be.weight_noise.atHead();
-            try lin_cuda.linear(be, b.logits, b.t, 1, self.lm.head);
-        }
+        var dev: Dev = .of(self);
+        try qwen35_dev.decode(&dev, graph, want_logits);
     }
 
     /// Which layer the coming launches belong to, for the weight-noise curve. This
@@ -1615,7 +1215,7 @@ pub const CudaLM = struct {
     /// Device-side embedding gather of g_state[0]'s row into bufs.x.
     fn embedGather(self: *CudaLM) !void {
         const cfg = self.cfg;
-        const x = offsetBufSized(self.bufs.x, 0, cfg.hidden * 4);
+        const x = self.bufs.x.slice(0, cfg.hidden * 4);
         if (self.lm.embed.dtype == .bf16) {
             try self.be.opEmbedGatherS(x, self.lm.embed.bytes, cfg.hidden);
         } else {
@@ -1633,6 +1233,213 @@ pub const CudaLM = struct {
     }
 };
 
+/// `qwen35_dev`'s adapter over a `CudaLM`: each op is the call its forward made before
+/// the forward was shared, so the CUDA output is unchanged by the move.
+const Dev = struct {
+    m: *CudaLM,
+    cfg: qwen35.Config,
+    lm: *const qwen35.Model,
+    bufs: *const Bufs,
+
+    const Weight = lin_cuda.Weight;
+
+    pub fn of(m: *CudaLM) Dev {
+        return .{ .m = m, .cfg = m.cfg, .lm = m.lm, .bufs = &m.bufs };
+    }
+
+    pub fn view(_: *const Dev, b: Buf, off: usize, bytes: usize) error{}!Buf {
+        return b.slice(off, bytes);
+    }
+    pub fn rms(d: *const Dev, x: Buf, out: Buf, w: []const f32, rows: usize, dim: usize) !void {
+        try d.m.be.qkNorm(x, out, try nbuf(d.m.be, w), rows, dim, d.cfg.rms_eps);
+    }
+    pub fn prep(d: *const Dev, x: Buf, m: usize, cols: usize, ws: []const Weight) !lin_cuda.Group {
+        return lin_cuda.prep(d.m.be, d.m.lin_plan, x, m, cols, ws);
+    }
+    pub fn gemm(d: *const Dev, g: lin_cuda.Group, y: Buf, w: Weight) !void {
+        try lin_cuda.gemm(d.m.be, d.m.lin_plan, g, y, w, null);
+    }
+    pub fn linear(d: *const Dev, y: Buf, x: Buf, m: usize, w: Weight) !void {
+        try lin_cuda.linear(d.m.be, d.m.lin_plan, y, x, m, w, null);
+    }
+    pub fn deinterleave2(d: *const Dev, src: Buf, a: Buf, b: Buf, total: usize, hd: usize) !void {
+        try d.m.be.opDeinterleave2(src, a, b, total, hd);
+    }
+    pub fn mulSigmoid(d: *const Dev, a: Buf, g: Buf, n: usize) !void {
+        try d.m.be.opMulSigmoid(a, g, n);
+    }
+    pub fn add(d: *const Dev, x: Buf, t: Buf, n: usize) !void {
+        try d.m.be.opAdd(x, t, n);
+    }
+    pub fn addRms(d: *const Dev, x: Buf, t: Buf, out: Buf, w: []const f32, rows: usize, dim: usize) !void {
+        try d.add(x, t, rows * dim);
+        try d.rms(x, out, w, rows, dim);
+    }
+    pub fn siluMul(d: *const Dev, a: Buf, b: Buf, n: usize) !void {
+        try d.m.be.siluMul(a, b, n);
+    }
+    pub fn l2normRows(d: *const Dev, x: Buf, rows: usize, dim: usize) !void {
+        try d.m.be.opL2NormRows(x, rows, dim, d.cfg.rms_eps);
+    }
+    pub fn l2normRowsGrouped(d: *const Dev, x: Buf, rows: usize, dim: usize, group: usize, stride: usize) !void {
+        try d.m.be.opL2NormRowsGrouped(x, rows, dim, group, stride, d.cfg.rms_eps);
+    }
+    pub fn gdnGates(d: *const Dev, ab: Buf, a_dt: []const f32, gates: Buf, heads: usize) !void {
+        try d.m.be.opGdnGates(ab, try nbuf(d.m.be, a_dt), gates, heads);
+    }
+    pub fn gdnConvStep(d: *const Dev, state: Buf, x: Buf, w: []const f32, out: Buf, channels: usize) !void {
+        try d.m.be.opGdnConvStep(state, x, try nbuf(d.m.be, w), out, channels);
+    }
+    pub fn gdnDeltaStep(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, scale: f32) !void {
+        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, 1, d.cfg.convChannels(), scale);
+        try d.m.be.opGdnDeltaStep(state, conv, gates, o, heads, dk, k_heads, scale);
+    }
+    pub fn gdnGatesBatch(d: *const Dev, alpha: Buf, beta: Buf, a_dt: []const f32, gates: Buf, heads: usize, n: usize, pitch: usize) !void {
+        try d.m.be.opGdnGatesBatch(alpha, beta, try nbuf(d.m.be, a_dt), gates, heads, n, pitch);
+    }
+    pub fn gdnConvBatch(d: *const Dev, state: Buf, x: Buf, w: []const f32, out: Buf, channels: usize, n: usize) !void {
+        try d.m.be.opGdnConvBatch(state, x, try nbuf(d.m.be, w), out, channels, n);
+    }
+    pub fn gdnDeltaChunk(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, n: usize, channels: usize, scale: f32) !void {
+        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, n, channels, scale);
+        try d.m.be.opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, n, channels, scale);
+    }
+
+    pub fn convState(d: *const Dev, lin_idx: usize) Buf {
+        const bytes = d.cfg.convChannels() * (d.cfg.conv_kernel - 1) * 4;
+        return d.m.conv_state.slice(lin_idx * bytes, bytes);
+    }
+    pub fn ssmState(d: *const Dev, lin_idx: usize) Buf {
+        const bytes = d.cfg.lin_v_heads * d.cfg.lin_head_dim * d.cfg.lin_head_dim * 4;
+        return d.m.ssm_state.slice(lin_idx * bytes, bytes);
+    }
+    pub fn aDt(d: *const Dev, lin_idx: usize) []const f32 {
+        return d.m.a_dt[lin_idx];
+    }
+    pub fn gdnRoute(d: *const Dev, lin_idx: usize, n: usize) qwen35_dev.GdnRoute(Weight) {
+        return .{
+            .chunk = gdnChunkOk(d.cfg.lin_head_dim, n),
+            .stacked = if (n > 1) d.m.ab_cat[lin_idx] else null,
+        };
+    }
+    /// Where the batched alpha and beta land in `ab_n`: one stacked output read as two
+    /// views of its pitch, or two tight planes with beta at `pad_rows`.
+    pub fn abViews(d: *const Dev, route: qwen35_dev.GdnRoute(Weight), n: usize) error{}!qwen35_dev.AbViews(Buf) {
+        const heads = d.cfg.lin_v_heads;
+        const ab_n = d.bufs.ab_n;
+        if (route.stacked) |cat| return .{
+            .alpha = ab_n.slice(0, n * cat.rows * 4),
+            .beta = ab_n.slice(heads * 4, n * cat.rows * 4 - heads * 4),
+            .pitch = cat.rows,
+        };
+        return .{
+            .alpha = ab_n.slice(0, n * heads * 4),
+            .beta = ab_n.slice(pad_rows * heads * 4, n * heads * 4),
+            .pitch = heads,
+        };
+    }
+
+    pub fn ropeStep(d: *const Dev, qk: Buf, heads: usize) !void {
+        const c = d.cfg;
+        try d.m.be.opRopeImrope(qk, d.m.pos3_d, d.m.freqs_d, heads, c.rope_dim / 2, d.m.sin_off, c.rope_sections, c.head_dim);
+    }
+    pub fn ropeRows(d: *const Dev, qk: Buf, heads: usize, n: usize) !void {
+        const c = d.cfg;
+        try d.m.be.opRopeImropePos(qk, d.m.pos3s_d, d.m.freqs_d, n, heads, c.rope_dim / 2, d.m.sin_off, c.rope_sections, c.head_dim);
+    }
+    pub fn storeKvStep(d: *const Dev, slot: usize, comptime graph: bool) !void {
+        const kv = d.cfg.kvDim();
+        if (graph) {
+            const fmt = kvFmt(d.m.kv_dtype);
+            try d.m.be.opKvAppendS(d.m.k_cache[slot].buf, d.bufs.k, kv, kv, 0, fmt);
+            try d.m.be.opKvAppendS(d.m.v_cache[slot].buf, d.bufs.v, kv, kv, 0, fmt);
+        } else try d.storeKvRows(slot, 1);
+    }
+    pub fn storeKvRows(d: *const Dev, slot: usize, n: usize) !void {
+        const kv = d.cfg.kvDim();
+        try d.m.storeKv(d.m.k_cache[slot].buf, d.m.len * kv, d.bufs.k, 0, n * kv);
+        try d.m.storeKv(d.m.v_cache[slot].buf, d.m.len * kv, d.bufs.v, 0, n * kv);
+    }
+    pub fn attendStep(d: *const Dev, slot: usize, comptime graph: bool) !void {
+        const c = d.cfg;
+        const b = d.bufs;
+        if (graph) {
+            try d.m.be.opAttnDecodeSGraph(b.q, d.m.k_cache[slot].buf, d.m.v_cache[slot].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, c.head_dim, nsplit, attnScale(c), kvFmt(d.m.kv_dtype));
+        } else try d.attend(slot, 1, nsplit);
+    }
+    pub fn attendRows(d: *const Dev, slot: usize, n: usize) !void {
+        try d.attend(slot, n, nsplit_prefill);
+    }
+    pub fn attend(d: *const Dev, slot: usize, n: usize, splits: usize) !void {
+        const c = d.cfg;
+        const b = d.bufs;
+        if (dual_kernels) return d.m.be.opAttnRowsDual(b.q, d.m.k_cache[slot].buf, d.m.v_cache[slot].buf, b.attn, b.attn_scratch, d.m.len + 1, n, c.n_heads, c.n_kv_heads, c.head_dim, splits, attnScale(c), kvFmt(d.m.kv_dtype));
+        try d.m.be.opAttnDecode(b.q, d.m.k_cache[slot].buf, d.m.v_cache[slot].buf, b.attn, b.attn_scratch, d.m.len + 1, n, c.n_heads, c.n_kv_heads, c.head_dim, splits, attnScale(c), 0, 0, false, kvFmt(d.m.kv_dtype));
+    }
+    pub fn attnScale(c: qwen35.Config) f32 {
+        return 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+    }
+
+    pub fn forwardBegin(d: *const Dev, _: usize) !void {
+        // Hybrid split: the hidden begins on the device (bufs.x); `on_host` tracks
+        // where the live residual stream sits as CPU layers pull it over.
+        if (d.m.split) |*sp| sp.on_host = false;
+    }
+    /// Run layer `l` on the host when the split put it there; true when it did.
+    pub fn layerBegin(d: *const Dev, l: usize, n: usize) !bool {
+        const m = d.m;
+        m.noiseAtLayer(l);
+        const sp = if (m.split) |*s| s else return false;
+        const hidden = d.cfg.hidden;
+        const x = d.bufs.x.slice(0, n * hidden * 4);
+        if (!sp.on_gpu[l]) {
+            if (!sp.on_host) {
+                try m.be.tensorDownload(x, std.mem.sliceAsBytes(sp.hx[0 .. n * hidden]));
+                sp.on_host = true;
+            }
+            const host_io = m.io orelse return error.SplitIoUnset;
+            try m.lm.cpuLayer(host_io, m.gpa, l, sp.hx[0 .. n * hidden], n, sp.freqs, &sp.state, &sp.scratch);
+            return true;
+        }
+        if (sp.on_host) {
+            try m.be.tensorUpload(x, std.mem.sliceAsBytes(sp.hx[0 .. n * hidden]));
+            sp.on_host = false;
+        }
+        return false;
+    }
+    pub fn tapNormedStep(d: *const Dev, l: usize) !void {
+        const od = d.m.op_dump orelse return;
+        if (l != 0) return;
+        const hidden = d.cfg.hidden;
+        try d.m.be.tensorDownload(d.bufs.normed.slice(0, hidden * 4), std.mem.sliceAsBytes(od[d.m.op_dump_row * hidden ..][0..hidden]));
+        d.m.op_dump_row += 1;
+    }
+    pub fn tapNormedRows(d: *const Dev, l: usize, n: usize) !void {
+        const od = d.m.op_dump orelse return;
+        if (l != 0) return;
+        try d.m.be.tensorDownload(d.bufs.normed.slice(0, n * d.cfg.hidden * 4), std.mem.sliceAsBytes(od[0 .. n * d.cfg.hidden]));
+    }
+    pub fn tapLayer(d: *const Dev, l: usize, n: usize) !void {
+        const dump = d.m.layer_dump orelse return;
+        const hidden = d.cfg.hidden;
+        try d.m.be.tensorDownload(d.bufs.x.slice((n - 1) * hidden * 4, hidden * 4), std.mem.sliceAsBytes(dump[l * hidden ..][0..hidden]));
+    }
+    /// The split's host KV advances in lockstep. A decode step brings the hidden back
+    /// for the device LM head; a prefill reads no logits and the next chunk re-embeds.
+    pub fn forwardEnd(d: *const Dev, n: usize, step: bool) !void {
+        const sp = if (d.m.split) |*s| s else return;
+        if (step and sp.on_host) {
+            try d.m.be.tensorUpload(d.bufs.x.slice(0, d.cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0..d.cfg.hidden]));
+            sp.on_host = false;
+        }
+        sp.state.kv.commit(n);
+        sp.state.len += n;
+    }
+    pub fn headBegin(d: *const Dev) void {
+        d.m.be.weight_noise.atHead();
+    }
+};
+
 /// Zero a device buffer via chunked uploads of a host zero slab.
 fn zeroBuffer(be: *Backend, gpa: std.mem.Allocator, buf: Buf, bytes: usize) !void {
     const chunk = @min(bytes, 4 << 20);
@@ -1642,7 +1449,7 @@ fn zeroBuffer(be: *Backend, gpa: std.mem.Allocator, buf: Buf, bytes: usize) !voi
     var off: usize = 0;
     while (off < bytes) : (off += chunk) {
         const n = @min(chunk, bytes - off);
-        try be.tensorUpload(offsetBufSized(buf, off, n), zeros[0..n]);
+        try be.tensorUpload(buf.slice(off, n), zeros[0..n]);
     }
 }
 
@@ -1919,14 +1726,12 @@ test "cpu split prefill before any step needs a seeded io" {
 }
 
 test "the GDN chunk recurrence is gated on the head dim and the row count only" {
-    // Which kernel alpha/beta take is lin_llm_cuda's decision; the regression this
-    // pins is that a dtype with no batched GEMV must STILL take the chunk recurrence.
+    // Which kernel alpha/beta take is lin_cuda's decision; the regression this pins is
+    // that a dtype with no batched GEMV must STILL take the chunk recurrence.
     const n = 512;
-    try std.testing.expect(gdnRoute(128, n, false).chunk);
-    try std.testing.expect(gdnRoute(128, n, true).stacked);
-    try std.testing.expect(!gdnRoute(128, n, false).stacked);
-    // Decode, and a head dim the chunk kernel cannot take, drop `chunk`.
-    try std.testing.expect(!gdnRoute(128, 1, false).chunk);
-    try std.testing.expect(!gdnRoute(48, n, false).chunk);
-    try std.testing.expect(!gdnRoute(512, n, false).chunk);
+    try std.testing.expect(gdnChunkOk(128, n));
+    // Decode, and a head dim the chunk kernel cannot take, do not.
+    try std.testing.expect(!gdnChunkOk(128, 1));
+    try std.testing.expect(!gdnChunkOk(48, n));
+    try std.testing.expect(!gdnChunkOk(512, n));
 }

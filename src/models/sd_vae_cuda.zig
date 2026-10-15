@@ -1,4 +1,5 @@
-//! GPU-resident SD-family VAE decode on the CUDA backends (AutoencoderKL).
+//! GPU-resident VAE decode on the CUDA backends: the AutoencoderKL (`decode`, over
+//! `sd_vae_dev`) and the Wan 2.1 decoder (`decodeWan`, over `wan_vae_dev`), one adapter.
 //!
 //! The CUDA analogue of `sd_vae_gpu`. The mid-block attention runs `be.attn`,
 //! an f32 online softmax that materializes no scores plane, rather than the
@@ -10,7 +11,11 @@
 
 const std = @import("std");
 const sd_vae = @import("sd_vae.zig");
+const conv_cuda = @import("conv_cuda.zig");
 const sd_unet_cuda = @import("sd_unet_cuda.zig");
+const dev = @import("sd_vae_dev.zig");
+const wan_vae = @import("wan_vae.zig");
+const wan_vae_dev = @import("wan_vae_dev.zig");
 const ops = @import("tp_ops");
 const cuda = @import("tp_gpu").cuda;
 
@@ -27,7 +32,7 @@ const Bufs = struct {
     t: Buf = .{},
     u: Buf = .{},
     /// f32 on both ends of the decode: the incoming latent and the outgoing RGB.
-    /// Separate from `x`/`t` because those are f16 under `Config.act_f16`.
+    /// Separate from `x`/`t` because those may be 16-bit.
     stage: Buf = .{},
     patch: Buf = .{},
     gstat: Buf = .{},
@@ -80,8 +85,11 @@ pub fn decode(
     lat_h: usize,
     lat_w: usize,
     cancel: ?*std.atomic.Value(bool),
+    /// Activation storage; null takes `Config.act_f16`.
+    act_override: ?cuda.backend.Dt,
 ) ![]f32 {
     const cfg = dec.cfg;
+    const act: cuda.backend.Dt = act_override orelse if (cfg.act_f16) .f16 else .f32;
     std.debug.assert(z.len == lat_h * lat_w * cfg.z_channels);
     var bufs: Bufs = .{};
     defer bufs.deinit(be);
@@ -91,34 +99,24 @@ pub fn decode(
     var norms: NormBufs = .{ .alloc = arena.allocator(), .be = be };
     defer norms.deinit();
 
-    var h = lat_h;
-    var w = lat_w;
-    var ch = cfg.innermost();
-
     // Sizing mirrors the loader's own width bookkeeping: the first resnet of a
     // level reads the PREVIOUS level's (wider) input at the NEW (doubled)
     // resolution, so sizing off `block_out_channels` alone under-allocates by 2x.
-    // See the same note in `sd_vae_gpu`, where it cost a wrong decode.
-    var max_elems: usize = 0;
-    // TWO widths, not one. `u` only ever receives a convolution's OUTPUT, so it
-    // peaks one level narrower than `x`/`t`, see `sd_vae.activationElems`.
+    // TWO widths: `u` only ever receives a convolution's OUTPUT, so it peaks one
+    // level narrower than `x`/`t` (`sd_vae.activationElems`).
     const widths = sd_vae.activationElems(cfg, lat_h, lat_w);
-    max_elems = @intCast(widths.wide);
+    const max_elems: usize = @intCast(widths.wide);
 
-    // `act_f16` halves the two widest buffers, which is where a whole-image
+    // 16-bit storage halves the two widest buffers, which is where a whole-image
     // decode's gigabytes are: at 1056x1584 each holds 256 channels at FULL image
     // resolution (428M elements). The latent coming IN and the RGB going OUT are
     // f32 either way, so they get their own small staging buffer rather than
     // borrowing one of these.
-    const asz: usize = if (cfg.act_f16) 2 else 4;
+    const asz = act.bytes();
+    inline for (.{ "x", "t", "u" }) |f| @field(bufs, f).dt = act;
     try be.ensureDeviceBuffer(&bufs.x, max_elems * asz);
     try be.ensureDeviceBuffer(&bufs.t, max_elems * asz);
     try be.ensureDeviceBuffer(&bufs.stage, @max(z.len, lat_h * lat_w * 64 * 3) * 4);
-    // The upload target depends on whether the checkpoint HAS a
-    // `post_quant_conv`: the Flux-lineage 16-channel VAE does not, so the latent is
-    // staged straight into `t`, which is where `conv_in` reads from, instead of
-    // going through a convolution that does not exist. Allocated before the upload
-    // so `ensureDeviceBuffer` cannot move the buffer out from under it.
     try be.tensorUpload(bufs.stage, std.mem.sliceAsBytes(z));
     try be.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * asz);
     try be.ensureDeviceBuffer(&bufs.gstat, cfg.norm_groups * gn_chunks * 3 * 4);
@@ -129,194 +127,103 @@ pub fn decode(
 
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
-
-    // The Flux-lineage 16-channel VAE has NO `post_quant_conv` (BFL dropped it),
-    // so `conv_in` reads the staged latent directly; with one it runs first.
-    const a16 = cfg.act_f16;
-    if (dec.post_quant) |pq| {
-        try conv(be, &bufs, &bufs.t, &bufs.stage, h, w, pq, .stride1, false, a16);
-        try conv(be, &bufs, &bufs.x, &bufs.t, h, w, dec.conv_in, .stride1, a16, a16);
-    } else {
-        try conv(be, &bufs, &bufs.x, &bufs.stage, h, w, dec.conv_in, .stride1, false, a16);
-    }
-
-    try resnet(be, &bufs, &norms, h, w, dec.mid1, cfg);
-    try attn(be, &bufs, &norms, h, w, dec.mid_attn, cfg);
-    try resnet(be, &bufs, &norms, h, w, dec.mid2, cfg);
-
-    // The O(seq^2) attention scratch is dead now but sits at the START (the
-    // mid-block runs at latent resolution) and would otherwise stay resident
-    // through the whole 8x upsampling; flush and free it.
-    try be.endBatch();
-    be.freeAttnScratch();
-    inline for (.{ "aq", "ak", "av", "ao" }) |f| be.tensorDestroy(&@field(bufs, f));
-    try be.beginBatch();
-
-    for (dec.levels) |level| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        for (level.blocks) |b| {
-            try resnet(be, &bufs, &norms, h, w, b, cfg);
-            ch = b.out_ch;
-        }
-        if (level.upsample) |up| {
-            try convResidual(be, &bufs, &bufs.t, &bufs.x, h, w, up, .upsample2x, cfg.act_f16);
-            std.mem.swap(Buf, &bufs.x, &bufs.t);
-            h *= 2;
-            w *= 2;
-        }
-    }
-
-    try groupNorm(be, &bufs, &norms, &bufs.t, &bufs.x, h * w, ch, dec.norm_out, cfg, true);
-    // The head writes RGB back into the f32 staging buffer, the host wants f32.
-    try conv(be, &bufs, &bufs.stage, &bufs.t, h, w, dec.conv_out, .stride1, a16, false);
-
+    const ext = try dev.body(Dev{ .be = be, .bufs = &bufs, .norms = &norms, .groups = cfg.norm_groups, .eps = cfg.norm_eps }, dec, lat_h, lat_w, cancel);
     try be.endBatch();
 
-    const rgb = try gpa.alloc(f32, h * w * 3);
+    const rgb = try gpa.alloc(f32, ext[0] * ext[1] * 3);
     errdefer gpa.free(rgb);
     try be.tensorDownload(bufs.stage, std.mem.sliceAsBytes(rgb));
     return rgb;
 }
 
-/// `a += b` over two activation buffers in whichever format they are stored.
-fn addAct(be: *Backend, a: Buf, b: Buf, total: usize, act16: bool) !void {
-    if (act16) return be.opAddH16(a, b, total);
-    return be.opAdd(a, b, total);
-}
+/// Decode a Wan 2.1 latent (planar `[16][zh][zw]`, already denormalized) to planar
+/// `[3][8*zh][8*zw]` pixels in [-1, 1], the chain at `act`. Caller frees.
+pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool), act: cuda.backend.Dt) ![]f32 {
+    std.debug.assert(z.len == wan_vae.latent_channels * zh * zw);
+    var bufs: Bufs = .{};
+    defer bufs.deinit(be);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var norms: NormBufs = .{ .alloc = arena.allocator(), .be = be };
+    defer norms.deinit();
 
-fn resnet(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, r: sd_vae.Resnet, cfg: Config) !void {
-    const n = h * w;
-    const out_n = n * r.out_ch;
-    const a16 = cfg.act_f16;
-    try groupNorm(be, bufs, norms, &bufs.t, &bufs.x, n, r.in_ch, r.norm1, cfg, true);
-    try conv(be, bufs, &bufs.u, &bufs.t, h, w, r.conv1, .stride1, a16, a16);
-    try groupNorm(be, bufs, norms, &bufs.t, &bufs.u, n, r.out_ch, r.norm2, cfg, true); // consumes u
-    try conv(be, bufs, &bufs.u, &bufs.t, h, w, r.conv2, .stride1, a16, a16); // reuses u
-    if (r.nin) |nin| {
-        try convResidual(be, bufs, &bufs.t, &bufs.x, h, w, nin, .stride1, a16);
-        try addAct(be, bufs.u, bufs.t, out_n, a16);
-    } else {
-        try addAct(be, bufs.u, bufs.x, out_n, a16);
+    const n0 = zh * zw;
+    const widths = dec.activationElems(zh, zw);
+    const asz = act.bytes();
+    inline for (.{ "x", "t", "u" }) |f| @field(bufs, f).dt = act;
+    try be.ensureDeviceBuffer(&bufs.x, @as(usize, @intCast(widths.wide)) * asz);
+    try be.ensureDeviceBuffer(&bufs.t, @as(usize, @intCast(widths.wide)) * asz);
+    try be.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * asz);
+    try be.ensureDeviceBuffer(&bufs.stage, @max(z.len, n0 * 64 * 3) * 4);
+    {
+        const rows = try wan_vae.planarToRows(gpa, z, wan_vae.latent_channels, n0);
+        defer gpa.free(rows);
+        try be.tensorUpload(bufs.stage, std.mem.sliceAsBytes(rows));
     }
-    std.mem.swap(Buf, &bufs.x, &bufs.u);
+    const c = dec.mid_attn.proj.co;
+    inline for (.{ "aq", "ak", "av", "ao" }) |f| try be.ensureDeviceBuffer(&@field(bufs, f), n0 * c * 4);
+
+    try be.beginBatch();
+    errdefer if (be.batching()) be.abortBatch();
+    const ext = try wan_vae_dev.body(Dev{ .be = be, .bufs = &bufs, .norms = &norms }, dec, zh, zw, cancel);
+    try be.endBatch();
+
+    const n = ext[0] * ext[1];
+    const rgb = try gpa.alloc(f32, n * 3);
+    defer gpa.free(rgb);
+    try be.tensorDownload(bufs.stage, std.mem.sliceAsBytes(rgb));
+    return wan_vae.rowsToPlanar(gpa, rgb, 3, n);
 }
 
-/// A/B switch for the mid-block attention (see `attn`). `zimage-cuda-test` runs both.
+/// A/B switch for the mid-block attention (see `Dev.attnCore`). `zimage-cuda-test` runs both.
 pub var force_naive_attn: bool = false;
 
-/// Mid-block attention: one head over all `ch` channels (512), so `opAttnTC`
-/// takes it directly, and selects its own query-tiled path when the scores plane
-/// exceeds the scratch budget, which at a 1024-square render it does.
-fn attn(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, ab: sd_vae.AttnBlock, cfg: Config) !void {
-    const n = h * w;
-    const ch = ab.channels;
-    const a16 = cfg.act_f16;
-    try groupNorm(be, bufs, norms, &bufs.t, &bufs.x, n, ch, ab.norm, cfg, false);
-    // q/k/v/out stay f32: they are at latent resolution (tens of MB, not
-    // where the memory goes) and both attention paths take f32 buffers.
-    try conv(be, bufs, &bufs.aq, &bufs.t, h, w, ab.q, .stride1, a16, false);
-    try conv(be, bufs, &bufs.ak, &bufs.t, h, w, ab.k, .stride1, a16, false);
-    try conv(be, bufs, &bufs.av, &bufs.t, h, w, ab.v, .stride1, a16, false);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
-    // `opAttnTC` on BOTH arms, given the f32 scores band. The constraint it has to
-    // respect: a tensor-core path that materializes the scores plane in f16 cannot
-    // serve this VAE, because the
-    // Flux/Z-Image VAE's attention *logits* reach 9.95e6 on a 12x10 latent where
-    // SD1.5's reach 8.3, 152x past f16's 65504 ceiling, and even without
-    // overflow f16's quantum up there is ~8000, which destroys a softmax whose
-    // differences are O(1). It rendered solid white with no error. Everything
-    // upstream is finite and in fact *smaller* than SD's, so only the logits show it.
-    //
-    // `be.attn` keeps an online softmax in f32 and materializes no scores plane
-    // at all, so it cannot overflow and needs no O(seq²) buffer.
-    if (force_naive_attn) {
-        try be.attn(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, n, 1, 1, ch, scale, false);
-    } else {
-        try be.opAttnTC(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, 1, 1, ch, scale);
-    }
-    // The projection lands in `t`, not back in `aq`: the residual add is against
-    // `x`, which is f16 under `act_f16`, and `t` is the activation-format scratch.
-    // (`t` is free here, the three projections consumed it.)
-    try conv(be, bufs, &bufs.t, &bufs.ao, h, w, ab.proj, .stride1, false, a16);
-    try addAct(be, bufs.x, bufs.t, n * ch, a16);
-}
-
-fn groupNorm(
+/// `sd_vae_dev`'s and `wan_vae_dev`'s ops on this backend.
+const Dev = struct {
     be: *Backend,
     bufs: *Bufs,
     norms: *NormBufs,
-    dst: *Buf,
-    src: *const Buf,
-    n: usize,
-    ch: usize,
-    nw: sd_vae.GroupNormW,
-    cfg: Config,
-    silu: bool,
-) !void {
-    const cat = try norms.get(nw);
-    try be.opGroupNorm(src.*, dst.*, cat, bufs.gstat, bufs.gmi, n, ch, cfg.norm_groups, gn_chunks, cfg.norm_eps, silu, cfg.act_f16);
-}
+    /// GroupNorm's; the Wan decoder has none.
+    groups: usize = 0,
+    eps: f32 = 0,
 
-fn conv(
-    be: *Backend,
-    bufs: *Bufs,
-    dst: *Buf,
-    src: *const Buf,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: sd_unet_cuda.SampleMode,
-    /// Storage format of `src` / `dst`. The running activations (`x`/`t`/`u`) are
-    /// f16 under `cfg.act_f16`; the attention projections and the host-facing
-    /// staging buffer stay f32, so a call has to say which it is touching.
-    src16: bool,
-    dst16: bool,
-) !void {
-    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, null, 1.0, src16, dst16);
-}
+    pub fn conv(d: Dev, dst: *Buf, src: *const Buf, h: usize, w: usize, cv: Conv2d, mode: conv_cuda.SampleMode, act_div: f32) !void {
+        try conv_cuda.conv2d(d.be, &d.bufs.patch, dst, src, h, w, cv, mode, null, act_div);
+    }
 
-/// Divisor applied to the activation of a convolution that reads the RESIDUAL
-/// STREAM, before it is cast to f16 (`Backend.opConvF16Scaled` undoes it exactly).
-///
-/// Not defensive, measured. An SDXL VAE decoder's residual reaches 4.2e5
-/// (probed at a 64² latent: the last upsample conv's f32 output is 1.26e5 and the
-/// next block's 1x1 shortcut reads it), against f16's ceiling of 65504. Without
-/// this, that cast produced `inf`, the following GroupNorm turned it into NaN via
-/// its mean, and every SDXL render at 512² or larger came out solid white with no
-/// error on `cuda`, `zig-cuda` and `vulkan` alike. SD1.5's VAE peaks near 7e3, two
-/// orders lower, which is why this was invisible for the family the code was
-/// written against, and it is the same reason ComfyUI decodes the SDXL VAE in fp32
-/// (or ships the "fp16-fix" weights) by default.
-///
-/// 256 is a power of two (so the scaling is exact, it only shifts the exponent and
-/// f16 keeps all 11 mantissa bits) and leaves 38x headroom over the measured peak.
-/// Its cost is that true values below 256*6e-8 = 1.5e-5 underflow to zero, which
-/// against a residual whose peak is ~1e5 is 1e-10 relative, hence a modest divisor
-/// rather than a blanket huge one.
-///
-/// Only the residual-reading convolutions need it, and that is a measured claim
-/// too: every OTHER convolution here reads a GroupNorm output (peak 67 measured, and
-/// bounded by |gamma|*O(1)+|beta| by construction) or the latent itself, so scaling
-/// them would only cost precision at the bottom of the range.
-const residual_act_div: f32 = 256.0;
+    pub fn groupNorm(d: Dev, dst: *Buf, src: *const Buf, n: usize, ch: usize, nw: sd_vae.GroupNormW, silu: bool) !void {
+        const cat = try d.norms.get(nw);
+        try d.be.opGroupNorm(src.*, dst.*, cat, d.bufs.gstat, d.bufs.gmi, n, ch, d.groups, gn_chunks, d.eps, silu);
+    }
 
-/// `conv` for a convolution whose input is the residual stream, the 1x1 shortcut
-/// and the level upsamples. See `residual_act_div`.
-fn convResidual(
-    be: *Backend,
-    bufs: *Bufs,
-    dst: *Buf,
-    src: *const Buf,
-    h: usize,
-    w: usize,
-    cv: Conv2d,
-    mode: sd_unet_cuda.SampleMode,
-    act16: bool,
-) !void {
-    // Under f16 storage the divisor is 1.0, and that is not a shortcut: `act_div`
-    // exists to bring a value too big for f16 *through* the cast, and an f16 buffer
-    // could never have held that value. The two answer the same question and
-    // `Config.act_f16` is off exactly where the divisor is load-bearing (SDXL).
-    const div: f32 = if (act16) 1.0 else residual_act_div;
-    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, null, div, act16, act16);
-}
+    pub fn channelNorm(d: Dev, dst: *Buf, src: *const Buf, n: usize, gamma: []const f32, silu: bool) !void {
+        std.debug.assert(src.dt == dst.dt);
+        const gbuf: Buf = .{ .buf = try d.be.smallBuffer(std.mem.sliceAsBytes(gamma)), .mem = .null_handle, .size = 0 };
+        try d.be.opVaeNorm(src.*, dst.*, gbuf, n, gamma.len, silu);
+    }
+
+    pub fn add(d: Dev, a: Buf, b: Buf, n: usize) !void {
+        try d.be.opAdd(a, b, n);
+    }
+
+    /// `opAttnTC` on both arms, given the f32 scores band. A tensor-core path that
+    /// materializes the scores plane in f16 cannot serve this VAE: the Flux/Z-Image VAE's
+    /// attention LOGITS reach 9.95e6 on a 12x10 latent where SD1.5's reach 8.3, and it
+    /// rendered solid white with no error while everything upstream stayed finite.
+    /// `be.attn` keeps an online softmax in f32 and materializes no scores plane.
+    pub fn attnCore(d: Dev, n: usize, ch: usize) !void {
+        const b = d.bufs;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
+        if (force_naive_attn) return d.be.attn(b.aq, b.ak, b.av, b.ao, n, n, 1, 1, ch, scale, false);
+        try d.be.opAttnTC(b.aq, b.ak, b.av, b.ao, n, 1, 1, ch, scale);
+    }
+
+    /// The O(seq²) attention scratch sits at the START (the mid-block runs at latent
+    /// resolution) and would otherwise stay resident through the whole 8x upsampling.
+    pub fn midDone(d: Dev) !void {
+        try d.be.endBatch();
+        d.be.freeAttnScratch();
+        inline for (.{ "aq", "ak", "av", "ao" }) |f| d.be.tensorDestroy(&@field(d.bufs, f));
+        try d.be.beginBatch();
+    }
+};

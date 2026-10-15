@@ -115,7 +115,11 @@ fn hexToDigest(hex: []const u8) ?Digest {
 }
 
 /// Whole-file and per-chunk digests in one pass through `buf`.
-pub fn hashFile(io: Io, file: Io.File, size: u64, chunk_bytes: u64, chunks: []Digest, buf: []u8, cancel: ?*const Cancel) !Digest {
+pub fn hashFile(io: Io, file: Io.File, size: u64, chunk_bytes: u64, chunks: []Digest, buf: []u8, cancel: ?*const Cancel, prog: ?*Progress) !Digest {
+    if (prog) |p| {
+        p.bytes_total.store(size, .monotonic);
+        p.bytes_done.store(0, .monotonic);
+    }
     var r = file.reader(io, buf);
     try r.seekTo(0);
     var whole = Blake3.init(.{});
@@ -132,6 +136,7 @@ pub fn hashFile(io: Io, file: Io.File, size: u64, chunk_bytes: u64, chunks: []Di
             left -= got.len;
         }
         h.final(out);
+        if (prog) |p| p.bytes_done.store(off + @min(chunk_bytes, size - off), .monotonic);
     }
     var d: Digest = undefined;
     whole.final(&d);
@@ -537,6 +542,10 @@ pub const Progress = struct {
     phase: std.atomic.Value(Phase) = .init(.hashing),
     bytes_total: std.atomic.Value(u64) = .init(0),
     bytes_done: std.atomic.Value(u64) = .init(0),
+    /// Payload this run carried over the wire. Only grows, unlike `bytes_done`,
+    /// which jumps to what the receiver already held on every connect: a rate
+    /// is read off this one.
+    bytes_moved: std.atomic.Value(u64) = .init(0),
     chunks_total: std.atomic.Value(u32) = .init(0),
     /// Chunk PUTs made, resends included.
     puts: std.atomic.Value(u32) = .init(0),
@@ -595,6 +604,8 @@ pub const SendOptions = struct {
     /// The wait before the second attempt; it doubles after each failure.
     retry_base_ns: u64 = std.time.ns_per_s,
     cancel: ?*Cancel = null,
+    /// Fed during the hashing pass in `init`, before `run` takes it over.
+    progress: ?*Progress = null,
     /// Test hook: cut the link after this many payload bytes on the first
     /// connection, as a dropped network would.
     cut_after_bytes: ?u64 = null,
@@ -608,7 +619,7 @@ const Built = struct {
     hex: [64]u8,
 };
 
-fn buildManifest(gpa: std.mem.Allocator, io: Io, file: Io.File, name: []const u8, size: u64, chunk_bytes: u64, cancel: ?*const Cancel) !Built {
+fn buildManifest(gpa: std.mem.Allocator, io: Io, file: Io.File, name: []const u8, size: u64, chunk_bytes: u64, cancel: ?*const Cancel, prog: ?*Progress) !Built {
     if (size == 0) return error.EmptyFile;
     if (!nameOk(name)) return error.NotAModelName;
     if (chunk_bytes < min_chunk_bytes or chunk_bytes > max_chunk_bytes) return error.BadChunkSize;
@@ -620,7 +631,7 @@ fn buildManifest(gpa: std.mem.Allocator, io: Io, file: Io.File, name: []const u8
     errdefer gpa.free(chunks);
     const io_buf = try gpa.alloc(u8, io_buf_len);
     defer gpa.free(io_buf);
-    const digest = try hashFile(io, file, size, chunk_bytes, chunks, io_buf, cancel);
+    const digest = try hashFile(io, file, size, chunk_bytes, chunks, io_buf, cancel, prog);
 
     var hexes = try gpa.alloc([]const u8, n);
     defer gpa.free(hexes);
@@ -657,7 +668,7 @@ pub const Sender = struct {
         const size = (try file.stat(io)).size;
         if (size == 0) return error.EmptyFile;
         const name = std.fs.path.basename(path);
-        const built = try buildManifest(gpa, io, file, name, size, opts.chunk_bytes, opts.cancel);
+        const built = try buildManifest(gpa, io, file, name, size, opts.chunk_bytes, opts.cancel, opts.progress);
         errdefer gpa.free(built.json);
         errdefer gpa.free(built.chunks);
         const io_buf = try gpa.alloc(u8, io_buf_len);
@@ -680,6 +691,7 @@ pub const Sender = struct {
     /// before the next, so a daemon restart is not five failures in a row.
     pub fn run(self: *Sender, connector: Connector, prog: *Progress) void {
         prog.bytes_total.store(self.size, .monotonic);
+        prog.bytes_done.store(0, .monotonic);
         prog.chunks_total.store(@intCast(self.chunks.len), .monotonic);
         prog.phase.store(.sending, .release);
         var attempts: u32 = 0;
@@ -772,6 +784,7 @@ pub const Sender = struct {
             if (resp.status != 202) return error.ChunkRefused;
             done_bytes += len;
             prog.bytes_done.store(done_bytes, .monotonic);
+            _ = prog.bytes_moved.fetchAdd(len, .monotonic);
         }
         prog.phase.store(.committing, .release);
         const target = try std.fmt.bufPrint(&target_buf, "/v1/blob/{s}/commit", .{&self.hex});
@@ -819,7 +832,7 @@ pub const Offer = struct {
         const file = try Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
         const st = try file.stat(io);
-        const built = try buildManifest(gpa, io, file, std.fs.path.basename(path), st.size, chunk_bytes, null);
+        const built = try buildManifest(gpa, io, file, std.fs.path.basename(path), st.size, chunk_bytes, null, null);
         gpa.free(built.chunks); // the JSON carries them; a read needs neither
         errdefer gpa.free(built.json);
         const owned = try gpa.dupe(u8, path);
@@ -1073,6 +1086,7 @@ pub const Fetcher = struct {
             try self.store.writeChunk(&self.hex, i, l.reader(), len, null);
             done_bytes += len;
             prog.bytes_done.store(done_bytes, .monotonic);
+            _ = prog.bytes_moved.fetchAdd(len, .monotonic);
         }
         prog.phase.store(.committing, .release);
         const path = self.store.commit(&self.hex) catch |err| {
@@ -1173,10 +1187,14 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     const total = try writeTestModel(io, tmp.dir, "m.safetensors", 2 * @as(usize, @intCast(cb)) + 1000, 7);
     const src_path = try std.fs.path.join(gpa, &.{ root, "m.safetensors" });
     defer gpa.free(src_path);
-    var s = try Sender.init(gpa, io, src_path, .{ .chunk_bytes = cb });
+    var hashed: Progress = .{};
+    var s = try Sender.init(gpa, io, src_path, .{ .chunk_bytes = cb, .progress = &hashed });
     defer s.deinit();
     try testing.expectEqual(@as(usize, 3), s.chunks.len);
     try testing.expectEqual(@as(u64, total), s.size);
+    // The hashing pass reports the whole file, the short tail chunk included.
+    try testing.expectEqual(@as(u64, total), hashed.bytes_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, total), hashed.bytes_done.load(.monotonic));
     const tail = s.chunkLen(2);
 
     const have0 = try store.begin(s.man_json);

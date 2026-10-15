@@ -34,7 +34,10 @@
 
 const std = @import("std");
 const audio = @import("minimax_h3_audio.zig");
+const conv_cuda = @import("conv_cuda.zig");
+const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
+const minimax_h3_audio_dev = @import("minimax_h3_audio_dev.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -115,67 +118,22 @@ fn devBuf(be: *Backend, data: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(data)), .mem = .null_handle, .size = data.len * 4 };
 }
 
-/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`, im2col + tensor-core GEMM.
-///
-/// `dst` may alias `src`: the GEMM reads only the patch matrix.
-fn conv(be: *Backend, ws: *Workspace, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
-    const out_len = in_len; // every conv here is stride 1 and same-padded
-    std.debug.assert(out_len * c.plen() <= ws.shapes.patch);
-    try be.opIm2col1d(src, ws.patch, 0, out_len, c.k, c.in_ch, in_len, c.dilation, c.padding, c.stride);
-    if (f16_gemm) {
-        try be.opMatmulF16(dst, ws.patch, out_len, c.w16, c.out_ch, c.plen(), c.bias, false, false);
-        return out_len;
-    }
-    const w32 = std.mem.sliceAsBytes(c.w32);
-    // The tiled f32 GEMM where there is one; the hand-PTX arm has none, and its
-    // one-thread-per-output fallback is correct at about a third of the speed.
-    // Falling back to f16 there instead would be a silent 50 dB of SNR.
-    be.opMatmulF32Lt(dst, ws.patch, out_len, w32, c.out_ch, c.plen(), c.bias) catch |err| switch (err) {
-        error.UnsupportedKernelArm => try be.opMatmul(dst, 0, ws.patch, 0, out_len, w32, false, c.out_ch, c.plen(), 1.0, c.bias),
-        else => return err,
-    };
-    return out_len;
+/// `dst[out_len][out_ch] = conv(src[in_len][in_ch])`; `dst` may alias `src` (the
+/// patch holds the whole input, one band).
+fn convAt(be: *Backend, ws: *Workspace, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
+    const plan: lin_cuda.Plan = if (f16_gemm) lin_cuda.Plan.tower else f32_plan;
+    return conv_cuda.conv1d(be, plan, ws.patch, ws.shapes.patch, dst, src, c, in_len);
 }
 
-/// The anti-aliased activation, in place: `x[len][ch]` -> `x[len][ch]`.
-fn aaSnake(be: *Backend, ws: *Workspace, x: Buf, act: DevAct, len: usize) !void {
-    std.debug.assert(act.channels * len <= ws.shapes.aa);
-    const up = try devBuf(be, act.up_filter);
-    const down = try devBuf(be, act.down_filter);
-    const snake = try devBuf(be, act.snake);
-    try be.opAaUpSnake(x, ws.aa, up, snake, len, act.channels, act.k, act.upPad(), act.upSlice());
-    try be.opAaDown(ws.aa, x, down, len, 2 * len, act.channels, act.k, act.downPad());
-}
+/// Every conv at its stored f32 (see `f16_gemm`).
+const f32_plan: lin_cuda.Plan = blk: {
+    var p = lin_cuda.Plan.tower;
+    p.dense = .native;
+    break :blk p;
+};
 
-/// One `AMPBlock1` over `src`, which is NOT modified. Returns the buffer holding
-/// the result (one of the ping-pong pair).
-fn ampBlock(be: *Backend, ws: *Workspace, src: Buf, blk: *const Session.DevBlock, ch: usize, len: usize) !Buf {
-    var cur = src;
-    var dst = ws.blk0;
-    var other = ws.blk1;
-    for (blk.convs1, blk.convs2, 0..) |c1, c2, i| {
-        // activations[::2] pairs with convs1 and [1::2] with convs2: six
-        // distinct activations per block, not three reused.
-        try be.opAaUpSnake(cur, ws.aa, try devBuf(be, blk.acts[2 * i].up_filter), try devBuf(be, blk.acts[2 * i].snake), len, ch, blk.acts[2 * i].k, blk.acts[2 * i].upPad(), blk.acts[2 * i].upSlice());
-        try be.opAaDown(ws.aa, dst, try devBuf(be, blk.acts[2 * i].down_filter), len, 2 * len, ch, blk.acts[2 * i].k, blk.acts[2 * i].downPad());
-        _ = try conv(be, ws, dst, dst, c1, len);
-        try aaSnake(be, ws, dst, blk.acts[2 * i + 1], len);
-        _ = try conv(be, ws, dst, dst, c2, len);
-        try be.opAdd(dst, cur, ch * len);
-        cur = dst;
-        // Ping-pong, so the next iteration's residual source stays intact.
-        const t = dst;
-        dst = other;
-        other = t;
-    }
-    return cur;
-}
-
-/// Decode normalized stereo latents `[32][2][t]` (planar, the sampler's layout)
-/// to interleaved samples in [-1, 1], `[len][2]`.
-///
-/// Same signature as `minimax_h3_audio.decode` so the two are drop-in
-/// alternatives, and `minimax-h3-audio-cuda-test` compares them directly.
+/// Same signature as `minimax_h3_audio.decode` so the two are drop-in alternatives,
+/// and `minimax-h3-audio-cuda-test` compares them directly.
 pub fn decode(
     dec: *const AudioDecoder,
     sess: *const Session,
@@ -187,76 +145,62 @@ pub fn decode(
     t: usize,
     cancel: ?*std.atomic.Value(bool),
 ) !void {
-    const c_lat = dec.dec_in.in_ch;
-    const samples = ws.shapes.samples;
-    std.debug.assert(z.len == c_lat * audio.stereo * t);
-    std.debug.assert(out.len == samples * audio.stereo);
-    std.debug.assert(samples == t * dec.upsampleFactor());
-
-    // Channel-last from here on, so the denormalize doubles as the transpose.
-    const lat = try gpa.alloc(f32, t * c_lat);
-    defer gpa.free(lat);
-    const tail = try gpa.alloc(f32, samples);
-    defer gpa.free(tail);
-
-    for (0..audio.stereo) |s| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-
-        for (0..t) |i| {
-            for (0..c_lat) |c| {
-                lat[i * c_lat + c] = z[(c * audio.stereo + s) * t + i] * dec.latents_std[c] + dec.latents_mean[c];
-            }
-        }
-
-        try be.beginBatch();
-        errdefer if (be.batching()) be.abortBatch();
-        try be.tensorUpload(ws.blk0, std.mem.sliceAsBytes(lat));
-        _ = try conv(be, ws, ws.blk1, ws.blk0, sess.dec_in, t);
-        _ = try conv(be, ws, ws.acc, ws.blk1, sess.conv_pre, t);
-
-        var len = t;
-        for (sess.ups, 0..) |u, i| {
-            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-            const up_len = (len - 1) * u.stride + u.k - 2 * u.padding;
-            try be.opConvT1dCa(
-                ws.acc,
-                ws.up,
-                try devBuf(be, u.w),
-                try devBuf(be, u.bias),
-                up_len,
-                u.out_ch,
-                u.in_ch,
-                len,
-                u.k,
-                u.stride,
-                u.padding,
-            );
-            len = up_len;
-
-            // The stage's resblocks are SUMMED and averaged, not chained, so each
-            // reads the SAME `up` and the sum lands in `acc`.
-            for (0..dec.n_kernels) |j| {
-                const r = try ampBlock(be, ws, ws.up, &sess.blocks[i * dec.n_kernels + j], u.out_ch, len);
-                if (j == 0) {
-                    try be.opCopyOff(ws.acc, 0, r, 0, u.out_ch * len, false);
-                } else {
-                    try be.opAdd(ws.acc, r, u.out_ch * len);
-                }
-            }
-            try be.opScale(ws.acc, 1.0 / @as(f32, @floatFromInt(dec.n_kernels)), u.out_ch * len);
-        }
-
-        try aaSnake(be, ws, ws.acc, sess.act_post, len);
-        const post_len = try conv(be, ws, ws.blk0, ws.acc, sess.conv_post, len);
-        std.debug.assert(sess.conv_post.out_ch == 1 and post_len == samples);
-        try be.endBatch();
-
-        try be.tensorDownload(ws.blk0, std.mem.sliceAsBytes(tail));
-        // Clamped to [-1, 1], no tanh and no final bias. The interleave happens
-        // only here, because that is what a container wants.
-        for (0..samples) |i| out[i * audio.stereo + s] = std.math.clamp(tail[i], -1.0, 1.0);
-    }
+    try minimax_h3_audio_dev.decode(Dev{ .be = be, .ws = ws }, dec, sess, gpa, out, z, t, cancel);
 }
+
+/// The `minimax_h3_audio_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    ws: *Workspace,
+
+    pub fn beginBatch(d: Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn upload(d: Dev, b: Buf, data: []const f32) !void {
+        try d.be.tensorUpload(b, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: Dev, b: Buf, data: []f32) !void {
+        try d.be.tensorDownload(b, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn conv(d: Dev, dst: Buf, src: Buf, c: DevConv, in_len: usize) !usize {
+        return convAt(d.be, d.ws, dst, src, c, in_len);
+    }
+
+    pub fn convT(d: Dev, dst: Buf, src: Buf, u: DevConvT, len: usize, up_len: usize) !void {
+        try d.be.opConvT1dCa(src, dst, try devBuf(d.be, u.w), try devBuf(d.be, u.bias), up_len, u.out_ch, u.in_ch, len, u.k, u.stride, u.padding);
+    }
+
+    pub fn aaUp(d: Dev, src: Buf, act: DevAct, len: usize) !void {
+        try d.be.opAaUpSnake(src, d.ws.aa, try devBuf(d.be, act.up_filter), try devBuf(d.be, act.snake), len, act.channels, act.k, act.upPad(), act.upSlice());
+    }
+
+    pub fn aaDown(d: Dev, dst: Buf, act: DevAct, len: usize) !void {
+        try d.be.opAaDown(d.ws.aa, dst, try devBuf(d.be, act.down_filter), len, 2 * len, act.channels, act.k, act.downPad());
+    }
+
+    pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn copy(d: Dev, dst: Buf, src: Buf, n: usize) !void {
+        try d.be.opCopyOff(dst, 0, src, 0, n);
+    }
+
+    pub fn scale(d: Dev, x: Buf, f: f32, n: usize) !void {
+        try d.be.opScale(x, f, n);
+    }
+};
 
 // --- tests ----------------------------------------------------------------
 
@@ -342,19 +286,19 @@ test "the conv weight permutation matches the im2col column order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const d = try devConv(arena.allocator(), c);
-    const got = std.mem.bytesAsSlice(u16, d.w16);
+    const got = std.mem.bytesAsSlice(f32, d.w.bytes);
     try testing.expectEqual(@as(usize, out_ch * in_ch * k), got.len);
     // Row 0 source is [ic0k0, ic0k1, ic1k0, ic1k1, ic2k0, ic2k1] = 0..5;
     // permuted it is [ic0k0, ic1k0, ic2k0, ic0k1, ic1k1, ic2k1] = 0, 2, 4, 1, 3, 5.
     const want0 = [_]f32{ 0, 2, 4, 1, 3, 5 };
     for (want0, 0..) |v, i| {
-        try testing.expectEqual(v, @as(f32, @floatCast(@as(f16, @bitCast(got[i])))));
+        try testing.expectEqual(v, got[i]);
     }
     // ...and row 1 is the same pattern offset by the row stride, not a repeat of
     // row 0 (which is what a permutation that dropped `oc` would give).
-    try testing.expectEqual(@as(f32, 6), @as(f32, @floatCast(@as(f16, @bitCast(got[6])))));
-    try testing.expectEqual(@as(f32, 8), @as(f32, @floatCast(@as(f16, @bitCast(got[7])))));
-    try testing.expectEqual(@as(usize, k * in_ch), d.plen());
+    try testing.expectEqual(@as(f32, 6), got[6]);
+    try testing.expectEqual(@as(f32, 8), got[7]);
+    try testing.expectEqual(@as(usize, k * in_ch), d.w.cols);
 }
 
 test "the transposed conv weight permutation is in-major to tap-major" {

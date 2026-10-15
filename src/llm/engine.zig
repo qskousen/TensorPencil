@@ -2,6 +2,7 @@
 //! cache, then seq-1 decode steps.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const qwen3 = @import("../models/qwen3.zig");
 const test_gate = @import("../test_gate.zig");
 const tokenizer_mod = @import("tp_core").tokenizer;
@@ -912,7 +913,7 @@ test "multi-turn generation continues the cache" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -953,7 +954,7 @@ test "Progress publishes what Timing finally reports" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -1014,7 +1015,7 @@ test "generation with a growing cache matches fixed capacity" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -1052,7 +1053,7 @@ test "greedy generation produces valid tokens" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const safetensors = @import("tp_core").safetensors;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const te_path = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);

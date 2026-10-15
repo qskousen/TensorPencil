@@ -91,6 +91,7 @@ pub fn failureText(err: anyerror) []const u8 {
         error.CudnnError,
         => "out of VRAM",
         error.GpuDecodeNonFinite => "the GPU decode produced invalid pixels",
+        error.NonFiniteActivation => "a model component produced invalid values at the chosen precision",
         error.FileNotFound => "a model file is missing",
         error.UnknownArchitecture => "the checkpoint's architecture is not recognized",
         error.UnsupportedCheckpoint => "this checkpoint cannot run on the selected backend",
@@ -126,6 +127,11 @@ pub const ModelConfig = struct {
     text_encoder_2_path: []const u8,
     backend: pipeline.Backend,
     vae_decode: pipeline.VaeDecode,
+    /// The precision dials, null for `auto`. Per render, like the LoRA strengths:
+    /// the session takes them each image and reloads nothing.
+    te_act: ?pipeline.Act = null,
+    dit_act: ?pipeline.Act = null,
+    vae_act: ?pipeline.Act = null,
     /// LoRA sidecars, in order. NEITHER the list nor the strengths reload the
     /// model: a sidecar is attached beside the resident weights and never merged
     /// into them, so `Session.setLoras` swaps the whole stack for the cost of the
@@ -216,6 +222,9 @@ pub const ModelConfig = struct {
         opts.explicit_vae = self.vae_path.len > 0;
         opts.backend = self.backend;
         opts.vae_decode = self.vae_decode;
+        opts.te_act = self.te_act;
+        opts.dit_act = self.dit_act;
+        opts.vae_act = self.vae_act;
     }
 };
 
@@ -278,6 +287,20 @@ pub const ImageMeta = struct {
     weight_dtype: []const u8 = "",
     shift: f32 = 0,
     loras: []wire.LoraInfo = &.{},
+    /// `precision.Acts` as text, known only once the render is done (a fallback can
+    /// move it). Written while the host thread may be reading this struct, so the
+    /// bytes go in first and the length is published after them.
+    act_buf: [64]u8 = undefined,
+    act_len: std.atomic.Value(u8) = .init(0),
+
+    pub fn actDtype(self: *const ImageMeta) []const u8 {
+        return self.act_buf[0..self.act_len.load(.acquire)];
+    }
+
+    fn setActs(self: *ImageMeta, a: pipeline.precision.Acts) void {
+        const text = std.fmt.bufPrint(&self.act_buf, "{f}", .{a}) catch return;
+        self.act_len.store(@intCast(text.len), .release);
+    }
 
     fn deinit(self: *ImageMeta, gpa: std.mem.Allocator) void {
         for (self.loras) |l| gpa.free(l.name);
@@ -979,12 +1002,15 @@ pub const Diffuser = struct {
         self.hashes.notify_ctx = self;
         self.hashes.cancel = &gi.cancel;
         gi.meta.deinit(self.gpa);
+        const used = pipeline.usedPath;
+        // A VAE baked into the checkpoint gets no field, as in A1111.
+        const vae_path = if (sess.sources.get(.decoder) == .side) m.vae_path else "";
         gi.meta = .{
-            .clip1 = modelStem(m.text_encoder_path),
-            .clip2 = modelStem(m.text_encoder_2_path),
-            .vae = modelStem(m.vae_path),
+            .clip1 = modelStem(used(sess.sources, .conditioner, m.dit_path, m.text_encoder_path)),
+            .clip2 = modelStem(used(sess.sources, .conditioner2, m.dit_path, m.text_encoder_2_path)),
+            .vae = modelStem(vae_path),
             .model_hash = self.hashes.autoV2(self.gpa, self.io, m.dit_path),
-            .vae_hash = self.hashes.autoV2(self.gpa, self.io, m.vae_path),
+            .vae_hash = self.hashes.autoV2(self.gpa, self.io, vae_path),
             .weight_dtype = sess.weightDtype(),
             .shift = shift,
         };
@@ -1793,6 +1819,8 @@ pub const Diffuser = struct {
         self.fillMeta(gi, sess.?, sess.?.resolvedShift(opts));
         var suspend_snap: ?pipeline.Snapshot = null;
         opts.suspend_out = &suspend_snap;
+        var fell_back: [3]?pipeline.Act = undefined;
+        for (&fell_back, std.enums.values(pipeline.precision.Component)) |*f, c| f.* = sess.?.dials.get(c).fallback;
         var img = sess.?.generate(opts, progress) catch |err| {
             if (err == error.Paused) {
                 if (gi.resume_snapshot) |*old| old.deinit(self.gpa); // replace any prior
@@ -1806,6 +1834,7 @@ pub const Diffuser = struct {
                 gi.status.store(@intFromEnum(GenStatus.canceled), .release);
             } else {
                 std.log.err("image generation failed: {t}", .{err});
+                if (err == error.NonFiniteActivation) if (sess.?.last_failure) |f| self.putNotice("{f}; the render failed (its precision setting allows no wider dtype)", .{f});
                 self.failImage(gi, err);
             }
             self.busy.store(false, .release);
@@ -1813,6 +1842,12 @@ pub const Diffuser = struct {
             return;
         };
         defer img.deinit(self.gpa);
+        if (img.acts) |a| gi.meta.setActs(a);
+        // Said once: the fallback is kept for the session, so later images start there.
+        for (fell_back, std.enums.values(pipeline.precision.Component)) |before, c| {
+            const now = sess.?.dials.get(c).fallback;
+            if (now != null and !std.meta.eql(before, now)) self.putNotice("the {s} switched to {t} after a non-finite output; kept for this session", .{ c.label(), now.? });
+        }
         // Completed (resume, if any, is consumed): drop the saved latent.
         if (gi.resume_snapshot) |*s| {
             s.deinit(self.gpa);

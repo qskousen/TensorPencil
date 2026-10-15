@@ -30,12 +30,16 @@
 //! multiple of 128.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const zimage = @import("zimage.zig");
+const zimage_dev = @import("zimage_dev.zig");
 const lin = @import("lin.zig");
+const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
 const DiT = zimage.DiT;
+const File = @This();
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
@@ -49,10 +53,6 @@ const s_bytes_cap: usize = 2 << 30;
 /// pipeline exists. For A/B and for reproducing a mismatch; the device test runs both.
 pub var force_attn_full: bool = false;
 
-/// Exact power-of-two prescale on V across attention's f16 cast. See the call site in
-/// `blockForward`; `zimage_cuda.v_div` is the CUDA twin and must stay the same value, or
-/// the two arms compute different arithmetic on the same checkpoint.
-const v_div: f32 = 1.0 / 64.0;
 
 /// How many heads share one scores plane, given the plane size and a byte budget.
 fn headsPerBatch(cfg: zimage.Config, rows_pad: usize, cap: usize, ws_s_bytes: ?usize) usize {
@@ -105,6 +105,9 @@ pub const Session = struct {
     /// `[sigmas.len][dim]`.
     finals: []f32,
     mod_stride: usize,
+    /// Every block linear's dispatch, and what it decided for this checkpoint.
+    lin: lin_gpu.Lin,
+    lin_plan: lin_gpu.Plan,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -125,8 +128,17 @@ pub const Session = struct {
         const img_padded = cfg.padded(n_img);
         const seq = cap_padded + img_padded;
         const half = cfg.head_dim / 2;
+        var l = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.maxRows(model.device_lins), 0, 0);
+        errdefer l.deinit();
+        var lp = try lin_gpu.plan(ctx, model.device_lins, lin_use, "zimage_gpu");
+        if (model.lora) |st| {
+            lp.lora = st;
+            try l.presizeLora(st, model.device_lins, std.mem.alignForward(usize, seq, 128));
+        }
 
         var self: Session = .{
+            .lin = l,
+            .lin_plan = lp,
             .cfg = cfg,
             .lat_h = lat_h,
             .lat_w = lat_w,
@@ -208,6 +220,7 @@ pub const Session = struct {
         gpa.free(self.sigmas);
         gpa.free(self.mods);
         gpa.free(self.finals);
+        self.lin.deinit();
         self.* = undefined;
     }
 
@@ -257,7 +270,7 @@ pub const Workspace = struct {
 
     const fields = [_][]const u8{ "x_d", "img_d", "nrm_d", "dlt_d", "q_d", "k_d", "v_d", "attn_d", "mg_d", "mu_d", "mv_d", "imgin_d", "qt_d", "kt_d", "v16_d", "s_d", "part_d", "md_d" };
 
-    pub fn init(ctx: *gpu.Context, model: *const DiT, lat_h: usize, lat_w: usize, cap_padded_cap: usize) !Workspace {
+    pub fn init(ctx: *gpu.Context, model: *const DiT, lat_h: usize, lat_w: usize, cap_padded_cap: usize, act: gpu.Dt) !Workspace {
         const cfg = model.cfg;
         const n_img = (lat_h / cfg.patch) * (lat_w / cfg.patch);
         const img_padded = cfg.padded(n_img);
@@ -265,19 +278,21 @@ pub const Workspace = struct {
         const seq_pad = std.mem.alignForward(usize, seq, 128);
         const tc = useTensorCoreAttn(ctx);
         const hpb = if (tc) headsPerBatch(cfg, seq_pad, scoresCap(ctx.budget_override), null) else 1;
+        const ew = act.bytes();
         const sizes = [fields.len]usize{
-            seq * cfg.dim * 4,
-            img_padded * cfg.dim * 4,
-            seq * cfg.dim * 4,
-            seq * cfg.dim * 4,
+            seq * cfg.dim * ew,
+            img_padded * cfg.dim * ew,
+            seq * cfg.dim * ew,
+            // A GEMM output, and the int8 and fp8 GEMMs store whole 128-row tiles.
+            seq_pad * cfg.dim * ew,
             // q/k/v are 128-row PADDED: the f16 conversion writes whole padded
             // rows, and `opAttnOut` writes `rows_pad` of them back into `attn_d`.
             seq_pad * cfg.qDim() * 4,
             seq_pad * cfg.kvDim() * 4,
             seq_pad * cfg.kvDim() * 4,
             seq_pad * cfg.qDim() * 4,
-            seq * cfg.mlp_dim * 4,
-            seq * cfg.mlp_dim * 4,
+            seq_pad * cfg.mlp_dim * ew,
+            seq_pad * cfg.mlp_dim * ew,
             (model.modulatedBlocks() * 4 * cfg.dim + cfg.dim) * 4,
             n_img * cfg.patchDim() * 4,
             if (tc) seq_pad * cfg.qDim() * 2 else 16,
@@ -296,6 +311,8 @@ pub const Workspace = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             made += 1;
         }
+        // The attention block stays f32 (`zimage_cuda.Workspace.act` says why).
+        inline for (.{ "x_d", "img_d", "nrm_d", "dlt_d", "mg_d", "mu_d" }) |name| @field(self, name).dt = act;
         return self;
     }
 
@@ -305,22 +322,14 @@ pub const Workspace = struct {
     }
 };
 
-/// Whether this context can run Z-Image's block GEMMs at all. The trunk weights are
-/// dense bf16 in every checkpoint seen so far, which needs one of the two f16-weight
-/// tensor-core pipelines; a device without either has no path and must stay on the
-/// CPU rather than silently producing something.
+/// What Z-Image's linears run under: its activations pass f16's range, so every route
+/// that narrows one stages it in bf16 or not at all.
+const lin_use: lin_gpu.Use = .{ .blockq = .auto, .act16 = .bf16 };
+
+/// Whether this context can run every block linear this checkpoint has.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    // Every device linear checked against what THIS device has: a bf16 weight needs one
-    // of the f16-weight coop pipelines and an NVFP4 one needs the decode entry.
-    const has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
-    const caps: lin.Caps = .{ .f32 = true, .fp8 = true, .bf16 = has_f16w, .f16 = has_f16w, .nvfp4 = ctx.hasNvfp4Decode() };
-    if (lin.unsupported(model.device_lins, caps)) |bad| {
-        std.log.warn("zimage_gpu: {s} is {t}, which this device has no GEMM for — the trunk " ++
-            "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
-        return false;
-    }
-    return true;
+    return lin_gpu.runs(ctx, model.device_lins, lin_use, model.lora, "zimage_gpu");
 }
 
 /// One denoiser forward. `out`/`x_lat` are planar `[channels][lat_h][lat_w]`.
@@ -338,13 +347,6 @@ pub fn forward(
 ) !void {
     const cfg = model.cfg;
     const dim = cfg.dim;
-    const seq = sess.seq;
-    const half = cfg.head_dim / 2;
-    const sin_off: u32 = @intCast(seq * half);
-    const img_sin_off: u32 = @intCast(sess.img_padded * half);
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-    const zero_off: u32 = @intCast(model.zeroShiftOffset());
-
     std.debug.assert(x_lat.len == cfg.channels * sess.lat_h * sess.lat_w);
     std.debug.assert(out.len == x_lat.len);
 
@@ -360,179 +362,145 @@ pub fn forward(
         owned_final = try model.finalScale(io, gpa, adaln);
         break :blk StepMod{ .mods = owned_mods.?, .final = owned_final.? };
     };
-
     const patches = try zimage.patchify(gpa, cfg, x_lat, sess.lat_h, sess.lat_w);
     defer gpa.free(patches);
-
     try ctx.tensorUpload(ws.mv_d, std.mem.sliceAsBytes(step.mods));
     try ctx.tensorUpload(ws.imgin_d, std.mem.sliceAsBytes(patches));
-
-    // Pre-size the NVFP4 decode scratch to the model's widest linear BEFORE the batch
-    // opens; growing it mid-forward flushes the recording batch.
-    {
-        const need = lin.maxScratch(model.device_lins, .nvfp4, gpu.Context.nvfp4ScratchBytes);
-        if (need > 0) try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, need);
-    }
+    try lin_gpu.presize(ctx, sess.lin_plan, model.device_lins);
 
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
-
-    // --- the image half: x_embedder, pad, then the noise_refiner stack ---------
-    //
-    // `x_embedder` is the one weight the loader materializes to f32 (it feeds the
-    // fused `opMatmul`, which has no bf16 pipeline), so it takes the f32 arm.
-    try ctx.opMatmul(ws.img_d, 0, ws.imgin_d, 0, sess.n_img, model.x_embedder.w.bytes, model.x_embedder.w.dtype == .f8_e4m3, dim, cfg.patchDim(), model.x_embedder.w.scale, model.x_embedder.b);
-    // The learned pad token, broadcast into the tail rows.
-    for (sess.n_img..sess.img_padded) |r| {
-        try ctx.opElt(.copy, sess.x_pad_d, ws.img_d, null, null, .{
-            .u0 = @intCast(dim),
-            .u2 = @intCast(r * dim),
-            .u3 = 0,
-        }, dim, 1, 1);
-    }
-    for (model.noise_refiner, 0..) |*blk, i| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        try blockForward(ctx, cfg, blk, ws, ws.img_d, sess.img_padded, sess.img_freqs_d, img_sin_off, @intCast(i * 4 * dim), zero_off, attn_scale);
-    }
-
-    // --- the joint sequence ----------------------------------------------------
-    try ctx.opElt(.copy, sess.cap_d, ws.x_d, null, null, .{
-        .u0 = @intCast(sess.cap_padded * dim),
-        .u2 = 0,
-        .u3 = 0,
-    }, sess.cap_padded * dim, 1, 1);
-    try ctx.opElt(.copy, ws.img_d, ws.x_d, null, null, .{
-        .u0 = @intCast(sess.img_padded * dim),
-        .u2 = @intCast(sess.cap_padded * dim),
-        .u3 = 0,
-    }, sess.img_padded * dim, 1, 1);
-
-    for (model.layers, 0..) |*blk, i| {
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        const base: u32 = @intCast((model.noise_refiner.len + i) * 4 * dim);
-        try blockForward(ctx, cfg, blk, ws, ws.x_d, seq, sess.freqs_d, sin_off, base, zero_off, attn_scale);
-    }
+    const d: Dev = .{
+        .model = model,
+        .ctx = ctx,
+        .sess = sess,
+        .ws = ws,
+        .geom = .{ .n_img = sess.n_img, .img_padded = sess.img_padded, .seq = sess.seq },
+        .zero_off = @intCast(model.zeroShiftOffset()),
+    };
+    try zimage_dev.body(d, model, cancel);
     try ctx.endBatch();
+    // A 16-bit stream that overflowed can leave the output finite (`allFinite`).
+    if (ws.x_d.dt != .f32 and !try ctx.allFinite(ws.x_d, sess.seq * dim)) return error.NonFiniteActivation;
 
-    // --- the final layer, on the host ------------------------------------------
-    // Row-wise, so running it on the image rows alone is exactly equal to running it
-    // on the whole sequence and slicing, which is what the reference does.
     const img_rows = try gpa.alloc(f32, sess.n_img * dim);
     defer gpa.free(img_rows);
-    try ctx.tensorDownloadAt(ws.x_d, sess.cap_padded * dim * 4, std.mem.sliceAsBytes(img_rows));
-
-    ops.norm.layerNormUnit(img_rows, img_rows, dim, cfg.final_eps);
-    var row: usize = 0;
-    while (row < img_rows.len) : (row += dim) {
-        for (img_rows[row..][0..dim], step.final) |*v, sc| v.* = (1.0 + sc) * v.*;
-    }
+    try ctx.downloadF32At(ws.x_d, sess.cap_padded * dim, img_rows);
     const final = try gpa.alloc(f32, sess.n_img * cfg.patchDim());
     defer gpa.free(final);
-    try ops.matmul.matmul(io, gpa, final, img_rows, sess.n_img, model.final_linear.w, model.final_linear.b);
+    try model.finalLayer(io, gpa, final, img_rows, step.final, sess.n_img);
     zimage.unpatchify(cfg, out, final, sess.lat_h, sess.lat_w);
 }
 
-/// One `JointTransformerBlock` on the device. `x` is `[rows][dim]`, modified in
-/// place; `mod_base` is this block's offset into the uploaded modulation table.
-fn blockForward(
+/// `zimage_dev`'s ops on this backend.
+const Dev = struct {
+    model: *const DiT,
     ctx: *gpu.Context,
-    cfg: zimage.Config,
-    blk: anytype,
+    sess: *Session,
     ws: *Workspace,
-    x: Buf,
-    rows: usize,
-    freqs: Buf,
-    sin_off: u32,
-    mod_base: u32,
+    geom: struct { n_img: usize, img_padded: usize, seq: usize },
+    /// The modulation table's trailing ZERO block: Z-Image's modulation has no shift,
+    /// and this is how the shared `modulate` kernel expresses that.
     zero_off: u32,
-    attn_scale: f32,
-) !void {
-    const dim = cfg.dim;
-    const heads = cfg.n_heads;
-    const kv_heads = cfg.n_kv_heads;
-    const hd = cfg.head_dim;
-    const half = hd / 2;
-    const total: u32 = @intCast(rows * dim);
 
-    // --- attention: x += tanh(gate_msa) * norm2(attn(modulate(norm1(x), scale_msa)))
-    try rmsNorm(ctx, x, ws.nrm_d, blk.attn_norm1, rows, dim, cfg.norm_eps);
-    // `u3` points at the table's trailing ZERO block: Z-Image's modulation has no
-    // shift, and this is how the shared `modulate` kernel expresses that.
-    try ctx.opElt(.modulate, ws.nrm_d, null, ws.mv_d, null, .{
-        .u0 = total,
-        .u1 = @intCast(dim),
-        .u2 = mod_base,
-        .u3 = zero_off,
-    }, rows * dim, 1, 1);
+    /// `x_embedder` (the one weight the loader materializes to f32, so it takes the f32
+    /// arm), then the learned pad token broadcast into the tail rows.
+    pub fn embed(d: Dev) !void {
+        const dim = d.model.cfg.dim;
+        try d.sess.lin.linearAt(d.sess.lin_plan, d.ws.img_d, 0, d.ws.imgin_d, 0, d.sess.n_img, d.model.x_embedder.w, d.model.x_embedder.b);
+        for (d.sess.n_img..d.sess.img_padded) |r| {
+            try d.ctx.opElt(gpu.eltCopy(.f32, d.ws.img_d.dt), d.sess.x_pad_d, d.ws.img_d, null, null, .{ .u0 = @intCast(dim), .u2 = @intCast(r * dim), .u3 = 0 }, dim, 1, 1);
+        }
+    }
 
-    // The fused qkv as three zero-copy row views, see the module header.
-    const wq = blk.attn.q;
-    const wk = blk.attn.k;
-    const wv = blk.attn.v;
-    try gemm(ctx, ws.q_d, ws.nrm_d, rows, wq);
-    try gemm(ctx, ws.k_d, ws.nrm_d, rows, wk);
-    try gemm(ctx, ws.v_d, ws.nrm_d, rows, wv);
+    pub fn blockBegin(_: Dev, _: zimage_dev.Stage, _: usize) !void {}
 
-    // The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5, see
-    // `zimage.Config.qk_eps`. Same kernel, different push constant.
-    ctx.independent(2);
-    try rmsNorm(ctx, ws.q_d, ws.q_d, blk.attn.qnorm, rows * heads, hd, cfg.qk_eps);
-    try rmsNorm(ctx, ws.k_d, ws.k_d, blk.attn.knorm, rows * kv_heads, hd, cfg.qk_eps);
-    ctx.independent(2);
-    try ctx.opElt(.rope_inter, ws.q_d, null, freqs, null, .{
-        .u0 = @intCast(rows * heads * half),
-        .u1 = @intCast(half),
-        .u2 = sin_off,
-        .u3 = @intCast(heads),
-    }, rows * heads * half, 1, 1);
-    try ctx.opElt(.rope_inter, ws.k_d, null, freqs, null, .{
-        .u0 = @intCast(rows * kv_heads * half),
-        .u1 = @intCast(half),
-        .u2 = sin_off,
-        .u3 = @intCast(kv_heads),
-    }, rows * kv_heads * half, 1, 1);
+    /// The caption rows, then the image rows, into the joint sequence.
+    pub fn join(d: Dev) !void {
+        const dim = d.model.cfg.dim;
+        const cap = d.sess.cap_padded * dim;
+        const img = d.sess.img_padded * dim;
+        try d.ctx.opElt(gpu.eltCopy(.f32, d.ws.x_d.dt), d.sess.cap_d, d.ws.x_d, null, null, .{ .u0 = @intCast(cap), .u2 = 0, .u3 = 0 }, cap, 1, 1);
+        try d.ctx.opElt(gpu.eltCopy(d.ws.img_d.dt, d.ws.x_d.dt), d.ws.img_d, d.ws.x_d, null, null, .{ .u0 = @intCast(img), .u2 = @intCast(cap), .u3 = 0 }, img, 1, 1);
+    }
 
-    // Exact power-of-two prescale on V across attention's f16 cast, the CUDA arm's
-    // `zimage_cuda.v_div` and the same reason: Q and K are RMS-normed on the way in, V is
-    // not, and this trunk's V reaches ~98000 by the deep blocks, past f16's 65504. It
-    // becomes inf, `softmax @ V` becomes NaN, and the render is solid white with no error.
-    // Attention is linear in V, so this is the same arithmetic; a power of two shifts the
-    // exponent and costs no mantissa.
-    try ctx.opElt(.scale_f32, ws.v_d, ws.v_d, null, null, .{ .u0 = @intCast(rows * cfg.kvDim()), .f0 = v_div }, rows * cfg.kvDim(), 1, 1);
-    try attention(ctx, cfg, ws, rows, attn_scale);
-    try ctx.opElt(.scale_f32, ws.attn_d, ws.attn_d, null, null, .{ .u0 = @intCast(rows * cfg.qDim()), .f0 = 1.0 / v_div }, rows * cfg.qDim(), 1, 1);
-    try gemm(ctx, ws.dlt_d, ws.attn_d, rows, blk.attn.out);
-    // The sandwich norm: a SECOND RMSNorm, on the sublayer's output, inside the
-    // residual. krea2 has no equivalent.
-    try rmsNorm(ctx, ws.dlt_d, ws.dlt_d, blk.attn_norm2, rows, dim, cfg.norm_eps);
-    // The gate was `tanh`'d on the host, inside the table.
-    try ctx.opElt(.gated_add, x, ws.dlt_d, ws.mv_d, null, .{
-        .u0 = total,
-        .u1 = @intCast(dim),
-        .u2 = mod_base + @as(u32, @intCast(dim)),
-    }, rows * dim, 1, 1);
+    pub fn trace(_: Dev, _: []const u8, _: usize, _: Buf, _: usize) void {}
 
-    // --- feed-forward ----------------------------------------------------------
-    try rmsNorm(ctx, x, ws.nrm_d, blk.ffn_norm1, rows, dim, cfg.norm_eps);
-    try ctx.opElt(.modulate, ws.nrm_d, null, ws.mv_d, null, .{
-        .u0 = total,
-        .u1 = @intCast(dim),
-        .u2 = mod_base + 2 * @as(u32, @intCast(dim)),
-        .u3 = zero_off,
-    }, rows * dim, 1, 1);
-    try gemm(ctx, ws.mg_d, ws.nrm_d, rows, blk.ffn.w1);
-    try gemm(ctx, ws.mu_d, ws.nrm_d, rows, blk.ffn.w3);
-    try ctx.opElt(.silu_mul, ws.mg_d, ws.mu_d, null, null, .{
-        .u0 = @intCast(rows * cfg.mlp_dim),
-    }, rows * cfg.mlp_dim, 1, 1);
-    try gemm(ctx, ws.dlt_d, ws.mg_d, rows, blk.ffn.w2);
-    try rmsNorm(ctx, ws.dlt_d, ws.dlt_d, blk.ffn_norm2, rows, dim, cfg.norm_eps);
-    try ctx.opElt(.gated_add, x, ws.dlt_d, ws.mv_d, null, .{
-        .u0 = total,
-        .u1 = @intCast(dim),
-        .u2 = mod_base + 3 * @as(u32, @intCast(dim)),
-    }, rows * dim, 1, 1);
-}
+    /// The norm, then the modulation's scale (`1 + scale`, with no shift).
+    pub fn modNorm(d: Dev, x: Buf, nrm: Buf, rows: usize, off: usize, norm_w: []const f32) !void {
+        const cfg = d.model.cfg;
+        try rmsNorm(d.ctx, x, nrm, norm_w, rows, cfg.dim, cfg.norm_eps);
+        try d.ctx.opElt(gpu.eltAt("modulate", nrm.dt), nrm, null, d.ws.mv_d, null, .{
+            .u0 = @intCast(rows * cfg.dim),
+            .u1 = @intCast(cfg.dim),
+            .u2 = @intCast(off),
+            .u3 = d.zero_off,
+        }, rows * cfg.dim, 1, 1);
+    }
+
+    pub fn prep(d: Dev, x: Buf, m: usize, cols: usize, group: []const Weight) !lin_gpu.Group {
+        return d.sess.lin.prep(d.sess.lin_plan, x, m, cols, group);
+    }
+
+    pub fn gemms(d: Dev, g: lin_gpu.Group, ys: []const Buf, group: []const Weight) !void {
+        for (ys, group) |y, w| try d.sess.lin.gemm(d.sess.lin_plan, g, y, w, .{});
+    }
+
+    pub fn linear(d: Dev, y: Buf, x: Buf, m: usize, w: Weight) !void {
+        try d.sess.lin.linear(d.sess.lin_plan, y, 0, x, m, w);
+    }
+
+    pub fn qkNormRope(d: Dev, qnorm: []const f32, knorm: []const f32, rows: usize, stage: zimage_dev.Stage) !void {
+        const cfg = d.model.cfg;
+        const ctx = d.ctx;
+        const ws = d.ws;
+        const half = cfg.head_dim / 2;
+        const freqs = if (stage == .image) d.sess.img_freqs_d else d.sess.freqs_d;
+        const sin_off: u32 = @intCast((if (stage == .image) d.sess.img_padded else d.sess.seq) * half);
+        ctx.independent(2);
+        try rmsNorm(ctx, ws.q_d, ws.q_d, qnorm, rows * cfg.n_heads, cfg.head_dim, cfg.qk_eps);
+        try rmsNorm(ctx, ws.k_d, ws.k_d, knorm, rows * cfg.n_kv_heads, cfg.head_dim, cfg.qk_eps);
+        ctx.independent(2);
+        try ctx.opElt(.rope_inter, ws.q_d, null, freqs, null, .{
+            .u0 = @intCast(rows * cfg.n_heads * half),
+            .u1 = @intCast(half),
+            .u2 = sin_off,
+            .u3 = @intCast(cfg.n_heads),
+        }, rows * cfg.n_heads * half, 1, 1);
+        try ctx.opElt(.rope_inter, ws.k_d, null, freqs, null, .{
+            .u0 = @intCast(rows * cfg.n_kv_heads * half),
+            .u1 = @intCast(half),
+            .u2 = sin_off,
+            .u3 = @intCast(cfg.n_kv_heads),
+        }, rows * cfg.n_kv_heads * half, 1, 1);
+    }
+
+    pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {
+        try d.ctx.opElt(.scale_f32, buf, buf, null, null, .{ .u0 = @intCast(n), .f0 = f }, n, 1, 1);
+    }
+
+    pub fn attention(d: Dev, rows: usize) !void {
+        const cfg = d.model.cfg;
+        try File.attention(d.ctx, cfg, d.ws, rows, 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim))));
+    }
+
+    pub fn rowNorm(d: Dev, buf: Buf, w: []const f32, rows: usize) !void {
+        const cfg = d.model.cfg;
+        try rmsNorm(d.ctx, buf, buf, w, rows, cfg.dim, cfg.norm_eps);
+    }
+
+    /// The gate was `tanh`'d on the host, inside the table.
+    pub fn gatedAdd(d: Dev, x: Buf, t: Buf, rows: usize, off: usize) !void {
+        const dim = d.model.cfg.dim;
+        std.debug.assert(x.dt == t.dt);
+        try d.ctx.opElt(gpu.eltAt("gated_add", x.dt), x, t, d.ws.mv_d, null, .{ .u0 = @intCast(rows * dim), .u1 = @intCast(dim), .u2 = @intCast(off) }, rows * dim, 1, 1);
+    }
+
+    pub fn siluMul(d: Dev, mg: Buf, mu: Buf, n: usize) !void {
+        std.debug.assert(mg.dt == mu.dt);
+        try d.ctx.opElt(gpu.eltAt("silu_mul", mg.dt), mg, mu, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+};
 
 /// Attention over `rows` positions, q/k/v already normed and rope'd in `ws.q_d`/`k_d`/
 /// `v_d`, result into `ws.attn_d`. Both paths are non-causal and mathematically the
@@ -631,48 +599,6 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
     }
 }
 
-/// A block GEMM, dispatched by weight dtype. Z-Image ships dense bf16, which takes
-/// one of the two f16-weight tensor-core pipelines (native bf16 where the device has
-/// a bf16 coop config, else bf16->f16 at upload, both keep the conversion off the
-/// host under weight streaming), exactly as `dit_gpu` routes its dense bf16 blocks.
-fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
-    // The block linears carry no bias, but the f16-weight coop GEMM always folds one
-    // in, so hand it a zero vector.
-    //
-    // The FULL slice, never `zeros[0..w.rows]`. `smallBuffer` caches by host
-    // POINTER alone, so every width would map to whichever length was uploaded first:
-    // once a `dim`-wide GEMM cached a 3840-float buffer, the `mlp_dim` GEMM's
-    // `bias_compact` would read 10240 floats out of it and run off the end. The
-    // dispatch reads only `rows` entries, so one full-width buffer serves them all,
-    // which is also exactly what `dit_gpu` does and why.
-    const zeros: []const f32 = &zero_bias;
-    std.debug.assert(w.rows <= zeros.len);
-    switch (w.dtype) {
-        .bf16 => {
-            if (ctx.pipe_coop_bf16w != .null_handle) {
-                try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, zeros);
-            } else {
-                try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, zeros);
-            }
-        },
-        .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
-        // Weight-only NVFP4: decoded to an f16 scratch inside the GEMM, so the 4-bit form
-        // stays resident. `zeros` is the FULL vector for the reason above.
-        .nvfp4 => {
-            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
-            const meta = w.nvfp4.?;
-            try ctx.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
-        },
-        .f32, .f8_e4m3 => try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null),
-        // `zimage.gpuLinKindSupported` gates this before a session is built, so
-        // reaching here is a programming error rather than a bad checkpoint.
-        else => return error.UnsupportedDType,
-    }
-}
-
-/// Widest zero bias any Z-Image GEMM needs. `mlp_dim` is the largest output width.
-const zero_bias: [zimage.z_image.mlp_dim]f32 = @splat(0);
-
 /// Weighted RMSNorm over `[rows][dim]`, `x -> out` (may alias).
 ///
 /// The SUBGROUP kernel wherever it exists. `Elt.rmsnorm` gives each THREAD a whole
@@ -688,7 +614,7 @@ const zero_bias: [zimage.z_image.mlp_dim]f32 = @splat(0);
 fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, eps: f32) !void {
     const w = try normBuf(ctx, weights);
     if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, out, w, rows, dim, eps);
-    try ctx.opElt(.rmsnorm, x, out, w, null, .{
+    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, out, w, null, .{
         .u0 = @intCast(rows),
         .u1 = @intCast(dim),
         .f0 = eps,
@@ -776,7 +702,7 @@ fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*gpu.Context {
     return gpu.Context.init(gpa, std.testing.io) catch error.SkipZigTest;
 }
 
-const zit_ckpt = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
+const zit_ckpt = build_options.model_root ++ "/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
 
 test "Z-Image gpu attention matches ops.attention at the model's head geometry" {
     // `attn_full` at 30 heads x 128, Z-Image's exact shape, and the one place the
@@ -899,7 +825,7 @@ test "Z-Image gpu forward matches the CPU forward on a real checkpoint" {
 
         var sess = try Session.init(gpa, io, ctx, &model, lat, lat, cap, cap_padded, &.{ sigma, 0 });
         defer sess.deinit(gpa, ctx);
-        var ws = try Workspace.init(ctx, &model, lat, lat, cap_padded);
+        var ws = try Workspace.init(ctx, &model, lat, lat, cap_padded, .f32);
         defer ws.deinit(ctx);
 
         const got = try gpa.alloc(f32, x_lat.len);
