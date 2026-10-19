@@ -383,6 +383,48 @@ pub fn main(init: std.process.Init) !void {
             } else ckpt = args[i];
         }
         try mageflowVkTest(arena, io, stdout, ckpt, layers, lat_arg, cap_arg, refs_arg, sigma_arg);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "moss-image-te-test")) {
+        var te: []const u8 = TensorPencil.model_root ++ "/text_encoders/qwen3.5_9b-INT8_CONVROT.safetensors";
+        var backend: []const u8 = "zig-cuda";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
+                i += 1;
+                backend = args[i];
+            } else te = args[i];
+        }
+        try mossImageTeTest(arena, io, stdout, te, backend);
+    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "moss-image-cuda-test") or std.mem.eql(u8, args[1], "moss-image-vk-test"))) {
+        const vk = std.mem.eql(u8, args[1], "moss-image-vk-test");
+        var ckpt: []const u8 = TensorPencil.model_root ++ "/diffusion_models/moss/moss_image_sft-INT8_CONVROT.safetensors";
+        var libs = false;
+        var layers: usize = 0;
+        var lat_arg: usize = 16;
+        var cap_arg: usize = 20;
+        var sigma_arg: f32 = 0.75;
+        var prof = false;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) {
+                libs = true;
+            } else if (std.mem.eql(u8, args[i], "--prof")) {
+                prof = true;
+            } else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch layers;
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch sigma_arg;
+            } else ckpt = args[i];
+        }
+        if (prof and !vk) return mossImageCudaProf(arena, io, stdout, ckpt, libs, lat_arg, cap_arg);
+        try mossImageTest(arena, io, stdout, ckpt, if (vk) .vulkan else if (libs) .cuda else .zig_cuda, layers, lat_arg, cap_arg, sigma_arg);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mageflow-cuda-test")) {
         var ckpt: []const u8 = TensorPencil.model_root ++ "/diffusion_models/mageflow/mageFlow_mageFlow4B.safetensors";
         var libs = false;
@@ -938,6 +980,12 @@ pub fn main(init: std.process.Init) !void {
             \\      one Mage-Flow forward at real shapes: batched s/step best-of-N,
             \\      then one sync-per-op pass for the per-category split
             \\  TensorPencil mageflow-vk-test [<mage ckpt>]
+            \\  TensorPencil moss-image-te-test [<qwen3.5 te>] [--backend zig-cuda|cuda|vulkan]
+            \\      the Qwen3.5 text encoder on the device against the exact ComfyUI
+            \\      reference in moss_image_te_ref: weight-only, and W8A8 by its noise
+            \\  TensorPencil moss-image-cuda-test | moss-image-vk-test [<ckpt>] [libs] [--layers N] [--lat N] [--cap N] [--sigma S]
+            \\      MOSS-Image's device forward against its CPU forward: weight-only to the
+            \\      exact forward, W8A8 by the size of its activation noise
             \\  TensorPencil mageflow-cuda-test [<mage ckpt>] [libs]
             \\        [--layers N] [--lat N] [--cap N] [--refs N] [--sigma S]
             \\        Mage-Flow's CUDA forward against its CPU forward. The axes
@@ -2474,7 +2522,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => &.{},
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -4324,6 +4372,295 @@ fn mageflowCudaTest(
         failures += try loraReport(stdout, want, want_l, got0, got_l, tol, true);
     }
     try summarize(stdout, failures);
+}
+
+/// MOSS-Image's device forward against its CPU forward, on the real checkpoint, over
+/// depth, canvas tokens, text length and sigma. Weight-only is held to the exact
+/// forward; W8A8 by the size of its activation noise against the format's.
+fn mossImageTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    backend: enum { cuda, zig_cuda, vulkan },
+    layers: usize,
+    lat: usize,
+    seq_txt: usize,
+    sigma: f32,
+) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const moss = TensorPencil.models.moss_image;
+    const dev = TensorPencil.models.moss_image_dev;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("moss-image test needs a MOSS-Image checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    const store = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    var cfg = try moss.Config.detect(store);
+    if (layers != 0) cfg.layers = @min(layers, cfg.layers);
+    var model = try moss.DiT.loadWith(arena, store, cfg);
+    defer model.deinit();
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const ctxv = try arena.alloc(f32, seq_txt * cfg.txt_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, cfg.channels * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+    const exact = try arena.alloc(f32, x_lat.len);
+    try model.forward(io, arena, exact, x_lat, lat, lat, sigma, ctxv, seq_txt, null);
+    const tol = checkTol(if (cfg.layers <= 4) 1e-2 else 3e-2);
+    var failures: usize = 0;
+
+    if (backend == .vulkan) {
+        const arm = TensorPencil.models.moss_image_gpu;
+        const ctx = TensorPencil.gpu.context.Context.init(arena, io) catch |err| {
+            try stdout.print("vulkan unavailable: {t}\n", .{err});
+            return;
+        };
+        defer ctx.deinit();
+        try stdout.print("== moss-image-vk-test ==\nvulkan device: {s}\ntrunk depth {d}, latent {d}x{d}, text {d}, sigma {d}\n", .{ ctx.deviceName(), cfg.layers, lat, lat, seq_txt, sigma });
+        if (!arm.supported(ctx, &model)) {
+            try stdout.print("checkpoint dtype unsupported on this device\n", .{});
+            return;
+        }
+        const emu: ActEmu(*TensorPencil.gpu.context.Context, TensorPencil.models.lin_gpu.actQuant) = .{ .dev = ctx, .plan = try arm.linPlan(ctx, &model), .lins = model.device_lins };
+        const run = struct {
+            fn f(m: *const moss.DiT, c: *TensorPencil.gpu.context.Context, i: Io, a: std.mem.Allocator, l: usize, t: []const f32, st: usize, s: f32, x: []const f32) ![]f32 {
+                var sess = try arm.Session.init(a, i, c, m, l, l, t, st, &.{ s, 0 });
+                defer sess.deinit(a, c);
+                var ws = try arm.Workspace.init(c, m, l * l, st, dev.streamDtFor(testAct()));
+                defer ws.deinit(c);
+                const got = try a.alloc(f32, x.len);
+                try arm.forward(m, c, &sess, &ws, i, a, got, x, s, null);
+                return got;
+            }
+        }.f;
+        try mossImageChecks(arm, emu, stdout, &failures, &model, io, arena, ctx, run, lat, ctxv, seq_txt, sigma, x_lat, exact, tol);
+        if (lat <= 16) {
+            arm.force_attn_full = true;
+            defer arm.force_attn_full = false;
+            arm.force_weight_only = true;
+            defer arm.force_weight_only = false;
+            try checkRel(stdout, &failures, "forward (attn_full)", exact, try run(&model, ctx, io, arena, lat, ctxv, seq_txt, sigma, x_lat), tol);
+        }
+        return summarize(stdout, failures);
+    }
+
+    const arm = TensorPencil.models.moss_image_cuda;
+    var be = (if (backend == .cuda) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== moss-image-cuda-test ==\ncuda device: {s} (kernels: {t})\ntrunk depth {d}, latent {d}x{d}, text {d}, sigma {d}\n", .{
+        be.deviceName(), be.kernels, cfg.layers, lat, lat, seq_txt, sigma,
+    });
+    if (!arm.supported(&model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+    const emu: ActEmu(*cuda.Backend, TensorPencil.models.lin_cuda.actQuant) = .{ .dev = be, .plan = try arm.linPlan(&model), .lins = model.device_lins };
+    const run = struct {
+        fn f(m: *const moss.DiT, b: *cuda.Backend, i: Io, a: std.mem.Allocator, l: usize, t: []const f32, st: usize, s: f32, x: []const f32) ![]f32 {
+            var sess = try arm.Session.init(a, i, b, m, l, l, t, st, &.{ s, 0 });
+            defer sess.deinit(a, b);
+            var ws = try arm.Workspace.init(b, m, l * l, st, dev.streamDtFor(testAct()));
+            defer ws.deinit(b);
+            const got = try a.alloc(f32, x.len);
+            try arm.forward(m, b, &sess, &ws, i, a, got, x, s, null);
+            return got;
+        }
+    }.f;
+    try mossImageChecks(arm, emu, stdout, &failures, &model, io, arena, be, run, lat, ctxv, seq_txt, sigma, x_lat, exact, tol);
+    try summarize(stdout, failures);
+}
+
+/// MOSS-Image's Qwen3.5 encoder on a device against the fixture's exact conditioning.
+fn mossImageTeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, te: []const u8, backend: []const u8) !void {
+    const mm = TensorPencil.models;
+    const dual_lin = mm.dual_lin;
+    const ref_path = "src/models/assets/moss_image_te_ref.safetensors";
+    std.Io.Dir.cwd().access(io, te, .{}) catch {
+        try stdout.print("moss-image-te-test needs the Qwen3.5 text encoder ({s})\n", .{te});
+        return;
+    };
+    var ref = try TensorPencil.safetensors.SafeTensors.open(arena, io, ref_path);
+    defer ref.deinit();
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, te);
+    defer ck.deinit();
+    var enc = try mm.moss_image_text.Encoder.load(arena, ck.store());
+    defer enc.deinit();
+    const hidden = enc.hidden();
+
+    const Arm = enum { cuda, libs, vulkan };
+    const arm: Arm = if (std.mem.eql(u8, backend, "vulkan")) .vulkan else if (std.mem.eql(u8, backend, "cuda")) .libs else .cuda;
+    var be: ?*TensorPencil.gpu.cuda.Backend = null;
+    var ctx: ?*TensorPencil.gpu.context.Context = null;
+    defer if (be) |b| b.deinit();
+    defer if (ctx) |c| c.deinit();
+    switch (arm) {
+        .vulkan => ctx = TensorPencil.gpu.context.Context.init(arena, io) catch |err| {
+            try stdout.print("vulkan unavailable: {t}\n", .{err});
+            return;
+        },
+        .cuda, .libs => be = (if (arm == .libs) TensorPencil.gpu.cuda.Backend.initLibs(arena) else TensorPencil.gpu.cuda.Backend.init(arena)) catch |err| {
+            try stdout.print("cuda unavailable: {t}\n", .{err});
+            return;
+        },
+    }
+    try stdout.print("== moss-image-te-test ==\n{s}: {s}\n", .{ backend, if (be) |b| b.deviceName() else ctx.?.deviceName() });
+
+    const encodeOn = struct {
+        fn f(a: std.mem.Allocator, b: ?*TensorPencil.gpu.cuda.Backend, c: ?*TensorPencil.gpu.context.Context, e: *const mm.moss_image_text.Encoder, ids: []const u32, mode: dual_lin.IntGemm) ![]f32 {
+            const out = try a.alloc(f32, ids.len * e.hidden());
+            const cap = TensorPencil.kv_cache.Capacity.fixed(ids.len);
+            if (b) |bb| {
+                var use = mm.lin_cuda.Use.llm(mm.qwen35_cuda.CudaLM.prefill_batch);
+                use.int8 = mode;
+                var lm = try mm.qwen35_cuda.CudaLM.initUse(a, bb, &e.lm, cap, use);
+                defer lm.deinit();
+                try lm.encode(ids, out);
+            } else {
+                var use = mm.lin_gpu.Use.llm(mm.qwen35_gpu.VulkanLM.prefill_batch);
+                use.int8 = mode;
+                var lm = try mm.qwen35_gpu.VulkanLM.initUse(a, c.?, &e.lm, cap, use);
+                defer lm.deinit();
+                try lm.encode(ids, out);
+            }
+            return out;
+        }
+    }.f;
+
+    var failures: usize = 0;
+    for (0..2) |p| {
+        var kb: [16]u8 = undefined;
+        const tv = try ref.require(try std.fmt.bufPrint(&kb, "tokens.{d}", .{p}));
+        const raw = std.mem.bytesAsSlice(i32, tv.bytes);
+        const ids = try arena.alloc(u32, raw.len);
+        for (ids, raw) |*d, s| d.* = @intCast(s);
+        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{p}))).toF32Alloc(arena);
+        std.debug.assert(want.len == ids.len * hidden);
+        try stdout.print("prompt {d}: {d} tokens\n", .{ p, ids.len });
+
+        const wo = try encodeOn(arena, be, ctx, &enc, ids, .weight_only_f32);
+        try checkRel(stdout, &failures, "  weight-only f32", want, wo, checkTol(2e-3));
+        const w8 = try encodeOn(arena, be, ctx, &enc, ids, .w8a8);
+        // W8A8 is the format's own arithmetic: held by the size of its noise against
+        // the CPU forward with each linear's activation quantized as the device does.
+        const lins = try enc.lm.deviceLins(arena);
+        // The hook holds a pointer to `emu`, so each encode runs inside its branch.
+        defer TensorPencil.ops.matmul.act_quant = null;
+        const emulated = if (be) |b| blk: {
+            var use = mm.lin_cuda.Use.llm(mm.qwen35_cuda.CudaLM.prefill_batch);
+            use.int8 = .w8a8;
+            const emu: ActEmu(*TensorPencil.gpu.cuda.Backend, mm.lin_cuda.actQuant) = .{ .dev = b, .plan = try mm.lin_cuda.plan(lins, use, "te-test"), .lins = lins };
+            emu.install();
+            break :blk try enc.encodeIds(io, arena, ids);
+        } else blk: {
+            var use = mm.lin_gpu.Use.llm(mm.qwen35_gpu.VulkanLM.prefill_batch);
+            use.int8 = .w8a8;
+            const emu: ActEmu(*TensorPencil.gpu.context.Context, mm.lin_gpu.actQuant) = .{ .dev = ctx.?, .plan = try mm.lin_gpu.plan(ctx.?, lins, use, "te-test"), .lins = lins };
+            emu.install();
+            break :blk try enc.encodeIds(io, arena, ids);
+        };
+        TensorPencil.ops.matmul.act_quant = null;
+        try stdout.print("  emulated W8A8 vs exact rel L2 {e:.4}  (the format's own error)\n", .{relL2f(want, emulated)});
+        try checkQuantNoise(stdout, &failures, "  w8a8", want, emulated, wo, w8);
+    }
+    try summarize(stdout, failures);
+}
+
+/// One MOSS-Image CUDA forward, timed warm and then split by the backend's profiler.
+fn mossImageCudaProf(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool, lat: usize, seq_txt: usize) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const moss = TensorPencil.models.moss_image;
+    const arm = TensorPencil.models.moss_image_cuda;
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    var model = try moss.DiT.load(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store()));
+    defer model.deinit();
+    var be = try (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena));
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const ctxv = try arena.alloc(f32, seq_txt * model.cfg.txt_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x = try arena.alloc(f32, model.cfg.channels * lat * lat);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    const out = try arena.alloc(f32, x.len);
+    const sigma: f32 = 0.75;
+    var sess = try arm.Session.init(arena, io, be, &model, lat, lat, ctxv, seq_txt, &.{ sigma, 0 });
+    defer sess.deinit(arena, be);
+    var ws = try arm.Workspace.init(be, &model, lat * lat, seq_txt, .f32);
+    defer ws.deinit(be);
+    try arm.forward(&model, be, &sess, &ws, io, arena, out, x, sigma, null);
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const ta = std.Io.Clock.real.now(io);
+        try arm.forward(&model, be, &sess, &ws, io, arena, out, x, sigma, null);
+        best = @min(best, @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - ta.nanoseconds)) / 1e6);
+    }
+    try stdout.print("== moss-image cuda ({s}) {d}x{d} latent, text {d} ==\nforward {d:.1} ms (best of 3)\n", .{ if (libs) "libs" else "hand_ptx", lat, lat, seq_txt, best });
+    be.profile = true;
+    be.prof.reset();
+    try arm.forward(&model, be, &sess, &ws, io, arena, out, x, sigma, null);
+    be.profile = false;
+    var tot: f64 = 0;
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@intFromEnum(cat)];
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
+        const i = @intFromEnum(cat);
+        try stdout.print("  {s:<7} {d:>8.1} ms  {d:>5.1}%  ({d} launches)\n", .{ @tagName(cat), be.prof.ms[i], if (tot == 0) 0 else 100 * be.prof.ms[i] / tot, be.prof.n[i] });
+    }
+}
+
+/// The two checks both arms run: weight-only against the exact forward, and the
+/// format's W8A8 by its noise, when the device quantizes activations at all.
+fn mossImageChecks(
+    comptime arm: type,
+    emu: anytype,
+    stdout: *Io.Writer,
+    failures: *usize,
+    model: *const TensorPencil.models.moss_image.DiT,
+    io: Io,
+    arena: std.mem.Allocator,
+    device: anytype,
+    run: anytype,
+    lat: usize,
+    ctxv: []const f32,
+    seq_txt: usize,
+    sigma: f32,
+    x_lat: []const f32,
+    exact: []const f32,
+    tol: f64,
+) !void {
+    if (!emu.quantizes()) {
+        try checkRel(stdout, failures, "forward", exact, try run(model, device, io, arena, lat, ctxv, seq_txt, sigma, x_lat), tol);
+        return;
+    }
+    const q = try arena.alloc(f32, x_lat.len);
+    {
+        emu.install();
+        defer TensorPencil.ops.matmul.act_quant = null;
+        try model.forward(io, arena, q, x_lat, lat, lat, sigma, ctxv, seq_txt, null);
+    }
+    const fmt = relL2f(exact, q);
+    try stdout.print("emulated activation quant vs f32  rel L2 {e:.4}  (the format's own error)\n", .{fmt});
+    arm.force_weight_only = true;
+    const wo = run(model, device, io, arena, lat, ctxv, seq_txt, sigma, x_lat);
+    arm.force_weight_only = false;
+    try checkRel(stdout, failures, "forward (weight-only)", exact, try wo, tol);
+    const got = try run(model, device, io, arena, lat, ctxv, seq_txt, sigma, x_lat);
+    // Past ~5% the trunk amplifies a quantizer's noise chaotically (42 blocks at sigma
+    // 1 reach 17% where 12 blocks hold 7e-4), and two draws of it differ in size by
+    // half on BOTH arms: the ratio then measures the draw, not the route.
+    var noise_fail: usize = 0;
+    try checkQuantNoise(stdout, &noise_fail, "forward (W8A8)", exact, q, try wo, got);
+    if (fmt < 5e-2) failures.* += noise_fail else if (noise_fail != 0)
+        try stdout.print("  (not gated: the format's own error is past 5%, where the ratio is the draw's)\n", .{});
 }
 
 /// `--lora <file> [--strength s]` on a device check.

@@ -97,6 +97,12 @@ pub const mageflow = @import("models/mageflow.zig");
 pub const mageflow_text = @import("models/mageflow_text.zig");
 pub const mageflow_gpu = @import("models/mageflow_gpu.zig");
 pub const mageflow_cuda = @import("models/mageflow_cuda.zig");
+pub const moss_image = @import("models/moss_image.zig");
+pub const moss_image_text = @import("models/moss_image_text.zig");
+pub const moss_image_dev = @import("models/moss_image_dev.zig");
+pub const moss_image_cuda = @import("models/moss_image_cuda.zig");
+pub const moss_image_gpu = @import("models/moss_image_gpu.zig");
+pub const attn_gpu = @import("models/attn_gpu.zig");
 /// Mage-Flow's VAE: a one-step diffusion codec, 128 channels at 16x, not an
 /// `AutoencoderKL`.
 pub const mage_vae = @import("models/mage_vae.zig");
@@ -230,6 +236,10 @@ test {
     _ = mageflow_text;
     _ = mageflow_gpu;
     _ = mageflow_cuda;
+    _ = moss_image;
+    _ = moss_image_text;
+    _ = moss_image_cuda;
+    _ = moss_image_gpu;
     _ = mage_vae;
     _ = mage_vae_gpu;
     _ = mage_vae_cuda;

@@ -206,11 +206,17 @@ pub const CudaLM = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, cap: kvmod.Capacity) !CudaLM {
+        return initUse(gpa, be, lm, cap, lin_cuda.Use.llm(prefill_chunk));
+    }
+
+    /// `init` with the linear routes' policy given, for a caller that is not a chat
+    /// session (a text encoder runs the encoder dial's integer arithmetic).
+    pub fn initUse(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, cap: kvmod.Capacity, use: lin_cuda.Use) !CudaLM {
         const cfg = lm.cfg;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
-        const lin_plan = try lin_cuda.plan(try lm.deviceLins(alloc), lin_cuda.Use.llm(prefill_chunk), "qwen35 cuda");
+        const lin_plan = try lin_cuda.plan(try lm.deviceLins(alloc), use, "qwen35 cuda");
 
         var self: CudaLM = init_defaults.of(CudaLM);
         self.lm = lm;
@@ -1063,6 +1069,38 @@ pub const CudaLM = struct {
         }
     }
 
+    /// The final-normed hidden state of every row of `ids`, prefilled at the cache's
+    /// current length: what a text encoder reads of this model. `out` is
+    /// `[ids.len][hidden]`.
+    pub fn encode(self: *CudaLM, ids: []const u32, out: []f32) !void {
+        const cfg = self.cfg;
+        const hidden = cfg.hidden;
+        std.debug.assert(out.len == ids.len * hidden);
+        const x = try self.gpa.alloc(f32, @min(ids.len, prefill_chunk) * hidden);
+        defer self.gpa.free(x);
+        var pos3s: [prefill_chunk * 3]u32 = undefined;
+        var off: usize = 0;
+        while (off < ids.len) {
+            try bnd.check(self);
+            const n: usize = @min(prefill_chunk, ids.len - off);
+            try qwen3.embedTokens(self.lm.embed, ids[off..][0..n], x[0 .. n * hidden]);
+            for (0..n) |t| pos3s[t * 3 ..][0..3].* = @splat(@intCast(self.pos_next + t));
+            try self.stepBatch(x[0 .. n * hidden], pos3s[0 .. n * 3]);
+            self.pos_next += n;
+            const rows = out[off * hidden ..][0 .. n * hidden];
+            // A split whose last layer ran on the host leaves the stream there.
+            if (self.split) |*sp| if (sp.on_host) {
+                ops.norm.rmsNorm(rows, sp.hx[0 .. n * hidden], self.lm.final_norm, cfg.rms_eps);
+                off += n;
+                continue;
+            };
+            var dev: Dev = .of(self);
+            try dev.rms(self.bufs.x, self.bufs.normed, self.lm.final_norm, n, hidden);
+            try self.be.downloadF32(self.bufs.normed.slice(0, n * hidden * self.bufs.normed.dt.bytes()), rows);
+            off += n;
+        }
+    }
+
     /// Prefill one image: `embeds` is the ViT output ([grid_w*grid_h rows of
     /// hidden]), injected in batched chunks with M-RoPE grid positions (t
     /// fixed at the image start, h/w = merged-grid row/col); the next text
@@ -1291,8 +1329,8 @@ const Dev = struct {
         try d.m.be.opGdnConvStep(state, x, try nbuf(d.m.be, w), out, channels);
     }
     pub fn gdnDeltaStep(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, scale: f32) !void {
-        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, 1, d.cfg.convChannels(), scale);
-        try d.m.be.opGdnDeltaStep(state, conv, gates, o, heads, dk, k_heads, scale);
+        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, 1, d.cfg.convChannels(), scale);
+        try d.m.be.opGdnDeltaStep(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, scale);
     }
     pub fn gdnGatesBatch(d: *const Dev, alpha: Buf, beta: Buf, a_dt: []const f32, gates: Buf, heads: usize, n: usize, pitch: usize) !void {
         try d.m.be.opGdnGatesBatch(alpha, beta, try nbuf(d.m.be, a_dt), gates, heads, n, pitch);
@@ -1301,8 +1339,8 @@ const Dev = struct {
         try d.m.be.opGdnConvBatch(state, x, try nbuf(d.m.be, w), out, channels, n);
     }
     pub fn gdnDeltaChunk(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, n: usize, channels: usize, scale: f32) !void {
-        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, n, channels, scale);
-        try d.m.be.opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, n, channels, scale);
+        if (dual_kernels) return d.m.be.opGdnDeltaChunkDual(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, n, channels, scale);
+        try d.m.be.opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, n, channels, scale);
     }
 
     pub fn convState(d: *const Dev, lin_idx: usize) Buf {

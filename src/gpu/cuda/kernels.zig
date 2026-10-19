@@ -5997,7 +5997,10 @@ pub fn buildGdnDeltaChunk(alloc: std.mem.Allocator, d: usize) ![:0]u8 {
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
     try b.linef("mov.u32 {s}, %ctaid.x;", .{r_h});
     try b.linef("mov.u32 {s}, %tid.x;", .{r_j});
-    try b.linef("rem.u32 {s}, {s}, {s};", .{ r_kh, r_h, r_kheads }); // kh = h % k_heads
+    const r_grp = try b.reg(.b32);
+    try b.linef("ld.param.u32 {s}, [p_group]; max.u32 {s}, {s}, 1;", .{ r_grp, r_grp, r_grp });
+    try b.linef("div.u32 {s}, {s}, {s};", .{ r_kh, r_h, r_grp });
+    try b.linef("rem.u32 {s}, {s}, {s};", .{ r_kh, r_kh, r_kheads }); // kh = (h / group) % k_heads
     try b.linef("mov.u32 {s}, sk;", .{r_sk});
     try b.linef("mov.u32 {s}, sq;", .{r_sq});
 
@@ -6083,7 +6086,7 @@ pub fn buildGdnDeltaChunk(alloc: std.mem.Allocator, d: usize) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "gdn_delta_chunk",
-        "    .param .u64 p_s,\n    .param .u64 p_cv,\n    .param .u64 p_g,\n    .param .u64 p_o,\n    .param .u32 p_heads,\n    .param .u32 p_kheads,\n    .param .u32 p_n,\n    .param .u32 p_ch,\n    .param .f32 p_scale",
+        "    .param .u64 p_s,\n    .param .u64 p_cv,\n    .param .u64 p_g,\n    .param .u64 p_o,\n    .param .u32 p_heads,\n    .param .u32 p_kheads,\n    .param .u32 p_n,\n    .param .u32 p_ch,\n    .param .u32 p_group,\n    .param .f32 p_scale",
         shared_decl,
     );
 }

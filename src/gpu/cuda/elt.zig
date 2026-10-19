@@ -4359,13 +4359,14 @@ pub const attn_split_tree_ptx: [:0]const u8 = ptx.preamble ++
 /// so per-thread memory-level parallelism is the lever. d % 4 == 0.
 /// b0=S (all heads, [heads][d][d]), b1=conv_out ([q(k_heads*d) |
 /// k(k_heads*d) | v(heads*d)]), b2=gates ([decay(heads) | beta(heads)]),
-/// b3=o out [heads*d]. u0=heads, u1=d, u2=k_heads. f0=readout scale.
+/// b3=o out [heads*d]. u0=heads, u1=d, u2=k_heads, u3=v-heads per k-head
+/// (0 or 1: tiled). f0=readout scale.
 pub const gdn_delta_step_ptx: [:0]const u8 = ptx.preamble ++
     \\.visible .entry gdn_delta_step(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<6>;
-    \\  .reg .b32 %r<28>;
+    \\  .reg .b32 %r<30>;
     \\  .reg .f32 %f<20>;
     \\  .reg .b64 %rd<28>;
     \\  .shared .align 4 .b8 sk[1024];
@@ -4377,7 +4378,9 @@ pub const gdn_delta_step_ptx: [:0]const u8 = ptx.preamble ++
     \\  ld.param.f32 %f1,[f0];                 // scale
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  rem.u32 %r6,%r1,%r5;                   // kh = h % k_heads
+    \\  ld.param.u32 %r28,[u3]; max.u32 %r28,%r28,1;
+    \\  div.u32 %r29,%r1,%r28;
+    \\  rem.u32 %r6,%r29,%r5;                  // kh = (h / group) % k_heads
     \\  mul.lo.s32 %r7,%r6,%r4;                // kh*d
     \\  ld.param.u32 %r8,[u0];                 // heads
     \\  mul.lo.s32 %r9,%r5,%r4;                // qk span = k_heads*d

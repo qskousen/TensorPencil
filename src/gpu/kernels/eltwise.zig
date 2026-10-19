@@ -304,7 +304,8 @@ const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 //   build_delta_net_autoregressive, one token). a = state [heads*dd*dd] (in
 //   place), b = conv_out [q(kheads*dd) | k(kheads*dd) | v(heads*dd)],
 //   c = gates [decay(heads) | beta(heads)], d = o [heads*dd]. u0 = heads,
-//   u1 = dd (<=128), u2 = kheads, f0 = readout scale. One thread per head.
+//   u1 = dd (<=128), u2 = kheads, u3 = v-heads per k-head (0 or 1: tiled),
+//   f0 = readout scale. One thread per head.
 export fn gdn_delta_step() callconv(.spirv_kernel) void {
     decorate();
     const h = gpu.global_invocation_id[0];
@@ -314,8 +315,9 @@ export fn gdn_delta_step() callconv(.spirv_kernel) void {
     const kheads = pc.u2;
     const scale = pc.f0;
     const qkdim = kheads * dd;
-    const qbase = (h % kheads) * dd;
-    const kbase = qkdim + (h % kheads) * dd;
+    const kidx = (h / @max(pc.u3, 1)) % kheads;
+    const qbase = kidx * dd;
+    const kbase = qkdim + kidx * dd;
     const vbase = 2 * qkdim + h * dd;
     const sbase = h * dd * dd;
     const decay = c.data[h];

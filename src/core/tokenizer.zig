@@ -11,11 +11,15 @@ const build_options = @import("build_options");
 const tables = @import("unicode_tables.zig");
 const gguf_mod = @import("gguf.zig");
 const prompt_weights = @import("prompt_weights.zig");
+const nfc_mod = @import("nfc.zig");
 
 const vocab_json = @embedFile("assets/qwen_tokenizer/vocab.json");
 const merges_txt = @embedFile("assets/qwen_tokenizer/merges.txt");
 /// The merge rules Qwen3 has and Qwen2.5 does not. See `Tokenizer.initQwen25`.
 const qwen25_dropped_merges = @embedFile("assets/qwen_tokenizer/qwen25_dropped_merges.txt");
+/// Qwen3.5's own 248k vocabulary (ComfyUI's `qwen35_tokenizer`).
+const qwen35_vocab_json = @embedFile("assets/qwen35_tokenizer/vocab.json");
+const qwen35_merges_txt = @embedFile("assets/qwen35_tokenizer/merges.txt");
 
 pub const pad_token: u32 = 151643; // <|endoftext|>
 pub const im_start: u32 = 151644;
@@ -55,6 +59,53 @@ const special_tokens = [_]Special{
     .{ .text = "</tool_response>", .id = 151666 },
     .{ .text = "<think>", .id = 151667 },
     .{ .text = "</think>", .id = 151668 },
+};
+
+/// Added tokens of the embedded Qwen3.5 tokenizer, longest first.
+const qwen35_special_tokens = blk: {
+    const list = [_]Special{
+        .{ .text = "<|endoftext|>", .id = 248044 },
+        .{ .text = "<|im_start|>", .id = 248045 },
+        .{ .text = "<|im_end|>", .id = 248046 },
+        .{ .text = "<|object_ref_start|>", .id = 248047 },
+        .{ .text = "<|object_ref_end|>", .id = 248048 },
+        .{ .text = "<|box_start|>", .id = 248049 },
+        .{ .text = "<|box_end|>", .id = 248050 },
+        .{ .text = "<|quad_start|>", .id = 248051 },
+        .{ .text = "<|quad_end|>", .id = 248052 },
+        .{ .text = "<|vision_start|>", .id = 248053 },
+        .{ .text = "<|vision_end|>", .id = 248054 },
+        .{ .text = "<|vision_pad|>", .id = 248055 },
+        .{ .text = "<|image_pad|>", .id = 248056 },
+        .{ .text = "<|video_pad|>", .id = 248057 },
+        .{ .text = "<tool_call>", .id = 248058 },
+        .{ .text = "</tool_call>", .id = 248059 },
+        .{ .text = "<|fim_prefix|>", .id = 248060 },
+        .{ .text = "<|fim_middle|>", .id = 248061 },
+        .{ .text = "<|fim_suffix|>", .id = 248062 },
+        .{ .text = "<|fim_pad|>", .id = 248063 },
+        .{ .text = "<|repo_name|>", .id = 248064 },
+        .{ .text = "<|file_sep|>", .id = 248065 },
+        .{ .text = "<tool_response>", .id = 248066 },
+        .{ .text = "</tool_response>", .id = 248067 },
+        .{ .text = "<think>", .id = 248068 },
+        .{ .text = "</think>", .id = 248069 },
+        .{ .text = "<|audio_start|>", .id = 248070 },
+        .{ .text = "<|audio_end|>", .id = 248071 },
+        .{ .text = "<tts_pad>", .id = 248072 },
+        .{ .text = "<tts_text_bos>", .id = 248073 },
+        .{ .text = "<tts_text_eod>", .id = 248074 },
+        .{ .text = "<tts_text_bos_single>", .id = 248075 },
+        .{ .text = "<|audio_pad|>", .id = 248076 },
+    };
+    var sorted = list;
+    @setEvalBranchQuota(10000);
+    std.mem.sort(Special, &sorted, {}, struct {
+        fn lt(_: void, a: Special, b: Special) bool {
+            return a.text.len > b.text.len;
+        }
+    }.lt);
+    break :blk sorted;
 };
 
 // --- GPT-2 byte<->unicode mapping ----------------------------------------
@@ -192,6 +243,12 @@ pub const Tokenizer = struct {
     eos: ?u32 = null,
     pretok: Pretok = .qwen2,
     kind: Kind = .bpe,
+    /// NFC the text before splitting it, as transformers' slow `Qwen2Tokenizer` does.
+    /// On for the embedded vocabularies, which every diffusion text encoder uses
+    /// whatever its container, GGUF included: their reference is ComfyUI. Off for one
+    /// built from a GGUF's own vocabulary, which only chat uses: its reference is
+    /// llama.cpp, which does not normalize.
+    nfc: bool = false,
     /// SentencePiece data (kind == .spm; empty for BPE): per-id merge score,
     /// stored-text -> id (for merge lookups / text_to_token), byte-fallback
     /// map (byte -> "<0xNN>" token id), and the unknown-token id.
@@ -226,15 +283,30 @@ pub const Tokenizer = struct {
         return initVariant(gpa, .qwen25);
     }
 
+    /// Qwen3.5's vocabulary, split by the Qwen2 regex: ComfyUI tokenizes it with
+    /// transformers' `Qwen2Tokenizer`, whose pattern is fixed whatever the vocab.
+    pub fn initQwen35(gpa: std.mem.Allocator) !Tokenizer {
+        var t = try initFrom(gpa, qwen35_vocab_json, qwen35_merges_txt, null);
+        t.specials = &qwen35_special_tokens;
+        t.turn_end = 248046;
+        t.pad = 248044;
+        t.newline = t.byte_id['\n'];
+        return t;
+    }
+
     pub const MergeSet = enum { qwen3, qwen25 };
 
     fn initVariant(gpa: std.mem.Allocator, set: MergeSet) !Tokenizer {
+        return initFrom(gpa, vocab_json, merges_txt, if (set == .qwen25) qwen25_dropped_merges else null);
+    }
+
+    fn initFrom(gpa: std.mem.Allocator, vocab: []const u8, merges_text: []const u8, drop: ?[]const u8) !Tokenizer {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
         // Vocab: token key (byte-level unicode string) -> id.
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, vocab_json, .{});
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, vocab, .{});
         if (parsed != .object) return error.InvalidVocab;
         const vocab_obj = parsed.object;
 
@@ -260,8 +332,8 @@ pub const Tokenizer = struct {
 
         // Merges.
         var dropped: std.StringHashMapUnmanaged(void) = .empty;
-        if (set == .qwen25) {
-            var dl = std.mem.splitScalar(u8, qwen25_dropped_merges, '\n');
+        if (drop) |d| {
+            var dl = std.mem.splitScalar(u8, d, '\n');
             while (dl.next()) |l| {
                 const line = std.mem.trimEnd(u8, l, "\r");
                 if (line.len != 0) try dropped.put(alloc, line, {});
@@ -269,7 +341,7 @@ pub const Tokenizer = struct {
         }
         var merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty;
         var rank: u32 = 0;
-        var lines = std.mem.splitScalar(u8, merges_txt, '\n');
+        var lines = std.mem.splitScalar(u8, merges_text, '\n');
         var first = true;
         while (lines.next()) |line_raw| {
             const line = std.mem.trimEnd(u8, line_raw, "\r");
@@ -284,7 +356,7 @@ pub const Tokenizer = struct {
             rank += 1;
         }
 
-        return .{ .arena = arena, .id_to_bytes = id_to_bytes, .byte_id = byte_id, .merges = merges };
+        return .{ .arena = arena, .id_to_bytes = id_to_bytes, .byte_id = byte_id, .merges = merges, .nfc = true };
     }
 
     /// Extend the verbatim-matched special list, for a model that adds tokens
@@ -1017,6 +1089,14 @@ pub const Tokenizer = struct {
         if (self.kind == .spm) return self.encodeSpm(gpa, text, out);
         if (self.kind == .gemma4) return self.encodeGemma4(gpa, text, out);
         if (self.kind == .unigram) return self.encodeUnigram(gpa, text, out);
+        if (self.nfc) if (try nfc_mod.normalize(gpa, text)) |n| {
+            defer gpa.free(n);
+            return self.encodeBpe(gpa, n, out);
+        };
+        return self.encodeBpe(gpa, text, out);
+    }
+
+    fn encodeBpe(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
         var i: usize = 0;
         while (i < text.len) {
             // Earliest special-token occurrence from i.

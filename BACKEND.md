@@ -529,6 +529,7 @@ isolation — these models disagree with themselves across dtypes by 23-25 dB.
 | SenseNova 1024², 8 steps, cfg 1 | 30.30 | — | — | **0.48** | whole render 14.9 s; vulkan 1.36x of cuda in a paired run |
 | MiniMax H3 256², 5 frames, 8 steps | — | 0.88 | — | **0.14** | whole render 54 s / 24 s, of which the VAEs are 6.3 s / 4.6 s. Step 1 carries the 32B encoder (18.7 / 14.0 s); a COLD first read of it off disk is another ~90 s and swamps everything here |
 | Mage-Flow 1024², 30 steps, cfg 5 | — | — | — | **0.755** | ComfyUI 0.621 (82%) |
+| MOSS-Image 1024², 25 steps, cfg 2.5, int8 | 12 s at 256² | 2.29 | 1.70 | **1.17** | ComfyUI 0.694 (59%, int8 attention). Encode 0.8 s on the device, 6.4 s on the host |
 
 The CPU path is the reference; no GPU arm is bit-identical to it. All three GPU arms agree
 with each other inside their models' own precision envelopes.
@@ -718,6 +719,44 @@ its emulation in `lin-cuda-test` / `lin-vk-test`. The emulation quantizes only
 on all three arms at sigma 0.9 and 1.0. Pinned against ComfyUI at every stage
 by `tools/gen_mageflow_*.py` and `gen_mage_vae_fixtures.py`, each fixture carrying
 its own control.
+
+### 2L. MOSS-Image (single-stream DiT over Flux 2's latent, Qwen3.5-9B encoder)
+
+42 single-stream blocks, patch 1 over Mage-Flow's 128-channel latent (either codec decodes
+it), one modulation shared by every block, a soft-capped `situ` FFN and split-half 4-axis
+RoPE. The conventions that are silent wrong answers are in `moss_image.zig`'s header and
+`moss_image_text.zig`'s.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Text encoder** (Qwen3.5-9B, HF safetensors, final normed state) | ✅ | ✅ | ✅ | ✅ | `moss_image_text.zig`, `qwen35.Model.loadHf`, `{CudaLM,VulkanLM}.encode` |
+| **Text refiner** (2 blocks, once per conditioning) | ✅ | host | host | host | `DiT.textTokens` |
+| **DiT** (42 blocks) | ✅ all dtypes | ✅ every format `lin_gpu` routes (int8 checked) | ✅ | ✅ | `moss_image{,_dev,_gpu,_cuda}.zig`; fused `qkv` / `ffn_up_gate` run as row views |
+| **VAE decode** | ✅ | ✅ | ✅ | ✅ | Mage-Flow's, `pipeline.MageFlowVae` |
+| **LoRA sidecar** | ✅ | ✅ | ✅ | ✅ | §2J; split q/k/v keys land on thirds of a fused `qkv` (`lora_keys_fused`) |
+
+**The encoder is HF-named, so its V heads are GROUPED** (v-head h reads k-head
+h / (v/k)), where a GGUF's are tiled (h % k). llama.cpp's converter permutes them, but
+that permutes `out_proj`'s columns, which an int8 convrot weight cannot take. Every GDN
+kernel (dual chunk, CUDA chunk and step PTX, the SPIR-V step) takes the group instead
+(`Config.v_group`); the CUDA cross-kernel test runs both orders. Its `1 + w` norms and
+`A = -exp(A_log)` are applied at load, in f32. ComfyUI adds the one in bf16 and holds the
+two F32 tensors per DeltaNet layer as bf16, 4e-3 to 6e-3 off an exact forward; the
+fixture keeps both (`tools/gen_moss_image_te.py`).
+
+Gates: `moss-image-cuda-test` / `moss-image-vk-test` (`--layers`, `--lat`, `--cap`,
+`--sigma`; `--prof` profiles one CUDA forward) and `moss-image-te-test --backend`. The
+TE weight-only at f32 is 1e-6 against the exact reference on both CUDA arms and 4e-4 on
+Vulkan, its W8A8 1.03-1.11x the emulated format error. The DiT weight-only at full depth
+is 1.6e-3 to 1.2e-2 on CUDA (tensor-core attention) and 1.1e-5 on Vulkan through
+`attn_full`. Past ~5% format error (42 blocks at sigma 1) the W8A8 ratio wanders
+0.5-1.6x on both arms, where 12 blocks hold 0.9-1.1x: there it is reported, not gated.
+
+Against ComfyUI, 768², 20 steps, cfg 2.5, `--rng cpu`: 16.2 dB, and ComfyUI against
+ITSELF with only the checkpoint's int8 attention (`comfy_kitchen_int8`) swapped for SDPA
+is 16.4 dB; ours against that SDPA render is 29.6 dB. So the gap is ComfyUI's int8
+attention, which nothing here runs yet (`tools/gen_moss_image_render.py
+--no-int8-attention` is the control).
 
 ### 2I. DiT block weight-dtype support
 
@@ -1076,7 +1115,7 @@ a live dial, and a stack swaps on a live session for the cost of the LoRA files.
 
 | family | cpu | vulkan | zig-cuda | cuda |
 |---|---|---|---|---|
-| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
+| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `moss_image`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
 
 **Vulkan's sidecar is `models/lora_gpu.zig`, applied inside `lin_gpu.gemm`**, so every
 linear the dispatcher runs takes its hits: two bf16 cooperative GEMMs, the B one compacting
@@ -1383,6 +1422,8 @@ commas and the settings line splits on those.
 | nearest-2× upsample | explicit | fused into im2col | fused into im2col | ↤ | — |
 | convrot (Hadamard un-rotate) | `ops/convrot.zig` | `rotate`/`rotate_fwht` | `buildPrep` | ↤ | int8/int4, group 256 |
 | 4-bit decode | `ops/{w4a8,nvfp4}.zig` | `w4a8_decode_t`/`nvfp4_decode_t`/`i4_decode_t` | `w4a8_decode`/`nvfp4_decode` PTX | ↤ | per GEMM into scratch |
+
+The Vulkan tensor-core attention is written once, `models/attn_gpu.zig` (`core` the scores/softmax/P@V loop, `stage` the plain f16 staging, `run` both or `attn_full`), and every diffusion family calls it: krea2 and the SD UNet stage their own operands (fused norm+rope, padded heads), H3 runs a query band against all keys at 8 softmax chunks. The SD VAE's single wide head (`opAttnScoresVae`, query-banded) is a different kernel and stays its own.
 
 `↤ shared` = `cuda` reuses zig-cuda's hand-PTX kernel (only batched GEMM and prefill
 attention differ).
@@ -1750,6 +1791,7 @@ half-computed state), while cancel unwinds between layers via `engine.publishCan
 | **Decode GEMV (dp4a int8)** | ggml `vec_dot` | ❌ (`OpSDot` needs a module the shared one cannot be) | ✅ every arch via `lin_cuda` (`gemv_q*_q8`, `_q8n`, `gemv_dual_*_q8`) | ↤ |
 | Prefill GEMM | `matmul.zig` microkernel | coopmat bf16/f16 + int8 s8→s32 | hand hgemm/igemm/i4gemm, MMQ pipes | **cuBLASLt** |
 | **GDN / gated DeltaNet** (qwen35) | ✅ | `gdn_gates`/`gdn_conv_step`/`gdn_delta_step` | + batched `gdn_conv_batch`, `opGdnDeltaChunk` | ↤ |
+| **GDN grouped v-heads** (an HF checkpoint, `Config.v_group`) | ✅ | ✅ | ✅ both chunk kernels and the step | ↤ |
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
 | **Sampling** (argmax/temp/top-k/top-p/min-p + penalties) | ✅ `llm/sample.zig` | ✅ argmax/top-k select (qwen3) | ✅ (qwen3/qwen35/gemma3/gemma4) | ↤ |
 | **Turn-boundary checkpoint / rollback** | ❌ | ❌ | ✅ qwen3/qwen35/gemma3/gemma4 | ↤ |

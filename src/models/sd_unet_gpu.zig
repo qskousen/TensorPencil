@@ -30,6 +30,7 @@ const sd_unet = @import("sd_unet.zig");
 const conv_gpu = @import("conv_gpu.zig");
 const dev = @import("sd_unet_dev.zig");
 const lin_gpu = @import("lin_gpu.zig");
+const attn_gpu = @import("attn_gpu.zig");
 const lora_gpu = @import("lora_gpu.zig");
 const lora_mod = @import("lora.zig");
 const ops = @import("tp_ops");
@@ -598,53 +599,19 @@ fn selfAttn(ctx: *Context, ws: *Workspace, n: usize, heads: usize, hd: usize) !v
         .f0 = 1.0,
     }, rows / 2, 1, 1);
 
-    // Scores -> two-pass softmax -> P@V, in batches of heads so the O(seq^2)
-    // scores plane stays bounded. This is the path the DiT runs (`dit_gpu`'s
-    // flash switch is off: the recompute pass costs more than the coalesced S
-    // write it saves at these tilings), and the one its kernels are exercised on.
-    const s_stride: u32 = @intCast(seq_pad);
-    const s_plane_elems = seq_pad * seq_pad;
-    const s_plane: u32 = @intCast(s_plane_elems);
-    // Pre-sized by `Workspace.init` from the same function, deliberately:
-    // growing these inside the recording batch would free memory that already
-    // recorded dispatches reference.
-    const hpb = headsPerBatch(seq_pad, heads);
-
-    var h0: usize = 0;
-    while (h0 < heads) : (h0 += hpb) {
-        const hb = @min(hpb, heads - h0);
-        try ctx.opAttnScores(ws.s, ws.qh, ws.kh, .{
-            .u0 = @intCast(heads * tc_head_dim),
-            .u1 = s_stride,
-            .u2 = @intCast(h0),
-            .u3 = 1, // no GQA: one query head per kv head
-            .u4 = @intCast(tc_head_dim * seq_pad),
-            .u5 = s_plane,
-        }, seq_pad / 128, seq_pad / 128, hb);
-        try ctx.opElt(.softmax_partial, ws.s, null, null, ws.part, .{
-            .u0 = @intCast(hb * n * nchunks),
-            .u1 = nchunks,
-            .u2 = @intCast(n),
-            .u3 = s_stride,
-            .u5 = s_plane,
-        }, hb * n * nchunks, 1, 1);
-        try ctx.opElt(.softmax_combine, ws.part, null, null, ws.md, .{
-            .u0 = @intCast(hb * n),
-            .u1 = nchunks,
-            .u2 = @intCast(n),
-            .u3 = s_stride,
-        }, hb * n, 1, 1);
-        try ctx.opAttnOut(ws.s, ws.vh, ws.apad, ws.md, .{
-            .u0 = s_stride,
-            .u1 = s_plane,
-            .u2 = @intCast(h0),
-            .u3 = 1,
-            .u4 = @intCast(heads * tc_head_dim),
-            .u5 = @intCast(heads * tc_head_dim),
-            .f0 = @bitCast(@as(u32, @intCast(n))),
-            .f1 = @bitCast(s_stride), // MD rows per head plane
-        }, seq_pad / 128, hb);
-    }
+    // Scores -> two-pass softmax -> P@V, in batches of heads so the O(seq^2) scores
+    // plane stays bounded. The batch is `Workspace.init`'s, from the same function,
+    // deliberately: growing the scratch inside the recording batch would free memory
+    // that already recorded dispatches reference.
+    try attn_gpu.core(ctx, .{ .s = ws.s, .part = ws.part, .md = ws.md }, ws.qh, ws.kh, ws.vh, ws.apad, .{
+        .q_rows = n,
+        .kv_rows = n,
+        .heads = heads,
+        .kv_heads = heads,
+        .hd = tc_head_dim,
+        .max_hb = headsPerBatch(seq_pad, heads),
+        .nchunks = nchunks,
+    }, null);
 
     try ctx.opElt(.head_unpad, ws.apad, ws.ao, null, null, .{
         .u0 = @intCast(n * heads * hd),

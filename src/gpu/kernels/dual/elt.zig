@@ -68,6 +68,15 @@ pub inline fn siluMul(e: Env, comptime dt: Dt) void {
     e.stT(.a, dt, i, k.silu(e.ldT(.a, dt, i)) * e.ldT(.b, dt, i));
 }
 
+/// MOSS-Image's soft-capped gated pair: a = 4 tanh(b / 4) sigmoid(b) * 25 tanh(a / 25),
+/// a the hidden half and b the gate, both `dt`. u0 = n.
+pub inline fn situ(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const h = e.ldT(.a, dt, i);
+    const g = e.ldT(.b, dt, i);
+    e.stT(.a, dt, i, (4.0 * k.tanh(g * 0.25) * k.sigmoid(g)) * (25.0 * k.tanh(h * 0.04)));
+}
+
 /// a *= sigmoid(b), both `dt`. u0 = n.
 pub inline fn sigmoidMul(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;

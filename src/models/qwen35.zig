@@ -33,6 +33,7 @@ const weights_mod = @import("tp_core").weights;
 const qwen3 = @import("qwen3.zig");
 const ops = @import("tp_ops");
 const loader = @import("loader.zig");
+const quant_weight = @import("quant_weight.zig");
 const kv_cache_mod = @import("tp_core").kv_cache;
 const prof = @import("tp_core").prof;
 
@@ -61,6 +62,16 @@ pub const Config = struct {
     lin_v_heads: usize,
     lin_head_dim: usize,
     conv_kernel: usize,
+    /// Consecutive v-heads per k-head. A GGUF reorders the v-heads tiled
+    /// (v-head h reads k-head h % k_heads, so 1 here); an HF checkpoint keeps
+    /// them grouped (h / (v_heads / k_heads)), and its `out_proj` columns can
+    /// not be permuted to tiled once they are int8 convrot.
+    v_group: usize = 1,
+
+    /// The k-head v-head `h` reads.
+    pub fn kHead(self: Config, h: usize) usize {
+        return (h / self.v_group) % self.lin_k_heads;
+    }
 
     pub fn qDim(self: Config) usize {
         return self.n_heads * self.head_dim;
@@ -143,7 +154,100 @@ pub const Config = struct {
             .conv_kernel = try key(g, "ssm.conv_kernel"),
         };
     }
+
+    /// An HF-named checkpoint (`model.language_model.*`, ComfyUI's text encoder
+    /// files): the dims come off the shapes; RoPE theta, the rotated fraction and
+    /// eps are Qwen3.5's own and appear in no tensor.
+    pub fn detectHf(store: WeightStore) !Config {
+        const pfx = hf_prefix;
+        var buf: [160]u8 = undefined;
+        const embed = store.get(hfName(&buf, pfx, "embed_tokens.weight", null)) orelse return error.UnknownModelConfig;
+        const es = embed.info.shape.slice();
+        if (es.len != 2) return error.UnknownModelConfig;
+        const vocab = es[0];
+        const hidden = es[1];
+
+        var n_layers: usize = 0;
+        var interval: usize = 0;
+        while (store.get(hfName(&buf, pfx, "input_layernorm.weight", n_layers)) != null) : (n_layers += 1) {
+            if (interval == 0 and store.get(hfName(&buf, pfx, "self_attn.q_proj.weight", n_layers)) != null) interval = n_layers + 1;
+        }
+        if (n_layers == 0 or interval < 2 or n_layers % interval != 0) return error.UnknownModelConfig;
+        const at = interval - 1;
+
+        const dim0 = struct {
+            fn f(st: WeightStore, name: []const u8) !usize {
+                const v = st.get(name) orelse return error.UnknownModelConfig;
+                return v.info.shape.slice()[0];
+            }
+        }.f;
+        const head_dim = try dim0(store, hfName(&buf, pfx, "self_attn.q_norm.weight", at));
+        const n_heads = try dim0(store, hfName(&buf, pfx, "self_attn.q_proj.weight", at)) / (2 * head_dim);
+        const n_kv = try dim0(store, hfName(&buf, pfx, "self_attn.k_proj.weight", at)) / head_dim;
+        const inter = try dim0(store, hfName(&buf, pfx, "mlp.gate_proj.weight", 0));
+        const v_heads = try dim0(store, hfName(&buf, pfx, "linear_attn.A_log", 0));
+        const dk = try dim0(store, hfName(&buf, pfx, "linear_attn.norm.weight", 0));
+        const conv_ch = try dim0(store, hfName(&buf, pfx, "linear_attn.in_proj_qkv.weight", 0));
+        const conv = store.get(hfName(&buf, pfx, "linear_attn.conv1d.weight", 0)) orelse return error.UnknownModelConfig;
+        const cs = conv.info.shape.slice();
+        if (conv_ch < v_heads * dk or (conv_ch - v_heads * dk) % (2 * dk) != 0) return error.UnknownModelConfig;
+        const k_heads = (conv_ch - v_heads * dk) / (2 * dk);
+        if (k_heads == 0 or v_heads % k_heads != 0) return error.UnknownModelConfig;
+
+        return .{
+            .n_layers = n_layers,
+            .hidden = hidden,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv,
+            .head_dim = head_dim,
+            .rope_dim = head_dim / 4,
+            .intermediate = inter,
+            .rope_theta = 1e7,
+            .rms_eps = 1e-6,
+            .vocab = vocab,
+            .full_attn_interval = interval,
+            .rope_sections = .{ 11, 11, 10 },
+            .lin_k_heads = k_heads,
+            .lin_v_heads = v_heads,
+            .lin_head_dim = dk,
+            .conv_kernel = cs[cs.len - 1],
+            .v_group = v_heads / k_heads,
+        };
+    }
 };
+
+/// Where an HF checkpoint keeps the language tower.
+pub const hf_prefix = "model.language_model.";
+
+const HfLoader = struct {
+    store: WeightStore,
+    alloc: std.mem.Allocator,
+
+    fn mat(h: HfLoader, name: []const u8, layer: ?usize, rows: usize, cols: usize) !Weight {
+        var buf: [160]u8 = undefined;
+        return quant_weight.load(h.alloc, h.store, hfName(&buf, hf_prefix, name, layer), rows, cols, .{ .who = "qwen35" });
+    }
+
+    fn vec(h: HfLoader, name: []const u8, layer: ?usize, len: usize) ![]f32 {
+        var buf: [160]u8 = undefined;
+        return loader.vector(h.alloc, h.store, hfName(&buf, hf_prefix, name, layer), len);
+    }
+
+    /// A `(1 + w)` RMSNorm weight, stored as the `w` it multiplies by.
+    fn norm(h: HfLoader, name: []const u8, layer: ?usize, len: usize) ![]f32 {
+        const w = try h.vec(name, layer, len);
+        for (w) |*v| v.* += 1;
+        return w;
+    }
+};
+
+fn hfName(buf: []u8, pfx: []const u8, name: []const u8, layer: ?usize) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll(pfx) catch {};
+    if (layer) |l| w.print("layers.{d}.", .{l}) catch {};
+    w.writeAll(name) catch {};
+    return w.buffered();
+}
 
 const Mlp = struct {
     post_norm: []const f32,
@@ -294,6 +398,74 @@ pub const Model = struct {
         };
     }
 
+
+    /// An HF-named checkpoint, applying what llama.cpp's converter bakes into a GGUF:
+    /// `1 + w` on every RMSNorm but the gated one, and `a = -exp(A_log)`. The
+    /// v-heads stay grouped (`Config.v_group`). Linears load through the shared
+    /// quantized-format reader, so an int8 convrot export runs as stored.
+    pub fn loadHf(gpa: std.mem.Allocator, store: WeightStore) !Model {
+        const cfg = try Config.detectHf(store);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const h = HfLoader{ .store = store, .alloc = alloc };
+
+        const embed = try h.mat("embed_tokens.weight", null, cfg.vocab, cfg.hidden);
+        // A text encoder never reads the head; an export without one still loads.
+        const head = if (store.get("lm_head.weight") != null)
+            try quant_weight.load(alloc, store, "lm_head.weight", cfg.vocab, cfg.hidden, .{ .who = "qwen35" })
+        else
+            embed;
+        const final_norm = try h.norm("norm.weight", null, cfg.hidden);
+
+        const layers = try alloc.alloc(Layer, cfg.n_layers);
+        for (layers, 0..) |*layer, l| {
+            const mlp: Mlp = .{
+                .post_norm = try h.norm("post_attention_layernorm.weight", l, cfg.hidden),
+                .gate = try h.mat("mlp.gate_proj.weight", l, cfg.intermediate, cfg.hidden),
+                .up = try h.mat("mlp.up_proj.weight", l, cfg.intermediate, cfg.hidden),
+                .down = try h.mat("mlp.down_proj.weight", l, cfg.hidden, cfg.intermediate),
+            };
+            const input_norm = try h.norm("input_layernorm.weight", l, cfg.hidden);
+            if (cfg.isRecurrent(l)) {
+                const a = try h.vec("linear_attn.A_log", l, cfg.lin_v_heads);
+                for (a) |*v| v.* = -@exp(v.*);
+                layer.* = .{ .linear = .{
+                    .input_norm = input_norm,
+                    .qkv = try h.mat("linear_attn.in_proj_qkv.weight", l, cfg.convChannels(), cfg.hidden),
+                    .z = try h.mat("linear_attn.in_proj_z.weight", l, cfg.linVDim(), cfg.hidden),
+                    .alpha = try h.mat("linear_attn.in_proj_a.weight", l, cfg.lin_v_heads, cfg.hidden),
+                    .beta = try h.mat("linear_attn.in_proj_b.weight", l, cfg.lin_v_heads, cfg.hidden),
+                    .a = a,
+                    .dt_bias = try h.vec("linear_attn.dt_bias", l, cfg.lin_v_heads),
+                    .conv_w = try h.vec("linear_attn.conv1d.weight", l, cfg.convChannels() * cfg.conv_kernel),
+                    .ssm_norm = try h.vec("linear_attn.norm.weight", l, cfg.lin_head_dim),
+                    .out = try h.mat("linear_attn.out_proj.weight", l, cfg.hidden, cfg.linVDim()),
+                    .mlp = mlp,
+                } };
+            } else {
+                layer.* = .{ .attn = .{
+                    .input_norm = input_norm,
+                    .qg = try h.mat("self_attn.q_proj.weight", l, cfg.qDim() * 2, cfg.hidden),
+                    .k = try h.mat("self_attn.k_proj.weight", l, cfg.kvDim(), cfg.hidden),
+                    .v = try h.mat("self_attn.v_proj.weight", l, cfg.kvDim(), cfg.hidden),
+                    .o = try h.mat("self_attn.o_proj.weight", l, cfg.hidden, cfg.qDim()),
+                    .q_norm = try h.norm("self_attn.q_norm.weight", l, cfg.head_dim),
+                    .k_norm = try h.norm("self_attn.k_norm.weight", l, cfg.head_dim),
+                    .mlp = mlp,
+                } };
+            }
+        }
+
+        return .{
+            .arena = arena,
+            .cfg = cfg,
+            .embed = embed,
+            .head = head,
+            .layers = layers,
+            .final_norm = final_norm,
+        };
+    }
 
     /// Every linear the device forwards run, tagged by layer and field, for a backend's
     /// route check at load.
@@ -549,14 +721,14 @@ fn linLayerForward(
         l2NormRows(qc, d, cfg.rms_eps);
         l2NormRows(kc, d, cfg.rms_eps);
 
-        // Per-head delta rule; v-head h uses k-head h % lin_k_heads.
+        // Per-head delta rule; v-head h uses k-head `cfg.kHead(h)`.
         const o_t = s.lin_o[t * vdim ..][0..vdim];
         const _td = prof.tic();
         for (0..heads) |h| {
             const decay = @exp(layer.a[h] * softplus(s.lin_alpha[t * heads + h] + layer.dt_bias[h]));
             const beta = 1.0 / (1.0 + @exp(-s.lin_beta[t * heads + h]));
-            const kh = kc[(h % cfg.lin_k_heads) * d ..][0..d];
-            const qh = qc[(h % cfg.lin_k_heads) * d ..][0..d];
+            const kh = kc[cfg.kHead(h) * d ..][0..d];
+            const qh = qc[cfg.kHead(h) * d ..][0..d];
             const vh = vc[h * d ..][0..d];
             const S = ssm_state[h * d * d ..][0 .. d * d];
 

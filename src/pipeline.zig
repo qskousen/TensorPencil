@@ -62,6 +62,7 @@ const dit_mod = @import("tp_models").models.dit;
 const sensenova = @import("tp_models").models.sensenova;
 const sensenova_cuda = @import("tp_models").models.sensenova_cuda;
 const lin_cuda = @import("tp_models").models.lin_cuda;
+const lin_gpu = @import("tp_models").models.lin_gpu;
 const models_lin = @import("tp_models").models.lin;
 const sensenova_gpu = @import("tp_models").models.sensenova_gpu;
 const zimage = @import("tp_models").models.zimage;
@@ -74,10 +75,17 @@ const minimax_h3_dev = @import("tp_models").models.minimax_h3_dev;
 const anima_dev = @import("tp_models").models.anima_dev;
 const mageflow_dev = @import("tp_models").models.mageflow_dev;
 const mageflow = @import("tp_models").models.mageflow;
+const moss_image = @import("tp_models").models.moss_image;
+const moss_image_text = @import("tp_models").models.moss_image_text;
 const mageflow_text = @import("tp_models").models.mageflow_text;
 const mage_vae = @import("tp_models").models.mage_vae;
 const mageflow_cuda = @import("tp_models").models.mageflow_cuda;
 const mageflow_gpu = @import("tp_models").models.mageflow_gpu;
+const moss_image_cuda = @import("tp_models").models.moss_image_cuda;
+const moss_image_dev = @import("tp_models").models.moss_image_dev;
+const moss_image_gpu = @import("tp_models").models.moss_image_gpu;
+const qwen35_cuda = @import("tp_models").models.qwen35_cuda;
+const qwen35_gpu = @import("tp_models").models.qwen35_gpu;
 const mage_vae_dev = @import("tp_models").models.mage_vae_dev;
 const mage_vae_cuda = @import("tp_models").models.mage_vae_cuda;
 const mage_vae_gpu = @import("tp_models").models.mage_vae_gpu;
@@ -872,7 +880,7 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
         // SenseNova joins them by table rather than by template: its schedule is
         // the same `discrete_flow` shift, and ComfyUI's own workflow leaves the
         // KSampler on `normal`, which over a flow table IS `simple`.
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => .simple,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => .simple,
         .sd15, .sdxl => .normal,
     };
 }
@@ -1650,7 +1658,7 @@ pub const CondNoise = struct {
     /// cache with its own rope index, not a token sequence to append to.
     pub fn concatSupported(f: Family) bool {
         return switch (f) {
-            .krea2, .sd15, .sdxl, .mageflow, .minimax_h3 => true,
+            .krea2, .sd15, .sdxl, .mageflow, .moss_image, .minimax_h3 => true,
             .zimage, .anima, .sensenova => false,
         };
     }
@@ -2257,6 +2265,12 @@ pub const Denoiser = struct {
     mf_vk: ?mageflow_gpu.Session = null,
     mf_vk_neg: ?mageflow_gpu.Session = null,
     mf_vk_ws: ?mageflow_gpu.Workspace = null,
+    mi_cu: ?moss_image_cuda.Session = null,
+    mi_cu_neg: ?moss_image_cuda.Session = null,
+    mi_cu_ws: ?moss_image_cuda.Workspace = null,
+    mi_vk: ?moss_image_gpu.Session = null,
+    mi_vk_neg: ?moss_image_gpu.Session = null,
+    mi_vk_ws: ?moss_image_gpu.Workspace = null,
     zi_cu: ?zimage_cuda.Session = null,
     zi_cu_neg: ?zimage_cuda.Session = null,
     zi_cu_ws: ?zimage_cuda.Workspace = null,
@@ -2305,6 +2319,12 @@ pub const Denoiser = struct {
         if (self.mf_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.mf_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.mf_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.mi_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.mi_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.mi_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.mi_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.mi_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.mi_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
         if (self.zi_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.zi_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.zi_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
@@ -2392,6 +2412,7 @@ pub const Denoiser = struct {
         if (s.family() == .anima) return self.predictAnima(gpa, v_out, latent, sigma, step, cancel);
         if (s.family() == .sensenova) return self.predictSenseNova(gpa, v_out, latent, sigma, cancel);
         if (s.family() == .mageflow) return self.predictMageFlow(gpa, v_out, latent, sigma, cancel);
+        if (s.family() == .moss_image) return self.predictMossImage(gpa, v_out, latent, sigma, cancel);
         const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
@@ -2508,6 +2529,45 @@ pub const Denoiser = struct {
 
         const v_neg = self.v_neg.?;
         try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, self.mf_refs, cancel);
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    fn predictMossImage(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const dit = &s.models.moss_image.dit;
+        std.debug.assert(v_out.len == dit.cfg.channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+
+        if (self.mi_cu) |*cu| {
+            const b = s.cu_be.?;
+            try moss_image_cuda.forward(dit, b, cu, &self.mi_cu_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try moss_image_cuda.forward(dit, b, &self.mi_cu_neg.?, &self.mi_cu_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        if (self.mi_vk) |*vk| {
+            const c = s.gpu_ctx.?;
+            try moss_image_gpu.forward(dit, c, vk, &self.mi_vk_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try moss_image_gpu.forward(dit, c, &self.mi_vk_neg.?, &self.mi_vk_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+
+        try dit.forward(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, self.cond_pos.data, self.cond_pos.seq, cancel);
+        if (self.cfg == 1.0) return;
+        const v_neg = self.v_neg.?;
+        try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
@@ -3045,6 +3105,14 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{ mage_vae.probe, sd_vae.packed_latent_probe } },
             .conditioner2, .decoder2 => error.NoSuchComponent,
         },
+        // MOSS-Image decodes Mage-Flow's latent, so it takes both of its codecs.
+        // The conditioner probe is a DeltaNet tensor, which only a Qwen3.5 has.
+        .moss_image => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{moss_image.probe} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{qwen35_te_probe} },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{ mage_vae.probe, sd_vae.packed_latent_probe } },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
+        },
         // Anima normally BUNDLES its VAE (a single-file checkpoint carrying
         // `first_stage_model.*` alongside `model.diffusion_model.*`) and ships its
         // encoder separately, the opposite split from Z-Image, and the reason
@@ -3276,7 +3344,7 @@ fn encoderConfigFor(fam: Family) ?qwen3.Config {
         .krea2, .mageflow => qwen3.Config.vl_4b,
         .zimage => qwen3.Config.qwen3_4b,
         .anima => qwen3.Config.qwen3_0_6b,
-        .sd15, .sdxl, .sensenova, .minimax_h3 => null,
+        .sd15, .sdxl, .sensenova, .minimax_h3, .moss_image => null,
     };
 }
 
@@ -3332,6 +3400,12 @@ pub const Family = enum {
     /// latent pixel and the latent format is the identity. See
     /// `models/mageflow.zig` and `models/mage_vae.zig`.
     mageflow,
+    /// MOSS-Image, a 42-block SINGLE-stream DiT over Mage-Flow's latent (Flux 2's
+    /// 128 channels at 16x, either codec), patch 1, one modulation shared by
+    /// every block. Its encoder is Qwen3.5-9B, the hybrid DeltaNet LLM, read as
+    /// its final normed state over a template ending in an open think block.
+    /// See `models/moss_image.zig`.
+    moss_image,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -3345,7 +3419,7 @@ pub const Family = enum {
     /// before drawing the control.
     pub fn supportsLora(self: Family) bool {
         return switch (self) {
-            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .sd15, .sdxl => true,
+            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .moss_image, .sd15, .sdxl => true,
         };
     }
 
@@ -3358,7 +3432,8 @@ pub const Family = enum {
             // the model itself, so "even" is not the constraint here; `latentShape`
             // rounds to `tokenPx` instead. Mage-Flow is patch 1: a token IS a
             // latent cell, so there is nothing to pack and no parity to keep.
-            .sd15, .sdxl, .sensenova, .mageflow => false,
+            // MOSS-Image is patch 1 on the same latent.
+            .sd15, .sdxl, .sensenova, .mageflow, .moss_image => false,
         };
     }
 
@@ -3367,7 +3442,7 @@ pub const Family = enum {
     pub fn isVideo(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image => false,
         };
     }
 
@@ -3376,7 +3451,7 @@ pub const Family = enum {
     pub fn hasAudio(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image => false,
         };
     }
 };
@@ -3563,6 +3638,19 @@ pub const MageFlowModels = struct {
     vit: ?minimax_h3_vit.Vit = null,
 };
 
+/// MOSS-Image: three separate files. The encoder is a Qwen3.5 on the host for
+/// now, the decoder either codec for Mage-Flow's latent.
+pub const MossImageModels = struct {
+    enc_st: ?Container,
+    enc: moss_image_text.Encoder,
+    dit_st: Container,
+    dit: moss_image.DiT,
+    vae_st: ?Container,
+    vae: MageFlowVae,
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+};
+
 pub const ZImageModels = struct {
     tok: tokenizer_mod.Tokenizer,
     /// Null when that component came out of the primary checkpoint.
@@ -3667,6 +3755,7 @@ pub const Models = union(Family) {
     minimax_h3: MiniMaxH3Models,
     sensenova: SenseNovaModels,
     mageflow: MageFlowModels,
+    moss_image: MossImageModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -3760,6 +3849,15 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const ps = pv.info.shape.slice();
         if (ts.len >= 1 and ts[0] == mageflow.txt_dim and ps.len >= 1 and ps[0] == mageflow.channels) return .mageflow;
     }
+    // MOSS-Image, ComfyUI's test: the shared block modulation and the fused FFN
+    // projection, both of which only this architecture has.
+    for ((componentSpec(.moss_image, .denoiser) catch unreachable).prefixes) |pfx| {
+        var b1: [96]u8 = undefined;
+        var b2: [96]u8 = undefined;
+        const a = std.fmt.bufPrint(&b1, "{s}" ++ moss_image.probe, .{pfx}) catch continue;
+        const b = std.fmt.bufPrint(&b2, "{s}" ++ moss_image.probe2, .{pfx}) catch continue;
+        if (store.get(a) != null and store.get(b) != null) return .moss_image;
+    }
     return error.UnknownArchitecture;
 }
 
@@ -3768,7 +3866,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => unreachable,
     };
 }
 
@@ -3816,12 +3914,21 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
             .decoder => "models/vae/mage_flow_vae_bf16.safetensors",
             else => "",
         },
+        .moss_image => switch (comp) {
+            .conditioner => "models/text_encoders/qwen3.5_9b.safetensors",
+            .decoder => "models/vae/flux2-vae.safetensors",
+            else => "",
+        },
         else => "",
     };
 }
 
 /// Mage-Flow's `sampling_settings.shift`, from ComfyUI's `MageFlow`.
 pub const mageflow_shift: f32 = 6.0;
+/// ComfyUI's `MOSSImage.sampling_settings.shift`.
+pub const moss_image_shift: f32 = 5.0;
+/// A tensor only a Qwen3.5's DeltaNet layers carry.
+const qwen35_te_probe = "model.language_model.layers.0.linear_attn.A_log";
 
 /// Planar `[c][n]` -> channel-last `[n][c]`, the layout `mage_vae` works in.
 /// The sampler is planar for every family; only this codec's grid is not.
@@ -3866,6 +3973,7 @@ pub fn defaultShift(fam: Family) f32 {
         // ComfyUI's `MageFlow.sampling_settings`, and far higher than any other
         // family's here.
         .mageflow => mageflow_shift,
+        .moss_image => moss_image_shift,
         .sd15, .sdxl => sampler.default_shift,
     };
 }
@@ -3892,6 +4000,8 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // SenseNova conditions on its own trunk's KV cache. There is no encoder to
         // declare a capability, and no fixed token window to interpolate in.
         .sensenova => false,
+        // A Qwen3.5 hidden state, so the same reason as krea2's.
+        .moss_image => false,
         .sd15, .sdxl => clip_text.TextEncoder.supports_prompt_weights,
     };
 }
@@ -3957,6 +4067,7 @@ pub const Session = struct {
             .zimage => |*m| m.dit.device_lins,
             .anima => |*m| m.dit.device_lins,
             .mageflow => |*m| m.dit.device_lins,
+            .moss_image => |*m| m.dit.device_lins,
             .sensenova => |*m| m.dit.device_lins,
             .sd15, .sdxl => |*m| m.unet.device_lins,
             .minimax_h3 => &.{},
@@ -4002,7 +4113,7 @@ pub const Session = struct {
                 .minimax_h3 => .f16,
                 .sd15, .sdxl => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
                 .zimage => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
-                .mageflow => |*m| switch (m.vae) {
+                inline .mageflow, .moss_image => |*m| switch (m.vae) {
                     .anchor => |*v| if (v.cfg.act_f16) .f16 else .f32,
                     // Every narrowed buffer stays under 210 on real renders; the
                     // per-pixel residual, which reaches 3e4, stays f32 at every width.
@@ -4032,11 +4143,13 @@ pub const Session = struct {
         return switch (comp) {
             .encoder => switch (self.models) {
                 inline .krea2, .zimage, .anima, .mageflow, .minimax_h3 => |*m| m.enc.integerKind(),
+                // The Qwen3.5 encode runs on the host.
+                .moss_image => null,
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.clip.device_lins) orelse if (m.clip_g) |*g| models_lin.integerKind(g.device_lins) else null,
                 .sensenova => |*m| models_lin.integerKind(m.dit.prefix_lins),
             },
             .denoiser => switch (self.models) {
-                inline .krea2, .zimage, .anima, .mageflow, .sensenova, .minimax_h3 => |*m| models_lin.integerKind(m.dit.device_lins),
+                inline .krea2, .zimage, .anima, .mageflow, .moss_image, .sensenova, .minimax_h3 => |*m| models_lin.integerKind(m.dit.device_lins),
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.unet.device_lins),
             },
             .vae => null,
@@ -4094,6 +4207,10 @@ pub const Session = struct {
                     if (self.cu_be != null and sensenova_cuda.supported(&m.dit)) return sensenova_dev.streamDtFor(want);
                     if (self.gpu_ctx) |gc| if (sensenova_gpu.supported(gc, &m.dit)) return sensenova_dev.streamDtFor(want);
                 },
+                .moss_image => |*m| {
+                    if (self.cu_be != null and moss_image_cuda.supported(&m.dit)) return moss_image_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (moss_image_gpu.supported(gc, &m.dit)) return moss_image_dev.streamDtFor(want);
+                },
             },
             .vae => switch (self.models) {
                 .sd15, .sdxl, .zimage, .krea2, .anima => if (self.cu_be != null or self.gpu_ctx != null) return want,
@@ -4101,7 +4218,7 @@ pub const Session = struct {
                     if (self.cu_be != null and minimax_h3_vae_cuda.supported(&m.vae)) return want;
                     if (self.gpu_ctx != null and minimax_h3_vae_gpu.supported(&m.vae)) return want;
                 },
-                .mageflow => |*m| switch (m.vae) {
+                inline .mageflow, .moss_image => |*m| switch (m.vae) {
                     .anchor => if (self.cu_be != null or self.gpu_ctx != null) return want,
                     .distilled => |*v| {
                         if (self.cu_be != null and mage_vae_cuda.supported(v)) return want;
@@ -4127,6 +4244,7 @@ pub const Session = struct {
                     if (self.gpu_ctx) |gc| if (sensenova_gpu.supported(gc, &m.dit)) return sensenova_dev.streamDtFor(want);
                     if (want != .f32 and self.encoderIntWeights()) return want;
                 },
+                .moss_image => {},
             },
         }
         return .f32;
@@ -4225,9 +4343,18 @@ pub const Session = struct {
         return if (self.sd_vk_lora_ok.?) gc else null;
     }
 
+    /// The decoder of a family that renders Mage-Flow's latent.
+    fn mageVae(self: *Session) ?*MageFlowVae {
+        return switch (self.models) {
+            .mageflow => |*m| &m.vae,
+            .moss_image => |*m| &m.vae,
+            else => null,
+        };
+    }
+
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => null,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -4244,6 +4371,7 @@ pub const Session = struct {
             .minimax_h3 => |*m| m.dit_st.store(),
             .sensenova => |*m| m.dit_st.store(),
             .mageflow => |*m| m.dit_st.store(),
+            .moss_image => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
@@ -4317,6 +4445,7 @@ pub const Session = struct {
     fn loraKeys(self: *const Session) []const lora_mod.Rename {
         return switch (self.models) {
             .zimage => &zimage.lora_keys,
+            .moss_image => |*m| if (m.dit.cfg.fused_qkv) &moss_image.lora_keys_fused else &.{},
             else => &.{},
         };
     }
@@ -4331,6 +4460,7 @@ pub const Session = struct {
             .zimage => |*m| m.dit.lora = null,
             .anima => |*m| m.dit.detachLora(),
             .mageflow => |*m| m.dit.lora = null,
+            .moss_image => |*m| m.dit.lora = null,
             .sd15, .sdxl => |*m| {
                 m.unet.lora = null;
                 m.clip.lora = null;
@@ -4495,7 +4625,7 @@ pub const Session = struct {
                 return n;
             },
             // Each walks every linear it runs; the int8 A is for the device trunk.
-            inline .krea2, .zimage, .anima, .mageflow => |*m| {
+            inline .krea2, .zimage, .anima, .mageflow, .moss_image => |*m| {
                 const n = try m.dit.attachLora(self.gpa, stack);
                 if (self.cu_be != null) try lin_cuda.quantizeLora(self.gpa, stack, m.dit.device_lins, lin_cuda.blockq_gemm, .w8a8);
                 return n;
@@ -4540,6 +4670,7 @@ pub const Session = struct {
             .minimax_h3 => |*m| m.dit_st.payloadLen(),
             .sensenova => |*m| m.dit_st.payloadLen(),
             .mageflow => |*m| m.dit_st.payloadLen(),
+            .moss_image => |*m| m.dit_st.payloadLen(),
             .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
@@ -4759,6 +4890,51 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .mageflow = m };
             },
+            .moss_image => {
+                var m: MossImageModels = .{
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try moss_image.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
+                m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                m.enc_view = enc_r.view;
+                m.enc = try moss_image_text.Encoder.load(gpa, enc_r.store);
+                errdefer m.enc.deinit();
+                if (m.enc.hidden() != m.dit.cfg.txt_dim) {
+                    std.log.err("moss-image: the text encoder is {d} wide, the DiT reads {d}", .{ m.enc.hidden(), m.dit.cfg.txt_dim });
+                    return error.ShapeMismatch;
+                }
+
+                const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
+                m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = if (vae_r.store.get(mage_vae.probe) != null)
+                    .{ .distilled = try mage_vae.MageVae.load(gpa, vae_r.store, "") }
+                else
+                    .{ .anchor = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux2, "") };
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .moss_image = m };
+            },
             .anima => {
                 var m: AnimaModels = .{
                     .tok = undefined,
@@ -4943,7 +5119,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => unreachable,
                 };
             },
             // One file, one model: the prompt is encoded by the trunk's own
@@ -5095,6 +5271,13 @@ pub const Session = struct {
         if (self.family() == .mageflow) {
             const fresh = try mageflow.DiT.load(self.gpa, store);
             const m = &self.models.mageflow;
+            m.dit.deinit();
+            m.dit = fresh;
+            return;
+        }
+        if (self.family() == .moss_image) {
+            const fresh = try moss_image.DiT.load(self.gpa, store);
+            const m = &self.models.moss_image;
             m.dit.deinit();
             m.dit = fresh;
             return;
@@ -5301,6 +5484,18 @@ pub const Session = struct {
                 m.dit_st.deinit();
                 m.tok.deinit();
             },
+            .moss_image => |*m| {
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+            },
             .anima => |*m| {
                 m.vae.deinit();
                 m.dit.deinit();
@@ -5391,6 +5586,8 @@ pub const Session = struct {
             // `ModelSamplingDiscreteFlow` at multiplier 1.0, like Z-Image's; only
             // the shift differs, and it is large (6.0).
             .mageflow => .{ .discrete_flow = shift },
+            // `ModelSamplingDiscreteFlow` again, at shift 5.
+            .moss_image => .{ .discrete_flow = shift },
             // `SenseNovaModelSampling` subclasses `ModelSamplingDiscreteFlow`, so
             // this is the same 1000-rung table again. Only the default shift
             // differs (3.0), and that is `defaultShift`'s answer, not this one's.
@@ -5455,7 +5652,7 @@ pub const Session = struct {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
-            .krea2, .zimage, .anima, .minimax_h3, .mageflow => sampler.scaleInitialNoise(x, sigma0),
+            .krea2, .zimage, .anima, .minimax_h3, .mageflow, .moss_image => sampler.scaleInitialNoise(x, sigma0),
             // The one family whose initial noise is not unit variance. Leaving the
             // scale out does not soften the image, it renders noise.
             .sensenova => {
@@ -5480,7 +5677,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow => .flow,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -5520,6 +5717,7 @@ pub const Session = struct {
             // Not a latent: SenseNova's canvas is the RGB image itself.
             .sensenova => sensenova.latent_channels,
             .mageflow => mageflow.channels,
+            .moss_image => |*m| m.dit.cfg.channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -5953,6 +6151,7 @@ pub const Session = struct {
             // twelve encoder layers, the other three tap one.
             .krea2 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .mageflow => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            .moss_image => |*m| .{ .rows = c.seq, .segs = 1, .w = m.enc.hidden() },
             .zimage => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .minimax_h3 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             // The adapter's rows, pad rows included: they are attended to, so they
@@ -5999,7 +6198,7 @@ pub const Session = struct {
             // extent renders.
             .sensenova => sensenova.spatial_scale,
             // 16, and it is the VAE's patch: one latent cell is one 16x16 tile.
-            .mageflow => mage_vae.spatial_scale,
+            .mageflow, .moss_image => mage_vae.spatial_scale,
         };
     }
 
@@ -6070,7 +6269,7 @@ pub const Session = struct {
             // Not an approximation: the canvas IS the image, so the preview is the
             // decode.
             .sensenova => sensenova.canvasToRgb(rgb_out, z, h * w),
-            .mageflow => mage_vae.latentPreviewInto(rgb_out, z, h, w),
+            .mageflow, .moss_image => mage_vae.latentPreviewInto(rgb_out, z, h, w),
             .sd15 => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
             .sdxl => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
         }
@@ -6430,6 +6629,12 @@ pub const Session = struct {
                 return .{ .data = data, .seq = seq };
             },
             .mageflow => |*m| return self.encodeMageFlow(gpa, m, text, o),
+            .moss_image => |*m| {
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(gpa);
+                try moss_image_text.buildIds(&m.enc.tok, gpa, text, &ids);
+                return .{ .data = try self.runQwen35(gpa, &m.enc, ids.items), .seq = ids.items.len };
+            },
             .sd15 => |*m| {
                 var p = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
                 defer p.deinit(gpa);
@@ -6996,6 +7201,35 @@ pub const Session = struct {
                     }
                     const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
                     d.mf_vk_ws = try mageflow_gpu.Workspace.init(gc, &m.dit, seq_txt_cap, n_tok, self.actFor(.denoiser));
+                }
+            }
+            return d;
+        }
+
+        if (self.family() == .moss_image) {
+            const m = &self.models.moss_image;
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, m.dit.cfg.channels * lat_h * lat_w);
+            if (self.cu_be) |b| {
+                if (moss_image_cuda.supported(&m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.mi_cu = try moss_image_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+                    if (cond_neg) |cn| d.mi_cu_neg = try moss_image_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cn.data, cn.seq, sigmas);
+                    const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.mi_cu_ws = try moss_image_cuda.Workspace.init(b, &m.dit, lat_h * lat_w, seq_txt_cap, self.actFor(.denoiser));
+                } else {
+                    std.log.warn("MOSS-Image: this checkpoint's weight dtype has no CUDA GEMM path; the trunk runs on the CPU.", .{});
+                }
+            } else if (self.gpu_ctx) |gc| {
+                if (moss_image_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.mi_vk = try moss_image_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+                    if (cond_neg) |cn| d.mi_vk_neg = try moss_image_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn.data, cn.seq, sigmas);
+                    const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |cn| cn.seq else 0);
+                    d.mi_vk_ws = try moss_image_gpu.Workspace.init(gc, &m.dit, lat_h * lat_w, seq_txt_cap, self.actFor(.denoiser));
+                } else {
+                    std.log.warn("MOSS-Image: this checkpoint's weight dtype has no Vulkan GEMM path; the trunk runs on the CPU.", .{});
                 }
             }
             return d;
@@ -8671,6 +8905,32 @@ pub const Session = struct {
         };
     }
 
+    /// A Qwen3.5 text encoder's final-normed states for `ids`, on whichever device the
+    /// session has. Its integer weights run the encoder dial's arithmetic. Caller frees.
+    fn runQwen35(self: *Session, gpa: std.mem.Allocator, enc: *const moss_image_text.Encoder, ids: []const u32) ![]f32 {
+        const out = try gpa.alloc(f32, ids.len * enc.hidden());
+        errdefer gpa.free(out);
+        const cap = @import("tp_core").kv_cache.Capacity.fixed(ids.len);
+        if (self.cu_be) |b| {
+            var use = lin_cuda.Use.llm(qwen35_cuda.CudaLM.prefill_batch);
+            use.int8 = lin_cuda.dual_lin.encoderInt8();
+            var lm = try qwen35_cuda.CudaLM.initUse(gpa, b, &enc.lm, cap, use);
+            defer lm.deinit();
+            try lm.encode(ids, out);
+        } else if (self.gpu_ctx) |gc| {
+            var use = lin_gpu.Use.llm(qwen35_gpu.VulkanLM.prefill_batch);
+            use.int8 = lin_cuda.dual_lin.encoderInt8();
+            var lm = try qwen35_gpu.VulkanLM.initUse(gpa, gc, &enc.lm, cap, use);
+            defer lm.deinit();
+            try lm.encode(ids, out);
+        } else {
+            const host = try enc.encodeIds(self.io, gpa, ids);
+            defer gpa.free(host);
+            @memcpy(out, host);
+        }
+        return out;
+    }
+
     /// Mage-Flow's conditioning, text-only or with reference pictures.
     /// `mageflow_text.prepare` owns the presentation; this adds the encode and
     /// the prefix strip.
@@ -9199,15 +9459,15 @@ pub const Session = struct {
         // whole-image decode is already bounded. `decodePlanar`'s ladder would
         // have nothing to recover from and its tiles would cut the CoD decoder's
         // 32x32 attention windows.
-        if (self.family() == .mageflow) {
-            const m = &self.models.mageflow;
+        // MOSS-Image renders into the same latent and takes either codec too.
+        if (self.mageVae()) |vae| {
             if (latent.len != mageflow.channels * lat_h * lat_w) return error.LatentSizeMismatch;
             self.setMemTag(.vae);
             try note(progress, "decoding latent...\n", .{});
             const dec_start = std.Io.Clock.real.now(io);
             const width = lat_w * mage_vae.spatial_scale;
             const height = lat_h * mage_vae.spatial_scale;
-            const out: Image = switch (m.vae) {
+            const out: Image = switch (vae.*) {
                 .distilled => |*v| blk: {
                     const z = try planarToInterleaved(gpa, latent, mageflow.channels, lat_h * lat_w);
                     defer gpa.free(z);
@@ -10110,8 +10370,8 @@ test "the live preview follows the family's own latent format" {
     defer gpa.free(rgb);
 
     var sess: Session = init_defaults.of(Session);
-    var prev: [8][]u8 = undefined;
-    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3, Family.sensenova, Family.mageflow }, 0..) |fam, fi| {
+    var prev: [9][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3, Family.sensenova, Family.mageflow, Family.moss_image }, 0..) |fam, fi| {
         sess.models = switch (fam) {
             .krea2 => .{ .krea2 = undefined },
             .sd15 => .{ .sd15 = undefined },
@@ -10121,6 +10381,7 @@ test "the live preview follows the family's own latent format" {
             .minimax_h3 => .{ .minimax_h3 = undefined },
             .sensenova => .{ .sensenova = undefined },
             .mageflow => .{ .mageflow = undefined },
+            .moss_image => .{ .moss_image = undefined },
         };
         const ch: usize = switch (fam) {
             .krea2 => wan_vae.latent_channels,
@@ -10128,7 +10389,7 @@ test "the live preview follows the family's own latent format" {
             .anima => anima.latent_channels,
             .minimax_h3 => minimax_h3.latent_channels,
             .sensenova => sensenova.latent_channels,
-            .mageflow => mageflow.channels,
+            .mageflow, .moss_image => mageflow.channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };
         // Exactly the family's channel count, a read one plane past the end is an
@@ -10152,6 +10413,8 @@ test "the live preview follows the family's own latent format" {
     // asserts the sharing is deliberate rather than a fall-through.
     try std.testing.expectEqualSlices(u8, prev[0], prev[4]);
     try std.testing.expect(!std.mem.eql(u8, prev[3], prev[4]));
+    // MOSS-Image renders into Mage-Flow's latent format.
+    try std.testing.expectEqualSlices(u8, prev[7], prev[8]);
 }
 
 test "downsampleLatent box-averages every plane of a non-krea2 latent" {

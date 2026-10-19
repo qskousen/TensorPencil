@@ -13,6 +13,7 @@ const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 const lin_gpu = @import("lin_gpu.zig");
 const minimax_h3_dev = @import("minimax_h3_dev.zig");
+const attn_gpu = @import("attn_gpu.zig");
 
 const DiT = minimax_h3.DiT;
 const Context = gpu.Context;
@@ -355,51 +356,21 @@ const Dev = struct {
         }
 
         const q_pad = minimax_h3_dev.padRows(rows);
-        const kv_pad = minimax_h3_dev.padRows(seq);
-        const nchunks = Workspace.nchunks;
         try ctx.opElt(.f32_to_h16, ws.q_d, null, null, ws.qh_d, .{
             .u0 = @intCast(q_pad * inner / 2),
             .u1 = @intCast(rows * inner),
             .f0 = scale,
         }, q_pad * inner / 2, 1, 1);
-
-        // The softmax couples its row count to the valid key count only through
-        // `q % u2`, which holds for any band no longer than the sequence.
-        const s_plane: u32 = @intCast(q_pad * kv_pad);
-        var h0: usize = 0;
-        while (h0 < heads) : (h0 += 1) {
-            try ctx.opAttnScores(ws.s_d, ws.qh_d, ws.kh_d, .{
-                .u0 = @intCast(inner),
-                .u1 = @intCast(kv_pad),
-                .u2 = @intCast(h0),
-                .u3 = 1,
-                .u4 = @intCast(hd * kv_pad),
-                .u5 = s_plane,
-            }, kv_pad / 128, q_pad / 128, 1);
-            try ctx.opElt(.softmax_partial, ws.s_d, null, null, ws.part_d, .{
-                .u0 = @intCast(rows * nchunks),
-                .u1 = @intCast(nchunks),
-                .u2 = @intCast(seq),
-                .u3 = @intCast(kv_pad),
-                .u5 = s_plane,
-            }, rows * nchunks, 1, 1);
-            try ctx.opElt(.softmax_combine, ws.part_d, null, null, ws.md_d, .{
-                .u0 = @intCast(rows),
-                .u1 = @intCast(nchunks),
-                .u2 = @intCast(seq),
-                .u3 = @intCast(q_pad),
-            }, rows, 1, 1);
-            try ctx.opAttnOut(ws.s_d, ws.v16_d, ws.attn_d, ws.md_d, .{
-                .u0 = @intCast(kv_pad),
-                .u1 = s_plane,
-                .u2 = @intCast(h0),
-                .u3 = 1,
-                .u4 = @intCast(inner),
-                .u5 = @intCast(inner),
-                .f0 = @bitCast(@as(u32, @intCast(seq))),
-                .f1 = @bitCast(@as(u32, @intCast(q_pad))),
-            }, q_pad / 128, 1);
-        }
+        // One head at a time: the scratch is sized for one band's plane.
+        try attn_gpu.core(ctx, .{ .s = ws.s_d, .part = ws.part_d, .md = ws.md_d }, ws.qh_d, ws.kh_d, ws.v16_d, ws.attn_d, .{
+            .q_rows = rows,
+            .kv_rows = seq,
+            .heads = heads,
+            .kv_heads = heads,
+            .hd = hd,
+            .max_hb = 1,
+            .nchunks = Workspace.nchunks,
+        }, null);
     }
 
     pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {

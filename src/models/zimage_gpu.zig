@@ -35,6 +35,7 @@ const zimage = @import("zimage.zig");
 const zimage_dev = @import("zimage_dev.zig");
 const lin = @import("lin.zig");
 const lin_gpu = @import("lin_gpu.zig");
+const attn_gpu = @import("attn_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -43,34 +44,10 @@ const File = @This();
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// Two-pass softmax chunk count, 32 interleaved chunks per row so a warp covers a
-/// row with coalesced reads. Same value `dit_gpu` uses.
-const nchunks = 32;
-/// Cap on the materialized attention-scores buffer; heads batch to fit it.
-const s_bytes_cap: usize = 2 << 30;
-
 /// Force the correctness-first `attn_full` path even where the tensor-core scores
 /// pipeline exists. For A/B and for reproducing a mismatch; the device test runs both.
 pub var force_attn_full: bool = false;
 
-
-/// How many heads share one scores plane, given the plane size and a byte budget.
-fn headsPerBatch(cfg: zimage.Config, rows_pad: usize, cap: usize, ws_s_bytes: ?usize) usize {
-    const plane = rows_pad * rows_pad * 2; // f16 scores
-    var hb = @max(1, @min(cfg.n_heads, cap / @max(plane, 1)));
-    if (ws_s_bytes) |c| hb = @max(1, @min(hb, c / @max(plane, 1)));
-    return hb;
-}
-
-fn scoresCap(budget: u64) usize {
-    if (budget == 0) return s_bytes_cap;
-    return @min(s_bytes_cap, @max(64 << 20, budget / 4));
-}
-
-/// Whether the tensor-core scores/PV pipeline is available and wanted.
-fn useTensorCoreAttn(ctx: *gpu.Context) bool {
-    return !force_attn_full and ctx.pipe_scores != .null_handle;
-}
 
 /// Per-image cache: everything constant across sampling steps.
 pub const Session = struct {
@@ -257,18 +234,11 @@ pub const Workspace = struct {
     mu_d: Buf,
     mv_d: Buf, // the whole modulation table for this step
     imgin_d: Buf, // [n_img][patchDim] raw patches
-    // Tensor-core attention operands and scratch. Sized for the TRUNK sequence,
-    // which is the longer of the two the forward runs (the `noise_refiner` sees only
-    // the image half), and `hb` is recomputed per call from `s_d.size` so a shorter
-    // sequence just batches more heads at once.
-    qt_d: Buf, // f16 [rows_pad][q_dim], softmax scale prefolded
-    kt_d: Buf, // f16 per-head k-major [kv_heads][hd][rows_pad]
-    v16_d: Buf, // f16 [rows_pad][kv_dim]
-    s_d: Buf, // f16 [hb][rows_pad][rows_pad]
-    part_d: Buf,
-    md_d: Buf,
+    /// Sized for the TRUNK sequence, the longer of the two the forward runs (the
+    /// `noise_refiner` sees only the image half); a shorter one batches more heads.
+    attn: attn_gpu.Scratch,
 
-    const fields = [_][]const u8{ "x_d", "img_d", "nrm_d", "dlt_d", "q_d", "k_d", "v_d", "attn_d", "mg_d", "mu_d", "mv_d", "imgin_d", "qt_d", "kt_d", "v16_d", "s_d", "part_d", "md_d" };
+    const fields = [_][]const u8{ "x_d", "img_d", "nrm_d", "dlt_d", "q_d", "k_d", "v_d", "attn_d", "mg_d", "mu_d", "mv_d", "imgin_d" };
 
     pub fn init(ctx: *gpu.Context, model: *const DiT, lat_h: usize, lat_w: usize, cap_padded_cap: usize, act: gpu.Dt) !Workspace {
         const cfg = model.cfg;
@@ -276,8 +246,6 @@ pub const Workspace = struct {
         const img_padded = cfg.padded(n_img);
         const seq = cap_padded_cap + img_padded;
         const seq_pad = std.mem.alignForward(usize, seq, 128);
-        const tc = useTensorCoreAttn(ctx);
-        const hpb = if (tc) headsPerBatch(cfg, seq_pad, scoresCap(ctx.budget_override), null) else 1;
         const ew = act.bytes();
         const sizes = [fields.len]usize{
             seq * cfg.dim * ew,
@@ -295,12 +263,6 @@ pub const Workspace = struct {
             seq_pad * cfg.mlp_dim * ew,
             (model.modulatedBlocks() * 4 * cfg.dim + cfg.dim) * 4,
             n_img * cfg.patchDim() * 4,
-            if (tc) seq_pad * cfg.qDim() * 2 else 16,
-            if (tc) cfg.kvDim() * seq_pad * 2 else 16,
-            if (tc) seq_pad * cfg.kvDim() * 2 else 16,
-            if (tc) hpb * seq_pad * seq_pad * 2 else 16,
-            if (tc) hpb * seq * nchunks * 2 * 4 else 16,
-            if (tc) hpb * seq_pad * 2 * 4 else 16,
         };
         var self: Workspace = undefined;
         var made: usize = 0;
@@ -311,6 +273,7 @@ pub const Workspace = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             made += 1;
         }
+        self.attn = try attn_gpu.Scratch.init(ctx, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, attn_gpu.s_bytes_cap);
         // The attention block stays f32 (`zimage_cuda.Workspace.act` says why).
         inline for (.{ "x_d", "img_d", "nrm_d", "dlt_d", "mg_d", "mu_d" }) |name| @field(self, name).dt = act;
         return self;
@@ -318,6 +281,7 @@ pub const Workspace = struct {
 
     pub fn deinit(self: *Workspace, ctx: *gpu.Context) void {
         inline for (fields) |name| ctx.tensorDestroy(&@field(self, name));
+        self.attn.deinit(ctx);
         self.* = undefined;
     }
 };
@@ -503,100 +467,16 @@ const Dev = struct {
 };
 
 /// Attention over `rows` positions, q/k/v already normed and rope'd in `ws.q_d`/`k_d`/
-/// `v_d`, result into `ws.attn_d`. Both paths are non-causal and mathematically the
-/// same; they differ in how the scores are produced.
-///
-/// The tensor-core path is not an optimization here, it is a requirement.
-/// `attn_full` is one thread per (query, head) looping every key, which at a 1056x1584
-/// render (~6800 tokens) runs long enough to trip the GPU watchdog,
-/// `error_device_lost`, not a slow render. It stays as the reference the device test
-/// compares against, and as the fallback where `pipe_scores` is absent.
+/// `v_d`, result into `ws.attn_d`. `attn_full` is the reference the device test holds
+/// the tensor-core path to (`attn_gpu`).
 fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize, scale: f32) !void {
-    const heads = cfg.n_heads;
-    const kv_heads = cfg.n_kv_heads;
-    const hd = cfg.head_dim;
-    const q_dim = cfg.qDim();
-    const kv_dim = cfg.kvDim();
-
-    if (!useTensorCoreAttn(ctx)) {
-        return ctx.opElt(.attn_full, ws.q_d, ws.k_d, ws.v_d, ws.attn_d, .{
-            .u0 = @intCast(rows),
-            .u1 = @intCast(heads),
-            .u2 = @intCast(kv_heads),
-            .u3 = @intCast(hd),
-            .f0 = scale,
-        }, rows * heads, 1, 1);
-    }
-
-    const rows_pad = std.mem.alignForward(usize, rows, 128);
-    // f16 operands: Q with the softmax scale prefolded and zero pad rows, K per-head
-    // k-major with zero pad columns, V with zero pad rows, so padded keys score 0 and
-    // padded-j probabilities contribute nothing to P@V.
-    ctx.independent(3);
-    try ctx.opElt(.f32_to_h16, ws.q_d, null, null, ws.qt_d, .{
-        .u0 = @intCast(rows_pad * q_dim / 2),
-        .u1 = @intCast(rows * q_dim),
-        .f0 = scale,
-    }, rows_pad * q_dim / 2, 1, 1);
-    try ctx.opElt(.gather_kmajor_h16, ws.k_d, null, null, ws.kt_d, .{
-        .u0 = @intCast(kv_dim * rows_pad / 2),
-        .u1 = @intCast(hd),
-        .u2 = @intCast(rows_pad),
-        .u3 = @intCast(rows),
-        .u4 = @intCast(kv_heads),
-    }, kv_dim * rows_pad / 2, 1, 1);
-    try ctx.opElt(.f32_to_h16, ws.v_d, null, null, ws.v16_d, .{
-        .u0 = @intCast(rows_pad * kv_dim / 2),
-        .u1 = @intCast(rows * kv_dim),
-        .f0 = 1.0,
-    }, rows_pad * kv_dim / 2, 1, 1);
-
-    // Recomputed per call, not taken from `Workspace.init`: the two sequence
-    // lengths a forward runs (image half, then the joint sequence) give different
-    // plane sizes, and the buffers were sized for the longer one.
-    const plane = rows_pad * rows_pad * 2;
-    var hb_cap = headsPerBatch(cfg, rows_pad, scoresCap(ctx.budget_override), ws.s_d.size);
-    hb_cap = @max(1, @min(hb_cap, ws.part_d.size / @max(rows * nchunks * 2 * 4, 1)));
-    hb_cap = @max(1, @min(hb_cap, ws.md_d.size / @max(rows_pad * 2 * 4, 1)));
-    std.debug.assert(hb_cap * plane <= ws.s_d.size);
-
-    const s_stride: u32 = @intCast(rows_pad);
-    const s_plane: u32 = @intCast(rows_pad * rows_pad);
-    var h0: usize = 0;
-    while (h0 < heads) : (h0 += hb_cap) {
-        const hb = @min(hb_cap, heads - h0);
-        try ctx.opAttnScores(ws.s_d, ws.qt_d, ws.kt_d, .{
-            .u0 = @intCast(q_dim),
-            .u1 = s_stride,
-            .u2 = @intCast(h0),
-            .u3 = @intCast(heads / kv_heads),
-            .u4 = @intCast(hd * rows_pad),
-            .u5 = s_plane,
-        }, rows_pad / 128, rows_pad / 128, hb);
-        try ctx.opElt(.softmax_partial, ws.s_d, null, null, ws.part_d, .{
-            .u0 = @intCast(hb * rows * nchunks),
-            .u1 = nchunks,
-            .u2 = @intCast(rows),
-            .u3 = s_stride,
-            .u5 = s_plane,
-        }, hb * rows * nchunks, 1, 1);
-        try ctx.opElt(.softmax_combine, ws.part_d, null, null, ws.md_d, .{
-            .u0 = @intCast(hb * rows),
-            .u1 = nchunks,
-            .u2 = @intCast(rows),
-            .u3 = s_stride,
-        }, hb * rows, 1, 1);
-        try ctx.opAttnOut(ws.s_d, ws.v16_d, ws.attn_d, ws.md_d, .{
-            .u0 = s_stride,
-            .u1 = s_plane,
-            .u2 = @intCast(h0),
-            .u3 = @intCast(heads / kv_heads),
-            .u4 = @intCast(kv_dim),
-            .u5 = @intCast(q_dim),
-            .f0 = @bitCast(@as(u32, @intCast(rows))),
-            .f1 = @bitCast(s_stride), // MD rows per head plane
-        }, rows_pad / 128, hb);
-    }
+    try attn_gpu.run(ctx, &ws.attn, ws.q_d, ws.k_d, ws.v_d, ws.attn_d, .{
+        .rows = rows,
+        .heads = cfg.n_heads,
+        .kv_heads = cfg.n_kv_heads,
+        .hd = cfg.head_dim,
+        .scale = scale,
+    }, force_attn_full);
 }
 
 /// Weighted RMSNorm over `[rows][dim]`, `x -> out` (may alias).
@@ -821,7 +701,7 @@ test "Z-Image gpu forward matches the CPU forward on a real checkpoint" {
     defer force_attn_full = saved;
     for ([_]bool{ true, false }) |full| {
         force_attn_full = full;
-        if (!full and !useTensorCoreAttn(ctx)) continue; // no scores pipeline here
+        if (!full and !attn_gpu.tensorCores(ctx)) continue; // no scores pipeline here
 
         var sess = try Session.init(gpa, io, ctx, &model, lat, lat, cap, cap_padded, &.{ sigma, 0 });
         defer sess.deinit(gpa, ctx);

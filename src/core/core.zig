@@ -47,6 +47,8 @@ pub const t5_tokenizer = @import("t5_tokenizer.zig");
 pub const prompt_a1111 = @import("prompt_a1111.zig");
 pub const jinja = @import("jinja.zig");
 pub const unicode_tables = @import("unicode_tables.zig");
+/// Unicode NFC, which transformers applies to a prompt before a Qwen tokenizer splits it.
+pub const nfc = @import("nfc.zig");
 pub const image = @import("image.zig");
 /// Waveform container I/O (WAV) and torchaudio-compatible rate conversion.
 pub const audio = @import("audio.zig");
@@ -61,6 +63,7 @@ pub const prof = @import("prof.zig");
 
 test {
     _ = dtype;
+    _ = nfc;
     _ = tensor;
     _ = quants;
     _ = quants_fixtures;

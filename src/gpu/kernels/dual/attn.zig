@@ -254,7 +254,8 @@ pub inline fn attnMerge(e: Env) void {
 /// a = S [heads][D][D], b = conv_out [n][channels] (`[q | k | v]` per token),
 /// c = gates [n][2 * heads] (`[decay | beta]`), d = o [n][heads * D].
 /// u0 = heads (one thread per head and column, so not the thread count), u2 = k_heads,
-/// u3 = n, u4 = channels. f0 = the readout scale.
+/// u3 = n, u4 = channels, u5 = consecutive v-heads per k-head (0 or 1: tiled, v-head h
+/// reads k-head h % k_heads). f0 = the readout scale.
 pub inline fn gdnDeltaChunk(e: Env, comptime D: u32) void {
     @setEvalBranchQuota(16 * D);
     const heads = e.u(0);
@@ -267,8 +268,9 @@ pub inline fn gdnDeltaChunk(e: Env, comptime D: u32) void {
     const sbase = h * D * D;
     var s: [D]f32 = undefined;
     inline for (0..D) |i_| s[i_] = e.ld(.a, sbase + @as(u32, @intCast(i_)) * D + j);
-    const qoff = (h % kh) * D;
-    const koff = kh * D + (h % kh) * D;
+    const kidx = (h / @max(e.u(5), 1)) % kh;
+    const qoff = kidx * D;
+    const koff = kh * D + kidx * D;
     const voff = 2 * kh * D + h * D;
     var t: u32 = 0;
     while (t < e.u(3)) : (t += 1) {

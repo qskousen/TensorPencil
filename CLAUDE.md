@@ -446,6 +446,7 @@ of the stage API works on every family.
 | `anima` | `models/anima.zig` (Cosmos-Predict2 + LLM adapter) | Qwen3-0.6B + T5 | Wan 2.1 | 16 |
 | `sensenova` | `models/sensenova.zig` (Qwen3-shaped MoT trunk) | the trunk's own base copy | none (pixel space) | 3 |
 | `mageflow` | `models/mageflow.zig` (double-stream MMDiT) | Qwen3-VL 4B | Mage-VAE (16x) | 128 |
+| `moss_image` | `models/moss_image.zig` (single-stream, patch 1) | Qwen3.5 9B (HF) | Mage-Flow's (either codec) | 128 |
 
 - **SenseNova is not a DiT and has no side components.** One 8B trunk carries TWO
   weight copies per layer: the prompt runs the base copy causally and leaves a KV
@@ -489,6 +490,12 @@ of the stage API works on every family.
   resolution for the VAE, because Mage's RoPE aligns reference and target by
   POSITION. Feeding both one extent, which is what MiniMax H3 deliberately does,
   misaligns the edit. The same references go on both CFG branches.
+- **MOSS-Image's encoder is an HF-named Qwen3.5, whose DeltaNet V heads are GROUPED**
+  (v-head h reads k-head h / (v/k)) where a GGUF's are tiled (h % k); `Config.v_group`
+  carries it into every GDN kernel, since permuting the heads would permute an int8
+  convrot `out_proj`'s columns. ComfyUI runs this checkpoint with int8 attention, which
+  alone moves its render 16 dB; `tools/gen_moss_image_render.py --no-int8-attention` is
+  the comparison that means something.
 - **The family is detected from the denoiser's own tensor names** (`detectFamily`), never
   from a flag. SDXL must be tested before SD1.5 (both are LDM UNets; `label_emb` is what
   distinguishes them), and Anima is identified by its LLM adapter, not its trunk, which it

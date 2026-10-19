@@ -141,6 +141,8 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             // Not a side file: SenseNova's "conditioner" is the trunk's own
             // understanding half, in the checkpoint the denoiser came from.
             .sensenova => dims.len == 2 and dims[1] == models.sensenova.u15_8b.dim,
+            // The probe is a DeltaNet `A_log`, `[v_heads]`; `storeFits` checks the width.
+            .moss_image => dims.len == 1,
             .sd15, .sdxl => dims.len == 1 and dims[0] == models.clip_text.clip_l.hidden,
         },
         .conditioner2 => switch (fam) {
@@ -157,7 +159,7 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             // `[2 * latent_channels][hidden][1][1]` (mean and logvar stacked), or
             // the Flux2 anchor's fold BatchNorm, a bare `[latent_channels]` whose
             // width is what separates it from any other `AutoencoderKL`.
-            .mageflow => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
+            .mageflow, .moss_image => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
                 (dims.len == 1 and dims[0] == models.mage_vae.latent_channels),
             .krea2, .anima, .minimax_h3, .sensenova => true,
         },
@@ -175,6 +177,15 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     const v = probeView(store, fam, comp) orelse return false;
     if (!componentFits(v, fam, comp)) return false;
     if (comp != .conditioner) return true;
+    if (fam == .moss_image) {
+        // A Qwen3.5 at the width the released DiT reads; any depth runs.
+        const root = v.info.name[0 .. std.mem.indexOf(u8, v.info.name, "layers.") orelse return false];
+        var buf: [256]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{root}) catch return false;
+        const e = store.get(name) orelse return false;
+        const ed = e.info.shape.slice();
+        return ed.len == 2 and ed[1] == tp.models.moss_image.txt_dim;
+    }
     // Krea2 wants Qwen3-VL-4B, Z-Image plain Qwen3-4B: same vocab, width and
     // depth, different rope, and either can sit at `model.`. The vision tower
     // is the only structural difference. A VL file stripped of its tower is
@@ -227,7 +238,7 @@ fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
         .minimax_h3 => C.qwen3vl_32b_h3,
         // Not a Qwen3 encoder file: the depth check below is about a SIDE
         // encoder's layer count, and SenseNova has no side encoder to check.
-        .sd15, .sdxl, .sensenova => null,
+        .sd15, .sdxl, .sensenova, .moss_image => null,
     };
 }
 
@@ -405,6 +416,7 @@ fn loraSpec(fam: Family) ?LoraSpec {
         },
         .anima => .{ .probe = "blocks.0.self_attn.q_proj", .in_dim = m.anima.anima_2b.dim, .out_dim = m.anima.anima_2b.dim },
         .mageflow => .{ .probe = "transformer_blocks.0.attn.to_q", .in_dim = m.mageflow.features, .out_dim = m.mageflow.features, .layers = m.mageflow.n_blocks },
+        .moss_image => .{ .probe = "layers.0.proj.q", .in_dim = m.moss_image.features, .out_dim = m.moss_image.features, .layers = m.moss_image.n_blocks },
         .sd15, .sdxl, .minimax_h3 => null,
     };
 }
@@ -570,6 +582,17 @@ pub fn traits(fam: Family) Traits {
             .height = 1024,
             .steps = 30,
             .cfg = 5.0,
+        },
+        // ComfyUI's `image_moss_image_t2i` template: 1024x1024, 25 steps, cfg 2.5,
+        // `simple` (with `er_sde`, which this tree does not have yet).
+        .moss_image => .{
+            .label = "MOSS-Image (single-stream DiT)",
+            .short = "MOSS-Image",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 25,
+            .cfg = 2.5,
         },
         .sd15 => .{
             .label = "SD1.5 (UNet)",

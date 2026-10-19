@@ -472,6 +472,11 @@ pub inline fn silu(x: f32) f32 {
     return x * sigmoid(x);
 }
 
+/// Saturates cleanly at both ends: the exp under `sigmoid` goes to inf or 0.
+pub inline fn tanh(x: f32) f32 {
+    return 2.0 * sigmoid(2.0 * x) - 1.0;
+}
+
 /// log(1 + exp(x)), the linear tail past 20 where the f32 exp would overflow.
 pub inline fn softplus(x: f32) f32 {
     return if (x > 20.0) x else log2(1.0 + exp(x)) * 0.6931471805599453;
@@ -996,6 +1001,9 @@ const bodies = .{
     .{ "gated_add_scaled", At(elt.gatedAddScaled, .f32).run },
     .{ "gated_add_scaled_f16", At(elt.gatedAddScaled, .f16).run },
     .{ "gated_add_scaled_bf16", At(elt.gatedAddScaled, .bf16).run },
+    .{ "situ", At(elt.situ, .f32).run },
+    .{ "situ_f16", At(elt.situ, .f16).run },
+    .{ "situ_bf16", At(elt.situ, .bf16).run },
 };
 
 comptime {

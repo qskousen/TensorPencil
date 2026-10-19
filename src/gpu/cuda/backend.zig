@@ -4119,7 +4119,7 @@ pub const Backend = struct {
     ///
     /// `conv_out` is [n][channels] and `gates` [n][2*heads], the batched layouts,
     /// and `o` is [n][heads*d].
-    pub fn opGdnDeltaChunk(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
+    pub fn opGdnDeltaChunk(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, group: usize, n: usize, channels: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert(d % 32 == 0 and d <= 256 and n >= 1);
@@ -4132,21 +4132,22 @@ pub const Backend = struct {
         var pkh: u32 = @intCast(k_heads);
         var pn: u32 = @intCast(n);
         var pch: u32 = @intCast(channels);
+        var pgrp: u32 = @intCast(group);
         var pscale = scale;
         var params = [_]?*anyopaque{
-            @ptrCast(&ps),     @ptrCast(&pcv), @ptrCast(&pg), @ptrCast(&po),
-            @ptrCast(&pheads), @ptrCast(&pkh), @ptrCast(&pn), @ptrCast(&pch),
-            @ptrCast(&pscale),
+            @ptrCast(&ps),     @ptrCast(&pcv), @ptrCast(&pg),   @ptrCast(&po),
+            @ptrCast(&pheads), @ptrCast(&pkh), @ptrCast(&pn),   @ptrCast(&pch),
+            @ptrCast(&pgrp),   @ptrCast(&pscale),
         };
         self.ctx.launch(f, .{ @intCast(heads), 1, 1 }, .{ @intCast(d), 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// `opGdnDeltaChunk` through the dual kernel Vulkan runs (`dual/attn.zig`), the same
     /// arithmetic in the same order; for a head dim it was instantiated at (64, 128).
-    pub fn opGdnDeltaChunkDual(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
+    pub fn opGdnDeltaChunkDual(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, group: usize, n: usize, channels: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
-        const u = [7]u32{ @intCast(heads), @intCast(d), @intCast(k_heads), @intCast(n), @intCast(channels), 0, 0 };
+        const u = [7]u32{ @intCast(heads), @intCast(d), @intCast(k_heads), @intCast(n), @intCast(channels), @intCast(group), 0 };
         switch (d) {
             64 => try self.dualElems("gdn_delta_chunk_d64", state, conv_out, gates, o, u, .{ scale, 0 }, heads * d),
             128 => try self.dualElems("gdn_delta_chunk_d128", state, conv_out, gates, o, u, .{ scale, 0 }, heads * d),
@@ -4191,13 +4192,13 @@ pub const Backend = struct {
     /// One decode step of the gated-delta-net recurrence: one 256-thread
     /// block per v-head over its [d][d] state (d <= 128 so the staging
     /// threads fit the block).
-    pub fn opGdnDeltaStep(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, scale: f32) Error!void {
+    pub fn opGdnDeltaStep(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, group: usize, scale: f32) Error!void {
         std.debug.assert(d % 4 == 0); // the state walks are x4 unrolled
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert(d <= 128);
         const f = try self.eltFn(elt.gdn_delta_step_ptx, "gdn_delta_step");
-        try self.rowLaunch(f, state, conv_out, gates, o, .{ @intCast(heads), @intCast(d), @intCast(k_heads), 0, 0, 0 }, .{ scale, 0 }, heads);
+        try self.rowLaunch(f, state, conv_out, gates, o, .{ @intCast(heads), @intCast(d), @intCast(k_heads), @intCast(group), 0, 0 }, .{ scale, 0 }, heads);
     }
 
     /// Tree-verify flash-decoding attention: seq_q tree
@@ -7022,6 +7023,14 @@ pub const Backend = struct {
         try self.dualElemsAt("silu_mul", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
+    /// a = situ(hidden = a, gate = b), in place (MOSS-Image's FFN), both at `a`'s dtype.
+    pub fn situ(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(a.dt == b.dt);
+        try self.dualElemsAt("situ", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     /// GeGLU gate: a = geluTanh(a) * b, in place (Gemma FFN). total = elements.
     pub fn geluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
@@ -8625,7 +8634,7 @@ test "gdn ops match CPU reference" {
     try be.opGdnGates(ab_d, adt_d, gates_d, heads);
     try be.opGdnConvStep(st_d, qkv_d, cw_d, conv_d, channels);
     try be.opL2NormRows(conv_d.slice(0, 2 * k_heads * d * 4), 2 * k_heads, d, eps);
-    try be.opGdnDeltaStep(state_d, conv_d, gates_d, o_d, heads, d, k_heads, scale);
+    try be.opGdnDeltaStep(state_d, conv_d, gates_d, o_d, heads, d, k_heads, 1, scale);
 
     var got_o: [heads * d]f32 = undefined;
     var got_state: [heads * d * d]f32 = undefined;
@@ -8764,8 +8773,9 @@ test "the dual attention and delta-chunk kernels match the CUDA ones" {
     var prng = std.Random.DefaultPrng.init(4242);
     const rand = prng.random();
 
-    // The recurrence: dual chunk, PTX chunk and PTX per-token, bit for bit.
-    {
+    // The recurrence: dual chunk, PTX chunk and PTX per-token, bit for bit, with the
+    // v-heads tiled over the k-heads (a GGUF) and grouped (an HF checkpoint).
+    for ([_]usize{ 1, 2 }) |grp| {
         const heads = 4;
         const kh = 2;
         const d = 128;
@@ -8796,8 +8806,8 @@ test "the dual attention and delta-chunk kernels match the CUDA ones" {
         defer be.tensorDestroy(&gates_d);
         try be.tensorUpload(conv_d, std.mem.sliceAsBytes(conv));
         try be.tensorUpload(gates_d, std.mem.sliceAsBytes(&gates));
-        try be.opGdnDeltaChunk(bufs[0][0], conv_d, gates_d, bufs[0][1], heads, d, kh, n, channels, scale);
-        try be.opGdnDeltaChunkDual(bufs[1][0], conv_d, gates_d, bufs[1][1], heads, d, kh, n, channels, scale);
+        try be.opGdnDeltaChunk(bufs[0][0], conv_d, gates_d, bufs[0][1], heads, d, kh, grp, n, channels, scale);
+        try be.opGdnDeltaChunkDual(bufs[1][0], conv_d, gates_d, bufs[1][1], heads, d, kh, grp, n, channels, scale);
         for (0..n) |t| try be.opGdnDeltaStep(
             bufs[2][0],
             conv_d.slice(t * channels * 4, channels * 4),
@@ -8806,6 +8816,7 @@ test "the dual attention and delta-chunk kernels match the CUDA ones" {
             heads,
             d,
             kh,
+            grp,
             scale,
         );
         var got: [3][2][]f32 = undefined;
@@ -8826,7 +8837,7 @@ test "the dual attention and delta-chunk kernels match the CUDA ones" {
                 diff += 1;
                 worst = @max(worst, @abs(x - y));
             };
-            errdefer std.debug.print("delta: arm {d} {s}: {d} of {d} differ from the PTX chunk, worst {e}\n", .{ w, if (part == 0) "state" else "output", diff, got[0][part].len, worst });
+            errdefer std.debug.print("delta (group {d}): arm {d} {s}: {d} of {d} differ from the PTX chunk, worst {e}\n", .{ grp, w, if (part == 0) "state" else "output", diff, got[0][part].len, worst });
             try std.testing.expectEqual(@as(usize, 0), diff);
         };
     }

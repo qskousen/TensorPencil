@@ -137,6 +137,11 @@ pub const VulkanLM = struct {
     a_dt: [][]f32,
 
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen35.Model, cap: kvmod.Capacity) !VulkanLM {
+        return initUse(gpa, ctx, lm, cap, lin_gpu.Use.llm(prefill_chunk));
+    }
+
+    /// `init` with the linear routes' policy given (see `qwen35_cuda.CudaLM.initUse`).
+    pub fn initUse(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen35.Model, cap: kvmod.Capacity, use: lin_gpu.Use) !VulkanLM {
         const cfg = lm.cfg;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -168,7 +173,7 @@ pub const VulkanLM = struct {
         self.lin = try lin_gpu.Lin.init(gpa, ctx, max_out, gemv_nchunk, 1);
         errdefer self.lin.deinit();
         const lins = try lm.deviceLins(alloc);
-        self.lin_plan = try self.lin.plan(lins, lin_gpu.Use.llm(prefill_chunk), "qwen35 vulkan");
+        self.lin_plan = try self.lin.plan(lins, use, "qwen35 vulkan");
         // Sized for the batched routes, so not for the LM head: a prefill reads no
         // logits and a decode step runs it as a one-row GEMV, while its expansion would
         // be vocab x hidden of scratch.
@@ -283,6 +288,35 @@ pub const VulkanLM = struct {
         }
     }
 
+    /// The final-normed hidden state of every row of `ids`, prefilled at the cache's
+    /// current length: what a text encoder reads of this model. `out` is
+    /// `[ids.len][hidden]`.
+    pub fn encode(self: *VulkanLM, ids: []const u32, out: []f32) !void {
+        const cfg = self.cfg;
+        const hidden = cfg.hidden;
+        std.debug.assert(out.len == ids.len * hidden);
+        const x = try self.gpa.alloc(f32, @min(ids.len, prefill_chunk) * hidden);
+        defer self.gpa.free(x);
+        var pos3s: [prefill_chunk * 3]u32 = undefined;
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n: usize = @min(prefill_chunk, ids.len - off);
+            try qwen3.embedTokens(self.lm.embed, ids[off..][0..n], x[0 .. n * hidden]);
+            for (0..n) |t| pos3s[t * 3 ..][0..3].* = @splat(@intCast(self.len + t));
+            try self.ctx.tensorUpload(try self.ctx.view(self.bufs.x, 0, n * hidden * 4), std.mem.sliceAsBytes(x[0 .. n * hidden]));
+            try self.ctx.tensorUpload(self.pos3s_d, std.mem.sliceAsBytes(pos3s[0 .. n * 3]));
+            try self.ctx.beginBatch();
+            errdefer if (self.ctx.batching) self.ctx.abortBatch();
+            var dev: Dev = .{ .m = self, .cfg = cfg, .lm = self.lm, .bufs = &self.bufs };
+            try qwen35_dev.batch(&dev, n);
+            try dev.rms(self.bufs.x, self.bufs.normed, self.lm.final_norm, n, hidden);
+            try self.ctx.endBatch();
+            self.len += n;
+            try self.ctx.downloadF32At(self.bufs.normed, 0, out[off * hidden ..][0 .. n * hidden]);
+            off += n;
+        }
+    }
+
     fn stepOne(self: *VulkanLM, id: u32) !void {
         const cfg = self.cfg;
         const x = try self.gpa.alloc(f32, cfg.hidden);
@@ -357,7 +391,7 @@ const Dev = struct {
     }
     /// The chunk kernel at one token, so a decode step and a prefill agree exactly.
     pub fn gdnDeltaStep(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, scale: f32) !void {
-        try d.ctx().opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, 1, d.cfg.convChannels(), scale);
+        try d.ctx().opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, 1, d.cfg.convChannels(), scale);
     }
     pub fn gdnGatesBatch(d: *const Dev, alpha: Buf, beta: Buf, a_dt: []const f32, gates: Buf, heads: usize, n: usize, pitch: usize) !void {
         try d.ctx().opGdnGatesBatch(alpha, beta, try nbuf(d.ctx(), a_dt), gates, heads, n, pitch);
@@ -366,7 +400,7 @@ const Dev = struct {
         try d.ctx().opGdnConvBatch(state, x, try nbuf(d.ctx(), w), out, channels, n);
     }
     pub fn gdnDeltaChunk(d: *const Dev, state: Buf, conv: Buf, gates: Buf, o: Buf, heads: usize, dk: usize, k_heads: usize, n: usize, channels: usize, scale: f32) !void {
-        try d.ctx().opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, n, channels, scale);
+        try d.ctx().opGdnDeltaChunk(state, conv, gates, o, heads, dk, k_heads, d.cfg.v_group, n, channels, scale);
     }
 
     pub fn convState(d: *const Dev, lin_idx: usize) Buf {

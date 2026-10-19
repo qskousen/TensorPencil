@@ -414,3 +414,15 @@
   ~3 MB for 110 ms. libzstd does the same frame in 10 ms. `tools/gen_fonts.py
   --pack zstd` emits the frames; wiring them in is worth it only with a libzstd
   dependency, which is a 4.5 MB saving to weigh against a new C library
+- MOSS-Image, what support left open:
+  1. int8 attention. The checkpoint asks for `comfy_kitchen_int8` per layer, and that
+     choice alone moves ComfyUI's render 16 dB (BACKEND.md 2L), so matching ComfyUI as
+     shipped needs a quantized QK^T route; it is also most of ComfyUI's speed lead
+     (attention is a third of our 1024² forward, `moss-image-cuda-test --prof`).
+  2. Speed: 1.17 s/step against ComfyUI's 0.694 at 1024². Measured per forward: GEMMs
+     217 ms, attention 165 ms, elementwise 89 ms (464 launches: the `v_div` pair, rmsMod,
+     situ, gatedAdd, both qk norms and ropes per block) on the 3090. `situ` could fold
+     into the down projection's activation quant as ComfyUI's does.
+  3. `er_sde`, the sampler ComfyUI's MOSS templates use. Not in `core/sampler.zig`.
+  4. `MOSSImageLayoutPrompt`, ComfyUI's bounding-box layout prompt (a JSON caption with
+     per-box captions and colours), for tp-gui.

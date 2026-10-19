@@ -40,6 +40,7 @@ const mageflow = @import("mageflow.zig");
 const mageflow_dev = @import("mageflow_dev.zig");
 const lin = @import("lin.zig");
 const lin_gpu = @import("lin_gpu.zig");
+const attn_gpu = @import("attn_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -57,8 +58,6 @@ const channels = mageflow.channels; // 128
 const eps: f32 = 1e-6;
 const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
 
-/// Two-pass softmax chunk count, matching `zimage_gpu` and `dit_gpu`.
-const nchunks = 32;
 /// Cap on the materialized attention-scores buffer; heads batch to fit it.
 ///
 /// A MEMORY bound, not a speed one: at 1024x1024 the whole 24-head plane is
@@ -151,23 +150,6 @@ fn lap(io: std.Io, acc: *i128) void {
 /// answer it gave is that there is no answer: 4-6 heads beat 24 by ~3% at
 /// 1024x1024 and lose by about as much at 768x768.
 pub var heads_per_batch: usize = 0;
-
-fn headsPerBatch(rows_pad: usize, cap: usize, ws_s_bytes: ?usize) usize {
-    const plane = rows_pad * rows_pad * 2; // f16 scores
-    var hb = @max(1, @min(heads, cap / @max(plane, 1)));
-    if (heads_per_batch != 0) hb = @max(1, @min(hb, heads_per_batch));
-    if (ws_s_bytes) |c| hb = @max(1, @min(hb, c / @max(plane, 1)));
-    return hb;
-}
-
-fn scoresCap(budget: u64) usize {
-    if (budget == 0) return s_bytes_cap;
-    return @min(s_bytes_cap, @max(64 << 20, budget / 4));
-}
-
-fn useTensorCoreAttn(ctx: *gpu.Context) bool {
-    return !force_attn_full and ctx.pipe_scores != .null_handle;
-}
 
 /// Per-image cache: everything constant across sampling steps.
 pub const Session = struct {
@@ -334,27 +316,18 @@ pub const Workspace = struct {
     mod_d: Buf,
     imgin_d: Buf,
     out_d: Buf,
-    /// Tensor-core attention operands and scratch.
-    qh_d: Buf,
-    kh_d: Buf,
-    v16_d: Buf,
-    s_d: Buf,
-    part_d: Buf,
-    md_d: Buf,
+    attn: attn_gpu.Scratch,
 
     const fields = [_][]const u8{
         "xt_d",  "xi_d",   "ntxt_d", "nimg_d",  "qt_d",  "kt_d",  "vt_d",
         "qi_d",  "ki_d",   "vi_d",   "q_d",     "k_d",   "v_d",   "attn_d",
         "dtxt_d", "dimg_d", "mt_d",  "mi_d",    "mod_d", "imgin_d", "out_d",
-        "qh_d",  "kh_d",   "v16_d",  "s_d",     "part_d", "md_d",
     };
 
     pub fn init(ctx: *gpu.Context, model: *const DiT, seq_txt: usize, n_tok: usize, act: gpu.Dt) !Workspace {
         const tp = std.mem.alignForward(usize, seq_txt, 128);
         const ip = std.mem.alignForward(usize, n_tok, 128);
         const seq_pad = std.mem.alignForward(usize, seq_txt + n_tok, 128);
-        const tc = useTensorCoreAttn(ctx);
-        const hpb = if (tc) headsPerBatch(seq_pad, scoresCap(ctx.budget_override), null) else 1;
         const sizes = [fields.len]usize{
             tp * F * 4,
             ip * F * 4,
@@ -377,12 +350,6 @@ pub const Workspace = struct {
             model.modStride() * 4,
             n_tok * channels * 4,
             n_tok * channels * 4,
-            if (tc) seq_pad * F * 2 else 16,
-            if (tc) F * seq_pad * 2 else 16,
-            if (tc) seq_pad * F * 2 else 16,
-            if (tc) hpb * seq_pad * seq_pad * 2 else 16,
-            if (tc) hpb * (seq_txt + n_tok) * nchunks * 2 * 4 else 16,
-            if (tc) hpb * seq_pad * 2 * 4 else 16,
         };
         var self: Workspace = undefined;
         var made: usize = 0;
@@ -393,6 +360,7 @@ pub const Workspace = struct {
             @field(self, name) = try ctx.tensorCreate(size);
             made += 1;
         }
+        self.attn = try attn_gpu.Scratch.init(ctx, seq_txt + n_tok, heads, heads, hd, s_bytes_cap);
         // The attention block stays f32 (`mageflow_dev.streamDtFor`).
         inline for (.{ "xt_d", "xi_d", "ntxt_d", "nimg_d", "dtxt_d", "dimg_d", "mt_d", "mi_d" }) |name| @field(self, name).dt = act;
         return self;
@@ -400,6 +368,7 @@ pub const Workspace = struct {
 
     pub fn deinit(self: *Workspace, ctx: *gpu.Context) void {
         inline for (fields) |name| ctx.tensorDestroy(&@field(self, name));
+        self.attn.deinit(ctx);
         self.* = undefined;
     }
 };
@@ -631,79 +600,14 @@ fn gatedAdd(ctx: *gpu.Context, x: Buf, delta: Buf, mod: Buf, rows: usize, gate_o
 /// `ws.attn_d`. Both paths are non-causal and the same arithmetic; see the header
 /// for why the tensor-core one is a requirement rather than a speed choice.
 fn attention(ctx: *gpu.Context, ws: *Workspace, rows: usize) !void {
-    if (!useTensorCoreAttn(ctx)) {
-        return ctx.opElt(.attn_full, ws.q_d, ws.k_d, ws.v_d, ws.attn_d, .{
-            .u0 = @intCast(rows),
-            .u1 = heads,
-            .u2 = heads,
-            .u3 = hd,
-            .f0 = attn_scale,
-        }, rows * heads, 1, 1);
-    }
-
-    const rows_pad = std.mem.alignForward(usize, rows, 128);
-    ctx.independent(3);
-    try ctx.opElt(.f32_to_h16, ws.q_d, null, null, ws.qh_d, .{
-        .u0 = @intCast(rows_pad * F / 2),
-        .u1 = @intCast(rows * F),
-        .f0 = attn_scale,
-    }, rows_pad * F / 2, 1, 1);
-    try ctx.opElt(.gather_kmajor_h16, ws.k_d, null, null, ws.kh_d, .{
-        .u0 = @intCast(F * rows_pad / 2),
-        .u1 = hd,
-        .u2 = @intCast(rows_pad),
-        .u3 = @intCast(rows),
-        .u4 = heads,
-    }, F * rows_pad / 2, 1, 1);
-    try ctx.opElt(.f32_to_h16, ws.v_d, null, null, ws.v16_d, .{
-        .u0 = @intCast(rows_pad * F / 2),
-        .u1 = @intCast(rows * F),
-        .f0 = 1.0,
-    }, rows_pad * F / 2, 1, 1);
-
-    const plane = rows_pad * rows_pad * 2;
-    var hb_cap = headsPerBatch(rows_pad, scoresCap(ctx.budget_override), ws.s_d.size);
-    hb_cap = @max(1, @min(hb_cap, ws.part_d.size / @max(rows * nchunks * 2 * 4, 1)));
-    hb_cap = @max(1, @min(hb_cap, ws.md_d.size / @max(rows_pad * 2 * 4, 1)));
-    std.debug.assert(hb_cap * plane <= ws.s_d.size);
-
-    const s_stride: u32 = @intCast(rows_pad);
-    const s_plane: u32 = @intCast(rows_pad * rows_pad);
-    var h0: usize = 0;
-    while (h0 < heads) : (h0 += hb_cap) {
-        const hb = @min(hb_cap, heads - h0);
-        try ctx.opAttnScores(ws.s_d, ws.qh_d, ws.kh_d, .{
-            .u0 = F,
-            .u1 = s_stride,
-            .u2 = @intCast(h0),
-            .u3 = 1,
-            .u4 = @intCast(hd * rows_pad),
-            .u5 = s_plane,
-        }, rows_pad / 128, rows_pad / 128, hb);
-        try ctx.opElt(.softmax_partial, ws.s_d, null, null, ws.part_d, .{
-            .u0 = @intCast(hb * rows * nchunks),
-            .u1 = nchunks,
-            .u2 = @intCast(rows),
-            .u3 = s_stride,
-            .u5 = s_plane,
-        }, hb * rows * nchunks, 1, 1);
-        try ctx.opElt(.softmax_combine, ws.part_d, null, null, ws.md_d, .{
-            .u0 = @intCast(hb * rows),
-            .u1 = nchunks,
-            .u2 = @intCast(rows),
-            .u3 = s_stride,
-        }, hb * rows, 1, 1);
-        try ctx.opAttnOut(ws.s_d, ws.v16_d, ws.attn_d, ws.md_d, .{
-            .u0 = s_stride,
-            .u1 = s_plane,
-            .u2 = @intCast(h0),
-            .u3 = 1,
-            .u4 = F,
-            .u5 = F,
-            .f0 = @bitCast(@as(u32, @intCast(rows))),
-            .f1 = @bitCast(s_stride),
-        }, rows_pad / 128, hb);
-    }
+    try attn_gpu.run(ctx, &ws.attn, ws.q_d, ws.k_d, ws.v_d, ws.attn_d, .{
+        .rows = rows,
+        .heads = heads,
+        .kv_heads = heads,
+        .hd = hd,
+        .scale = attn_scale,
+        .max_hb = heads_per_batch,
+    }, force_attn_full);
 }
 
 /// Every linear here carries a bias, folded into the GEMM where its kernel takes one.

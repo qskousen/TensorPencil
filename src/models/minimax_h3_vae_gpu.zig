@@ -18,6 +18,7 @@ const std = @import("std");
 const vae = @import("minimax_h3_vae.zig");
 const minimax_h3_vae_dev = @import("minimax_h3_vae_dev.zig");
 const lin_gpu = @import("lin_gpu.zig");
+const attn_gpu = @import("attn_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 
@@ -226,64 +227,16 @@ fn attentionAt(ctx: *Context, ws: *Workspace, seq: usize, heads: usize, hd: usiz
 
 /// The scores/softmax/PV pipeline over the padded operands, one head at a time.
 fn tcAttention(ctx: *Context, ws: *Workspace, seq: usize, heads: usize, hp: usize, scale: f32) !void {
-    const rows_pad = std.mem.alignForward(usize, seq, 128);
-    const inner = heads * hp;
-    const nchunks = Workspace.nchunks;
-    ctx.independent(3);
-    try ctx.opElt(.f32_to_h16, ws.qp_d, null, null, ws.qh_d, .{
-        .u0 = @intCast(rows_pad * inner / 2),
-        .u1 = @intCast(seq * inner),
-        .f0 = scale,
-    }, rows_pad * inner / 2, 1, 1);
-    try ctx.opElt(.gather_kmajor_h16, ws.kp_d, null, null, ws.kh_d, .{
-        .u0 = @intCast(inner * rows_pad / 2),
-        .u1 = @intCast(hp),
-        .u2 = @intCast(rows_pad),
-        .u3 = @intCast(seq),
-        .u4 = @intCast(heads),
-    }, inner * rows_pad / 2, 1, 1);
-    try ctx.opElt(.f32_to_h16, ws.vp_d, null, null, ws.v16_d, .{
-        .u0 = @intCast(rows_pad * inner / 2),
-        .u1 = @intCast(seq * inner),
-        .f0 = 1.0,
-    }, rows_pad * inner / 2, 1, 1);
-
-    const s_stride: u32 = @intCast(rows_pad);
-    const s_plane: u32 = @intCast(rows_pad * rows_pad);
-    var h0: usize = 0;
-    while (h0 < heads) : (h0 += 1) {
-        try ctx.opAttnScores(ws.s_d, ws.qh_d, ws.kh_d, .{
-            .u0 = @intCast(inner),
-            .u1 = s_stride,
-            .u2 = @intCast(h0),
-            .u3 = 1,
-            .u4 = @intCast(hp * rows_pad),
-            .u5 = s_plane,
-        }, rows_pad / 128, rows_pad / 128, 1);
-        try ctx.opElt(.softmax_partial, ws.s_d, null, null, ws.part_d, .{
-            .u0 = @intCast(seq * nchunks),
-            .u1 = @intCast(nchunks),
-            .u2 = @intCast(seq),
-            .u3 = s_stride,
-            .u5 = s_plane,
-        }, seq * nchunks, 1, 1);
-        try ctx.opElt(.softmax_combine, ws.part_d, null, null, ws.md_d, .{
-            .u0 = @intCast(seq),
-            .u1 = @intCast(nchunks),
-            .u2 = @intCast(seq),
-            .u3 = s_stride,
-        }, seq, 1, 1);
-        try ctx.opAttnOut(ws.s_d, ws.v16_d, ws.op_d, ws.md_d, .{
-            .u0 = s_stride,
-            .u1 = s_plane,
-            .u2 = @intCast(h0),
-            .u3 = 1,
-            .u4 = @intCast(inner),
-            .u5 = @intCast(inner),
-            .f0 = @bitCast(@as(u32, @intCast(seq))),
-            .f1 = @bitCast(s_stride),
-        }, rows_pad / 128, 1);
-    }
+    try attn_gpu.stage(ctx, ws.qp_d, ws.kp_d, ws.vp_d, ws.qh_d, ws.kh_d, ws.v16_d, seq, heads, heads, hp, scale);
+    try attn_gpu.core(ctx, .{ .s = ws.s_d, .part = ws.part_d, .md = ws.md_d }, ws.qh_d, ws.kh_d, ws.v16_d, ws.op_d, .{
+        .q_rows = seq,
+        .kv_rows = seq,
+        .heads = heads,
+        .kv_heads = heads,
+        .hd = hp,
+        .max_hb = 1,
+        .nchunks = Workspace.nchunks,
+    }, null);
 }
 
 /// One whole-window decode, RAW (unclamped, un-finalized) planar

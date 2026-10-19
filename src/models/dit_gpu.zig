@@ -12,6 +12,7 @@ const dit = @import("dit.zig");
 const dit_dev = @import("dit_dev.zig");
 const lin = @import("lin.zig");
 const lin_gpu = @import("lin_gpu.zig");
+const attn_gpu = @import("attn_gpu.zig");
 const Weight = lin_gpu.Weight;
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
@@ -479,6 +480,26 @@ pub fn forward(
     }
 }
 
+/// The profile's attention split, for `attn_gpu.core`.
+const AttnTimer = struct {
+    io: std.Io,
+    t_mark: *std.Io.Timestamp,
+    prof: *Prof,
+
+    fn lap(self: *const AttnTimer) attn_gpu.Lap {
+        return .{ .ctx = self, .f = f };
+    }
+
+    fn f(p: *const anyopaque, phase: attn_gpu.Phase) void {
+        const self: *const AttnTimer = @ptrCast(@alignCast(p));
+        lapNs(self.io, self.t_mark, switch (phase) {
+            .scores => &self.prof.scores_ns,
+            .softmax => &self.prof.smax_ns,
+            .out => &self.prof.aout_ns,
+        });
+    }
+};
+
 /// `dit_dev`'s ops on this backend. Its fp8 fast path stages: the modulated norm (or the
 /// gate, or silu) writes the cooperative GEMM's f16 operand with the weight scale folded
 /// in, shared by every GEMM of the group, and q/k/v (and with them the gate and `wo`)
@@ -704,24 +725,7 @@ const Dev = struct {
                     .f1 = 1e-5,
                 }, seq * kv_heads, 1, 1);
                 mark(io, &t_mark, &prof.elt_ns);
-                ctx.independent(3);
-                try ctx.opElt(.f32_to_h16, q_d, null, null, qt_d, .{
-                    .u0 = @intCast(seq_pad * heads * hd / 2),
-                    .u1 = @intCast(seq * heads * hd),
-                    .f0 = attn_scale,
-                }, seq_pad * heads * hd / 2, 1, 1);
-                try ctx.opElt(.gather_kmajor_h16, k_d, null, null, kt_d, .{
-                    .u0 = @intCast(kv_heads * hd * seq_pad / 2),
-                    .u1 = hd,
-                    .u2 = @intCast(seq_pad),
-                    .u3 = @intCast(seq),
-                    .u4 = kv_heads,
-                }, kv_heads * hd * seq_pad / 2, 1, 1);
-                try ctx.opElt(.f32_to_h16, v_d, null, null, v16_d, .{
-                    .u0 = @intCast(seq_pad * kv_heads * hd / 2),
-                    .u1 = @intCast(seq * kv_heads * hd),
-                    .f0 = 1.0,
-                }, seq_pad * kv_heads * hd / 2, 1, 1);
+                try attn_gpu.stage(ctx, q_d, k_d, v_d, qt_d, kt_d, v16_d, seq, heads, kv_heads, hd, attn_scale);
                 mark(io, &t_mark, &prof.elt_ns);
             } else {
             // The q and k chains (norm -> rope -> convert/gather) touch disjoint
@@ -758,24 +762,7 @@ const Dev = struct {
             }, seq * kv_heads * half, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             if (tc_attn) {
-                ctx.independent(3);
-                try ctx.opElt(.f32_to_h16, q_d, null, null, qt_d, .{
-                    .u0 = @intCast(seq_pad * heads * hd / 2),
-                    .u1 = @intCast(seq * heads * hd),
-                    .f0 = attn_scale,
-                }, seq_pad * heads * hd / 2, 1, 1);
-                try ctx.opElt(.gather_kmajor_h16, k_d, null, null, kt_d, .{
-                    .u0 = @intCast(kv_heads * hd * seq_pad / 2),
-                    .u1 = hd,
-                    .u2 = @intCast(seq_pad),
-                    .u3 = @intCast(seq),
-                    .u4 = kv_heads,
-                }, kv_heads * hd * seq_pad / 2, 1, 1);
-                try ctx.opElt(.f32_to_h16, v_d, null, null, v16_d, .{
-                    .u0 = @intCast(seq_pad * kv_heads * hd / 2),
-                    .u1 = @intCast(seq * kv_heads * hd),
-                    .f0 = 1.0,
-                }, seq_pad * kv_heads * hd / 2, 1, 1);
+                try attn_gpu.stage(ctx, q_d, k_d, v_d, qt_d, kt_d, v16_d, seq, heads, kv_heads, hd, attn_scale);
             } else {
                 ctx.independent(2);
                 try ctx.opElt(.gather_kmajor, q_d, null, null, qt_d, .{
@@ -810,68 +797,41 @@ const Dev = struct {
                 mark(io, &t_mark, &prof.smax_ns);
                 try ctx.opFlash(.out, q_src, kt_d, v16_d, attn_d, push, seq_pad / 128, heads);
                 mark(io, &t_mark, &prof.aout_ns);
+            } else if (tc_attn) {
+                const timer: AttnTimer = .{ .io = io, .t_mark = &t_mark, .prof = prof };
+                try attn_gpu.core(ctx, .{ .s = s_d, .part = part_d, .md = md_d }, q_src, kt_d, v16_d, attn_d, .{
+                    .q_rows = seq,
+                    .kv_rows = seq,
+                    .heads = heads,
+                    .kv_heads = kv_heads,
+                    .hd = hd,
+                    .max_hb = heads_per_batch,
+                    .nchunks = nchunks,
+                }, timer.lap());
             } else {
                 const s_stride: u32 = @intCast(s_rows);
                 const s_plane: u32 = @intCast(s_rows * s_rows);
                 var h0: usize = 0;
                 while (h0 < heads) : (h0 += heads_per_batch) {
                     const hb = @min(heads_per_batch, heads - h0);
-                    if (tc_attn) {
-                        try ctx.opAttnScores(s_d, q_src, kt_d, .{
-                            .u0 = heads * hd,
-                            .u1 = s_stride,
-                            .u2 = @intCast(h0),
-                            .u3 = heads / kv_heads,
-                            .u4 = @intCast(hd * seq_pad),
-                            .u5 = s_plane,
-                        }, seq_pad / 128, seq_pad / 128, hb);
-                    } else {
-                        try ctx.opElt(.attn_scores, qt_d, kt_d, null, s_d, .{
-                            .u0 = @intCast(seq),
-                            .u1 = heads,
-                            .u2 = kv_heads,
-                            .u3 = hd,
-                            .u4 = @intCast(h0),
-                            .f0 = attn_scale,
-                        }, std.math.divCeil(usize, seq, 8) catch unreachable, std.math.divCeil(usize, seq, 8) catch unreachable, hb);
-                    }
+                    try ctx.opElt(.attn_scores, qt_d, kt_d, null, s_d, .{
+                        .u0 = @intCast(seq),
+                        .u1 = heads,
+                        .u2 = kv_heads,
+                        .u3 = hd,
+                        .u4 = @intCast(h0),
+                        .f0 = attn_scale,
+                    }, std.math.divCeil(usize, seq, 8) catch unreachable, std.math.divCeil(usize, seq, 8) catch unreachable, hb);
                     mark(io, &t_mark, &prof.scores_ns);
-                    if (tc_attn) {
-                        try ctx.opElt(.softmax_partial, s_d, null, null, part_d, .{
-                            .u0 = @intCast(hb * seq * nchunks),
-                            .u1 = @intCast(nchunks),
-                            .u2 = @intCast(seq),
-                            .u3 = s_stride,
-                            .u5 = s_plane,
-                        }, hb * seq * nchunks, 1, 1);
-                        try ctx.opElt(.softmax_combine, part_d, null, null, md_d, .{
-                            .u0 = @intCast(hb * seq),
-                            .u1 = @intCast(nchunks),
-                            .u2 = @intCast(seq),
-                            .u3 = s_stride,
-                        }, hb * seq, 1, 1);
-                        mark(io, &t_mark, &prof.smax_ns);
-                        try ctx.opAttnOut(s_d, v16_d, attn_d, md_d, .{
-                            .u0 = s_stride,
-                            .u1 = s_plane,
-                            .u2 = @intCast(h0),
-                            .u3 = heads / kv_heads,
-                            .u4 = kv_heads * hd,
-                            .u5 = heads * hd,
-                            .f0 = @bitCast(@as(u32, @intCast(seq))),
-                            .f1 = @bitCast(s_stride), // MD rows per head plane
-                        }, seq_pad / 128, hb);
-                    } else {
-                        try ctx.opElt(.attn_out, s_d, null, v_d, attn_d, .{
-                            .u0 = @intCast(seq),
-                            .u1 = heads,
-                            .u2 = kv_heads,
-                            .u3 = hd,
-                            .u4 = @intCast(h0),
-                            .u5 = s_stride,
-                            .f0 = @bitCast(s_plane),
-                        }, hd / 8, std.math.divCeil(usize, seq, 8) catch unreachable, hb);
-                    }
+                    try ctx.opElt(.attn_out, s_d, null, v_d, attn_d, .{
+                        .u0 = @intCast(seq),
+                        .u1 = heads,
+                        .u2 = kv_heads,
+                        .u3 = hd,
+                        .u4 = @intCast(h0),
+                        .u5 = s_stride,
+                        .f0 = @bitCast(s_plane),
+                    }, hd / 8, std.math.divCeil(usize, seq, 8) catch unreachable, hb);
                     mark(io, &t_mark, &prof.aout_ns);
                 }
             }
