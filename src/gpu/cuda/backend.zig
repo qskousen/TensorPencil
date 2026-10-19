@@ -5313,7 +5313,8 @@ pub const Backend = struct {
         return rows * cols;
     }
 
-    /// Decode packed W4A8 -> int8 into `self.w4a8_i8` and return it.
+    /// Decode packed W4A8 or W6A8 -> int8 into `self.w4a8_i8` and return it. `levels`
+    /// is `[256][16]` or `[256][64]` int8 (`ops.w4a8.Meta.levelBytes`), which says which.
     ///
     /// The packed weight, its fp8 group scales and its 4 KiB level table all go through
     /// the ordinary weight cache, so they stream and evict like any other weight, the
@@ -5330,6 +5331,17 @@ pub const Backend = struct {
     ) Error!DeviceBuffer {
         self.ptic();
         defer self.ptoc(.prep);
+        if (levels.len == 256 * 64) {
+            std.debug.assert(packed_bytes.len == rows * cols * 3 / 4 and cols % 32 == 0 and group_size % 16 == 0);
+            const p_db = try self.cachedWeight(packed_bytes);
+            const s_db = try self.cachedWeight(s_rel);
+            const l_db = try self.cachedWeight(levels);
+            try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
+            const threads = rows * cols / 4;
+            try self.dualElems("w6a8_decode", p_db, self.w4a8_i8, s_db, l_db, .{ @intCast(threads), @intCast(cols), @intCast(group_size), 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+            return self.w4a8_i8;
+        }
+        std.debug.assert(levels.len == 256 * 16);
         std.debug.assert(packed_bytes.len == rows * cols / 2);
         std.debug.assert(s_rel.len == rows * cols / group_size);
         // The kernel reads FOUR packed bytes per thread and so loads one group scale per
@@ -5949,11 +5961,13 @@ pub const Backend = struct {
     /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal`
     /// treats the seq_q queries as the last positions of the seq_kv keys
     /// (square when equal, text encoder; seq_q 1, KV-cached LLM decode);
-    /// the DiT passes false.
+    /// the DiT passes false. Heads up to 512 wide: the kernel's accumulator is a
+    /// fixed local array, which a wider head overruns.
     pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert(seq_q <= seq_kv);
+        if (hd > 512) return error.UnsupportedWidth;
         const f = try self.eltFn(elt.attn_ptx, "attn");
         try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq_q), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), @intCast(seq_kv) }, .{ scale, 0 }, seq_q * n_heads);
     }
@@ -7021,6 +7035,16 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         std.debug.assert(a.dt == b.dt);
         try self.dualElemsAt("silu_mul", a.dt, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// x ([2h][2w][co]) += `DupUp3D(s)`, `s` the [h][w][ci] stage input, both at `x`'s
+    /// dtype (`wan_vae.dupUpAdd`).
+    pub fn dupUpAdd(self: *Backend, x: DeviceBuffer, s: DeviceBuffer, h: usize, w: usize, ci: usize, co: usize, ft: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(x.dt == s.dt);
+        const total = 4 * h * w * co;
+        try self.dualElemsAt("dup_up_add", x.dt, x, s, null, null, .{ @intCast(total), @intCast(co), @intCast(ci), @intCast(w), @intCast(ft), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// a = situ(hidden = a, gate = b), in place (MOSS-Image's FFN), both at `a`'s dtype.

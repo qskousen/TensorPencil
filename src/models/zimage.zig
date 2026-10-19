@@ -28,6 +28,7 @@ const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const quant_weight = @import("quant_weight.zig");
+const sd_vae = @import("sd_vae.zig");
 const lin = @import("lin.zig");
 const lora_mod = @import("lora.zig");
 
@@ -153,26 +154,9 @@ pub const latent_rgb_factors = [latent_channels][3]f32{
 };
 pub const latent_rgb_bias = [3]f32{ -0.0329, -0.0718, -0.0851 };
 
-/// Fill `rgb_out` (`[zh*zw][3]` RGB8) with the latent2rgb preview of the planar
-/// `[16][zh*zw]` sampler latent `z`, using ComfyUI's `((v + 1) / 2).clamp(0, 1) * 255`
-/// mapping. Its own function rather than `sd_vae`'s because that one is compiled
-/// against a 4-channel matrix, the same reason `wan_vae` has its own.
+/// The latent2rgb preview of the planar [16][zh*zw] sampler latent `z` into RGB8.
 pub fn latentPreviewInto(rgb_out: []u8, z: []const f32, zh: usize, zw: usize) void {
-    const plane = zh * zw;
-    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
-    for (0..plane) |p| {
-        var acc = latent_rgb_bias;
-        inline for (0..latent_channels) |c| {
-            const v = z[c * plane + p];
-            acc[0] += v * latent_rgb_factors[c][0];
-            acc[1] += v * latent_rgb_factors[c][1];
-            acc[2] += v * latent_rgb_factors[c][2];
-        }
-        inline for (0..3) |ch| {
-            const u = std.math.clamp((acc[ch] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
-            rgb_out[p * 3 + ch] = @intFromFloat(u);
-        }
-    }
+    sd_vae.linearPreviewInto(latent_channels, rgb_out, z, zh, zw, &latent_rgb_factors, latent_rgb_bias);
 }
 
 const LinearW = struct {
@@ -1274,7 +1258,7 @@ test "Z-Image LoRA keys land on the checkpoint's fused qkv and out" {
     defer gpa.free(blob);
     var st = try safetensors.SafeTensors.initFromSlice(gpa, blob);
     defer st.deinit();
-    var side = try lora_mod.Sidecar.load(gpa, .{ .safetensors = &st }, &lora_keys);
+    var side = try lora_mod.Sidecar.load(gpa, .{ .safetensors = &st }, .{ .renames = &lora_keys });
     defer side.deinit();
     const qkv = side.index.getPtr("layers.3.attention.qkv.weight").?;
     try testing.expectEqual(3 * d, qkv.out_dim);

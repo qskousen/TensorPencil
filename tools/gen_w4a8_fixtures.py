@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference fixtures for ComfyUI's `asym_w4a8_int8` weight format.
+"""Reference fixtures for ComfyUI's `asym_w4a8_int8` and `w6a8_int8` weight formats.
 
 Every number here comes from `comfy_kitchen`'s own implementation
 (`comfy_kitchen.backends.eager.w4a8_int8`) — the code ComfyUI actually runs — never
@@ -8,6 +8,10 @@ from ours. The format stores a 4-bit weight that *decodes to an int8 convrot wei
     q      = nibble(packed)                       # 0..15, even col = LOW nibble
     level  = codebook[q]      (or q - 8 when the layer ships no codebook)
     int8   = rint(clamp(level * s_rel[row, group], -127, 127))
+
+`w6a8_int8` is the same storage contract at 6 bits: a row is the K/2-byte nibble plane
+then a K/4-byte plane of each code's top 2 bits, and a code decodes uniformly as
+`(q - 32) * s_rel`, no codebook.
 
 and from there it is the int8-convrot GEMM this engine already implements
 (per-output-row `s_channel`, Hadamard-256 activation rotation). So the *only* new
@@ -54,6 +58,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     _dequant_int4_grouped_to_int8,
     dequantize_w4a8_int8_weight,
 )
+from comfy_kitchen.tensor.w4a8_packed import _pack_codes
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "src", "ops", "assets", "w4a8_fixtures.json")
 OUT_REAL = os.path.join(
@@ -85,12 +90,15 @@ def pack_nibbles(q: np.ndarray) -> np.ndarray:
     return ((lo | (hi << 4)).astype(np.uint8)).view(np.int8)
 
 
-def make_case(name, rows, cols, group_size, codebook, s_rel_f32, seed, convrot_groupsize=256):
+def make_case(name, rows, cols, group_size, codebook, s_rel_f32, seed, convrot_groupsize=256, bits=4):
     """One synthetic case, decoded by the reference."""
     rng = np.random.default_rng(seed)
     groups = cols // group_size
-    q = rng.integers(0, 16, size=(rows, cols), dtype=np.uint8)
-    packed = pack_nibbles(q)
+    q = rng.integers(0, 1 << bits, size=(rows, cols), dtype=np.uint8)
+    if bits == 4:
+        packed = pack_nibbles(q)
+    else:
+        packed = _pack_codes(torch.from_numpy(q.astype(np.int32)), bits).numpy()
 
     # Round-trip the group scale through fp8 e4m3 so the fixture stores exactly what a
     # checkpoint stores and the Zig side decodes the same bytes.
@@ -119,6 +127,7 @@ def make_case(name, rows, cols, group_size, codebook, s_rel_f32, seed, convrot_g
 
     return {
         "name": name,
+        "bits": bits,
         "rows": rows,
         "cols": cols,
         "group_size": group_size,
@@ -179,6 +188,20 @@ def synthetic_cases():
     rows, cols, gs = 2, 256, 16
     s = np.ones((rows, cols // gs), dtype=np.float32)
     cases.append(make_case("ties_to_even", rows, cols, gs, tie_cb, s, seed=16))
+
+    # 6. W6A8: the nibble plane then the 2-bit high plane, uniform (q - 32) levels.
+    #    Scales across binades at group 16; group 32; and s_rel 0.5, which puts every odd
+    #    (q - 32) exactly on a tie, half of all levels.
+    rng = np.random.default_rng(6)
+    rows, cols, gs = 4, 256, 16
+    s = (2.0 ** rng.integers(-2, 3, size=(rows, cols // gs))).astype(np.float32) * np.float32(1.25)
+    cases.append(make_case("w6_gs16", rows, cols, gs, None, s, seed=17, bits=6))
+    rows, cols, gs = 3, 512, 32
+    s = (0.5 + np.arange(rows * (cols // gs), dtype=np.float32).reshape(rows, -1) * 0.25)
+    cases.append(make_case("w6_gs32", rows, cols, gs, None, s.astype(np.float32), seed=18, bits=6))
+    rows, cols, gs = 2, 256, 16
+    cases.append(make_case("w6_ties", rows, cols, gs, None, np.full((rows, cols // gs), 0.5, dtype=np.float32), seed=19, bits=6))
+    cases.append(make_case("w6_saturate", rows, cols, gs, None, np.full((rows, cols // gs), 8.0, dtype=np.float32), seed=20, bits=6))
 
     return cases
 
@@ -285,7 +308,7 @@ def main():
               f"range [{v.min():4d}, {v.max():4d}]")
         # `saturate` collapses on purpose (the clamp is what it tests) and
         # `ties_to_even` has only 16 half-integer levels.
-        if c["name"] not in ("ties_to_even", "saturate"):
+        if c["name"] not in ("ties_to_even", "saturate", "w6_saturate"):
             assert len(np.unique(v)) >= 12, f"{c['name']} decodes to too few levels"
 
     tie = next(c for c in out["cases"] if c["name"] == "ties_to_even")

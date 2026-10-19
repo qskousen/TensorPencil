@@ -590,7 +590,7 @@ test "the CUDA W4A8 decode matches ops.w4a8.decode" {
         levels.* = w4a8.Levels.init(&w4a8.fixed_lut);
 
         const want = try alloc.alloc(i8, c.rows * c.cols);
-        w4a8.decode(want, packed_bytes, s_rel, levels, c.rows, c.cols, c.gs);
+        w4a8.decode(want, packed_bytes, s_rel, .{ .w4 = levels }, c.rows, c.cols, c.gs);
 
         const db = try be.w4a8ToI8(packed_bytes, s_rel, std.mem.asBytes(levels), c.rows, c.cols, c.gs);
         const got = try alloc.alloc(i8, c.rows * c.cols);

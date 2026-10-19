@@ -355,7 +355,7 @@ fn intWeight(w: Weight) gpu.Context.IntWeight {
         .i4 => .{ .i4 = w.bytes },
         else => blk: {
             const meta = w.w4a8.?;
-            break :blk .{ .w4a8 = .{ .packed_bytes = w.bytes, .s_rel = meta.s_rel, .levels = std.mem.asBytes(meta.levels), .group_size = meta.group_size } };
+            break :blk .{ .w4a8 = .{ .packed_bytes = w.bytes, .s_rel = meta.s_rel, .levels = meta.levelBytes(), .group_size = meta.group_size } };
         },
     };
 }
@@ -788,7 +788,7 @@ pub const Lin = struct {
             .w4a8 => {
                 std.debug.assert(o.y_off == 0);
                 const meta = w.w4a8.?;
-                const wbuf = try ctx.w4a8Decode(w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.rows, w.cols, meta.group_size);
+                const wbuf = try ctx.w4a8Decode(w.bytes, meta.s_rel, meta.levelBytes(), w.rows, w.cols, meta.group_size);
                 try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows);
                 folded = o.bias == null;
             },

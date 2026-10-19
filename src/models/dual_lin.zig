@@ -286,7 +286,7 @@ fn refuseRoute(comptime C: type, caps: C, lins: []const Weight, rot: bool, w: We
     // Named here rather than met as `w.row_scale.?` in the GEMM, where the null is a
     // slice at address 0.
     switch (w.dtype) {
-        .i8, .i4, .w4a8 => if (w.row_scale == null or w.row_scale.?.len != w.rows) return .no_row_scale,
+        .i8, .i4, .w4a8, .w6a8 => if (w.row_scale == null or w.row_scale.?.len != w.rows) return .no_row_scale,
         else => {},
     }
     return caps.refuse(lins, rot, w, r);

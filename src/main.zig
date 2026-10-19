@@ -425,6 +425,33 @@ pub fn main(init: std.process.Init) !void {
         }
         if (prof and !vk) return mossImageCudaProf(arena, io, stdout, ckpt, libs, lat_arg, cap_arg);
         try mossImageTest(arena, io, stdout, ckpt, if (vk) .vulkan else if (libs) .cuda else .zig_cuda, layers, lat_arg, cap_arg, sigma_arg);
+    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "qwen-image21-cuda-test") or std.mem.eql(u8, args[1], "qwen-image21-vk-test"))) {
+        const vk = std.mem.eql(u8, args[1], "qwen-image21-vk-test");
+        var ckpt: []const u8 = TensorPencil.model_root ++ "/diffusion_models/qwen2.1/qwen_image_2.1_turbo_int8_convrot.safetensors";
+        var libs = false;
+        var layers: usize = 0;
+        var lat_arg: usize = 16;
+        var cap_arg: usize = 20;
+        var sigma_arg: f32 = 0.75;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) {
+                libs = true;
+            } else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                layers = std.fmt.parseInt(usize, args[i], 10) catch layers;
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                lat_arg = std.fmt.parseInt(usize, args[i], 10) catch lat_arg;
+            } else if (std.mem.eql(u8, args[i], "--cap") and i + 1 < args.len) {
+                i += 1;
+                cap_arg = std.fmt.parseInt(usize, args[i], 10) catch cap_arg;
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                sigma_arg = std.fmt.parseFloat(f32, args[i]) catch sigma_arg;
+            } else ckpt = args[i];
+        }
+        try qwenImage21DevTest(arena, io, stdout, ckpt, if (vk) .vulkan else if (libs) .cuda else .zig_cuda, layers, lat_arg, cap_arg, sigma_arg);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mageflow-cuda-test")) {
         var ckpt: []const u8 = TensorPencil.model_root ++ "/diffusion_models/mageflow/mageFlow_mageFlow4B.safetensors";
         var libs = false;
@@ -530,8 +557,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "taehv-test")) {
         try taehvTest(arena, io, stdout, if (args.len >= 3) args[2] else TensorPencil.model_root ++ "/vae_approx/taew2_1.safetensors");
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "wan-vae-test")) {
-        // `wan-vae-test [latent side] [vae path]`
+        // `wan-vae-test [latent side] [vae path] [naive-attn]`: the last runs the CUDA
+        // arms' mid-block attention through the f32 kernel, to isolate its share.
         const zh: usize = if (args.len >= 3) (std.fmt.parseInt(usize, args[2], 10) catch 16) else 16;
+        if (args.len >= 5 and std.mem.eql(u8, args[4], "naive-attn")) TensorPencil.models.sd_vae_cuda.force_naive_attn = true;
         try wanVaeTest(arena, io, stdout, zh, if (args.len >= 4) args[3] else TensorPencil.model_root ++ "/vae/krea2RealVae_v10.safetensors");
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "dump-ptx")) {
         try dumpPtx(arena, io, stdout, if (args.len >= 3) args[2] else "", if (args.len >= 4) args[3] else "");
@@ -2522,7 +2551,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => &.{},
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -3148,7 +3177,7 @@ fn sensenovaTestLoad(
     if (lora_path.len > 0) {
         out.lora_ck = try TensorPencil.pipeline.Container.open(arena, io, lora_path);
         var stack: TensorPencil.models.lora.Stack = .{};
-        _ = try stack.add(arena, out.lora_ck.?.store(), 1.0, lora_path, &.{});
+        _ = try stack.add(arena, out.lora_ck.?.store(), 1.0, lora_path, .{});
         out.stack = stack;
         out.lora_path = lora_path;
     }
@@ -3457,7 +3486,7 @@ fn renderParams(
         w,
         h,
         std.fs.path.stem(opts.dit_path),
-        null,
+        img.family,
         opts.sampler,
         opts.scheduler,
         opts.prompt_syntax,
@@ -4357,7 +4386,7 @@ fn mageflowCudaTest(
         });
     }
     mageflow_cuda.force_naive_attn = saved;
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, &.{})) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{})) |st| {
         failures += try reportAttach(stdout, st, try model.attachLora(arena, st), layers != 0);
         try TensorPencil.models.lin_cuda.quantizeLora(arena, st, model.device_lins, TensorPencil.models.lin_cuda.blockq_gemm, .w8a8);
         const want_l = try arena.alloc(f32, x_lat.len);
@@ -4477,6 +4506,147 @@ fn mossImageTest(
     }.f;
     try mossImageChecks(arm, emu, stdout, &failures, &model, io, arena, be, run, lat, ctxv, seq_txt, sigma, x_lat, exact, tol);
     try summarize(stdout, failures);
+}
+
+/// Qwen-Image 2.1's device forward against its CPU forward, on the real checkpoint, over
+/// depth, canvas tokens, text length and sigma. One session runs two sigmas, so the
+/// second reads the prefix keys and values the first left behind.
+fn qwenImage21DevTest(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    ckpt: []const u8,
+    backend: enum { cuda, zig_cuda, vulkan },
+    layers: usize,
+    lat: usize,
+    seq_txt: usize,
+    sigma: f32,
+) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const qi = TensorPencil.models.qwen_image21;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("qwen-image21 device test needs a Qwen-Image 2.1 checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try TensorPencil.pipeline.Container.open(arena, io, ckpt);
+    defer ck.deinit();
+    const store = try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store());
+    var cfg = try qi.Config.detect(store);
+    if (layers != 0) cfg.layers = @min(layers, cfg.layers);
+    var model = try qi.DiT.loadWith(arena, store, cfg);
+    defer model.deinit();
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    const ctxv = try arena.alloc(f32, seq_txt * cfg.txt_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, cfg.in_ch * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+    const sigmas = [_]f32{ sigma, sigma * 0.5 };
+    var exact: [2][]f32 = undefined;
+    for (&exact, sigmas) |*e, s| {
+        e.* = try arena.alloc(f32, cfg.out_ch * lat * lat);
+        try model.forward(io, arena, e.*, x_lat, lat, lat, s, ctxv, seq_txt, &.{}, null);
+    }
+    const inp: Qi21In = .{ .model = &model, .lat = lat, .ctxv = ctxv, .seq_txt = seq_txt, .sigmas = &sigmas, .x_lat = x_lat, .exact = exact, .tol = checkTol(if (cfg.layers <= 4) 1e-2 else 3e-2) };
+    var failures: usize = 0;
+
+    if (backend == .vulkan) {
+        const arm = TensorPencil.models.qwen_image21_gpu;
+        const ctx = TensorPencil.gpu.context.Context.init(arena, io) catch |err| {
+            try stdout.print("vulkan unavailable: {t}\n", .{err});
+            return;
+        };
+        defer ctx.deinit();
+        try stdout.print("== qwen-image21-vk-test ==\nvulkan device: {s}\ntrunk depth {d}, latent {d}x{d}, text {d}, sigma {d} then {d}\n", .{ ctx.deviceName(), cfg.layers, lat, lat, seq_txt, sigmas[0], sigmas[1] });
+        if (!arm.supported(ctx, &model)) {
+            try stdout.print("checkpoint dtype unsupported on this device\n", .{});
+            return;
+        }
+        const emu: ActEmu(*TensorPencil.gpu.context.Context, TensorPencil.models.lin_gpu.actQuant) = .{ .dev = ctx, .plan = try arm.linPlan(ctx, &model), .lins = model.device_lins };
+        try qwenImage21Checks(arm, ctx, emu, stdout, &failures, io, arena, inp);
+        return summarize(stdout, failures);
+    }
+
+    const arm = TensorPencil.models.qwen_image21_cuda;
+    var be = (if (backend == .cuda) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== qwen-image21-cuda-test ==\ncuda device: {s} (kernels: {t})\ntrunk depth {d}, latent {d}x{d}, text {d}, sigma {d} then {d}\n", .{
+        be.deviceName(), be.kernels, cfg.layers, lat, lat, seq_txt, sigmas[0], sigmas[1],
+    });
+    if (!arm.supported(arena, &model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+    const emu: ActEmu(*cuda.Backend, TensorPencil.models.lin_cuda.actQuant) = .{ .dev = be, .plan = try arm.linPlan(arena, &model), .lins = model.device_lins };
+    try qwenImage21Checks(arm, be, emu, stdout, &failures, io, arena, inp);
+    try summarize(stdout, failures);
+}
+
+const Qi21In = struct {
+    model: *const TensorPencil.models.qwen_image21.DiT,
+    lat: usize,
+    ctxv: []const f32,
+    seq_txt: usize,
+    sigmas: []const f32,
+    x_lat: []const f32,
+    exact: [2][]f32,
+    tol: f64,
+};
+
+/// Both arms' checks: exact attention against the exact forward (the walk itself),
+/// weight-only, then W8A8 by its noise when the checkpoint is integer.
+fn qwenImage21Checks(comptime arm: type, device: anytype, emu: anytype, stdout: *Io.Writer, failures: *usize, io: Io, arena: std.mem.Allocator, in: Qi21In) !void {
+    const dev = TensorPencil.models.qwen_image21_dev;
+    const run = struct {
+        fn f(m: *const TensorPencil.models.qwen_image21.DiT, b: @TypeOf(device), i: Io, a: std.mem.Allocator, l: usize, t: []const f32, st: usize, ss: []const f32, x: []const f32) ![2][]f32 {
+            var sess = try arm.Session.init(a, i, b, m, l, l, t, st, &.{ ss[0], ss[1], 0 });
+            defer sess.deinit(a, b);
+            var ws = try arm.Workspace.init(b, m, l * l, sess.pre, dev.streamDtFor(testAct()));
+            defer ws.deinit(b);
+            var got: [2][]f32 = undefined;
+            for (&got, ss) |*g, s| {
+                g.* = try a.alloc(f32, m.cfg.out_ch * l * l);
+                try arm.forward(m, b, &sess, &ws, i, a, g.*, x, s, null);
+            }
+            return got;
+        }
+    }.f;
+    const names = [2][]const u8{ "first step (prefix pass)", "second step (cached prefix)" };
+    if (in.lat <= 16 and emu.quantizes()) {
+        // Exact attention and weight-only linears leave the walk itself, which must
+        // hold to the CPU forward at f32 rounding. Integer weights only: a dense or
+        // NVFP4 weight's GEMM stages its activation at 16 bits.
+        arm.force_attn_f32 = true;
+        arm.force_weight_only = true;
+        defer arm.force_attn_f32 = false;
+        defer arm.force_weight_only = false;
+        const ex = try run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
+        for (names, in.exact, ex) |n, e, g| try checkRel(stdout, failures, try std.fmt.allocPrint(arena, "{s} (f32 attention)", .{n}), e, g, checkTol(1e-4));
+    }
+    if (!emu.quantizes()) {
+        const got = try run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
+        for (names, in.exact, got) |n, e, g| try checkRel(stdout, failures, n, e, g, in.tol);
+        return;
+    }
+    arm.force_weight_only = true;
+    const wo = run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
+    arm.force_weight_only = false;
+    const wog = try wo;
+    for (names, in.exact, wog) |n, e, g| try checkRel(stdout, failures, try std.fmt.allocPrint(arena, "{s} (weight-only)", .{n}), e, g, in.tol);
+    const q = try arena.alloc(f32, in.x_lat.len);
+    {
+        emu.install();
+        defer TensorPencil.ops.matmul.act_quant = null;
+        try in.model.forward(io, arena, q, in.x_lat, in.lat, in.lat, in.sigmas[0], in.ctxv, in.seq_txt, &.{}, null);
+    }
+    try stdout.print("emulated activation quant vs f32  rel L2 {e:.4}  (the format's own error)\n", .{relL2f(in.exact[0], q)});
+    const got = try run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
+    try checkQuantNoise(stdout, failures, "first step (W8A8)", in.exact[0], q, wog[0], got[0]);
 }
 
 /// MOSS-Image's Qwen3.5 encoder on a device against the fixture's exact conditioning.
@@ -4775,7 +4945,7 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         });
     }
     zimage_cuda.force_naive_attn = saved;
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, &zimage.lora_keys)) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{ .renames = &zimage.lora_keys })) |st| {
         failures += try reportAttach(stdout, st, try model.attachLora(arena, st), layers != 0);
         try TensorPencil.models.lin_cuda.quantizeLora(arena, st, model.device_lins, TensorPencil.models.lin_cuda.blockq_gemm, .w8a8);
         // The caption half and the AdaLN linears are patched too, so both are rebuilt.
@@ -6151,7 +6321,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
         failures += try animaForwardCheck(arena, io, stdout, be, &model, depth, qdt, rnd);
     }
 
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, &.{})) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{})) |st| {
         var cfg = full;
         if (lora_layers != 0) cfg.n_layers = lora_layers;
         var model = try anima.DiT.load(arena, dstore, cfg);
@@ -6196,7 +6366,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
 fn animaTol(qdt: ?TensorPencil.dtype.DType, depth: usize) f64 {
     const base: f64 = switch (qdt orelse .f32) {
         .i4 => 6e-2,
-        .i8, .w4a8 => 6e-3,
+        .i8, .w4a8, .w6a8 => 6e-3,
         // A GGUF block quant on the device decodes to convrot int8 per GEMM
         // (`lin_cuda`), so its residual against the weight-only CPU reference is int8's
         // plus the format's own regrid, not the dense one. Measured on a q4_k Anima:
@@ -6758,18 +6928,24 @@ fn wanVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize, v
     };
     const zw = zh;
     const plane = zh * zw;
-    var prng = std.Random.DefaultPrng.init(7);
-    const z = try arena.alloc(f32, wan_vae.latent_channels * plane);
-    for (z, 0..) |*v, i| v.* = prng.random().floatNorm(f32) * wan_vae.latents_std[i / plane] + wan_vae.latents_mean[i / plane];
-
     var st = try TensorPencil.SafeTensors.open(arena, io, vae_path);
     defer st.deinit();
     var dec = try wan_vae.Decoder.load(arena, .{ .safetensors = &st });
     defer dec.deinit();
+
+    // The latent at its own format's statistics: Wan 2.1's 16 channels, or Qwen-Image
+    // 2.1's 64 for the Wan 2.2 layout.
+    const qi = TensorPencil.models.qwen_image21;
+    const zc = dec.latentChannels();
+    const mean: []const f32 = if (zc == qi.latent_channels) &qi.latents_mean else &wan_vae.latents_mean;
+    const sdev: []const f32 = if (zc == qi.latent_channels) &qi.latents_std else &wan_vae.latents_std;
+    var prng = std.Random.DefaultPrng.init(7);
+    const z = try arena.alloc(f32, zc * plane);
+    for (z, 0..) |*v, i| v.* = prng.random().floatNorm(f32) * sdev[i / plane] + mean[i / plane];
     const want = try dec.decode(io, arena, z, zh, zw, null);
     // Vulkan reads repacked weights, and keys them on host addresses.
     try dec.repackConvs(arena);
-    try stdout.print("== wan-vae-test zh={d} ({d}x{d} px) ==\n", .{ zh, zh * 8, zw * 8 });
+    try stdout.print("== wan-vae-test zh={d} ({d}x{d} px, {d} out channels) ==\n", .{ zh, zh * dec.scale(), zw * dec.scale(), dec.outChannels() });
 
     var bad = false;
     const Arm = struct {
@@ -7209,13 +7385,13 @@ fn dumpPtx(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, which: []const 
 /// A LoRA stack for a device check, or null when `path` is empty. Lives in `arena`
 /// at a stable address, since a model holds a pointer to it; the container is
 /// never closed, because the factors are views into its mapping.
-fn openTestLora(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, strength: f32, renames: []const TensorPencil.models.lora.Rename) !?*TensorPencil.models.lora.Stack {
+fn openTestLora(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, strength: f32, keys: TensorPencil.models.lora.KeyMap) !?*TensorPencil.models.lora.Stack {
     if (path.len == 0) return null;
     const ck = try arena.create(TensorPencil.pipeline.Container);
     ck.* = try TensorPencil.pipeline.Container.openNamed(arena, io, path);
     const st = try arena.create(TensorPencil.models.lora.Stack);
     st.* = .{};
-    _ = try st.add(arena, ck.store(), strength, path, renames);
+    _ = try st.add(arena, ck.store(), strength, path, keys);
     try stdout.print("lora: {s} at strength {d}, {d} keys\n", .{ path, strength, st.files.items[0].side.keyCount() });
     return st;
 }
@@ -7419,7 +7595,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         if (!std.math.isFinite(rel) or rel > checkTol(tol)) return error.GpuMismatch;
         try stdout.print("cuda DiT forward OK ({s}; int4 vs W4A16 ref includes activation-quant)\n", .{qtag});
 
-        const st = (try openTestLora(arena, io, stdout, lora_path, strength, &.{})) orelse return;
+        const st = (try openTestLora(arena, io, stdout, lora_path, strength, .{})) orelse return;
         var control: f64 = 0;
         // The control row: the same delta comparison for a small change of the INPUT,
         // with no sidecar anywhere. The LoRA's delta figure means something only
@@ -7869,7 +8045,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     const params = try renderParams(arena, io, &opts, &img, img.width, img.height);
     var png: std.ArrayList(u8) = .empty;
     defer png.deinit(arena);
-    try TensorPencil.image.encodePngRgbText(arena, &png, img.rgb, img.width, img.height, &.{
+    try img.encodePng(arena, &png, &.{
         .{ .keyword = "parameters", .text = params },
     });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = png.items });
@@ -9279,7 +9455,7 @@ fn loraInfo(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         defer ct.deinit();
         var stack: lora.Stack = .{};
         defer stack.deinit(arena);
-        const n = try stack.add(arena, ct.store(), 1.0, path, renames);
+        const n = try stack.add(arena, ct.store(), 1.0, path, .{ .renames = renames });
         var hist: [8]struct { rank: usize = 0, n: usize = 0 } = @splat(.{});
         var it = stack.files.items[0].side.index.valueIterator();
         while (it.next()) |t| for (t.factors) |f| {
@@ -10052,12 +10228,28 @@ fn linTestWeights(arena: std.mem.Allocator, rnd: std.Random, wf: []const f32, ro
         const levels = try arena.create(ops.w4a8.Levels);
         levels.* = ops.w4a8.Levels.init(null);
         const meta = try arena.create(ops.w4a8.Meta);
-        meta.* = .{ .s_rel = s_rel, .levels = levels, .group_size = group };
+        meta.* = .{ .s_rel = s_rel, .codes = .{ .w4 = levels }, .group_size = group };
         var w = Weight.init(b, .w4a8, rows, cols);
         w.row_scale = row_scale;
         w.w4a8 = meta;
         w.convrot = ops.convrot.group_size;
         try ws.append(arena, .{ .name = "w4a8", .w = w });
+    }
+    {
+        const group = 64;
+        const b = try arena.alloc(u8, rows * cols * 3 / 4);
+        rnd.bytes(b);
+        const s_rel = try arena.alloc(u8, rows * cols / group);
+        for (s_rel) |*v| v.* = 0x28 | (rnd.int(u8) & 0x07);
+        const levels = try arena.create(ops.w4a8.Levels6);
+        levels.* = ops.w4a8.Levels6.init();
+        const meta = try arena.create(ops.w4a8.Meta);
+        meta.* = .{ .s_rel = s_rel, .codes = .{ .w6 = levels }, .group_size = group };
+        var w = Weight.init(b, .w6a8, rows, cols);
+        w.row_scale = row_scale;
+        w.w4a8 = meta;
+        w.convrot = ops.convrot.group_size;
+        try ws.append(arena, .{ .name = "w6a8", .w = w });
     }
     {
         const b = try arena.alloc(u8, rows * cols / 2);
@@ -11392,7 +11584,7 @@ fn h3TestLora(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, dit: *Tensor
     ct.* = try TensorPencil.pipeline.Container.openNamed(arena, io, path);
     const stack = try arena.create(lora.Stack);
     stack.* = .{};
-    _ = try stack.add(arena, ct.store(), 1.0, path, &.{});
+    _ = try stack.add(arena, ct.store(), 1.0, path, .{});
     const n = try dit.attachLora(arena, stack);
     try stdout.print("lora: {s}, {d} targets attached\n", .{ path, n });
 }

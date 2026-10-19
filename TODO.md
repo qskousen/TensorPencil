@@ -426,3 +426,19 @@
   3. `er_sde`, the sampler ComfyUI's MOSS templates use. Not in `core/sampler.zig`.
   4. `MOSSImageLayoutPrompt`, ComfyUI's bounding-box layout prompt (a JSON caption with
      per-box captions and colours), for tp-gui.
+  5. `effectiveAct(.encoder)` still answers f32 for MOSS: the Qwen3.5 encode runs on the
+     device (`runQwen35`) at whatever `CudaLM`/`VulkanLM` store, which was never read off.
+     The PNG's activation field says f32 regardless.
+- Qwen-Image 2.1, what support left open:
+  1. Reference editing. The CPU DiT takes `Ref`s spliced at a slot (the toy fixture pins
+     it); missing are the 2.2-layout VAE ENCODER (alpha padded at 1.0 as ComfyUI does),
+     the 8B encoder's vision tower presenting the reference to the text, the slot syntax
+     in the prompt, and the device arms' image prefix parts beyond the rect call.
+  2. The f16 DiT stream measured slower than f32 in one run (2.15 against 1.38 s/step,
+     int8, CUDA, shared card). An interleaved same-binary A/B decides the default; a
+     profile first, since "flat or slower f16" has been dispatcher staging before.
+  3. The VAE at f32 only: f16 overflows it and bf16 is 2-3e-2. Find which tensor
+     outgrows f16 (an exact power-of-two prescale as elsewhere) before calling it.
+  4. The prefix's text runs on Vulkan go through the per-thread `attn_causal_batched`.
+     Fine at a prompt's length and run once per conditioning; long prompts or image
+     prefixes want the tensor-core path with a causal row bound.

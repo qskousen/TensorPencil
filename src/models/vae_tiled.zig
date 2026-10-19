@@ -20,10 +20,9 @@
 
 const std = @import("std");
 
-/// VAE spatial upscale factor (latent -> pixels).
-const scale = 8;
-
 pub const Params = struct {
+    /// Pixels per latent pixel along each axis.
+    scale: usize = 8,
     /// Latent tile size (side, in latent pixels). Caps the per-tile attention
     /// plane at (tile²)² * 2 bytes and conv buffers at (8*tile)² * maxC * 4.
     /// 128 -> a 512 MiB attention plane, ~1 MP conv tiles.
@@ -33,17 +32,16 @@ pub const Params = struct {
     overlap: usize = 16,
 };
 
-/// Decode a denormalized planar [c][zh][zw] latent to planar [3][8*zh][8*zw]
-/// pixels in [-1, 1] by decoding overlapping tiles and feather-blending them.
+/// Decode a denormalized planar [c][zh][zw] latent to planar [cout][s*zh][s*zw]
+/// pixels in [-1, 1] (`s` = `params.scale`) by decoding overlapping tiles and
+/// feather-blending them.
 ///
 /// `decodeTile(ctx, gpa, io, sub, th, tw)` decodes a planar [c][th][tw]
-/// sub-latent to planar [3][8*th][8*tw] pixels (it owns the result; this frees
+/// sub-latent to planar [cout][s*th][s*tw] pixels (it owns the result; this frees
 /// it). Caller frees the returned image.
 ///
-/// The latent channel count is *derived* from `z.len / (zh*zw)` rather than
-/// taken from a model constant: the tiling is identical for krea2's 16-channel
-/// Wan latent and the SD family's 4-channel one, and hardcoding either is how a
-/// second family ends up unable to tile at all.
+/// Both channel counts are *derived*, `c` from `z.len` and `cout` from the first
+/// tile, so one tiling serves every latent width and an RGBA decoder alike.
 pub fn decode(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -54,7 +52,7 @@ pub fn decode(
     ctx: anytype,
     comptime decodeTile: fn (@TypeOf(ctx), std.mem.Allocator, std.Io, []const f32, usize, usize) anyerror![]f32,
 ) ![]f32 {
-    const cout = 3;
+    const scale = params.scale;
     std.debug.assert(zh != 0 and zw != 0);
     std.debug.assert(z.len % (zh * zw) == 0);
     const cin = z.len / (zh * zw);
@@ -69,10 +67,11 @@ pub fn decode(
     const width = zw * scale;
     const plane = height * width;
 
-    // Weighted accumulation over the full image (host RAM), normalized at the end.
-    const accum = try gpa.alloc(f32, cout * plane);
+    // Weighted accumulation over the full image (host RAM), normalized at the end;
+    // sized at the first tile, which is what says how many channels there are.
+    var cout: usize = 0;
+    var accum: []f32 = &.{};
     defer gpa.free(accum);
-    @memset(accum, 0);
     const wsum = try gpa.alloc(f32, plane);
     defer gpa.free(wsum);
     @memset(wsum, 0);
@@ -99,6 +98,12 @@ pub fn decode(
 
             const ph = th * scale;
             const pw = tw * scale;
+            if (cout == 0) {
+                if (px.len == 0 or px.len % (ph * pw) != 0) return error.TileShapeMismatch;
+                cout = px.len / (ph * pw);
+                accum = try gpa.alloc(f32, cout * plane);
+                @memset(accum, 0);
+            } else if (px.len != cout * ph * pw) return error.TileShapeMismatch;
             const oy0 = r0 * scale;
             const ox0 = c0 * scale;
 
@@ -163,15 +168,17 @@ const testing = std.testing;
 /// latent value, overlapping tiles agree exactly in their overlap, so the
 /// feather-blended tiled result must equal a single whole-image decode. This
 /// isolates the tiling/blend math from any real conv/attention behavior.
-fn upsampleCh0(_: void, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+const Local = struct { scale: usize, cout: usize };
+
+fn upsampleCh0(l: Local, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
     _ = io;
-    const ph = th * scale;
-    const pw = tw * scale;
-    const out = try gpa.alloc(f32, 3 * ph * pw);
+    const ph = th * l.scale;
+    const pw = tw * l.scale;
+    const out = try gpa.alloc(f32, l.cout * ph * pw);
     for (0..ph) |ty| {
         for (0..pw) |tx| {
-            const v = sub[(ty / scale) * tw + (tx / scale)]; // channel 0
-            for (0..3) |ch| out[(ch * ph + ty) * pw + tx] = v;
+            const v = sub[(ty / l.scale) * tw + (tx / l.scale)]; // channel 0
+            for (0..l.cout) |ch| out[(ch * ph + ty) * pw + tx] = v + @as(f32, @floatFromInt(ch));
         }
     }
     return out;
@@ -183,10 +190,12 @@ test "tiled decode of a local op equals the whole decode" {
     const zh = 40;
     const zw = 56;
 
-    // Both latent widths in the engine: krea2's Wan latent (16) and the SD
-    // family's (4). The channel count is derived from `z.len`, so a regression
-    // that reintroduces a hardcoded 16 fails on the 4-channel arm.
-    for ([_]usize{ 16, 4 }) |cin| {
+    // krea2's Wan latent (16) and the SD family's (4) at 8x into RGB, and Qwen-Image
+    // 2.1's (64) at 16x into RGBA. Every count is derived, so a regression that
+    // hardcodes one fails on another arm.
+    for ([_][3]usize{ .{ 16, 8, 3 }, .{ 4, 8, 3 }, .{ 64, 16, 4 } }) |arm| {
+        const cin = arm[0];
+        const local: Local = .{ .scale = arm[1], .cout = arm[2] };
         const z = try gpa.alloc(f32, cin * zh * zw);
         defer gpa.free(z);
         // Smooth-ish deterministic latent so borders are non-trivial.
@@ -201,17 +210,17 @@ test "tiled decode of a local op equals the whole decode" {
             }
         }
 
-        const whole = try upsampleCh0({}, gpa, io, z, zh, zw);
+        const whole = try upsampleCh0(local, gpa, io, z, zh, zw);
         defer gpa.free(whole);
 
         // Several tile/overlap configs, including tile larger than the image.
         const cfgs = [_]Params{
-            .{ .tile = 16, .overlap = 4 },
-            .{ .tile = 24, .overlap = 8 },
-            .{ .tile = 100, .overlap = 16 }, // > zh, single row of tiles
+            .{ .scale = local.scale, .tile = 16, .overlap = 4 },
+            .{ .scale = local.scale, .tile = 24, .overlap = 8 },
+            .{ .scale = local.scale, .tile = 100, .overlap = 16 }, // > zh, single row of tiles
         };
         for (cfgs) |p| {
-            const tiled = try decode(gpa, io, z, zh, zw, p, {}, upsampleCh0);
+            const tiled = try decode(gpa, io, z, zh, zw, p, local, upsampleCh0);
             defer gpa.free(tiled);
             try testing.expectEqual(whole.len, tiled.len);
             for (whole, tiled) |a, b| {

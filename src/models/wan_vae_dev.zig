@@ -1,4 +1,4 @@
-//! The Wan 2.1 VAE decoder's device walk, written once for every GPU backend over the
+//! The Wan VAE decoder's device walk, written once for every GPU backend over the
 //! same adapter as `sd_vae_dev` (`sd_vae_cuda.Dev`, `sd_vae_gpu.Dev`), plus its one
 //! op of its own, `channelNorm` (the per-position channel L2 norm, optionally followed
 //! by silu). `body` runs between the adapter's upload of the latent rows into
@@ -22,16 +22,23 @@ pub fn body(d: anytype, dec: *const wan_vae.Decoder, zh: usize, zw: usize, cance
     try d.midDone();
     try res(d, h, w, dec.mid_res2);
 
+    var ch = dec.conv_in.co;
     for (dec.ups) |layer| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         switch (layer) {
-            .res => |rb| try res(d, h, w, rb),
+            .res => |rb| {
+                try res(d, h, w, rb);
+                ch = rb.conv2.co;
+            },
             .up => |cv| {
                 try sd_vae_dev.convResidual(d, &b.t, &b.x, h, w, cv.asOps(), .upsample2x);
                 std.mem.swap(@TypeOf(b.x), &b.x, &b.t);
                 h *= 2;
                 w *= 2;
+                ch = cv.co;
             },
+            .save => try d.copy(b.sv, b.x, h * w * ch),
+            .dup_add => |du| try d.dupUpAdd(b.x, b.sv, h / 2, w / 2, du),
         }
     }
 

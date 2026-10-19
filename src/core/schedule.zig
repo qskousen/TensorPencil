@@ -252,6 +252,11 @@ pub const Scheduler = enum {
     beta,
     linear_quadratic,
     kl_optimal,
+    /// The family's reference pipeline's own schedule, which ComfyUI does not have
+    /// (Qwen-Image 2.1: `DiffusersFlow`). A family without one refuses it.
+    reference,
+    /// The fixed sigma list a distilled release ships, whatever the step count.
+    turbo,
 
     /// The `--scheduler` spelling and the GUI config value.
     pub fn parse(s: []const u8) ?Scheduler {
@@ -274,6 +279,8 @@ pub const Scheduler = enum {
             .beta => "Beta",
             .linear_quadratic => "Linear Quadratic",
             .kl_optimal => "KL Optimal",
+            .reference => "Reference",
+            .turbo => "Turbo",
         };
     }
 
@@ -289,6 +296,69 @@ pub const Scheduler = enum {
         };
     }
 };
+
+/// diffusers' `FlowMatchEulerDiscreteScheduler` under a dynamic-shift config, the way
+/// `QwenImage21Pipeline` drives it: `linspace(1, 1/N, N)`, the exponential time shift
+/// at a mu read off the TARGET's latent token count, a stretch so the last non-zero
+/// sigma is `terminal`, then 0. ComfyUI instead samples its Flux table at one fixed mu
+/// (diffusers' value at 1024x1024) with no stretch, which is right at one resolution.
+///
+/// The arithmetic is numpy's: linspace and mu in f64, everything after the cast to
+/// f32 in f32 with each python float scalar narrowed first. One step has no stretch
+/// (its only sigma is 1, and diffusers divides 0 by 0 there and returns NaN).
+pub const DiffusersFlow = struct {
+    base_seq: f64 = 256,
+    max_seq: f64 = 8192,
+    base_shift: f64 = 0.5,
+    max_shift: f64 = 0.9,
+    terminal: ?f32 = 0.02,
+
+    pub fn mu(c: DiffusersFlow, tokens: usize) f64 {
+        const m = (c.max_shift - c.base_shift) / (c.max_seq - c.base_seq);
+        const b = c.base_shift - m * c.base_seq;
+        return @as(f64, @floatFromInt(tokens)) * m + b;
+    }
+
+    /// `build` at a shift carried as f32: the f64 mu for `tokens` when `shift` is its
+    /// rounding, since diffusers narrows `exp(mu)` and the rounded mu can move a bit.
+    pub fn buildAt(c: DiffusersFlow, gpa: std.mem.Allocator, steps: usize, shift: f32, tokens: usize) ![]f32 {
+        const exact = c.mu(tokens);
+        return c.build(gpa, steps, if (@as(f32, @floatCast(exact)) == shift) exact else shift);
+    }
+
+    /// `steps + 1` sigmas at `mu` (`c.mu(tokens)` unless overridden), caller frees.
+    pub fn build(c: DiffusersFlow, gpa: std.mem.Allocator, steps: usize, at_mu: f64) ![]f32 {
+        if (steps < 1) return error.NoSteps;
+        const out = try gpa.alloc(f32, steps + 1);
+        const e: f32 = @floatCast(@exp(at_mu));
+        const n: f64 = @floatFromInt(steps);
+        const stop = 1.0 / n;
+        const step = if (steps > 1) (stop - 1.0) / (n - 1.0) else 0;
+        for (out[0..steps], 0..) |*o, i| {
+            const lin: f64 = if (i + 1 == steps) stop else @as(f64, @floatFromInt(i)) * step + 1.0;
+            const t: f32 = @floatCast(lin);
+            o.* = e / (e + (1.0 / t - 1.0));
+        }
+        if (c.terminal) |term| if (steps > 1) {
+            const scale = (1.0 - out[steps - 1]) / (1.0 - term);
+            for (out[0..steps]) |*o| o.* = 1.0 - (1.0 - o.*) / scale;
+        };
+        out[steps] = 0;
+        return out;
+    }
+};
+
+/// Qwen-Image 2.1 Turbo's `sample_sigmas` (its model_index.json): its scheduler runs
+/// them unshifted and unstretched, so these plus the terminal 0 ARE the schedule.
+pub const qwen_image21_turbo_sigmas = [_]f64{ 1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568 };
+
+/// A fixed list run unshifted, then 0. Caller frees.
+pub fn fixedSigmas(gpa: std.mem.Allocator, list: []const f64) ![]f32 {
+    const out = try gpa.alloc(f32, list.len + 1);
+    for (out[0..list.len], list) |*o, v| o.* = @floatCast(v);
+    out[list.len] = 0;
+    return out;
+}
 
 /// Build a descending sigma schedule ending at exactly 0. Caller frees.
 ///
@@ -306,6 +376,8 @@ pub fn build(gpa: std.mem.Allocator, table: SigmaTable, sched: Scheduler, steps:
         .beta => betaSchedule(gpa, table, steps),
         .linear_quadratic => linearQuadratic(gpa, table, steps),
         .kl_optimal => klOptimal(gpa, table, steps),
+        // A property of the release, not of the table; `pipeline` resolves these.
+        .reference, .turbo => error.SchedulerNeedsFamily,
     };
 }
 
@@ -824,6 +896,10 @@ test "schedules are descending, end at exactly zero, and stay in the table's ran
 
     for ([_]SigmaTable{ .{ .flux = default_shift }, .{ .discrete = ladder } }) |table| {
         for (comptime std.enums.values(Scheduler)) |sched| {
+            if (sched == .reference or sched == .turbo) {
+                try std.testing.expectError(error.SchedulerNeedsFamily, build(gpa, table, sched, 8));
+                continue;
+            }
             for ([_]usize{ 2, 3, 7, 20, 50 }) |steps| {
                 const s = try build(gpa, table, sched, steps);
                 defer gpa.free(s);
@@ -842,6 +918,24 @@ test "schedules are descending, end at exactly zero, and stay in the table's ran
                 }
             }
         }
+    }
+}
+
+test "the release schedules are descending and end at exactly zero" {
+    const gpa = std.testing.allocator;
+    var cases: [10][]f32 = undefined;
+    var n: usize = 0;
+    defer for (cases[0..n]) |c| gpa.free(c);
+    for ([_]usize{ 2, 7, 40 }) |steps| for ([_]usize{ 256, 4096, 16384 }) |tokens| {
+        cases[n] = try (DiffusersFlow{}).build(gpa, steps, (DiffusersFlow{}).mu(tokens));
+        n += 1;
+    };
+    cases[n] = try fixedSigmas(gpa, &qwen_image21_turbo_sigmas);
+    n += 1;
+    for (cases[0..n]) |sg| {
+        try std.testing.expectEqual(@as(f32, 1), sg[0]);
+        try std.testing.expectEqual(@as(f32, 0), sg[sg.len - 1]);
+        for (sg[0 .. sg.len - 1], sg[1..]) |a, b| try std.testing.expect(a > b);
     }
 }
 
@@ -936,6 +1030,32 @@ test "the SD sigma ladder and normal schedule match diffusers' EulerDiscreteSche
         for (want_t, got_t, 0..) |e, a, i| {
             errdefer std.debug.print("{d}-step timestep[{d}]: expected {d:.4} got {d:.4}\n", .{ n, i, e, a });
             try std.testing.expectApproxEqAbs(e, a, 1e-3);
+        }
+    }
+}
+
+test "the diffusers flow schedule matches diffusers bit for bit, base and turbo" {
+    const gpa = std.testing.allocator;
+    const Case = struct { kind: []const u8, steps: usize, tokens: usize, bits: []const u32 };
+    const F = struct { turbo_sample_sigmas: []const f64, cases: []const Case };
+    const parsed = try std.json.parseFromSlice(F, gpa, @embedFile("assets/qwen_image21_sigmas.json"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(f64, &qwen_image21_turbo_sigmas, parsed.value.turbo_sample_sigmas);
+    for (parsed.value.cases) |c| {
+        const got = if (std.mem.eql(u8, c.kind, "turbo"))
+            try fixedSigmas(gpa, &qwen_image21_turbo_sigmas)
+        else
+            try (DiffusersFlow{}).build(gpa, c.steps, (DiffusersFlow{}).mu(c.tokens));
+        defer gpa.free(got);
+        errdefer std.debug.print("{s} steps {d} tokens {d}: got {any}\n", .{ c.kind, c.steps, c.tokens, got });
+        try std.testing.expectEqual(c.bits.len, got.len);
+        for (c.bits, got) |b, g| try std.testing.expectEqual(b, @as(u32, @bitCast(g)));
+        // The pipeline carries mu as an f32 shift; rounding it there must not move a bit.
+        if (std.mem.eql(u8, c.kind, "base")) {
+            const mu32: f32 = @floatCast((DiffusersFlow{}).mu(c.tokens));
+            const via = try (DiffusersFlow{}).buildAt(gpa, c.steps, mu32, c.tokens);
+            defer gpa.free(via);
+            for (c.bits, via) |b, g| try std.testing.expectEqual(b, @as(u32, @bitCast(g)));
         }
     }
 }

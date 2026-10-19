@@ -758,6 +758,45 @@ is 16.4 dB; ours against that SDPA render is 29.6 dB. So the gap is ComfyUI's in
 attention, which nothing here runs yet (`tools/gen_moss_image_render.py
 --no-int8-attention` is the control).
 
+### 2M. Qwen-Image 2.1 (block-causal single-stream DiT, Qwen3-VL-8B, RGBA Wan 2.2 VAE)
+
+32 single-stream blocks at 4096, patch 1 on a 64-channel latent at 16x. The sequence is the
+prompt (reference latents spliced in at their slots) then the target; text is causal and an
+image block sees through its own end. The prefix is modulated at t = 0, the target at the
+sampled t, which is why the device arms compute the prefix ONCE per conditioning and keep
+each block's K/V (diffusers' `use_kv_cache`, ComfyUI's prefix cache): a step runs only the
+target rows against `[cached prefix | own]`, unmasked. The silent conventions are in
+`qwen_image21.zig`'s header and `qwen_image21_text.zig`'s.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Text encoder** (Qwen3-VL-8B, last state UNNORMED, system turn stripped) | ✅ | ✅ | ✅ | ✅ | `qwen3.Variant.qwen_image21`, `qwen_image21_text.zig` |
+| **DiT** (32 blocks) | ✅ all dtypes | ✅ every format `lin_gpu` routes | ✅ | ✅ | `qwen_image21{,_dev,_gpu,_cuda}.zig`; base files fuse the FFN (`gate_up`), turbo files ship it split |
+| **Prefix attention** | `kv_end` | `attn_causal_batched` (text), rect `attn_gpu.core` (image blocks) | `opAttnTCCausal` / `opAttnTCRect` | same | one call per layout part |
+| **VAE decode** (Wan 2.2 layout, temporal kernel 1, RGBA) | ✅ | ✅ f32 | ✅ f32 | ✅ f32 | `wan_vae.loadNested`, `dup_up_add` |
+| **LoRA sidecar** | ✅ | ✅ | ✅ | ✅ | §2J; `qwen_image21.loraKeys` |
+
+Gates: `qwen-image21-cuda-test` / `qwen-image21-vk-test` (`--layers`, `--lat`, `--cap`,
+`--sigma`, a checkpoint path). Each runs TWO sigmas on one session, so the second reads the
+cached prefix. On an integer checkpoint the walk with exact attention and weight-only
+linears holds the CPU forward to 5e-6 to 9e-6 at full depth on all three arms (both steps),
+the tensor-core attention to 0.6e-3 to 1.6e-3, and W8A8 to 0.97-1.22x the emulated format
+noise; all seven released files pass (bf16, int8, W4A8, NVFP4, W6A8). Against ComfyUI: the
+TE 1.0e-5 on the real 8B, one real DiT forward 1.24e-5, the VAE 9.2e-6 (alpha plane
+included); the CUDA render matches the CPU one at 55.4 dB, Vulkan at 53.0.
+
+⚠️ **The VAE runs at f32 only.** `wan-vae-test 8 <qwen vae>`: f32 1.7e-3 to 2.1e-3 on every
+arm, f16 NaN (its activations outgrow 65504), bf16 2-3e-2, where Wan 2.1's VAE is 2e-4 /
+4e-4 / 3e-3. The f32 floor is not the mid-block attention (Vulkan's is exact there and shows
+the same); the conv path's 16-bit staging is the likely share, unmeasured.
+
+**The schedule is diffusers', not ComfyUI's** (`schedule.DiffusersFlow`): mu linear in the
+target's token count, the exponential shift, the stretch to `shift_terminal` 0.02. The
+`reference` scheduler is it, bit-exact against diffusers at every size (the f32 shift
+reaches it through `buildAt`); the family's flux table takes the same mu, so every
+ComfyUI scheduler also moves with resolution. Turbo is the `turbo` scheduler's 8 fixed
+sigmas; base and turbo checkpoints are indistinguishable by weights.
+
 ### 2I. DiT block weight-dtype support
 
 The CUDA columns hold for every family (krea2, Z-Image, Anima): one dispatcher,
@@ -1115,7 +1154,15 @@ a live dial, and a stack swaps on a live session for the cost of the LoRA files.
 
 | family | cpu | vulkan | zig-cuda | cuda |
 |---|---|---|---|---|
-| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `moss_image`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
+| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `moss_image`, `qwen_image21`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
+
+**A family's LoRA spellings are its `lora.KeyMap`**: ComfyUI's `diffusion_model.` always,
+plus the prefixes its trainers write. Qwen-Image 2.1 takes diffusers' `transformer.` and
+bare names too (ComfyUI's QwenImage map), and the catalog's `loraFits` probes the same
+list. ⚠️ ComfyUI drops a FUSED 2.1 checkpoint's FFN-half keys (`gate_layer`, `proj`)
+spelled `diffusion_model.`, warning that they did not load; we apply them. Pinned against
+ComfyUI's own `load_lora_for_models` on a toy (`tools/gen_qwen_image21_lora.py`), fused and
+split, 3.6e-7.
 
 **Vulkan's sidecar is `models/lora_gpu.zig`, applied inside `lin_gpu.gemm`**, so every
 linear the dispatcher runs takes its hits: two bf16 cooperative GEMMs, the B one compacting
@@ -1989,8 +2036,8 @@ not token-identical to f32 — and a dtype toggle rebuilds the context.
 
 ## 7. Data-format support matrix
 
-DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q2_k, q3_k, q4_k, q5_k,
-q6_k, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq3_xxs, iq3_s, q1_0, q2_0_g64, q2_0_g128`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
+DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, w4a8, nvfp4, q4_0, q8_0, q2_k, q3_k, q4_k, q5_k,
+q6_k, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq3_xxs, iq3_s, q1_0, q2_0_g64, q2_0_g128, w6a8`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
 path; GGUF `q*` are the **LLM** path.
 
 | Format | cpu | vulkan | zig-cuda | cuda | How it computes |
@@ -2002,6 +2049,7 @@ path; GGUF `q*` are the **LLM** path.
 | **int8 (+convrot)** | ✅ | ✅ s8→s32 tensor cores | ✅ m16n8k32 s8 IMMA | ✅ cuBLASLt `R_8I`/`COMPUTE_32I` | Hadamard un-rotate at dequant |
 | **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) | ✅ hand-PTX (no cuBLASLt s4) | nibble-packed 2/byte |
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; stays packed, decodes to int8 **per GEMM** then runs the ordinary int8 convrot GEMM. `ops/w4a8.zig` |
+| **w6a8** (`w6a8_int8`) | ✅ | ✅ `w6a8_decode_t` | ✅ `w6a8_decode` | ✅ ditto | `.w4a8` at 6 bits: `I8 [rows, 3·cols/4]`, the nibble plane then a plane of each code's top 2 bits, uniform `(q − 32)·s_rel`, no codebook. Its own dtype (3/4 byte per element); the same `Weight.w4a8` metadata (`Codes.w6`) and routes, the decode funnel branching on the level table's size. Exact against `comfy_kitchen` on CPU and on every device route (`lin-cuda-test`, `lin-vk-test`) |
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | 4-bit E2M1 + fp8 per-16-block scale + per-tensor scale; stays packed, decodes to **bf16** per GEMM then the existing bf16 tensor-core GEMM. Weight-only; the native W4A4-fp4 GEMM is sm_100+. `ops/nvfp4.zig` |
 | **GGUF q4_0** | ✅ ggml | ✅ `gemv_dual_q4_0` | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_dual_q8_0` | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
@@ -2023,6 +2071,8 @@ path; GGUF `q*` are the **LLM** path.
   formats with no hand kernel. cuBLASLt/cuDNN never consume block quants directly.
 - **convrot** (`src/ops/convrot.zig`): size-256 Hadamard rotation applied at int8/int4 dequant.
   `cols` must be a multiple of 256 (i4 also even, from nibble packing).
+- **W6A8 is read by the W4A8 reader** (`quant_weight.w4a8`), which takes the bit depth from the
+  stored row width and cross-checks it against `comfy_quant`'s `format`.
 - ⚠️ **The packed 4-bit formats share ONE container loader** (`models/quant_weight.zig`), called
   from krea2's, Anima's and Z-Image's `mat`. All store `[rows, cols/2]`, which is *exactly* the
   int4-convrot signature, so each is detected by its own sidecar (`_scale_2` for NVFP4, `_s_rel`
@@ -2082,7 +2132,7 @@ activations `add{,_relu,_scaled,_h16}` · `relu` · `silu{,_mul,_mul16,_mul_h16}
 rope `rope_inter` · `rope_half{,_pos,_part}` · `rope_imrope{,_pos}` · `rope_vision{,_gemma4}`; row
 reductions (one subgroup per row) `rmsnorm` · `group_rmsnorm` · `rms_mod` · `layernorm{,_h16}` · `ln_mod` ·
 `l2norm_rows{,_g}` · `gn_stats{,_h16}` · `rowmax_i8`; GroupNorm/VAE `gn_combine` · `gn_apply{,_h16}` ·
-`vae_norm` · `bias_compact{,_h16}` · `bias_add_{f16,h16}` · `add_bias_rows{,_h16}` · `im2col` ·
+`vae_norm` · `dup_up_add` · `bias_compact{,_h16}` · `bias_add_{f16,h16}` · `add_bias_rows{,_h16}` · `im2col` ·
 `im2col_sd{,_h16}` · `im2col1d`; Mage-VAE (typed but the last three) `dw_conv3` · `col_mean`
 (two passes, row chunks then partials) · `mul_cols_sigmoid` · `nerf_feat` · `modulate_pr` ·
 `gated_add_pr` (f32 residual) · `layernorm_f32_{f16,bf16}` · `patch_scatter` · `win_gather` ·
@@ -2095,7 +2145,8 @@ per query, head and KV chunk) · `attn_rows_g{2,4,8}_{f32,f16,q8}` (the same per
 heads together) · `attn_merge`; k-split `gemv_combine{,4}`; H3
 audio `aa_up_snake` · `aa_down` · `convt1d_ca` · `snake1d_ca` · `mean_heads_pool`; dequantizers
 `dequant_<fmt>_{f16,bf16}` for fp8, q8_0, q4_0, q1_0, q2_0_g64, q2_0_g128, iq4_nl, iq4_xs, q2_k,
-q3_k, q4_k, q5_k, q6_k, iq2_xxs, iq2_xs, iq3_xxs, iq3_s (raw row-major input); the weight-only
+q3_k, q4_k, q5_k, q6_k, iq2_xxs, iq2_xs, iq3_xxs, iq3_s (raw row-major input); the W6A8 decode
+`w6a8_decode` (row-major, CUDA) and `w6a8_decode_t` (k-major from transposed input, Vulkan); the weight-only
 integer convrot decodes `dequant_i8row_bf16` (unrotated int8) and `i{8,4}row_rot_bf16` (row scale
 plus the 256-point rotation back, one lane per 16 values over `shfl.bfly`: PTX only, the SPIR-V
 build of those two entries is empty and no Vulkan table names them); decode GEMVs
@@ -2363,4 +2414,6 @@ Delete a row when it closes.
 | q8_0 MMQ built and LOST | `mmq_pipe_q8_0` exists, is correct (device test against an exact f64 reference, teeth checked by mis-wiring the per-substep scale) and is opt-in via `--dit-gguf-gemm mmq`. It measures **566 ms** of GEMM per step against the dequant route's **440** and cuBLASLt int8's **141**. ⚠️ Do not retry it expecting the estimate that motivated it: the premise was that `igemm_pipe` runs ~1.68x cuBLASLt, but igemm_pipe chains the mma's s32 C operand across k and NO MMQ can, because the scale changes every 32 elements. Isolation: A staging is 225 of the 566 (`TP_MMQ8_NOSTAGE` gives 342), and even at 342 it loses, because q4_k's nibble packing feeds TWO substeps from one 32-byte A fragment where 8-bit weights need their own, doubling shared A-load traffic on the one axis this kernel family responds to. The only real lever left is a one-time repack to planar qs + a scale plane, worth ~5% end-to-end on this card. |
 | No int8 decode for GGUF block quants other than q2_k/q4_k/q8_0 in diffusion | q5_k/q6_k/q4_0/iq4_nl DiTs take the bf16 dequant route on CUDA (every family, via `lin_cuda`) and are CPU-only on Vulkan; `Backend.blockQFormat` is the one place to widen, and each format needs only a load-stage block walk in `buildPrep`. |
 | q2_0 g64 kernels unexecuted | GEMV and MMQ are generated from the same templates as g128 but no g64 file exists here to run them against. |
+| Qwen-Image 2.1 reference editing | The DiT takes reference latents (`Ref`, spliced at a slot, the CPU toy fixture pins it), but nothing produces them: no 2.2-layout VAE encoder, no vision tower for the 8B encoder, no device path for an image prefix part beyond the rect call. |
+| Qwen-Image 2.1 f16 DiT stream | Finite at 1024² on a real conditioning, but one run measured 2.15 s/step against f32's 1.38 (int8, CUDA, shared card): not an A/B. The default stays f32 until an interleaved one says otherwise. |
 | `--text-encoder-2` split path unexercised | every SDXL checkpoint here is bundled, so the flag is built and reviewed but not measured. |

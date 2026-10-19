@@ -436,6 +436,11 @@ pub const entries = [_]Entry{
     .{ .name = "situ", .wg = elem_wg },
     .{ .name = "situ_f16", .wg = elem_wg },
     .{ .name = "situ_bf16", .wg = elem_wg },
+    .{ .name = "dup_up_add", .wg = elem_wg },
+    .{ .name = "dup_up_add_f16", .wg = elem_wg },
+    .{ .name = "dup_up_add_bf16", .wg = elem_wg },
+    .{ .name = "w6a8_decode", .wg = elem_wg },
+    .{ .name = "w6a8_decode_t", .wg = elem_wg },
 };
 
 pub fn get(comptime name: []const u8) Entry {

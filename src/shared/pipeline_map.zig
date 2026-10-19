@@ -118,6 +118,8 @@ pub fn toPipelineScheduler(s: config.Scheduler) ?tp.sampler.Scheduler {
         .beta => .beta,
         .linear_quadratic => .linear_quadratic,
         .kl_optimal => .kl_optimal,
+        .reference => .reference,
+        .turbo => .turbo,
     };
 }
 
@@ -150,6 +152,8 @@ pub fn fromPipelineScheduler(s: ?tp.sampler.Scheduler) config.Scheduler {
         .beta => .beta,
         .linear_quadratic => .linear_quadratic,
         .kl_optimal => .kl_optimal,
+        .reference => .reference,
+        .turbo => .turbo,
     };
 }
 

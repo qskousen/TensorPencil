@@ -135,6 +135,7 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
         .conditioner => switch (fam) {
             // Mage-Flow reads krea2's Qwen3-VL-4B file, at a different tap.
             .krea2, .mageflow => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
+            .qwen_image21 => dims.len == 2 and dims[1] == models.qwen3.Config.vl_8b.hidden,
             .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
             .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
             .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
@@ -161,6 +162,8 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             // width is what separates it from any other `AutoencoderKL`.
             .mageflow, .moss_image => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
                 (dims.len == 1 and dims[0] == models.mage_vae.latent_channels),
+            // The nested stage's norm: `storeFits` checks the latent width.
+            .qwen_image21 => dims.len == 4,
             .krea2, .anima, .minimax_h3, .sensenova => true,
         },
         .decoder2, .denoiser => true,
@@ -176,6 +179,16 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
 pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
     const v = probeView(store, fam, comp) orelse return false;
     if (!componentFits(v, fam, comp)) return false;
+    if (fam == .qwen_image21 and comp == .decoder) {
+        // The Wan 2.2 video VAE has the same nesting at 48 channels and a 3-tap time
+        // axis; the loader takes only 64 at temporal kernel 1.
+        const root = v.info.name[0 .. std.mem.indexOf(u8, v.info.name, "decoder.") orelse return false];
+        var buf: [256]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "{s}decoder.conv1.weight", .{root}) catch return false;
+        const c = store.get(name) orelse return false;
+        const cd = c.info.shape.slice();
+        return cd.len == 5 and cd[1] == tp.models.qwen_image21.latent_channels and cd[2] == 1;
+    }
     if (comp != .conditioner) return true;
     if (fam == .moss_image) {
         // A Qwen3.5 at the width the released DiT reads; any depth runs.
@@ -198,12 +211,12 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     // and renders in a different style, missing an attribute here and there, and
     // it wants more steps to converge (garbage at 8, fine at 30). That is a
     // choice to offer, not one to take away; `pipeline` warns instead.
-    if ((fam == .krea2 or fam == .zimage or fam == .mageflow) and store != .gguf) {
+    if ((fam == .krea2 or fam == .zimage or fam == .mageflow or fam == .qwen_image21) and store != .gguf) {
         // Under whatever the probe answered under: a bundled checkpoint keeps
         // its encoder beneath a prefix, and the tower sits beneath the same one.
         // Asked flat, such a file answers "no tower" and is then offered to the
         // one family it is wrong for.
-        const wants_tower = fam == .krea2 or fam == .mageflow;
+        const wants_tower = fam != .zimage;
         if (wants_tower != tp.models.qwen3.Config.hasVisionTower(store, containerPrefix(v.info.name))) return false;
     }
     const cfg = encoderConfig(fam) orelse return true;
@@ -233,6 +246,7 @@ fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
     const C = tp.models.qwen3.Config;
     return switch (fam) {
         .krea2, .mageflow => C.vl_4b,
+        .qwen_image21 => C.vl_8b,
         .zimage => C.qwen3_4b,
         .anima => C.qwen3_0_6b,
         .minimax_h3 => C.qwen3vl_32b_h3,
@@ -299,6 +313,13 @@ pub const LoraInfo = struct {
     /// Whether a sidecar family can apply it: native `diffusion_model.` keys and no
     /// reshaped pad (`lora.Sidecar.refusedSuffix`).
     sidecar: bool = true,
+    /// Targets under another spelling (diffusers' `transformer.` or bare names),
+    /// which only a family whose key map lists it reads, and their `depth`. Kept apart
+    /// because a text-encoder LoRA in the same file is deeper than the denoiser.
+    foreign: bool = false,
+    foreign_depth: u32 = 0,
+    /// A reshaped pad anywhere, which no sidecar takes under any spelling.
+    refused: bool = false,
 };
 
 /// Keys that end one adapter target, in every form either LoRA route reads.
@@ -313,7 +334,10 @@ pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
     var out: LoraInfo = .{};
     var native = false;
     for (store.names()) |name| {
-        if (lora.Sidecar.refusedSuffix(name) != null) out.sidecar = false;
+        if (lora.Sidecar.refusedSuffix(name) != null) {
+            out.sidecar = false;
+            out.refused = true;
+        }
         const ends = for (lora.dialects) |d| {
             if (std.mem.endsWith(u8, name, d.b)) break true;
         } else for (target_ends) |e| {
@@ -329,9 +353,13 @@ pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
             continue;
         }
         out.targets += 1;
+        const depth = if (layerIndex(name)) |n| n + 1 else 0;
         if (std.mem.startsWith(u8, name, lora.Sidecar.prefix)) {
             native = true;
-            if (layerIndex(name)) |n| out.depth = @max(out.depth, n + 1);
+            out.depth = @max(out.depth, depth);
+        } else {
+            out.foreign = true;
+            out.foreign_depth = @max(out.foreign_depth, depth);
         }
     }
     if (!native) out.sidecar = false;
@@ -373,11 +401,16 @@ pub fn loraFits(store: tp.weights.WeightStore, fam: Family) bool {
         else => {},
     }
     const spec = loraSpec(fam) orelse return false;
-    if (!info.sidecar or info.depth > spec.layers) return false;
     // One target, checked on both sides: `a` contracts the model's width and `b`
     // emits the linear's own. A LoRA for another variant of this architecture has
     // the right names and the wrong widths.
-    return loraTargetFits(store, spec.probe, spec.in_dim, spec.out_dim);
+    if (info.sidecar and info.depth <= spec.layers and
+        loraTargetFits(store, tp.models.lora.Sidecar.prefix, spec.probe, spec.in_dim, spec.out_dim)) return true;
+    // A diffusers spelling: its targets are bare or `transformer.`, and only a family
+    // whose key map lists those reads them.
+    if (info.refused or !info.foreign or info.foreign_depth > spec.layers) return false;
+    for (spec.prefixes) |p| if (loraTargetFits(store, p, spec.probe, spec.in_dim, spec.out_dim)) return true;
+    return false;
 }
 
 const LoraSpec = struct {
@@ -389,6 +422,8 @@ const LoraSpec = struct {
     /// The most blocks a file may name. Unbounded where the depth varies by
     /// checkpoint.
     layers: u32 = std.math.maxInt(u32),
+    /// The family's other spellings (`lora.KeyMap.prefixes`).
+    prefixes: []const []const u8 = &.{},
 };
 
 /// The one linear every sidecar LoRA for a family patches, and its widths: the
@@ -417,19 +452,26 @@ fn loraSpec(fam: Family) ?LoraSpec {
         .anima => .{ .probe = "blocks.0.self_attn.q_proj", .in_dim = m.anima.anima_2b.dim, .out_dim = m.anima.anima_2b.dim },
         .mageflow => .{ .probe = "transformer_blocks.0.attn.to_q", .in_dim = m.mageflow.features, .out_dim = m.mageflow.features, .layers = m.mageflow.n_blocks },
         .moss_image => .{ .probe = "layers.0.proj.q", .in_dim = m.moss_image.features, .out_dim = m.moss_image.features, .layers = m.moss_image.n_blocks },
+        .qwen_image21 => .{
+            .probe = "transformer_blocks.0.attn.to_q",
+            .in_dim = m.qwen_image21.features,
+            .out_dim = m.qwen_image21.features,
+            .layers = m.qwen_image21.n_blocks,
+            .prefixes = m.qwen_image21.loraKeys(true).prefixes,
+        },
         .sd15, .sdxl, .minimax_h3 => null,
     };
 }
 
-fn loraTargetFits(store: tp.weights.WeightStore, probe: []const u8, in_dim: usize, out_dim: usize) bool {
+fn loraTargetFits(store: tp.weights.WeightStore, prefix: []const u8, probe: []const u8, in_dim: usize, out_dim: usize) bool {
     const lora = tp.models.lora;
     var buf: [512]u8 = undefined;
     for (lora.dialects) |d| {
-        const a = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ lora.Sidecar.prefix, probe, d.a }) catch continue;
+        const a = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix, probe, d.a }) catch continue;
         const av = store.get(a) orelse continue;
         const ad = av.info.shape.slice();
         if (ad.len != 2 or ad[1] != in_dim) return false;
-        const b = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ lora.Sidecar.prefix, probe, d.b }) catch return false;
+        const b = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix, probe, d.b }) catch return false;
         const bv = store.get(b) orelse return false;
         const bd = bv.info.shape.slice();
         return bd.len == 2 and bd[0] == out_dim and bd[1] == ad[0];
@@ -593,6 +635,18 @@ pub fn traits(fam: Family) Traits {
             .height = 1024,
             .steps = 25,
             .cfg = 2.5,
+        },
+        // diffusers' `QwenImage21Pipeline`: 1024x1024, 40 steps, no guidance ("meant
+        // to be sampled without guidance"). Turbo is a checkpoint indistinguishable
+        // by its weights; it runs on the `turbo` scheduler's 8 fixed sigmas.
+        .qwen_image21 => .{
+            .label = "Qwen-Image 2.1 (block-causal DiT)",
+            .short = "Qwen-Image 2.1",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 40,
+            .cfg = 1.0,
         },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
@@ -1278,5 +1332,44 @@ test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
         const store: tp.weights.WeightStore = .{ .safetensors = &st };
         try std.testing.expect(storeFits(store, .krea2, .conditioner));
         try std.testing.expect(!storeFits(store, .zimage, .conditioner));
+    }
+}
+
+test "loraFits takes a diffusers-spelled Qwen-Image 2.1 LoRA and nothing else claims it" {
+    const gpa = std.testing.allocator;
+    const d = tp.models.qwen_image21.features;
+    const rank: usize = 16;
+    // diffusers writes `transformer.<name>`; bare names are the same file without it.
+    for ([_][]const u8{ "transformer.", "" }) |pfx| {
+        var na: [128]u8 = undefined;
+        var nb: [128]u8 = undefined;
+        const a = try std.fmt.bufPrint(&na, "{s}transformer_blocks.0.attn.to_q.lora_A.weight", .{pfx});
+        const b = try std.fmt.bufPrint(&nb, "{s}transformer_blocks.0.attn.to_q.lora_B.weight", .{pfx});
+        const bytes = try stFile(gpa, &.{
+            .{ .name = a, .dims = &.{ rank, d } },
+            .{ .name = b, .dims = &.{ d, rank } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const store: tp.weights.WeightStore = .{ .safetensors = &st };
+        errdefer std.debug.print("prefix '{s}'\n", .{pfx});
+        try std.testing.expect(loraFits(store, .qwen_image21));
+        // Mage-Flow and MOSS share the name and read only `diffusion_model.`.
+        for ([_]Family{ .mageflow, .moss_image, .krea2, .zimage, .sensenova }) |f|
+            try std.testing.expect(!loraFits(store, f));
+    }
+    // Qwen-Image 1.0's LoRAs use the same bare names at 3072 wide and 60 deep.
+    {
+        const bytes = try stFile(gpa, &.{
+            .{ .name = "transformer_blocks.59.attn.to_q.lora_A.weight", .dims = &.{ rank, 3072 } },
+            .{ .name = "transformer_blocks.59.attn.to_q.lora_B.weight", .dims = &.{ 3072, rank } },
+            .{ .name = "transformer_blocks.0.attn.to_q.lora_A.weight", .dims = &.{ rank, 3072 } },
+            .{ .name = "transformer_blocks.0.attn.to_q.lora_B.weight", .dims = &.{ 3072, rank } },
+        });
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        try std.testing.expect(!loraFits(.{ .safetensors = &st }, .qwen_image21));
     }
 }

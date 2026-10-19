@@ -137,7 +137,8 @@ export fn attn_full() callconv(.spirv_kernel) void {
 // that are independent by construction.
 //
 // u0=total rows, u1=n_heads, u2=n_kv, u3=hd, u4=s_rows (per-item length),
-// f0=scale. a=q, b=k, c=v, d=out.
+// u5 = where query row 0 sits among the keys (0 for CLIP), u6 != 0 lifts the mask so
+// every query sees keys [item start, u6), f0=scale. a=q, b=k, c=v, d=out.
 export fn attn_causal_batched() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -154,7 +155,7 @@ export fn attn_causal_batched() callconv(.spirv_kernel) void {
     const kv_start = (q_global / s_rows) * s_rows;
     // Inclusive of the query's own row, exclusive above it, the only difference
     // from the non-causal form, and the whole point of the kernel.
-    const kv_end = q_global + 1;
+    const kv_end = if (pc.u6 != 0) pc.u6 else q_global + 1 + pc.u5;
     const qb = idx * hd;
     const kvdim = n_kv * hd;
     var acc: [256]f32 = undefined;

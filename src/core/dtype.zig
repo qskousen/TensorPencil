@@ -119,6 +119,11 @@ pub const DType = enum {
     /// The 128-element variant of the above. 2.125 bpw including the scale.
     /// Decoded natively rather than by ggml, see `quants.dequantQ2_0G128`.
     q2_0_g128,
+    /// ComfyUI's `w6a8_int8`: `.w4a8` at 6 bits, uniform codes and no codebook, a
+    /// row being the nibble plane then a plane of each code's top two bits. Its own
+    /// dtype because its storage is 3/4 of a byte per element; the sidecars are the
+    /// same `ops.matmul.Weight.w4a8` (`ops/w4a8.zig`). Sub-byte: use `storageBytes`.
+    w6a8,
 
     const name_table = .{
         .{ "F8_E4M3", DType.f8_e4m3 },
@@ -168,6 +173,7 @@ pub const DType = enum {
             .f32, .u32, .i32 => .{ .byte_size = 4, .bit_size = 32, .block_elems = 1, .block_bytes = null },
             .f64, .u64, .i64 => .{ .byte_size = 8, .bit_size = 64, .block_elems = 1, .block_bytes = null },
             .i4, .w4a8, .nvfp4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
+            .w6a8 => .{ .byte_size = null, .bit_size = 6, .block_elems = 1, .block_bytes = null },
             .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },
             .q2_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 84 },

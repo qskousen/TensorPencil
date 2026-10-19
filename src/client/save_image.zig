@@ -59,10 +59,18 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
     });
 }
 
-/// PNG bytes for `rgba` with the metadata block. `rgba` is `w*h*4`.
+/// PNG bytes for `rgba` with the metadata block. `rgba` is `w*h*4`. RGBA when any
+/// pixel is not fully opaque, else RGB, which loses nothing.
 pub fn encodeAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, rgba: []const u8, w: usize, h: usize) Error![]u8 {
     const params = paramsAlloc(gpa, info, w, h) catch return error.OutOfMemory;
     defer gpa.free(params);
+    const texts = [_]tp.image.TextChunk{.{ .keyword = "parameters", .text = params }};
+    if (!tp.image.opaque4(rgba)) {
+        var png: std.ArrayList(u8) = .empty;
+        errdefer png.deinit(gpa);
+        tp.image.encodePngText(gpa, &png, rgba, w, h, 4, &texts) catch return error.EncodeFailed;
+        return png.toOwnedSlice(gpa);
+    }
     const rgb = try gpa.alloc(u8, w * h * 3);
     defer gpa.free(rgb);
     for (0..w * h) |i| {
@@ -72,9 +80,7 @@ pub fn encodeAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, rgba: []
     }
     var png: std.ArrayList(u8) = .empty;
     errdefer png.deinit(gpa);
-    tp.image.encodePngRgbText(gpa, &png, rgb, w, h, &.{
-        .{ .keyword = "parameters", .text = params },
-    }) catch return error.EncodeFailed;
+    tp.image.encodePngRgbText(gpa, &png, rgb, w, h, &texts) catch return error.EncodeFailed;
     return png.toOwnedSlice(gpa);
 }
 
@@ -264,6 +270,24 @@ test "a saved PNG carries the parameters chunk and the pixels" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualSlices(u8, "\x89PNG", bytes[0..4]);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "parameters") != null);
+}
+
+test "a saved PNG keeps a render's alpha, and stays RGB when there is none" {
+    const gpa = std.testing.allocator;
+    const info: wire.ImageInfo = .{ .prompt = "p", .req_seed = 9, .start_ns = 5, .req_steps = 1 };
+    for ([_][8]u8{ .{ 10, 20, 30, 255, 40, 50, 60, 128 }, .{ 10, 20, 30, 255, 40, 50, 60, 255 } }) |rgba| {
+        const png = try encodeAlloc(gpa, &info, &rgba, 2, 1);
+        defer gpa.free(png);
+        const raw = try tp.image.decodePngRaw(gpa, png);
+        defer gpa.free(raw.pixels);
+        if (rgba[7] == 255) {
+            try std.testing.expectEqual(@as(usize, 3), raw.channels);
+            try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40, 50, 60 }, raw.pixels);
+        } else {
+            try std.testing.expectEqual(@as(usize, 4), raw.channels);
+            try std.testing.expectEqualSlices(u8, &rgba, raw.pixels);
+        }
+    }
 }
 
 test "an a1111 parameters block round-trips through its own parser" {

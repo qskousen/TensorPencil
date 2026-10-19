@@ -2056,7 +2056,7 @@ test "the loader reads a W4A8 weight as W4A8, not as the int4 it is shaped like"
     // -3.5 (a tie, so -4 under ties-to-even) and level 2 is -3.0.
     const got = try arena.allocator().alloc(i8, rows * cols);
     const meta = w.w4a8.?;
-    ops.w4a8.decode(got, w.bytes, meta.s_rel, meta.levels, rows, cols, meta.group_size);
+    ops.w4a8.decode(got, w.bytes, meta.s_rel, meta.codes, rows, cols, meta.group_size);
     for (got, 0..) |v, i|
         try testing.expectEqual(@as(i8, if (i % 2 == 0) -4 else -3), v);
 }

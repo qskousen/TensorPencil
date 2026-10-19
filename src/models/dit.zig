@@ -1273,7 +1273,7 @@ test "a W4A8 layer of a real checkpoint decodes to comfy_kitchen's int8 weight" 
     // the reference. This is what pins the metadata wiring: a `s_rel` slice off by a row
     // or a codebook read from the wrong tensor shows up only in the decoded values.
     const got = try arena.allocator().alloc(i8, ref.rows * ref.cols);
-    ops.w4a8.decode(got, w.bytes, w.w4a8.?.s_rel, w.w4a8.?.levels, ref.rows, ref.cols, ref.group_size);
+    ops.w4a8.decode(got, w.bytes, w.w4a8.?.s_rel, w.w4a8.?.codes, ref.rows, ref.cols, ref.group_size);
     // Head and tail first: a bare hash mismatch says nothing about where, and these
     // localize it to the first or last row.
     for (ref.expect_i8_head, 0..) |want, i| {

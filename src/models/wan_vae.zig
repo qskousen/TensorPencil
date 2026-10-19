@@ -1,4 +1,5 @@
-//! Wan 2.1 VAE decoder (the Krea 2 VAE), specialized for still images.
+//! Wan VAE decoder (the Krea 2 VAE), specialized for still images. Also reads the
+//! Wan 2.2 layout at temporal kernel 1 that Qwen-Image 2.1 ships (`loadNested`).
 //!
 //! With a single frame (T=1) and no feature cache, every causal 3D conv in
 //! ComfyUI's reference (`comfy/ldm/wan/vae.py`) sees only zero padding in
@@ -56,24 +57,9 @@ pub const latent_rgb_factors = [latent_channels][3]f32{
 };
 pub const latent_rgb_bias = [3]f32{ -0.1835, -0.0868, -0.3360 };
 
-/// Fill `rgb_out` ([zh*zw][3] RGB8) with the latent2rgb preview of the planar
-/// [16][zh*zw] normalized sampler latent `z`.
+/// The latent2rgb preview of the planar [16][zh*zw] sampler latent `z` into RGB8.
 pub fn latentPreviewInto(rgb_out: []u8, z: []const f32, zh: usize, zw: usize) void {
-    const plane = zh * zw;
-    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
-    for (0..plane) |p| {
-        var acc = latent_rgb_bias;
-        inline for (0..latent_channels) |c| {
-            const v = z[c * plane + p];
-            acc[0] += v * latent_rgb_factors[c][0];
-            acc[1] += v * latent_rgb_factors[c][1];
-            acc[2] += v * latent_rgb_factors[c][2];
-        }
-        inline for (0..3) |ch| {
-            const u = std.math.clamp((acc[ch] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
-            rgb_out[p * 3 + ch] = @intFromFloat(u);
-        }
-    }
+    sd_vae.linearPreviewInto(latent_channels, rgb_out, z, zh, zw, &latent_rgb_factors, latent_rgb_bias);
 }
 
 pub const Conv2d = struct {
@@ -113,22 +99,41 @@ pub const AttnBlock = struct {
     proj: Conv2d, // 1x1
 };
 
+/// `DupUp3D` at spatial factor 2, the Wan 2.2 up stage's shortcut: the stage's input,
+/// each channel repeated and pixel-shuffled to 2x, added to the stage's output. At a
+/// single frame only temporal phase `ft - 1` survives (`first_chunk`).
+pub const DupUp = struct {
+    ci: usize,
+    co: usize,
+    /// Temporal factor, 2 on a stage that upsamples time too.
+    ft: usize,
+
+    /// Input channel that output channel `o` reads at sub-pixel (`r`, `q`).
+    pub fn src(d: DupUp, o: usize, r: usize, q: usize) usize {
+        const f = d.ft * 4;
+        return (o * f + (d.ft - 1) * 4 + r * 2 + q) / (d.co * f / d.ci);
+    }
+};
+
 pub const Layer = union(enum) {
     res: ResBlock,
-    /// nearest-exact 2x upsample followed by a 3x3 conv halving channels.
+    /// nearest-exact 2x upsample followed by a 3x3 conv (halving channels on Wan 2.1).
     up: Conv2d,
+    /// Keep the stage input for the `dup_add` that closes the stage.
+    save,
+    dup_add: DupUp,
 };
 
 pub const Decoder = struct {
     arena: std.heap.ArenaAllocator,
-    post_quant: Conv2d, // "conv2", 1x1 16->16
-    conv_in: Conv2d, // 16 -> 384
+    post_quant: Conv2d, // "conv2", 1x1 z->z
+    conv_in: Conv2d, // z -> 384
     mid_res1: ResBlock,
     mid_attn: AttnBlock,
     mid_res2: ResBlock,
     ups: []Layer,
     head_norm: []const f32,
-    head_conv: Conv2d, // 96 -> 3
+    head_conv: Conv2d, // 96 -> 3, or 4 (RGBA) on Qwen-Image 2.1
 
     /// Every convolution in the decoder. Caller frees the list.
     pub fn convList(self: *Decoder, gpa: std.mem.Allocator) ![]*Conv2d {
@@ -146,6 +151,7 @@ pub const Decoder = struct {
         for (self.ups) |*l| switch (l.*) {
             .res => |*r| try Walk.res(&out, gpa, r),
             .up => |*c| try out.append(gpa, c),
+            .save, .dup_add => {},
         };
         return out.toOwnedSlice(gpa);
     }
@@ -194,6 +200,7 @@ pub const Decoder = struct {
     /// `store` may be a `weights.Prefixed` view of a bundled checkpoint, this loader
     /// always sees the VAE at the root. See `weights.Prefixed`.
     pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !Decoder {
+        if (store.get("decoder.upsamples.0.upsamples.0.residual.0.gamma") != null) return loadNested(gpa, store);
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -252,31 +259,133 @@ pub const Decoder = struct {
         };
     }
 
+    /// The Wan 2.2 layout (`decoder.upsamples.N.upsamples.M`), read off the file: each
+    /// stage's residual blocks and widths, whether it upsamples, and whether its
+    /// shortcut is temporal. Only temporal kernel 1; a 3-tap one needs a frame cache.
+    fn loadNested(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !Decoder {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const c1 = (store.get("decoder.conv1.weight") orelse return error.MissingTensor).info.shape.slice();
+        if (c1.len != 5 or c1[2] != 1) return error.UnsupportedVae;
+        const z = c1[1];
+        const head = (store.get("decoder.head.2.weight") orelse return error.MissingTensor).info.shape.slice();
+        if (head.len != 5) return error.ShapeMismatch;
+
+        var ups: std.ArrayList(Layer) = .empty;
+        var c = c1[0];
+        var stage: usize = 0;
+        while (true) : (stage += 1) {
+            const base = try std.fmt.allocPrint(alloc, "decoder.upsamples.{d}.upsamples", .{stage});
+            var n_res: usize = 0;
+            while (store.get(try std.fmt.allocPrint(alloc, "{s}.{d}.residual.2.weight", .{ base, n_res })) != null) n_res += 1;
+            if (n_res == 0) break;
+            const rs = try std.fmt.allocPrint(alloc, "{s}.{d}.resample.1", .{ base, n_res });
+            const up = store.get(try std.fmt.allocPrint(alloc, "{s}.weight", .{rs})) != null;
+            const stage_in = c;
+            if (up) try ups.append(alloc, .save);
+            for (0..n_res) |j| {
+                const co = (store.get(try std.fmt.allocPrint(alloc, "{s}.{d}.residual.2.weight", .{ base, j })).?).info.shape.slice()[0];
+                try ups.append(alloc, .{ .res = try loadRes(alloc, store, base, j, c, co) });
+                c = co;
+            }
+            if (up) {
+                try ups.append(alloc, .{ .up = try loadConvAs(.keep, alloc, store, rs, c, c, 3) });
+                const tc = try std.fmt.allocPrint(alloc, "{s}.{d}.time_conv.weight", .{ base, n_res });
+                const d: DupUp = .{ .ci = stage_in, .co = c, .ft = if (store.get(tc) != null) 2 else 1 };
+                if ((d.co * d.ft * 4) % d.ci != 0) return error.ShapeMismatch;
+                try ups.append(alloc, .{ .dup_add = d });
+            }
+        }
+        if (stage == 0) return error.MissingTensor;
+
+        const mid_c = c1[0];
+        const ups_owned = try ups.toOwnedSlice(alloc);
+        const post_quant = try loadConv(alloc, store, "conv2", z, z, 1);
+        const conv_in = try loadConvAs(.keep, alloc, store, "decoder.conv1", z, mid_c, 3);
+        const mid_res1 = try loadRes(alloc, store, "decoder.middle", 0, mid_c, mid_c);
+        const mid_attn: AttnBlock = .{
+            .norm = try loadGamma(alloc, store, "decoder.middle.1.norm.gamma", mid_c),
+            .qkv = try loadConv(alloc, store, "decoder.middle.1.to_qkv", mid_c, 3 * mid_c, 1),
+            .proj = try loadConv(alloc, store, "decoder.middle.1.proj", mid_c, mid_c, 1),
+        };
+        const mid_res2 = try loadRes(alloc, store, "decoder.middle", 2, mid_c, mid_c);
+        const head_norm = try loadGamma(alloc, store, "decoder.head.0.gamma", c);
+        const head_conv = try loadConv(alloc, store, "decoder.head.2", c, head[0], 3);
+
+        return .{
+            .arena = arena,
+            .post_quant = post_quant,
+            .conv_in = conv_in,
+            .mid_res1 = mid_res1,
+            .mid_attn = mid_attn,
+            .mid_res2 = mid_res2,
+            .ups = ups_owned,
+            .head_norm = head_norm,
+            .head_conv = head_conv,
+        };
+    }
+
+    pub fn latentChannels(self: *const Decoder) usize {
+        return self.post_quant.ci;
+    }
+
+    /// 3, or 4 for an RGBA decoder.
+    pub fn outChannels(self: *const Decoder) usize {
+        return self.head_conv.co;
+    }
+
+    /// Elements the largest `.save` keeps, 0 for a decoder without stage shortcuts.
+    pub fn savedElems(self: *const Decoder, zh: usize, zw: usize) usize {
+        var n = zh * zw;
+        var c = self.conv_in.co;
+        var most: usize = 0;
+        for (self.ups) |l| switch (l) {
+            .res => |rb| c = rb.conv2.co,
+            .up => |cv| {
+                n *= 4;
+                c = cv.co;
+            },
+            .save => most = @max(most, n * c),
+            .dup_add => {},
+        };
+        return most;
+    }
+
+    /// Pixels per latent pixel along each axis.
+    pub fn scale(self: *const Decoder) usize {
+        var s: usize = 1;
+        for (self.ups) |l| if (l == .up) {
+            s *= 2;
+        };
+        return s;
+    }
+
     pub fn deinit(self: *Decoder) void {
         self.arena.deinit();
         self.* = undefined;
     }
 
-    /// The device walk's activation sizes in elements: `wide` bounds `x` and `t`, `out`
-    /// bounds `u`, which only ever receives a residual block's convolution outputs.
+    /// The device walk's activation sizes in elements. `out` is `wide`: `wan_vae_dev`
+    /// rotates `x`, `t` and `u` (a residual block swaps `x` with `u`, an upsample `x`
+    /// with `t`), so each must hold the widest activation.
     pub fn activationElems(self: *const Decoder, zh: usize, zw: usize) sd_vae.ActWidths {
         var n: u64 = @as(u64, zh) * zw;
         var wide: u64 = n * self.conv_in.co;
-        var out: u64 = n * self.mid_res1.conv2.co;
         for (self.ups) |layer| switch (layer) {
-            .res => |rb| {
-                wide = @max(wide, n * @max(rb.conv1.ci, rb.conv2.co));
-                out = @max(out, n * rb.conv2.co);
-            },
+            .res => |rb| wide = @max(wide, n * @max(rb.conv1.ci, rb.conv2.co)),
             .up => |cv| {
                 n *= 4;
                 wide = @max(wide, n * cv.co);
             },
+            .save, .dup_add => {},
         };
-        return .{ .wide = @max(wide, n * self.head_conv.ci), .out = out };
+        wide = @max(wide, n * self.head_conv.ci);
+        return .{ .wide = wide, .out = wide };
     }
 
-    /// Upper bound on the PEAK device bytes a whole-image GPU decode of a [16][zh][zw]
+    /// Upper bound on the PEAK device bytes a whole-image GPU decode of a [z][zh][zw]
     /// latent needs beyond the weights: the activation buffers at the chain's width,
     /// the f32 staging buffer, and the mid-block attention at latent resolution
     /// (`scores_resident` is the Vulkan arm, which also keeps k-major copies of Q and K
@@ -288,16 +397,18 @@ pub const Decoder = struct {
         const c: u64 = self.mid_attn.proj.co;
         const attn = 4 * seq * c * 4 +
             if (scores_resident) 2 * seq * c * 4 + @as(u64, sd_vae.scoresBand(@intCast(seq))) * seq * 4 else 0;
-        const stage: u64 = @max(seq * latent_channels, seq * 64 * 3) * 4;
+        const sc: u64 = self.scale();
+        const stage: u64 = @max(seq * self.latentChannels(), seq * sc * sc * self.outChannels()) * 4;
         const abytes: u64 = if (act16) 2 else 4;
         const patch_band: u64 = 256 << 20;
-        return (2 * a.wide + a.out) * abytes + attn + stage + patch_band;
+        return (2 * a.wide + a.out + self.savedElems(zh, zw)) * abytes + attn + stage + patch_band;
     }
 
-    /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized)
-    /// to planar [3][8*zh][8*zw] pixels in [-1, 1]. Caller frees the result.
+    /// Decode a VAE-space latent (planar [z][zh][zw], already denormalized) to planar
+    /// [`outChannels`][scale*zh][scale*zw] pixels in [-1, 1]. Caller frees the result.
     pub fn decode(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool)) ![]f32 {
-        std.debug.assert(z.len == latent_channels * zh * zw);
+        const zc = self.latentChannels();
+        std.debug.assert(z.len == zc * zh * zw);
         // Arm fine-grained cancel inside the CPU matmul/attention kernels: a
         // full-resolution conv (an im2col matmul) is seconds of CPU work.
         const prev_tok = ops.cancel.token;
@@ -313,9 +424,11 @@ pub const Decoder = struct {
         }.f;
 
         // planar -> channel-last
-        var x = try planarToRows(gpa, z, latent_channels, zh * zw);
+        var x = try planarToRows(gpa, z, zc, zh * zw);
         var h = zh;
         var w = zw;
+        var saved: ?[]f32 = null;
+        defer if (saved) |s| gpa.free(s);
 
         x = try self.applyConv(io, gpa, x, h, w, self.post_quant);
         x = try self.applyConv(io, gpa, x, h, w, self.conv_in);
@@ -342,6 +455,15 @@ pub const Decoder = struct {
                     w *= 2;
                     x = try self.applyConv(io, gpa, x, h, w, conv);
                 },
+                .save => saved = gpa.dupe(f32, x) catch |e| {
+                    gpa.free(x);
+                    return e;
+                },
+                .dup_add => |d| {
+                    dupUpAdd(x, saved.?, h / 2, w / 2, d);
+                    gpa.free(saved.?);
+                    saved = null;
+                },
             }
         }
 
@@ -351,7 +473,7 @@ pub const Decoder = struct {
         x = try self.applyConv(io, gpa, x, h, w, self.head_conv);
 
         defer gpa.free(x);
-        return rowsToPlanar(gpa, x, 3, h * w);
+        return rowsToPlanar(gpa, x, self.outChannels(), h * w);
     }
 
     /// conv2d that frees the input (on error too) and returns a fresh output.
@@ -511,6 +633,16 @@ pub fn conv2d(io: std.Io, gpa: std.mem.Allocator, out: []f32, in: []const f32, h
         }
         try ops.matmul.matmul(io, gpa, out[y0 * w * conv.co ..][0 .. yn * w * conv.co], buf[0 .. yn * w * patch_len], yn * w, weight, conv.b);
     }
+}
+
+/// `x` ([2h*2w][d.co], channel-last) += `DupUp3D(s)`, `s` the [h*w][d.ci] stage input.
+pub fn dupUpAdd(x: []f32, s: []const f32, h: usize, w: usize, d: DupUp) void {
+    std.debug.assert(x.len == 4 * h * w * d.co and s.len == h * w * d.ci);
+    for (0..2 * h) |y| for (0..2 * w) |xx| {
+        const dst = x[(y * 2 * w + xx) * d.co ..][0..d.co];
+        const from = s[(y / 2 * w + xx / 2) * d.ci ..][0..d.ci];
+        for (dst, 0..) |*o, ch| o.* += from[d.src(ch, y % 2, xx % 2)];
+    };
 }
 
 /// Nearest-exact 2x spatial upsample of channel-last activations.
@@ -761,6 +893,8 @@ test "decode stage parity" {
                 x = try dec.applyConv(io, gpa, x, h, w, conv);
                 c = conv.co;
             },
+            // Wan 2.1 has no stage shortcut.
+            .save, .dup_add => unreachable,
         }
         var namebuf: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&namebuf, "up{d}", .{i});

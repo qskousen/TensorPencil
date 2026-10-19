@@ -439,11 +439,12 @@ pub const Sidecar = struct {
     pub const prefix = "diffusion_model.";
 
     /// Load every factor pair in `store`, in any dialect, keyed by the base
-    /// tensor name it patches. `renames` is the family's key map, empty for the
-    /// families whose LoRAs use the checkpoint's own names.
+    /// tensor name it patches. `keys` is the family's key map, empty for the
+    /// families whose LoRAs use the checkpoint's own names under `diffusion_model.`.
     ///
     /// The runtime dial is not taken here: see `Stack.File.strength`.
-    pub fn load(gpa: std.mem.Allocator, store: WeightStore, renames: []const Rename) !Sidecar {
+    pub fn load(gpa: std.mem.Allocator, store: WeightStore, keys: KeyMap) !Sidecar {
+        const renames = keys.renames;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -460,7 +461,7 @@ pub const Sidecar = struct {
             // Only denoiser keys are this loader's business; anything else in
             // the file belongs to another component (a text-encoder LoRA) and is
             // not evidence of a problem.
-            if (!std.mem.startsWith(u8, full, prefix)) continue;
+            const pfx = keys.prefixOf(full) orelse continue;
 
             if (refusedSuffix(full)) |sfx| {
                 std.log.err("lora: {s} is a {s} adapter, which is a different calculation and not a plain LoRA", .{ full, sfx[1..] });
@@ -475,7 +476,7 @@ pub const Sidecar = struct {
             if (for (adapter.stem_suffixes) |sfx| {
                 if (std.mem.endsWith(u8, full, sfx)) break sfx;
             } else null) |sfx| {
-                stem = full[prefix.len .. full.len - sfx.len];
+                stem = full[pfx.len .. full.len - sfx.len];
                 t = try adapterTarget(gpa, alloc, store, full[0 .. full.len - sfx.len], stem);
             } else {
                 const d: Dialect = for (dialects) |cand| {
@@ -485,7 +486,7 @@ pub const Sidecar = struct {
                     continue;
                 };
                 const full_stem = full[0 .. full.len - d.a.len];
-                stem = full[prefix.len .. full.len - d.a.len];
+                stem = full[pfx.len .. full.len - d.a.len];
                 // A pair with a Tucker core or a DoRA magnitude is not a plain pair.
                 var kb: [512]u8 = undefined;
                 const odd = for ([_][]const u8{ ".lora_mid.weight", ".dora_scale" }) |sib| {
@@ -668,10 +669,10 @@ pub const Stack = struct {
         store: WeightStore,
         strength: f32,
         path: []const u8,
-        renames: []const Rename,
+        keys: KeyMap,
     ) !usize {
         if (self.files.items.len >= max_files) return error.TooManyLoras;
-        var side = try Sidecar.load(gpa, store, renames);
+        var side = try Sidecar.load(gpa, store, keys);
         errdefer side.deinit();
         return self.addSidecar(gpa, side, strength, path);
     }
@@ -1130,6 +1131,21 @@ pub const max_files: usize = 16;
 
 /// One key spelling a family's LoRAs use for a tensor its checkpoint names
 /// differently, matched on the end of the file's stem.
+/// How a family's LoRA files name its tensors: ComfyUI's `diffusion_model.` prefix,
+/// plus any the family's trainers write (`prefixes`, tried in order after it; "" is
+/// diffusers' bare spelling), and the key renames onto fused tensors.
+pub const KeyMap = struct {
+    renames: []const Rename = &.{},
+    prefixes: []const []const u8 = &.{},
+
+    /// The prefix `full` is written under, or null when it is none of this map's.
+    fn prefixOf(self: KeyMap, full: []const u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, full, Sidecar.prefix)) return Sidecar.prefix;
+        for (self.prefixes) |p| if (std.mem.startsWith(u8, full, p)) return p;
+        return null;
+    }
+};
+
 pub const Rename = struct {
     /// As the LoRA spells it, e.g. `.attention.to_q`.
     from: []const u8,
@@ -1479,7 +1495,7 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
     try testing.expect(store.get("diffusion_model.blocks.0.attn.out_proj.lora_down.weight") != null);
 
     for ([_]f32{ 1.0, 0.5 }) |strength| {
-        var side = try Sidecar.load(gpa, store, &.{});
+        var side = try Sidecar.load(gpa, store, .{});
         defer side.deinit();
         try testing.expectEqual(targets.len, side.count());
 
@@ -1548,7 +1564,7 @@ test "a shape disagreement is distinguished from no entry at all" {
     var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, reference_fixture);
     defer st.deinit();
     const store: WeightStore = .{ .safetensors = &st };
-    var side = try Sidecar.load(gpa, store, &.{});
+    var side = try Sidecar.load(gpa, store, .{});
     defer side.deinit();
 
     const bytes = [_]u8{0} ** (16 * 9 * 4);
@@ -1591,8 +1607,8 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
     const s2: f32 = 0.25;
     var stack: Stack = .{};
     defer stack.deinit(gpa);
-    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, store, s1, "file1", &.{}));
-    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, pfx.store(), s2, "file2", &.{}));
+    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, store, s1, "file1", .{}));
+    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, pfx.store(), s2, "file2", .{}));
 
     for ([_][]const u8{ "blocks.0.mlp.fc2", "blocks.0.attn.qkv_proj", "blocks.0.attn.out_proj" }) |name| {
         var buf: [128]u8 = undefined;
@@ -1660,7 +1676,7 @@ test "a file that patches nothing is refused rather than ignored" {
 
     var stack: Stack = .{};
     defer stack.deinit(gpa);
-    _ = try stack.add(gpa, store, 1.0, "file1", &.{});
+    _ = try stack.add(gpa, store, 1.0, "file1", .{});
 
     const bytes = [_]u8{0} ** 16;
     var other = Weight.init(&bytes, .f32, 2, 2);
@@ -1727,7 +1743,7 @@ test "the generic loader reproduces ComfyUI's merge for every adapter on a linea
 
         var stack: Stack = .{};
         defer stack.deinit(gpa);
-        _ = try stack.add(gpa, .{ .safetensors = &st }, strength, name, &.{});
+        _ = try stack.add(gpa, .{ .safetensors = &st }, strength, name, .{});
 
         const base_v = fstore.get(try std.fmt.bufPrint(&buf, "{s}.base", .{name})).?;
         const want_v = fstore.get(try std.fmt.bufPrint(&buf, "{s}.want", .{name})).?;
@@ -2075,7 +2091,7 @@ test "a rank-8 factor pads to the slab, keeps the file's scale, and applies unch
 
     var stack: Stack = .{};
     defer stack.deinit(gpa);
-    try testing.expectEqual(@as(usize, 2), try stack.add(gpa, store, 1.0, "rank8", &.{}));
+    try testing.expectEqual(@as(usize, 2), try stack.add(gpa, store, 1.0, "rank8", .{}));
 
     const t = stack.index.get("blk.fc.weight").?.items[0].target;
     // alpha / the FILE's rows: 4 / 8, not 4 / 32.
@@ -2261,7 +2277,7 @@ test "a target no linear matches is counted and named, and a bundled tag still m
     defer st.deinit();
     var stack: Stack = .{};
     defer stack.deinit(gpa);
-    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, .{ .safetensors = &st }, 1.0, "f", &.{}));
+    try testing.expectEqual(@as(usize, 3), try stack.add(gpa, .{ .safetensors = &st }, 1.0, "f", .{}));
 
     const base = [_]u8{0} ** (out_dim * in_dim * 2);
     var wa = Weight.init(&base, .bf16, out_dim, in_dim);
@@ -2320,7 +2336,7 @@ test "split q/k/v keys merge onto row blocks of the fused tensor, each with its 
     };
     var stack: Stack = .{};
     defer stack.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), try stack.add(gpa, .{ .safetensors = &st }, 1.0, "z", &keys));
+    try testing.expectEqual(@as(usize, 1), try stack.add(gpa, .{ .safetensors = &st }, 1.0, "z", .{ .renames = &keys }));
     try testing.expectEqual(@as(usize, 2), stack.files.items[0].side.keyCount());
 
     const t = stack.index.get("l.0.attention.qkv.weight").?.items[0].target;

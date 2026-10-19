@@ -28,6 +28,7 @@
 //! inside the GEMM; the Gguf mapping must outlive the model.
 
 const std = @import("std");
+const lin_kind = @import("lin.zig");
 const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
 const qwen3 = @import("qwen3.zig");
@@ -504,6 +505,18 @@ pub const Model = struct {
         head.tag = "lm_head";
         try lins.append(alloc, head);
         return lins.toOwnedSlice(alloc);
+    }
+
+    /// The integer convrot kind the layers carry, or null, without allocating.
+    pub fn integerKind(self: *const Model) ?lin_kind.Kind {
+        for (self.layers) |layer| {
+            const k = switch (layer) {
+                .attn => |al| lin_kind.integerKind(&.{ al.qg, al.k, al.v, al.o, al.mlp.gate, al.mlp.up, al.mlp.down }),
+                .linear => |ll| lin_kind.integerKind(&.{ ll.qkv, ll.z, ll.out, ll.mlp.gate, ll.mlp.up, ll.mlp.down }),
+            };
+            if (k) |kind| return kind;
+        }
+        return null;
     }
 
     pub fn deinit(self: *Model) void {

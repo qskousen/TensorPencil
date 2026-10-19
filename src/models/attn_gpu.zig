@@ -94,12 +94,13 @@ pub fn core(ctx: *gpu.Context, b: Bufs, qh: Buf, kh: Buf, v16: Buf, out: Buf, c:
             .u1 = @intCast(c.nchunks),
             .u2 = @intCast(c.kv_rows),
             .u3 = @intCast(kv_pad),
+            .u4 = @intCast(c.q_rows),
             .u5 = s_plane,
         }, hb * c.q_rows * c.nchunks, 1, 1);
         try ctx.opElt(.softmax_combine, b.part, null, null, b.md, .{
             .u0 = @intCast(hb * c.q_rows),
             .u1 = @intCast(c.nchunks),
-            .u2 = @intCast(c.kv_rows),
+            .u2 = @intCast(c.q_rows),
             .u3 = @intCast(q_pad),
         }, hb * c.q_rows, 1, 1);
         if (lap) |l| l.f(l.ctx, .softmax);
@@ -120,27 +121,33 @@ pub fn core(ctx: *gpu.Context, b: Bufs, qh: Buf, kh: Buf, v16: Buf, out: Buf, c:
 /// f32 `[rows][heads * hd]` q/k/v into `core`'s f16 operands, the softmax scale
 /// folded into Q.
 pub fn stage(ctx: *gpu.Context, q: Buf, k: Buf, v: Buf, qh: Buf, kh: Buf, v16: Buf, rows: usize, heads: usize, kv_heads: usize, hd: usize, scale: f32) !void {
-    const rows_pad = std.mem.alignForward(usize, rows, 128);
+    return stageRect(ctx, q, k, v, qh, kh, v16, rows, rows, heads, kv_heads, hd, scale);
+}
+
+/// `stage` with `q_rows` queries and `kv_rows` keys.
+pub fn stageRect(ctx: *gpu.Context, q: Buf, k: Buf, v: Buf, qh: Buf, kh: Buf, v16: Buf, q_rows: usize, kv_rows: usize, heads: usize, kv_heads: usize, hd: usize, scale: f32) !void {
+    const q_pad = std.mem.alignForward(usize, q_rows, 128);
+    const kv_pad = std.mem.alignForward(usize, kv_rows, 128);
     const q_dim = heads * hd;
     const kv_dim = kv_heads * hd;
     ctx.independent(3);
     try ctx.opElt(.f32_to_h16, q, null, null, qh, .{
-        .u0 = @intCast(rows_pad * q_dim / 2),
-        .u1 = @intCast(rows * q_dim),
+        .u0 = @intCast(q_pad * q_dim / 2),
+        .u1 = @intCast(q_rows * q_dim),
         .f0 = scale,
-    }, rows_pad * q_dim / 2, 1, 1);
+    }, q_pad * q_dim / 2, 1, 1);
     try ctx.opElt(.gather_kmajor_h16, k, null, null, kh, .{
-        .u0 = @intCast(kv_dim * rows_pad / 2),
+        .u0 = @intCast(kv_dim * kv_pad / 2),
         .u1 = @intCast(hd),
-        .u2 = @intCast(rows_pad),
-        .u3 = @intCast(rows),
+        .u2 = @intCast(kv_pad),
+        .u3 = @intCast(kv_rows),
         .u4 = @intCast(kv_heads),
-    }, kv_dim * rows_pad / 2, 1, 1);
+    }, kv_dim * kv_pad / 2, 1, 1);
     try ctx.opElt(.f32_to_h16, v, null, null, v16, .{
-        .u0 = @intCast(rows_pad * kv_dim / 2),
-        .u1 = @intCast(rows * kv_dim),
+        .u0 = @intCast(kv_pad * kv_dim / 2),
+        .u1 = @intCast(kv_rows * kv_dim),
         .f0 = 1.0,
-    }, rows_pad * kv_dim / 2, 1, 1);
+    }, kv_pad * kv_dim / 2, 1, 1);
 }
 
 /// The f16 operands and the scores scratch for a square attention of up to `rows_cap`
@@ -156,16 +163,22 @@ pub const Scratch = struct {
     const fields = [_][]const u8{ "qh", "kh", "v16", "s", "part", "md" };
 
     pub fn init(ctx: *gpu.Context, rows_cap: usize, heads: usize, kv_heads: usize, hd: usize, cap: usize) !Scratch {
+        return initRect(ctx, rows_cap, rows_cap, heads, kv_heads, hd, cap);
+    }
+
+    /// `init` for up to `q_cap` queries against up to `kv_cap` keys.
+    pub fn initRect(ctx: *gpu.Context, q_cap: usize, kv_cap: usize, heads: usize, kv_heads: usize, hd: usize, cap: usize) !Scratch {
         const tc = tensorCores(ctx);
-        const rows_pad = std.mem.alignForward(usize, rows_cap, 128);
-        const hb = headsFitting(heads, rows_pad, rows_pad, scoresCap(cap, ctx.budget_override));
+        const q_pad = std.mem.alignForward(usize, q_cap, 128);
+        const kv_pad = std.mem.alignForward(usize, kv_cap, 128);
+        const hb = headsFitting(heads, q_pad, kv_pad, scoresCap(cap, ctx.budget_override));
         const sizes = [fields.len]usize{
-            if (tc) rows_pad * heads * hd * 2 else 16,
-            if (tc) kv_heads * hd * rows_pad * 2 else 16,
-            if (tc) rows_pad * kv_heads * hd * 2 else 16,
-            if (tc) hb * rows_pad * rows_pad * 2 else 16,
-            if (tc) hb * rows_cap * nchunks * 2 * 4 else 16,
-            if (tc) hb * rows_pad * 2 * 4 else 16,
+            if (tc) q_pad * heads * hd * 2 else 16,
+            if (tc) kv_heads * hd * kv_pad * 2 else 16,
+            if (tc) kv_pad * kv_heads * hd * 2 else 16,
+            if (tc) hb * q_pad * kv_pad * 2 else 16,
+            if (tc) hb * q_cap * nchunks * 2 * 4 else 16,
+            if (tc) hb * q_pad * 2 * 4 else 16,
         };
         var self: Scratch = undefined;
         var made: usize = 0;
@@ -212,4 +225,116 @@ pub fn run(ctx: *gpu.Context, sc: *const Scratch, q: Buf, k: Buf, v: Buf, out: B
         .hd = sh.hd,
         .max_hb = sh.max_hb,
     }, null);
+}
+
+// --- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+const ops = @import("tp_ops");
+
+// Needs the `testdata/gpu-tests` marker (see context.zig).
+fn gpuCtx(gpa: std.mem.Allocator) !*gpu.Context {
+    std.Io.Dir.cwd().access(testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    return gpu.Context.init(gpa, testing.io) catch error.SkipZigTest;
+}
+
+fn relL2(want: []const f32, got: []const f32) f64 {
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |e, a| {
+        num += @as(f64, e - a) * (e - a);
+        den += @as(f64, e) * e;
+    }
+    return @sqrt(num / den);
+}
+
+test "gpu rectangular attention and the offset causal kernel match the CPU op" {
+    const gpa = testing.allocator;
+    const ctx = try gpuCtx(gpa);
+    defer ctx.deinit();
+    if (!tensorCores(ctx)) return error.SkipZigTest;
+
+    // Qwen-Image 2.1's target pass: 256 queries after a prefix, 32 heads of 128. The
+    // prefix lengths: none (square), a whole tile, and one that leaves the keys unaligned.
+    for ([_]usize{ 0, 128, 20 }) |pre| try rectCase(gpa, ctx, pre);
+}
+
+fn rectCase(gpa: std.mem.Allocator, ctx: *gpu.Context, pre: usize) !void {
+    const q_rows = 256;
+    const kv_rows = pre + q_rows;
+    const heads = 32;
+    const hd = 128;
+    const dim = heads * hd;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const q = try gpa.alloc(f32, q_rows * dim);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, kv_rows * dim);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, kv_rows * dim);
+    defer gpa.free(v);
+    for (q) |*x| x.* = rand.floatNorm(f32);
+    for (k) |*x| x.* = rand.floatNorm(f32);
+    for (v) |*x| x.* = rand.floatNorm(f32);
+
+    const Case = struct { name: []const u8, causal: bool };
+    for ([_]Case{ .{ .name = "rect", .causal = false }, .{ .name = "causal at an offset", .causal = true } }) |c| {
+        // Unmasked: every query sees every key. Causal: query i sits at key `pre + i`.
+        const ends = try gpa.alloc(u32, q_rows);
+        defer gpa.free(ends);
+        for (ends, 0..) |*e, i| e.* = if (c.causal) @intCast(pre + i + 1) else @intCast(kv_rows);
+        const want = try gpa.alloc(f32, q_rows * dim);
+        defer gpa.free(want);
+        try ops.attention.attention(testing.io, gpa, want, q, k, v, .{
+            .seq_q = q_rows,
+            .seq_kv = kv_rows,
+            .n_heads = heads,
+            .n_kv_heads = heads,
+            .head_dim = hd,
+            .kv_end = ends,
+        });
+
+        var bufs: [4]Buf = @splat(.{ .buf = .null_handle, .mem = .null_handle, .size = 0 });
+        defer for (&bufs) |*b| ctx.tensorDestroy(b);
+        bufs[0] = try ctx.tensorCreate(std.mem.alignForward(usize, q_rows, 128) * dim * 4);
+        bufs[1] = try ctx.tensorCreate(kv_rows * dim * 4);
+        bufs[2] = try ctx.tensorCreate(kv_rows * dim * 4);
+        bufs[3] = try ctx.tensorCreate(std.mem.alignForward(usize, q_rows, 128) * dim * 4);
+        try ctx.tensorUpload(bufs[0], std.mem.sliceAsBytes(q));
+        try ctx.tensorUpload(bufs[1], std.mem.sliceAsBytes(k));
+        try ctx.tensorUpload(bufs[2], std.mem.sliceAsBytes(v));
+
+        const paths = [2][]const u8{ "f32 kernel", "tensor cores" };
+        for (0..if (c.causal) 1 else 2) |pi| {
+            if (pi == 0) {
+                try ctx.opElt(.attn_causal_batched, bufs[0], bufs[1], bufs[2], bufs[3], .{
+                    .u0 = q_rows,
+                    .u1 = heads,
+                    .u2 = heads,
+                    .u3 = hd,
+                    .u4 = q_rows,
+                    .u5 = @intCast(pre),
+                    .u6 = if (c.causal) 0 else @intCast(kv_rows),
+                    .f0 = scale,
+                }, q_rows * heads, 1, 1);
+            } else {
+                var sc = try Scratch.initRect(ctx, q_rows, kv_rows, heads, heads, hd, s_bytes_cap);
+                defer sc.deinit(ctx);
+                // Recorded as one batch, the way a forward runs it.
+                try ctx.beginBatch();
+                try stageRect(ctx, bufs[0], bufs[1], bufs[2], sc.qh, sc.kh, sc.v16, q_rows, kv_rows, heads, heads, hd, scale);
+                try core(ctx, sc.bufs(), sc.qh, sc.kh, sc.v16, bufs[3], .{ .q_rows = q_rows, .kv_rows = kv_rows, .heads = heads, .kv_heads = heads, .hd = hd }, null);
+                try ctx.endBatch();
+            }
+            const got = try gpa.alloc(f32, q_rows * dim);
+            defer gpa.free(got);
+            try ctx.tensorDownload(try ctx.view(bufs[3], 0, got.len * 4), std.mem.sliceAsBytes(got));
+            const rel = relL2(want, got);
+            errdefer std.debug.print("prefix {d}, {s}, {s}: rel L2 {e:.3}\n", .{ pre, c.name, paths[pi], rel });
+            const bound: f64 = if (pi == 0) 1e-5 else 5e-3;
+            try testing.expect(rel < bound);
+        }
+    }
 }

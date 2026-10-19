@@ -285,6 +285,8 @@ pub const Scheduler = enum(u8) {
     beta,
     linear_quadratic,
     kl_optimal,
+    reference,
+    turbo,
 
     pub fn label(self: Scheduler) []const u8 {
         return switch (self) {
@@ -298,6 +300,8 @@ pub const Scheduler = enum(u8) {
             .beta => "Beta (step count may differ)",
             .linear_quadratic => "Linear Quadratic",
             .kl_optimal => "KL Optimal",
+            .reference => "Reference pipeline",
+            .turbo => "Turbo (fixed sigmas)",
         };
     }
 

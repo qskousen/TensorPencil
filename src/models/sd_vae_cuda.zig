@@ -37,6 +37,8 @@ const Bufs = struct {
     patch: Buf = .{},
     gstat: Buf = .{},
     gmi: Buf = .{},
+    /// The Wan 2.2 stage input its shortcut adds back (`wan_vae.Layer.save`).
+    sv: Buf = .{},
     /// Mid-block attention projections and output.
     aq: Buf = .{},
     ak: Buf = .{},
@@ -136,10 +138,13 @@ pub fn decode(
     return rgb;
 }
 
-/// Decode a Wan 2.1 latent (planar `[16][zh][zw]`, already denormalized) to planar
-/// `[3][8*zh][8*zw]` pixels in [-1, 1], the chain at `act`. Caller frees.
+/// Decode a Wan latent (planar `[z][zh][zw]`, already denormalized) to planar
+/// `[oc][s*zh][s*zw]` pixels in [-1, 1], the chain at `act`. Caller frees.
 pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool), act: cuda.backend.Dt) ![]f32 {
-    std.debug.assert(z.len == wan_vae.latent_channels * zh * zw);
+    const zc = dec.latentChannels();
+    const oc = dec.outChannels();
+    const s = dec.scale();
+    std.debug.assert(z.len == zc * zh * zw);
     var bufs: Bufs = .{};
     defer bufs.deinit(be);
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -150,13 +155,14 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocat
     const n0 = zh * zw;
     const widths = dec.activationElems(zh, zw);
     const asz = act.bytes();
-    inline for (.{ "x", "t", "u" }) |f| @field(bufs, f).dt = act;
+    inline for (.{ "x", "t", "u", "sv" }) |f| @field(bufs, f).dt = act;
     try be.ensureDeviceBuffer(&bufs.x, @as(usize, @intCast(widths.wide)) * asz);
     try be.ensureDeviceBuffer(&bufs.t, @as(usize, @intCast(widths.wide)) * asz);
     try be.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * asz);
-    try be.ensureDeviceBuffer(&bufs.stage, @max(z.len, n0 * 64 * 3) * 4);
+    if (dec.savedElems(zh, zw) > 0) try be.ensureDeviceBuffer(&bufs.sv, dec.savedElems(zh, zw) * asz);
+    try be.ensureDeviceBuffer(&bufs.stage, @max(z.len, n0 * s * s * oc) * 4);
     {
-        const rows = try wan_vae.planarToRows(gpa, z, wan_vae.latent_channels, n0);
+        const rows = try wan_vae.planarToRows(gpa, z, zc, n0);
         defer gpa.free(rows);
         try be.tensorUpload(bufs.stage, std.mem.sliceAsBytes(rows));
     }
@@ -169,10 +175,10 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocat
     try be.endBatch();
 
     const n = ext[0] * ext[1];
-    const rgb = try gpa.alloc(f32, n * 3);
+    const rgb = try gpa.alloc(f32, n * oc);
     defer gpa.free(rgb);
-    try be.tensorDownload(bufs.stage, std.mem.sliceAsBytes(rgb));
-    return wan_vae.rowsToPlanar(gpa, rgb, 3, n);
+    try be.tensorDownload(bufs.stage.slice(0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
+    return wan_vae.rowsToPlanar(gpa, rgb, oc, n);
 }
 
 /// A/B switch for the mid-block attention (see `Dev.attnCore`). `zimage-cuda-test` runs both.
@@ -204,6 +210,15 @@ const Dev = struct {
 
     pub fn add(d: Dev, a: Buf, b: Buf, n: usize) !void {
         try d.be.opAdd(a, b, n);
+    }
+
+    pub fn copy(d: Dev, dst: Buf, src: Buf, n: usize) !void {
+        std.debug.assert(dst.dt == src.dt);
+        try d.be.tensorCopy(dst, 0, src, 0, n * src.dt.bytes());
+    }
+
+    pub fn dupUpAdd(d: Dev, x: Buf, sv: Buf, h: usize, w: usize, du: wan_vae.DupUp) !void {
+        try d.be.dupUpAdd(x, sv, h, w, du.ci, du.co, du.ft);
     }
 
     /// `opAttnTC` on both arms, given the f32 scores band. A tensor-core path that

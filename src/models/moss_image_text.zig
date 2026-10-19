@@ -47,6 +47,10 @@ pub const Encoder = struct {
         self.* = undefined;
     }
 
+    pub fn integerKind(self: *const Encoder) ?@import("lin.zig").Kind {
+        return self.lm.integerKind();
+    }
+
     pub fn hidden(self: *const Encoder) usize {
         return self.lm.cfg.hidden;
     }

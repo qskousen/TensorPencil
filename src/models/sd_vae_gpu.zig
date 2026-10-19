@@ -60,6 +60,8 @@ const Bufs = struct {
     /// GroupNorm chunk statistics and the merged per-group {mean, inv}.
     gstat: DeviceBuffer = none,
     gmi: DeviceBuffer = none,
+    /// The Wan 2.2 stage input its shortcut adds back (`wan_vae.Layer.save`).
+    sv: DeviceBuffer = none,
     /// Mid-block attention. `aq`/`ak`/`av` are the f32 projections, `ao` the f32
     /// output, `s` one query band of the scores plane. `qh`/`kh` are k-major f32
     /// copies of Q and K on the f32 path, and f16 Q and k-major K on the tensor-core
@@ -176,11 +178,14 @@ pub fn decode(
     return rgb;
 }
 
-/// Decode a Wan 2.1 latent (planar `[16][zh][zw]`, already denormalized) to planar
-/// `[3][8*zh][8*zw]` pixels in [-1, 1], the chain at `act`. Reads repacked conv weights
+/// Decode a Wan latent (planar `[z][zh][zw]`, already denormalized) to planar
+/// `[oc][s*zh][s*zw]` pixels in [-1, 1], the chain at `act`. Reads repacked conv weights
 /// (`wan_vae.Decoder.repackConvs`). Caller frees.
 pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool), act: gpu_context.Dt) ![]f32 {
-    std.debug.assert(z.len == wan_vae.latent_channels * zh * zw);
+    const zc = dec.latentChannels();
+    const oc = dec.outChannels();
+    const s = dec.scale();
+    std.debug.assert(z.len == zc * zh * zw);
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -192,13 +197,14 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Alloca
     const widths = dec.activationElems(zh, zw);
     const wide: usize = @intCast(widths.wide);
     const asz = act.bytes();
-    inline for (.{ "x", "t", "u" }) |f| @field(bufs, f).dt = act;
+    inline for (.{ "x", "t", "u", "sv" }) |f| @field(bufs, f).dt = act;
     try ctx.ensureDeviceBuffer(&bufs.x, wide * asz);
     try ctx.ensureDeviceBuffer(&bufs.t, wide * asz);
     try ctx.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * asz);
-    try ctx.ensureDeviceBuffer(&bufs.stage, @max(z.len, n0 * 64 * 3) * 4);
+    if (dec.savedElems(zh, zw) > 0) try ctx.ensureDeviceBuffer(&bufs.sv, dec.savedElems(zh, zw) * asz);
+    try ctx.ensureDeviceBuffer(&bufs.stage, @max(z.len, n0 * s * s * oc) * 4);
     {
-        const rows = try wan_vae.planarToRows(gpa, z, wan_vae.latent_channels, n0);
+        const rows = try wan_vae.planarToRows(gpa, z, zc, n0);
         defer gpa.free(rows);
         try ctx.tensorUpload(bufs.stage, std.mem.sliceAsBytes(rows));
     }
@@ -222,10 +228,10 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Alloca
     try ctx.endBatch();
 
     const n = ext[0] * ext[1];
-    const rgb = try gpa.alloc(f32, n * 3);
+    const rgb = try gpa.alloc(f32, n * oc);
     defer gpa.free(rgb);
-    try ctx.tensorDownload(bufs.stage, std.mem.sliceAsBytes(rgb));
-    return wan_vae.rowsToPlanar(gpa, rgb, 3, n);
+    try ctx.tensorDownload(try ctx.view(bufs.stage, 0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
+    return wan_vae.rowsToPlanar(gpa, rgb, oc, n);
 }
 
 /// The mid-block attention's scratch for `n` positions of a `c`-wide head: f32
@@ -296,6 +302,23 @@ const Dev = struct {
     pub fn add(d: Dev, a: DeviceBuffer, b: DeviceBuffer, n: usize) !void {
         std.debug.assert(a.dt == b.dt);
         try d.ctx.opElt(gpu_context.eltAt("add", a.dt), a, b, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn copy(d: Dev, dst: DeviceBuffer, src: DeviceBuffer, n: usize) !void {
+        std.debug.assert(dst.dt == src.dt);
+        try d.ctx.opElt(gpu_context.eltAt("copy", src.dt), src, dst, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn dupUpAdd(d: Dev, x: DeviceBuffer, sv: DeviceBuffer, h: usize, w: usize, du: wan_vae.DupUp) !void {
+        std.debug.assert(x.dt == sv.dt);
+        const total = 4 * h * w * du.co;
+        try d.ctx.opElt(gpu_context.eltAt("dup_up_add", x.dt), x, sv, null, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(du.co),
+            .u2 = @intCast(du.ci),
+            .u3 = @intCast(w),
+            .u4 = @intCast(du.ft),
+        }, total, 1, 1);
     }
 
     /// The scores plane is f32, not the f16 the tensor-core path would give: the

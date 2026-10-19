@@ -1,5 +1,6 @@
 //! ComfyUI's `asym_w4a8_int8` weight format: a 4-bit weight that DECODES to the
-//! int8-convrot weight this engine already runs.
+//! int8-convrot weight this engine already runs. Its `w6a8_int8` sibling is the same
+//! contract at 6 bits (`Levels6`, `code6`).
 //!
 //! A layer ships five tensors: `weight` (I8 [N, K/2], two 4-bit codebook indices per
 //! byte), `weight_s_rel` (F8_E4M3 [N, K/group_size], the per-group relative scale),
@@ -67,6 +68,10 @@ pub const uniform_levels: [16]f32 = blk: {
 
 /// The `format` string this module handles, as written into `comfy_quant`.
 pub const format_name = "asym_w4a8_int8";
+/// The 6-bit sibling: a row is the `cols / 2`-byte nibble plane, then a `cols / 4`-byte
+/// plane of each code's top two bits (column `c` in byte `c / 4` at bit `2 * (c % 4)`),
+/// and a code `q` decodes uniformly as `q - 32`, with no codebook.
+pub const format_name6 = "w6a8_int8";
 
 /// A quantized layer's `comfy_quant` blob: a JSON object stored as U8 bytes next to
 /// the weight. Every field has ComfyUI's own default, since `_load_quantized_module`
@@ -126,6 +131,51 @@ pub const Levels = struct {
     }
 };
 
+/// Every int8 value a 6-bit tensor can decode to, `[s_rel byte][code]`: the uniform
+/// `q - 32` times the group scale, through the same multiply-round-clamp as `Levels`.
+pub const Levels6 = struct {
+    table: [256][64]i8,
+
+    pub fn init() Levels6 {
+        var lv: Levels6 = undefined;
+        for (0..256) |b| {
+            const s = dtypes.f8e4m3ToF32(@intCast(b));
+            for (0..64) |i| {
+                const p = (@as(f32, @floatFromInt(i)) - 32.0) * s;
+                const v = if (std.math.isNan(p)) 0.0 else std.math.clamp(roundTiesEven(p), -127.0, 127.0);
+                lv.table[b][i] = @intFromFloat(v);
+            }
+        }
+        return lv;
+    }
+};
+
+/// A row's 6-bit code for column `c`, `row` being that row's `3 * cols / 4` bytes.
+pub inline fn code6(row: []const u8, cols: usize, c: usize) u8 {
+    const lo = row[c / 2];
+    const nib: u8 = if (c & 1 == 0) lo & 0xF else lo >> 4;
+    const hi = (row[cols / 2 + c / 4] >> @intCast(2 * (c % 4))) & 3;
+    return nib | (hi << 4);
+}
+
+/// How a layer's codes decode: a 4-bit codebook table, or the uniform 6-bit one.
+pub const Codes = union(enum) {
+    w4: *const Levels,
+    w6: *const Levels6,
+
+    pub fn bits(self: Codes) u8 {
+        return switch (self) {
+            .w4 => 4,
+            .w6 => 6,
+        };
+    }
+
+    /// Stored bytes per row of `cols` logical columns.
+    pub fn rowBytes(self: Codes, cols: usize) usize {
+        return cols * self.bits() / 8;
+    }
+};
+
 /// The sidecars a PACKED W4A8 weight needs in order to decode, carried on
 /// `ops.matmul.Weight.w4a8` so `Weight.bytes` can stay the 4-bit storage.
 ///
@@ -137,9 +187,9 @@ pub const Levels = struct {
 pub const Meta = struct {
     /// Raw fp8-e4m3 bytes of `weight_s_rel`: `[rows][cols / group_size]`.
     s_rel: []const u8,
-    /// This layer's `[256][16]` int8 decode table. A pointer, not a value, so a GPU
-    /// backend can key a 4 KiB device copy on its address the same way it keys weights.
-    levels: *const Levels,
+    /// This layer's int8 decode table. A pointer, not a value, so a GPU backend can key
+    /// a device copy on its address the same way it keys weights.
+    codes: Codes,
     group_size: u32,
 
     /// Group count per row.
@@ -147,14 +197,32 @@ pub const Meta = struct {
         return cols / self.group_size;
     }
 
+    /// The decode table as a device takes it: `[256][2^bits]` int8, so its length is
+    /// what tells a backend the bit depth.
+    pub fn levelBytes(self: Meta) []const u8 {
+        return switch (self.codes) {
+            .w4 => |lv| std.mem.asBytes(lv),
+            .w6 => |lv| std.mem.asBytes(lv),
+        };
+    }
+
     /// The metadata for rows `[row0, row0 + nrows)`, what a fused qkv split needs: the
     /// per-group scales are per row, so a row view that kept the parent's `s_rel` would
     /// read q's scales for k and v. `levels` is per tensor and shared unchanged.
     pub fn rowSlice(self: Meta, cols: usize, row0: usize, nrows: usize) Meta {
         const g = self.groups(cols);
-        return .{ .s_rel = self.s_rel[row0 * g ..][0 .. nrows * g], .levels = self.levels, .group_size = self.group_size };
+        return .{ .s_rel = self.s_rel[row0 * g ..][0 .. nrows * g], .codes = self.codes, .group_size = self.group_size };
     }
 };
+
+/// `validate` for a 6-bit layer: the reference's `_check_six_bit_layout` on top (K a
+/// multiple of 32, groups a multiple of 16), and `3 * cols / 4` bytes a row.
+pub fn validate6(rows: usize, cols: usize, group_size: usize, convrot_groupsize: usize, packed_len: usize, s_rel_len: usize) !usize {
+    if (cols % 32 != 0 or group_size < 16 or group_size % 16 != 0) return error.ShapeMismatch;
+    const groups = try validate(rows, cols, group_size, convrot_groupsize, rows * cols / 2, s_rel_len);
+    if (packed_len != rows * cols * 3 / 4) return error.ShapeMismatch;
+    return groups;
+}
 
 /// Sanity-check a layer's tensor sizes against each other.
 ///
@@ -178,13 +246,13 @@ pub fn validate(rows: usize, cols: usize, group_size: usize, convrot_groupsize: 
 /// int8 buffer, addressed absolutely so the row ranges of concurrent callers do not
 /// overlap).
 ///
-/// `packed_bytes` is `weight` as stored (`[rows, cols/2]`), `s_rel` the raw fp8 bytes
-/// of `weight_s_rel` (`[rows, cols/group_size]`).
+/// `packed_bytes` is `weight` as stored (`[rows, codes.rowBytes(cols)]`), `s_rel` the
+/// raw fp8 bytes of `weight_s_rel` (`[rows, cols/group_size]`).
 pub fn decodeRows(
     dst: []i8,
     packed_bytes: []const u8,
     s_rel: []const u8,
-    lv: *const Levels,
+    codes: Codes,
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -194,6 +262,18 @@ pub fn decodeRows(
     std.debug.assert(dst.len == rows * cols);
     std.debug.assert(row1 <= rows);
     const groups = cols / group_size;
+    const lv = switch (codes) {
+        .w4 => |l| l,
+        .w6 => |l6| {
+            const rb = cols * 3 / 4;
+            for (row0..row1) |r| {
+                const src = packed_bytes[r * rb ..][0..rb];
+                const srow = s_rel[r * groups ..][0..groups];
+                for (dst[r * cols ..][0..cols], 0..) |*o, c| o.* = l6.table[srow[c / group_size]][code6(src, cols, c)];
+            }
+            return;
+        },
+    };
     const per_group = group_size / 2; // bytes; group_size is even (see validate)
     for (row0..row1) |r| {
         const src = packed_bytes[r * cols / 2 ..][0 .. cols / 2];
@@ -222,7 +302,7 @@ pub fn decode(
     dst: []i8,
     packed_bytes: []const u8,
     s_rel: []const u8,
-    lv: *const Levels,
+    codes: Codes,
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -230,25 +310,25 @@ pub fn decode(
     const max_threads = 16;
     const cpus = std.Thread.getCpuCount() catch 1;
     const n = @min(@min(cpus, max_threads), @max(rows / 64, 1));
-    if (n <= 1) return decodeRows(dst, packed_bytes, s_rel, lv, rows, cols, group_size, 0, rows);
+    if (n <= 1) return decodeRows(dst, packed_bytes, s_rel, codes, rows, cols, group_size, 0, rows);
 
     const Ctx = struct {
         dst: []i8,
         packed_bytes: []const u8,
         s_rel: []const u8,
-        lv: *const Levels,
+        codes: Codes,
         rows: usize,
         cols: usize,
         group_size: usize,
         fn run(c: *const @This(), row0: usize, row1: usize) void {
-            decodeRows(c.dst, c.packed_bytes, c.s_rel, c.lv, c.rows, c.cols, c.group_size, row0, row1);
+            decodeRows(c.dst, c.packed_bytes, c.s_rel, c.codes, c.rows, c.cols, c.group_size, row0, row1);
         }
     };
     const ctx = Ctx{
         .dst = dst,
         .packed_bytes = packed_bytes,
         .s_rel = s_rel,
-        .lv = lv,
+        .codes = codes,
         .rows = rows,
         .cols = cols,
         .group_size = group_size,
@@ -277,6 +357,7 @@ const fixtures_json = @embedFile("assets/w4a8_fixtures.json");
 
 const Case = struct {
     name: []const u8,
+    bits: u8 = 4,
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -298,6 +379,33 @@ fn loadFixtures(gpa: std.mem.Allocator) !std.json.Parsed(Fixtures) {
     return std.json.parseFromSlice(Fixtures, gpa, fixtures_json, .{ .ignore_unknown_fields = true });
 }
 
+/// A case's decode table and its size check, 4 or 6 bits.
+const CaseCodes = struct {
+    lv4: Levels,
+    lv6: Levels6,
+    bits: u8,
+
+    fn init(c: Case) CaseCodes {
+        var cb: [16]f32 = undefined;
+        const cbp: ?*const [16]f32 = if (c.codebook) |v| blk: {
+            @memcpy(&cb, v[0..16]);
+            break :blk &cb;
+        } else null;
+        return .{ .lv4 = Levels.init(cbp), .lv6 = Levels6.init(), .bits = c.bits };
+    }
+
+    fn codes(self: *const CaseCodes) Codes {
+        return if (self.bits == 6) .{ .w6 = &self.lv6 } else .{ .w4 = &self.lv4 };
+    }
+
+    fn validateCase(self: *const CaseCodes, c: Case, packed_len: usize, s_rel_len: usize) !usize {
+        return if (self.bits == 6)
+            validate6(c.rows, c.cols, c.group_size, c.convrot_groupsize, packed_len, s_rel_len)
+        else
+            validate(c.rows, c.cols, c.group_size, c.convrot_groupsize, packed_len, s_rel_len);
+    }
+};
+
 fn unhex(gpa: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try gpa.alloc(u8, hex.len / 2);
     _ = try std.fmt.hexToBytes(out, hex);
@@ -315,18 +423,12 @@ test "W4A8 decode matches comfy_kitchen's reference on every fixture case" {
         const s_rel = try unhex(gpa, c.s_rel_hex);
         defer gpa.free(s_rel);
 
-        _ = try validate(c.rows, c.cols, c.group_size, c.convrot_groupsize, packed_bytes.len, s_rel.len);
-
-        var cb: [16]f32 = undefined;
-        const cbp: ?*const [16]f32 = if (c.codebook) |v| blk: {
-            @memcpy(&cb, v[0..16]);
-            break :blk &cb;
-        } else null;
-        const lv = Levels.init(cbp);
+        const cc = CaseCodes.init(c);
+        _ = try cc.validateCase(c, packed_bytes.len, s_rel.len);
 
         const dst = try gpa.alloc(i8, c.rows * c.cols);
         defer gpa.free(dst);
-        decode(dst, packed_bytes, s_rel, &lv, c.rows, c.cols, c.group_size);
+        decode(dst, packed_bytes, s_rel, cc.codes(), c.rows, c.cols, c.group_size);
 
         for (dst, c.expect_i8, 0..) |got, want, i| {
             std.testing.expectEqual(@as(i8, @intCast(want)), got) catch |e| {
@@ -372,8 +474,8 @@ test "the threaded and single-threaded W4A8 decodes agree" {
     defer gpa.free(par);
     const seq = try gpa.alloc(i8, rows * c.cols);
     defer gpa.free(seq);
-    decode(par, packed_big, s_rel_big, &lv, rows, c.cols, c.group_size);
-    decodeRows(seq, packed_big, s_rel_big, &lv, rows, c.cols, c.group_size, 0, rows);
+    decode(par, packed_big, s_rel_big, .{ .w4 = &lv }, rows, c.cols, c.group_size);
+    decodeRows(seq, packed_big, s_rel_big, .{ .w4 = &lv }, rows, c.cols, c.group_size, 0, rows);
     try std.testing.expectEqualSlices(i8, seq, par);
 }
 
@@ -393,16 +495,11 @@ test "a W4A8 weight dequantizes to the reference's f32 weight through the int8 c
         defer gpa.free(packed_bytes);
         const s_rel = try unhex(gpa, c.s_rel_hex);
         defer gpa.free(s_rel);
-        var cb: [16]f32 = undefined;
-        const cbp: ?*const [16]f32 = if (c.codebook) |v| blk: {
-            @memcpy(&cb, v[0..16]);
-            break :blk &cb;
-        } else null;
-        const lv = Levels.init(cbp);
+        const cc = CaseCodes.init(c);
 
         const q = try gpa.alloc(i8, c.rows * c.cols);
         defer gpa.free(q);
-        decode(q, packed_bytes, s_rel, &lv, c.rows, c.cols, c.group_size);
+        decode(q, packed_bytes, s_rel, cc.codes(), c.rows, c.cols, c.group_size);
 
         // int8 * per-row scale, then rotate each 256-group back to the original basis
         // exactly what `ops.matmul`'s `.i8` convrot dequant does per k-slice.
@@ -446,19 +543,14 @@ test "a matmul through the PACKED W4A8 weight equals one through the materialize
         defer gpa.free(packed_bytes);
         const s_rel = try unhex(gpa, c.s_rel_hex);
         defer gpa.free(s_rel);
-        var cb: [16]f32 = undefined;
-        const cbp: ?*const [16]f32 = if (c.codebook) |v| blk: {
-            @memcpy(&cb, v[0..16]);
-            break :blk &cb;
-        } else null;
-        const levels = Levels.init(cbp);
-        const meta: Meta = .{ .s_rel = s_rel, .levels = &levels, .group_size = @intCast(c.group_size) };
+        const cc = CaseCodes.init(c);
+        const meta: Meta = .{ .s_rel = s_rel, .codes = cc.codes(), .group_size = @intCast(c.group_size) };
 
         const q = try gpa.alloc(i8, c.rows * c.cols);
         defer gpa.free(q);
-        decode(q, packed_bytes, s_rel, &levels, c.rows, c.cols, c.group_size);
+        decode(q, packed_bytes, s_rel, cc.codes(), c.rows, c.cols, c.group_size);
 
-        var w_packed = matmul.Weight.init(packed_bytes, .w4a8, c.rows, c.cols);
+        var w_packed = matmul.Weight.init(packed_bytes, if (c.bits == 6) .w6a8 else .w4a8, c.rows, c.cols);
         w_packed.row_scale = c.s_channel;
         w_packed.convrot = 256;
         w_packed.w4a8 = &meta;

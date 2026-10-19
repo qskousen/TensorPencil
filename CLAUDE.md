@@ -447,7 +447,13 @@ of the stage API works on every family.
 | `sensenova` | `models/sensenova.zig` (Qwen3-shaped MoT trunk) | the trunk's own base copy | none (pixel space) | 3 |
 | `mageflow` | `models/mageflow.zig` (double-stream MMDiT) | Qwen3-VL 4B | Mage-VAE (16x) | 128 |
 | `moss_image` | `models/moss_image.zig` (single-stream, patch 1) | Qwen3.5 9B (HF) | Mage-Flow's (either codec) | 128 |
+| `qwen_image21` | `models/qwen_image21.zig` (block-causal single-stream, patch 1) | Qwen3-VL 8B (last state, unnormed) | Wan 2.2 layout, RGBA (16x) | 64 |
 
+- **Qwen-Image 2.1's prefix never sees the target and is modulated at t = 0**, so the
+  device arms compute it once per conditioning and keep each block's K/V; a step runs the
+  target rows alone. It samples on DIFFUSERS' schedule (`reference`: mu from the target's
+  token count, stretched to 0.02), which ComfyUI does not reproduce, and its VAE decodes
+  RGBA: `Image.alpha` carries the plane to the PNG, f16 overflows it (VAE stays f32).
 - **SenseNova is not a DiT and has no side components.** One 8B trunk carries TWO
   weight copies per layer: the prompt runs the base copy causally and leaves a KV
   cache (that cache IS the conditioning, carried in `Cond.data`), and the canvas
@@ -557,6 +563,7 @@ they support** — a new reader belongs in that shared module the day it is writ
 | int8 tensorwise | I8 + ONE scalar scale, no rotation | same GEMM, unrotated activation prep |
 | int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan has no `sint4`, so it decodes per GEMM to int8 |
 | `asym_w4a8_int8` | 4-bit codebook indices + fp8 per-group scales | decodes to int8 convrot, per GEMM |
+| `w6a8_int8` | uniform 6-bit codes (nibble plane + 2-bit plane) + fp8 per-group scales | the same, its own dtype `.w6a8` |
 | NVFP4 | E2M1 nibbles + fp8 block scales, swizzled | decodes to bf16, feeds the bf16 GEMM |
 | GGUF block quants (q4_k, q8_0, …) | ggml blocks | decodes per GEMM to int8 convrot or bf16/f16 (`--dit-gguf-gemm`); Vulkan to f16 or bf16 |
 

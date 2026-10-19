@@ -1261,6 +1261,75 @@ pub inline fn pixelShuffle(e: Env) void {
     e.st(.b, i, e.ld(.a, ((py / r) * w + px / r) * (c * r * r) + ch * r * r + (py % r) * r + px % r));
 }
 
+/// `DupUp3D` at spatial factor 2, added: a `[2h][2w][u1]` (`dt`) += b, the `[h][w][u2]`
+/// stage input with each channel repeated and pixel-shuffled, temporal phase `ft - 1`
+/// kept (`wan_vae.DupUp.src`). u0 = total, u1 = co, u2 = ci, u3 = w, u4 = ft.
+pub inline fn dupUpAdd(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const co = e.u(1);
+    const ci = e.u(2);
+    const w = e.u(3);
+    const ft = e.u(4);
+    const ch = i % co;
+    const px = (i / co) % (2 * w);
+    const py = i / (co * 2 * w);
+    const f = ft * 4;
+    const src = (ch * f + (ft - 1) * 4 + (py % 2) * 2 + px % 2) / (co * f / ci);
+    const s = e.ldT(.b, dt, ((py / 2) * w + px / 2) * ci + src);
+    e.stT(.a, dt, i, e.ldT(.a, dt, i) + s);
+}
+
+/// The int8 levels of a W6A8 byte pair: column `2j` from the low nibble of `byte` and
+/// bits `sh..sh+1` of `hi`, column `2j + 1` from the high nibble and bits `sh+2..sh+3`,
+/// each through the `[256][64]` table row of scale byte `s` (`ops.w4a8.Levels6`).
+inline fn w6Pair(e: Env, byte: u32, hi: u32, sh: u32, s: u32) [2]u32 {
+    const lo = (byte & 0xF) | (((hi >> @intCast(sh)) & 3) << 4);
+    const up = (byte >> 4) | (((hi >> @intCast(sh + 2)) & 3) << 4);
+    return .{ e.byte(.d, s * 64 + lo), e.byte(.d, s * 64 + up) };
+}
+
+/// A packed W6A8 weight to row-major int8, four columns a thread (the CUDA layout).
+/// a = packed `[rows][3*cols/4]` bytes, b = int8 `[rows][cols]`, c = s_rel fp8 bytes
+/// `[rows][cols/group]`, d = the level table. u0 = rows*cols/4, u1 = cols, u2 = group.
+pub inline fn w6a8Decode(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const cols = e.u(1);
+    const quads = cols / 4;
+    const row = t / quads;
+    const q = t % quads;
+    const base = row * (cols * 3 / 4);
+    const hi = e.byte(.a, base + cols / 2 + q);
+    const s = e.byte(.c, row * (cols / e.u(2)) + (4 * q) / e.u(2));
+    const p0 = w6Pair(e, e.byte(.a, base + 2 * q), hi, 0, s);
+    const p1 = w6Pair(e, e.byte(.a, base + 2 * q + 1), hi, 4, s);
+    e.stW(.b, t, p0[0] | (p0[1] << 8) | (p1[0] << 16) | (p1[1] << 24));
+}
+
+/// `w6a8Decode` into the k-major layout Vulkan's int8 GEMM reads, from inputs the
+/// weight upload already byte-transposed (see `w4a8_decode_t` in eltwise.zig, whose
+/// layout this keeps): a = packed `[3*cols/4][stride]`, c = s_rel `[cols/group][stride]`,
+/// b = int8 `[cols][stride]`. A thread owns one nibble byte-column `j` for four rows.
+/// u0 = (cols/2)*(stride/4), u1 = group/2, u2 = stride/4, u3 = cols/2.
+pub inline fn w6a8DecodeT(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const rq = e.u(2);
+    const j = t / rq;
+    const r = t % rq;
+    const pw = e.ldW(.a, t);
+    const hw = e.ldW(.a, (e.u(3) + j / 2) * rq + r);
+    const sw = e.ldW(.c, (j / e.u(1)) * rq + r);
+    const sh = 4 * (j % 2);
+    var lo_out: u32 = 0;
+    var hi_out: u32 = 0;
+    inline for (0..4) |i| {
+        const v = w6Pair(e, (pw >> (8 * i)) & 0xFF, (hw >> (8 * i)) & 0xFF, sh, (sw >> (8 * i)) & 0xFF);
+        lo_out |= v[0] << (8 * i);
+        hi_out |= v[1] << (8 * i);
+    }
+    e.stW(.b, 2 * j * rq + r, lo_out);
+    e.stW(.b, (2 * j + 1) * rq + r, hi_out);
+}
+
 /// Patch matrix of a NON-OVERLAPPING k x k stride-k convolution over channel-last
 /// `[h][w][ci]`: `b[oy*ow + ox][(dy*k + dx)*ci + c] = a[(oy*k + dy)*w + ox*k + dx][c]`.
 /// No padding, because a stride-k window never leaves the input. a = src, b = dst.
@@ -1468,15 +1537,16 @@ pub inline fn meanHeadsPool(e: Env) void {
 
 /// Online-softmax partial over an interleaved slice of f16-pair WORDS of a scores
 /// row. a = S (f16 pairs), d = partials [(z*rows + q)*nchunks + chunk] x {m, d}.
-/// u0 = threads, u1 = nchunks, u2 = rows (= valid cols), u3 = S row stride,
-/// u5 = S plane stride (elements).
+/// u0 = threads, u1 = nchunks, u2 = valid cols, u3 = S row stride, u4 = rows per
+/// plane (0 for u2, square), u5 = S plane stride (elements).
 pub inline fn softmaxPartial(e: Env) void {
     const i = k.elem(e) orelse return;
     const nch = e.u(1);
     const chunk = i % nch;
     const qz = i / nch;
-    const q = qz % e.u(2);
-    const z = qz / e.u(2);
+    const rows = if (e.u(4) != 0) e.u(4) else e.u(2);
+    const q = qz % rows;
+    const z = qz / rows;
     const base_w = (z * e.u(5) + q * e.u(3)) / 2;
     const nw = (e.u(2) + 1) / 2;
     var m: f32 = -3.4e38;

@@ -1105,7 +1105,7 @@ test "the Vulkan W4A8 decode matches ops.w4a8.decode, including the row padding"
 
         // Expected: the CPU decode, laid out k-major with zeroed row padding.
         const row_major = try alloc.alloc(i8, c.rows * c.cols);
-        w4a8.decode(row_major, packed_bytes, s_rel, levels, c.rows, c.cols, c.gs);
+        w4a8.decode(row_major, packed_bytes, s_rel, .{ .w4 = levels }, c.rows, c.cols, c.gs);
         const want = try alloc.alloc(i8, stride * c.cols);
         @memset(want, 0);
         for (0..c.cols) |k| {

@@ -1854,7 +1854,8 @@ pub const Diffuser = struct {
             gi.resume_snapshot = null;
         }
 
-        // The pipeline returns packed RGB; clients want RGBA. Convert once.
+        // The pipeline returns packed RGB, plus alpha from an RGBA decoder; clients
+        // want RGBA. Convert once.
         const px = img.width * img.height;
         const rgba = self.gpa.alloc(u8, px * 4) catch |err| {
             self.failImage(gi, err);
@@ -1866,7 +1867,7 @@ pub const Diffuser = struct {
             rgba[i * 4 + 0] = img.rgb[i * 3 + 0];
             rgba[i * 4 + 1] = img.rgb[i * 3 + 1];
             rgba[i * 4 + 2] = img.rgb[i * 3 + 2];
-            rgba[i * 4 + 3] = 255;
+            rgba[i * 4 + 3] = if (img.alpha) |a| a[i] else 255;
         }
         gi.done_ns.store(nowNs(self.io), .release);
         gi.rgba = rgba;

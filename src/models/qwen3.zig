@@ -122,6 +122,18 @@ pub const Config = struct {
         .prefix = "model.language_model.",
     };
 
+    /// Qwen-Image 2.1's encoder: Qwen3-VL-8B. Plain Qwen3-8B shares every shape and
+    /// differs in theta, so only the vision tower tells them apart, as for the 4B.
+    pub const vl_8b: Config = .{
+        .n_layers = 36,
+        .hidden = 4096,
+        .n_heads = 32,
+        .n_kv_heads = 8,
+        .intermediate = 12288,
+        .rope_theta = 5000000.0,
+        .prefix = "model.language_model.",
+    };
+
     /// MiniMax H3's conditioning encoder: Qwen3-VL-32B TRUNCATED to the first 50
     /// of its 64 layers, with no `lm_head` and, unlike every other variant here,
     /// no final norm in the checkpoint at all.
@@ -177,9 +189,14 @@ pub const Config = struct {
     /// checkpoint ("" once a `Prefixed` store has taken it off): asking without
     /// it answers no for a file that does carry the tower.
     pub fn hasVisionTower(store: WeightStore, container: []const u8) bool {
-        var buf: [160]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "{s}model.visual.patch_embed.proj.weight", .{container}) catch return false;
-        return store.get(name) != null;
+        // Nested beside the language tower (`model.visual.`) or, in a flattened
+        // export, at the top level (`visual.`).
+        for ([_][]const u8{ "model.visual.", "visual." }) |at| {
+            var buf: [160]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "{s}{s}patch_embed.proj.weight", .{ container, at }) catch return false;
+            if (store.get(name) != null) return true;
+        }
+        return false;
     }
 
     /// The prefix this store spells the language tower with: this config's own,
@@ -203,7 +220,7 @@ pub const Config = struct {
     pub fn detect(store: WeightStore) !Config {
         if (store == .gguf) return detectGguf(store.gguf);
         const vl = hasVisionTower(store, "");
-        inline for (.{ vl_4b, qwen3_0_6b, qwen3_4b }) |preset| {
+        inline for (.{ vl_4b, vl_8b, qwen3_0_6b, qwen3_4b }) |preset| {
             // A VL language tower answers on `model.language_model.` or, flat,
             // on `model.`; the vision tower says which model it belongs to.
             for ([2][]const u8{ preset.prefix, "model." }) |pfx| {
@@ -349,6 +366,9 @@ pub const minimax_h3_taps = [_]usize{Config.qwen3vl_32b_h3.n_layers};
 /// on nothing else about how the states are read.
 pub const mageflow_taps = [_]usize{Config.vl_4b.n_layers};
 
+/// Qwen-Image 2.1 reads Mage-Flow's tap on the 8B body, with the final norm NOT applied.
+pub const qwen_image21_taps = [_]usize{Config.vl_8b.n_layers};
+
 /// Which conditioning stack a `TextEncoder` produces.
 ///
 /// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
@@ -376,10 +396,14 @@ pub const Variant = enum {
     /// Mage-Flow: krea2's Qwen3-VL-4B checkpoint, but ONE normalized final
     /// hidden state rather than krea2's 12-layer tap stack.
     mageflow,
+    /// Qwen-Image 2.1: Qwen3-VL-8B, the last layer's output WITHOUT the final norm
+    /// (transformers 4.57's `hidden_states[-1]`, which Qwen tuned against).
+    qwen_image21,
 
     pub fn config(self: Variant) Config {
         return switch (self) {
             .krea2, .mageflow => Config.vl_4b,
+            .qwen_image21 => Config.vl_8b,
             .zimage => Config.qwen3_4b,
             .anima => Config.qwen3_0_6b,
             .minimax_h3 => Config.qwen3vl_32b_h3,
@@ -393,6 +417,7 @@ pub const Variant = enum {
             .anima => &anima_taps,
             .minimax_h3 => &minimax_h3_taps,
             .mageflow => &mageflow_taps,
+            .qwen_image21 => &qwen_image21_taps,
         };
     }
 
@@ -413,7 +438,7 @@ pub const Variant = enum {
     /// the converse).
     pub fn appliesFinalNorm(self: Variant) bool {
         return switch (self) {
-            .krea2, .zimage, .minimax_h3 => false,
+            .krea2, .zimage, .minimax_h3, .qwen_image21 => false,
             .anima, .mageflow => true,
         };
     }

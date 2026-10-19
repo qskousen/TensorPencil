@@ -148,9 +148,9 @@ pub const Weight = struct {
     /// Per-output-row dequant scale (ComfyUI int8 `weight_scale`, `[rows]`).
     /// When set, overrides `scale` for `.i8`/`.i4` weights.
     row_scale: ?[]const f32 = null,
-    /// ComfyUI `asym_w4a8_int8` sidecars, set iff `dtype == .w4a8`. `bytes` is then
-    /// the packed `[rows][cols/2]` nibble storage and `row_scale` is `s_channel`;
-    /// decoding a nibble needs the per-group scale and level table in here. Kept
+    /// ComfyUI `asym_w4a8_int8` / `w6a8_int8` sidecars, set iff `dtype` is `.w4a8` or
+    /// `.w6a8`. `bytes` is then the packed storage (`ops/w4a8.zig`) and `row_scale` is
+    /// `s_channel`; decoding a code needs the per-group scale and level table in here. Kept
     /// packed on purpose, materializing the int8 doubles the footprint, which is
     /// the entire difference between this format and int8. See `ops/w4a8.zig`.
     w4a8: ?*const w4a8_mod.Meta = null,
@@ -200,7 +200,7 @@ pub const Error = error{ UnsupportedDType, UnsupportedCheckpoint, QuantBackendUn
 /// problem at the point furthest from its cause.
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => true,
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4 => true,
         .q4_0, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q1_0, .q2_0_g64 => have_ggml,
         // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
         .q2_0_g128 => true,
@@ -370,7 +370,7 @@ fn matmulExact(
     std.debug.assert(y.len == m * w.rows);
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => {},
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4 => {},
         .q4_0, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
@@ -387,7 +387,7 @@ fn matmulExact(
     // An error and not an assert: an assert is compiled out in ReleaseFast, and the
     // null then reaches the panel pack as a slice at address 0. Loaders attach this
     // in `quant_weight.load`.
-    if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8) {
+    if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8) {
         if (w.row_scale == null or w.row_scale.?.len != w.rows) {
             std.log.err("matmul: {s} is {t} with no per-row scale for its {d} rows", .{
                 w.tag orelse "<untagged weight>", w.dtype, w.rows,
@@ -397,7 +397,7 @@ fn matmulExact(
     }
     // A `.w4a8` weight without its sidecars cannot be decoded at all, and the nibbles
     // would otherwise be read as signed int4, plausible values, wrong weight.
-    if (w.dtype == .w4a8) std.debug.assert(w.w4a8 != null);
+    if (w.dtype == .w4a8 or w.dtype == .w6a8) std.debug.assert(w.w4a8 != null);
     // NVFP4 carries no row scale and no rotation; its block scales and level table are
     // the only way to read the nibbles at all.
     if (w.dtype == .nvfp4) {
@@ -753,7 +753,7 @@ fn packedTask(
 ) void {
     // i4 is sub-byte packed (nibbles), so it can't ride the byteSize-based
     // typed path; it has its own kernel that unpacks two values per byte.
-    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .nvfp4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
@@ -939,13 +939,25 @@ inline fn dequantW4A8Slice(w: Weight, row: usize, col0: usize, n: usize, dst: []
     const gs = meta.group_size;
     const srow = meta.s_rel[row * meta.groups(w.cols) ..];
     const rs = w.row_scale.?[row];
-    const byte0 = (row * w.cols + col0) / 2;
-    for (0..n) |k| {
-        const c = col0 + k;
-        const tbl = &meta.levels.table[srow[c / gs]];
-        const byte = w.bytes[byte0 + k / 2];
-        const nib: u4 = @truncate(if (c & 1 == 0) byte else byte >> 4);
-        dst[k] = @as(f32, @floatFromInt(tbl[nib])) * rs;
+    switch (meta.codes) {
+        .w4 => |lv| {
+            const byte0 = (row * w.cols + col0) / 2;
+            for (0..n) |k| {
+                const c = col0 + k;
+                const tbl = &lv.table[srow[c / gs]];
+                const byte = w.bytes[byte0 + k / 2];
+                const nib: u4 = @truncate(if (c & 1 == 0) byte else byte >> 4);
+                dst[k] = @as(f32, @floatFromInt(tbl[nib])) * rs;
+            }
+        },
+        .w6 => |lv| {
+            const rb = w.cols * 3 / 4;
+            const src = w.bytes[row * rb ..][0..rb];
+            for (0..n) |k| {
+                const c = col0 + k;
+                dst[k] = @as(f32, @floatFromInt(lv.table[srow[c / gs]][w4a8_mod.code6(src, w.cols, c)])) * rs;
+            }
+        },
     }
 }
 
@@ -981,7 +993,7 @@ fn packedTaskI4(
                     continue;
                 }
                 var tmp: [KC]f32 = undefined;
-                if (w.dtype == .w4a8)
+                if (w.dtype == .w4a8 or w.dtype == .w6a8)
                     dequantW4A8Slice(w, row, kc0, kl, tmp[0..kl])
                 else if (w.dtype == .nvfp4)
                     nvfp4_mod.decodeSliceF32(tmp[0..kl], w.bytes, w.nvfp4.?.*, cols, row, kc0, kl)
@@ -1113,7 +1125,7 @@ fn runRange(
     scratch: []f32,
     tok: cancel.Token,
 ) void {
-    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .nvfp4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch, tok);
@@ -1195,7 +1207,7 @@ fn runRangeI4(
         const nr = @min(panel_rows, row_end - r);
         for (0..nr) |j| {
             const dst = scratch[j * cols ..][0..cols];
-            if (w.dtype == .w4a8)
+            if (w.dtype == .w4a8 or w.dtype == .w6a8)
                 dequantW4A8Slice(w, r + j, 0, cols, dst)
             else if (w.dtype == .nvfp4)
                 nvfp4_mod.decodeSliceF32(dst, w.bytes, w.nvfp4.?.*, cols, r + j, 0, cols)

@@ -36,7 +36,8 @@ pub fn kindOf(dt: DType) Kind {
         .f8_e4m3 => .fp8,
         .i8 => .i8,
         .i4 => .i4,
-        .w4a8 => .w4a8,
+        // W6A8 decodes through the same int8 funnel on every arm (`ops/w4a8.zig`).
+        .w4a8, .w6a8 => .w4a8,
         .nvfp4 => .nvfp4,
         else => if (dt.isBlockQuant()) .blockq else .other,
     };

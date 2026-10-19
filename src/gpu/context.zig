@@ -379,7 +379,7 @@ pub var force_i8_prep_3pass: bool = false;
 /// inline so a caller can pass it through `@call`.
 pub const FlashPass = enum { md, out };
 
-pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q3_k, gemv4_dual_q4_k, gemv4_dual_q8_0, gemv4_dual_q4_0, gemv4_dual_iq4_nl, gemv4_dual_iq4_xs, gemv4_dual_q5_k, gemv4_dual_q6_k, gemv4_dual_q1_0, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g128, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xs, gemv4_dual_iq3_xxs, gemv4_dual_iq3_s, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16 };
+pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q3_k, gemv4_dual_q4_k, gemv4_dual_q8_0, gemv4_dual_q4_0, gemv4_dual_iq4_nl, gemv4_dual_iq4_xs, gemv4_dual_q5_k, gemv4_dual_q6_k, gemv4_dual_q1_0, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g128, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xs, gemv4_dual_iq3_xxs, gemv4_dual_iq3_s, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16, dup_up_add, dup_up_add_f16, dup_up_add_bf16, w6a8_decode, w6a8_decode_t };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("act_steer"),
     dualEntry("rmsnorm"),
@@ -720,6 +720,11 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("situ"),
     dualEntry("situ_f16"),
     dualEntry("situ_bf16"),
+    dualEntry("dup_up_add"),
+    dualEntry("dup_up_add_f16"),
+    dualEntry("dup_up_add_bf16"),
+    dualEntry("w6a8_decode"),
+    dualEntry("w6a8_decode_t"),
 };
 
 // A pipeline is found by `Elt` ordinal, so a slot out of order launches another kernel.
@@ -3954,6 +3959,8 @@ pub const Context = struct {
         cols: usize,
         group_size: usize,
     ) Error!vk.Buffer {
+        if (levels.len == 256 * 64) return self.w6a8Decode(packed_bytes, s_rel, levels, rows, cols, group_size);
+        std.debug.assert(levels.len == 256 * 16);
         std.debug.assert(packed_bytes.len == rows * cols / 2);
         std.debug.assert(s_rel.len == rows * cols / group_size);
         std.debug.assert(group_size % 2 == 0);
@@ -3973,6 +3980,35 @@ pub const Context = struct {
             .u4 = 0,
             .u5 = 0,
             .u6 = 0,
+        }, total, 1, 1);
+        return self.w4a8_t.buf;
+    }
+
+    /// `w4a8Decode` for a 6-bit weight (`levels` the `[256][64]` table): the same
+    /// transposed inputs, the packed rows `3 * cols / 4` bytes wide.
+    fn w6a8Decode(
+        self: *Context,
+        packed_bytes: []const u8,
+        s_rel: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) Error!vk.Buffer {
+        std.debug.assert(packed_bytes.len == rows * cols * 3 / 4 and cols % 32 == 0 and group_size % 16 == 0);
+        std.debug.assert(s_rel.len == rows * cols / group_size);
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        try self.ensureDeviceBuffer(&self.w4a8_t, w4a8ScratchBytes(rows, cols));
+        const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols * 3 / 4), .mem = .null_handle, .size = 0 };
+        const sc: DeviceBuffer = .{ .buf = try self.weightBuffer(s_rel, 1, rows, cols / group_size), .mem = .null_handle, .size = 0 };
+        const lv: DeviceBuffer = .{ .buf = try self.smallBuffer(levels), .mem = .null_handle, .size = 0 };
+        const quads = stride / 4;
+        const total = (cols / 2) * quads;
+        try self.opElt(.w6a8_decode_t, p, self.w4a8_t, sc, lv, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(group_size / 2),
+            .u2 = @intCast(quads),
+            .u3 = @intCast(cols / 2),
         }, total, 1, 1);
         return self.w4a8_t.buf;
     }
@@ -6202,6 +6238,7 @@ test "gpu typed dual kernels agree with their f32 instance" {
         .{ .base = "sigmoid_mul", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
         .{ .base = "silu_mul", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
         .{ .base = "situ", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n, .act = true }, null, null }, .push = .{ .u0 = n }, .total = n },
+        .{ .base = "dup_up_add", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n / 2, .act = true }, null, null }, .push = .{ .u0 = n, .u1 = 96, .u2 = 192, .u3 = 8, .u4 = 2 }, .total = n },
         .{ .base = "add_scaled", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n }, null, null }, .push = .{ .u0 = n, .f0 = 0.0625 }, .total = n },
         .{ .base = "gated_add_scaled", .s = .{ .{ .len = n, .act = true, .out = true }, .{ .len = n }, .{ .len = 2 * dim }, null }, .push = .{ .u0 = n, .u1 = dim, .u2 = dim, .f0 = 0.0625 }, .total = n },
         .{ .base = "rope_inter", .s = .{ .{ .len = n, .act = true, .out = true }, null, .{ .len = 2 * rows * half }, null }, .push = .{ .u0 = n / 2, .u1 = half, .u2 = rows * half, .u3 = heads }, .total = n / 2 },

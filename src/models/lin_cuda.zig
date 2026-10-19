@@ -517,7 +517,7 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
         // runs the same int8 GEMM, so the 4-bit form stays resident.
         .w4a8 => {
             const meta = w.w4a8.?;
-            try be.opI8GemmW4A8(y, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, bias);
+            try be.opI8GemmW4A8(y, w.bytes, meta.s_rel, meta.levelBytes(), w.row_scale.?, w.rows, w.cols, meta.group_size, bias);
         },
         .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
         // Expanded to bf16 per call, rotated back into the checkpoint's basis, against
@@ -526,19 +526,19 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
         .i4_wo => try be.opI4GemmWo(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, zb),
         .w4a8_wo => {
             const meta = w.w4a8.?;
-            try be.opW4A8GemmWo(y, x, m, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, zb);
+            try be.opW4A8GemmWo(y, x, m, w.bytes, meta.s_rel, meta.levelBytes(), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, zb);
         },
         .i8_wo16 => try be.opI8GemmWoF16(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, o.rot, zb),
         .i8_wo32 => try be.opI8GemmWoF32(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, o.rot, bias),
         .i4_wo32 => try be.opI4GemmWoF32(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, bias),
         .w4a8_wo32 => {
             const meta = w.w4a8.?;
-            try be.opW4A8GemmWoF32(y, x, m, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, bias);
+            try be.opW4A8GemmWoF32(y, x, m, w.bytes, meta.s_rel, meta.levelBytes(), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, bias);
         },
         .i4_wo16 => try be.opI4GemmWoF16(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, zb),
         .w4a8_wo16 => {
             const meta = w.w4a8.?;
-            try be.opW4A8GemmWoF16(y, x, m, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, zb);
+            try be.opW4A8GemmWoF16(y, x, m, w.bytes, meta.s_rel, meta.levelBytes(), w.row_scale.?, w.rows, w.cols, meta.group_size, o.rot, zb);
         },
         // Weight-only: decoded to a 16-bit scratch inside the GEMM, the packed form resident.
         .nvfp4 => {

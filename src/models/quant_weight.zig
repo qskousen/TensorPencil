@@ -158,7 +158,7 @@ const Int8Conf = struct {
 /// weight that reached the int8 arm means the sidecars and the metadata disagree, and
 /// reading those bytes as int8 gives finite, plausible, wrong numbers.
 const foreign_formats = [_][]const u8{
-    "nvfp4", "asym_w4a8_int8", "float8_e4m3fn", "float8_e5m2", "mxfp8",
+    "nvfp4", "asym_w4a8_int8", "w6a8_int8", "float8_e4m3fn", "float8_e5m2", "mxfp8",
 };
 
 /// ComfyUI's writer emits `convrot` only when it is true, so for `int8_tensorwise` an
@@ -316,7 +316,9 @@ fn int8Rotation(
     return ops.convrot.group_size;
 }
 
-/// Build a `Weight` for a ComfyUI `asym_w4a8_int8` layer, or null when `name` is not one.
+/// Build a `Weight` for a ComfyUI `asym_w4a8_int8` or `w6a8_int8` layer, or null when
+/// `name` is not one. The bit depth is the stored row width (`cols/2` or `3*cols/4`
+/// bytes), checked against the layer's `comfy_quant`.
 ///
 /// The sidecars are `<name>_s_rel` (fp8, per `group_size` elements), `<name>_s_channel`
 /// (f32, one per output row), an optional `<name>_codebook` (f32[16]) and the layer's
@@ -350,14 +352,16 @@ pub fn w4a8(
 
     const view = store.get(name) orelse return error.MissingTensor;
     const shape = view.info.shape.slice();
+    const six = shape.len == 2 and cols % 4 == 0 and shape[1] == cols * 3 / 4;
     if (view.info.dtype != .i8 or shape.len != 2 or cols % 2 != 0 or
-        shape[0] != rows or shape[1] != cols / 2)
+        shape[0] != rows or (shape[1] != cols / 2 and !six))
     {
-        std.log.err("w4a8: {s} has shape {any} ({t}), expected I8 [{d}, {d}]", .{
-            name, shape, view.info.dtype, rows, cols / 2,
+        std.log.err("w4a8: {s} has shape {any} ({t}), expected I8 [{d}, {d}] (4 bits) or [{d}, {d}] (6 bits)", .{
+            name, shape, view.info.dtype, rows, cols / 2, rows, cols * 3 / 4,
         });
         return error.ShapeMismatch;
     }
+    const format = if (six) ops.w4a8.format_name6 else ops.w4a8.format_name;
 
     // The group size is derived from `_s_rel`'s OWN shape and only then cross-checked
     // against `comfy_quant`. Trusting the JSON alone would let a stale or mistyped
@@ -380,8 +384,8 @@ pub fn w4a8(
             std.log.err("w4a8: {s}'s comfy_quant is not valid JSON ({t}): '{s}'", .{ name, e, qv.bytes });
             return error.UnsupportedCheckpoint;
         };
-        if (!std.mem.eql(u8, conf.format, ops.w4a8.format_name)) {
-            std.log.err("w4a8: {s} has a W4A8 scale but comfy_quant says format '{s}'", .{ name, conf.format });
+        if (!std.mem.eql(u8, conf.format, format)) {
+            std.log.err("w4a8: {s} is stored as {s} but comfy_quant says format '{s}'", .{ name, format, conf.format });
             return error.UnsupportedCheckpoint;
         }
         if (conf.group_size != group_size) {
@@ -420,20 +424,31 @@ pub fn w4a8(
     var cb_store: [16]f32 = undefined;
     var codebook: ?*const [16]f32 = null;
     if (store.get(try std.fmt.bufPrint(&nbuf, "{s}_codebook", .{name}))) |cv| {
+        // The 6-bit levels are uniform by construction; a table there is a writer bug.
+        if (six) {
+            std.log.err("w4a8: {s} is 6-bit, which has no codebook, yet ships one", .{name});
+            return error.UnsupportedCheckpoint;
+        }
         if (cv.info.elemCount() != 16) return error.ShapeMismatch;
         const tmp = try cv.toF32Alloc(alloc);
         @memcpy(&cb_store, tmp[0..16]);
         codebook = &cb_store;
     }
 
-    _ = try ops.w4a8.validate(rows, cols, group_size, convrot_groupsize, view.bytes.len, sv.bytes.len);
-
-    const levels = try alloc.create(ops.w4a8.Levels);
-    levels.* = ops.w4a8.Levels.init(codebook);
     const meta = try alloc.create(ops.w4a8.Meta);
-    meta.* = .{ .s_rel = sv.bytes, .levels = levels, .group_size = @intCast(group_size) };
+    if (six) {
+        _ = try ops.w4a8.validate6(rows, cols, group_size, convrot_groupsize, view.bytes.len, sv.bytes.len);
+        const levels = try alloc.create(ops.w4a8.Levels6);
+        levels.* = ops.w4a8.Levels6.init();
+        meta.* = .{ .s_rel = sv.bytes, .codes = .{ .w6 = levels }, .group_size = @intCast(group_size) };
+    } else {
+        _ = try ops.w4a8.validate(rows, cols, group_size, convrot_groupsize, view.bytes.len, sv.bytes.len);
+        const levels = try alloc.create(ops.w4a8.Levels);
+        levels.* = ops.w4a8.Levels.init(codebook);
+        meta.* = .{ .s_rel = sv.bytes, .codes = .{ .w4 = levels }, .group_size = @intCast(group_size) };
+    }
 
-    var w = Weight.init(view.bytes, .w4a8, rows, cols);
+    var w = Weight.init(view.bytes, if (six) .w6a8 else .w4a8, rows, cols);
     w.row_scale = s_channel;
     w.convrot = ops.convrot.group_size;
     w.w4a8 = meta;

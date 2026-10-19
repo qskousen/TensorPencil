@@ -1,4 +1,4 @@
-//! Minimal image output: 8-bit RGB PNG.
+//! Minimal image output: 8-bit RGB or RGBA PNG.
 //!
 //! Matches ComfyUI's default PIL encoding: per-scanline adaptive filtering
 //! (min-sum-of-absolute-differences heuristic) feeding a zlib deflate stream at
@@ -8,10 +8,6 @@ const std = @import("std");
 const flate = std.compress.flate;
 
 const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
-
-/// Bytes per pixel for truecolor RGB. The filters predict from the pixel `bpp`
-/// bytes back, so this must match the IHDR color type.
-const bpp = 3;
 
 /// Largest IDAT payload, matching PIL/ComfyUI's 64 KiB chunking.
 const idat_chunk = 65536;
@@ -28,7 +24,13 @@ pub fn encodePngRgb(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []c
 /// Like `encodePngRgb`, but also embeds `texts` as `tEXt` chunks (placed after
 /// IHDR, before the image data, per the PNG spec's ancillary-chunk ordering).
 pub fn encodePngRgbText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []const u8, width: usize, height: usize, texts: []const TextChunk) !void {
-    std.debug.assert(pixels.len == width * height * 3);
+    return encodePngText(gpa, out, pixels, width, height, 3, texts);
+}
+
+/// `encodePngRgbText` over [h][w][channels] u8, 3 (RGB) or 4 (RGBA).
+pub fn encodePngText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []const u8, width: usize, height: usize, channels: usize, texts: []const TextChunk) !void {
+    std.debug.assert(channels == 3 or channels == 4);
+    std.debug.assert(pixels.len == width * height * channels);
 
     try out.appendSlice(gpa, &png_signature);
 
@@ -37,7 +39,7 @@ pub fn encodePngRgbText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels:
     std.mem.writeInt(u32, ihdr[0..4], @intCast(width), .big);
     std.mem.writeInt(u32, ihdr[4..8], @intCast(height), .big);
     ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // color type: truecolor RGB
+    ihdr[9] = if (channels == 4) 6 else 2; // truecolor, with or without alpha
     ihdr[10] = 0; // compression
     ihdr[11] = 0; // filter
     ihdr[12] = 0; // interlace
@@ -54,10 +56,10 @@ pub fn encodePngRgbText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels:
     }
 
     // Adaptive-filter each scanline: filter byte + filtered row bytes.
-    const stride = width * 3;
+    const stride = width * channels;
     const raw = try gpa.alloc(u8, height * (stride + 1));
     defer gpa.free(raw);
-    try filterScanlines(gpa, raw, pixels, width, height);
+    try filterScanlines(gpa, raw, pixels, width, height, channels);
 
     // zlib stream: 2-byte header (level 4 -> FLEVEL "fast", matching ComfyUI),
     // the raw deflate body, then an Adler-32 of the filtered scanlines.
@@ -102,8 +104,9 @@ fn deflateRaw(gpa: std.mem.Allocator, data: []const u8) ![]u8 {
 /// Write, for each scanline, the best of the five PNG filters (chosen by the
 /// min-sum-of-absolute-differences heuristic libpng and PIL use) into `raw`,
 /// laid out as [filter_byte][filtered_row] per line.
-fn filterScanlines(gpa: std.mem.Allocator, raw: []u8, pixels: []const u8, width: usize, height: usize) !void {
-    const stride = width * 3;
+/// The filters predict from the pixel `bpp` bytes back, so it must match the IHDR.
+fn filterScanlines(gpa: std.mem.Allocator, raw: []u8, pixels: []const u8, width: usize, height: usize, bpp: usize) !void {
+    const stride = width * bpp;
 
     const cand = try gpa.alloc(u8, stride);
     defer gpa.free(cand);
@@ -217,6 +220,16 @@ pub fn pngText(data: []const u8, keyword: []const u8) ?[]const u8 {
 }
 
 pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
+    const r = try decodePngRaw(gpa, data);
+    if (r.channels == 3) return .{ .pixels = r.pixels, .width = r.width, .height = r.height };
+    defer gpa.free(r.pixels);
+    const pixels = try gpa.alloc(u8, r.width * r.height * 3);
+    for (0..r.width * r.height) |p| @memcpy(pixels[p * 3 ..][0..3], r.pixels[p * 4 ..][0..3]);
+    return .{ .pixels = pixels, .width = r.width, .height = r.height };
+}
+
+/// The file's own pixels, [h][w][channels], 3 or 4 channels.
+pub fn decodePngRaw(gpa: std.mem.Allocator, data: []const u8) !struct { pixels: []u8, width: usize, height: usize, channels: usize } {
     if (data.len < 8 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return error.InvalidPng;
 
     var width: usize = 0;
@@ -266,7 +279,7 @@ pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
 
     // Reverse the per-row filters in place over a reconstruction buffer.
     const recon = try gpa.alloc(u8, height * stride);
-    defer gpa.free(recon);
+    errdefer gpa.free(recon);
     for (0..height) |y| {
         const ft = raw[y * (stride + 1)];
         const row = raw[y * (stride + 1) + 1 ..][0..stride];
@@ -286,17 +299,50 @@ pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
         }
     }
 
-    // Drop alpha if present.
-    const pixels = try gpa.alloc(u8, width * height * 3);
-    errdefer gpa.free(pixels);
-    if (channels == 3) {
-        @memcpy(pixels, recon);
-    } else {
-        for (0..width * height) |p| {
-            @memcpy(pixels[p * 3 ..][0..3], recon[p * 4 ..][0..3]);
-        }
+    return .{ .pixels = recon, .width = width, .height = height, .channels = channels };
+}
+
+/// Interleaved [h][w][3] plus an [h][w] alpha plane to [h][w][4], gpa-owned.
+pub fn interleaveRgba(gpa: std.mem.Allocator, rgb: []const u8, alpha: []const u8, w: usize, h: usize) ![]u8 {
+    std.debug.assert(rgb.len == w * h * 3 and alpha.len == w * h);
+    const rgba = try gpa.alloc(u8, w * h * 4);
+    for (0..w * h) |i| {
+        rgba[i * 4 ..][0..3].* = rgb[i * 3 ..][0..3].*;
+        rgba[i * 4 + 3] = alpha[i];
     }
-    return .{ .pixels = pixels, .width = width, .height = height };
+    return rgba;
+}
+
+/// Whether every pixel of an interleaved `[n][4]` buffer has alpha 255.
+pub fn opaque4(rgba: []const u8) bool {
+    var i: usize = 3;
+    while (i < rgba.len) : (i += 4) if (rgba[i] != 255) return false;
+    return true;
+}
+
+/// One planar f32 channel in [-1, 1] to u8, `planarF32ToRgb8`'s mapping.
+pub fn planarF32ToU8(gpa: std.mem.Allocator, plane: []const f32) ![]u8 {
+    const px = try gpa.alloc(u8, plane.len);
+    for (px, plane) |*p, v| p.* = @intFromFloat(@round(std.math.clamp(v * 0.5 + 0.5, 0.0, 1.0) * 255.0));
+    return px;
+}
+
+test "an RGBA PNG keeps its alpha and still reads as RGB" {
+    const gpa = std.testing.allocator;
+    const rgb = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    const alpha = [_]u8{ 255, 128, 0, 7 };
+    const rgba = try interleaveRgba(gpa, &rgb, &alpha, 2, 2);
+    defer gpa.free(rgba);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodePngText(gpa, &out, rgba, 2, 2, 4, &.{});
+    const raw = try decodePngRaw(gpa, out.items);
+    defer gpa.free(raw.pixels);
+    try std.testing.expectEqual(@as(usize, 4), raw.channels);
+    try std.testing.expectEqualSlices(u8, rgba, raw.pixels);
+    const back = try decodePngRgb(gpa, out.items);
+    defer gpa.free(back.pixels);
+    try std.testing.expectEqualSlices(u8, &rgb, back.pixels);
 }
 
 /// Interleaved [h][w][3] to [h][w][4] with an opaque alpha, gpa-owned.
@@ -573,7 +619,8 @@ test "png round-trips through deflate and filtering" {
     const raw = try dc.reader.allocRemaining(gpa, .unlimited);
     defer gpa.free(raw);
 
-    const stride = width * 3;
+    const bpp = 3;
+    const stride = width * bpp;
     try std.testing.expectEqual(height * (stride + 1), raw.len);
 
     // Reverse the per-row filters and compare to the original pixels.

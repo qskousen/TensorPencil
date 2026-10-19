@@ -266,8 +266,7 @@ pub const latent_rgb_factors_sdxl = [latent_channels][3]f32{
 pub const latent_rgb_bias_sdxl = [3]f32{ 0.1084, -0.0175, -0.0011 };
 
 /// Fill `rgb_out` (`[zh*zw][3]` RGB8) with the latent2rgb preview of the planar
-/// `[4][zh*zw]` sampler latent `z`. Same `(v + 1) / 2` mapping ComfyUI's
-/// `Latent2RGBPreviewer` uses.
+/// `[4][zh*zw]` sampler latent `z`.
 pub fn latentPreviewInto(
     rgb_out: []u8,
     z: []const f32,
@@ -276,19 +275,34 @@ pub fn latentPreviewInto(
     factors: *const [latent_channels][3]f32,
     bias: [3]f32,
 ) void {
+    linearPreviewInto(latent_channels, rgb_out, z, zh, zw, factors, bias);
+}
+
+/// The latent2rgb preview every family with a linear factor table shares: a per-pixel
+/// `[c][3]` matmul plus bias over the planar `[c][zh*zw]` latent, then ComfyUI's
+/// `Latent2RGBPreviewer` mapping `((v + 1) / 2).clamp(0, 1) * 255`.
+pub fn linearPreviewInto(
+    comptime c: usize,
+    rgb_out: []u8,
+    z: []const f32,
+    zh: usize,
+    zw: usize,
+    factors: *const [c][3]f32,
+    bias: [3]f32,
+) void {
     const plane = zh * zw;
-    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
+    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= c * plane);
     for (0..plane) |p| {
         var acc = bias;
-        inline for (0..latent_channels) |c| {
-            const v = z[c * plane + p];
-            acc[0] += v * factors[c][0];
-            acc[1] += v * factors[c][1];
-            acc[2] += v * factors[c][2];
+        inline for (0..c) |ch| {
+            const v = z[ch * plane + p];
+            acc[0] += v * factors[ch][0];
+            acc[1] += v * factors[ch][1];
+            acc[2] += v * factors[ch][2];
         }
-        inline for (0..3) |ch| {
-            const u = std.math.clamp((acc[ch] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
-            rgb_out[p * 3 + ch] = @intFromFloat(u);
+        inline for (0..3) |k| {
+            const u = std.math.clamp((acc[k] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
+            rgb_out[p * 3 + k] = @intFromFloat(u);
         }
     }
 }

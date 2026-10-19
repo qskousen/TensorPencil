@@ -1004,6 +1004,11 @@ const bodies = .{
     .{ "situ", At(elt.situ, .f32).run },
     .{ "situ_f16", At(elt.situ, .f16).run },
     .{ "situ_bf16", At(elt.situ, .bf16).run },
+    .{ "dup_up_add", At(elt.dupUpAdd, .f32).run },
+    .{ "dup_up_add_f16", At(elt.dupUpAdd, .f16).run },
+    .{ "dup_up_add_bf16", At(elt.dupUpAdd, .bf16).run },
+    .{ "w6a8_decode", elt.w6a8Decode },
+    .{ "w6a8_decode_t", elt.w6a8DecodeT },
 };
 
 comptime {
