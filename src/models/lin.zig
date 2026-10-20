@@ -123,6 +123,9 @@ pub fn integerKind(lins: []const Weight) ?Kind {
     return ([3]Kind{ .i8, .i4, .w4a8 })[best];
 }
 
+/// Whether the int8 prep rotates: the checkpoint's choice, read off every weight that
+/// takes a prep, W4A8 included (its weights are rotated, and an unrotated activation
+/// against them renders noise). Null when the list mixes the two.
 pub fn convrot(lins: []const Weight) ?bool {
     var seen: ?bool = null;
     for (lins) |w| {

@@ -2227,6 +2227,10 @@ fn senseNovaPrefix(model: *const sensenova.Model, cond: Cond) sensenova.Prefix {
     };
 }
 
+/// One image's denoiser. `predict` cannot be a free function on the GPU backends: text
+/// fusion, rope tables, timestep vectors and the activation workspace are built once per
+/// image. Bound to one resolution; it borrows its conditionings, which must outlive it.
+/// `Session.predict` is the one-shot form.
 pub const Denoiser = struct {
     sess: *Session,
     lat_h: usize,
@@ -3309,7 +3313,8 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
 /// 1. An explicitly given path wins. If the user passed `--text-encoder` or
 ///    `--vae`, that file is used even when the primary checkpoint also carries one,
 ///    overriding a bundled component is the whole reason to pass the flag.
-/// 2. Otherwise the primary checkpoint must contain it.
+/// 2. Otherwise the primary checkpoint's own copy, then a defaulted side file, else
+///    `error.ComponentNotInCheckpoint`.
 ///
 /// Either way the component may sit under a prefix, and either way the loader is
 /// handed a store in which it sits at the root (see `weights.Prefixed`), so no loader
@@ -4386,6 +4391,7 @@ pub const Session = struct {
                         if (self.gpu_ctx) |gc| if (mage_vae_gpu.supported(gc, v)) return want;
                     },
                 },
+                // Qwen-Image 2.1's VAE stays f32: f16 overflows it.
                 else => {},
             },
             .encoder => switch (self.models) {
@@ -7279,7 +7285,8 @@ pub const Session = struct {
     /// Stage 2, build the per-image denoiser (see `Denoiser`). `cond_neg` and a
     /// `cfg` other than 1.0 go together: pass both for classifier-free guidance,
     /// neither for a single forward per step. `sigmas` is the whole schedule (the
-    /// Vulkan backend precomputes a timestep vector per entry).
+    /// Vulkan backend precomputes a timestep vector per entry). Device allocations are
+    /// tagged `.latent` and `.dit` for the VRAM meter.
     pub fn denoiser(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -7697,10 +7704,6 @@ pub const Session = struct {
         try d.predict(gpa, v_out, latent, sigma, null);
     }
 
-    /// Stage 3, latent -> pixels on the resident VAE: denormalize, then decode
-    /// through the adaptive whole-image -> GPU-tiled -> CPU-tiled ladder (see
-    /// `VaeDecode`), then interleave to RGB8. `latent` is `[16][lat_h][lat_w]`
-    /// planar and is NOT modified. The image comes back at `lat_w*8 x lat_h*8`.
     /// Options for `generateClip`. A subset of `Options`: the knobs that do not
     /// apply to a clip (tiling modes, prompt weighting, CFG) are absent rather
     /// than accepted and ignored.
@@ -9666,6 +9669,10 @@ pub const Session = struct {
         };
     }
 
+    /// Stage 3, latent -> pixels on the resident VAE: denormalize onto a copy, then
+    /// decode through the `decodePlanar` ladder (`VaeDecode` overrides it). `latent` is
+    /// planar `[c][lat_h][lat_w]` and is not modified. Device allocations are tagged
+    /// `.vae` for the VRAM meter.
     pub fn decode(
         self: *Session,
         latent: []const f32,

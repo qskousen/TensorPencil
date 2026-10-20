@@ -1,10 +1,10 @@
 //! The remote link's gate, on a loopback socket with no engine: the daemon's
 //! server end (`serve_tls.zig`, tls.zig behind the real `server.serve`
 //! routing) against the client's end (`link.connect` on a `tp://` endpoint,
-//! std's TLS client pinned to the minted certificate). Checks: hello with the
-//! right token, a wrong token refused with 401 and the connection closed, a
-//! wrong pin refused at the handshake, a 4 MiB events frame and an 8 MiB
-//! upload intact. Exits 0 only when all of it holds. `zig build tls-spike`.
+//! the tls.zig client `serve_tls.installClient` installs, pinned to the minted
+//! certificate). Checks: hello with the right token, a wrong token refused with
+//! 401 and the connection closed, a wrong pin refused at the handshake, a 4 MiB
+//! events frame and an 8 MiB upload intact. Exits 0 only when all of it holds. `zig build tls-spike`.
 const std = @import("std");
 const Io = std.Io;
 const serve = @import("serve");

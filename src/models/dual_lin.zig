@@ -161,7 +161,8 @@ pub fn encoderInt8() IntGemm {
 /// also the only dense arm that reads and writes f16 activations.
 pub const DenseCompute = enum { native, f16 };
 
-/// The width a route that narrows the f32 activation to 16 bits stages it in.
+/// The width a route that narrows the f32 activation to 16 bits stages it in. Range
+/// decides it, not precision: an activation past 65504 needs `bf16`.
 pub const Act16 = enum { f16, bf16 };
 
 /// A caller's routing choices.

@@ -13,15 +13,7 @@
 //!
 //! `tp-serve --remote <bind>:<port> [--models <dir>]... [--backend <name>]
 //! [--state <dir>] [--pair-host <name>] [--new-token] [--incoming <dir>]`
-//!
-//! A remote host READS as well as writes model files: `/v1/pull/<catalog id>`
-//! hands back a file it holds, so a client can take a model it lacks. Only a
-//! file in the scanned folders is nameable, and only by the id a scan gave it
-//! (`Host.offerPath`, off a table published per scan so a connection thread
-//! never touches the live catalog). Nothing a user typed is reachable that way,
-//! which is why the receipt below is still about what tp-serve WRITES.
-//! serves the network.
-//! The state directory (default: `serve/` beside the settings file) holds the
+//! serves the network. The state directory (default: `serve/` beside the settings file) holds the
 //! certificate, its key and the hash of the token; all three are minted on
 //! first start, and the pairing string a client pastes into its Hosts list
 //! (`tp://<host>:<port>/<certificate>#<token>`) is printed ONCE, as a `pair`
@@ -31,6 +23,13 @@
 //! client sends. A client may put a model file it has and the host lacks into
 //! `--incoming` (default: the first `--models` folder) over `/v1/blob/*`; the
 //! host rescans when one lands.
+//!
+//! A remote host READS as well as writes model files: `/v1/pull/<catalog id>`
+//! hands back a file it holds, so a client can take a model it lacks. Only a
+//! file in the scanned folders is nameable, and only by the id a scan gave it
+//! (`Host.offerPath`, off a table published per scan so a connection thread
+//! never touches the live catalog). Nothing a user typed is reachable that way,
+//! which is why the receipt below is still about what tp-serve WRITES.
 //!
 //! **Everything this process may open for writing**, which is the list a
 //! syscall trace is diffed against. The receipt is `zig build serve-probe`

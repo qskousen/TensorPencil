@@ -488,8 +488,9 @@ pub const Event = union(enum) {
     delta: struct { msg: u32 = 0, variant: u32 = 0, text: []const u8 = "" },
     stats: struct { msg: u32 = 0, variant: u32 = 0, stats: TurnStats = .{} },
     turn_end: struct { msg: u32 = 0, variant: u32 = 0 },
-    /// The tool calls a finished reply made, reported once. Nothing is queued
-    /// here; the client places each one and answers with `chat_image`.
+    /// The tool calls a finished reply made, and again in a snapshot, since the
+    /// host keeps no record of who heard them. Nothing is queued here; the
+    /// client places each one and answers with `chat_image`.
     img_requested: struct { calls: []const ImageCall = &.{} },
     ctx: struct { tokens: u64 = 0, kv_bytes: u64 = 0 },
     /// The whole unified image list, in creation order (snapshot).

@@ -878,8 +878,10 @@ pub const Hosts = struct {
         postScanTo(s, cfg);
     }
 
-    /// False while the settings are being held back, so a caller does not
-    /// announce a send that did not happen (and does not say so every frame).
+    /// A remote host gets each model path as its catalog id (`refsToIds`), since
+    /// it holds no path of ours. False while the settings are being held back,
+    /// so a caller does not announce a send that did not happen (and does not
+    /// say so every frame).
     fn postSettingsTo(self: *Hosts, s: *Slot, cfg: *const config.Config) bool {
         const r = s.remote orelse return false;
         // A remote host is told nothing until this machine can name its files;

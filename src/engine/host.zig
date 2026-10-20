@@ -658,11 +658,9 @@ pub const Host = struct {
     /// Tell the client what a finished reply asked for. The host queues none of
     /// it: the client places each call like a render of its own and names what
     /// came back with `chat_image`. The sizes come from the settings, so a chat
-    /// host with no image engine still reports the call.
-    /// Report the renders the model asked for. `again` re-parses a reply
-    /// already reported, for a client that was not listening the first time;
-    /// placing one twice is prevented by the client, which knows the calls it
-    /// has already taken.
+    /// host with no image engine still reports the call. `again` re-parses a
+    /// reply already reported, for a client that was not listening the first
+    /// time; the client refuses a call it already placed.
     fn reportImageCalls(self: *Host, s: *chat.Session, again: bool) void {
         var calls: std.ArrayList(chat.ImageCall) = .empty;
         defer calls.deinit(self.gpa);

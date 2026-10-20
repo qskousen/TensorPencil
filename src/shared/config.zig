@@ -2206,6 +2206,7 @@ test "load sets an unreadable JSON file aside and writes nothing over it" {
     var environ: Environ = .init(gpa);
     defer environ.deinit();
 
+    std.testing.log_level = .err; // the set-aside warns on purpose
     const bad = "{\n  \"llm_model\": \"/m.gguf\",\n  \"model_dirs\": [\"/models\"]\n}\n";
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = bad });
     const cfg = Config.load(io, gpa, &environ, file);

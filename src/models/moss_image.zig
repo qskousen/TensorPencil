@@ -22,6 +22,10 @@
 //!
 //! Loads from any `WeightStore`. Block q/k/v are fused (`proj.qkv`, repacked
 //! files) or split (`proj.q`, `.k`, `.v`); both run the same forward.
+//!
+//! ComfyUI renders this checkpoint with int8 attention, which alone moves the image
+//! far more than we differ from it: compare renders against
+//! `tools/gen_moss_image_render.py --no-int8-attention`.
 
 const std = @import("std");
 const build_options = @import("build_options");

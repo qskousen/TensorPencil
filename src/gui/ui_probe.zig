@@ -1,6 +1,12 @@
 //! Visual probe for the chat workspace: renders the whole screen from canned
 //! data into a PNG, with no model, no GPU and no engine.
-//! `zig build ui-probe -- out.png [width height]`.
+//! `zig build ui-probe -- out.png [width height] [mode] [--click=X,Y]`, mode one of
+//! `--states` (the status bar under three loads), `--settings`, `--studio` (with
+//! `--lora`, over a selection that has a LoRA section), `--hosts` (one status bar
+//! per host, through the real `status_bar.render`, so two bars sharing a history
+//! ring, widget id or handle shows), `--library` or `--reopened` (a run whose
+//! files have gone: ghost slots, no toast, no retry). `--click` is in the PNG's
+//! physical pixels.
 //!
 //! Exists because every failure mode of this screen is visual — a face that
 //! resolved to the wrong weight, a band that stole a rail's width, a hairline

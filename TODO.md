@@ -1,151 +1,56 @@
-- one weight path for every model: every weight GEMM and conv goes through one
-  dispatcher per backend, so a format, a kernel or a LoRA route added once reaches
-  every family. Done: every linear goes through `lin_cuda` / `lin_gpu` and every
-  convolution through `conv_cuda` / `conv_gpu`. In order, each
-  with an interleaved A/B and, where the kernels do not change, a byte-identical render:
-  1. DONE: SD UNet linears on CUDA through `lin_cuda` (`run`, `Plan.dense`,
-     `takesF16`); byte-identical renders on f16 SDXL, f32 SD1.5 and with a LoRA, and
-     int8 / q4_k SDXL now render. Measured (`diffusion-profile`, quiet GPU, 1024²,
-     one forward): f16 137-146 ms, int8 convrot 122 ms, q4_k 196-199 ms. The bias
-     now rides every route's epilogue but fp8, the f16 block-quant decode and MMQ
-     (`lin_cuda.gemmBias`); what is left of int8's GEMM win goes to its activation
-     prep (8 ms, once per input since q/k/v share one). q4_k pays its per-GEMM
-     decode and twice the elementwise launches
-  2. DONE: CLIP on CUDA through `lin_cuda`, loader on `quant_weight.load`; a bundled
-     int8 SDXL loads and renders on its own towers. Dense CLIP renders pixel-identical.
-     Integer towers run weight-only (`lin_cuda.encoder_int8`): conditioning against
-     the dense source 0.0084-0.0089 rel L2, W8A8 0.012-0.013 (`cond-diff`).
-  3. DONE for the SD UNet: convs stay in the checkpoint's order and dtype, every CUDA
-     conv reads one f16 device weight (`Backend.weightF16`), block quants decode per
-     call. q4_k SDXL DiT VRAM 3306 -> 2141 MB; the SD/Flux VAE (`sd_vae`) is on it too,
-     f16 SDXL peak RSS 11.08 -> 8.09 GB; `wan_vae` (Anima 6.74 -> 6.37 GB) and `mage_vae`
-     (Mage-Flow -0.7 GB) too, and the conv LoRA's A (f16, file order); Vulkan keeps no
-     f32 copy of any of them where it has the coop GEMM.
+- weight dispatch (`dual_lin`, `lin_cuda` / `lin_gpu`, `conv_cuda` / `conv_gpu`), what is left:
+  - the SD LoRA sidecar costs +12-16% per step on SDXL; ~9.5 ms/step of B side on SD1.5
+    768² is not yet attributed between its GEMM, the `lo` bf16 pass and launch count.
+    LoKr, DoRA and whole diffs, which it refuses, each have an exact runtime form (LoKr's
+    kron is two reshaped GEMMs, DoRA a per-row or per-column scale computed at attach)
+  - SenseNova's generation check cannot tell rounding-flip drift from a defect past a few
+    layers on the 4-token canvas (BACKEND.md 2G). Mage-Flow's split (weight-only walk,
+    noise magnitude, per-route emulation; BACKEND.md 2H) is the shape to move it onto.
+  - Vulkan's fp8 coop GEMM is built with f16 accumulators unconditionally
+    (`coopmat.coop_acc_h16`), while its f16-store sibling is gated on the device offering
+    them (`coop_acc_f16`): Intel Alchemist offers f32/s32 only. Untested there.
+  - `--vram-budget` on CUDA refuses a 72 MB allocation mid-forward on a 1024² krea2 int8
+    render at 6, 10 and 16 GiB, intermittently at 16, with every unevictable entry pinned
+    (~190) or an unconsumed prefetch (13): the pin claims leave the activations no room.
+  - Vulkan's W8A16 (an explicit `--dit-act f16` / `--te-act f16` on int8) runs ~1.5x a
+    W8A8 krea2 step: the f16 coop GEMM is 44-52 TF/s against int8's 77-90 (`vk-wo-bench`).
+    The f16/bf16 coop GEMM's own rate (~50 of the card's ~71) is the lever; it is also
+    61% of a 1024² Wan decode on Vulkan.
+  - Vulkan's fused int8 prep at 25600 (four padded chunks) rotates twice, 242 GB/s on the
+    3090 and 160 on the RX 6800 XT; it runs only under an explicit W8A8 on a 32B encoder.
+  - `opMatmulIntWoF32` (W8A32) rotates the whole WEIGHT per GEMM through `rotate_fwht`,
+    one thread per group, which spills its 256 floats to scratch.
+  - Vulkan linears still re-cast and re-pad an operand that is already 16-bit
+    (`coopGemmPad`); reading an aligned one directly is open.
+  - The f16 weight-only integer routes (`*_wo16`, krea2's text fusion) have no checkpoint
+    here that reaches them; only `lin-cuda-test` and `lin-vk-test` run them.
   - These real-model test files are gone from this machine and their tests skip: the
     `krea2CenterSemiraw_v10{Fp8,Int8,Int8-ASYM_W4A8_INT8,Int8-INT4_CONVROT_SR}` DiTs,
     `anim-q4k-calib.gguf`, `lpips_alex`, the two Anima int8/W4A8 conversions,
     `models/assets/minimax_h3_vae.safetensors`.
-  4. The SD sidecar's cost: now +12-16% per step on SDXL (was +55%); a LoRA keeps
-     the f16 chain and the int8 A path is wired. A shared A GEMM is measured out
-     (≤1.8 ms/step ceiling), and so is running the sidecar first (B's read of the
-     output plane is 1.2 ms/step, 1.7%, `lora-sidecar-bench`'s `b_overwrite`). What is
-     left is ~9.5 ms/step of B side on SD1.5 768² beyond that read, not yet attributed
-     between its GEMM, the `lo` bf16 pass and launch count. And LoKr, DoRA and whole diffs, which it refuses today, each
-     have an exact runtime form (LoKr's kron is two reshaped GEMMs, DoRA a per-row
-     or per-column scale computed once at attach)
-  5. `dual_lin`: one linear dispatcher, `dual.zig`'s idea applied to the GEMMs. In
-     place: `models/dual_lin.zig` (Route, Policy, `routeOf`, `Plan`, `check`, all over a
-     comptime `Caps` adapter) and one executor per backend, `models/lin_cuda.zig` and
-     `models/lin_gpu.zig`, which every diffusion trunk, text encoder and LLM stepper on
-     both backends calls. Device checks: `lin-cuda-test`,
-     `lin-vk-test`. Left:
-     - SenseNova's generation check cannot tell rounding-flip drift from a defect past
-       a few layers on the 4-token canvas (BACKEND.md 2G). Mage-Flow's split (weight-only
-       walk, noise magnitude, per-route emulation; BACKEND.md 2H) holds at any depth and
-       is the shape to move SenseNova's onto.
-     - Vulkan's fp8 coop GEMM is built with f16 accumulators unconditionally
-       (`coopmat.coop_acc_h16`), while its f16-store sibling is gated on the device
-       offering them (`coop_acc_f16`): Intel Alchemist advertises f32/s32 accumulate only,
-       so the fp8 pipe asks the Arc for a configuration it never offered. Untested there.
-     - `--vram-budget` on CUDA refuses a 72 MB allocation mid-forward on a 1024² krea2 int8
-       render at 6, 10 and 16 GiB, intermittently at 16 (two runs in three), with every
-       unevictable entry pinned (~190) or an unconsumed prefetch (13): the pin claims leave
-       the activations no room under a budget.
-     - Vulkan's W8A16 (an explicit `--dit-act f16` / `--te-act f16` on int8) runs ~1.5x
-       a W8A8 krea2 step: the f16 coop GEMM is 44-52 TF/s against int8's 77-90
-       (`vk-wo-bench`), and the pack is no longer the cost. The f16/bf16 coop GEMM's own
-       rate (~50 of the card's ~71 at f32 accumulate) is the lever. It is also 61% of a
-       1024² Wan decode on Vulkan now that the conv gathers into its operand.
-     - Vulkan's fused int8 prep at 25600 (four padded chunks) rotates twice, 242 GB/s on the
-       3090 and 160 on the RX 6800 XT; it runs only under an explicit W8A8 on a 32B encoder.
-     - `opMatmulIntWoF32` (W8A32, an explicit `--dit-act f32` on an integer checkpoint)
-       rotates the whole WEIGHT per GEMM through `rotate_fwht`, one thread per group, which
-       spills its 256 floats to scratch: the slow kernel the activation prep no longer uses.
-     - LLM parity, warm (`tp-llm --bench`, 1309-token prompt, greedy ids identical):
-       Qwen3-4B q4_k: Vulkan pp 1951 / tg 63 (`qwen3_gpu`, one batched forward at any
-       position, 2048-row chunks); Qwen3.5-9B q6_k: Vulkan pp 1074 / tg 37.5, CUDA 1550 /
-       84 (`qwen35_dev.zig` on both). Left:
-       - Vulkan decode is now GEMV-bound: Qwen3-4B q4_k at short context (`TP_VK_PROFILE`)
-         spends 74% of GPU time in the dual GEMVs. On the f32 route decode takes, the Vulkan
-         build now matches or beats zig-cuda's build of the same source (`dual-gemv-bench`,
-         q4_k 480-500 GB/s, q6_k 460-530, after the k-quants' 16-element units and two rows
-         a subgroup, which took Qwen3-4B decode 91 -> 112 tok/s); what CUDA
-         has beyond that is its dp4a q8 route, which Vulkan cannot match without `OpSDot`.
-         Done on the dispatch side: residual add + hidden norm in one workgroup kernel
-         (`coopmat.buildAddRms`), q/k norm + rope in one (`qk_norm_rope`), K/V projected
-         straight into an f32 cache, the merge's loads batched, a one-subgroup argmax;
-         67.5 -> 79.9 tok/s under `TP_VK_PROFILE` (89 without it). Left: silu_mul into the down GEMV (0.13 ms a token), the
-         attention merge (7 us a call).
-       - Prefill attention: the old square tiled f32 kernel was 8.5% faster than the
-         grouped split one on a fresh 1309-row chunk (measured), and both are scalar; a
-         coopmat flash kernel is the lever. A block-quant prefill also re-expands every
-         weight to f16 per chunk (why the chunk is 2048: 512 rows was 1563 tok/s).
-       - Every dense weight is cached twice on Vulkan (GEMV and coop layouts): a bf16 4B
-         holds 16 GB. One layout both read would halve it.
-       - Vulkan decode against CUDA: ~8.9 ms a token vs 7.6 (Qwen3-4B q4_k, 112 vs 131 tok/s).
-         The GEMV kernels now match CUDA's in a back-to-back bench; what is left is each
-         GEMV's ramp and drain between barriers and the small ones (k is 1.5 MB), so the
-         lever is the step's structure, not a kernel: fewer barrier-separated levels
-         (silu_mul folded into the down GEMV, more `independent` groups), or a persistent
-         decode kernel. Design it before building it.
-       - The q8 decode GEMV is wired on Vulkan (`opGemvQuantizeX`, `gemv_dual_q8`) but off,
-         and an `OpSDot` module would not turn it on: MEASURED with `dp4a` emitting real
-         `OpSDot` (capabilities injected, `dual-gemv-bench`), q8 trails the f32 route on
-         the k-quants (q4_k 371 vs 394 GB/s, q5_k 447 vs 472, q6_k equal) and gains ~5% on
-         q8_0 only, before its quantize pass, while the f32 route already runs q8_0 at
-         800+ GB/s. A q8 kernel that decodes in 16-element units is what could change that.
-       - The one-thread-per-query `Backend.attn` kernel in its remaining callers (the DiT
-         text fusion, anima, the embedders, the H3 VAE and audio encoder, CLIP), most of
-         them non-causal, which `opAttnDecode` has no mode for.
-       - CUDA's f16 KV path changes the greedy tokens on Qwen3.5-9B where f32, q8_0 and
-         Vulkan f16 do not (predates the shared forward).
-  6. The f16 weight-only integer routes (`*_wo16`, krea2's text fusion) have no
-     checkpoint here that reaches them; only `lin-cuda-test` and `lin-vk-test` run them.
-- activation precision as a per-component dial (text encoder, denoiser, VAE):
-  f32 / f16 / bf16, default `auto`. Its prerequisites are done: one device forward per
-  family and VAE (`models/*_dev.zig`), typed device buffers, dtype-generic `dual.zig`
-  kernels and a dtype-aware `lin_cuda` / `lin_gpu`, so the dial is written once per
-  family. The machinery is in (`src/precision.zig`, `Session.actFor`/`widen`, the
-  per-step finite check, the VAE ladder, CLI and GUI); what a component honours is
-  the SD UNet (cuda and Vulkan), krea2's DiT (cuda and Vulkan; zig-cuda stays f32) and
-  the SD/Flux VAEs on every GPU arm, Z-Image, Anima and Mage-Flow on every arm (default
-  f32: an explicit f16 overflows at step 1 on every checkpoint), and SenseNova's canvas
-  on every arm (default f32; f16 runs through a scaled residual). SenseNova's overflow was the residual (~7e4 at the last
-  layer of the last step) and the down projection's output (~5e4): the stream is stored
-  divided by 16 with the RMSNorm eps scaled to match and the delta kept f32
-  (`sensenova_dev.streamDiv`), which made f16 viable. Z-Image and Anima are the same
-  shape of problem; trace WHERE they overflow (their residual, a delta or the MLP) and
-  try the same split before settling for f32. H3's trunk takes the same split (residual
-  /256, default f32). The Wan, H3 video and Mage VAEs and every text encoder (CLIP, Qwen3, SenseNova's
-  prompt pass) follow the dial on every arm; every device check takes `--act`.
-  DiT defaults are f16 only where raw f16's range
-  fits with no workaround, else f32; never ComfyUI's bf16 (on krea2 bf16 costs ~7x f16's
-  velocity error at the same speed). Vulkan: krea2's
-  fp8 forward's larger perturbation floor is the fp8 GEMM's f16 accumulators and costs the
-  forward nothing against the CPU (BACKEND.md 2A); its int8 prep reads only f32, so a 16-bit stream pays a
-  widening copy per group. The PNG field is our own (`Activation dtype`), since
-  neither A1111 nor Civitai has one. Vulkan's 3x3 convs now gather straight into
-  the coop GEMM's 16-bit operand; its LINEARS still re-cast and re-pad an operand that
-  is already 16-bit (`coopGemmPad`), and reading an aligned one directly is open. fp8 is
-  not a chain dtype; it is a later GEMM-input route like W8A8, on cards with fp8
-  tensor cores. The rules:
-  - `auto` = a per-family static rule (each component's default and allowed
-    dtypes; ComfyUI's choices: f16 SD UNet, bf16 DiTs, f32 where range forces)
-    plus a finite check on every step's output. No calibration forward, nothing
-    written next to a checkpoint.
-  - A known overflow with an exact fix (a power-of-two prescale, an f32 scores
-    plane) takes the fix, keeping the dtype.
-  - On a non-finite step: fail with an error naming the component, dtype and step;
-    the CLI logs it, the GUI toasts it (over the wire from a remote host), and the
-    render reruns at the fallback, f16 then bf16 then f32, skipping what the card
-    cannot run fast.
-  - The fallback is REMEMBERED per component for the session, so later images do
-    not retry; it clears on unload or a model switch, survives LoRA swaps, and a
-    change of that component's dial clears it. Reported once; each PNG records
-    the dtype it actually used.
-  - An explicit dtype choice gets the check and no fallback.
-  - Receipt for whether bf16 is an acceptable SD fallback: SDXL at f32 / f16 /
-    bf16, one seed; if bf16 is clearly worse than f16, SD falls back to f32
+- LLM on Vulkan, against CUDA (Qwen3-4B q4_k 112 vs 131 tok/s decode):
+  - decode is GEMV-bound (74% of GPU time) and the GEMVs match CUDA's back to back; what
+    is left is each GEMV's ramp and drain between barriers, so the lever is the step's
+    structure: silu_mul folded into the down GEMV (0.13 ms a token), more `independent`
+    groups, or a persistent decode kernel. Design it before building it. The attention
+    merge is 7 us a call.
+  - prefill attention is scalar; a coopmat flash kernel is the lever. A block-quant
+    prefill re-expands every weight to f16 per chunk (why the chunk is 2048).
+  - every dense weight is cached twice (GEMV and coop layouts): a bf16 4B holds 16 GB.
+  - the q8 decode GEMV is wired but off, and `OpSDot` alone would not turn it on
+    (MEASURED: q8 trails the f32 route on the k-quants). A q8 kernel decoding in
+    16-element units is what could change that.
+- the one-thread-per-query `Backend.attn` kernel in its remaining callers (the DiT text
+  fusion, anima, the embedders, the H3 VAE and audio encoder, CLIP), most of them
+  non-causal, which `opAttnDecode` has no mode for
+- CUDA's f16 KV path changes the greedy tokens on Qwen3.5-9B where f32, q8_0 and Vulkan
+  f16 do not
+- activation precision: Z-Image and Anima default to f32 because an explicit f16
+  overflows at step 1. Trace WHERE (residual, a delta or the MLP) and try SenseNova's
+  split (`sensenova_dev.streamDiv`) before settling for f32. fp8 as a GEMM-input route
+  (like W8A8) on cards with fp8 tensor cores is unbuilt. Receipt still owed for whether
+  bf16 is an acceptable SD fallback: SDXL at f32 / f16 / bf16, one seed; if bf16 is
+  clearly worse than f16, SD falls back to f32
 - mageflow: the Vulkan bf16 GEMM runs at 38 TFLOP/s against cuBLASLt's 52, and it
   is at its OWN ceiling, not being called badly (`anima-vk-bench` reports 36.8-40.2
   at every shape). Kernel work: tiling, double-buffering, swizzle. The same bench
@@ -173,17 +78,14 @@
   3.7x faster again on Vulkan (0.3 s against 1.1 s at 1024x1024, unexplained and
   worth a look from the other direction: what the CUDA VAE is doing that the
   Vulkan one is not), so the codec is not where to look
+- mageflow: the edit path has never run against Mage-Flow-EDIT (`mage_flow_edit_bf16` /
+  `mage_flow_edit_int8_convrot`), which is not on this box
 - mageflow: the VAE ENCODE side is still host-only (`mage_vae.encode`), which costs
   a fixed second or so per reference image on the edit path rather than per step.
   It shares the DiCo block and the 2 head blocks with decode, so the device arm is
   mostly assembled already; what it needs new is the `[3][h][w]` patch embed at
   stride 16 and the affine `LayerNorm2d` the head blocks use. Host on Vulkan too,
   for the same reason
-- mageflow: the edit path is wired and pinned, but Mage-Flow-EDIT is a SEPARATE
-  checkpoint (`mage_flow_edit_bf16` / `mage_flow_edit_int8_convrot`) that is not
-  on this box. The T2I checkpoint runs the edit path correctly and ignores the
-  instruction, which is what ComfyUI does with the same file. Nothing to write;
-  the file is the gap
 - gpu: still per backend, and candidates for `kernels/dual.zig`: CUDA's block-quant decode
   GEMVs (warp-per-row dp4a/f16; Vulkan's are the dual ones), its attention and the GEMMs.
   CUDA keeps its own attention: the dual pair cost it 17% of qwen35 prefill, and 7% once
@@ -202,18 +104,7 @@
   mma.m16n8k32), and a kernel needing an instruction an older target lacks would still
   have to be written by hand. A startup check against `cc_major` that says so, rather
   than a JIT log, is the missing piece
-- lora: only SenseNova and MiniMax H3 have a sidecar path at all, and tp-gui now drives
-  LoRAs PER IMAGE (a list change swaps the stack on the live session instead of
-  reloading), so the missing family funnels below are what gates the feature for
-  everyone else. `Family.supportsLora` is the list the UI asks first; it and
-  `Session.attachLoras` must stay in step
-- lora: krea2, Z-Image and Anima route their device GEMMs through `lin_cuda` too, so
-  each is a `lora` field on the DiT plus a `plan.lora` assignment plus a host funnel;
-  they currently REFUSE a `--lora` rather than ignoring it. The SD UNets need conv
-  factors (kohya's `[r, in, kh, kw]` plus `lora_mid`) and a text-encoder LoRA
-  (`lora_te_` / `lora_te1_` / `lora_te2_`), neither of which `lora.zig` has
 - begin filling in holes in the capabilities grid (BACKEND.md)
-- add more sampling methods
 - preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
   "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL
   (`taesd_decoder.pth`, `taesdxl_decoder.pth`) and Z-Image (`taef1_decoder.pth`) needs
@@ -299,27 +190,21 @@
   `tp-llm --reasoning-markers`): a fine-tune whose markers are in NEITHER
   `known_reasoning` nor the flag still falls back to the family guess, and tp-gui has
   no override field, so a GUI user cannot answer for such a model
-- serve: the privacy hardening the canary suite does NOT cover, in the plan but unbuilt:
-  a `Content` type whose formatters print a length (so logging a prompt is a compile
-  error rather than a review question), a `-Dprivacy-audit` build refusing `{any}` under
-  `serve/`, and a runtime taint check on emitted log lines. What exists instead: the
-  sinks are gone from the engine, the two content dumps are compiled out under
-  `-Dprivacy`, `serve/privacy_test.zig` walks for a canary with teeth, and
-  `serve_main.zig`'s module doc lists every write path, diffed against a real strace run.
-  A lost host is respawned once; a second loss is final until restart, by design. The scheduler places at enqueue and never moves a job afterwards, so a host
-  that dies with pending work fails it rather than re-placing it; `chat_contention` and
-  the cold-start step cost are assumed figures with no measurement behind them. Two
-  local hosts share one card with two arbiters that only see each other as "others
-  hold": a 31B chat model beside a diffusion pipeline prefilled at 1 tok/s, so the
-  second local host is for a second card or a small model until the scheduler weighs
-  VRAM. A non-NVIDIA host now reports its card (Vulkan heap budget for VRAM, DRM fdinfo
-  for busy time), with two caveats worth knowing: the busy figure is THIS PROCESS's, not
-  the whole card's, so another program's work on a shared GPU is invisible; and i915's
-  counter overshoots (107% measured), so it is clamped. Remote host gaps: the token sits
-  in the settings file in plaintext (a `token_file` per host, or a keychain shim, would move it). A remote
-  host has no `--idle-exit`, and one client at a time is still the rule. Model sync is
-  one direction only (client to host) and offers just the image checkpoint, not its
-  side files or LoRAs; a host never asks for a file, and nothing removes one
+- serve: the privacy hardening the canary suite does NOT cover: a `Content` type whose
+  formatters print a length (so logging a prompt is a compile error rather than a review
+  question), a `-Dprivacy-audit` build refusing `{any}` under `serve/`, and a runtime
+  taint check on emitted log lines
+- hosts: the scheduler places at enqueue and never moves a job afterwards, so a host that
+  dies with pending work fails it rather than re-placing it. `chat_contention` and the
+  cold-start step cost are assumed figures with no measurement behind them
+- hosts: two local hosts share one card with two arbiters that only see each other as
+  "others hold" (a 31B chat model beside a diffusion pipeline prefilled at 1 tok/s), so a
+  second local host is for a second card or a small model until the scheduler weighs VRAM
+- hosts: a non-NVIDIA host's busy figure is THIS PROCESS's, not the whole card's, so another
+  program's work on a shared GPU is invisible; i915's counter overshoots (107%) and is clamped
+- remote hosts: the token sits in the settings file in plaintext (a `token_file` per host,
+  or a keychain shim, would move it); no `--idle-exit`; one client at a time; nothing
+  removes a model file from a host
 - gui: a transcript does not record the system prompt it was generated under, so
   reloading replays an old conversation under current settings (e.g. with or
   without the image-tool description). Same class as the markers were
@@ -397,34 +282,30 @@
   measured: write-after-write on reused scratch is 21% of a decode's barriers
   (alternate the buffers in the model), and binding extents would clear the 10% that fall
   on another offset, once every GEMM's padded write is known to stay inside its view.
-- windows: what is left is the system C libraries, since every Zig source compiles and
-  the SDL3/dvui link succeeds. libvips and the libav set have to come from somewhere with
-  `.pc` files, which is what the release workflow's MSYS2 step is for. The native build,
-  the fast and gated suites, tp-llm, tp-serve and chat-probe run on a Windows box (RX 6800
-  XT), which exercises `filemap` and `dynlib`. Open there: the gated suite intermittently
+- windows: libvips and the libav set have to come from somewhere with `.pc` files (the
+  release workflow's MSYS2 step). The gated suite on the Windows box intermittently
   ends "test runner failed to respond for 1m" after every test passed, only seen on runs
   that recompiled; cause unconfirmed
 - macos: no Metal backend, so a Mac is CPU-only, which the README's own numbers put at
   ~290 s/step. The Vulkan arm would reach it through MoltenVK (`openVulkanLib` already
   names the dylibs) but coopmat is unlikely to be there, so the non-coop GEMM path is
   what would have to carry it
-- cuda: a context that faulted in tp-gui with both models resident (image generated,
-  then a chat turn) is now reported once, by `Context.check`, with the kernels the ring
-  still holds. The FAULT ITSELF is unattributed: the only capture is aftermath, every
+- cuda: a context faulted in tp-gui with both models resident (image generated, then a
+  chat turn). `Context.check` reports it with the kernels the ring holds, but the FAULT
+  ITSELF is unattributed: the only capture is aftermath, every
   call in the context already failing with the same sticky code. The next occurrence
   should name a kernel; `CUDA_LAUNCH_BLOCKING=1` pins it to one launch. Suspect the
   paths the handover exercises, LLM promote-at-boundary and the growable KV, not the
   copy that reports it
-- hosts: a failed render is now reported and moved to a host that has not had it
-  (`Hosts.takeFailure` / `replay`). The move itself is UNCOVERED by a unit test: the
+- hosts: moving a failed render to a host that has not had it (`Hosts.takeFailure` /
+  `replay`) is UNCOVERED by a unit test: the
   fake `Remote` these tests build is `undefined` apart from `failed`, so posting to one
   faults, and a slot has to be up to be chosen. The decision is tested directly
   (`placeExcluding` with a skip list, the `Asked` bookkeeping); what is not is that the
   replayed enqueue reaches the wire. A `Remote` that can be stood up with a link that
   answers nothing would close it, and `hosts-probe` is where it would run
-- sampler: eleven of ComfyUI's are in (`core/sampler.zig`), over four steppers plus a
-  mid-step model callback, each pinned against ComfyUI's own body on both families.
-  What is left, roughly by how often anyone picks it: `uni_pc` / `uni_pc_bh2` (its own
+- sampler: ComfyUI's samplers not yet in `core/sampler.zig`, roughly by how often anyone
+  picks one: `uni_pc` / `uni_pc_bh2` (its own
   multistep predictor-corrector, the biggest single addition left), `ddim` (needs its
   own eta and an alpha-bar walk rather than a sigma one), `lms` (Adams-Bashforth, whose
   coefficients the reference gets from `scipy.integrate.quad` over a polynomial, so the
@@ -436,7 +317,7 @@
   fixture in `tools/gen_sampler_fixtures.py`; the trap is that ComfyUI ships a SEPARATE
   `_RF` body for several of them and dispatches on `CONST`, which a port that reads
   only the eps form gets plausibly wrong on krea2 and Z-Image
-- tp-gui fonts: bold CJK runs render regular since the Bold face went (10.5 MB).
+- tp-gui fonts: bold CJK runs render regular (no Bold face embedded).
   FreeType's synthetic bold (`FT_GlyphSlot_Embolden`, em/24) is a fair stand-in at
   UI sizes, measured in-app, but it is a dvui change: `Font.Cache.getOrCreate`
   knows when bold was asked and only a regular source matched, and the two

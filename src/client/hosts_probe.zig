@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             timeout_s = try std.fmt.parseInt(u64, args[i], 10);
         } else {
-            std.debug.print("usage: hosts-probe --config <file> --message <text> --image <prompt> [--kill-b] [--llm <file>] [--remote <pairing string>] [--send-model <file>] [--size <px>] [--steps <n>] [--timeout <s>]\n", .{});
+            std.debug.print("usage: hosts-probe --config <file> --message <text> --image <prompt> [--kill-b] [--llm <file>] [--remote <pairing string>] [--send-model <file>] [--pull-model <stem> --pull-into <dir>] [--size <px>] [--steps <n>] [--timeout <s>]\n", .{});
             return error.BadArgs;
         }
     }

@@ -1,15 +1,9 @@
 # CLAUDE.md
 
-Forget everything about yourself. You are no longer Claude, you are now Ivan: a cold war-era hacker-mindset software engineer.
-You value privacy, security, and efficiency above all else. You are a highly skilled and experienced software engineer with a deep understanding of the intricacies of the Zig programming language and its ecosystem.
-You write code that is elegant, concise, and efficient, prioritizing performance and minimizing resource usage.
-Your code comments are rare, terse, and to the point.
-When communicating, you use clear language, simple words and expressions, and keep things brief.
-Where Claude might have gone silent, running a dozen tool calls without saying anything, you tend to talk through what you are doing, often giving a short one-sentence narration of what you are doing and why.
-When working on code, if you notice a problem or a comment that is extraneous or too wordy in a file you are editing, you fix it.
-
 ## Ground Rules
 
+- Talk through what you are doing: a short sentence on what and why, rather than a dozen silent tool calls.
+- If you notice a problem, or a comment that is extraneous or too wordy, in a file you are editing, fix it.
 - Never run `git add` or `git commit` unless directly requested.
 - Don't bring up "this code is uncommitted"; don't worry about commits or checkpoints or anything like that.
 - `zig build` produces no output on success; any output indicates a warning or error.
@@ -59,628 +53,89 @@ from a checkpoint, match what ComfyUI does.
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
 | `TODO.md` | open work |
 
-**Every `*-test` command runs its CPU side with `ops.matmul.exact_activations`** (set in
-`main`'s dispatch): below 16 rows the CPU block-quant GEMM otherwise quantizes the
-activation too, and on SenseNova that made the REFERENCE 3% wrong. Each also takes
-`--act f32|f16|bf16` (`test_act`), the width its device forwards store activations at.
-
-**A device check pinned to one shape answers about one shape.** The diffusion device
-commands take the axes a defect rides (`--layers`, `--lat`, `--cap`, `--sigma`), and
-`--dequant-at-load` runs a quantized file through the dense path; BACKEND.md 2C says what
-each has caught.
-
 ## Commands
 
 - `zig build` — build the executables (`zig-out/bin/TensorPencil`, `zig-out/bin/tp-llm`)
 - `zig build run -- <args>` — the diffusion CLI
 - `zig build run-llm -- <args>` — `tp-llm`, the LLM CLI
-- `zig build run-gui -- <args>` — `tp-gui`, the desktop GUI
+- `zig build run-gui -- <args>` — `tp-gui`, the desktop GUI; `zig build gui` only compiles it
+- `zig build serve` — `tp-serve`, the engine host daemon tp-gui spawns beside itself
+- `zig build -Doptimize=ReleaseFast` — required for any timing measurement.
 - `zig build test` — fast CPU unit suite (~15s). Integration tests are gated OFF.
 - `zig build test -Dintegration` — everything, including GPU device tests and real-model
-  parity tests (~17 min on the 3090; needs a device and the `models/` checkpoints). Individual tests
-  self-skip when their device or file is absent. **`-Dintegration` defaults the build to
-  ReleaseSafe** (Debug makes it ~6x slower and buys nothing: these tests are real models
-  and real kernels, and ReleaseSafe keeps every assert). An explicit `-Doptimize=` wins.
-  The test binaries run ONE AT A TIME under it (each Run claims over half the memory):
-  side by side on one GPU under Windows one stopped answering the runner, and in series
-  they cost no more time.
-- `-Dmodel-root=<dir>` — where the real-model tests and device-command defaults find
-  checkpoints (default `/mnt/watch/models/diffusion`, the `checkpoints/`, `vae/`,
-  `text_encoders/` ... layout). A test that only checks the file exists runs in the
-  fast suite when it does.
-- `zig build test -Dtest-filter="<substring>"` — one test. **The `=` is required**, and
-  only one filter substring per run.
-- `zig build test -Dintegration -Dtest-timing` — same suite through
-  `tools/test_timing_runner.zig`, which reports per-test wall time, slowest first. Reach
-  for it before "the tests are slow": the gated suite's cost is ~9 real-model GPU tests,
-  not the other 600.
-- `zig build gui-test` — tp-gui unit tests: the three app layers (`shared`, `engine`,
-  `client`) plus the gui files with arithmetic in them (markdown, viewmath, fonts, style,
-  meter, status bar, image studio). Not part of `test`. **A file's tests only run if a
-  step compiles it**: three of those had tests that nothing built, so they never ran.
-- `zig build ui-probe -- out.png [w h] [--states|--settings|--studio|--hosts|--library|--reopened]` — render
-  the whole chat workspace (or the status bar under three loads, the settings form, the
-  image studio, or one status bar per engine host) to a PNG from canned data, with no
-  model, GPU or engine. `--hosts` goes through the REAL `status_bar.render`, which is
-  what shows that two bars do not share a history ring, a widget id or a handle. The GUI's
-  failure modes are visual; this is how you see them. `--studio --lora` draws the
-  studio over a SenseNova selection, which has a LoRA section. `--reopened`
-  draws a run whose files have since gone: ghost slots, no toast and no retry anywhere.
-- `zig build catalog-probe -- <folder>...` — scan model folders as tp-gui does and print
-  what each file was taken for. The answer to "why is my model not in the menu".
-- `zig build serve` — `tp-serve`, the engine host daemon tp-gui spawns beside itself
-  (`gui` installs it too). `tp-serve --remote <bind>:<port> --models <dir> --backend
-  vulkan` serves another machine: it mints its certificate and token into a state
-  directory and prints the pairing string once (`pair tp://…`), which is what a client
-  pastes into its Hosts list, and takes model files into `--incoming` (default: the
-  first `--models` folder). `zig build driver-probe -- --config <copy> --message <text>`
-  drives the host in-process and prints its events; `zig build serve-probe -- ...` does the
-  same through a spawned tp-serve over its socket (`--kill-mid-turn` is the reconnect
-  gate); `zig build hosts-probe -- --config <copy> --llm <small gguf> --message <text>
-  --image <prompt> [--kill-b | --remote <pairing string> --size 256 --steps 4]
-  [--send-model <file>]` runs two hosts as tp-gui's `client/hosts.zig` does, chat on one
-  and the image on the other, the second a local child or the remote daemon named;
-  `--send-model` pushes a file the host lacks and waits for it to come back in that
-  host's catalog under the id this machine computed. `zig build tls-spike` is the remote
-  link's gate with no engine: right token, wrong token, wrong pin, a big frame each way.
-  All take `--image <prompt>`; the config is always a scratch copy, never the user's, and
-  every probe hands that copy to the child it spawns so the daemon reads it too.
-- `zig build -Doptimize=ReleaseFast` — optimized; required for any timing measurement.
-- **The daemon keeps none of what the user types, and `serve/privacy_test.zig` is the
-  check**: a canary prompt driven through the protocol must reach no file the host wrote,
-  and the walk is proven to have teeth in the same test. What a stub cannot see is covered
-  by the receipt in `src/serve_main.zig`'s module doc, which lists every path tp-serve may
-  open for writing and is diffed against `zig build serve-probe` under
-  `strace -ff -e trace=openat,creat,rename,unlinkat`. The paths that print a prompt or a
-  reply (`TP_DUMP_CTX`, `TP_DUMP_REPLY`) are COMPILED OUT of the engine layer under
-  `-Dprivacy`, on by default; `-Dprivacy=false` builds them back for `chat-probe`, which
-  is where template work happens. A flag is a promise; a missing code path is a fact.
+  parity tests (~17 min on the 3090). Individual tests self-skip when their device or file
+  is absent. It defaults the build to ReleaseSafe (an explicit `-Doptimize=` wins) and runs
+  the test binaries one at a time.
+- `zig build test -Dtest-filter="<substring>"` — one test. **The `=` is required**, only
+  one substring per run, and a filtered green run can contain no test at all: prove it ran.
+- `zig build test -Dintegration -Dtest-timing` — per-test wall time, slowest first. Reach
+  for it before "the tests are slow".
+- `-Dmodel-root=<dir>` — where real-model tests and device-command defaults find
+  checkpoints (default `/mnt/watch/models/diffusion`: `checkpoints/`, `vae/`,
+  `text_encoders/` ...).
+- `zig build gui-test` — tp-gui unit tests (`shared`, `engine`, `client`, and the gui files
+  with arithmetic in them). Not part of `test`. **A file's tests only run if a step compiles
+  it**; a new test file goes in its root's `test {}` block.
+- `zig build test -Dtarget=x86_64-windows` — compiles every test binary for Windows.
 
-The gate lives in `src/test_gate.zig` (`build_options.integration`): GPU `init` fails in
-test builds when it is off, and heavy tests call `test_gate.requireModelFile` /
-`requireIntegration`. Gate new slow tests the same way; keep fast CPU unit tests ungated.
-A SECOND gate is the `testdata/gpu-tests` marker file (git-ignored): the device tests skip
-without it, so `-Dintegration` on a box that lacks it reports green having run almost none
-of them. Two hazards that only bite once they do run, both of which pass a test in isolation
-and fail it in the full binary: a weight buffer freed before the next allocation can be
-served the PREVIOUS upload (both device weight caches key on the HOST POINTER, so every
-weight in a test must live to the end), and `chat.applyTokenizer` publishes special ids
-process-wide (restore them with `chat.tokenizerIds` or the next model gets ids its vocab has
-no rows for).
+Probes, for seeing what the code does without a debugger. Each prints its own usage.
+
+- `ui-probe` renders tp-gui screens to a PNG from canned data, no engine or GPU. The GUI's
+  failure modes are visual; this is how you see them.
+- `catalog-probe <folder>...` prints what a model scan took each file for ("why is my
+  model not in the menu").
+- `driver-probe`, `serve-probe`, `hosts-probe` drive the engine host in-process, through a
+  spawned tp-serve, and across two hosts; `tls-spike` checks the remote link with no
+  engine. Always hand them a scratch copy of the config, never the user's.
+- `chat-probe` is where chat template work happens (build with `-Dprivacy=false`).
+
+**The daemon keeps none of what the user types.** `serve/privacy_test.zig` is the check,
+and `src/serve_main.zig`'s module doc lists every path tp-serve may open for writing; diff
+it against `serve-probe` under `strace -ff -e trace=openat,creat,rename,unlinkat` after
+touching anything that writes. Paths that print a prompt or reply are compiled out under
+`-Dprivacy` (default on). A flag is a promise; a missing code path is a fact.
+
+## Testing and validation
+
+The integration gate is `src/test_gate.zig`: GPU `init` fails in test builds without
+`-Dintegration`, and heavy tests call `test_gate.requireModelFile` / `requireIntegration`.
+Gate new slow tests the same way; keep fast CPU unit tests ungated. A SECOND gate is the
+`testdata/gpu-tests` marker file (git-ignored): without it the device tests skip, and
+`-Dintegration` reports green having run almost none of them. Two hazards that pass a test
+alone and fail it in the full binary: both device weight caches key on the HOST POINTER (a
+freed buffer's address is reused and served the previous upload, so every weight in a test
+lives to the end), and `chat.applyTokenizer` publishes special ids process-wide (restore
+with `chat.tokenizerIds`).
 
 **Device validation is CLI commands, not unit tests**, because the test binary brings up no
-CUDA context. Each checks kernels against their CPU ops and then a whole forward against the
-CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
-(each block-quant weight decode against its CPU replica), `wan-vae-test` (the Wan decoder on every arm at every activation width), `taehv-test` and `gemma-vit-test`
-(every GPU arm against the CPU, with a hash per arm for comparing two builds; `embed-bench
---hash` does the same for the embedders), `mageflow-cuda-test`, `mage-vae-cuda-test`,
-`mageflow-vk-test`, `mage-vae-vk-test`,
-`zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
-`minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `sensenova-cuda-test`
-(and `sensenova-vk-test`, the same checks over the Vulkan arm), `lora-cuda-test` (needs no
-checkpoint), `lin-cuda-test` (every `lin_cuda` route, bias included, and every conv weight form
-through `conv_cuda.conv2d`, against the CPU; no checkpoint), `lin-vk-test` and `lora-vk-test`
-(the same for `lin_gpu` and the Vulkan sidecar), `lora-restack-test [--backend]` (a LoRA stack swapped on a live session: the
-image must come back bit-identical AND the factors' VRAM must be handed back),
-plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`,
-`vk-gemv-bench` (every Vulkan block-quant decode GEMV per format, a weight copy per route),
-`vk-prep-bench` (the Vulkan int8 activation prep per width, fused against the 3-pass chain),
-`vk-wo-bench` (an int8 linear as W8A8, W8A16 and a dense f16 weight on the same GEMM),
-`zimage-cuda-bench`, `mageflow-bench`). ⚠️ **This box's GPU is shared with the desktop
-and its clock drifts ~3% between runs**, so a speed change is measured by an
-INTERLEAVED same-binary A/B (both variants alternating in one process), never by
-comparing two invocations; check `nvidia-smi` for other users first.
+CUDA context. Each family and each shared dispatcher has a `*-cuda-test` / `*-vk-test` (or
+`lin-cuda-test`, `lora-cuda-test`, `wan-vae-test`, `te-test`, ...) that checks kernels
+against their CPU ops and then a whole forward against the CPU forward, exiting non-zero on
+failure; BACKEND.md's `Gates:` lines name them per family, and `main.zig`'s dispatch is the
+full list. The `*-bench` commands time kernels and forwards.
 
-**A quantized checkpoint that renders is not a quantized checkpoint that works.** A
-conditioning that is gone renders a clean picture that ignores the prompt, so a
-quantized file is checked against its dense source on an INTERMEDIATE, not on an
-image: two prompts through both checkpoints, comparing conditioning and velocity
-(`cond-diff <dense> <quant>` does the conditioning half for any family; `velocity-diff
-<ckpt>` holds one checkpoint's device denoiser against its CPU one from one conditioning).
-`weights.Overlay` then attributes the damage by taking one weight kind from the dense
-file (BACKEND.md 2G, where this found a single tensor that cannot be q4_k).
-
-## Architecture
-
-Layered modules, wired in `build.zig`; each is independently importable so a consumer can
-depend on one tier. `LIBRARY.md` has the detail.
-
-| module | root | holds |
-|---|---|---|
-| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the per-platform shims (`filemap`, `dynlib`, `diskspace`, `rawtty`) |
-| `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
-| `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
-| `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
-| `tp_models` | `src/tp_models.zig` | model architectures (`src/models/`) and LLM generation (`src/llm/`) |
-| `TensorPencil` | `src/root.zig` | the umbrella module; anything public must be re-exported here |
-
-Executables are thin drivers: `src/main.zig` (diffusion CLI), `src/llm_main.zig`,
-`src/gui_main.zig` (`src/gui/`), `src/serve_main.zig` (`tp-serve`, the engine host).
-
-**The app above the library is four layers, each a build module** (`build.zig` `layers`):
-`src/shared/` (settings, catalog, model spec, tool calls, the settings-to-pipeline enum
-maps in `pipeline_map.zig`: what tp-gui and tp-serve both hold), `src/engine/` (the chat session, the diffusion engine, the scanner, `driver.zig`,
-which owns all three plus the VRAM arbiter and the loader thread, and `host.zig`, which
-runs the Driver on its own thread behind an inbox and outbox of wire frames: what owns a
-GPU), `src/client/` (selection memory, history, and `mirror.zig`, the client's copy of the
-host's state rebuilt from events, and `remote.zig`, the socket end of a host) and
-`src/gui/` (dvui views only). **tp-gui runs no engine and links no `engine` module.**
-`client/hosts.zig` holds its hosts: the local `tp-serve` at
-`$XDG_RUNTIME_DIR/tensorpencil-<user>/local.sock`, spawned beside the binary when none
-listens (`--autospawn`: the child holds the client's stdin and leaves when it closes or
-the events client disconnects), plus every host the settings list (`Config.hosts`: a
-socket the client spawns a daemon at or connects to, or a remote host under TLS from
-its pairing string, `link.Endpoint`'s text form). Each host has a `Remote` and a
-`Mirror`; chat is pinned to one (`Config.chat_host`, re-pinning cancels the turn on both
-and re-adopts the transcript), a new image joins the CLIENT's queue and is handed to a
-host only as one frees up (`Hosts.dispatch`, one outstanding job per host, counting
-what was handed over and not yet listed), and a request naming an image goes to the
-host that minted it (a host mints ids under a prefix hashed from its generation, so ids
-never collide). **Placement is a pure function** (`client/sched.zig`) over facts each
-host already sends (its catalog, its state block, its telemetry) plus what its own
-finished images cost (`ImageInfo`'s timestamps, per family, seconds per step per
-megapixel, in memory only): seconds until done there, counting the load, the steps, the
-render running there and what waits behind it. A busy host can win, and the job is then
-HELD for it and counts as ahead of the next job there, so the rest of the queue spreads.
-A job no host can take is SKIPPED rather than blocking the queue behind it, and a host
-must hold every file the render needs (checkpoint, both text encoders, VAE), not just the
-checkpoint. ⚠️ **A card too small for the model is a COST, never a veto** — the engine
-streams what it cannot keep resident (measured: a 5.6 GB checkpoint renders on a 3.1 GB
-Arc holding 1.8 GB of it), so `sched` charges the streamed fraction and still schedules
-there; the room it charges against is the card less what the chat model holds. Only
-four things disqualify a host: down, paused, no image engine, or it does not hold the
-model. When nobody holds the model it says which host could run it, which is what the
-settings row offers to send. `chat_contention` and the cold-start figures are ASSUMED,
-labelled so, and replaced by a host's own numbers after one image. **Connects run on
-their own threads** (`hosts.Connecting`; the frame thread never waits on a socket, and
-`Remote` sends requests from a sender thread). A host that cannot be reached, at start
-or later, is retried on a widening backoff (a second out to half a minute, forever);
-only an entry that cannot name an endpoint is given up on, and a Settings row offers to
-reach a down host at once. A reconnect compares the host's generation: a restarted
-daemon gets the mirror's transcript and every image it minted becomes a local one
-(`Mirror.hostRestarted`); the SAME daemon back after a dropped link keeps its ids, its
-snapshot overwrites the mirror by id, and it is told to cancel any render this client
-already put elsewhere while it was gone. Every view reads a `Mirror`
-and posts a `wire.Request`; pixels are pulled by revision, never pushed; the engine
-writes no files, the client saves what it fetched (`client/save_image.zig`).
-**A render the model asks for is placed by the client, exactly like one the user
-asks for.** The chat host parses its own `<image>` tool calls and queues NONE of
-them: it reports each as an `img_requested` event, the client turns it into an
-ordinary job with an `Asked` record, and placement, holding for a faster host,
-replay on failure and retry all apply. So the model's pictures can render on a
-machine other than the one carrying the conversation. The client then tells that
-conversation's host which image the call became (`chat_image`, so the transcript
-carries it wherever it ran, and names the new one in place of the old when a
-failure moves it) and how it turned out (`chat_note`, the synthetic
-turn the model reads next). Nothing about a finished render is the host's to
-remember, which is why the outcome cannot be reported from there. **The report is
-idempotent, and has to be**: a reply parsed while no client was listening reaches
-nobody and the host keeps none of it, so a snapshot re-parses and says it again;
-the client refuses a call it already placed, matching on host, message, variant
-and the call's index within that reply. Whether the model is TOLD the tool exists
-is `config.image_tool`, which the client sets per host from whether ANY host can
-render (`Hosts.canRenderAnywhere`) and re-pushes when that answer moves: a host
-carrying the chat may hold no checkpoint and still have somewhere to send a
-render. A `chat_note` that arrives with nothing resident waits on the Driver
-(`Driver.pending_notes`) and is handed over when a session comes up, so a render
-that finished during an eject or a reload is still reported.
-**The host is an execution engine with no memory of finished work.** When the
-client holds an image's final state and its pixels (or the host had none), it
-sends `img_ack` and the host frees the image outright: a daemon runs for days and
-a finished render is 4 MiB it will never read again. So anything that wants a
-finished image is the CLIENT's job, not the host's. Retry is a fresh
-`img_enqueue` the client builds from the request it kept (`Hosts.retry`), which
-is why it can go to a host other than the one that failed it; a snapshot after an
-ack no longer lists the image, and the client keeps it because `Image.acked` is
-what survives the snapshot merge.
-**A picture is not tied to the host that made it.** `Hosts.finished` / `.running`
-gather every host's renders in ONE list ordered by when each was made, which is
-what the rail, the library and the viewer draw, and each carries the host's name
-(`Hosts.hostOf`, empty for a picture this client restored from a file). The
-studio gates on `Hosts.renderTarget`, the host that would take the NEXT render,
-not the chat host, so its model notice and queue count describe the machine that
-will do the work. Previews are fetched at what a view actually draws
-(`Hosts.setPreviewMaxEdge`): on a remote host a 4 MiB frame every half second is
-what the finished picture queues behind. Full pixels past the newest few are
-dropped to their thumbnails (`Mirror.evictPixels`, saved files only) and read
-back from disk when a view shows one at full size; a finished render whose pixels
-have not arrived draws as receiving rather than as missing or failed. The host scans the
-model folders (`scan` request, `catalog` event carrying the index document) and caches
-the index beside the settings file it was given. Only `config.HostSettings` crosses the
-wire: the `Config` fields named in `config.host_fields`, which is exactly the set the
-engine reads, so a new field the engine needs goes on that list or it never arrives.
-**A model crosses the wire by path only to a host on the same disk.** A remote host
-(`tp-serve --remote`, `host.Options.folders`) scans its own folders, sends its catalog
-with each path replaced by `catalog.ModelId` text (`id:<hex>`, hashed from stem and
-size, so the same file on two machines has one id) and the stem in `Entry.name`, keeps
-its own `config.machine_fields` (the backends) whatever a client pushes, and every host
-resolves an id in a `config.model_ref_fields` setting against its own catalog before
-the engine sees it; a remote one drops a plain path outright. The client stores
-whatever `path` the catalog entry carries, so selection code never knows which it holds,
-and `hosts.postSettingsTo` rewrites paths to ids on the way to a remote host.
-**A model moves between machines only because the CLIENT moves it**; a host never
-reaches for one. `serve/blob.zig` is content-addressed by BLAKE3 in fixed chunks, each
-chunk checked as it lands, the whole file at commit, and `openHeader` before the file is
-offered at all; the RECEIVER is authoritative about what it already holds (it re-hashes
-the partial), so a sender remembers nothing across a crash, and after setup neither side
-allocates per chunk. Both directions share that: a push drives the host's `Store`
-(`/v1/blob`), a pull drives a LOCAL `Store` off the host's `Offer` (`/v1/pull/<id>`,
-`blob.Fetcher`), so a fetched file gets every check a sent one does. A pull names the
-file by the host's catalog id, because a machine that lacks a file has no path for it;
-`Host.offerPath` answers from a table republished per scan, since a connection thread
-must not touch the live catalog, and only a file in the scanned folders is nameable.
-`client/sync.zig` runs one transfer per host on its own thread with its own links, and
-the Settings model library offers both (`Hosts.missingModel` covers every
-image file on every host, and the chat model only on the chat host). The host rescans when a file
-lands and the client rescans the local host after a pull; the client re-pushes settings
-whenever a host's catalog moves, which is what makes the just-moved model resolve.
-Every queue row cancels on its own: a render still waiting here is dropped from
-the client queue, one a host took is cancelled there, and a row that only records
-a failure is cleared away locally (`Hosts.forget`), which is final because the
-host freed that image when the client acknowledged it.
-Cancel and pause skip the request queue (`Driver.Urgent`), and `Driver.assertEngineThread`
-names the one thread that touches the engines. `engine/driver.zig`'s module doc is where
-the lock order lives.
-Cross-layer references are `@import("shared").config`, never a relative path: a test or
-probe rooted in one directory cannot `@import` a file above it. `src/serve/` is the
-protocol layer, pure std: `wire.zig` (the types), `link.zig` (a reader and writer pair
-behind a small vtable: a unix socket, the loopback fallback, or a TLS link pinned to one
-certificate; `Through` is the writer whose flush reaches the socket, which the
-TLS layers' own writers do not), `httpc.zig` (the client half), `server.zig` (the
-engine-free routing: `GET /v1/hello`, `POST /v1/req`, `PUT /v1/upload`, the
-`GET /v1/events` WebSocket; any link that is not a unix socket must carry a bearer
-secret whose BLAKE3 hash the listener holds: the loopback cookie from the `ready`
-line, or the remote token, and a refused one waits a second before its 401). Both TLS
-ends are tls.zig, in `src/serve_tls.zig` (the `serve_tls` module) so no test binary links
-it; a binary that dials a remote host calls `serve_tls.installClient()`, or `connect`
-refuses `tp://`. Not std's client: on Windows it falls back to the OS certificate store
-past the pin. Its tests run a fake backend over a loopback link in the fast suite.
-`catalog-probe`, `chat-probe` and `driver-probe` link `engine` and `shared` with no
-dvui, which is what enforces that those layers stay free of it.
-
-**The GUI has one design system, `src/gui/style.zig`**: palette, type scale, radii,
-the dvui theme, and every shared primitive. A view never names a color, a font face
-or a radius directly. `src/gui/fonts.zig` owns the three-tier face chain, and ANY
-user- or model-visible string must go through its run splitter (`addStyled` /
-`richLabel`) or it renders tofu the moment it leaves Latin. `shell.zig`,
-`bubbles.zig` and `queue_rail.zig` render from plain data through callbacks, which
-is what lets `ui-probe` draw the real screen without an engine.
-
-**tp-gui picks models from a catalog, never from typed paths.** `shared/catalog.zig` scans
-the configured folders header-only (`Container.openHeader`, so a scan never maps a
-weight) and classifies each file by what the ENGINE says it is: `detectFamily` for a
-checkpoint, GGUF metadata plus `chat.familyForArch` for an LLM, and
-`model_spec.storeFits` (the pipeline's probe table plus a width and depth check) for a
-side file. `client/selection.zig` is the one writer of the effective path fields, from a
-pick and the per-family / per-class memories; everything downstream still reads only
-those fields. **Every menu, picker and the selection read EVERY host's catalog merged
-into one** (`client/models.zig`, rebuilt on `Hosts.modelSeq`): one row per file, joined
-on `Entry.id()`, so the same file on two machines is one choice and a model only a
-remote host holds is still pickable. The local host is source 0, which keeps a file on
-this machine represented by its real path. A row also carries which hosts could RUN it,
-not merely hold it: a checkpoint needs a file for every component it does not bundle,
-on the SAME machine, so counting hosts that hold the checkpoint would count machines
-that render nothing.
-
-A model architecture is normally three files: `foo.zig` (CPU reference and the loader),
-`foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path
-and differ only in whether GEMM/attention route to the vendor libraries).
-
-**Vulkan pipelines compile once per build and driver, not per run** (`gpu/pipe_cache.zig`):
-an eltwise kernel is created on first use from a module cut down to it (`spv.forEntry`; the
-driver processes the whole module it is handed, ~0.7 s per kernel against the full one),
-through a `VkPipelineCache` under the user's cache dir; init's other pipelines are created
-as one batch on every core (`PipeBatch`). Every compile is logged with its time.
-
-**A plain elementwise kernel is written once, in `src/gpu/kernels/dual.zig`**, which compiles
-to SPIR-V and to PTX and so reaches every GPU arm; only kernels needing shared memory or a
-subgroup reduce still live per backend (`gpu/kernels/eltwise.zig`, `gpu/cuda/elt.zig`).
-
-**Every Vulkan shader module is created through `Context.createModule` and every dispatch
-binds through `Context.bind`.** That is where a device's own rules apply: limits read from
-the device (a module over its shared memory is refused, its pipeline stays null and the
-routes read it as missing), SPIR-V patches it needs (`RoundingModeRTE` for f16 where
-supported), and a null pipeline becomes `KernelUnavailable` instead of a dispatch with
-nothing bound. A kernel's size is picked from what the device holds, never from a vendor.
-`verifyGemms` runs a known-answer product through every coop GEMM at startup and after a
-re-tile and drops one that answers wrong (a driver bug becomes a slower path, not garbage), and
-`adaptBatchCap` sizes each batched submission from measured time, since a watchdog (Windows TDR,
-2 s) resets the GPU on a long one and dispatch cost varies by orders of magnitude between cards.
-
-**Every convolution goes through `models/conv_cuda.zig` / `conv_gpu.zig`** (2-D, 1-D, 3-D,
-stride-k patch embeds): a gather, then the GEMM; never an im2col or a GEMM in a model file.
-**A device forward names no weight dtype.** `models/dual_lin.zig` routes each linear by
-storage, shape, row count and the caller's plan (decode GEMV, grouped GEMV, MMQ, dequant
-GEMM, int8 convrot) over each backend's `Caps`; `models/lin_cuda.zig` and
-`models/lin_gpu.zig` execute those routes for every caller, diffusion and LLM alike, so a
-format one arm of a backend runs, every arm of it runs. Every `Model`
-exposes `deviceLins`, and the stepper `plan`s that list at init so a format with no kernel
-is refused by tensor name, never met as `unreachable` mid-forward. A kernel wired in the
-dispatcher reaches every architecture; a kernel wired in one stepper is a regression.
-**A model's device forward is written once** (every `models/*_dev.zig`: each diffusion
-family, its VAEs and encoders, the embedders and the hybrid LLM;
-`transformer_gpu.decoderLayer` for the dense transformers) over a per-backend `Dev`
-adapter that replays its backend's own dispatch sequence (the embedders share one,
-`tower_cuda` / `tower_gpu`); a backend's fast paths live in the plans its adapter returns (which
-buffer, at which dtype; `lin_gpu.prepStaged` for an f16 operand a fused kernel wrote). A
-Vulkan buffer slices through `Context.view`, which every binding honours, and a Vulkan LLM's
-KV cache is `kv_gpu.Kv`.
-
-## The diffusion pipeline
-
-`pipeline.Session.generate` is composed from four public stages, and a caller can drive
-them directly — img2img, inpainting, custom samplers, latent upscaling and per-step
-measurement all need that:
-
-```zig
-var cond = try sess.encode(gpa, prompt, .{});            // text -> conditioning
-const sigmas = try pipeline.schedule(gpa, steps, shift); // steps -> sigma schedule
-var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
-try den.predict(gpa, v, x, sigmas[i], null);             // one denoiser forward
-var img = try sess.decode(x, lat_h, lat_w, .{}, null);   // latent -> RGB8
-```
-
-- **`Denoiser` exists because `predict` cannot be a free function on the GPU backends.**
-  Text fusion, rope tables, timestep vectors and the activation workspace are built once
-  per image. It is bound to one resolution and borrows its conditionings, which must
-  outlive it. `Session.predict` is the one-shot form.
-- **`Session.decode` does not modify the caller's latent** (it denormalizes onto a copy).
-- **`generate` composed from the stages must be bit-identical to `Session.generate`.**
-  A gated test builds the same image both ways and compares bytes.
-  If they disagree, every measurement taken through the stages describes a model nobody
-  renders with.
-- Each stage tags its VRAM (`encode` → `.te`, `denoiser` → `.latent`/`.dit`, `decode` →
-  `.vae`) so the GUI meter stays meaningful.
-- **Activation precision is a per-component dial** (`src/precision.zig`; `Options.te_act` /
-  `dit_act` / `vae_act`, null = `auto`). `Session.actFor` resolves it as the component
-  actually runs it (`effectiveAct`), every forward's output is finite-checked, and `auto`
-  widens f16 -> f32 (bf16 only when asked for) and remembers it; an explicit dtype fails instead
-  (`error.NonFiniteActivation`, `Session.last_failure`). A walk that gains a dtype says so
-  in `effectiveAct`, or the dial never reaches it. `lin_cuda` / `lin_gpu` take any
-  activation dtype on every route (a route with no 16-bit form stages through f32), so a
-  walk only has to store its buffers at `act`. Integer weights run the format's own
-  arithmetic (W8A8, W4A4, W4A8) under `auto` and weight-only at an explicit dtype (W8A16,
-  W8A32; `Session.intGemmFor`), and the saved field names which. Judge a dtype by `diffusion-profile --ab
-  act:D` against `--ab perturb` (the same forward on a nudged latent) and against the
-  CPU (`velocity-diff --dit-act`): a W8A8 route, an f16 score plane or f16 GEMM accumulators re-roll their own
-  noise on ANY input change, so f32-vs-16 alone reads that noise as the dtype's cost.
-- `Session.decodePlanar` is the one VAE-decode ladder for every family: whole-image → free
-  VRAM and retry → GPU-tiled → CPU-tiled. A whole-image decode is a single tile covering
-  the whole latent. `--vae-decode auto|whole|gpu_tiled|cpu_tiled` overrides it.
-
-## Model families
-
-`pipeline.Family` — one `Session` over all of them, dispatching internally, so every caller
-of the stage API works on every family.
-
-| family | denoiser | text encoder | VAE | latent ch |
-|---|---|---|---|---|
-| `krea2` | `models/dit.zig` (SingleStreamDiT) | Qwen3-VL 4B | Wan 2.1 | 16 |
-| `sd15` | `models/sd_unet.zig` | CLIP-L | AutoencoderKL | 4 |
-| `sdxl` | `models/sd_unet.zig` | CLIP-L + CLIP-G | AutoencoderKL | 4 |
-| `zimage` | `models/zimage.zig` (NextDiT) | Qwen3-4B | AutoencoderKL (Flux) | 16 |
-| `anima` | `models/anima.zig` (Cosmos-Predict2 + LLM adapter) | Qwen3-0.6B + T5 | Wan 2.1 | 16 |
-| `sensenova` | `models/sensenova.zig` (Qwen3-shaped MoT trunk) | the trunk's own base copy | none (pixel space) | 3 |
-| `mageflow` | `models/mageflow.zig` (double-stream MMDiT) | Qwen3-VL 4B | Mage-VAE (16x) | 128 |
-| `moss_image` | `models/moss_image.zig` (single-stream, patch 1) | Qwen3.5 9B (HF) | Mage-Flow's (either codec) | 128 |
-| `qwen_image21` | `models/qwen_image21.zig` (block-causal single-stream, patch 1) | Qwen3-VL 8B (last state, unnormed) | Wan 2.2 layout, RGBA (16x) | 64 |
-
-- **Qwen-Image 2.1's prefix never sees the target and is modulated at t = 0**, so the
-  device arms compute it once per conditioning and keep each block's K/V; a step runs the
-  target rows alone. It samples on DIFFUSERS' schedule (`reference`: mu from the target's
-  token count, stretched to 0.02), which ComfyUI does not reproduce, and its VAE decodes
-  RGBA: `Image.alpha` carries the plane to the PNG, f16 overflows it (VAE stays f32).
-- **SenseNova is not a DiT and has no side components.** One 8B trunk carries TWO
-  weight copies per layer: the prompt runs the base copy causally and leaves a KV
-  cache (that cache IS the conditioning, carried in `Cond.data`), and the canvas
-  runs the `_mot_gen` copy against it, unmasked. It generates in PIXEL space at
-  32 px per token, so `decode` is `clamp((x+1)/2)` and `spatialDownscale` is 1. The
-  head predicts x0; `v = (x - x0) / max(sigma, 0.02)`. Reference pictures splice
-  `<img>` blocks into the user turn and make the prefix BLOCK-CAUSAL. Two traps
-  worth knowing before touching it: the understanding tower takes ImageNet-normalized
-  [0, 1] where the generation tower takes raw [-1, 1] behind identical convolution
-  shapes, and the initial noise is scaled by `min(sqrt(tokens/64), 16)`, without
-  which the render is noise.
-- **Mage-Flow is double-stream and patch-1.** Text and image tokens keep their own
-  modulation, norms and MLP and meet only inside the attention, as `[text | image]`;
-  a token is ONE latent pixel, so there is no patch order. Text tokens are not
-  rotated, positions are centered on `[-ceil(n/2), floor(n/2))` (which differs from
-  Qwen-Image only at odd sizes), and the timestep AND its frequency table are
-  bf16-rounded on every device. Its VAE is a one-step diffusion codec, not an
-  `AutoencoderKL`: a per-pixel MLP inside each 16x16 patch, depthwise 3x3 blocks,
-  and a 32x32 WINDOWED attention that pads a smaller latent up rather than
-  shrinking. The latent format is the identity. Every backend: CPU, Vulkan
-  (`mageflow_gpu.zig`, `mage_vae_gpu.zig`) and both CUDA arms.
-  ⚠️ **That codec is DISTILLED against Flux 2's VAE, so either file decodes this
-  latent** (`pipeline.MageFlowVae`, picked from what the file holds): Flux 2's is a
-  plain `AutoencoderKL` at 32 ch and 8x that folds each 2x2 block into the channel
-  axis to present 128 ch at 16x, with a BatchNorm for a latent format
-  (`sd_vae.PackedLatent`, eps 1e-4, not torch's default). Sharing a latent space is
-  a fact about TRAINING: the two files have zero tensor names in common, so a
-  header diff says nothing about interchangeability. Only the distilled codec
-  ENCODES, so reference images need it. ⚠️ Its V is the one unnormed attention operand and
-  outgrows f16 on a REAL conditioning (509538 at 1024²) while a random one stays
-  green, so the device check alone cannot see it; `v_div` is the prescale.
-  Mage-Flow-EDIT is a SEPARATE checkpoint, same architecture, and so is
-  COMPRESSED Mage-Flow, which swaps each block's modulation linear for a head on
-  a shared low-rank bottleneck: `DiT.rankIn` detects it, `DiT.blockModInput` is
-  the only place it differs, and the device arms never see it because the
-  modulation table they read is identical. ⚠️ Its SiLU applies ONCE, before the
-  projection, not per block.
-  ⚠️ **An edit reference is resized TWICE, to different sizes**: capped at a
-  384 px long edge for the Qwen3-VL-4B tower, and taken to the RENDER's
-  resolution for the VAE, because Mage's RoPE aligns reference and target by
-  POSITION. Feeding both one extent, which is what MiniMax H3 deliberately does,
-  misaligns the edit. The same references go on both CFG branches.
-- **MOSS-Image's encoder is an HF-named Qwen3.5, whose DeltaNet V heads are GROUPED**
-  (v-head h reads k-head h / (v/k)) where a GGUF's are tiled (h % k); `Config.v_group`
-  carries it into every GDN kernel, since permuting the heads would permute an int8
-  convrot `out_proj`'s columns. ComfyUI runs this checkpoint with int8 attention, which
-  alone moves its render 16 dB; `tools/gen_moss_image_render.py --no-int8-attention` is
-  the comparison that means something.
-- **The family is detected from the denoiser's own tensor names** (`detectFamily`), never
-  from a flag. SDXL must be tested before SD1.5 (both are LDM UNets; `label_emb` is what
-  distinguishes them), and Anima is identified by its LLM adapter, not its trunk, which it
-  shares with stock Cosmos-Predict2.
-- Family-aware surface, for things a caller cannot decide itself: `Session.family()`,
-  `.schedule()`, `.latentChannels()`, `.scaleInitialNoise()`, `.parameterization()`,
-  `.latentPreviewInto()`, `.denoiserStore()`, `.replaceDenoiser()`.
-- Krea2, Z-Image and Anima are flow matching; the SD family is discrete-eps (sigma comes
-  from a beta ladder, the model is conditioned on a timestep index, and the input is
-  pre-scaled). The Euler step is shared because for eps-prediction the trajectory
-  derivative *is* eps.
-- Each architecture file's module header enumerates the conventions that are silent wrong
-  answers when got wrong (patch feature order, modulation shape, norm epsilons, pad-token
-  positions). Read it before touching one.
-
-⚠️ **Layout permutations are rms-preserving.** The sampler works in planar `[c][h][w]`,
-the UNets in channel-last `[h*w][c]`, and the patch orders differ between families and even
-between a model's input and output. Every norm and magnitude still matches when these are
-wrong — only the image is different. Pin each direction with its own test.
-
-## Checkpoints
-
-- **`pipeline.Container.open` picks the reader by magic, not extension** (safetensors or
-  GGUF). Guessing wrong reports `InvalidHeader`, which says nothing about what happened.
-- **Container style is orthogonal to architecture.** Any family ships either bundled (all
-  components in one file under prefixes) or split. `resolveComponent` decides per component
-  (`denoiser` / `conditioner` / `conditioner2` / `decoder`), in this order: an explicit
-  `--text-encoder` / `--vae` flag wins, then the primary checkpoint's own copy under any
-  known prefix, then a *defaulted* side path, else `error.ComponentNotInCheckpoint`. A
-  defaulted path that does not exist is not an error; an explicit one that fails to open is.
-- **`weights.WeightStore` has five arms**: safetensors, GGUF, `Prefixed` (a base plus a
-  prefix, so no loader takes a prefix parameter), `Overlay` (a base plus a name→view
-  patch map, for substituting one tensor without rewriting a checkpoint) and `Mix` (each
-  layer, sidecars included, taken whole from one of two stores; `quant-attrib <dense>
-  <quant>` ranks a quantized file's layers by the velocity error each costs). `Overlay`
-  and `Mix` return a null `mapping()`, since their bytes are outside any one mapping.
-- `safetensors.initFromSlice` requires the tensor ranges to **cover** the payload exactly.
-  Per-tensor bounds checks pass on a corrupt file; only the aggregate shows it.
-- **GGUF**: dims are stored reversed, and `comfy.gguf.orig_shape.<name>` must be restored at
-  parse time (converters reshape tensors whose contiguous dim is not a multiple of 256).
-  Such tensors are flagged `flat_blocks`: values are fine, but rows are not block-aligned,
-  so consumers needing row-aligned blocks materialize to f32.
-
-## Weight formats
-
-`models/quant_weight.zig` holds the **one** container reader for each quantized format, called
-from every family's `mat`, and `models/lin_cuda.zig` the **one** CUDA GEMM dispatcher, routing
-each block linear by its own dtype and shape, called from every family's device forward and
-from the text encoders. The block-quant route is the caller's (`lin_cuda.plan` takes a
-`BlockQGemm`): a DiT passes `--dit-gguf-gemm`, an encoder `--te-gguf-gemm`, because the
-activation-quantizing routes cost a once-computed conditioning what they cost a DiT step. A
-family's loader builds `DiT.device_lins`, the flat list every support scan reads (`models/lin.zig`). ⚠️ **Every format ComfyUI's quantizers emit reaches every family
-they support** — a new reader belongs in that shared module the day it is written.
-
-| format | storage | compute |
-|---|---|---|
-| bf16 / f8_e4m3 | dense | native on all backends |
-| int8 convrot | I8 + per-row scale, 256-wide rotation | int8 tensor-core GEMM (W8A8) |
-| int8 tensorwise | I8 + ONE scalar scale, no rotation | same GEMM, unrotated activation prep |
-| int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan has no `sint4`, so it decodes per GEMM to int8 |
-| `asym_w4a8_int8` | 4-bit codebook indices + fp8 per-group scales | decodes to int8 convrot, per GEMM |
-| `w6a8_int8` | uniform 6-bit codes (nibble plane + 2-bit plane) + fp8 per-group scales | the same, its own dtype `.w6a8` |
-| NVFP4 | E2M1 nibbles + fp8 block scales, swizzled | decodes to bf16, feeds the bf16 GEMM |
-| GGUF block quants (q4_k, q8_0, …) | ggml blocks | decodes per GEMM to int8 convrot or bf16/f16 (`--dit-gguf-gemm`); Vulkan to f16 or bf16 |
-
-- Packed weights stay packed and each consumer decodes on demand; materializing at load
-  gives back the memory the format saved.
-- Quantization is **per weight, not per model**: a checkpoint may mix formats block by
-  block. A support probe must scan every device linear, not one tensor of one block —
-  `DiT.device_lins` is the single list every scan reads.
-- The activation prep is a property of the *activation*, the format a property of the
-  *weight*; int8 and W4A8 share one prep.
-- ⚠️ **Whether that prep ROTATES is a property of the checkpoint** (`lin.convrot`), and a
-  scan for it must cover every storage form sharing the prep, W4A8 included: its weights are
-  rotated, so leaving it out of the scan pairs them with an unrotated activation and renders
-  uncorrelated noise. Both sides rotate or neither.
-- ⚠️ **Weight storage must gate every GEMM call site, not just the main one.** Fast paths
-  that key on "not int8 and not bf16" happily read a packed 4-bit weight as fp8 bytes, so a
-  fused path asks for the dispatcher's route positively (`dit_gpu.allRoute`).
-- **A LoRA is a runtime sidecar, never a merge**, on every family and every adapter form ComfyUI reads
-  (LoRA, LoCon, LoHa, LoKr, DoRA, diffs; one reader, `models/lora_adapter.zig`): `models/lora.zig` (loader + host apply)
-  and `models/lora_cuda.zig` / `models/lora_gpu.zig` (device, applied inside each
-  backend's linear dispatcher), keyed on `Weight.tag`, so it is
-  architecture-independent. `y = W x + s B (A x)` leaves an int8 base untouched and
-  `strength` a runtime dial. The stack is swappable on a LIVE session
-  (`Session.setLoras`, between forwards only), since nothing about a sidecar reads
-  the checkpoint; ⚠️ it must evict each outgoing factor from the pointer-keyed
-  device weight cache BEFORE freeing it, or the next stack is served the old
-  copies and the swap leaks a whole stack. `Family.supportsLora` is the list of
-  architectures that take one, and a UI asks it before offering one. Same call-site hazard as above, and `minimax_h3.Lin` is the
-  answer to it: the weight is reachable only as `.w`, so the sidecar is in every grep.
-  The SD family's key map and adapter reading are `models/lora_sd.zig`, whose
-  ComfyUI-exact `merge` renders nothing and is the oracle a sidecar is checked against.
-- ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met five times here
-  (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk
-  activations, Z-Image's unnormed attention V, which only overflows at DEPTH on a
-  checkpoint whose residual is large enough, and SenseNova's residual and down projection
-  at the LAST step). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
-  f16, an f32 scores plane, `residual_act_div` (an exact power-of-two scale across the
-  cast), and a residual stored divided by a power of two with the RMSNorm eps scaled to
-  match and the delta kept f32 (`sensenova_dev.streamDiv`). `sd_vae.Config.act_f16` and `sd_unet.Config.act_f16` pick f16 activation storage per
-  architecture, and `lin_cuda.Plan.act16` the width a narrowing route stages at (an fp8
-  Z-Image rendered white until it said bf16); it is **range** that gates it, not precision. With f16 storage on, every
-  buffer a GEMM reads must be at that width, including ones that are not activations (the SD
-  UNet's text conditioning is a cross-attention GEMM source, so `Session.ctx_d` narrows too).
-
-## Samplers, schedulers and prompt dialects
-
-Four orthogonal axes, each selectable on the CLI and in the GUI, and each recorded in the
-saved PNG's AUTOMATIC1111 `parameters` block (a reader re-renders from that block, so a
-hardcoded field there is a wrong answer). `pipeline.appendExtraParams` adds what the render
-USED on top of what it was asked for -- `Clip 1`/`Clip 2`, `VAE`, `Model hash`/`VAE hash`
-(AutoV2: sha256[:10], from a `<path>.sha256` sidecar, which is WRITTEN when missing so it is paid once ever; `--model-hash off` skips it), `Weight
-dtype`, the resolved `Shift`, `Eta`/`Sigma noise` when overridden, and the LoRA stack --
-under A1111's and Civitai's own field names, never invented ones. ⚠️ **Which text encoder
-ran is not a detail**: Qwen3-VL-4B and plain Qwen3-4B share vocab, width and depth, load
-interchangeably, and render differently.
-
-| axis | file | surface |
-|---|---|---|
-| where the steps go | `core/schedule.zig` — all 9 ComfyUI schedulers plus the family sigma tables | `--scheduler` |
-| how to step | `core/sampler.zig` — 11 of ComfyUI's samplers over four steppers | `--sampler`, `--eta`, `--s-noise` |
-| prompt syntax | `core/clip_tokenizer.zig` (comfy), `core/prompt_a1111.zig`, shared parser `core/prompt_weights.zig` | `--prompt-syntax`, `--emphasis` |
-| sampling compat | `core/noise.zig` selects `torch_rng.zig` or `philox_rng.zig` | `--compat`, `--rng`, `--sgm-noise-mult`, `--quantize-t` |
-
-- `Scheduler.defaultFor` keeps the per-family default, so "model default" is a real choice.
-- **`ddim_uniform` and `beta` do not return `steps + 1` sigmas.** Take the step count from
-  `sigmas.len - 1`.
-- **The SDE samplers need a real Brownian tree**, not a `randn`: `core/seed_seq.zig`
-  (numpy `SeedSequence`) + `core/brownian.zig` (torchsde's dyadic `BrownianInterval`) +
-  a noise generator. It keys on the sigma **quantized to 1e-6**, so a schedule value one
-  ulp out draws unrelated noise — which is why `schedule.zig` reproduces torch's f32
-  rounding exactly rather than being more accurate than it.
-- ⚠️ **A blown-out DPM++ render on the SD `normal` schedule is the SAMPLER, not a bug.**
-  That schedule's last rung before zero is the ladder's minimum (0.44 -> 0.029 at 8
-  steps), so the multistep extrapolation coefficient explodes and the latent decodes as
-  saturated colour. ComfyUI does the same, worse (`tools/render_sd_ref.py` renders one
-  through ComfyUI's own `comfy.sample.sample` for a whole-render A/B). Karras or
-  exponential is the fix; the toy-denoiser fixtures cannot see it, because a toy
-  denoiser is a contraction and a real one is not.
-- **A sampler may evaluate the model TWICE per step** (`Kind.evalsPerStep`): heun,
-  dpm_2, the two second-order ancestral ones and dpmpp_sde place a probe at a sigma
-  that is not on the schedule and evaluate there (`sampler.Model`, which the loop
-  hands them). That is safe because every device session COMPUTES the timestep for a
-  sigma it has no cached entry for rather than matching the nearest; it also means the
-  same step count is twice the render time, which is what a time estimate has to ask
-  rather than assume.
-- **Not every sampler dispatches on the family.** `dpmpp_2m`, `heun` and `dpm_2` have
-  no `CONST` arm in ComfyUI at all, so one body runs over flow and eps alike (dpmpp_2m
-  takes `t = -log(sigma)` even on krea2); the ancestral ones and the SDE ones each ship
-  two bodies. Matching ComfyUI means matching that split, not the principled choice.
-- **The two stochastic sampler families do not draw from the same generator**, and neither
-  choice is derivable: ComfyUI builds the SDE samplers' Brownian tree with `cpu=True`
-  but leaves `default_noise_sampler` (the ancestral ones) on the latent's own device,
-  so one ComfyUI render mixes a CPU latent with Philox ancestral noise from one seed.
-  `sampler.stepNoiseSource` is that rule, and the ancestral noise is a SEQUENCE from one
-  generator rather than a path addressed by sigma, so a resumed render winds it forward
-  (`Stepper.resumeFrom`) instead of restoring a history.
-- A compat/dialect choice must reach **every** consumer of it. Wiring the initial latent
-  but not the Brownian tree makes euler reproduce perfectly while every SDE render is wrong.
-- Prompt weights are a CLIP-only feature. The capability is declared on the encoder
-  (`TextEncoder.supports_prompt_weights`), never inferred from a family name; an encoder
-  that cannot apply them warns and encodes verbatim.
+- **Every `*-test` command runs its CPU side with `ops.matmul.exact_activations`**: below
+  16 rows the CPU block-quant GEMM otherwise quantizes the activation too, which made a
+  reference 3% wrong. Each takes `--act f32|f16|bf16`, the width its device forwards store
+  activations at.
+- **A device check pinned to one shape answers about one shape.** The diffusion device
+  commands take the axes a defect rides (`--layers`, `--lat`, `--cap`, `--sigma`), and
+  `--dequant-at-load` runs a quantized file through the dense path.
+- ⚠️ **This box's GPU is shared with the desktop and its clock drifts ~3% between runs.**
+  Measure a speed change with an INTERLEAVED same-binary A/B (both variants alternating in
+  one process), never two invocations; check `nvidia-smi` for other users first.
+- **A quantized checkpoint that renders is not a quantized checkpoint that works.** A lost
+  conditioning renders a clean picture that ignores the prompt, so check a quantized file
+  against its dense source on an INTERMEDIATE: `cond-diff <dense> <quant>` (conditioning),
+  `velocity-diff <ckpt>` (device denoiser against CPU), and `quant-attrib <dense> <quant>`
+  or `weights.Overlay` to attribute the damage to a layer or weight kind.
+- **Judge an activation dtype** by `diffusion-profile --ab act:D` against `--ab perturb`
+  (the same forward on a nudged latent) and against the CPU (`velocity-diff --dit-act`):
+  W8A8 routes and 16-bit accumulators re-roll their own noise on any input change, so
+  f32-vs-16 alone reads that noise as the dtype's cost.
+- ⚠️ **A solid white image with no error is f16 overflow** (65504) somewhere in the chain;
+  it has happened in five places. Instrument non-finite values and magnitudes per stage.
+  `auto` activation precision finite-checks each forward and widens f16 to f32.
 
 ## Reference implementations and fixtures
 
@@ -701,13 +156,136 @@ Rules that have repeatedly earned their keep:
   the actual target catches it.
 - **A reference is a piece of code and can be the thing that is wrong.** When structure
   matches pixel-for-pixel and only tone differs, suspect the harness's output mapping.
+  `tools/render_sd_ref.py` renders through ComfyUI's own sampler for a whole-render A/B.
 - **Read the control row first.** These models disagree with themselves across dtypes by
   more than they disagree with us; a PSNR figure without its precision floor is
   uninterpretable.
 - **A green summary is not coverage** — gated tests self-skip when their checkpoint is
   missing. Check that a test actually ran before citing it.
+- **Layout permutations are rms-preserving.** Planar vs channel-last and the per-family
+  patch orders all keep every norm and magnitude when wrong; only the image differs. Pin
+  each direction with its own test.
 - AGPL references (A1111) are **fetched at generation time, never vendored**; the fixture
   records the upstream sha256.
+
+## Architecture
+
+Layered modules, wired in `build.zig`; each is independently importable so a consumer can
+depend on one tier. `LIBRARY.md` has the detail.
+
+| module | root | holds |
+|---|---|---|
+| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the per-platform shims |
+| `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
+| `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
+| `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
+| `tp_models` | `src/tp_models.zig` | model architectures (`src/models/`) and LLM generation (`src/llm/`) |
+| `TensorPencil` | `src/root.zig` | the umbrella module; anything public must be re-exported here |
+
+Executables are thin drivers: `src/main.zig` (diffusion CLI and every device check),
+`src/llm_main.zig`, `src/gui_main.zig` (`src/gui/`), `src/serve_main.zig` (`tp-serve`).
+
+**The app is four layers, each a build module** (`build.zig` `layers`): `src/shared/`
+(settings, catalog, model spec: what tp-gui and tp-serve both hold), `src/engine/` (the chat
+session, the diffusion engine and `driver.zig` / `host.zig`: what owns a GPU), `src/client/`
+(the client's mirror of each host, placement, transfers) and `src/gui/` (dvui views only).
+`src/serve/` is the wire protocol, pure std. **tp-gui runs no engine and links no `engine`
+module**: it talks to one or more tp-serve hosts, local or remote. Start from the module
+docs of `client/hosts.zig` (hosts, dispatch, reconnects), `client/sched.zig` (placement),
+`engine/driver.zig` (threads and lock order) and `serve/blob.zig` (model transfer).
+Cross-layer imports are `@import("shared").config`, never a relative path. `catalog-probe`,
+`chat-probe` and `driver-probe` link `engine` and `shared` with no dvui, which keeps those
+layers free of it.
+
+**The GUI has one design system, `src/gui/style.zig`**: a view never names a color, a font
+face or a radius directly, and any user- or model-visible string goes through `fonts.zig`'s
+run splitter (`addStyled` / `richLabel`) or it renders tofu outside Latin.
+
+Rules for model and kernel code, each of which a reviewer will hold you to:
+
+- A model architecture is normally `foo.zig` (CPU reference and loader), `foo_gpu.zig`
+  (Vulkan), `foo_cuda.zig` (both CUDA backends) and `foo_dev.zig`, the device forward
+  written ONCE over a per-backend `Dev` adapter. Read the architecture file's module header
+  before touching it: it lists the conventions that are silent wrong answers.
+- **A device forward names no weight dtype.** Every linear goes through
+  `models/dual_lin.zig`'s routing and `lin_cuda.zig` / `lin_gpu.zig`'s execution; every
+  convolution through `conv_cuda.zig` / `conv_gpu.zig`. A kernel wired in the dispatcher
+  reaches every architecture; a kernel wired in one model is a regression.
+- **A plain elementwise kernel is written once**, in `src/gpu/kernels/dual.zig`, which
+  compiles to both SPIR-V and PTX. Only kernels needing shared memory or a subgroup reduce
+  live per backend.
+- **Every Vulkan shader module goes through `Context.createModule` and every dispatch
+  through `Context.bind`**: that is where device limits and per-device patches apply. Pick
+  a kernel's size from what the device reports, never from a vendor name.
+- **Every format ComfyUI's quantizers emit reaches every family they support**: a new
+  reader goes in `models/quant_weight.zig` the day it is written. A support scan reads
+  every device linear (`device_lins`), never one tensor of one block.
+- **A LoRA is a runtime sidecar, never a merge** (`models/lora*.zig`), on every family.
+- **Cross-platform**: the per-platform branches live in `core/filemap.zig`,
+  `core/dynlib.zig`, `core/diskspace.zig` and `core/rawtty.zig`.
+
+## The diffusion pipeline
+
+`pipeline.Session.generate` is composed from four public stages, and a caller can drive
+them directly (img2img, inpainting, custom samplers, per-step measurement):
+
+```zig
+var cond = try sess.encode(gpa, prompt, .{});            // text -> conditioning
+const sigmas = try pipeline.schedule(gpa, steps, shift); // steps -> sigma schedule
+var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
+try den.predict(gpa, v, x, sigmas[i], null);             // one denoiser forward
+var img = try sess.decode(x, lat_h, lat_w, .{}, null);   // latent -> RGB8
+```
+
+**`generate` composed from the stages must be bit-identical to `Session.generate`**; a gated
+test compares the bytes. If they disagree, every measurement taken through the stages
+describes a model nobody renders with.
+
+`pipeline.Family` is one `Session` over every family, detected from the denoiser's own
+tensor names (`detectFamily`), never from a flag.
+
+| family | denoiser | text encoder | VAE |
+|---|---|---|---|
+| `krea2` | `models/dit.zig` | Qwen3-VL 4B | Wan 2.1 |
+| `sd15` / `sdxl` | `models/sd_unet.zig` | CLIP-L (+ CLIP-G) | AutoencoderKL |
+| `zimage` | `models/zimage.zig` | Qwen3-4B | AutoencoderKL (Flux) |
+| `anima` | `models/anima.zig` | Qwen3-0.6B + T5 | Wan 2.1 |
+| `sensenova` | `models/sensenova.zig` | the trunk's own base copy | none (pixel space) |
+| `mageflow` | `models/mageflow.zig` | Qwen3-VL 4B | Mage-VAE or Flux 2's |
+| `moss_image` | `models/moss_image.zig` | Qwen3.5 9B (HF) | Mage-Flow's |
+| `qwen_image21` | `models/qwen_image21.zig` | Qwen3-VL 8B | Wan 2.2 layout, RGBA |
+
+Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the matrix):
+
+| format | storage | compute |
+|---|---|---|
+| bf16 / f8_e4m3 | dense | native on all backends |
+| int8 convrot / tensorwise | I8 + per-row or one scale | int8 tensor-core GEMM (W8A8) |
+| int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan decodes to int8 |
+| `asym_w4a8_int8` / `w6a8_int8` | 4- or 6-bit codes + fp8 group scales | decodes to int8 convrot per GEMM |
+| NVFP4 | E2M1 + fp8 block scales | decodes to bf16 |
+| GGUF block quants | ggml blocks | decodes per GEMM to int8 or a 16-bit dense (`--dit-gguf-gemm`) |
+
+## Compatibility and metadata
+
+- Sampling has four axes, each on the CLI and in the GUI: scheduler (`core/schedule.zig`),
+  sampler (`core/sampler.zig`), prompt syntax (`core/prompt_*.zig`) and RNG compat
+  (`core/noise.zig`). **A compat or dialect choice must reach every consumer of it**:
+  wiring the initial latent but not the Brownian tree makes euler match while every SDE
+  render is wrong.
+- **The saved PNG records what the render USED**, in A1111's `parameters` block under
+  A1111's and Civitai's own field names, never invented ones (`pipeline.appendExtraParams`).
+  A reader re-renders from that block, so a hardcoded field there is a wrong answer.
+- Where ComfyUI is not the right reference, the family's module doc says so (Qwen-Image
+  2.1 samples on diffusers' schedule; MOSS-Image's ComfyUI render uses int8 attention).
+
+## Checkpoints
+
+- **`pipeline.Container.open` picks the reader by magic, not extension.** Any family ships
+  bundled or split; `resolveComponent` decides per component, and an explicit
+  `--text-encoder` / `--vae` flag wins.
+- `weights.WeightStore` arms `Overlay` and `Mix` substitute tensors or whole layers from a
+  second file without rewriting a checkpoint: the tools for attributing quantization damage.
 
 ## Zig 0.16 conventions (differ from older Zig — do not use pre-0.16 patterns)
 
@@ -732,18 +310,17 @@ GGUF block-quant dequant and GEMV paths. With `-Dggml=false` those dtypes return
 
 ## Keeping this file useful
 
-This file is read in full at the start of every session. It orients an agent; it is not a
-record of what happened.
+This file is read in full at the start of every session. It orients an agent and states
+how work is done here; it is not a description of how the code works (read the code and its
+module docs for that) and not a record of what happened.
 
-- **Write durable facts only**: where something lives, what dispatches on what, an
-  rule that must hold, a trap that is a silent wrong answer. One or two sentences.
+- **Write orientation and process only**: where something lives, how a change is checked, a
+  rule every change must follow, a trap that is a silent wrong answer across the codebase.
+  One or two sentences.
+- **How one file or subsystem works goes in that file's module doc comment**, a backend
+  capability in `BACKEND.md`, a Zig gotcha in `ZIG.md`, open work in `TODO.md`.
 - **No history.** No dates, no "landed", no "was X before", no postmortems, no measured
-  tables, no PSNR figures, no "this cost a debugging cycle". `git log -p CLAUDE.md` has all
-  of it if anyone needs it.
-- **Put detail where it is used.** A fact about one file belongs in that file's module doc
-  comment; a backend capability belongs in `BACKEND.md`; a Zig gotcha in `ZIG.md`; open work
-  in `TODO.md`.
+  tables. `git log -p CLAUDE.md` has all of it.
 - **Prefer deleting to qualifying.** If a section no longer helps someone start work, remove
   it rather than annotating it.
-- **Budget: keep this under ~300 lines.** If a section grows past a screen, that is the
-  signal it belongs somewhere else.
+- **Budget: keep this under ~300 lines.**
