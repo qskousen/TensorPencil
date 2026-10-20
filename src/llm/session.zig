@@ -85,8 +85,9 @@ pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f
         if (getenv("TP_VK_STATS") != null) {
             const ctx = @import("tp_gpu").context.Context;
             const subs_ms = @as(f64, @floatFromInt(ctx.stat_submit_ns)) / 1e6;
-            try stdout.print("[vk: {d} dispatches, {d} submits, {d:.0} ms in submit+fence ({d:.0}% of wall), {d:.1} us/dispatch]\n", .{
+            try stdout.print("[vk: {d} dispatches, {d} barriers, {d} submits, {d:.0} ms in submit+fence ({d:.0}% of wall), {d:.1} us/dispatch]\n", .{
                 ctx.stat_ops,
+                ctx.stat_barriers,
                 ctx.stat_submits,
                 subs_ms,
                 100.0 * subs_ms / (elapsed_s * 1000.0),
@@ -188,6 +189,11 @@ pub fn archSupportsWeightNoise(arch: []const u8) bool {
 /// q5_k tensors), and one supported tensor in an otherwise unsupported model would
 /// answer yes to a question the user is really asking about the whole model.
 pub fn weightNoiseSupported(gg: *const gguf_mod.Gguf) bool {
+    return weightNoiseSupportedFor(gg, cuda.Backend.weightNoiseSupported);
+}
+
+/// `weightNoiseSupported` against the dtypes one backend's kernels honour.
+pub fn weightNoiseSupportedFor(gg: *const gguf_mod.Gguf, comptime wired_dt: fn (@import("tp_core").dtype.DType) bool) bool {
     const arch = gg.getStr("general.architecture") orelse return false;
     if (!archSupportsWeightNoise(arch)) return false;
     var quant: usize = 0;
@@ -203,7 +209,7 @@ pub fn weightNoiseSupported(gg: *const gguf_mod.Gguf) bool {
         const dt = (gg.get(name) orelse continue).info.dtype;
         if (!dt.isBlockQuant()) continue; // norms are f32 and cannot carry noise
         quant += 1;
-        if (cuda.Backend.weightNoiseSupported(dt)) wired += 1;
+        if (wired_dt(dt)) wired += 1;
     }
     return quant != 0 and wired * 2 >= quant;
 }
@@ -249,7 +255,12 @@ pub fn configureCuda(b: *cuda.Backend, profile: bool) void {
 /// caller holds it for the whole session, which is why this takes a pointer.
 pub fn useFileReads(be: ?*cuda.Backend, g: *const gguf_mod.Gguf) void {
     const b = be orelse return;
-    b.ctx.addWeightReader(.{
+    b.ctx.addWeightReader(ggufReader(g));
+}
+
+/// A weight reader serving `g`'s tensor bytes from its file.
+pub fn ggufReader(g: *const gguf_mod.Gguf) gpu_context.WeightReader {
+    return .{
         .ctx = @constCast(g),
         .read = struct {
             fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
@@ -257,7 +268,7 @@ pub fn useFileReads(be: ?*cuda.Backend, g: *const gguf_mod.Gguf) void {
                 return gg.readTo(dst, src);
             }
         }.read,
-    });
+    };
 }
 
 /// Per-architecture descriptor for `run`: the concrete stepper types plus the
@@ -359,15 +370,19 @@ pub fn run(
                 return error.UnsupportedBackend;
             } else {
                 const ctx = dev.vk_ctx.?;
-                // LLM weights never stream: pin everything; a model that
-                // doesn't fit fails cleanly (Vulkan has no CPU-split path).
+                // LLM weights never stream: pin everything; what does not fit moves
+                // to the host through the stepper's own split.
                 ctx.pin_budget = std.math.maxInt(u64);
                 errdefer |err| if (err == error.DeviceOutOfMemory) {
-                    stdout.writeAll("\n[out of device VRAM: this model doesn't fit resident, and the vulkan backend has no CPU-offload path]\n") catch {};
+                    stdout.writeAll("\n[out of device VRAM: this model doesn't fit resident]\n") catch {};
                     stdout.flush() catch {};
                 };
                 var model = try S.buildVulkan(gpa, ctx, lm, cap, first_seq);
                 defer model.deinit();
+                // As the CUDA branch: host layers need `io` from the first forward, and
+                // the one-time weight upload is not the prefill's.
+                if (@hasField(@TypeOf(model), "io")) model.io = io;
+                if (@hasDecl(@TypeOf(model), "warmWeights")) model.warmWeights();
                 try prefiller.prefill(&model);
                 return driver.drive(&model);
             }

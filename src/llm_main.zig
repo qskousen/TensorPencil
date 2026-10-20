@@ -20,7 +20,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const usage =
     \\usage: tp-llm --model <qwen3.safetensors> --prompt <text>
-    \\              [--backend cpu|zig-cuda|cuda|vulkan]
+    \\              [--backend cpu|zig-cuda|cuda|vulkan]  (default: CUDA with an NVIDIA device, else Vulkan, else cpu)
     \\              [--system <text>] [--tools <tools.json>]
     \\              [--max-tokens <n>] [--max-context <n>]
     \\              [--kv-dtype f32|f16|q8_0] [--mmap pread|mmap|buffered]
@@ -48,9 +48,8 @@ const usage =
     \\session ends only when nothing more can be freed.
     \\Speculative runs (--spec-k/--draft-model/--eagle/--tree) reserve
     \\the whole window physically up front, so their default window stays 4096.
-    \\--backend vulkan also reserves the whole window up front (no growable
-    \\buffers), so without an explicit --max-context it auto-sizes to the
-    \\largest window whose KV reservation fits in VRAM beside the weights,
+    \\--backend vulkan, without an explicit --max-context, auto-sizes to the
+    \\largest window whose KV fits in VRAM beside the weights,
     \\capped at the trained length.
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
@@ -192,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
     var prompt: ?[]const u8 = null;
     var system: ?[]const u8 = null;
     var tools_path: ?[]const u8 = null;
-    var backend: BackendKind = .cpu;
+    var backend_arg: ?BackendKind = null;
     var profile = false;
     var vram_budget: u64 = 0;
     var cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy = null;
@@ -340,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
             g_bench_rounds = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--backend")) {
             const name = try nextArg(args, &i);
-            backend = std.meta.stringToEnum(BackendKind, name) orelse {
+            backend_arg = std.meta.stringToEnum(BackendKind, name) orelse {
                 try stdout.print("unknown backend: {s} (cpu | zig-cuda | cuda | vulkan)\n", .{name});
                 try stdout.flush();
                 return error.InvalidArgument;
@@ -351,6 +350,13 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgument;
         }
     }
+    // Unnamed, the backend is the machine's: CUDA with an NVIDIA device, else Vulkan.
+    const backend: BackendKind = backend_arg orelse switch (TensorPencil.pipeline.detectBackend()) {
+        .cpu => .cpu,
+        .vulkan => .vulkan,
+        .zig_cuda => .@"zig-cuda",
+        .cuda => .cuda,
+    };
     const path = model_path orelse {
         try stdout.writeAll(usage);
         try stdout.flush();
@@ -392,9 +398,9 @@ pub fn main(init: std.process.Init) !void {
     // VRAM lazily, and stops gracefully when even layer offload can't
     // free enough). Speculative sessions allocate the whole window physically
     // up front, so without an explicit --max-context they keep the 4096
-    // default. Vulkan also reserves up front but AUTO-SIZES to what VRAM holds
-    // in its backend block below; 4096 here is a transient placeholder it
-    // overrides (it must be set before capacityPlan runs).
+    // default. Vulkan AUTO-SIZES to what VRAM holds in its backend block below;
+    // 4096 here is a transient placeholder it overrides (it must be set before
+    // capacityPlan runs).
     const fixed_session = opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null;
     opts.max_context = max_context_arg orelse
         (if (fixed_session or backend == .vulkan) 4096 else @min(trainedContext(&st), auto_context_cap));
@@ -448,11 +454,6 @@ pub fn main(init: std.process.Init) !void {
     if (st == .gguf and st.gguf.getStr("general.architecture") != null and
         std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "k2-horizon"))
     {
-        if (backend == .vulkan) {
-            try stdout.writeAll("K2 Horizon currently runs on cpu / zig-cuda / cuda\n");
-            try stdout.flush();
-            return error.UnsupportedBackend;
-        }
         if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
             try stdout.writeAll("speculative decoding is not supported for K2 Horizon yet\n");
             try stdout.flush();
@@ -631,11 +632,11 @@ fn runQwen3(
         try llm.chat.appendSystem(&tok, gpa, system, &ids);
     }
 
-    // Vulkan reserves the whole KV window up front (no growable buffers), so
-    // bring its device up now and auto-size the context to what VRAM holds
-    // before the banner and capacityPlan below read opts.max_context (an
-    // explicit --max-context always wins). CUDA defaults to the trained length
-    // and grows KV lazily. The context is reused by session.run's vulkan arm.
+    // Bring the Vulkan device up now and size the window to what VRAM can hold
+    // (the qwen3 cache grows into it; qwen35 and gemma3 reserve it whole) before
+    // the banner and capacityPlan below read opts.max_context (an explicit
+    // --max-context always wins). CUDA defaults to the trained length. The
+    // context is reused by session.run's vulkan arm.
     var vk_ctx: ?*TensorPencil.gpu.Context = null;
     defer if (vk_ctx) |c| c.deinit();
     if (backend == .vulkan) {
@@ -829,7 +830,7 @@ fn imageTurn(
 /// generation runs with the terminal cooked again, so Ctrl-C still kills
 /// a running reply. Returns null at end of session (Ctrl-D, closed stdin).
 fn readEditorMessage(ed: *llm.repl.Editor, fd: std.posix.fd_t, stdin: *Io.Reader, gpa: std.mem.Allocator, stdout: *Io.Writer) !?[]const u8 {
-    var raw = try llm.repl.RawTty.enter(fd);
+    var raw = try TensorPencil.rawtty.RawTty.enter(fd);
     defer raw.leave();
     try stdout.writeAll(llm.repl.enter_seq);
     try stdout.flush();
@@ -1468,6 +1469,10 @@ const SimpleDriver = struct {
     img_chat: ?ImageChat,
     pub fn drive(self: SimpleDriver, model: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        if (g_bench_rounds > 0) {
+            try benchStepper(model, self.io, self.gpa, self.ids.items, g_bench_rounds, self.stdout);
+            return .{ .n = 0, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = .{} };
+        }
         var timing: llm.engine.Timing = .{};
         const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat, &timing);
         return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };
@@ -1566,6 +1571,18 @@ fn benchStepper(model: anytype, io: Io, gpa: std.mem.Allocator, ids: []const u32
             try model.step(io, o[0..1], logits);
         }
         const t2 = Io.Clock.awake.now(io).nanoseconds;
+        if (getenv("TP_VK_STATS") != null) {
+            const C = TensorPencil.gpu.Context;
+            try stdout.print("vk round {d}{s}: {d} dispatches, {d} barriers; conflicts same-offset {d}, other-offset {d}, untracked {d}; raw {d} war {d} waw {d}\n", .{ r, armName(toggle != null, arm), C.stat_ops, C.stat_barriers, C.stat_conflict_same, C.stat_conflict_other, C.stat_conflict_poison, C.stat_conflict_raw, C.stat_conflict_war, C.stat_conflict_waw });
+            C.stat_conflict_raw = 0;
+            C.stat_conflict_war = 0;
+            C.stat_conflict_waw = 0;
+            C.stat_ops = 0;
+            C.stat_barriers = 0;
+            C.stat_conflict_same = 0;
+            C.stat_conflict_other = 0;
+            C.stat_conflict_poison = 0;
+        }
         if (r == 0) continue;
         const slot = arm * rounds + r - 1;
         pp[slot] = @as(f64, @floatFromInt(ids.len)) / (@as(f64, @floatFromInt(t1 - t0)) / 1e9);
@@ -1780,7 +1797,7 @@ fn runQwen35(
     // Read weight bytes from the checkpoint FILE rather than faulting the
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
     llm.session.useFileReads(be_cuda, g);
-    // Vulkan context up front (the qwen35 LLM runs on it; there is no Vulkan ViT).
+    // Vulkan context up front: the LLM and a one-shot --image's tower run on it.
     const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
     defer if (vk_ctx) |c| c.deinit();
 
@@ -1812,13 +1829,16 @@ fn runQwen35(
         const dec = try vips.loadRgb(gpa, ip);
         defer gpa.free(dec.pixels);
         const t_vit = Io.Clock.real.now(io).nanoseconds;
+        const on_vk = vk_ctx != null and !debug_cpu_vit;
         img = if (img_chat) |ic|
             try TensorPencil.models.vit35_cuda.encode(ic.qwen35.vit, ic.qwen35.be, gpa, dec.pixels, dec.width, dec.height)
+        else if (on_vk)
+            try TensorPencil.models.vit35_gpu.encode(&vit.?, vk_ctx.?, gpa, dec.pixels, dec.width, dec.height)
         else
             try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
         const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
         try stdout.print("[image {d}x{d} -> {d}x{d} tokens; vit {d:.1}s ({s})]\n", .{
-            dec.width, dec.height, img.?.grid_w, img.?.grid_h, vit_s, if (img_chat != null) "gpu" else "cpu",
+            dec.width, dec.height, img.?.grid_w, img.?.grid_h, vit_s, if (img_chat != null or on_vk) "gpu" else "cpu",
         });
         try stdout.flush();
     }
@@ -2020,7 +2040,9 @@ fn runK2Horizon(
     const be_cuda = try llm.session.bringUpCuda(arena, backend, profile);
     defer if (be_cuda) |be| be.deinit();
     llm.session.useFileReads(be_cuda, g);
-    const Spec = llm.session.UniformSpec(k2.Model, k2.CpuModel, TensorPencil.models.k2_horizon_cuda.CudaLM, void);
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
+    defer if (vk_ctx) |c| c.deinit();
+    const Spec = llm.session.UniformSpec(k2.Model, k2.CpuModel, TensorPencil.models.k2_horizon_cuda.CudaLM, TensorPencil.models.k2_horizon_gpu.VulkanLM);
     const driver: SimpleDriver = .{
         .tok = &tok,
         .io = io,
@@ -2031,7 +2053,7 @@ fn runK2Horizon(
         .prompt = prompt,
         .img_chat = null,
     };
-    const dev: llm.session.Devices = .{ .cu_be = be_cuda };
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
     const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, llm.session.no_prefill, driver, io, gpa, cap, stdout);
     if (profile) {
         if (backend == .cpu) {
@@ -2222,11 +2244,6 @@ fn runGemma4(
     profile: bool,
     stdout: *Io.Writer,
 ) !void {
-    if (backend == .vulkan) {
-        try stdout.writeAll("gemma4 runs on cpu / zig-cuda / cuda (the vulkan backend is a follow-up)\n");
-        try stdout.flush();
-        return error.InvalidArgument;
-    }
     if (image_path != null) {
         if (mmproj_path == null) {
             try stdout.writeAll("--image requires --mmproj <mmproj.gguf> (the vision embedder ships separately)\n");
@@ -2260,6 +2277,8 @@ fn runGemma4(
     // Read weight bytes from the checkpoint FILE rather than faulting the
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
     llm.session.useFileReads(be_cuda, g);
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
+    defer if (vk_ctx) |c| c.deinit();
 
     // Vision embedder (--mmproj), dispatched by clip.vision.projector_type:
     //   "gemma4uv" -> shallow "unified" embedder (12B; no ViT blocks), runs
@@ -2310,16 +2329,20 @@ fn runGemma4(
             try stdout.flush();
         };
         const t_vit = Io.Clock.real.now(io).nanoseconds;
-        const on_gpu = be_cuda != null;
+        const on_gpu = be_cuda != null or vk_ctx != null;
         if (proj_v) {
             const e = if (be_cuda) |bb|
                 try TensorPencil.models.gemma4v_vit_cuda.encode(&vit_v.?, bb, io, gpa, dec.pixels, dec.width, dec.height)
+            else if (vk_ctx) |c|
+                try TensorPencil.models.gemma4v_vit_gpu.encode(&vit_v.?, c, io, gpa, dec.pixels, dec.width, dec.height)
             else
                 try vit_v.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
             img = .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
         } else {
             const e = if (be_cuda) |bb|
                 try TensorPencil.models.gemma4_vit_cuda.encode(&vit_uv.?, bb, io, gpa, dec.pixels, dec.width, dec.height)
+            else if (vk_ctx) |c|
+                try TensorPencil.models.gemma4_vit_gpu.encode(&vit_uv.?, c, io, gpa, dec.pixels, dec.width, dec.height)
             else
                 try vit_uv.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
             img = .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
@@ -2373,15 +2396,13 @@ fn runGemma4(
     }
     defer if (profile) TensorPencil.prof.report(stdout) catch {};
 
-    // CUDA backend + pinning were set up front (before the vision encode). No
-    // CPU-split / offload / streaming, the 12B fits. gemma4 has no Vulkan
-    // backend (Spec.Vulkan = void); main() rejects --backend vulkan before here.
-    const dev: llm.session.Devices = .{ .cu_be = be_cuda };
+    // CUDA backend + pinning were set up front (before the vision encode).
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
     const Spec = llm.session.UniformSpec(
         gemma4.Model,
         gemma4.CpuModel,
         TensorPencil.models.gemma4_cuda.CudaLM,
-        void,
+        TensorPencil.models.gemma4_gpu.VulkanLM,
     );
     const prefiller: llm.session.ImagePrefiller(ImgEmbeds) = .{
         .img = if (img) |*e| e else null,

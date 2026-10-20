@@ -179,6 +179,30 @@ pub inline fn actSteer(e: Env, comptime dt: Dt) void {
     }
 }
 
+/// y[u2 + t * u4 + row] = f0 * dot(a[row * u1 ..][0..u1], b[t * u1 ..][0..u1]) for row < u0
+/// and t < u3, one subgroup a weight row, which stays in cache across the t: a skinny
+/// f32 weight (a router) has too few rows to fill a k-split GEMV. u1 % 4 == 0.
+pub inline fn gemvRowsF32(e: Env) void {
+    const r = Rows(e);
+    const cols = e.u(1);
+    var row = r.row;
+    while (row < e.u(0)) : (row += r.step) {
+        const base = row * cols;
+        var t: u32 = 0;
+        while (t < e.u(3)) : (t += 1) {
+            var acc: f32 = 0;
+            var i = r.lane * 4;
+            while (i < cols) : (i += r.lanes * 4) {
+                const w = e.ld4(.a, base + i);
+                const x = e.ld4(.b, t * cols + i);
+                acc += w[0] * x[0] + w[1] * x[1] + w[2] * x[2] + w[3] * x[3];
+            }
+            const total = k.sgSum(acc);
+            if (r.lane == 0) e.st(.c, e.u(2) + t * e.u(4) + row, total * e.f(0));
+        }
+    }
+}
+
 /// `rmsnorm` over groups: flattened groups are the rows, u1 their width, u2 the
 /// groups per original row (the weight is u2*u1 wide).
 pub inline fn groupRmsnorm(e: Env) void {

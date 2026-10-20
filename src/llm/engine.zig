@@ -392,10 +392,10 @@ pub fn generate(
         // same ids and the same KV count should also have the same device state.
         if (comptime @hasField(MH, "be")) {
             const be = model.be;
-            std.debug.print("[entry] be async_up={} pinned={d} streamed={d} weights={d} dev_used={d} remaining={d}\n", .{
-                be.async_uploads, be.pinned_bytes, be.streamed_bytes,
-                be.weights.count(), be.ctx.device_used, model.remaining(),
+            std.debug.print("[entry] be pinned={d} evictable={d} weights={d} dev_used={d} remaining={d}\n", .{
+                be.pinnedWeightBytes(), be.evictableWeightBytes(), be.weights.count(), be.deviceUsed(), model.remaining(),
             });
+            if (comptime @hasField(@TypeOf(be.*), "async_uploads")) std.debug.print("[entry] be async_up={}\n", .{be.async_uploads});
         }
         std.debug.print(
             "[entry] ids={d} idhash=0x{x} cached={d} first={any}\n" ++

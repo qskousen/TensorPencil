@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const sasm = @import("spirv_asm.zig");
+const spv_mod = @import("spv.zig");
 
 /// Helper for authoring a kernel as SPIR-V assembly text (see spirv_asm.zig).
 /// `id()` hands out fresh `%tN` names for anonymous SSA temporaries (mirroring
@@ -167,9 +168,8 @@ pub fn buildGemmI8(gpa: std.mem.Allocator, mt: u32, nt: u32) ![]align(4) u8 {
         \\%v3u = OpTypeVector %u32 3
         \\%ptr_in_v3 = OpTypePointer Input %v3u
         \\%gid = OpVariable %ptr_in_v3 Input
-        \\%c_arrlen = OpConstant %u32 268435456
-        \\%arr_s8 = OpTypeArray %s8 %c_arrlen
-        \\%arr_s32 = OpTypeArray %s32 %c_arrlen
+        \\%arr_s8 = OpTypeRuntimeArray %s8
+        \\%arr_s32 = OpTypeRuntimeArray %s32
         \\%sb = OpTypeStruct %arr_s8
         \\%sa = OpTypeStruct %arr_s8
         \\%sc = OpTypeStruct %arr_s32
@@ -356,11 +356,11 @@ pub fn buildGemmSharedI8(
     fuse_scale: bool,
     double_buf: bool,
     c_h16: bool,
-    /// s8 fragment M and N from the device. K is always 32 (every sint8 config we
-    /// accept), which is what keeps K_STEP at two k sub-steps and leaves the whole
-    /// staging path independent of the shape.
+    /// s8 fragment shape from the device. K is 32 or 16: the 64-deep slab is then two
+    /// or four k sub-steps, and the whole staging path is independent of the shape.
     frag_m: u32,
     frag_n: u32,
+    frag_k: u32,
     /// Per-warp output tile. Same trade as the f16 GEMM: accumulators per lane are
     /// warp_m * warp_n / subgroup_size regardless of fragment size, so 64x64 is 128
     /// f32/lane — fine on a ~255-register thread, far past an Intel Xe lane at SIMD32.
@@ -368,7 +368,9 @@ pub fn buildGemmSharedI8(
     warp_tile_n: u32,
 ) ![]align(4) u8 {
     std.debug.assert(!c_h16 or fuse_scale);
+    std.debug.assert(frag_k == 16 or frag_k == 32);
     const K_STEP: u32 = 64;
+    const KS: usize = K_STEP / frag_k; // k sub-steps per slab
     const NWARPS: u32 = if (warps8) 8 else 4;
     const THREADS: u32 = 32 * NWARPS;
     const WARP_N: u32 = NWARPS / 2; // warps along n
@@ -417,7 +419,11 @@ pub fn buildGemmSharedI8(
     // Fragment shape, wg tile and slab strides, all referenced as %cu_<value>.
     for ([_]u32{ frag_m, frag_n, WGN, A_ROWS, A_ROW_U32, B_ROW_U32, SCR_PER_WARP, A_U32, warp_tile_m, warp_tile_m * A_ROW_U32 }) |v|
         addC(&pool, &pn, v);
-    for (0..K_STEP / 32) |ks| addC(&pool, &pn, @intCast(ks * 32 * B_ROW_U32));
+    for (0..KS) |ks| {
+        addC(&pool, &pn, @intCast(ks * frag_k * B_ROW_U32));
+        addC(&pool, &pn, @intCast(ks * frag_k / 4));
+    }
+    addC(&pool, &pn, frag_k);
     addC(&pool, &pn, std.math.log2_int(u32, B_ROW_U32));
     addC(&pool, &pn, B_ROW_U32 - 1);
     addC(&pool, &pn, std.math.log2_int(u32, frag_n));
@@ -481,9 +487,8 @@ pub fn buildGemmSharedI8(
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
     if (fuse_scale) try em.line("%f32 = OpTypeFloat 32", .{});
     if (c_h16) try em.line("%f16 = OpTypeFloat 16", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
-    try em.line("%arr_s32 = OpTypeArray %{s} %c_arrlen", .{c_elem});
+    try em.line("%arr_u32 = OpTypeRuntimeArray %u32", .{});
+    try em.line("%arr_s32 = OpTypeRuntimeArray %{s}", .{c_elem});
     try em.line("%sb = OpTypeStruct %arr_u32", .{});
     try em.line("%sa = OpTypeStruct %arr_u32", .{});
     try em.line("%sc = OpTypeStruct %arr_s32", .{});
@@ -501,7 +506,7 @@ pub fn buildGemmSharedI8(
     try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
     try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
     if (fuse_scale) {
-        try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+        try em.line("%arr_f32 = OpTypeRuntimeArray %f32", .{});
         try em.line("%scale = OpTypeStruct %arr_f32", .{});
         try em.line("%ptr_scale = OpTypePointer StorageBuffer %scale", .{});
         try em.line("%vscale = OpVariable %ptr_scale StorageBuffer", .{});
@@ -520,8 +525,8 @@ pub fn buildGemmSharedI8(
 
     for (pool[0..pn]) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
 
-    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_{d} %cu_32 %cu_0", .{frag_m});
-    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_32 %cu_{d} %cu_1", .{frag_n});
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_{d} %cu_{d} %cu_0", .{ frag_m, frag_k });
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_{d} %cu_{d} %cu_1", .{ frag_k, frag_n });
     try em.line("%mat_c = OpTypeCooperativeMatrixKHR %s32 %cu_3 %cu_{d} %cu_{d} %cu_2", .{ frag_m, frag_n });
     try em.line("%c_s32_0 = OpConstant %s32 0", .{});
     try em.line("%c_acc0 = OpConstantComposite %mat_c %c_s32_0", .{});
@@ -742,15 +747,15 @@ pub fn buildGemmSharedI8(
         regs_next = try db.load(&em, kbc_name);
     }
 
-    // MMA: 2 ks of 32 k each, reading the current shared slab.
+    // MMA: KS sub-steps of frag_k each, reading the current shared slab.
     var acc_cur = acc_phi;
-    for (0..2) |ks| {
+    for (0..KS) |ks| {
         var ma: [8]u32 = undefined;
         for (0..MT) |mi| {
             const off1 = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off1, a_warp, mi * frag_m * A_ROW_U32 });
             const off = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off1, ks * 8 });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off1, ks * frag_k / 4 });
             const aptr = em.id();
             try em.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ aptr, off });
             ma[mi] = em.id();
@@ -758,7 +763,7 @@ pub fn buildGemmSharedI8(
         }
         for (0..NT) |nj| {
             const off1 = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %cu_{d} %cu_{d}", .{ off1, A_U32, ks * 32 * B_ROW_U32 });
+            try em.line("%t{d} = OpIAdd %u32 %cu_{d} %cu_{d}", .{ off1, A_U32, ks * frag_k * B_ROW_U32 });
             const off2 = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ off2, off1, b_warp });
             const off = em.id();
@@ -768,7 +773,7 @@ pub fn buildGemmSharedI8(
             const mb = em.id();
             try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %cu_0 %cu_{d}", .{ mb, bptr, B_ROW_U32 });
             for (0..MT) |mi| {
-                const acc_out = if (ks == 1) acc_next[mi][nj] else em.id();
+                const acc_out = if (ks == KS - 1) acc_next[mi][nj] else em.id();
                 try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d} 15", .{ acc_out, ma[mi], mb, acc_cur[mi][nj] });
                 acc_cur[mi][nj] = acc_out;
             }
@@ -884,16 +889,46 @@ pub fn buildGemmSharedI8(
 }
 
 /// Groups per chunk for `buildFusedPrepI8` at `cols`: the largest divisor of the group
-/// count whose f32 rows fit 48 KB of shared beside the per-lane maxes, with at most four
-/// chunks (each is emitted twice). Null: no build, the 3-pass chain runs.
-pub fn fusedPrepChunk(cols: usize) ?u32 {
+/// count whose f32 rows fit the device's `max_shared` bytes beside the per-lane maxes,
+/// with at most four chunks (each is emitted twice) and at most eight output words a
+/// lane (`PrepI8Emit.hold`). Null: no build, the 3-pass chain runs.
+/// The tallest `buildIntWoPack` tile whose shared [rows][257] plus row scales fit.
+pub fn woPackRows(max_shared: u64) ?u32 {
+    var r: u32 = 32;
+    while (r >= 8) : (r /= 2) if (@as(u64, r) * 258 * 4 <= max_shared) return r;
+    return null;
+}
+
+pub fn fusedPrepChunk(cols: usize, max_shared: u64) ?u32 {
     if (cols == 0 or cols % 256 != 0) return null;
     const ng: u32 = @intCast(cols / 256);
     var ch: u32 = ng;
     while (ch > 0) : (ch -= 1) {
         if (ng % ch != 0) continue;
-        if ((ch * 257 + prepLanes(ch) + 1) * 4 > 48 * 1024) continue;
+        if (@as(u64, ch * 257 + prepLanes(ch) + 1) * 4 > max_shared) continue;
+        if (ch * 64 / prepLanes(ch) > 8) continue;
         return if (ng / ch <= 4) ch else null;
+    }
+    return null;
+}
+
+/// How `buildFusedPrepI8` splits a row: `nc` chunks of `ch` groups on `wg` lanes. Padded
+/// when no chunk divides the row evenly (`fusedPrepChunk` is null): 256 lanes, chunks a
+/// multiple of four groups, and the last one running past the row, whose loads read zero
+/// and whose stores are skipped.
+pub const PrepPlan = struct { ch: u32, nc: u32, wg: u32, padded: bool };
+
+pub fn fusedPrepPlan(cols: usize, max_shared: u64) ?PrepPlan {
+    if (cols == 0 or cols % 256 != 0) return null;
+    const ng: u32 = @intCast(cols / 256);
+    if (fusedPrepChunk(cols, max_shared)) |ch| return .{ .ch = ch, .nc = ng / ch, .wg = prepLanes(ch), .padded = false };
+    var nc: u32 = 1;
+    while (nc <= 4) : (nc += 1) {
+        const ch = std.mem.alignForward(u32, std.math.divCeil(u32, ng, nc) catch unreachable, 4);
+        // Eight output words a lane at most (`PrepI8Emit.hold`).
+        if (ch > 32) continue;
+        if (@as(u64, ch * 257 + 256 + 1) * 4 > max_shared) continue;
+        return .{ .ch = ch, .nc = std.math.divCeil(u32, ng, ch) catch unreachable, .wg = 256, .padded = true };
     }
     return null;
 }
@@ -917,12 +952,13 @@ fn prepLanes(ch: u32) u32 {
 /// a barrier between stages, the last one normalizes and keeps a running abs-max, and a
 /// tree reduces the lanes' maxes. A row too wide for shared memory at f32 goes in chunks
 /// of groups, twice: once for the abs-max, once to quantize.
-pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
+pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32, max_shared: u64) ![]align(4) u8 {
     const NG: u32 = cols / 256;
     const PAD: u32 = 257; // lane t hits bank (t*257)%32 = t
-    const CH: u32 = fusedPrepChunk(cols) orelse return error.Unsupported;
-    const NC: u32 = NG / CH;
-    const WG: u32 = prepLanes(CH);
+    const plan = fusedPrepPlan(cols, max_shared) orelse return error.Unsupported;
+    const CH: u32 = plan.ch;
+    const NC: u32 = plan.nc;
+    const WG: u32 = plan.wg;
     const GMAX: u32 = CH * PAD; // [WG] per-lane abs-maxes
     const INV: u32 = GMAX + WG;
     const SH_LEN: u32 = INV + 1;
@@ -989,9 +1025,8 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
-    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%arr_f32 = OpTypeRuntimeArray %f32", .{});
+    try em.line("%arr_u32 = OpTypeRuntimeArray %u32", .{});
     try em.line("%sx = OpTypeStruct %arr_f32", .{});
     try em.line("%sq = OpTypeStruct %arr_u32", .{});
     try em.line("%ss = OpTypeStruct %arr_f32", .{});
@@ -1034,7 +1069,7 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     const rowcols = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ rowcols, row, cols });
 
-    const P = PrepI8Emit{ .em = &em, .ar = ar, .tid = tid, .row = row, .rowcols = rowcols, .CH = CH, .GMAX = GMAX, .INV = INV, .WG = WG, .LOADS = LOADS, .WORDS = WORDS, .BF = BF, .cols = cols };
+    const P = PrepI8Emit{ .em = &em, .ar = ar, .tid = tid, .row = row, .rowcols = rowcols, .CH = CH, .GMAX = GMAX, .INV = INV, .WG = WG, .LOADS = LOADS, .WORDS = WORDS, .BF = BF, .cols = cols, .padded = plan.padded };
     var cur: []const u8 = "%entry";
     var acc: []const u8 = "%cf_0";
     if (NC == 2) {
@@ -1099,6 +1134,8 @@ const PrepI8Emit = struct {
     WORDS: u32,
     BF: u32,
     cols: u32,
+    /// The last chunk runs past the row (`PrepPlan.padded`).
+    padded: bool,
 
     fn tmp(p: PrepI8Emit, i: u32) ![]const u8 {
         return std.fmt.allocPrint(p.ar, "%t{d}", .{i});
@@ -1144,12 +1181,28 @@ const PrepI8Emit = struct {
         const shi = try p.shIndex(j);
         const base = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ base, p.rowcols, c * p.CH * 256 });
-        const gi = em.id();
+        var gi = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gi, base, j });
+        // Past the row: read the row's first element, keep zero.
+        var inside: u32 = 0;
+        if (p.padded) {
+            const rel = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rel, j, c * p.CH * 256 });
+            inside = em.id();
+            try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ inside, rel, p.cols });
+            const safe = em.id();
+            try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %t{d}", .{ safe, inside, gi, p.rowcols });
+            gi = safe;
+        }
         const xp = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_sx_f32 %vx %cu_0 %t{d}", .{ xp, gi });
-        const v = em.id();
+        var v = em.id();
         try em.line("%t{d} = OpLoad %f32 %t{d}", .{ v, xp });
+        if (p.padded) {
+            const z = em.id();
+            try em.line("%t{d} = OpSelect %f32 %t{d} %t{d} %cf_0", .{ z, inside, v });
+            v = z;
+        }
         const sp = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_wg_f32 %vsh %t{d}", .{ sp, shi });
         try em.line("OpStore %t{d} %t{d}", .{ sp, v });
@@ -1420,13 +1473,30 @@ const PrepI8Emit = struct {
         return .{ .inv = inv, .roww = roww };
     }
 
-    fn storeWord(p: PrepI8Emit, roww: u32, word: u32, packed_w: u32) !void {
+    /// `c` is the chunk, which a padded plan needs to skip a word past the row.
+    fn storeWord(p: PrepI8Emit, roww: u32, word: u32, packed_w: u32, c: u32) !void {
         const em = p.em;
+        var skip: u32 = 0;
+        if (p.padded) {
+            const rel = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rel, word, c * p.CH * 64 });
+            const inside = em.id();
+            try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ inside, rel, p.cols / 4 });
+            skip = em.id();
+            const do = em.id();
+            try em.line("OpSelectionMerge %t{d} None", .{skip});
+            try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ inside, do, skip });
+            try em.line("%t{d} = OpLabel", .{do});
+        }
         const wi = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ wi, roww, word });
         const qp = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_sq_u32 %vq %cu_0 %t{d}", .{ qp, wi });
         try em.line("OpStore %t{d} %t{d}", .{ qp, packed_w });
+        if (p.padded) {
+            try em.line("OpBranch %t{d}", .{skip});
+            try em.line("%t{d} = OpLabel", .{skip});
+        }
     }
 
     /// Coalesced quantize of chunk `c`, shared to packed int8.
@@ -1451,7 +1521,7 @@ const PrepI8Emit = struct {
             vals[k] = em.id();
             try em.line("%t{d} = OpLoad %f32 %t{d}", .{ vals[k], pp });
         }
-        try p.storeWord(qb.roww, word, try p.packWord(qb.inv, vals));
+        try p.storeWord(qb.roww, word, try p.packWord(qb.inv, vals), c);
         try em.closeLoop(L);
         return p.tmp(L.merge);
     }
@@ -1459,7 +1529,7 @@ const PrepI8Emit = struct {
     /// `quantize` of chunk `c` from the values `hold` kept, no shared read.
     fn quantizeHeld(p: PrepI8Emit, held: [8][4]u32, c: u32) !void {
         const qb = try p.quantBase(c);
-        for (0..p.WORDS) |wi| try p.storeWord(qb.roww, try p.wordOf(@intCast(wi)), try p.packWord(qb.inv, held[wi]));
+        for (0..p.WORDS) |wi| try p.storeWord(qb.roww, try p.wordOf(@intCast(wi)), try p.packWord(qb.inv, held[wi]), c);
     }
 };
 /// `x += t` (when u2 != 0), then `out = x * inv * g` with `inv = 1 / sqrt(mean(x^2) +
@@ -1515,8 +1585,7 @@ pub fn buildAddRms(gpa: std.mem.Allocator, wg: u32) ![]align(4) u8 {
     try em.line("%sgid = OpVariable %ptr_in_u32 Input", .{});
     try em.line("%nsg = OpVariable %ptr_in_u32 Input", .{});
     try em.line("%sgl = OpVariable %ptr_in_u32 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_f32 = OpTypeRuntimeArray %f32", .{});
     try em.line("%sbuf = OpTypeStruct %arr_f32", .{});
     try em.line("%ptr_sbuf = OpTypePointer StorageBuffer %sbuf", .{});
     for ([_][]const u8{ "va", "vb", "vc", "vd" }) |v| try em.line("%{s} = OpVariable %ptr_sbuf StorageBuffer", .{v});
@@ -1648,21 +1717,239 @@ pub fn buildAddRms(gpa: std.mem.Allocator, wg: u32) ![]align(4) u8 {
     return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
+/// A known-answer test of the cooperative matrix itself: each of `subgroups`
+/// subgroups of `lanes` invocations (one per `LocalInvocationId.y`) multiplies a
+/// 16x16 f16 A by a 16x16 f16 B into its own f32 C block (all row-major, stride 16),
+/// loading the operands from the storage buffers or, with `via_shared`, from
+/// workgroup memory the whole workgroup filled first, the way the GEMMs stage them,
+/// A there at row stride `a_stride` from element `a_offset`, loaded through a pointer
+/// computed at run time; with `bitcast` the copy reads 32-bit words and splits each
+/// with `OpBitcast` to a 2-vector of f16, as the GEMMs' staging does. With `iters` above 1 the product accumulates in a
+/// loop that carries C through an OpPhi and reloads both fragments each pass, as the
+/// GEMMs' k loop does, so C is `iters` times the product. `d[0]` gets the
+/// `SubgroupSize` the shader ran at. What `Context.coopProbe` runs.
+pub fn buildCoopProbe(gpa: std.mem.Allocator, lanes: u32, subgroups: u32, via_shared: bool, a_stride: u32, iters: u32, a_offset: u32, bitcast: bool) ![]align(4) u8 {
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability StorageBuffer16BitAccess", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpCapability GroupNonUniform", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %sgs %lid %va %vb %vc %vd{s}{s}", .{ if (via_shared) " %sha %shb" else "", if (bitcast) " %vau %vbu" else "" });
+    try em.line("OpExecutionMode %main LocalSize {d} {d} 1", .{ lanes, subgroups });
+    try em.line("OpDecorate %sgs BuiltIn SubgroupSize", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_h ArrayStride 2", .{});
+    try em.line("OpDecorate %arr_f ArrayStride 4", .{});
+    try em.line("OpDecorate %sbuf_h Block", .{});
+    try em.line("OpMemberDecorate %sbuf_h 0 Offset 0", .{});
+    try em.line("OpDecorate %sbuf_f Block", .{});
+    try em.line("OpMemberDecorate %sbuf_f 0 Offset 0", .{});
+    for ([_][]const u8{ "va", "vb", "vc", "vd" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+    }
+    if (bitcast) {
+        try em.line("OpDecorate %arr_u ArrayStride 4", .{});
+        try em.line("OpDecorate %sbuf_u Block", .{});
+        try em.line("OpMemberDecorate %sbuf_u 0 Offset 0", .{});
+        for ([_][]const u8{ "vau", "vbu" }, 0..) |v, b| {
+            try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+            try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+        }
+    }
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_u32 = OpTypePointer Input %u32", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%sgs = OpVariable %ptr_in_u32 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_256 = OpConstant %u32 256", .{});
+    try em.line("%c_cn = OpConstant %u32 {d}", .{256 * subgroups});
+    try em.line("%arr_h = OpTypeArray %f16 %c_256", .{});
+    try em.line("%arr_f = OpTypeArray %f32 %c_cn", .{});
+    try em.line("%sbuf_h = OpTypeStruct %arr_h", .{});
+    try em.line("%sbuf_f = OpTypeStruct %arr_f", .{});
+    try em.line("%ptr_sbuf_h = OpTypePointer StorageBuffer %sbuf_h", .{});
+    try em.line("%ptr_sbuf_f = OpTypePointer StorageBuffer %sbuf_f", .{});
+    try em.line("%va = OpVariable %ptr_sbuf_h StorageBuffer", .{});
+    try em.line("%vb = OpVariable %ptr_sbuf_h StorageBuffer", .{});
+    try em.line("%vc = OpVariable %ptr_sbuf_f StorageBuffer", .{});
+    try em.line("%vd = OpVariable %ptr_sbuf_f StorageBuffer", .{});
+    try em.line("%ptr_sb_h = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    try em.line("%ptr_sb_f = OpTypePointer StorageBuffer %f32", .{});
+    if (bitcast) {
+        try em.line("%c_128 = OpConstant %u32 128", .{});
+        try em.line("%arr_u = OpTypeArray %u32 %c_128", .{});
+        try em.line("%sbuf_u = OpTypeStruct %arr_u", .{});
+        try em.line("%ptr_sbuf_u = OpTypePointer StorageBuffer %sbuf_u", .{});
+        try em.line("%vau = OpVariable %ptr_sbuf_u StorageBuffer", .{});
+        try em.line("%vbu = OpVariable %ptr_sbuf_u StorageBuffer", .{});
+        try em.line("%ptr_sb_u = OpTypePointer StorageBuffer %u32", .{});
+    }
+    if (via_shared) {
+        try em.line("%c_shalen = OpConstant %u32 {d}", .{a_offset + 16 * a_stride});
+        try em.line("%c_aoff = OpConstant %u32 {d}", .{a_offset});
+        try em.line("%sha_t = OpTypeArray %f16 %c_shalen", .{});
+        try em.line("%ptr_wg_sha = OpTypePointer Workgroup %sha_t", .{});
+        try em.line("%sha = OpVariable %ptr_wg_sha Workgroup", .{});
+        try em.line("%sh_t = OpTypeArray %f16 %c_256", .{});
+        try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh_t", .{});
+        try em.line("%shb = OpVariable %ptr_wg_sh Workgroup", .{});
+        try em.line("%ptr_wg_h = OpTypePointer Workgroup %f16", .{});
+    }
+    try em.line("%c_u0 = OpConstant %u32 0", .{});
+    try em.line("%c_u1 = OpConstant %u32 1", .{});
+    try em.line("%c_u2 = OpConstant %u32 2", .{});
+    try em.line("%c_u3 = OpConstant %u32 3", .{});
+    try em.line("%c_u4 = OpConstant %u32 4", .{});
+    try em.line("%c_u15 = OpConstant %u32 15", .{});
+    try em.line("%c_u16 = OpConstant %u32 16", .{});
+    try em.line("%c_u264 = OpConstant %u32 264", .{});
+    try em.line("%c_lanes = OpConstant %u32 {d}", .{lanes});
+    try em.line("%c_astride = OpConstant %u32 {d}", .{if (via_shared) a_stride else 16});
+    try em.line("%c_iters = OpConstant %u32 {d}", .{iters});
+    const threads = lanes * subgroups;
+    if (via_shared) {
+        var it: u32 = 0;
+        while (it * threads < 256) : (it += 1) try em.line("%cofs{d} = OpConstant %u32 {d}", .{ it, it * threads });
+    }
+    try em.line("%c_f0 = OpConstant %f32 0", .{});
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_u3 %c_u16 %c_u16 %c_u0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_u3 %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %f32 %c_u3 %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %c_f0", .{});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
+    try em.line("%lidv = OpLoad %v3u %lid", .{});
+    try em.line("%lx = OpCompositeExtract %u32 %lidv 0", .{});
+    try em.line("%ly = OpCompositeExtract %u32 %lidv 1", .{});
+    if (via_shared) {
+        // Every invocation copies its share of A and B, then the workgroup syncs.
+        try em.line("%ly_l = OpIMul %u32 %ly %c_lanes", .{});
+        try em.line("%tid = OpIAdd %u32 %ly_l %lx", .{});
+        var it: u32 = 0;
+        while (it * threads < 256) : (it += 1) {
+            try em.line("%i{d} = OpIAdd %u32 %tid %cofs{d}", .{ it, it });
+            try em.line("%in{d} = OpULessThan %bool %i{d} %c_256", .{ it, it });
+            try em.line("OpSelectionMerge %cm{d} None", .{it});
+            try em.line("OpBranchConditional %in{d} %cb{d} %cm{d}", .{ it, it, it });
+            try em.line("%cb{d} = OpLabel", .{it});
+            // A element (r, c) goes to r * a_stride + c; B is dense.
+            try em.line("%r{d} = OpShiftRightLogical %u32 %i{d} %c_u4", .{ it, it });
+            try em.line("%c{d} = OpBitwiseAnd %u32 %i{d} %c_u15", .{ it, it });
+            try em.line("%rs{d} = OpIMul %u32 %r{d} %c_astride", .{ it, it });
+            try em.line("%ar{d} = OpIAdd %u32 %rs{d} %c{d}", .{ it, it, it });
+            try em.line("%ai{d} = OpIAdd %u32 %ar{d} %c_aoff", .{ it, it });
+            for ([_][3][]const u8{ .{ "va", "sha", "ai" }, .{ "vb", "shb", "i" } }) |pr| {
+                if (bitcast) {
+                    // Even elements carry their odd neighbour: one u32 word, split.
+                    try em.line("%ev{s}{d} = OpBitwiseAnd %u32 %i{d} %c_u1", .{ pr[0], it, it });
+                    try em.line("%iseven{s}{d} = OpIEqual %bool %ev{s}{d} %c_u0", .{ pr[0], it, pr[0], it });
+                    try em.line("OpSelectionMerge %em{s}{d} None", .{ pr[0], it });
+                    try em.line("OpBranchConditional %iseven{s}{d} %eb{s}{d} %em{s}{d}", .{ pr[0], it, pr[0], it, pr[0], it });
+                    try em.line("%eb{s}{d} = OpLabel", .{ pr[0], it });
+                    try em.line("%wi{s}{d} = OpShiftRightLogical %u32 %i{d} %c_u1", .{ pr[0], it, it });
+                    try em.line("%su{s}{d} = OpAccessChain %ptr_sb_u %{s}u %c_u0 %wi{s}{d}", .{ pr[0], it, pr[0], pr[0], it });
+                    try em.line("%wu{s}{d} = OpLoad %u32 %su{s}{d}", .{ pr[0], it, pr[0], it });
+                    try em.line("%hv{s}{d} = OpBitcast %v2f16 %wu{s}{d}", .{ pr[0], it, pr[0], it });
+                    for (0..2) |j| {
+                        try em.line("%h{s}{d}_{d} = OpCompositeExtract %f16 %hv{s}{d} {d}", .{ pr[0], it, j, pr[0], it, j });
+                        try em.line("%d{s}{d}_{d} = OpIAdd %u32 %{s}{d} %c_u{d}", .{ pr[0], it, j, pr[2], it, j });
+                        try em.line("%p{s}{d}_{d} = OpAccessChain %ptr_wg_h %{s} %d{s}{d}_{d}", .{ pr[0], it, j, pr[1], pr[0], it, j });
+                        try em.line("OpStore %p{s}{d}_{d} %h{s}{d}_{d}", .{ pr[0], it, j, pr[0], it, j });
+                    }
+                    try em.line("OpBranch %em{s}{d}", .{ pr[0], it });
+                    try em.line("%em{s}{d} = OpLabel", .{ pr[0], it });
+                    continue;
+                }
+                try em.line("%s{s}{d} = OpAccessChain %ptr_sb_h %{s} %c_u0 %i{d}", .{ pr[0], it, pr[0], it });
+                try em.line("%x{s}{d} = OpLoad %f16 %s{s}{d}", .{ pr[0], it, pr[0], it });
+                try em.line("%w{s}{d} = OpAccessChain %ptr_wg_h %{s} %{s}{d}", .{ pr[0], it, pr[1], pr[2], it });
+                try em.line("OpStore %w{s}{d} %x{s}{d}", .{ pr[0], it, pr[0], it });
+            }
+            try em.line("OpBranch %cm{d}", .{it});
+            try em.line("%cm{d} = OpLabel", .{it});
+        }
+        try em.line("OpControlBarrier %c_u2 %c_u2 %c_u264", .{});
+        // A run-time index, as the GEMMs compute theirs: ly * 0 + a_offset.
+        try em.line("%ly0 = OpIMul %u32 %ly %c_u0", .{});
+        try em.line("%aidx = OpIAdd %u32 %ly0 %c_aoff", .{});
+        try em.line("%pa = OpAccessChain %ptr_wg_h %sha %aidx", .{});
+        try em.line("%pb = OpAccessChain %ptr_wg_h %shb %c_u0", .{});
+    } else {
+        try em.line("%pa = OpAccessChain %ptr_sb_h %va %c_u0 %c_u0", .{});
+        try em.line("%pb = OpAccessChain %ptr_sb_h %vb %c_u0 %c_u0", .{});
+    }
+    try em.line("OpBranch %entry_end", .{});
+    try em.line("%entry_end = OpLabel", .{});
+    try em.line("%coff = OpIMul %u32 %ly %c_256", .{});
+    try em.line("%pc = OpAccessChain %ptr_sb_f %vc %c_u0 %coff", .{});
+    try em.line("OpBranch %head", .{});
+    try em.line("%head = OpLabel", .{});
+    try em.line("%iv = OpPhi %u32 %c_u0 %entry_end %inext %cont", .{});
+    try em.line("%acc = OpPhi %mat_c %c_acc0 %entry_end %accn %cont", .{});
+    try em.line("OpLoopMerge %merge %cont None", .{});
+    try em.line("OpBranch %cond", .{});
+    try em.line("%cond = OpLabel", .{});
+    try em.line("%more = OpULessThan %bool %iv %c_iters", .{});
+    try em.line("OpBranchConditional %more %body %merge", .{});
+    try em.line("%body = OpLabel", .{});
+    try em.line("%ma = OpCooperativeMatrixLoadKHR %mat_a %pa %c_u0 %c_astride", .{});
+    try em.line("%mb = OpCooperativeMatrixLoadKHR %mat_b %pb %c_u0 %c_u16", .{});
+    try em.line("%accn = OpCooperativeMatrixMulAddKHR %mat_c %ma %mb %acc", .{});
+    try em.line("OpBranch %cont", .{});
+    try em.line("%cont = OpLabel", .{});
+    try em.line("%inext = OpIAdd %u32 %iv %c_u1", .{});
+    try em.line("OpBranch %head", .{});
+    try em.line("%merge = OpLabel", .{});
+    try em.line("OpCooperativeMatrixStoreKHR %pc %acc %c_u0 %c_u16", .{});
+    try em.line("%l0 = OpBitwiseOr %u32 %lx %ly", .{});
+    try em.line("%first = OpIEqual %bool %l0 %c_u0", .{});
+    try em.line("OpSelectionMerge %done None", .{});
+    try em.line("OpBranchConditional %first %write %done", .{});
+    try em.line("%write = OpLabel", .{});
+    try em.line("%w = OpLoad %u32 %sgs", .{});
+    try em.line("%wf = OpConvertUToF %f32 %w", .{});
+    try em.line("%pd = OpAccessChain %ptr_sb_f %vd %c_u0 %c_u0", .{});
+    try em.line("OpStore %pd %wf", .{});
+    try em.line("OpBranch %done", .{});
+    try em.line("%done = OpLabel", .{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
+}
+
 /// Weight-only expansion of an int8 weight in the k-major layout `weightBuffer` and the
 /// 4-bit decodes write (byte (k, row) at k*stride + row) to the padded 16-bit k-major
 /// layout the coop GEMM reads, the per-row scale applied and, when `rotate`, the convrot
 /// rotation undone along k. Hand-assembled for the shared memory: the FWHT a thread
 /// keeps in a private array spills, measured at 2.3 s of a 3.2 s prompt pass.
 ///
-/// One workgroup of 256 threads per 32 rows by one 256-wide k group: a coalesced load
-/// into f32 shared [32 rows][257], the radix-4 FWHT with each stage's butterflies spread
+/// One workgroup of 256 threads per `rows` rows (`woPackRows`) by one 256-wide k group:
+/// a coalesced load into f32 shared [rows][257], the radix-4 FWHT with each stage's butterflies spread
 /// over every lane (consecutive lanes take consecutive rows, which the 257 pad puts in
 /// distinct banks), then coalesced 16-bit pairs out. k past `cols`
 /// up to its 64 pad is written as zero, which the GEMM multiplies against a zero
 /// activation. Bindings: 0 = weight words, 1 = out words, 2 = row scale f32. Push:
-/// stride/4, rows, n_pad, cols. Dispatch (ceil(rows/32), ceil(cols/256)).
-pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align(4) u8 {
-    const R: u32 = 32;
+/// stride/4, rows, n_pad, cols. Dispatch (ceil(rows/tile rows), ceil(cols/256)).
+pub fn buildIntWoPack(gpa: std.mem.Allocator, rows_per_tile: u32, rotate: bool, bf16: bool) ![]align(4) u8 {
+    const R = rows_per_tile;
+    std.debug.assert(R >= 8 and R <= 32 and std.math.isPowerOfTwo(R));
+    const lg = std.math.log2_int;
     const LANES: u32 = 256;
     const PAD: u32 = 257;
     const SC: u32 = R * PAD;
@@ -1715,9 +2002,8 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
-    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%arr_f32 = OpTypeRuntimeArray %f32", .{});
+    try em.line("%arr_u32 = OpTypeRuntimeArray %u32", .{});
     try em.line("%sw = OpTypeStruct %arr_u32", .{});
     try em.line("%so = OpTypeStruct %arr_u32", .{});
     try em.line("%ss = OpTypeStruct %arr_f32", .{});
@@ -1741,6 +2027,12 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
     for ([_]u32{ 0, 1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 24, 31, 32, 48, 63, 64, 128, 192, 256, 264, PAD, SC, 0x7FFF }) |v|
         try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
     try em.line("%cu_not63 = OpConstant %u32 {d}", .{~@as(u32, 63)});
+    // Tile shape: R rows, R/4 row-quads per k on load, R/2 row-pairs per k on store.
+    for ([_]struct { []const u8, u32 }{
+        .{ "R", R },             .{ "Rm1", R - 1 },        .{ "lgR", lg(u32, R) },
+        .{ "q", R / 4 },         .{ "qm1", R / 4 - 1 },    .{ "lgq", lg(u32, R / 4) },
+        .{ "h", R / 2 },         .{ "hm1", R / 2 - 1 },    .{ "lgh", lg(u32, R / 2) },
+    }) |c| try em.line("%c_{s} = OpConstant %u32 {d}", .{ c[0], c[1] });
     try em.line("%cf_0 = OpConstant %f32 0", .{});
     try em.line("%cf_scale = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, if (rotate) 1.0 / 16.0 else 1.0)))});
 
@@ -1765,7 +2057,7 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
     }
     const sw, const rows, const npad, const cols = pc;
     const r0 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_32", .{ r0, tile });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_R", .{ r0, tile });
     const k0 = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ k0, grp });
     const rq0 = em.id();
@@ -1776,17 +2068,17 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
     try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_not63", .{ kpad, kp63 });
     var cur: []const u8 = "%entry";
 
-    // Load: word w of the tile holds rows 4*(w%8).. +3 at k = k0 + w/8.
+    // Load: word w of the tile holds rows 4*(w%(R/4)).. +3 at k = k0 + w/(R/4).
     {
-        const L = try em.openLoop("%cu_8", cur);
+        const L = try em.openLoop("%c_q", cur);
         const w0 = em.id();
         try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ w0, L.iv });
         const w = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ w, w0, tid });
         const kk = em.id();
-        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_3", .{ kk, w });
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_lgq", .{ kk, w });
         const rq = em.id();
-        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_7", .{ rq, w });
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_qm1", .{ rq, w });
         const k = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ k, k0, kk });
         const rowq = em.id();
@@ -1832,12 +2124,12 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
         cur = try tmp(ar, L.merge);
     }
 
-    // The tile's 32 row scales, before the barrier the FWHT needs anyway.
+    // The tile's row scales, before the barrier the FWHT needs anyway.
     {
         const sel = em.id();
         const do = em.id();
         const lt = em.id();
-        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_32", .{ lt, tid });
+        try em.line("%t{d} = OpULessThan %bool %t{d} %c_R", .{ lt, tid });
         try em.line("OpSelectionMerge %t{d} None", .{sel});
         try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ lt, do, sel });
         try em.line("%t{d} = OpLabel", .{do});
@@ -1868,16 +2160,16 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
 
     if (rotate) {
         inline for (.{ 1, 4, 16, 64 }, 0..) |st, si| {
-            // Butterfly b = iv*256 + tid of the tile's 32 x 64: row b%32, slot b/32.
-            const L = try em.openLoop("%cu_8", cur);
+            // Butterfly b = iv*256 + tid of the tile's R x 64: row b%R, slot b/R.
+            const L = try em.openLoop("%c_q", cur);
             const b0 = em.id();
             try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ b0, L.iv });
             const b = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b, b0, tid });
             const brow = em.id();
-            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_31", .{ brow, b });
+            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_Rm1", .{ brow, b });
             const j = em.id();
-            try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_5", .{ j, b });
+            try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_lgR", .{ j, b });
             const tbase = em.id();
             try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ tbase, brow, PAD });
             const lo = em.id();
@@ -1921,21 +2213,21 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
         try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
     }
 
-    // Out: word w holds rows 2*(w%16), +1 at k = k0 + w/16.
+    // Out: word w holds rows 2*(w%(R/2)), +1 at k = k0 + w/(R/2).
     {
         const half = em.id();
         try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ half, npad });
         const rp0 = em.id();
         try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ rp0, r0 });
-        const L = try em.openLoop("%cu_16", cur);
+        const L = try em.openLoop("%c_h", cur);
         const w0 = em.id();
         try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ w0, L.iv });
         const w = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ w, w0, tid });
         const kk = em.id();
-        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_4", .{ kk, w });
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_lgh", .{ kk, w });
         const rp = em.id();
-        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_15", .{ rp, w });
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_hm1", .{ rp, w });
         const k = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ k, k0, kk });
         const orow = em.id();
@@ -2037,11 +2329,15 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rotate: bool, bf16: bool) ![]align
 /// multiple of 64, m of 128.
 /// GEMM occupancy experiment (lever 1) toggles for the fp8 coop pipeline;
 /// the f16-weight (VAE) pipeline always builds 4-warp/f32-acc since its
-/// padded widths aren't 256-multiples. coop_wgn is the wg tile N width the
-/// dispatch must divide rows by.
+/// padded widths aren't 256-multiples. 8 warps is the preference; a device
+/// whose shared memory cannot hold it gets 4 (`Context.coop_wgn`).
 pub const coop_warps8 = true;
 pub const coop_acc_h16 = true;
-pub const coop_wgn: u32 = if (coop_warps8) 256 else 128;
+
+/// The fp8 GEMM's wg tile N width, which the dispatch divides rows by.
+pub fn coopWgn(warps8: bool) u32 {
+    return if (warps8) 256 else 128;
+}
 
 /// Lanes per subgroup that every coop kernel in this file is authored for:
 /// each shader declares `LocalSize (subgroup_lanes, NWARPS, 1)` so one warp
@@ -2207,10 +2503,9 @@ pub fn buildGemmShared(
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_c = OpTypeArray %{s} %c_arrlen", .{c_elem});
+    try em.line("%arr_c = OpTypeRuntimeArray %{s}", .{c_elem});
     try em.line("%v4u32 = OpTypeVector %u32 4", .{});
-    try em.line("%arr_v4 = OpTypeArray %v4u32 %c_arrlen", .{});
+    try em.line("%arr_v4 = OpTypeRuntimeArray %v4u32", .{});
     try em.line("%sb4 = OpTypeStruct %arr_v4", .{});
     try em.line("%ptr_sb4 = OpTypePointer StorageBuffer %sb4", .{});
     try em.line("%vb4 = OpVariable %ptr_sb4 StorageBuffer", .{});
@@ -2812,11 +3107,15 @@ pub const scores_stage_k = false;
 /// (f32, [z][m_pad][s_stride]). Push (EltPush words): u0 = q row stride
 /// (heads*hd), u1 = s_stride, u2 = head_off, u3 = heads-per-kv group,
 /// u4 = K head stride (hd*s_stride), u5 = S plane stride (m_pad*s_stride).
-/// `hd` (multiple of 16) sets the unrolled k-depth; the DiT uses 128, the
-/// VAE mid-block 384.
+/// `hd` (multiple of 16) sets the k-depth, unrolled to 128 and a loop of four steps
+/// past it; the DiT uses 128, the Wan VAE mid-block 384.
 pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(4) u8 {
     std.debug.assert(hd % 16 == 0 and hd >= 64);
     std.debug.assert(!stage_k or hd % 64 == 0);
+    // Past 128 the k-depth is a loop of four steps: unrolled whole, a head-384 kernel
+    // took a driver that emulates the coop multiply (AMD RDNA2) 78 s to compile.
+    const looped = !stage_k and hd > 128;
+    std.debug.assert(!looped or hd % 64 == 0);
 
     var t: std.ArrayList(u8) = .empty;
     defer t.deinit(gpa);
@@ -2875,14 +3174,14 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
     try em.line("%u32 = OpTypeInt 32 0", .{});
     try em.line("%f16 = OpTypeFloat 16", .{});
     try em.line("%f32 = OpTypeFloat 32", .{});
+    if (looped) try em.line("%bool = OpTypeBool", .{});
     try em.line("%v3u = OpTypeVector %u32 3", .{});
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f16 = OpTypeArray %f16 %c_arrlen", .{});
-    try em.line("%arr_f16s = OpTypeArray %f16 %c_arrlen", .{});
-    try em.line("%arr_u32s = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%arr_f16 = OpTypeRuntimeArray %f16", .{});
+    try em.line("%arr_f16s = OpTypeRuntimeArray %f16", .{});
+    try em.line("%arr_u32s = OpTypeRuntimeArray %u32", .{});
     try em.line("%sk = OpTypeStruct %arr_f16", .{});
     try em.line("%sq = OpTypeStruct %arr_f16", .{});
     try em.line("%ss = OpTypeStruct %arr_f16s", .{});
@@ -3141,6 +3440,77 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
             }
             try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
         }
+    } else if (looped) {
+        const b_base = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b_base, kvmul, col_w });
+        // The values each accumulator leaves an iteration with, named ahead for the phis.
+        var acc_next: [4][4]u32 = undefined;
+        for (&acc_next) |*row| for (row) |*v| {
+            v.* = em.id();
+        };
+        const kofs = em.id();
+        const kofs_next = em.id();
+        try em.line("OpBranch %sc_head", .{});
+        try em.line("%sc_head = OpLabel", .{});
+        try em.line("%t{d} = OpPhi %u32 %c_u0 %entry %t{d} %sc_cont", .{ kofs, kofs_next });
+        var acc_in: [4][4][]const u8 = undefined;
+        for (0..4) |r| for (0..4) |nt| {
+            const ph = em.id();
+            try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %sc_cont", .{ ph, acc_next[r][nt] });
+            acc_in[r][nt] = try nm.f("t{d}", .{ph});
+        };
+        try em.line("OpLoopMerge %sc_merge %sc_cont None", .{});
+        try em.line("OpBranch %sc_body", .{});
+        try em.line("%sc_body = OpLabel", .{});
+        var cur = acc_in;
+        for (0..4) |kk| {
+            const koff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ koff, kofs, c_k16[kk] });
+            const a_off = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a_off, a_base, koff });
+            var ma: [4]u32 = undefined;
+            var ao_cur = a_off;
+            for (0..4) |r| {
+                if (r > 0) {
+                    const a2 = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a2, ao_cur, a_row16 });
+                    ao_cur = a2;
+                }
+                const aptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_sq_f16 %vq %c_u0 %t{d}", .{ aptr, ao_cur });
+                ma[r] = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %pqstride", .{ ma[r], aptr });
+            }
+            const krowmul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ krowmul, koff });
+            const b_ks = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b_ks, b_base, krowmul });
+            for (0..4) |nt| {
+                var b_off = b_ks;
+                if (nt > 0) {
+                    const bo = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ bo, b_ks, c_k16[nt] });
+                    b_off = bo;
+                }
+                const bptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_sk_f16 %vk %c_u0 %t{d}", .{ bptr, b_off });
+                const mb = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %psstride", .{ mb, bptr });
+                for (0..4) |r| {
+                    const acc_out = if (kk == 3) acc_next[r][nt] else em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %{s}", .{ acc_out, ma[r], mb, cur[r][nt] });
+                    cur[r][nt] = try nm.f("t{d}", .{acc_out});
+                }
+            }
+        }
+        try em.line("OpBranch %sc_cont", .{});
+        try em.line("%sc_cont = OpLabel", .{});
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ kofs_next, kofs });
+        const more = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %{s}", .{ more, kofs_next, c_hd });
+        try em.line("OpBranchConditional %t{d} %sc_head %sc_merge", .{more});
+        try em.line("%sc_merge = OpLabel", .{});
+        acc = cur;
     } else {
         const b_base = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b_base, kvmul, col_w });
@@ -3341,11 +3711,10 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]ali
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f16k = OpTypeArray %f16 %c_arrlen", .{});
-    try em.line("%arr_f16q = OpTypeArray %f16 %c_arrlen", .{});
-    try em.line("%arr_f32o = OpTypeArray %f32 %c_arrlen", .{});
-    try em.line("%arr_f16v = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_f16k = OpTypeRuntimeArray %f16", .{});
+    try em.line("%arr_f16q = OpTypeRuntimeArray %f16", .{});
+    try em.line("%arr_f32o = OpTypeRuntimeArray %f32", .{});
+    try em.line("%arr_f16v = OpTypeRuntimeArray %f16", .{});
     try em.line("%sk = OpTypeStruct %arr_f16k", .{});
     try em.line("%sq = OpTypeStruct %arr_f16q", .{});
     try em.line("%so = OpTypeStruct %arr_f32o", .{});
@@ -3961,11 +4330,10 @@ pub fn buildGemmAttnOut(gpa: std.mem.Allocator) ![]align(4) u8 {
     try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
     try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
     try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
-    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
-    try em.line("%arr_f16 = OpTypeArray %f16 %c_arrlen", .{});
-    try em.line("%arr_ss = OpTypeArray %u32 %c_arrlen", .{}); // S words (f16 pairs)
-    try em.line("%arr_o = OpTypeArray %f32 %c_arrlen", .{});
-    try em.line("%arr_md = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_f16 = OpTypeRuntimeArray %f16", .{});
+    try em.line("%arr_ss = OpTypeRuntimeArray %u32", .{}); // S words (f16 pairs)
+    try em.line("%arr_o = OpTypeRuntimeArray %f32", .{});
+    try em.line("%arr_md = OpTypeRuntimeArray %f32", .{});
     try em.line("%v2f16 = OpTypeVector %f16 2", .{});
     try em.line("%ss = OpTypeStruct %arr_ss", .{});
     try em.line("%sv = OpTypeStruct %arr_f16", .{});
@@ -4309,22 +4677,22 @@ test "coop shader emission is byte-stable" {
     try cases.append(gpa, .{
         .name = "gemm_shared fp8",
         .code = try buildGemmShared(gpa, false, coop_warps8, coop_acc_h16, false, false, 16, 16, 64, 64),
-        .want = "c2786ee48ca8e318f75bdfa862a6ef6eb9130607d3fc7c703ab7d2e3282b9262",
+        .want = "51df5d5fde8caa48a7bcb76d1b9a1f4eb36f2dc7f300abc3bd6aa556f692974e",
     });
     try cases.append(gpa, .{
         .name = "gemm_shared f16w",
         .code = try buildGemmShared(gpa, true, false, false, false, false, 16, 16, 64, 64),
-        .want = "278c7aa84da46975c3b74dcb0e295e6cfcd654b94c9513b2543960171fed06f9",
+        .want = "a6687bde152aa1d0a0edd7be5dc1735a4f3fe2ed7057f4830b28c4db669dfe1d",
     });
     try cases.append(gpa, .{
         .name = "gemm_shared c16",
         .code = try buildGemmShared(gpa, false, coop_warps8, true, true, false, 16, 16, 64, 64),
-        .want = "8b40ce8411c0b3666c5512d71701a0bd779dedbbb6ed457ce459c813dbe62b55",
+        .want = "6a6b39b5f06bcd8cff1a82d5aa4716073fea4492c0db1921aae52b8040bc272e",
     });
     try cases.append(gpa, .{
         .name = "gemm_shared bf16w",
         .code = try buildGemmShared(gpa, true, false, false, false, true, 16, 16, 64, 64),
-        .want = "fafef249d33d108b70b7f3209fa342c9b724568f86a48b9b93673a120497d553",
+        .want = "7a6f2762fbd19570f9cb3e0641b8da0bf3622f1fd211e3f0cc15ed5b29db8cb6",
     });
     // The 8x8 fragment shape Intel Alchemist advertises. Same warp tile, so this is
     // the same GEMM expressed as 8x8 fragments instead of 4x4; pinned separately
@@ -4332,45 +4700,52 @@ test "coop shader emission is byte-stable" {
     try cases.append(gpa, .{
         .name = "gemm_shared f16w 8x8",
         .code = try buildGemmShared(gpa, true, false, false, false, false, 8, 8, 64, 64),
-        .want = "5b3e783096338046be35aeba89487061acd0617351dd38c3c9fa375e3781fdaf",
+        .want = "b2102c64436000d3c0afa8d8a0a1ecd07ea84cd96dafd3d9ce8b13a3af8ab18e",
     });
     try cases.append(gpa, .{
         .name = "gemm_shared fp8 8x8",
         .code = try buildGemmShared(gpa, false, coop_warps8, false, false, false, 8, 8, 64, 64),
-        .want = "62ca8c86917bfc3995598c298de4990ff736443f327ad05e2b7fbf77443f3db9",
+        .want = "f1e1269eebd0c8239622573140018614e68fe15a471f3706c7f7ce012d7fd6d4",
     });
     // The 8x8x32 s8 shape Intel Alchemist advertises, at the tiles it can express.
     for ([_]struct { u32, u32, []const u8 }{
-        .{ 64, 64, "2627494dfe891f4cd8d1070d356e730f1d7e3db6c7500bc6fcb357ee38ec4ae7" },
-        .{ 32, 32, "29700b24c47b173b471752ef40bac41028e367ef85e727f63d83bab4becd5d43" },
-        .{ 16, 16, "a5233d78fed9fa0fc92b74fa0af632f38b2d518082126488959fad36c17a5f1b" },
+        .{ 64, 64, "190f602ee2f52daf990b7573eeaf7bba885573c7253408dce7951ae7ee069a26" },
+        .{ 32, 32, "923ca8a5b2639f2b2d78d52aedccd77720aedbfbf2c9610920226a890378ffb6" },
+        .{ 16, 16, "136fc65f47b263e11f87d07fe70dd13bb0646d0cac6ddece4a28d339f54df087" },
     }) |wt| {
         try cases.append(gpa, .{
             .name = "gemm_shared_i8 8x8",
-            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, true, coop_i8_double_buf, false, 8, 8, wt[0], wt[1]),
+            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, true, coop_i8_double_buf, false, 8, 8, 32, wt[0], wt[1]),
             .want = wt[2],
         });
     }
     try cases.append(gpa, .{
         .name = "gemm_i8",
         .code = try buildGemmI8(gpa, i8_mt, i8_nt),
-        .want = "35eab5702972e7bd98043ce570f308065d17ef2e05405fab38678d4b1d44ee01",
+        .want = "6601af7dbe80e69df1cfebf3237bb7f9edc78ee0f6757dd8e95c7b7c52cd5289",
     });
     for ([_]struct { bool, bool, []const u8, []const u8 }{
-        .{ false, false, "gemm_shared_i8 raw", "2b8c4c230568e15db93662b729ad652f34c1301eca1721db6e27808c741b4b5e" },
-        .{ true, false, "gemm_shared_i8 fused f32", "746a233b34f14921de994138152fc659fe63e26d8858d60b9e1f1c77c2982ac7" },
-        .{ true, true, "gemm_shared_i8 fused f16", "47aeeb001fc44e5b28a667902f18b89401dfd60f676e6a98e254a61a49edda15" },
+        .{ false, false, "gemm_shared_i8 raw", "08495ca4b06c5c03ec6c2c920f4e600f925664f908f7b881cadd50a6345aafd3" },
+        .{ true, false, "gemm_shared_i8 fused f32", "1922138372063a5582a09245accf438e1830806a63104f325581c08a95da8ddb" },
+        .{ true, true, "gemm_shared_i8 fused f16", "3e4f366a09ffdd52596a33a2576a4d7e5c967eed1bf2382f35fe05dc64d59cae" },
     }) |v| {
         try cases.append(gpa, .{
             .name = v[2],
-            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, v[0], coop_i8_double_buf, v[1], 16, 16, 64, 64),
+            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, v[0], coop_i8_double_buf, v[1], 16, 16, 32, 64, 64),
             .want = v[3],
         });
     }
+    // The 16x16x16 s8 config AMD RDNA2's Windows driver advertises: four 16-deep
+    // sub-steps per slab instead of two. Checked against the CPU by `gpu-i8-test` there.
+    try cases.append(gpa, .{
+        .name = "gemm_shared_i8 k16",
+        .code = try buildGemmSharedI8(gpa, coop_i8_warps8, false, coop_i8_double_buf, false, 16, 16, 16, 64, 64),
+        .want = "e8f53bfff8025cc450f6d8fdbbfac4eea68ef96ddf116a3b9d48fd952287ac9a",
+    });
     for ([_]struct { u32, []const u8, []const u8 }{
-        .{ 128, "gemm_scores 128", "75c1f20e4a67ceda7292df970a619549e0b70c8c4ee1baf97370a615d4cf1fd9" },
-        .{ 384, "gemm_scores 384", "e387f23ee3825ac12ae6f75b4e2c5c4e5428c92c8f0ffcbf12e89cc57d35661a" },
-        .{ 512, "gemm_scores 512", "5f6c156cb98a0c80451c3f18d7d73d8d82e1b799db74aac874f168380d0050fd" },
+        .{ 128, "gemm_scores 128", "758279393deaf4eb95de8069e9cb99864041b2d8015f1b6f46fdd036a9373dfe" },
+        .{ 384, "gemm_scores 384", "a6efff371bf582449150b1c5f6f4240668e0e66d4440336c2fc4f07dd929590b" },
+        .{ 512, "gemm_scores 512", "2695efd8803612c4e5b3bd94b40d2760a1126e9447ebdeba8188871350d76407" },
     }) |v| {
         try cases.append(gpa, .{
             .name = v[1],
@@ -4379,34 +4754,34 @@ test "coop shader emission is byte-stable" {
         });
     }
     for ([_]struct { u32, []const u8, []const u8 }{
-        .{ 2048, "fused_prep_i8 2048", "96f313a4f9f4d8e7e8068f4b9990347c8bb7026c5030bb7234f0bdf652ffce8d" },
-        .{ 3072, "fused_prep_i8 3072", "10e988924e34d7c57549af3a72f8288a88d17aae9807bde0c1204445b05cf10d" },
-        .{ 5376, "fused_prep_i8 5376", "ac4f433c5d8eab81805ed67839346503394af5d6fa7d5460b703fe9a4aa69097" },
-        .{ 6144, "fused_prep_i8 6144", "d9f8efb262c3403e1a26db9dba06eec3b8f4fd5de60de0f15a64d6ace9423001" },
-        .{ 8192, "fused_prep_i8 8192", "460776782a523eb305009cb7a2abd5bf8dc47bf6d6bdf58acdcb09238e360f2d" },
-        .{ 12288, "fused_prep_i8 12288", "490843d2e0872249a21ab79ffc357001c465112bd94fdf59739dd8a044d0d6dd" },
-        .{ 16384, "fused_prep_i8 16384", "3558df44130348cc8981ab8e71642eb094436eb9d73a41eb90bcd9d08966f5a7" },
+        .{ 2048, "fused_prep_i8 2048", "35cbcd01d8c68eedf2b00b261e37003f9fc10a72195fd5af3e7ae9ebae42658d" },
+        .{ 3072, "fused_prep_i8 3072", "9a8560757a97089620c8d9f9593b4eff079a90d4b84db7bc574dfe7440e164de" },
+        .{ 5376, "fused_prep_i8 5376", "17ec2a63a4cea53f9436a2dee8d7a9c5bd4768cf3ba9a4b8afba738929b92b7b" },
+        .{ 6144, "fused_prep_i8 6144", "7489da9d856ec7fe5aecc523bcd683d9f8c5673c1b7f4d4880cc6cf4c2bcaf6c" },
+        .{ 8192, "fused_prep_i8 8192", "7745e2f172d5c8070d311ff21f5f10f5d6be8278eb2650a31c70ffb96d652f78" },
+        .{ 12288, "fused_prep_i8 12288", "eee78cf6a39edc00d9b191c78882a5c1609b52682786d6ddad3b669419cc152b" },
+        .{ 16384, "fused_prep_i8 16384", "347c31266473cb48fdc64abc6a0f80065eb4205201bded1c4d5b9361d1c2fccb" },
     }) |v| {
         try cases.append(gpa, .{
             .name = v[1],
-            .code = try buildFusedPrepI8(gpa, v[0]),
+            .code = try buildFusedPrepI8(gpa, v[0], 48 * 1024),
             .want = v[2],
         });
     }
     try cases.append(gpa, .{
         .name = "flash_md",
         .code = try buildFlashMd(gpa),
-        .want = "4207c924485f0407b58167d51ecabfd1d90253fc68bca23361c95588bbc1e2ef",
+        .want = "e5fc94d24622f2e6ac0413cd8f4af097330d6b903c9f4b8cc39cfd5d784f2631",
     });
     try cases.append(gpa, .{
         .name = "flash_out",
         .code = try buildFlashOut(gpa),
-        .want = "cda1b5c50c4e47648a3d69e259ef81ff568781c85da303c3016c0b139b435197",
+        .want = "d3b1691eaa68ed399f7514094116254fcd2ae484045683f42756a87b8bf88ade",
     });
     try cases.append(gpa, .{
         .name = "gemm_attn_out",
         .code = try buildGemmAttnOut(gpa),
-        .want = "c2273b7916fde84a39a359820e50174ddf05dfb5f4f4ecf868e49af2b577ab3f",
+        .want = "2e9f641f1d248d3702d2571c693ee79661f24a17bdef954bcb72c2dd055e9616",
     });
 
     var changed: usize = 0;
@@ -4421,3 +4796,22 @@ test "coop shader emission is byte-stable" {
     }
     try std.testing.expectEqual(@as(usize, 0), changed);
 }
+
+test "every plan fusedPrepPlan offers builds, fits, and covers the row" {
+    const gpa = std.testing.allocator;
+    for ([_]u64{ 16 * 1024, 32 * 1024, 48 * 1024, 64 * 1024 }) |max_shared| {
+        for (1..129) |ng| {
+            const cols: u32 = @intCast(ng * 256);
+            const plan = fusedPrepPlan(cols, max_shared) orelse continue;
+            errdefer std.debug.print("cols {d} max_shared {d}: {any}\n", .{ cols, max_shared, plan });
+            try std.testing.expect(plan.ch * plan.nc >= ng);
+            try std.testing.expect(plan.padded or plan.ch * plan.nc == ng);
+            const code = try buildFusedPrepI8(gpa, cols, max_shared);
+            defer gpa.free(code);
+            try std.testing.expect(try spv_mod.workgroupBytes(gpa, code) <= max_shared);
+        }
+    }
+    // The widths with no even split that real encoders use.
+    for ([_]u32{ 2816, 9728, 25600 }) |cols| try std.testing.expect(fusedPrepPlan(cols, 32 * 1024).?.padded);
+}
+

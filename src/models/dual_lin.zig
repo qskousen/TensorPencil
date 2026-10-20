@@ -22,6 +22,8 @@ pub const DType = lin.DType;
 pub const Route = enum {
     /// Dense weights in their own width. `gemm_bf16` takes the bf16 tensor cores
     /// where the backend has them and the shape tiles, the f16 GEMM otherwise.
+    /// `gemm_f32` also takes an f16 or bf16 weight, widened, on a backend with no
+    /// 16-bit GEMM (`wideGemm`).
     gemm_f32,
     gemm_f16,
     gemm_bf16,
@@ -45,6 +47,8 @@ pub const Route = enum {
     gemv_fp8n,
     gemv_f32,
     gemv_f32n,
+    /// A skinny f32 weight (a router), one subgroup a row over every activation row.
+    gemv_f32_rows,
     /// Integer convrot and NVFP4. `_wo` expands the weight to bf16 per call against
     /// the unquantized activation (`IntGemm.weight_only`).
     i8,
@@ -83,13 +87,15 @@ pub const Route = enum {
     gemv_dual_q8,
     gemv_dual,
     gemv_dualn,
+    /// `gemv_dualn` against the q8_1 activation, each row bit-identical to `gemv_dual_q8`.
+    gemv_dualn_q8,
 
     pub fn prep(r: Route) Prep {
         return switch (r) {
             .i8, .w4a8, .i4_i8, .blockq_i8 => .i8,
             .i4, .blockq_i4 => .i4,
             .blockq_mmq => .mmq,
-            .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8 => .q8,
+            .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8, .gemv_dualn_q8 => .q8,
             else => .none,
         };
     }
@@ -377,8 +383,8 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
     };
     if (!pol.gemv) return switch (w.dtype) {
         .f32 => .gemm_f32,
-        .f16 => if (caps.denseGemm(.f16)) .gemm_f16 else null,
-        .bf16 => if (caps.denseGemm(.bf16)) .gemm_bf16 else null,
+        .f16 => if (caps.denseGemm(.f16)) .gemm_f16 else if (caps.wideGemm()) .gemm_f32 else null,
+        .bf16 => if (caps.denseGemm(.bf16)) .gemm_bf16 else if (caps.wideGemm()) .gemm_f32 else null,
         .f8_e4m3 => fp8Route(C, caps, w, pol),
         else => unreachable,
     };
@@ -390,11 +396,13 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
             .gemv_bf16n
         else if (caps.denseGemmTakes(w))
             .gemm_bf16
+        else if (caps.wideGemm())
+            .gemm_f32
         else
             null,
         .f16 => if (m == 1 and caps.gemvF16())
             .gemv_f16
-        else if (caps.denseGemm(.f16) and w.cols % 32 == 0) .gemm_f16 else null,
+        else if (caps.denseGemm(.f16) and w.cols % 32 == 0) .gemm_f16 else if (caps.wideGemm()) .gemm_f32 else null,
         .f8_e4m3 => if (m == 1)
             .gemv_fp8
         else if (m <= dense_grouped_max and grouped)
@@ -406,9 +414,11 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
         else if (grouped) .gemv_fp8n else null,
         .f32 => if (!caps.gemvF32())
             .gemm_f32
+        else if (caps.f32Rows(w, m))
+            .gemv_f32_rows
         else if (m == 1)
             .gemv_f32
-        else if (m <= dense_grouped_max) .gemv_f32n else .gemm_f32,
+        else if (m <= dense_grouped_max and grouped) .gemv_f32n else .gemm_f32,
         else => unreachable,
     };
 }
@@ -420,16 +430,18 @@ fn intRoute(comptime C: type, caps: C, pol: Policy, q: Route, wo: [3]Route) ?Rou
     return if (caps.i8Gemm()) q else null;
 }
 
-/// The weight-only route at the width `pol.int8` asks for, `wo` = { bf16, f16, f32 }; null
-/// where the backend has none, so a plan refuses it by name rather than running another
-/// precision than the one asked for.
+/// The weight-only route at the width `pol.int8` asks for, `wo` = { bf16, f16, f32 }. A
+/// 16-bit width the device has no GEMM for takes f32, which has both its range and its
+/// precision; null only where there is no f32 either, so a plan refuses it by name.
 fn woRoute(comptime C: type, caps: C, pol: Policy, wo: [3]Route) ?Route {
-    return switch (pol.int8) {
+    const i: usize = switch (pol.int8) {
         .w8a8 => unreachable,
-        .weight_only => if (caps.intWeightOnly()) wo[0] else null,
-        .weight_only_f16 => if (caps.intWeightOnly()) wo[1] else null,
-        .weight_only_f32 => if (caps.intWeightOnly32()) wo[2] else null,
+        .weight_only => 0,
+        .weight_only_f16 => 1,
+        .weight_only_f32 => 2,
     };
+    if (caps.intWeightOnly(pol.int8)) return wo[i];
+    return if (caps.intWeightOnly(.weight_only_f32)) wo[2] else null;
 }
 
 /// fp8 as a batch: staged at the width `Act16` asks for, or against the f32 activation
@@ -481,8 +493,10 @@ fn blockQGemv(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rout
         // blocks; its q8 twin needs the staged activation of a single row. A row that
         // is not takes the GEMM even at one row.
         if (w.cols % dt.blockElems() == 0) {
-            if (m == 1) return if (pol.decode_dp4a and caps.dualQ8(dt)) .gemv_dual_q8 else .gemv_dual;
-            if (caps.dualN(dt) and m <= grouped_max) return .gemv_dualn;
+            // A batch takes decode's activation, so a verify reproduces it.
+            const q8 = pol.decode_dp4a and caps.dualQ8(dt);
+            if (m == 1) return if (q8) .gemv_dual_q8 else .gemv_dual;
+            if (caps.dualN(dt) and m <= grouped_max) return if (q8) .gemv_dualn_q8 else .gemv_dualn;
         }
         return if (caps.quantKernel(dt)) .blockq_f16 else null;
     }

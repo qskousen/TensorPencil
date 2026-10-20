@@ -1,22 +1,13 @@
-//! Gemma 4 `gemma4v` vision tower forward on the CUDA backend: the 27-block
-//! SigLIP encoder (patch embed, learned 2-D position add, blocks) runs
-//! device-side; the cheap projector (3x3 avg-pool merge, std affine, weightless
-//! RMSNorm, input projection) runs on the host via gemma4v_vit.Vit.project.
-//! Mirrors gemma_vit_cuda, plus gemma4v's extras: per-head QK-RMSNorm (qkNorm),
-//! a 2-D neox vision RoPE (opRopeVisionGemma4), a weightless V-RMSNorm (qkNorm
-//! with a shared ones buffer), attention scale = 1.0, and a GeGLU-quick FFN
-//! (geluQuickMul). All RMS norms go through qkNorm (row = whole `dim`).
-//!
-//! The 72-dim heads are zero-padded to 128 on device (head_pad) for the
-//! tensor-core attention, matching gemma_vit_cuda. Block weights are Q8_0
-//! (dequant->f16 GEMM via opMatmulQuant) except ffn_down (F16, opMatmulF16);
-//! the patch kernel is f32 (opConvF16). ViT weights + scratch are scoped and
-//! released after encoding. Numerics differ from the CPU path only by the f16
-//! GEMM regime (validated cos > 0.999 vs CPU).
+//! The Gemma 4 `gemma4v` vision tower on CUDA: the adapter for `gemma4v_vit_dev.zig`.
+//! The 72-dim heads are zero-padded to 128 (head_pad) for the tensor-core attention;
+//! the pads are exact zeros on both sides of the scores. ViT weights and scratch are
+//! scoped and released after encoding. Numerics differ from the CPU path only by the
+//! f16 GEMM regime, which compounds through the 27 blocks (see the test).
 
 const std = @import("std");
 const lin_cuda = @import("lin_cuda.zig");
 const gemma4v_vit = @import("gemma4v_vit.zig");
+const gemma4v_vit_dev = @import("gemma4v_vit_dev.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -25,22 +16,10 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// GEMM in the weight's storage dtype (all gemma4v matmuls are bias-free):
-/// y[m][w.rows] = x @ Wᵀ. Q8_0 blocks dequant->f16 (opMatmulQuant, pads output
-/// rows to /128, see buffer sizing); F16 ffn_down straight; f32 patch via conv.
-/// The f16/bf16/f32 paths ADD a bias unconditionally (bias_compact asserts
-/// bias.len==w.rows), so a length-`w.rows` zero slice stands in for the absent
-/// gemma4v biases; the quant path takes no bias.
-fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, zero: []const f32) !void {
-    _ = zero;
-    try lin_cuda.towerLinear(be, dst, src, m, w, null, null);
-}
-
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
 }
 
-/// A norm weight as a cached small device buffer (weightless V-norm uses `ones`).
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
 }
@@ -48,144 +27,129 @@ fn nbuf(be: *Backend, weights: []const f32) !Buf {
 /// Encode interleaved RGB pixels to Gemma 4 image-token embeddings on CUDA.
 /// Same contract as gemma4v_vit.Vit.encode.
 pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
-    const cfg = vit.cfg;
-    const dim = cfg.dim;
-    const heads = cfg.n_heads;
-    const hd = cfg.headDim(); // 72
-    const hd_pad = std.mem.alignForward(usize, hd, 128); // 128
-    const half = hd / 4; // 18 rope pairs per axis (span = hd/2)
-    const kdim = 3 * cfg.patch * cfg.patch;
-
-    var prep = try vit.prepare(gpa, rgb, width, height);
-    defer prep.deinit(gpa);
-    const gx = prep.gx;
-    const gy = prep.gy;
-    const np = gx * gy;
-    // opMatmulQuant pads its output rows to /128, so GEMM-output buffers reserve
-    // the padded height (only the first np rows are read downstream).
-    const mpad = std.mem.alignForward(usize, np, 128);
-
-    const pos_rows = try vit.posEmbedRows(gpa, gx, gy);
-    defer gpa.free(pos_rows);
-
-    // 2-D neox RoPE tables (span rope over hd/2, theta 100) + per-token (x, y).
-    const max_pos = @max(gx, gy);
-    const sin_off = max_pos * half;
-    var freqs = try ops.rope.rotateHalfFreqs(gpa, max_pos, hd / 2, cfg.rope_theta);
-    defer freqs.deinit(gpa);
-    const pos2 = try gpa.alloc(u32, np * 2);
-    defer gpa.free(pos2);
-    for (0..np) |t| {
-        pos2[t * 2] = @intCast(t % gx); // x -> span 0
-        pos2[t * 2 + 1] = @intCast(t / gx); // y -> span 1
-    }
-
     be.weightScopeBegin();
     defer {
         be.weightScopeEnd();
         be.freeAttnScratch();
         be.freeConvScratch();
     }
-
-    // Weightless V-norm weight (ones over head_dim), and the rope/pos2 uploads.
-    const ones_host = try gpa.alloc(f32, hd);
-    defer gpa.free(ones_host);
-    @memset(ones_host, 1.0);
-    const ones_d = try nbuf(be, ones_host);
-
-    // Zero bias for the bias-less f16/f32 GEMMs (patch embed, ffn_down); length
-    // dim covers every such weight's w.rows.
-    const zeros = try gpa.alloc(f32, dim);
-    defer gpa.free(zeros);
-    @memset(zeros, 0.0);
-
-    var freqs_v = try be.tensorCreate(2 * sin_off * 4);
-    defer be.tensorDestroy(&freqs_v);
-    const freqs_buf = freqs_v;
-    var pos2_v = try be.tensorCreate(np * 2 * 4);
-    defer be.tensorDestroy(&pos2_v);
-    const pos2_d = pos2_v;
-    try be.tensorUpload(sized(freqs_buf, 0, sin_off * 4), std.mem.sliceAsBytes(freqs.cos));
-    try be.tensorUpload(sized(freqs_buf, sin_off * 4, sin_off * 4), std.mem.sliceAsBytes(freqs.sin));
-    try be.tensorUpload(pos2_d, std.mem.sliceAsBytes(pos2));
-
-    var bufs: [8]Buf = @splat(.{});
-    defer for (&bufs) |*b| be.tensorDestroy(b);
-    const sizes = [bufs.len]usize{
-        np * dim, // x (residual stream; conv + add only)
-        np * dim, // normed / compacted attn output / gemm input
-        mpad * dim, // proj (raw q/k/v projection; also patch upload np*kdim)
-        np * heads * hd_pad, // q (padded heads)
-        np * heads * hd_pad, // k
-        np * heads * hd_pad, // v
-        mpad * cfg.ffn, // big: FFN gate hidden (also attn out heads*hd_pad)
-        mpad * cfg.ffn, // up: FFN up hidden
-    };
-    for (&bufs, sizes) |*b, size| b.* = try be.tensorCreate(size * 4);
-    const x_d = bufs[0];
-    const normed_d = bufs[1];
-    const proj_d = bufs[2];
-    const q_d = bufs[3];
-    const k_d = bufs[4];
-    const v_d = bufs[5];
-    const big_d = bufs[6];
-    const up_d = bufs[7];
-    // t (residual delta / ffn_down out) reuses `up` after the gate is consumed;
-    // give it a dedicated buffer for clarity (dim <= ffn).
-    var t_v = try be.tensorCreate(mpad * dim * 4);
-    defer be.tensorDestroy(&t_v);
-    const t_d = t_v;
-
-    try be.beginBatch();
-    errdefer if (be.batching()) be.abortBatch();
-
-    // Patch embed (f32 conv) + learned 2-D position add.
-    try be.tensorUpload(sized(proj_d, 0, np * kdim * 4), std.mem.sliceAsBytes(prep.patches));
-    try gemm(be, x_d, proj_d, np, Weight.fromF32(vit.patch_w, dim, kdim), zeros);
-    try be.tensorUpload(sized(t_d, 0, np * dim * 4), std.mem.sliceAsBytes(pos_rows));
-    try be.opAdd(x_d, t_d, np * dim);
-
-    for (vit.blocks) |*blk| {
-        // --- attention ---
-        try be.qkNorm(x_d, normed_d, try nbuf(be, blk.ln1_w), np, dim, cfg.eps);
-        // Q/K: project -> per-head QK-norm -> 2-D RoPE -> pad heads to 128.
-        try gemm(be, proj_d, normed_d, np, blk.q, zeros);
-        try be.qkNorm(proj_d, proj_d, try nbuf(be, blk.q_norm), np * heads, hd, cfg.eps);
-        try be.opRopeVisionGemma4(proj_d, pos2_d, freqs_buf, np, heads, half, sin_off, hd);
-        try be.opHeadPad(q_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        try gemm(be, proj_d, normed_d, np, blk.k, zeros);
-        try be.qkNorm(proj_d, proj_d, try nbuf(be, blk.k_norm), np * heads, hd, cfg.eps);
-        try be.opRopeVisionGemma4(proj_d, pos2_d, freqs_buf, np, heads, half, sin_off, hd);
-        try be.opHeadPad(k_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        // V: project -> weightless per-head RMS -> pad.
-        try gemm(be, proj_d, normed_d, np, blk.v, zeros);
-        try be.qkNorm(proj_d, proj_d, ones_d, np * heads, hd, cfg.eps);
-        try be.opHeadPad(v_d, proj_d, np, heads, hd_pad, hd, dim, 0);
-        // Non-causal attention, scale = 1.0 (gemma4v).
-        try be.opAttnTC(q_d, k_d, v_d, big_d, np, heads, heads, hd_pad, 1.0);
-        try be.opHeadPad(normed_d, big_d, np, heads, hd, hd_pad, heads * hd_pad, 0);
-        try gemm(be, t_d, normed_d, np, blk.out, zeros);
-        try be.qkNorm(t_d, t_d, try nbuf(be, blk.attn_post_norm_w), np, dim, cfg.eps);
-        try be.opAdd(x_d, t_d, np * dim);
-
-        // --- FFN (GeGLU-quick) ---
-        try be.qkNorm(x_d, normed_d, try nbuf(be, blk.ln2_w), np, dim, cfg.eps);
-        try gemm(be, big_d, normed_d, np, blk.gate, zeros);
-        try gemm(be, up_d, normed_d, np, blk.up, zeros);
-        try be.geluQuickMul(big_d, up_d, np * cfg.ffn);
-        try gemm(be, t_d, big_d, np, blk.down, zeros);
-        try be.qkNorm(t_d, t_d, try nbuf(be, blk.ffn_post_norm_w), np, dim, cfg.eps);
-        try be.opAdd(x_d, t_d, np * dim);
-    }
-    try be.endBatch();
-
-    // Download the post-block patch states; the projector (pool, std affine,
-    // RMS, input projection) runs on the host via the shared gemma4v_vit path.
-    const x_host = try gpa.alloc(f32, np * dim);
-    defer gpa.free(x_host);
-    try be.tensorDownload(sized(x_d, 0, np * dim * 4), std.mem.sliceAsBytes(x_host));
-    return vit.project(io, gpa, x_host, gx, gy);
+    var d: Dev = .{ .be = be, .cfg = vit.cfg };
+    defer d.deinit();
+    return gemma4v_vit_dev.encode(&d, vit, io, gpa, rgb, width, height);
 }
+
+const Bufs = struct { x: Buf = .{}, normed: Buf = .{}, proj: Buf = .{}, big: Buf = .{}, up: Buf = .{}, t: Buf = .{} };
+
+/// The `gemma4v_vit_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    cfg: gemma4v_vit.Config,
+    b: Bufs = .{},
+    q: Buf = .{},
+    k: Buf = .{},
+    v: Buf = .{},
+    ones: Buf = .{},
+    freqs: Buf = .{},
+    pos2: Buf = .{},
+    sin_off: usize = 0,
+
+    fn deinit(d: *Dev) void {
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.proj, &d.b.big, &d.b.up, &d.b.t, &d.q, &d.k, &d.v, &d.ones, &d.freqs, &d.pos2 }) |b| d.be.tensorDestroy(b);
+    }
+
+    fn hdPad(d: *const Dev) usize {
+        return std.mem.alignForward(usize, d.cfg.headDim(), 128);
+    }
+
+    /// The buffers for a `gx` x `gy` grid, the rope tables and the per-token positions.
+    /// GEMM outputs reserve rows to a multiple of 128 (opMatmulQuant pads its output).
+    pub fn setup(d: *Dev, gpa: std.mem.Allocator, gx: usize, gy: usize) !void {
+        const cfg = d.cfg;
+        const be = d.be;
+        const np = gx * gy;
+        const mpad = std.mem.alignForward(usize, np, 128);
+        const hp = cfg.n_heads * d.hdPad();
+        const hd = cfg.headDim();
+        var rope = try gemma4v_vit_dev.Rope.init(gpa, cfg, gx, gy);
+        defer rope.deinit(gpa);
+        const ones = try gpa.alloc(f32, hd);
+        defer gpa.free(ones);
+        @memset(ones, 1.0);
+        d.ones = try be.tensorCreate(hd * 4);
+        try be.tensorUpload(d.ones, std.mem.sliceAsBytes(ones));
+        d.sin_off = rope.sin_off;
+        d.freqs = try be.tensorCreate(rope.table.len * 4);
+        d.pos2 = try be.tensorCreate(rope.pos2.len * 4);
+        try be.tensorUpload(sized(d.freqs, 0, rope.sin_off * 4), std.mem.sliceAsBytes(rope.table[0..rope.sin_off]));
+        try be.tensorUpload(sized(d.freqs, rope.sin_off * 4, rope.sin_off * 4), std.mem.sliceAsBytes(rope.table[rope.sin_off..]));
+        try be.tensorUpload(d.pos2, std.mem.sliceAsBytes(rope.pos2));
+        const sizes = [_]usize{ np * cfg.dim, np * cfg.dim, mpad * cfg.dim, mpad * cfg.ffn, mpad * cfg.ffn, mpad * cfg.dim, np * hp, np * hp, np * hp };
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.proj, &d.b.big, &d.b.up, &d.b.t, &d.q, &d.k, &d.v }, sizes) |b, n| b.* = try be.tensorCreate(n * 4);
+    }
+
+    pub fn beginBatch(d: *Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: *Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: *Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {
+        try d.be.tensorUpload(sized(b, 0, data.len * 4), std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: *Dev, b: Buf, dst: []f32) !void {
+        try d.be.tensorDownload(sized(b, 0, dst.len * 4), std.mem.sliceAsBytes(dst));
+    }
+
+    /// In the weight's storage dtype; every gemma4v linear is bias-free.
+    pub fn linear(d: *Dev, y: Buf, x: Buf, m: usize, w: Weight) !void {
+        try lin_cuda.towerLinear(d.be, y, x, m, w, null, null);
+    }
+
+    pub fn rms(d: *Dev, x: Buf, y: Buf, w: []const f32, rows: usize, dim: usize) !void {
+        try d.be.qkNorm(x, y, try nbuf(d.be, w), rows, dim, d.cfg.eps);
+    }
+
+    pub fn add(d: *Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn geluQuickMul(d: *Dev, g: Buf, u: Buf, n: usize) !void {
+        try d.be.geluQuickMul(g, u, n);
+    }
+
+    /// Each of q and k projected, per-head normed, roped and padded to 128; v projected,
+    /// unit-normed and padded; the tensor-core attention at scale 1.0, compacted back to
+    /// 72-wide heads in `normed`.
+    pub fn attention(d: *Dev, blk: *const gemma4v_vit.Block, np: usize) !Buf {
+        const cfg = d.cfg;
+        const be = d.be;
+        const dim = cfg.dim;
+        const heads = cfg.n_heads;
+        const hd = cfg.headDim();
+        const hd_pad = d.hdPad();
+        const half = hd / 4;
+        const b = d.b;
+        for ([2]*const Weight{ &blk.q, &blk.k }, [2][]const f32{ blk.q_norm, blk.k_norm }, [2]Buf{ d.q, d.k }) |w, nw, dst| {
+            try d.linear(b.proj, b.normed, np, w.*);
+            try be.qkNorm(b.proj, b.proj, try nbuf(be, nw), np * heads, hd, cfg.eps);
+            try be.opRopeVisionGemma4(b.proj, d.pos2, d.freqs, np, heads, half, d.sin_off, hd);
+            try be.opHeadPad(dst, b.proj, np, heads, hd_pad, hd, dim, 0);
+        }
+        try d.linear(b.proj, b.normed, np, blk.v);
+        try be.qkNorm(b.proj, b.proj, d.ones, np * heads, hd, cfg.eps);
+        try be.opHeadPad(d.v, b.proj, np, heads, hd_pad, hd, dim, 0);
+        try be.opAttnTC(d.q, d.k, d.v, b.big, np, heads, heads, hd_pad, 1.0);
+        try be.opHeadPad(b.normed, b.big, np, heads, hd, hd_pad, heads * hd_pad, 0);
+        return b.normed;
+    }
+};
 
 // --- tests -----------------------------------------------------------------
 

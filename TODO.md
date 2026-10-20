@@ -56,8 +56,11 @@
        (`vk-wo-bench`), and the pack is no longer the cost. The f16/bf16 coop GEMM's own
        rate (~50 of the card's ~71 at f32 accumulate) is the lever. It is also 61% of a
        1024² Wan decode on Vulkan now that the conv gathers into its operand.
-     - Vulkan's fused int8 prep at 25600 (four chunks) rotates twice at 99 GB/s; it runs
-       only under an explicit W8A8 on a 32B encoder.
+     - Vulkan's fused int8 prep at 25600 (four padded chunks) rotates twice, 242 GB/s on the
+       3090 and 160 on the RX 6800 XT; it runs only under an explicit W8A8 on a 32B encoder.
+     - `opMatmulIntWoF32` (W8A32, an explicit `--dit-act f32` on an integer checkpoint)
+       rotates the whole WEIGHT per GEMM through `rotate_fwht`, one thread per group, which
+       spills its 256 floats to scratch: the slow kernel the activation prep no longer uses.
      - LLM parity, warm (`tp-llm --bench`, 1309-token prompt, greedy ids identical):
        Qwen3-4B q4_k: Vulkan pp 1951 / tg 63 (`qwen3_gpu`, one batched forward at any
        position, 2048-row chunks); Qwen3.5-9B q6_k: Vulkan pp 1074 / tg 37.5, CUDA 1550 /
@@ -313,11 +316,7 @@
   for busy time), with two caveats worth knowing: the busy figure is THIS PROCESS's, not
   the whole card's, so another program's work on a shared GPU is invisible; and i915's
   counter overshoots (107% measured), so it is clamped. Remote host gaps: the token sits
-  in the settings file in plaintext (a `token_file` per host, or a keychain shim, would move it); and on
-  Windows std's TLS client falls back to the OS certificate store when the pinned
-  bundle lacks the presented issuer, so there a peer with any OS-trusted certificate
-  gets past the pin and is sent the token (tls.zig's client, which has no such
-  fallback, is the strict alternative; Linux and macOS pin strictly today). A remote
+  in the settings file in plaintext (a `token_file` per host, or a keychain shim, would move it). A remote
   host has no `--idle-exit`, and one client at a time is still the rule. Model sync is
   one direction only (client to host) and offers just the image checkpoint, not its
   side files or LoRAs; a host never asks for a file, and nothing removes one
@@ -345,6 +344,31 @@
   rules that out). It does not move the full-render figure, but nothing explains it. At
   all 42 layers it fails the check's bound (8.2e-2 against 4.4e-2 on cuda, f32), which was
   fitted to 32 layers
+- tp-gui chat runs every arch on Vulkan. There is no CPU arm: `chat.zig` refuses `.cpu`. A
+  new stepper joins `Arch` only once `llm/stepper.zig`'s ledger line for it is empty.
+- k2-horizon on Vulkan decodes at 85% of CUDA (BACKEND.md 9). What is left is GPU kernel
+  time, the q6_k `_sdot` GEMVs below half the card's bandwidth at its shapes; `gemvx`
+  reading each weight row once for several of an expert's rows would let device routing
+  take batches past 64.
+- `k2.HostCost` compares a 128-row CPU pass against one unoverlapped stage; CUDA's staging
+  overlaps compute at large batches, so between ~100 and ~200 rows it may pick the CPU
+  where staging was cheaper. Unmeasured.
+- Vulkan fp8 on a device that flushes f16 subnormals (`fp8_wide`) expands every weight to
+  f16 per GEMM and runs without krea2's staged paths: 3.51 s a forward on the RX 6800 XT,
+  0.97 on the 3090 forced, against 0.61 for the folded GEMM there. The fp8 coop kernel with
+  a device-screened warp tile (its tile is fixed at 64x64, and with f32 accumulators it was
+  4x slower than the f32 GEMM on that card) would read 1-byte weights and skip the expansion.
+- sensenova: int4 convrot is the FORMAT, not the file or the reader (ggufy's bytes equal
+  comfy_kitchen's; our GEMM equals its decode to 2e-6). Two separate costs: the WEIGHTS of
+  the gen copy's `mlp_mot_gen.gate_proj` / `up_proj` (ggufy rule file keeping them and
+  `mlp.down_proj` at int8: `sensenova_u15_int4_convrot_mlp8`, 13.0 GB, velocity 0.043 vs
+  0.22, clean weight-only and on Vulkan), and CUDA's 4-bit ACTIVATIONS, which still grain
+  that file under `auto`. CUDA has no int4-weight int8-activation route; Vulkan already
+  runs one (decode to int8) and renders it clean. Conditioning stays 0.55 from the base
+  copy's int4 roles.
+- sensenova: `sensenova_u15_asym_w4a8_int8` renders washed-out WHITE on CUDA and Vulkan
+  (512², 28 steps, cfg 4, seed 42) with no non-finite warning, though `quant-attrib`
+  (8 steps, cfg 1) puts its velocity error at 0.053 and its conditioning at 0.88.
 - sensenova: image EDITING renders the reference's structure exactly and its TONE
   wrong: at a 1024^2 canvas with a photographic reference of 16 tokens or more the
   output posterizes (46-54% of pixels clipped, against 0% for the same prompt with no
@@ -365,11 +389,21 @@
   before its next use. Keeping the first ~25 layers resident across prompts (a pin
   scoped to the encoder that the DiT's `evictUnpinned` still drops, or MRU-aware
   eviction for scans) would halve it. Only matters if the DiT leaves that VRAM free
+- vulkan decode: Qwen3.5-9B Q6_K gains 2% from the `OpSDot` GEMVs on the RX 6800 XT where
+  its q6_k kernel measures 1.44x; profile what else a token spends there (its GDN layers,
+  attention). The q4_0 `_sdot` GEMV still trails CUDA's dp4a one by ~25% at the large shapes.
+- vulkan barriers: synchronization validation is clean on AMD (BACKEND.md 5); the NVIDIA-only
+  paths are unvalidated, since the layer is not installed on the 3090 box. The levers it
+  measured: write-after-write on reused scratch is 21% of a decode's barriers
+  (alternate the buffers in the model), and binding extents would clear the 10% that fall
+  on another offset, once every GEMM's padded write is known to stay inside its view.
 - windows: what is left is the system C libraries, since every Zig source compiles and
   the SDL3/dvui link succeeds. libvips and the libav set have to come from somewhere with
-  `.pc` files, which is what the release workflow's MSYS2 step is for. Nothing on Windows
-  has been executed (`zig build test -Dtarget=x86_64-windows` cannot RUN the binaries),
-  so `filemap`'s section+view mapping and `dynlib`'s LoadLibraryW arm are both UNRUN
+  `.pc` files, which is what the release workflow's MSYS2 step is for. The native build,
+  the fast and gated suites, tp-llm, tp-serve and chat-probe run on a Windows box (RX 6800
+  XT), which exercises `filemap` and `dynlib`. Open there: the gated suite intermittently
+  ends "test runner failed to respond for 1m" after every test passed, only seen on runs
+  that recompiled; cause unconfirmed
 - macos: no Metal backend, so a Mac is CPU-only, which the README's own numbers put at
   ~290 s/step. The Vulkan arm would reach it through MoltenVK (`openVulkanLib` already
   names the dylibs) but coopmat is unlikely to be there, so the non-coop GEMM path is

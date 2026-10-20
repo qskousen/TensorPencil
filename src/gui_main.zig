@@ -10,5 +10,6 @@ pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 
 pub fn main(init: std.process.Init) !void {
+    @import("serve_tls").installClient();
     try app.run(init);
 }

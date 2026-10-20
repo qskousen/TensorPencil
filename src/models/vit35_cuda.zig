@@ -1,27 +1,19 @@
-//! CUDA-backend Qwen3.5/3.6 vision tower forward:
-//! the same qwen3vl_merger pipeline as vit35.Vit.encode, with the patch
-//! embed, 27 pre-LN blocks, and the merger projector running device-side.
-//! Host keeps only the cheap prep (smart resize, normalize, patch ordering,
-//! position interpolation, rope tables) via vit35.Vit.prepare.
+//! The Qwen3.5/3.6 vision tower on CUDA: the adapter for `vit35_dev.zig`.
 //!
-//! The bf16 mmproj weights feed the f16 tensor-core GEMM straight from the
-//! GGUF mmap (opMatmulBf16 pad-converts per call, like the LLM's dequant
-//! path). The 72-dim heads are zero-padded to 128 on device (head_pad) so
-//! the tensor-core attention's PV GEMM (n = head_dim, 128-multiple) applies;
-//! the pads are exact zeros end to end (K pads don't perturb scores, V pads
-//! produce zero output dims that the compaction drops), so the math matches
-//! the CPU path up to the f16 GEMM regime.
+//! The bf16 mmproj weights feed the f16 tensor-core GEMM straight from the GGUF mmap.
+//! The 72-dim heads are zero-padded to 128 (head_pad) so the tensor-core attention's
+//! PV GEMM applies; the pads are exact zeros end to end (K pads don't perturb scores, V
+//! pads produce zero output dims that the compaction drops).
 //!
-//! The ViT's weights are cached under a weight scope and released after
-//! encoding, along with the attention/GEMM scratch
-//! (weightScopeEnd/freeAttnScratch/freeConvScratch): image-sized state must
-//! not stay resident under the 19 GB LLM, the cache must not hold pointers
-//! into a Vit the caller may free, and, for REPL image turns, resident
-//! LLM weights and their captured decode graph must survive the encode.
+//! The ViT's weights are cached under a weight scope and released after encoding, along
+//! with the attention/GEMM scratch: image-sized state must not stay resident under the
+//! LLM, the cache must not hold pointers into a Vit the caller may free, and a resident
+//! LLM's weights and captured decode graph must survive the encode.
 
 const std = @import("std");
 const lin_cuda = @import("lin_cuda.zig");
 const vit35 = @import("vit35.zig");
+const vit35_dev = @import("vit35_dev.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -30,136 +22,136 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// GEMM in the mmproj weight's storage dtype (bf16 tensors, plus the f32
-/// host-summed patch kernel), y[m][w.rows] = x @ Wᵀ + bias, tight rows.
-fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32) !void {
-    try lin_cuda.towerLinear(be, dst, src, m, w, bias, null);
-}
-
 /// Encode interleaved RGB pixels to LLM embeddings on the CUDA backend.
 /// Same contract as Vit.encode; numerics differ by the f16 GEMM regime.
 pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
-    const cfg = vit.cfg;
-    const dim = cfg.dim;
-    const heads = cfg.n_heads;
-    const hd = cfg.headDim(); // 72
-    const hd_pad = std.mem.alignForward(usize, hd, 128);
-    const half = hd / 4; // 18 rope pairs per axis
-    const kdim = 3 * cfg.patch * cfg.patch;
-
-    var prep = try vit.prepare(gpa, rgb, width, height);
-    defer prep.deinit(gpa);
-    const np = prep.np();
-    const nm = np / 4;
-    const merged_dim = 4 * dim;
-
-    // The ViT leaves nothing resident: its weights are cached under a
-    // scope and dropped as a group below, along with the attention scores
-    // plane and the GEMM conversion scratch. The scoped release (rather
-    // than a full evictWeights) matters for REPL image turns, a resident
-    // LLM and its captured decode graph must survive a mid-session encode.
-    // It also protects correctness: the cache is keyed by host pointer,
-    // and the Vit arena those keys point into may die with the Vit.
     be.weightScopeBegin();
     defer {
         be.weightScopeEnd();
         be.freeAttnScratch();
         be.freeConvScratch();
     }
-
-    var bufs: [8]Buf = @splat(.{});
-    defer for (&bufs) |*b| be.tensorDestroy(b);
-    const sizes = [bufs.len]usize{
-        np * dim, // x (residual stream; [nm][merged_dim] after post_ln)
-        np * dim, // normed / compacted attention output
-        np * 3 * dim, // fused qkv
-        np * heads * hd_pad, // q (padded heads)
-        np * heads * hd_pad, // k
-        np * heads * hd_pad, // v
-        np * @max(heads * hd_pad, cfg.ffn), // attention out / FFN hidden / patch upload
-        @max(np * dim, nm * cfg.proj_dim), // t (residual delta; h0+embeds reuse)
-    };
-    for (&bufs, sizes) |*b, size| b.* = try be.tensorCreate(size * 4);
-    const x_d = bufs[0];
-    const normed_d = bufs[1];
-    const qkv_d = bufs[2];
-    const q_d = bufs[3];
-    const k_d = bufs[4];
-    const v_d = bufs[5];
-    const big_d = bufs[6];
-    const t_d = bufs[7];
-
-    // Rope tables + per-token (row, col) grid positions.
-    const max_pos = @max(prep.pw, prep.ph);
-    const sin_off = max_pos * half;
-    const freqs_d = try be.tensorCreate(2 * sin_off * 4);
-    var freqs_v = freqs_d;
-    defer be.tensorDestroy(&freqs_v);
-    try be.tensorUpload(sized(freqs_d, 0, sin_off * 4), std.mem.sliceAsBytes(prep.rope_cos));
-    try be.tensorUpload(sized(freqs_d, sin_off * 4, sin_off * 4), std.mem.sliceAsBytes(prep.rope_sin));
-    const pos2 = try gpa.alloc(u32, np * 2);
-    defer gpa.free(pos2);
-    for (0..np) |t| {
-        pos2[t * 2] = prep.py[t];
-        pos2[t * 2 + 1] = prep.px[t];
-    }
-    const pos2_d = try be.tensorCreate(np * 2 * 4);
-    var pos2_v = pos2_d;
-    defer be.tensorDestroy(&pos2_v);
-    try be.tensorUpload(pos2_d, std.mem.sliceAsBytes(pos2));
-
-    try be.beginBatch();
-    errdefer if (be.batching()) be.abortBatch();
-
-    // Patch embed GEMM (f32 host-summed kernel) + position embedding, the
-    // latter reordered host-side into the merged token order.
-    try be.tensorUpload(sized(big_d, 0, np * kdim * 4), std.mem.sliceAsBytes(prep.patches));
-    try gemm(be, x_d, big_d, np, Weight.fromF32(vit.patch_w, dim, kdim), vit.patch_b);
-    {
-        const pos_ordered = try gpa.alloc(f32, np * dim);
-        defer gpa.free(pos_ordered);
-        for (0..np) |t| {
-            const src = prep.pos[(prep.py[t] * prep.pw + prep.px[t]) * dim ..][0..dim];
-            @memcpy(pos_ordered[t * dim ..][0..dim], src);
-        }
-        try be.tensorUpload(sized(t_d, 0, np * dim * 4), std.mem.sliceAsBytes(pos_ordered));
-        try be.opAdd(x_d, t_d, np * dim);
-    }
-
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    for (vit.blocks) |*blk| {
-        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps);
-        try gemm(be, qkv_d, normed_d, np, blk.qkv, blk.qkv_b);
-        try be.opHeadPad(q_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, 0);
-        try be.opHeadPad(k_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, dim);
-        try be.opHeadPad(v_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, 2 * dim);
-        try be.opRopeVision(q_d, pos2_d, freqs_d, np, heads, half, sin_off, hd_pad);
-        try be.opRopeVision(k_d, pos2_d, freqs_d, np, heads, half, sin_off, hd_pad);
-        try be.opAttnTC(q_d, k_d, v_d, big_d, np, heads, heads, hd_pad, scale);
-        try be.opHeadPad(normed_d, big_d, np, heads, hd, hd_pad, heads * hd_pad, 0);
-        try gemm(be, t_d, normed_d, np, blk.out, blk.out_b);
-        try be.opAdd(x_d, t_d, np * dim);
-
-        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps);
-        try gemm(be, big_d, normed_d, np, blk.up, blk.up_b);
-        try be.gelu(big_d, np * cfg.ffn);
-        try gemm(be, t_d, big_d, np, blk.down, blk.down_b);
-        try be.opAdd(x_d, t_d, np * dim);
-    }
-    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps);
-
-    // 2x2 merge is a reinterpret (tokens are block-ordered), then the
-    // two-layer projector. h0 reuses normed (nm*merged_dim == np*dim).
-    try gemm(be, normed_d, x_d, nm, vit.mm0, vit.mm0_b);
-    try be.gelu(normed_d, nm * merged_dim);
-    try gemm(be, t_d, normed_d, nm, vit.mm2, vit.mm2_b);
-    try be.endBatch();
-
-    const embeds = try gpa.alloc(f32, nm * cfg.proj_dim);
-    errdefer gpa.free(embeds);
-    try be.tensorDownload(sized(t_d, 0, embeds.len * 4), std.mem.sliceAsBytes(embeds));
-    return .{ .embeds = embeds, .grid_w = prep.pw / 2, .grid_h = prep.ph / 2 };
+    var d: Dev = .{ .be = be, .cfg = vit.cfg };
+    defer d.deinit();
+    return vit35_dev.encode(&d, vit, gpa, rgb, width, height);
 }
+
+const Bufs = struct { x: Buf = .{}, normed: Buf = .{}, big: Buf = .{}, t: Buf = .{} };
+
+/// The `vit35_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    cfg: vit35.Config,
+    b: Bufs = .{},
+    qkv: Buf = .{},
+    q: Buf = .{},
+    k: Buf = .{},
+    v: Buf = .{},
+    freqs: Buf = .{},
+    pos2: Buf = .{},
+    sin_off: usize = 0,
+
+    fn deinit(d: *Dev) void {
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.qkv, &d.q, &d.k, &d.v, &d.freqs, &d.pos2 }) |b| d.be.tensorDestroy(b);
+    }
+
+    fn hdPad(d: *const Dev) usize {
+        return std.mem.alignForward(usize, d.cfg.headDim(), 128);
+    }
+
+    /// The buffers for `prep`'s token count, the rope tables and the per-token (row,
+    /// column) grid positions.
+    pub fn setup(d: *Dev, gpa: std.mem.Allocator, prep: *const Vit.Prepared) !void {
+        const cfg = d.cfg;
+        const dim = cfg.dim;
+        const np = prep.np();
+        const nm = np / 4;
+        const hp = cfg.n_heads * d.hdPad();
+        const sizes = [_]usize{
+            np * dim, // x, [nm][merged_dim] after post_ln
+            np * dim, // normed, the compacted attention output, h0
+            np * @max(hp, cfg.ffn), // attention out, FFN hidden, the patch upload
+            @max(np * dim, nm * cfg.proj_dim), // t: each delta, the positions, the embeds
+            np * 3 * dim,
+            np * hp,
+            np * hp,
+            np * hp,
+        };
+        inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.qkv, &d.q, &d.k, &d.v }, sizes) |b, n| b.* = try d.be.tensorCreate(n * 4);
+
+        const half = cfg.headDim() / 4;
+        d.sin_off = @max(prep.pw, prep.ph) * half;
+        d.freqs = try d.be.tensorCreate(2 * d.sin_off * 4);
+        try d.be.tensorUpload(sized(d.freqs, 0, d.sin_off * 4), std.mem.sliceAsBytes(prep.rope_cos));
+        try d.be.tensorUpload(sized(d.freqs, d.sin_off * 4, d.sin_off * 4), std.mem.sliceAsBytes(prep.rope_sin));
+        const pos2 = try gpa.alloc(u32, np * 2);
+        defer gpa.free(pos2);
+        for (0..np) |t| {
+            pos2[t * 2] = prep.py[t];
+            pos2[t * 2 + 1] = prep.px[t];
+        }
+        d.pos2 = try d.be.tensorCreate(np * 2 * 4);
+        try d.be.tensorUpload(d.pos2, std.mem.sliceAsBytes(pos2));
+    }
+
+    pub fn beginBatch(d: *Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: *Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: *Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {
+        try d.be.tensorUpload(sized(b, 0, data.len * 4), std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: *Dev, b: Buf, dst: []f32) !void {
+        try d.be.tensorDownload(sized(b, 0, dst.len * 4), std.mem.sliceAsBytes(dst));
+    }
+
+    /// In the weight's storage dtype (bf16 tensors, plus the f32 host-summed patch kernel).
+    pub fn linear(d: *Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: []const f32) !void {
+        try lin_cuda.towerLinear(d.be, y, x, m, w, bias, null);
+    }
+
+    pub fn layerNorm(d: *Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize) !void {
+        try d.be.opLayerNorm(x, y, w, b, rows, d.cfg.dim, d.cfg.eps);
+    }
+
+    pub fn add(d: *Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+
+    pub fn gelu(d: *Dev, x: Buf, n: usize) !void {
+        try d.be.gelu(x, n);
+    }
+
+    /// The fused qkv, its heads padded to 128, the vision rope, the tensor-core
+    /// attention, and the output compacted back to 72-wide heads in `normed`.
+    pub fn attention(d: *Dev, blk: *const vit35.Block, np: usize) !Buf {
+        const cfg = d.cfg;
+        const be = d.be;
+        const dim = cfg.dim;
+        const heads = cfg.n_heads;
+        const hd = cfg.headDim();
+        const hd_pad = d.hdPad();
+        const half = hd / 4;
+        try d.linear(d.qkv, d.b.normed, np, blk.qkv, blk.qkv_b);
+        try be.opHeadPad(d.q, d.qkv, np, heads, hd_pad, hd, 3 * dim, 0);
+        try be.opHeadPad(d.k, d.qkv, np, heads, hd_pad, hd, 3 * dim, dim);
+        try be.opHeadPad(d.v, d.qkv, np, heads, hd_pad, hd, 3 * dim, 2 * dim);
+        try be.opRopeVision(d.q, d.pos2, d.freqs, np, heads, half, d.sin_off, hd_pad);
+        try be.opRopeVision(d.k, d.pos2, d.freqs, np, heads, half, d.sin_off, hd_pad);
+        try be.opAttnTC(d.q, d.k, d.v, d.b.big, np, heads, heads, hd_pad, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
+        try be.opHeadPad(d.b.normed, d.b.big, np, heads, hd, hd_pad, heads * hd_pad, 0);
+        return d.b.normed;
+    }
+};
 
 /// A sized sub-view of a device buffer (raw pointer arithmetic).
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {

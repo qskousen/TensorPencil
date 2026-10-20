@@ -108,24 +108,6 @@ const Bufs = struct {
     }
 };
 
-/// GroupNorm weight ++ bias concatenations, cached by weight pointer: `gn_apply`
-/// reads both from one binding and the checkpoint stores them as two tensors.
-/// `Context.smallBuffer` keys on the concatenated slice, so each uploads once.
-const NormCats = struct {
-    map: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
-    alloc: std.mem.Allocator,
-
-    fn get(self: *NormCats, nw: mage_vae.NormW) ![]const f32 {
-        const key = @intFromPtr(nw.w.ptr);
-        if (self.map.get(key)) |c| return c;
-        const c = try self.alloc.alloc(f32, nw.w.len + nw.b.len);
-        @memcpy(c[0..nw.w.len], nw.w);
-        @memcpy(c[nw.w.len..], nw.b);
-        try self.map.put(self.alloc, key, c);
-        return c;
-    }
-};
-
 /// Whether this context can run the decode at all. Every weight is f32 after the
 /// loader, so the only question is that the model loaded.
 pub fn supported(ctx: *Context, model: *const MageVae) bool {
@@ -183,9 +165,8 @@ pub fn codForward(model: *const MageVae, ctx: *Context, gpa: std.mem.Allocator, 
     const n = lat_h * lat_w;
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var cats: NormCats = .{ .alloc = arena.allocator() };
+    var cats: sd_unet_gpu.GnCats = .{};
+    defer cats.deinit(ctx, gpa);
     var lin = try lin_gpu.Lin.init(gpa, ctx, mage_vae.hidden_x * mage_vae.patch_area, 0, 0);
     defer lin.deinit();
 
@@ -259,9 +240,8 @@ pub fn decode(
 
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var cats: NormCats = .{ .alloc = arena.allocator() };
+    var cats: sd_unet_gpu.GnCats = .{};
+    defer cats.deinit(ctx, gpa);
     var lin = try lin_gpu.Lin.init(gpa, ctx, mage_vae.hidden_x * mage_vae.patch_area, 0, 0);
     defer lin.deinit();
 
@@ -333,14 +313,14 @@ const Dev = struct {
     gpa: std.mem.Allocator,
     lin: *const lin_gpu.Lin,
     bufs: *Bufs,
-    cats: *NormCats,
+    cats: *sd_unet_gpu.GnCats,
     npw: usize,
     n_win: usize,
     plan: lin_gpu.Plan,
 
     /// The codec's linears at the loader's f32, or on the f16 coop GEMM when the
     /// activations are f16.
-    fn init(ctx: *Context, gpa: std.mem.Allocator, lin: *const lin_gpu.Lin, bufs: *Bufs, cats: *NormCats, npw: usize, n_win: usize, act: Dt) Dev {
+    fn init(ctx: *Context, gpa: std.mem.Allocator, lin: *const lin_gpu.Lin, bufs: *Bufs, cats: *sd_unet_gpu.GnCats, npw: usize, n_win: usize, act: Dt) Dev {
         var p = lin_gpu.Plan.tower;
         p.dense = if (act == .f16) .f16 else .native;
         return .{ .ctx = ctx, .gpa = gpa, .lin = lin, .bufs = bufs, .cats = cats, .npw = npw, .n_win = n_win, .plan = p };
@@ -390,7 +370,7 @@ const Dev = struct {
     }
 
     pub fn groupNorm(d: Dev, dst: *Buf, src: *const Buf, n: usize, nw: mage_vae.NormW, with_silu: bool) !void {
-        try sd_unet_gpu.groupNormInto(d.ctx, d.bufs.gstat, d.bufs.gmi, dst, src, n, H, try d.cats.get(nw), mage_vae.norm_groups, eps, with_silu);
+        try sd_unet_gpu.groupNormInto(d.ctx, d.bufs.gstat, d.bufs.gmi, dst, src, n, H, try d.cats.get(d.ctx, d.gpa, nw.w, nw.b), mage_vae.norm_groups, eps, with_silu);
     }
 
     pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {

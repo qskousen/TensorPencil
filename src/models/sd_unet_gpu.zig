@@ -129,10 +129,7 @@ pub const Session = struct {
     mlp_hidden: []f32,
     mlp_scratch: []f32,
 
-    /// GroupNorm weight ++ bias concatenations, cached by weight pointer.
-    /// `gn_apply` reads both out of ONE binding (x, out and the statistics take
-    /// the other three), and the checkpoint stores them as two tensors.
-    norm_cat: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
+    norms: GnCats = .{},
 
     /// Every linear's dispatch, and what it decided for this checkpoint.
     lin: lin_gpu.Lin,
@@ -200,20 +197,41 @@ pub const Session = struct {
     pub fn deinit(self: *Session, ctx: *Context) void {
         ctx.tensorDestroy(&self.ctx_d);
         ctx.tensorDestroy(&self.bias_d);
+        self.norms.deinit(ctx, self.arena.allocator());
         self.lin.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
 
-    fn normCat(self: *Session, nw: sd_unet.GroupNormW) ![]const f32 {
-        const key = @intFromPtr(nw.w.ptr);
-        if (self.norm_cat.get(key)) |v| return v;
-        const alloc = self.arena.allocator();
-        const cat = try alloc.alloc(f32, nw.w.len + nw.b.len);
-        @memcpy(cat[0..nw.w.len], nw.w);
-        @memcpy(cat[nw.w.len..], nw.b);
-        try self.norm_cat.put(alloc, key, cat);
-        return cat;
+};
+
+/// GroupNorm weight ++ bias on the device, keyed by weight pointer and owned here:
+/// `gn_apply` reads both from one binding and the checkpoint stores two tensors. Not
+/// `Context.smallBuffer`, which would key on the host concatenation and serve its copy to
+/// whatever the allocator puts at that address after it is freed.
+pub const GnCats = struct {
+    map: std.AutoHashMapUnmanaged(usize, DeviceBuffer) = .empty,
+
+    pub fn get(self: *GnCats, ctx: *Context, gpa: std.mem.Allocator, w: []const f32, b: []const f32) !DeviceBuffer {
+        const key = @intFromPtr(w.ptr);
+        if (self.map.get(key)) |db| return db;
+        const cat = try gpa.alloc(f32, w.len + b.len);
+        defer gpa.free(cat);
+        @memcpy(cat[0..w.len], w);
+        @memcpy(cat[w.len..], b);
+        var db = try ctx.tensorCreate(cat.len * 4);
+        errdefer ctx.tensorDestroy(&db);
+        try ctx.uploadRecorded(db, 0, std.mem.sliceAsBytes(cat));
+        try self.map.put(gpa, key, db);
+        return db;
+    }
+
+    /// After the last batch that reads them has been waited on.
+    pub fn deinit(self: *GnCats, ctx: *Context, gpa: std.mem.Allocator) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |db| ctx.tensorDestroy(db);
+        self.map.deinit(gpa);
+        self.* = undefined;
     }
 };
 
@@ -459,7 +477,7 @@ const Dev = struct {
 
     pub fn groupNorm(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, n: usize, ch: usize, nw: sd_unet.GroupNormW, silu: bool) !void {
         const cfg = d.u.cfg;
-        try groupNormInto(d.ctx, d.ws.gstat, d.ws.gmi, dst, src, n, ch, try d.sess.normCat(nw), cfg.norm_groups, cfg.norm_eps, silu);
+        try groupNormInto(d.ctx, d.ws.gstat, d.ws.gmi, dst, src, n, ch, try d.sess.norms.get(d.ctx, d.sess.arena.allocator(), nw.w, nw.b), cfg.norm_groups, cfg.norm_eps, silu);
     }
 
     pub fn conv(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, h: usize, w: usize, cv: Conv2d, mode: SampleMode, out_hw: ?[2]usize) !void {
@@ -634,15 +652,15 @@ pub fn groupNormInto(
     src: *const DeviceBuffer,
     n: usize,
     ch: usize,
-    cat: []const f32,
+    /// f32 weight ++ bias, `GnCats.get`.
+    cbuf: DeviceBuffer,
     groups: usize,
     eps: f32,
     silu: bool,
 ) !void {
     // `src` and `dst` at one `dt`; the statistics, weight and bias are f32 whatever it is.
-    std.debug.assert(cat.len == 2 * ch and dst.dt == src.dt);
+    std.debug.assert(cbuf.size >= 2 * ch * 4 and dst.dt == src.dt);
     const per_group = ch / groups;
-    const cbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(cat)), .mem = .null_handle, .size = 0 };
 
     try ctx.opElt(gpu_context.eltAt("gn_stats", src.dt), src.*, null, null, gstat, .{
         .u0 = @intCast(groups * gn_chunks),
@@ -875,6 +893,9 @@ test "gpu group norm matches ops.norm.groupNorm" {
     var dst: DeviceBuffer = none;
     defer ctx.tensorDestroy(&dst);
     try ctx.ensureDeviceBuffer(&dst, n * ch * 4);
+    var cats: GnCats = .{};
+    defer cats.deinit(ctx, gpa);
+    const cbuf = try cats.get(ctx, gpa, cat[0..ch], cat[ch..]);
 
     // Two regimes, because they are bounded by different things.
     //
@@ -896,7 +917,7 @@ test "gpu group norm matches ops.norm.groupNorm" {
         for (x) |*v| v.* = c.mean + rand.floatNorm(f32);
         try ctx.tensorUpload(src_or(&src, ctx, x), std.mem.sliceAsBytes(x));
         for ([2]bool{ false, true }) |silu| {
-            try groupNormInto(ctx, ws.gstat, ws.gmi, &dst, &src, n, ch, cat, groups, 1e-5, silu);
+            try groupNormInto(ctx, ws.gstat, ws.gmi, &dst, &src, n, ch, cbuf, groups, 1e-5, silu);
             const got = try gpa.alloc(f32, n * ch);
             defer gpa.free(got);
             try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));
@@ -909,6 +930,59 @@ test "gpu group norm matches ops.norm.groupNorm" {
             errdefer std.debug.print("mean={d} silu={}: rel L2 {d:.8}\n", .{ c.mean, silu, err });
             try testing.expect(err < c.tol);
         }
+    }
+}
+
+test "a group norm's weights are read again after the GnCats holding them is gone" {
+    // One decode after another hands its norms the same freed host addresses, and on a
+    // second VAE those hold different weights.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ctx = try gpuCtx(gpa, io);
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const groups = 32;
+    const n = 64;
+    const ch = 128;
+    const x = try gpa.alloc(f32, n * ch);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+    const wb = try gpa.alloc(f32, 2 * ch);
+    defer gpa.free(wb);
+
+    var ws: Workspace = .{
+        .gpa = gpa,
+        .skips = try gpa.alloc(DeviceBuffer, 0),
+        .skip_ch = try gpa.alloc(usize, 0),
+        .skip_hw = try gpa.alloc([2]usize, 0),
+    };
+    defer ws.deinit(ctx);
+    try ctx.ensureDeviceBuffer(&ws.gstat, groups * gn_chunks * 3 * 4);
+    try ctx.ensureDeviceBuffer(&ws.gmi, groups * 2 * 4);
+    var src: DeviceBuffer = none;
+    defer ctx.tensorDestroy(&src);
+    var dst: DeviceBuffer = none;
+    defer ctx.tensorDestroy(&dst);
+    try ctx.ensureDeviceBuffer(&dst, n * ch * 4);
+    try ctx.tensorUpload(src_or(&src, ctx, x), std.mem.sliceAsBytes(x));
+    const got = try gpa.alloc(f32, n * ch);
+    defer gpa.free(got);
+    const want = try gpa.alloc(f32, n * ch);
+    defer gpa.free(want);
+
+    for (0..2) |round| {
+        for (wb) |*v| v.* = rand.floatNorm(f32);
+        var cats: GnCats = .{};
+        defer cats.deinit(ctx, gpa);
+        const cbuf = try cats.get(ctx, gpa, wb[0..ch], wb[ch..]);
+        try groupNormInto(ctx, ws.gstat, ws.gmi, &dst, &src, n, ch, cbuf, groups, 1e-5, false);
+        try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));
+        ops.norm.groupNorm(want, x, ch, groups, wb[0..ch], wb[ch..], 1e-5);
+        const err = relL2(want, got);
+        errdefer std.debug.print("round {d}: rel L2 {d:.8}\n", .{ round, err });
+        try testing.expect(err < 2e-6);
     }
 }
 

@@ -265,7 +265,7 @@ test "a saved PNG carries the parameters chunk and the pixels" {
     const rgba = [_]u8{ 10, 20, 30, 255, 40, 50, 60, 255 };
     const path = try saveIn(std.testing.allocator, io, tmp.dir, "out", &info, &rgba, 2, 1);
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("out/tp_5_9.png", path);
+    try std.testing.expectEqualStrings("out" ++ std.fs.path.sep_str ++ "tp_5_9.png", path);
     const bytes = try tmp.dir.readFileAlloc(io, path, std.testing.allocator, .limited(1 << 20));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualSlices(u8, "\x89PNG", bytes[0..4]);

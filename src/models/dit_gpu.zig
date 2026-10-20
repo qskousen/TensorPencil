@@ -428,10 +428,12 @@ pub fn forward(
     try ctx.tensorUpload(ws.imgin_d, std.mem.sliceAsBytes(img_in));
     lapNs(io, &t_mark, &prof.xfer_ns);
 
-    // Without the coop GEMMs (`force_f32`, a capture) fp8 runs against the f32
-    // activation, which on this backend is what `bf16` staging resolves to.
+    // Without an fp8 coop GEMM (`force_f32`, a capture) fp8 runs against the f32
+    // activation, which on this backend is what `bf16` staging resolves to. The wide
+    // fp8 route (`fp8_wide`) still takes an f16 activation; only the staged paths
+    // (`coop`) need the build that folds the scale in.
     var gp = sess.lin_plan;
-    if (!coop) gp.act16 = .bf16;
+    if (!coop and (force_f32 or probing or !ctx.fp8_wide)) gp.act16 = .bf16;
 
     // One submission for the whole forward; profiling stays sync-per-op so the
     // per-category host times remain exact.

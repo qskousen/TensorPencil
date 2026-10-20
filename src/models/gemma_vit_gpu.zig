@@ -1,9 +1,11 @@
 //! Gemma 3 vision tower on the Vulkan backend: the adapter for `gemma_vit_dev.zig`.
 //! Attention is the non-causal `attn_full` at the true 72-wide head, and the linears
-//! run in each weight's storage dtype through `lin_gpu.towerLinear`.
+//! run in each weight's storage dtype through `lin_gpu.towerLinear`. Nothing stays
+//! resident after an encode (`tower_gpu.Scope`).
 
 const std = @import("std");
 const lin_gpu = @import("lin_gpu.zig");
+const tower_gpu = @import("tower_gpu.zig");
 const Weight = @import("tp_ops").matmul.Weight;
 const gemma_vit = @import("gemma_vit.zig");
 const gemma_vit_dev = @import("gemma_vit_dev.zig");
@@ -37,8 +39,12 @@ pub const VitGpu = struct {
     pub fn encode(self: *const VitGpu, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
         const cfg = self.vit.cfg;
         const np = cfg.side() * cfg.side();
+        const scope = tower_gpu.Scope.begin(ctx);
         var d: Dev = .{ .ctx = ctx, .cfg = cfg, .tl = try lin_gpu.Lin.init(gpa, ctx, lin_gpu.tower_max_out, 0, 0) };
-        defer d.deinit();
+        defer {
+            d.deinit();
+            scope.end(ctx, self.vit);
+        }
         const sizes = [_]usize{ np * cfg.dim, np * cfg.dim, np * @max(cfg.dim, cfg.ffn), np * cfg.dim, np * cfg.dim, np * cfg.dim, np * cfg.dim };
         inline for (.{ &d.b.x, &d.b.normed, &d.b.big, &d.b.t, &d.q, &d.k, &d.v }, sizes) |b, n| b.* = try ctx.tensorCreate(n * 4);
         return gemma_vit_dev.encode(&d, self.vit, io, gpa, rgb, width, height);

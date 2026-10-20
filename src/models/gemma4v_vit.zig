@@ -116,7 +116,7 @@ pub const Config = struct {
     }
 };
 
-const Block = struct {
+pub const Block = struct {
     ln1_w: []const f32,
     q: Weight,
     k: Weight,

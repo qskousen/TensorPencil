@@ -964,7 +964,20 @@ pub const CpuModel = struct {
     }
 };
 
+/// Image row `i`'s M-RoPE position (t, h, w): the image start, then its merged row and
+/// column, `i` running row-major over a `grid_w`-wide grid. The next text continues at the
+/// start plus the larger grid side.
+pub fn imagePos3(pos0: u32, grid_w: usize, i: usize) [3]u32 {
+    return .{ pos0, pos0 + @as(u32, @intCast(i / grid_w)), pos0 + @as(u32, @intCast(i % grid_w)) };
+}
+
 // --- tests -----------------------------------------------------------------
+
+test "an image's M-RoPE positions run row-major: t fixed, h the row, w the column" {
+    // A 3x2 grid at position 4, written out.
+    const want = [_][3]u32{ .{ 4, 4, 4 }, .{ 4, 4, 5 }, .{ 4, 4, 6 }, .{ 4, 5, 4 }, .{ 4, 5, 5 }, .{ 4, 5, 6 } };
+    for (want, 0..) |w, i| try std.testing.expectEqual(w, imagePos3(4, 3, i));
+}
 
 // The delta-rule recurrence against an independent naive f64 reference
 // (same formulas, straightforward loops) over a few tokens, catches

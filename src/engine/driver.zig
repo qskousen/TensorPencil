@@ -305,7 +305,7 @@ pub const Driver = struct {
         self.joinLoader();
         self.freeDiffuser();
         if (self.session) |s| {
-            s.be.bindThread();
+            s.dev.bindThread();
             s.deinit();
         }
         if (self.session_arena) |a| {
@@ -427,10 +427,10 @@ pub const Driver = struct {
         // fails and returns zeros, and that silent zero skips `setBudgets`
         // entirely, leaving the arbiter uninitialized and the first message
         // mass-offloading.
-        s.be.bindThread();
-        const mi = s.be.ctx.memGetInfo() orelse {
+        s.dev.bindThread();
+        const mi = s.dev.memInfo() orelse {
             log.warn("[vram] meter policy skipped: VRAM query failed{s} — arbiter budgets NOT updated", .{
-                if (s.be.ctx.isLost()) " (the CUDA context has been lost; restart to use the GPU)" else "",
+                if (s.dev.isLost()) " (the device context has been lost; restart to use the GPU)" else "",
             });
             return;
         };
@@ -446,7 +446,7 @@ pub const Driver = struct {
         // them straight back. `resolve` frames the handle as a RESERVE instead, where
         // an under-read can only fall back to what the user asked for.
         const tf: f32 = @floatFromInt(total);
-        const llm_res: u64 = s.be.deviceUsed();
+        const llm_res: u64 = s.dev.deviceUsed();
         const diff_res: u64 = if (self.diffuser) |*d| d.vramBytes() else 0;
         var card: vram.Card = .{
             .total = total,
@@ -732,7 +732,7 @@ pub const Driver = struct {
             s.worker = null;
         }
         self.session_mu.lockUncancelable(self.io);
-        s.be.bindThread(); // context current on THIS thread to free its device memory
+        s.dev.bindThread(); // context current on THIS thread to free its device memory
         {
             self.carry_mu.lockUncancelable(self.io);
             defer self.carry_mu.unlock(self.io);
@@ -880,7 +880,13 @@ pub const Driver = struct {
     fn probeWeightNoise(self: *Driver, path: []const u8) bool {
         var gg = tp.Gguf.openHeader(self.gpa, self.io, path) catch return false;
         defer gg.deinit();
-        return tp.llm.session.weightNoiseSupported(&gg);
+        const kind: ?tp.llm.device.Kind = switch (pipeline_map.toPipelineBackend(self.settings.llm_backend)) {
+            .zig_cuda => .zig_cuda,
+            .cuda => .cuda,
+            .vulkan => .vulkan,
+            .cpu => null,
+        };
+        return tp.llm.device.weightNoiseSupported(kind, &gg);
     }
 
     // ── Diffusion engine VRAM coordinator ─────────────────────────────────────
@@ -1307,8 +1313,8 @@ pub const Driver = struct {
                 s.updateSettings(&self.settings); // reasoning / VRAM priority, live
                 // Weight noise lands in a table the decode kernels re-read every
                 // launch, so a change takes effect on the next token, mid-reply.
-                s.be.weight_noise.amount = self.settings.weight_noise_amount;
-                s.be.weight_noise.setCurve(if (self.settings.weight_noise) self.settings.weight_noise_curve.slice() else "");
+                s.dev.weightNoise().amount = self.settings.weight_noise_amount;
+                s.dev.weightNoise().setCurve(if (self.settings.weight_noise) self.settings.weight_noise_curve.slice() else "");
                 if (ctx_reload) s.rebuildContext(chat.toKvDtype(self.settings.kv_dtype)) catch |err|
                     log.err("kv-dtype context rebuild failed: {t}", .{err});
             }
@@ -1548,7 +1554,7 @@ pub const Driver = struct {
         // freeing it, stop the LLM turn but let any in-flight image FINISH (don't
         // cancel it), then detach the transcript so the chat survives the swap.
         if (self.session) |s| {
-            s.be.bindThread();
+            s.dev.bindThread();
             s.requestCancel();
             if (s.worker) |t| {
                 t.join();
@@ -1608,7 +1614,7 @@ pub const Driver = struct {
         // (and is re-tokenizing). A few ms of a blocked render is the price.
         self.carry_mu.lockUncancelable(self.io);
         if (self.carry) |m| {
-            s.be.bindThread();
+            s.dev.bindThread();
             if (self.llm_suspend) |sus| {
                 // Unload-while-paused resume: restore the exact `ids` (open turn)
                 // verbatim instead of replaying (which would close the turn), then
@@ -1684,7 +1690,7 @@ pub const Driver = struct {
     fn buildSession(self: *Driver, arena: std.mem.Allocator) !*chat.Session {
         const seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(self.io).nanoseconds)));
         const s = try chat.Session.init(arena, self.gpa, self.io, self.wake, try chat.sessionOptions(arena, &self.load_settings, seed));
-        s.be.foreign_reclaim = .{ .ctx = @ptrCast(self), .call = llmForeignReclaim };
+        s.dev.setForeignReclaim(.{ .ctx = @ptrCast(self), .call = llmForeignReclaim });
         return s;
     }
 };

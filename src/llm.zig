@@ -10,6 +10,8 @@ pub const engine = @import("llm/engine.zig");
 pub const spec = @import("llm/spec.zig");
 pub const kv_cache = @import("tp_core").kv_cache;
 pub const session = @import("llm/session.zig");
+pub const device = @import("llm/device.zig");
+pub const stepper = @import("llm/stepper.zig");
 
 test {
     _ = chat;
@@ -21,4 +23,6 @@ test {
     _ = spec;
     _ = kv_cache;
     _ = session;
+    _ = device;
+    _ = stepper;
 }

@@ -39,8 +39,8 @@ const Config = sd_vae.Config;
 const none: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 
 /// The head width the mid-block attends at: LDM's `AttnBlock` uses one head over
-/// every channel, and the innermost level is 512 wide in both SD1.5 and SDXL.
-/// `Context.opAttnScoresSd` is the scores shader compiled for it.
+/// every channel, and the innermost level is 512 wide in both SD1.5 and SDXL. This
+/// decoder keeps its scores in f32, so no f16 coop scores kernel is built for it.
 const attn_hd: usize = 512;
 
 /// Scores-plane budget before the query dimension is tiled.
@@ -84,25 +84,6 @@ const Bufs = struct {
     }
 };
 
-/// GroupNorm weight ++ bias concatenations, cached by weight pointer: `gn_apply`
-/// reads both out of one binding, and the checkpoint stores them as two tensors.
-/// The concatenated slice is what `Context.smallBuffer` keys on, so each also
-/// uploads once.
-const NormCats = struct {
-    map: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
-    alloc: std.mem.Allocator,
-
-    fn get(self: *NormCats, nw: sd_vae.GroupNormW) ![]const f32 {
-        const key = @intFromPtr(nw.w.ptr);
-        if (self.map.get(key)) |c| return c;
-        const c = try self.alloc.alloc(f32, nw.w.len + nw.b.len);
-        @memcpy(c[0..nw.w.len], nw.w);
-        @memcpy(c[nw.w.len..], nw.b);
-        try self.map.put(self.alloc, key, c);
-        return c;
-    }
-};
-
 /// Decode a latent (channel-last `[lat_h*lat_w][4]`, already divided by
 /// `scaling_factor`) to channel-last `[8*lat_h * 8*lat_w][3]`. Caller frees.
 pub fn decode(
@@ -122,9 +103,8 @@ pub fn decode(
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var cats: NormCats = .{ .alloc = arena.allocator() };
+    var cats: sd_unet_gpu.GnCats = .{};
+    defer cats.deinit(ctx, gpa);
 
     // Activation sizing, and it has to mirror the loader's own width bookkeeping
     // rather than just the per-level output widths.
@@ -169,7 +149,7 @@ pub fn decode(
 
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.endBatch() catch {};
-    const ext = try dev.body(Dev{ .ctx = ctx, .bufs = &bufs, .cats = &cats, .groups = cfg.norm_groups, .eps = cfg.norm_eps }, dec, lat_h, lat_w, cancel);
+    const ext = try dev.body(Dev{ .ctx = ctx, .gpa = gpa, .bufs = &bufs, .cats = &cats, .groups = cfg.norm_groups, .eps = cfg.norm_eps }, dec, lat_h, lat_w, cancel);
     try ctx.endBatch();
 
     const rgb = try gpa.alloc(f32, ext[0] * ext[1] * 3);
@@ -188,9 +168,8 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Alloca
     std.debug.assert(z.len == zc * zh * zw);
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var cats: NormCats = .{ .alloc = arena.allocator() };
+    var cats: sd_unet_gpu.GnCats = .{};
+    defer cats.deinit(ctx, gpa);
 
     const n0 = zh * zw;
     const c = dec.mid_attn.proj.co;
@@ -224,7 +203,7 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Alloca
 
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.endBatch() catch {};
-    const ext = try wan_vae_dev.body(Dev{ .ctx = ctx, .bufs = &bufs, .cats = &cats, .coop_attn = coop }, dec, zh, zw, cancel);
+    const ext = try wan_vae_dev.body(Dev{ .ctx = ctx, .gpa = gpa, .bufs = &bufs, .cats = &cats, .coop_attn = coop }, dec, zh, zw, cancel);
     try ctx.endBatch();
 
     const n = ext[0] * ext[1];
@@ -268,8 +247,9 @@ fn sizeCoopAttn(ctx: *Context, bufs: *Bufs, n: usize, c: usize) !void {
 /// `sd_vae_dev`'s and `wan_vae_dev`'s ops on this backend.
 const Dev = struct {
     ctx: *Context,
+    gpa: std.mem.Allocator,
     bufs: *Bufs,
-    cats: *NormCats,
+    cats: *sd_unet_gpu.GnCats,
     /// GroupNorm's; the Wan decoder has none.
     groups: usize = 0,
     eps: f32 = 0,
@@ -285,7 +265,7 @@ const Dev = struct {
     }
 
     pub fn groupNorm(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, n: usize, ch: usize, nw: sd_vae.GroupNormW, silu: bool) !void {
-        try sd_unet_gpu.groupNormInto(d.ctx, d.bufs.gstat, d.bufs.gmi, dst, src, n, ch, try d.cats.get(nw), d.groups, d.eps, silu);
+        try sd_unet_gpu.groupNormInto(d.ctx, d.bufs.gstat, d.bufs.gmi, dst, src, n, ch, try d.cats.get(d.ctx, d.gpa, nw.w, nw.b), d.groups, d.eps, silu);
     }
 
     pub fn channelNorm(d: Dev, dst: *DeviceBuffer, src: *const DeviceBuffer, n: usize, gamma: []const f32, silu: bool) !void {

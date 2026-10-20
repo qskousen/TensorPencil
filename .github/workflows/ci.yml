@@ -47,3 +47,22 @@ jobs:
           zig build ui-probe -- ui.png
           zig build ui-probe -- ui-states.png --states
           test -s ui.png && test -s ui-states.png
+
+  # The Windows build, cross-compiled as the release builds it: it links prebuilt
+  # libvips and FFmpeg packages and every Windows-only code path, which the Linux
+  # job never compiles.
+  windows-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: |
+          zig build -Dtarget=x86_64-windows-gnu
+          zig build gui -Dtarget=x86_64-windows-gnu

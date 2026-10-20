@@ -117,3 +117,45 @@ pub const Dev = struct {
 fn small(ctx: *gpu.Context, w: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
 }
+
+/// What a one-off tower encode leaves behind, undone: open before the encode, `end`
+/// after it with the tower's model. Its weights and vectors are evicted and the
+/// context scratch it grew is freed, so nothing image-sized stays under the LLM.
+pub const Scope = struct {
+    mark: gpu.Context.ScratchMark,
+
+    pub fn begin(ctx: *gpu.Context) Scope {
+        return .{ .mark = ctx.scratchMark() };
+    }
+
+    pub fn end(s: Scope, ctx: *gpu.Context, model: anytype) void {
+        evictModel(ctx, model);
+        ctx.releaseScratchGrown(s.mark);
+    }
+};
+
+/// Free every device copy made of `model`'s weights and vectors: its `Weight`,
+/// `?Weight` and f32-slice fields, and those of each struct in a slice field. A tower
+/// that runs this after an encode leaves nothing resident under the LLM, and no cache
+/// entry keyed on a host pointer its owner may free.
+pub fn evictModel(ctx: *gpu.Context, model: anytype) void {
+    inline for (@typeInfo(@TypeOf(model.*)).@"struct".fields) |f| evictField(ctx, &@field(model.*, f.name));
+}
+
+fn evictField(ctx: *gpu.Context, p: anytype) void {
+    const F = @TypeOf(p.*);
+    if (F == Weight) return ctx.evictWeightBytes(p.bytes);
+    if (F == ?Weight) return if (p.*) |w| ctx.evictWeightBytes(w.bytes);
+    if (F == []const f32 or F == []f32) {
+        const b = std.mem.sliceAsBytes(p.*);
+        ctx.evictSmallRange(b);
+        ctx.evictWeightBytes(b);
+        return;
+    }
+    switch (@typeInfo(F)) {
+        .pointer => |pi| if (pi.size == .slice and @typeInfo(pi.child) == .@"struct") {
+            for (p.*) |*e| evictModel(ctx, e);
+        },
+        else => {},
+    }
+}

@@ -1,19 +1,12 @@
-//! Gemma 4 "unified" vision embedder on the CUDA backend. The embedder is
-//! shallow (no transformer, see gemma4_vit.zig), so the whole thing runs
-//! device-side as a short op chain: upload the im2col patch matrix, then
-//! LayerNorm -> patch-embed GEMM -> LayerNorm -> +pos-embed -> LayerNorm ->
-//! weightless RMSNorm -> projection GEMM, and download the embeddings. The
-//! smart-resize / normalize / im2col preprocessing and the positional-row
-//! gather stay on the host (cheap) via gemma4_vit's shared helpers.
-//!
-//! Weights and GEMM/conv scratch are scoped and released after encoding, so
-//! nothing image-sized stays resident under the LLM. Numerics differ from the
-//! CPU path only by the f16 GEMM regime (patch-embed f32 weight via opConvF16,
-//! projection bf16 via opMatmulBf16).
+//! The Gemma 4 "unified" vision embedder on CUDA: the adapter for `gemma4_vit_dev.zig`.
+//! Weights and GEMM/conv scratch are scoped and released after encoding, so nothing
+//! image-sized stays resident under the LLM. Numerics differ from the CPU path only by
+//! the f16 GEMM regime.
 
 const std = @import("std");
 const lin_cuda = @import("lin_cuda.zig");
 const gemma4_vit = @import("gemma4_vit.zig");
+const gemma4_vit_dev = @import("gemma4_vit_dev.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
 
@@ -21,11 +14,6 @@ const Vit = gemma4_vit.Vit;
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
-
-/// GEMM in the weight's storage dtype, y[m][w.rows] = x @ Wᵀ + bias.
-fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
-    try lin_cuda.towerLinear(be, dst, src, m, w, bias, null);
-}
 
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
@@ -35,63 +23,84 @@ fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
 /// Same contract as gemma4_vit.Vit.encode.
 pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
     _ = io;
-    const cfg = vit.cfg;
-    const dim = cfg.dim;
-    const kdim = cfg.kdim();
-
-    var pm = try vit.patchMatrix(gpa, rgb, width, height);
-    defer pm.deinit(gpa);
-    const np = pm.np();
-    const pos = try vit.posEmbedRows(gpa, pm.n_cols, pm.n_rows);
-    defer gpa.free(pos);
-
     be.weightScopeBegin();
     defer {
         be.weightScopeEnd();
         be.freeConvScratch();
     }
-
-    // patch_d holds the [np][kdim] patches, later reused for the [np][proj_dim]
-    // projection output (kdim=6912 >= proj_dim=3840). x_d is the [np][dim]
-    // working stream; t_d carries the uploaded positional rows.
-    var bufs: [3]Buf = @splat(.{});
-    defer for (&bufs) |*b| be.tensorDestroy(b);
-    const sizes = [bufs.len]usize{ np * kdim, np * dim, np * dim };
-    for (&bufs, sizes) |*b, size| b.* = try be.tensorCreate(size * 4);
-    const patch_d = bufs[0];
-    const x_d = bufs[1];
-    const t_d = bufs[2];
-
-    // Ones vector for the weightless RMSNorm (qkNorm with a unit weight).
-    const ones = try gpa.alloc(f32, dim);
-    defer gpa.free(ones);
-    @memset(ones, 1.0);
-    const ones_d: Buf = .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(ones)), .mem = .null_handle, .size = 0 };
-    // opMatmulBf16 requires a bias of length co; mm.input_projection has none,
-    // so feed a zero bias (a no-op add).
-    const zbias = try gpa.alloc(f32, cfg.proj_dim);
-    defer gpa.free(zbias);
-    @memset(zbias, 0.0);
-
-    try be.beginBatch();
-    errdefer if (be.batching()) be.abortBatch();
-
-    try be.tensorUpload(sized(patch_d, 0, np * kdim * 4), std.mem.sliceAsBytes(pm.data));
-    try be.opLayerNorm(patch_d, patch_d, vit.patch_norm_1_w, vit.patch_norm_1_b, np, kdim, cfg.eps_ln);
-    try gemm(be, x_d, patch_d, np, vit.patch_w, vit.patch_b); // patch embed (6912 -> 3840)
-    try be.opLayerNorm(x_d, x_d, vit.patch_norm_2_w, vit.patch_norm_2_b, np, dim, cfg.eps_ln);
-    try be.tensorUpload(sized(t_d, 0, np * dim * 4), std.mem.sliceAsBytes(pos));
-    try be.opAdd(x_d, t_d, np * dim); // + learned positional embedding
-    try be.opLayerNorm(x_d, x_d, vit.patch_norm_3_w, vit.patch_norm_3_b, np, dim, cfg.eps_ln);
-    try be.qkNorm(x_d, x_d, ones_d, np, dim, cfg.eps_rms); // weightless RMSNorm
-    try gemm(be, patch_d, x_d, np, vit.mm_proj, zbias); // projection (3840 -> 3840)
-    try be.endBatch();
-
-    const embeds = try gpa.alloc(f32, np * cfg.proj_dim);
-    errdefer gpa.free(embeds);
-    try be.tensorDownload(sized(patch_d, 0, np * cfg.proj_dim * 4), std.mem.sliceAsBytes(embeds));
-    return .{ .embeds = embeds, .grid_w = pm.n_cols, .grid_h = pm.n_rows };
+    var d: Dev = .{ .be = be, .gpa = gpa, .cfg = vit.cfg };
+    defer d.deinit();
+    return gemma4_vit_dev.encode(&d, vit, gpa, rgb, width, height);
 }
+
+const Bufs = struct { big: Buf = .{}, x: Buf = .{}, t: Buf = .{} };
+
+/// The `gemma4_vit_dev` adapter.
+const Dev = struct {
+    be: *Backend,
+    gpa: std.mem.Allocator,
+    cfg: gemma4_vit.Config,
+    b: Bufs = .{},
+    /// The weightless RMSNorm's weight.
+    ones: Buf = .{},
+    /// A zero bias for the projection, which has none.
+    zbias: []f32 = &.{},
+
+    fn deinit(d: *Dev) void {
+        inline for (.{ &d.b.big, &d.b.x, &d.b.t, &d.ones }) |b| d.be.tensorDestroy(b);
+        d.gpa.free(d.zbias);
+    }
+
+    /// `big` holds the [np][kdim] patches, then the [np][proj_dim] projection.
+    pub fn setup(d: *Dev, np: usize) !void {
+        const cfg = d.cfg;
+        inline for (.{ &d.b.big, &d.b.x, &d.b.t }, [_]usize{ np * cfg.kdim(), np * cfg.dim, np * cfg.dim }) |b, n| b.* = try d.be.tensorCreate(n * 4);
+        d.zbias = try d.gpa.alloc(f32, cfg.proj_dim);
+        @memset(d.zbias, 0.0);
+        const ones = try d.gpa.alloc(f32, cfg.dim);
+        defer d.gpa.free(ones);
+        @memset(ones, 1.0);
+        d.ones = try d.be.tensorCreate(cfg.dim * 4);
+        try d.be.tensorUpload(d.ones, std.mem.sliceAsBytes(ones));
+    }
+
+    pub fn beginBatch(d: *Dev) !void {
+        try d.be.beginBatch();
+    }
+
+    pub fn endBatch(d: *Dev) !void {
+        try d.be.endBatch();
+    }
+
+    pub fn abortBatch(d: *Dev) void {
+        if (d.be.batching()) d.be.abortBatch();
+    }
+
+    pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {
+        try d.be.tensorUpload(sized(b, 0, data.len * 4), std.mem.sliceAsBytes(data));
+    }
+
+    pub fn download(d: *Dev, b: Buf, dst: []f32) !void {
+        try d.be.tensorDownload(sized(b, 0, dst.len * 4), std.mem.sliceAsBytes(dst));
+    }
+
+    /// In the weight's storage dtype; a missing bias is the zero one.
+    pub fn linear(d: *Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
+        try lin_cuda.towerLinear(d.be, y, x, m, w, bias orelse d.zbias, null);
+    }
+
+    pub fn layerNorm(d: *Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32) !void {
+        try d.be.opLayerNorm(x, y, w, b, rows, dim, eps);
+    }
+
+    pub fn rmsUnit(d: *Dev, x: Buf, rows: usize, dim: usize, eps: f32) !void {
+        try d.be.qkNorm(x, x, d.ones, rows, dim, eps);
+    }
+
+    pub fn add(d: *Dev, x: Buf, y: Buf, n: usize) !void {
+        try d.be.opAdd(x, y, n);
+    }
+};
 
 // --- tests -----------------------------------------------------------------
 

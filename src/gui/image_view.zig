@@ -539,7 +539,7 @@ fn renderModelNotice(cfg: *const config.Config, fam: ?model_spec.Family) void {
         ) catch "The diffusion model failed to load.";
         const f = fam orelse return; // unreadable/unknown: Settings says why
         const t = model_spec.traits(f);
-        const want = pipeline_map.toPipelineBackend(cfg.diff_backend);
+        const want = pipeline_map.explicitBackend(cfg.diff_backend) orelse return;
         if (!t.supports(want)) break :blk std.fmt.bufPrint(
             &buf,
             "{s} has no kernels for the {t} backend. Generation will fail to load — change it in Settings.",

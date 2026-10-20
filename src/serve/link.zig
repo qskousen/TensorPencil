@@ -10,13 +10,12 @@
 //!
 //! A remote host is reached under TLS with its certificate pinned: the client
 //! trusts exactly the one certificate in the pairing string, and every request
-//! carries the token from the same string. The client half is std's TLS
-//! client; the server half needs tls.zig and lives with the daemon
-//! (`serve_tls.zig`), which hands its plaintext pair in through `Link.VTable`.
-//! One std hole worth knowing: on Windows, std's client falls back to the OS
-//! certificate store when the pinned bundle has no entry for the presented
-//! issuer, so there a peer holding any OS-trusted certificate gets past the
-//! pin (and is then sent the token). Linux and macOS pin strictly.
+//! carries the token from the same string. Both ends are tls.zig's
+//! (`serve_tls.zig`), which hands its plaintext pair in through `Link.VTable`;
+//! a binary that dials a remote host installs the client (`tls_dial`), so this
+//! module stays pure std. Not std's client: on Windows it falls back to the OS
+//! certificate store when the pinned bundle lacks the presented issuer, which
+//! lets any OS-trusted certificate past the pin, and the token with it.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -145,63 +144,12 @@ pub const Through = struct {
     }
 };
 
-/// The client end of a pinned TLS connection, std's client over a TCP stream.
-const TlsClient = struct {
-    link: Link,
-    stream: Io.net.Stream,
-    sr: Io.net.Stream.Reader,
-    sw: Io.net.Stream.Writer,
-    lock: Io.RwLock,
-    bundle: std.crypto.Certificate.Bundle,
-    client: std.crypto.tls.Client,
-    through: Through,
-    in_buf: [tls_buf_len]u8,
-    out_buf: [tls_buf_len]u8,
-    /// The plaintext side; an HTTP head must fit.
-    rd_buf: [buf_len]u8,
-    wr_buf: [tls_buf_len]u8,
+/// Opens a link under TLS over `stream`, trusting only the certificate `cert_der`, with
+/// every request carrying `token`. On failure the stream is still the caller's.
+pub const TlsDial = *const fn (gpa: std.mem.Allocator, io: Io, stream: Io.net.Stream, cert_der: []const u8, token: Secret) anyerror!*Link;
 
-    const vtable: Link.VTable = .{ .close = close, .shutdown = shutdown };
-
-    fn create(gpa: std.mem.Allocator, io: Io, stream: Io.net.Stream, cert_der: []const u8, token: Secret) !*TlsClient {
-        const c = try gpa.create(TlsClient);
-        errdefer gpa.destroy(c);
-        const now = Io.Clock.real.now(io);
-        c.bundle = try x509.bundleFromDer(gpa, cert_der, now.toSeconds());
-        errdefer c.bundle.deinit(gpa);
-        c.lock = .init;
-        c.stream = stream;
-        c.sr = stream.reader(io, &c.in_buf);
-        c.sw = stream.writer(io, &c.out_buf);
-        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-        io.random(&entropy);
-        c.client = try std.crypto.tls.Client.init(&c.sr.interface, &c.sw.interface, .{
-            .host = .no_verification,
-            .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &c.lock, .bundle = &c.bundle } },
-            .write_buffer = &c.wr_buf,
-            .read_buffer = &c.rd_buf,
-            .entropy = &entropy,
-            .realtime_now = now,
-        });
-        c.through.init(&c.client.writer, &c.sw.interface);
-        c.link = .{ .io = io, .in = &c.client.reader, .out = &c.through.interface, .trusted = false, .auth = token, .vt = &vtable };
-        return c;
-    }
-
-    fn close(l: *Link, gpa: std.mem.Allocator) void {
-        const c: *TlsClient = @fieldParentPtr("link", l);
-        c.client.end() catch {};
-        c.sw.interface.flush() catch {};
-        c.stream.close(l.io);
-        c.bundle.deinit(gpa);
-        gpa.destroy(c);
-    }
-
-    fn shutdown(l: *Link) void {
-        const c: *TlsClient = @fieldParentPtr("link", l);
-        c.stream.shutdown(l.io, .both) catch {};
-    }
-};
+/// The binary's TLS client (`serve_tls.installClient`); none refuses a `tp://` endpoint.
+pub var tls_dial: ?TlsDial = null;
 
 /// What an untrusted client presents on every request, 64 hex on the wire: a
 /// loopback host's one-run cookie, or a remote host's token. The host keeps
@@ -354,6 +302,30 @@ pub const Listener = struct {
         return self.server.accept(self.io);
     }
 
+    /// Bring a thread blocked in `accept` back by connecting to ourselves; false when
+    /// the connect fails. Closing the socket under the accept is not portable: Windows
+    /// cancels it, and std's `netAcceptWindows` takes a cancel as unreachable.
+    pub fn wake(self: *const Listener) bool {
+        const stream = switch (self.endpoint) {
+            .unix => |p| (Io.net.UnixAddress.init(p) catch return false).connect(self.io),
+            .loopback, .tls, .tcp => blk: {
+                // A listener bound to every address is reached on loopback.
+                var a = self.server.socket.address;
+                switch (a) {
+                    .ip4 => |*v| if (std.mem.allEqual(u8, &v.bytes, 0)) {
+                        v.bytes = .{ 127, 0, 0, 1 };
+                    },
+                    .ip6 => |*v| if (std.mem.allEqual(u8, &v.bytes, 0)) {
+                        v.bytes[15] = 1;
+                    },
+                }
+                break :blk a.connect(self.io, .{ .mode = .stream });
+            },
+        } catch return false;
+        stream.close(self.io);
+        return true;
+    }
+
     pub fn authHash(self: *const Listener) ?*const SecretHash {
         return if (self.auth) |*h| h else null;
     }
@@ -417,6 +389,9 @@ pub fn listenTcp(io: Io, bind: []const u8, port: u16, auth: SecretHash) !Listene
 pub fn connect(gpa: std.mem.Allocator, io: Io, ep: Endpoint) !*Link {
     switch (ep) {
         .unix => |p| {
+            // On Windows std returns Unexpected (a stack trace in Debug) for every
+            // failed AF_UNIX connect, a socket that is not there included.
+            Io.Dir.cwd().access(io, p, .{}) catch return error.FileNotFound;
             const stream = try (try Io.net.UnixAddress.init(p)).connect(io);
             errdefer stream.close(io);
             return Link.init(gpa, io, stream, true);
@@ -431,10 +406,10 @@ pub fn connect(gpa: std.mem.Allocator, io: Io, ep: Endpoint) !*Link {
         .tls => |t| {
             var der_buf: [max_cert_der]u8 = undefined;
             const der = try t.certDer(&der_buf);
+            const dial = tls_dial orelse return error.TlsClientNotInstalled;
             const stream = try connectHost(io, t.host, t.port);
             errdefer stream.close(io);
-            const c = try TlsClient.create(gpa, io, stream, der, t.token);
-            return &c.link;
+            return dial(gpa, io, stream, der, t.token);
         },
         .tcp => return error.PlainTcpRefused,
     }
@@ -447,9 +422,13 @@ fn connectHost(io: Io, host: []const u8, port: u16) !Io.net.Stream {
     return hn.connect(io, port, .{ .mode = .stream });
 }
 
-/// The local host's socket: `$XDG_RUNTIME_DIR/tensorpencil/local.sock`, the
-/// directory created 0700. Falls back to the temp dir, which is why the name
-/// carries the user.
+/// The local host's socket, `localPath`'s `local.sock`.
+pub fn defaultLocalPath(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) ![]u8 {
+    return localPath(gpa, io, env, "local.sock");
+}
+
+/// A socket named `name` in `$XDG_RUNTIME_DIR/tensorpencil-<user>`, the directory
+/// created 0700. Falls back to the temp dir, which is why the name carries the user.
 ///
 /// That directory is the local link's ONLY authentication: a unix link is
 /// trusted and carries no bearer secret, so anyone who can put a socket at this
@@ -458,18 +437,21 @@ fn connectHost(io: Io, host: []const u8, port: u16) !Io.net.Stream {
 /// not merely requested. A directory someone else owns is either group- or
 /// other-accessible, which this refuses, or 0700 and untraversable by us, which
 /// fails on first use -- a symlink to either lands in the same two cases.
-pub fn defaultLocalPath(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) ![]u8 {
+pub fn localPath(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, name: []const u8) ![]u8 {
     const base = env.get("XDG_RUNTIME_DIR") orelse env.get("TMPDIR") orelse env.get("TEMP") orelse "/tmp";
     const user = env.get("USER") orelse env.get("USERNAME") orelse "tp";
-    const dir = try std.fmt.allocPrint(gpa, "{s}/tensorpencil-{s}", .{ base, user });
+    // The native separator: Windows hands a unix socket's path to its socket driver
+    // as is, and that driver takes no '/'.
+    const sep = std.fs.path.sep_str;
+    const dir = try std.fmt.allocPrint(gpa, "{s}" ++ sep ++ "tensorpencil-{s}", .{ base, user });
     defer gpa.free(dir);
     const perms: Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
-    _ = Io.Dir.cwd().createDirPathStatus(io, dir, perms) catch {};
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dir, perms);
     if (builtin.os.tag != .windows) {
         const st = try Io.Dir.cwd().statFile(io, dir, .{});
         if (st.kind != .directory or st.permissions.toMode() & 0o077 != 0) return error.UnsafeSocketDir;
     }
-    return std.fmt.allocPrint(gpa, "{s}/local.sock", .{dir});
+    return std.fmt.allocPrint(gpa, "{s}" ++ sep ++ "{s}", .{ dir, name });
 }
 
 test "an endpoint's text form parses back" {
@@ -534,6 +516,66 @@ test "the certificate in a pairing string decodes to the DER it was made from" {
     const t: Endpoint.Tls = .{ .host = "h", .port = 1, .cert_b64 = text, .token = .{0} ** 32 };
     var out: [max_cert_der]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &der, try t.certDer(&out));
+}
+
+// What tp-serve's shutdown relies on, unix, loopback and a TCP listener on every address.
+test "wake brings a thread blocked in accept back" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "wake.sock" });
+    defer a.free(path);
+    const Waiter = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(w: *@This(), l: *Listener) void {
+            if (l.acceptStream()) |st| st.close(l.io) else |_| {}
+            w.done.store(true, .release);
+        }
+    };
+    for (0..3) |kind| {
+        var l = switch (kind) {
+            0 => if (Io.net.has_unix_sockets) try listenLocal(a, io, path) else continue,
+            1 => try listenLoopback(io),
+            else => try listenTcp(io, "0.0.0.0", 0, undefined),
+        };
+        var w: Waiter = .{};
+        const t = try std.Thread.spawn(.{}, Waiter.run, .{ &w, &l });
+        try Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .real);
+        try std.testing.expect(l.wake());
+        var waited: usize = 0;
+        while (!w.done.load(.acquire) and waited < 500) : (waited += 1) try Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .real);
+        const woke = w.done.load(.acquire);
+        // A thread `wake` failed to reach is freed by a plain connect, so the test fails
+        // instead of hanging.
+        if (!woke) {
+            const st = switch (l.endpoint) {
+                .unix => |p| (try Io.net.UnixAddress.init(p)).connect(io),
+                else => (try Io.net.IpAddress.parseIp4("127.0.0.1", l.server.socket.address.getPort())).connect(io, .{ .mode = .stream }),
+            } catch null;
+            if (st) |x| x.close(io);
+        }
+        t.join();
+        errdefer std.debug.print("listener kind {d} did not wake\n", .{kind});
+        try std.testing.expect(woke);
+        l.deinit(a);
+    }
+}
+
+// Where std reports a missing socket as Unexpected (Windows), with a stack trace.
+test "a unix socket with nothing at its path is FileNotFound" {
+    if (!Io.net.has_unix_sockets) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "nobody.sock" });
+    defer a.free(path);
+    try std.testing.expectError(error.FileNotFound, connect(a, io, .{ .unix = path }));
 }
 
 test "a loopback listener accepts a link and bytes cross it both ways" {

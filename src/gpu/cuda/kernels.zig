@@ -2720,22 +2720,19 @@ const gpa = std.heap.page_allocator;
 const Kernel = enum { v0, smem, pipe, pipe_lm };
 
 /// int8 IMMA GEMM validation (exact integer match vs a CPU reference) + timing.
-pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
+pub fn i8GemmTest(ctx: *Context, stdout: anytype) !void {
     var mod0 = try ctx.loadModule(igemm_v0_ptx);
     defer mod0.unload(ctx);
     const f_v0 = try mod0.getFunction(ctx, "igemm_v0");
 
-    // Build + JIT the tiled shared-memory kernel; dump its PTX for offline
-    // inspection so a JIT failure is debuggable.
+    // Build + JIT the tiled shared-memory kernel.
     const smem_ptx = try buildIgemmSmem(gpa);
     defer gpa.free(smem_ptx);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_smem.gen.ptx", .data = smem_ptx }) catch {};
     var mod1 = try ctx.loadModule(smem_ptx);
     defer mod1.unload(ctx);
     const f_smem = try mod1.getFunction(ctx, "igemm_smem");
     const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, false);
     defer gpa.free(pipe_ptx);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe.gen.ptx", .data = pipe_ptx }) catch {};
     var mod2 = try ctx.loadModule(pipe_ptx);
     defer mod2.unload(ctx);
     const f_pipe = try mod2.getFunction(ctx, "igemm_pipe");
@@ -2743,7 +2740,6 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     // bit-exact vs the plain ld.shared path, same math, different load path).
     const pipe_lm_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
     defer gpa.free(pipe_lm_ptx);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe_lm.gen.ptx", .data = pipe_lm_ptx }) catch {};
     var mod_lm = try ctx.loadModule(pipe_lm_ptx);
     defer mod_lm.unload(ctx);
     const f_pipe_lm = try mod_lm.getFunction(ctx, "igemm_pipe");

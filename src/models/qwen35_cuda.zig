@@ -74,11 +74,7 @@ fn gdnChunkOk(d: usize, n: usize) bool {
     return n > 1 and d % 32 == 0 and d <= 256;
 }
 
-/// Which layers a hybrid CPU/GPU split pushes to the host, once the count is
-/// fixed by the VRAM budget. `tail` keeps a contiguous device prefix (the
-/// last N layers go to CPU); `attn` evicts the KV-growing attention layers
-/// first (frees the most device memory as context grows, but interleaves).
-pub const CpuSplitPolicy = enum { tail, attn };
+pub const CpuSplitPolicy = residency.CpuSplitPolicy;
 
 /// DIAGNOSTIC: run the recurrence and the non-graph attention through the dual kernels
 /// Vulkan runs (`dual/attn.zig`) instead of this backend's own, for the A/B that decides
@@ -857,14 +853,20 @@ pub const CudaLM = struct {
         _ = try self.autoOffload(budget);
     }
 
-    /// Reset the session to an empty context (used by the layer-parity debug
-    /// harness and by the GUI's "new chat"): KV rows are overwritten lazily, so
-    /// only the position counters and the conv/recurrent states need clearing.
+    /// Reset the session to an empty context: KV rows are overwritten lazily, so only
+    /// the position counters and the conv/recurrent states, on either side of a split,
+    /// need clearing.
     pub fn resetCache(self: *CudaLM) !void {
         const cfg = self.cfg;
         const n_lin = cfg.n_layers - cfg.nAttnLayers();
         try zeroBuffer(self.be, self.gpa, self.conv_state, n_lin * cfg.convChannels() * (cfg.conv_kernel - 1) * 4);
         try zeroBuffer(self.be, self.gpa, self.ssm_state, n_lin * cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim * 4);
+        if (self.split) |*sp| {
+            @memset(sp.state.conv, 0);
+            @memset(sp.state.ssm, 0);
+            sp.state.kv.truncate(0);
+            sp.state.len = 0;
+        }
         self.len = 0;
         self.pos_next = 0;
     }
@@ -1117,12 +1119,7 @@ pub const CudaLM = struct {
             try bnd.check(self);
             // usize annotation: see prefill (@min narrows its result type).
             const n: usize = @min(prefill_chunk, total - off);
-            for (0..n) |t| {
-                const i = off + t;
-                pos3s[t * 3 + 0] = pos0;
-                pos3s[t * 3 + 1] = pos0 + @as(u32, @intCast(i / grid_w)); // h = merged row
-                pos3s[t * 3 + 2] = pos0 + @as(u32, @intCast(i % grid_w)); // w = merged col
-            }
+            for (0..n) |t| pos3s[t * 3 ..][0..3].* = qwen35.imagePos3(pos0, grid_w, off + t);
             try self.stepBatch(embeds[off * cfg.hidden ..][0 .. n * cfg.hidden], pos3s[0 .. n * 3]);
             off += n;
         }

@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const is_windows = target.result.os.tag == .windows;
 
     // Host toolchain workaround: recent glibc/binutils (e.g. Arch/CachyOS,
     // gcc 16+) ship crt startup objects whose .sframe section uses
@@ -59,24 +60,20 @@ pub fn build(b: *std.Build) void {
     // into the library as raw module bytes.
     // One object per kernel: the 0.16 SPIR-V backend only supports workgroup
     // storage in a single entry point per module.
+    // Each is a plain `zig build-obj` run, not a Compile step: on a Windows host,
+    // 0.16 closes the SPIR-V output file to move it out of the temporary cache
+    // dir and never reopens it (fixed in 0.17). A kernel can import only files
+    // beneath src/gpu/kernels, so those are every run's inputs.
     const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "dual" };
-    var kernel_objs: [kernel_names.len]*std.Build.Step.Compile = undefined;
+    const kernel_srcs = kernelSources(b);
+    var kernel_spv: [kernel_names.len]std.Build.LazyPath = undefined;
     for (kernel_names, 0..) |kname, i| {
-        kernel_objs[i] = b.addObject(.{
-            .name = kname,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt("src/gpu/kernels/{s}.zig", .{kname})),
-                .target = b.resolveTargetQuery(.{
-                    .cpu_arch = .spirv64,
-                    .os_tag = .vulkan,
-                    // SPIR-V 1.5 (Vulkan 1.2): required for workgroup-storage
-                    // variables in entry-point interfaces (shared-memory tiles).
-                    .cpu_features_add = std.Target.spirv.featureSet(&.{ .v1_4, .float16 }),
-                }),
-                .optimize = .ReleaseFast,
-            }),
-            .use_llvm = false,
-        });
+        // SPIR-V 1.4 for workgroup-storage variables in entry-point interfaces (shared-memory tiles).
+        const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build-obj", "-fno-llvm", "-OReleaseFast", "-target", "spirv64-vulkan", "-mcpu", "baseline+v1_4+float16" });
+        run.setName(b.fmt("compile spirv {s}", .{kname}));
+        run.addFileArg(b.path(b.fmt("src/gpu/kernels/{s}.zig", .{kname})));
+        kernel_spv[i] = run.addPrefixedOutputFileArg("-femit-bin=", b.fmt("{s}.spv", .{kname}));
+        for (kernel_srcs) |src| run.addFileInput(src);
     }
 
     // The CUDA generation every PTX module is built for: the hand kernels' headers
@@ -120,7 +117,7 @@ pub fn build(b: *std.Build) void {
     unalias_run.addFileArg(dual_ir.getEmittedLlvmIr());
     const dual_ll = unalias_run.addOutputFileArg("dual.ll");
     const dual_lower = b.addSystemCommand(&.{
-        b.graph.zig_exe, "cc",              "-target", "nvptx64-cuda", b.fmt("-march={s}", .{cuda_march}),
+        b.graph.zig_exe, "cc",              "-target", "nvptx64-cuda",         b.fmt("-march={s}", .{cuda_march}),
         "-Xclang",       "-target-feature", "-Xclang", ptxFeature(b, ptx_isa), "-Wno-unused-command-line-argument",
         "-g0",           "-O3",             "-S",      "-o",
     });
@@ -181,8 +178,8 @@ pub fn build(b: *std.Build) void {
     });
     gpu_mod.addImport("tp_core", core_mod);
     gpu_mod.addImport("tp_ops", ops_mod);
-    for (kernel_names, kernel_objs) |kname, obj| {
-        gpu_mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = obj.getEmittedBin() });
+    for (kernel_names, kernel_spv) |kname, spv| {
+        gpu_mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = spv });
     }
     gpu_mod.addAnonymousImport("dual_ptx", .{ .root_source_file = dual_ptx });
     mod.addImport("tp_gpu", gpu_mod);
@@ -267,6 +264,7 @@ pub fn build(b: *std.Build) void {
     // only by tp-serve and the engine probes (tp-gui has no engine). A flag is
     // a promise; a missing code path is a fact. `-Dprivacy=false` puts the
     // dumps back for a debugging build of chat-probe.
+    const bundle_libs = is_windows or (b.option(bool, "bundle-libs", "Linux: link the pinned libvips and FFmpeg packages and install them beside the executables, instead of the system's (a release build)") orelse false);
     const privacy = b.option(bool, "privacy", "Compile the prompt/reply debug dumps out of the engine layer (default true)") orelse true;
 
     const build_opts = b.addOptions();
@@ -340,7 +338,8 @@ pub fn build(b: *std.Build) void {
     // the libvips decode shim. Linked into the diffusion EXECUTABLE only — the
     // TensorPencil library module stays pure Zig, so the engine hands back a
     // `Clip` of plain data and this writes the container. Building needs
-    // libavformat/libavcodec/libavutil/libswscale/libswresample + pkg-config.
+    // libavformat/libavcodec/libavutil/libswscale/libswresample + pkg-config,
+    // or the pinned packages on Windows and under -Dbundle-libs (see `Pinned`).
     const av_libs = [_][]const u8{ "avformat", "avcodec", "avutil", "swscale", "swresample" };
     const av_module = b.createModule(.{
         .root_source_file = b.path("src/av.zig"),
@@ -350,7 +349,22 @@ pub fn build(b: *std.Build) void {
     });
     av_module.addCSourceFile(.{ .file = b.path("lib/video/av_helper.c"), .flags = &.{} });
     av_module.addIncludePath(b.path("lib/video"));
-    for (av_libs) |lib| av_module.linkSystemLibrary(lib, .{});
+    const av_dlls = if (is_windows) Pinned.link(b, av_module, &.{.{
+        .dep = "ffmpeg_win",
+        .includes = &.{"include"},
+        .libs = &.{ "lib/avformat.lib", "lib/avcodec.lib", "lib/avutil.lib", "lib/swscale.lib", "lib/swresample.lib" },
+        .dll_dir = "bin",
+        .licenses = &.{"LICENSE.txt"},
+    }}) else if (bundle_libs) Pinned.link(b, av_module, &.{.{
+        .dep = "ffmpeg_linux",
+        .includes = &.{"include"},
+        .shared = &.{ "lib/libavformat.so.62", "lib/libavcodec.so.62", "lib/libavutil.so.60", "lib/libswscale.so.9", "lib/libswresample.so.6" },
+        .licenses = &.{"LICENSE.txt"},
+    }}) else blk: {
+        for (av_libs) |lib| av_module.linkSystemLibrary(lib, .{});
+        break :blk null;
+    };
+    if (av_dlls) |l| b.getInstallStep().dependOn(l.install);
     exe.root_module.addImport("av", av_module);
 
     b.installArtifact(exe);
@@ -400,7 +414,8 @@ pub fn build(b: *std.Build) void {
     // a tiny C shim (its varargs C API is un-importable directly), ported
     // from DiffKeep. Linked into the tp-llm EXECUTABLE only — the
     // TensorPencil library module stays pure Zig. Building needs
-    // libvips-dev + pkg-config.
+    // libvips-dev + pkg-config, or the pinned packages on Windows and under
+    // -Dbundle-libs (see `Pinned`).
     const vips_module = b.createModule(.{
         .root_source_file = b.path("src/vips.zig"),
         .target = target,
@@ -412,7 +427,26 @@ pub fn build(b: *std.Build) void {
         .flags = &.{},
     });
     vips_module.addIncludePath(b.path("lib/vips"));
-    vips_module.linkSystemLibrary("vips", .{});
+    const vips_dlls = if (is_windows) Pinned.link(b, vips_module, &.{.{
+        .dep = "vips_win",
+        .includes = &.{ "include", "include/glib-2.0", "lib/glib-2.0/include" },
+        .libs = &.{ "lib/libvips.lib", "lib/libgio-2.0.lib", "lib/libgobject-2.0.lib", "lib/libglib-2.0.lib" },
+        .dll_dir = "bin",
+        .licenses = &.{ "LICENSE", "versions.json" },
+    }}) else if (bundle_libs) Pinned.link(b, vips_module, &.{ .{
+        .dep = "vips_linux_dev",
+        .includes = &.{ "include", "include/glib-2.0" },
+    }, .{
+        .dep = "vips_linux",
+        .includes = &.{"lib/glib-2.0/include"},
+        // One library: sharp's build folds libvips' dependencies and glib into it.
+        .shared = &.{"lib/libvips-cpp.so.8.18.7"},
+        .licenses = &.{ "README.md", "versions.json" },
+    } }) else blk: {
+        vips_module.linkSystemLibrary("vips", .{});
+        break :blk null;
+    };
+    if (vips_dlls) |l| b.getInstallStep().dependOn(l.install);
     llm_exe.root_module.addImport("vips", vips_module);
 
     b.installArtifact(llm_exe);
@@ -487,10 +521,20 @@ pub fn build(b: *std.Build) void {
 
     // tp-serve: the engine host behind a socket. `zig build serve` installs
     // it; the gui steps install it too, since tp-gui spawns it as the sibling
-    // binary of its own installed path. tls.zig is the server end of a remote
-    // link (std has only the client); it is linked by the serve exes and the
-    // tls-spike step alone, so no test binary carries it.
+    // binary of its own installed path. tls.zig is both ends of a remote link
+    // (`serve_tls`): the daemon's server, and the client each binary that dials
+    // a remote host installs. Only those binaries and tls-spike link it, so no
+    // test binary carries it.
     const tls_dep = b.lazyDependency("tls", .{ .target = target, .optimize = optimize });
+    const serve_tls_mod: ?*std.Build.Module = if (tls_dep) |td| b.createModule(.{
+        .root_source_file = b.path("src/serve_tls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "serve", .module = serve_mod },
+            .{ .name = "tls", .module = td.module("tls") },
+        },
+    }) else null;
     const serve_step = b.step("serve", "Build tp-serve (the engine host daemon)");
     const serve_install: ?*std.Build.Step.InstallArtifact = if (layers != null and tls_dep != null) blk: {
         const L = layers.?;
@@ -507,7 +551,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "serve", .module = serve_mod },
                     .{ .name = "shared", .module = L.shared },
                     .{ .name = "engine", .module = L.engine },
-                    .{ .name = "tls", .module = tls_dep.?.module("tls") },
+                    .{ .name = "serve_tls", .module = serve_tls_mod.? },
                 },
             }),
         });
@@ -554,17 +598,14 @@ pub fn build(b: *std.Build) void {
                     },
                 }),
             });
-            // SDL3 backend windowing system libraries (per DiffKeep's build.zig).
-            if (target.result.os.tag == .linux) {
-                gui_exe.root_module.linkSystemLibrary("X11", .{});
-                gui_exe.root_module.linkSystemLibrary("Xcursor", .{});
-                gui_exe.root_module.linkSystemLibrary("Xi", .{});
-                gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
-            }
+            if (serve_tls_mod) |stm| gui_exe.root_module.addImport("serve_tls", stm);
+            // No windowing library is linked: SDL3 loads X11 and Wayland itself at run
+            // time, so a release does not require any one of them on the user's system.
             // Install only via the `gui` / `run-gui` steps, never the default
             // step, so `zig build` / `zig build test` stay free of the GUI deps.
             const install_gui = b.addInstallArtifact(gui_exe, .{});
             if (serve_install) |si| install_gui.step.dependOn(&si.step);
+            if (vips_dlls) |l| install_gui.step.dependOn(l.install);
             gui_step.dependOn(&install_gui.step);
 
             // The installed binary, not the cached artifact: tp-gui finds
@@ -896,6 +937,7 @@ pub fn build(b: *std.Build) void {
                     },
                 }),
             });
+            if (serve_tls_mod) |stm| hp_exe.root_module.addImport("serve_tls", stm);
             const hp_install = b.addInstallArtifact(hp_exe, .{});
             if (serve_install) |si| hp_install.step.dependOn(&si.step);
             const hp_run = b.addRunArtifact(hp_exe);
@@ -907,12 +949,12 @@ pub fn build(b: *std.Build) void {
 
     // tls-spike: the remote link end to end on a loopback socket with no
     // engine: the real server routing behind tls.zig, the real client link
-    // (std's TLS client pinned to the minted certificate), the right token,
+    // (tls.zig's client pinned to the minted certificate), the right token,
     // a wrong token, a wrong pin, a pushed multi-MiB frame and a multi-MiB
     // upload. Exits non-zero on any failure. Pulls the lazy `tls` dep.
     {
         const spike_step = b.step("tls-spike", "Run the remote-link gate on a loopback socket");
-        if (tls_dep) |td| {
+        if (serve_tls_mod) |stm| {
             const spike_exe = b.addExecutable(.{
                 .name = "tls-spike",
                 .use_llvm = use_llvm,
@@ -922,7 +964,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .imports = &.{
                         .{ .name = "serve", .module = serve_mod },
-                        .{ .name = "tls", .module = td.module("tls") },
+                        .{ .name = "serve_tls", .module = stm },
                     },
                 }),
             });
@@ -1070,6 +1112,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    if (av_dlls) |l| l.findFrom(run_exe_tests, is_windows);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -1089,27 +1132,17 @@ pub fn build(b: *std.Build) void {
     const run_serve_tests = b.addRunArtifact(serve_tests);
 
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_serve_tests.step);
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_unalias_tests.step);
-    test_step.dependOn(&run_core_tests.step);
-    test_step.dependOn(&run_ops_tests.step);
-    test_step.dependOn(&run_gpu_tests.step);
-    test_step.dependOn(&run_runtime_tests.step);
-    test_step.dependOn(&run_models_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-
-    // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
+    const runs = [_]*std.Build.Step.Run{ run_serve_tests, run_mod_tests, run_unalias_tests, run_core_tests, run_ops_tests, run_gpu_tests, run_runtime_tests, run_models_tests, run_exe_tests };
+    // The device tests share one GPU: side by side under Windows one binary stopped
+    // answering the build runner for over a minute, and in series they cost no more time.
+    // A claim of all the memory runs them one at a time without ordering them, so a
+    // failure skips no other, and no peak can exceed it (a binary mapping a checkpoint
+    // bigger than half the RAM printed a red "exceeding" line on a green run).
+    const one_at_a_time: u64 = if (integration) std.process.totalSystemMemory() catch 0 else 0;
+    for (runs) |r| {
+        test_step.dependOn(&r.step);
+        if (one_at_a_time > 1) r.step.max_rss = one_at_a_time;
+    }
 }
 
 /// The `std.Target.nvptx.cpu` model named `name` (`sm_86`), if Zig has one.
@@ -1130,4 +1163,85 @@ fn ptxFeature(b: *std.Build, isa: []const u8) []const u8 {
         n += 1;
     };
     return b.fmt("+ptx{s}", .{digits[0..n]});
+}
+
+/// A prebuilt library package (`build.zig.zon`) standing in for pkg-config: what a
+/// Windows build always links, and a Linux one under -Dbundle-libs, so a release
+/// carries its own libvips and FFmpeg rather than a distribution's.
+const Pinned = struct {
+    dep: []const u8,
+    includes: []const []const u8 = &.{},
+    /// Import libs, linked by exact path: Zig's `-l` search does not try
+    /// every naming scheme these packages use (`libvips.lib`).
+    libs: []const []const u8 = &.{},
+    /// A directory whose DLLs install beside the executables (Windows).
+    dll_dir: ?[]const u8 = null,
+    /// Shared libraries, each linked by path and installed beside the executables
+    /// under its own name (its soname), which they find through `$ORIGIN`.
+    shared: []const []const u8 = &.{},
+    /// Installed to `share/licenses/<dep>/`: the libraries ship with their terms.
+    licenses: []const []const u8 = &.{},
+
+    const Linked = struct {
+        /// Installs the libraries beside the executables, and their licenses.
+        install: *std.Build.Step,
+        /// Where the libraries are, for a run of a binary that is not installed (a test).
+        dir: []const u8,
+
+        fn findFrom(self: Linked, run: *std.Build.Step.Run, windows: bool) void {
+            if (windows) run.addPathDir(self.dir) else run.setEnvironmentVariable("LD_LIBRARY_PATH", self.dir);
+        }
+    };
+
+    /// Points `module` at every package; null while one is still to be fetched.
+    fn link(b: *std.Build, module: *std.Build.Module, pkgs: []const Pinned) ?Linked {
+        const install = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        install.* = .init(.{ .id = .custom, .name = "install pinned libraries", .owner = b });
+        var dir: ?[]const u8 = null;
+        var shared = false;
+        for (pkgs) |pkg| {
+            const d = b.lazyDependency(pkg.dep, .{}) orelse return null;
+            for (pkg.includes) |p| module.addIncludePath(d.path(p));
+            for (pkg.libs) |p| module.addObjectFile(d.path(p));
+            if (pkg.dll_dir) |sub| {
+                // Recursive, so vips' loader modules keep the subdirectory it looks in.
+                const dlls = b.addInstallDirectory(.{
+                    .source_dir = d.path(sub),
+                    .install_dir = .bin,
+                    .install_subdir = "",
+                    .include_extensions = &.{".dll"},
+                });
+                install.dependOn(&dlls.step);
+                dir = d.builder.pathFromRoot(sub);
+            }
+            for (pkg.shared) |p| {
+                shared = true;
+                module.addObjectFile(d.path(p));
+                install.dependOn(&b.addInstallBinFile(d.path(p), std.fs.path.basename(p)).step);
+                dir = d.builder.pathFromRoot(std.fs.path.dirname(p).?);
+            }
+            for (pkg.licenses) |p| {
+                install.dependOn(&b.addInstallFile(d.path(p), b.fmt("share/licenses/{s}/{s}", .{ pkg.dep, std.fs.path.basename(p) })).step);
+            }
+        }
+        if (shared) module.addRPathSpecial("$ORIGIN");
+        return .{ .install = install, .dir = dir.? };
+    }
+};
+
+/// Every file under src/gpu/kernels, the whole input set of a SPIR-V kernel.
+fn kernelSources(b: *std.Build) []const std.Build.LazyPath {
+    const io = b.graph.io;
+    const root = "src/gpu/kernels";
+    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err|
+        std.debug.panic("open {s}: {t}", .{ root, err });
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var list: std.ArrayList(std.Build.LazyPath) = .empty;
+    while (walker.next(io) catch |err| std.debug.panic("walk {s}: {t}", .{ root, err })) |e| {
+        if (e.kind != .file) continue;
+        list.append(b.allocator, b.path(b.pathJoin(&.{ root, e.path }))) catch @panic("OOM");
+    }
+    return list.items;
 }

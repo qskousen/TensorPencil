@@ -83,7 +83,7 @@ pub const Config = struct {
     }
 };
 
-const Block = struct {
+pub const Block = struct {
     ln1_w: []const f32,
     ln1_b: []const f32,
     qkv: Weight,

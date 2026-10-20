@@ -297,10 +297,14 @@ pub const CudaLM = struct {
         self.freqs_local = try uploadFreqs(be, gpa, cap.initial, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null);
         errdefer be.tensorDestroy(&self.freqs_local);
 
+        // A buffer of its own: a small-buffer entry would be keyed on the host
+        // address freed here, and served to whatever upload lands there next.
         const ones_host = try gpa.alloc(f32, cfg.head_dim_global);
         defer gpa.free(ones_host);
         @memset(ones_host, 1.0);
-        self.ones = .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(ones_host)), .mem = .null_handle, .size = 0 };
+        self.ones = try be.tensorCreate(ones_host.len * 4);
+        errdefer be.tensorDestroy(&self.ones);
+        try be.tensorUpload(self.ones, std.mem.sliceAsBytes(ones_host));
 
         self.ring_rows = localRingText(cfg);
         self.buf_rows = textBufRows();
@@ -407,6 +411,7 @@ pub const CudaLM = struct {
         for (self.v_cache) |*b| be.growableDestroy(b);
         be.tensorDestroy(&self.freqs_global);
         be.tensorDestroy(&self.freqs_local);
+        be.tensorDestroy(&self.ones);
         self.bufs.deinit(be);
         self.freeSplit();
         self.arena.deinit();

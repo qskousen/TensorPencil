@@ -373,10 +373,7 @@ pub const Caps = struct {
     }
     /// The weight-only twins need the bf16 tensor cores; `Plan.withInt8` keeps them
     /// off a card without.
-    pub fn intWeightOnly(_: Caps) bool {
-        return true;
-    }
-    pub fn intWeightOnly32(_: Caps) bool {
+    pub fn intWeightOnly(_: Caps, _: dual_lin.IntGemm) bool {
         return true;
     }
     pub fn nvfp4(_: Caps) bool {
@@ -384,6 +381,10 @@ pub const Caps = struct {
     }
     pub fn h16(_: Caps) bool {
         return true;
+    }
+    /// Never needed: every CUDA arm has a 16-bit GEMM.
+    pub fn wideGemm(_: Caps) bool {
+        return false;
     }
     pub fn denseGemm(_: Caps, _: DType) bool {
         return true;
@@ -408,6 +409,9 @@ pub const Caps = struct {
         return true;
     }
     pub fn gemvF32(_: Caps) bool {
+        return false;
+    }
+    pub fn f32Rows(_: Caps, _: Weight, _: usize) bool {
         return false;
     }
     /// What the kernel behind route `r` cannot take about `w`, or null.
@@ -458,7 +462,7 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
     var folded = true;
     switch (r) {
         // Routes for kernels this backend lacks; `Caps` never chooses them.
-        .gemm_fp8_f32, .gemv_f32, .gemv_f32n, .i4_i8, .gemv_dualn => return error.UnsupportedDType,
+        .gemm_fp8_f32, .gemv_f32, .gemv_f32n, .gemv_f32_rows, .i4_i8, .gemv_dualn, .gemv_dualn_q8 => return error.UnsupportedDType,
         .gemm_f32 => if (w.scale == 1)
             be.opMatmulF32Lt(y, x, m, w.bytes, w.rows, w.cols, bias) catch |err| switch (err) {
                 error.UnsupportedKernelArm => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, bias),

@@ -27,9 +27,11 @@ pub fn rewrite(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
 
+    // LLVM writes IR in text mode, so a Windows host hands us CRLF; LF goes out.
     var lines = std.mem.splitScalar(u8, src, '\n');
     var first = true;
-    while (lines.next()) |line| {
+    while (lines.next()) |crlf| {
+        const line = std.mem.trimEnd(u8, crlf, "\r");
         if (parseAlias(line)) |al| {
             // NVPTX has no kernel aliases, so one body cannot carry two entry names.
             for (aliases.items) |seen| if (std.mem.eql(u8, seen.internal, al.internal)) return error.KernelExportedTwice;
@@ -127,4 +129,11 @@ test "two exports of one kernel is an error" {
 test "an alias without a kernel definition is an error" {
     const src = "@x = alias void (), ptr @m.x\ndefine void @m.x() {\n  ret void\n}\n";
     try std.testing.expectError(error.KernelNotFound, rewrite(std.testing.allocator, src));
+}
+
+test "CRLF IR from a Windows host is rewritten and comes out LF" {
+    const src = "@x = alias void (), ptr @m.k\r\ndefine private ptx_kernel void @m.k() {\r\n  ret void\r\n}\r\n";
+    const got = try rewrite(std.testing.allocator, src);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("define ptx_kernel void @x() {\n  ret void\n}\n", got);
 }

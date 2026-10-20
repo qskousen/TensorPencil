@@ -426,11 +426,22 @@ pub const Api = struct {
 
 /// Whether the CUDA driver library is installed. Cheap (a dlopen and a close),
 /// and not a claim that a device exists: a driver ships on boxes whose GPU was
-/// removed. `Api.load` plus `cuDeviceGetCount` is the real answer.
+/// removed. `deviceCount` is the real answer.
 pub fn driverPresent() bool {
     var lib = dynlib.openFirst(Api.driver_names) orelse return false;
     lib.close();
     return true;
+}
+
+/// The NVIDIA devices the installed driver reports; 0 when it does not load or
+/// initialize. The library stays loaded: CUDA does not support unloading it once
+/// `cuInit` has run.
+pub fn deviceCount() usize {
+    const api = Api.load() catch return 0;
+    if (api.cuInit(0) != CUDA_SUCCESS) return 0;
+    var n: c_int = 0;
+    if (api.cuDeviceGetCount(&n) != CUDA_SUCCESS) return 0;
+    return @intCast(@max(n, 0));
 }
 
 test "cuda driver loads and reports a device" {

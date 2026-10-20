@@ -151,8 +151,40 @@ inline fn ksigns(e: Env, comptime tbl: Slot, idx: u32) u32 {
     return e.byte(tbl, grid.ksigns_iq2xs_off + idx);
 }
 
-/// Element `idx` of the weight whose bytes start at `base` in slot a.
+/// Weight noise, `cuda/wnoise.zig`'s draw: the factor a super-block's scale takes, from
+/// its byte offset `off` within the weight, the per-launch key in u6 and sigma in f1.
+/// Exactly 1 at sigma 0, behind a branch uniform across the launch.
+inline fn jitter(e: Env, off: u32, comptime salt: u32) f32 {
+    const sig = e.f(1);
+    if (sig == 0) return 1;
+    var h = off ^ e.u(6) ^ salt;
+    h *%= 0x9E3779B1;
+    h ^= h >> 15;
+    h *%= 0x85EBCA6B;
+    h ^= h >> 13;
+    h *%= 0xC2B2AE35;
+    h ^= h >> 16;
+    const unit_draw = @as(f32, @floatFromInt(@as(i32, @bitCast(h)))) * 0x1p-31;
+    return @mulAdd(f32, unit_draw, sig, 1);
+}
+
+/// The two draws a super-block's scales take, `d` and its min.
+const salt_d: u32 = 0x00000000;
+const salt_dmin: u32 = 0x9E3779B9;
+
+/// Byte offset of the super-block holding element `idx` of the row at `base`.
+inline fn superBlockOff(comptime fmt: Fmt, base: u32, idx: u32) u32 {
+    return base + (idx / blockElems(fmt)) * blockBytes(fmt);
+}
+
+/// Element `idx` of the weight whose bytes start at `base` in slot a, its scale
+/// perturbed by the weight noise. The formats with a min jitter it in `valueRaw`.
 inline fn value(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, idx: u32) f32 {
+    if (comptime fmt == .fp8 or hasMin(fmt)) return valueRaw(e, fmt, tbl, base, idx);
+    return valueRaw(e, fmt, tbl, base, idx) * jitter(e, superBlockOff(fmt, base, idx), salt_d);
+}
+
+inline fn valueRaw(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, idx: u32) f32 {
     switch (fmt) {
         .fp8 => return e.ld(tbl, e.byte(.a, base + idx)) * e.f(0),
         .q8_0 => {
@@ -200,8 +232,8 @@ inline fn value(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, idx: u
             const j = idx & 255;
             const q = (e.byte(.a, blk + 16 + (j >> 7) * 32 + (j & 31)) >> @intCast(((j >> 5) & 3) * 2)) & 3;
             const sc = e.byte(.a, blk + (j >> 7) * 8 + ((j >> 5) & 3) * 2 + ((j & 31) >> 4));
-            const dl = e.f16At(.a, blk + 80) * @as(f32, @floatFromInt(sc & 15));
-            const ml = e.f16At(.a, blk + 82) * @as(f32, @floatFromInt(sc >> 4));
+            const dl = e.f16At(.a, blk + 80) * @as(f32, @floatFromInt(sc & 15)) * jitter(e, blk, salt_d);
+            const ml = e.f16At(.a, blk + 82) * @as(f32, @floatFromInt(sc >> 4)) * jitter(e, blk, salt_dmin);
             return dl * @as(f32, @floatFromInt(q)) - ml;
         },
         // 32 B hmask, 64 B of 2-bit quants, 12 B scales, f16 d. Sixteen sub-blocks
@@ -277,8 +309,8 @@ inline fn value(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, idx: u
             const j = idx & 255;
             const is = j >> 5;
             const sm = scaleMinK4(e, blk + 4, is);
-            const d = e.f16At(.a, blk) * @as(f32, @floatFromInt(sm[0]));
-            const m = e.f16At(.a, blk + 2) * @as(f32, @floatFromInt(sm[1]));
+            const d = e.f16At(.a, blk) * @as(f32, @floatFromInt(sm[0])) * jitter(e, blk, salt_d);
+            const m = e.f16At(.a, blk + 2) * @as(f32, @floatFromInt(sm[1])) * jitter(e, blk, salt_dmin);
             const qs_off: u32 = if (fmt == .q4_k) 16 else 48;
             const qs = e.byte(.a, blk + qs_off + ((j >> 6) << 5) + (j & 31));
             var q = (qs >> @intCast(((j >> 5) & 1) * 4)) & 15;
@@ -599,39 +631,70 @@ inline fn group(e: Env, comptime fmt: Fmt, comptime tbl: Slot, base: u32, g: u32
         },
         else => @compileError("no grouped decode for " ++ @tagName(fmt)),
     }
+    const off = base + sb * blockBytes(fmt);
+    r.d *= jitter(e, off, salt_d);
+    if (comptime hasMin(fmt)) r.m *= jitter(e, off, salt_dmin);
     return r;
 }
 
 /// The same dot against the q8_1 activation in slot b, four products per
-/// instruction. The layout is the one `quantize_q8_1` writes: `d[nblk]` f32, then
-/// one int8 per element, then a per-block sum this does not read (it needs the sum
-/// over a GROUP, which the codes give directly).
+/// instruction. The layout is the one `quantize_q8_1` writes per row, from word `seg`:
+/// `d[nblk]` f32, then one int8 per element, then a per-block sum this does not read
+/// (it needs the sum over a GROUP, which the codes give directly).
 ///
 /// Four groups share a q8_1 block, hence its scale.
-inline fn dotQ8(e: Env, comptime fmt: Fmt, gr: Group, g: u32, nblk: u32) f32 {
-    const x0 = nblk + g * 2;
+inline fn dotQ8(e: Env, comptime fmt: Fmt, comptime dot: Dot, gr: Group, g: u32, nblk: u32, seg: u32) f32 {
+    const x0 = seg + nblk + g * 2;
     const xa = e.ldW(.b, x0);
     const xb = e.ldW(.b, x0 + 1);
-    var acc = k.dp4a(gr.w[1], xb, k.dp4a(gr.w[0], xa, 0));
+    const d4 = if (dot == .sdot) k.sdot4 else k.dp4a;
+    var acc = d4(gr.w[1], xb, d4(gr.w[0], xa, 0));
     var r = gr.d * @as(f32, @floatFromInt(acc));
     if (comptime hasMin(fmt)) {
-        acc = k.dp4a(0x01010101, xb, k.dp4a(0x01010101, xa, 0));
+        acc = d4(0x01010101, xb, d4(0x01010101, xa, 0));
         r -= gr.m * @as(f32, @floatFromInt(acc));
     }
-    return r * e.ld(.b, g >> 2);
+    return r * e.ld(.b, seg + (g >> 2));
+}
+
+/// `dotQ8` over a 16-element `unit` (q4_k, q5_k, q6_k), which sits inside one q8_1
+/// block: its scales are decoded once for 16 elements instead of once for 8.
+inline fn dotQ8Unit(e: Env, comptime fmt: Fmt, comptime dot: Dot, un: Unit, u: u32, nblk: u32, seg: u32) f32 {
+    const x0 = seg + nblk + u * 4;
+    const d4 = if (dot == .sdot) k.sdot4 else k.dp4a;
+    var xw: [4]u32 = undefined;
+    inline for (0..4) |i| xw[i] = e.ldW(.b, x0 + @as(u32, i));
+    var acc: i32 = 0;
+    inline for (0..4) |i| acc = d4(un.w[i], xw[i], acc);
+    var r = un.d * @as(f32, @floatFromInt(acc));
+    if (comptime hasMin(fmt)) {
+        var sx: i32 = 0;
+        inline for (0..4) |i| sx = d4(0x01010101, xw[i], sx);
+        r -= un.m * @as(f32, @floatFromInt(sx));
+    }
+    return r * e.ld(.b, seg + (u >> 1));
+}
+
+/// Whether a q8 GEMV walks 16-element units: the `OpSDot` k-quants. The `_q8` twins
+/// keep 8-element groups, which is what CUDA's dual decode runs.
+inline fn q8Units(comptime fmt: Fmt, comptime dot: Dot) bool {
+    return dot == .sdot and unitElems(fmt) == 16;
 }
 
 /// A decode activation as the q8_1 blocks the q8 GEMVs read: x (f32, a) to `d[nblk]`
-/// f32, then one int8 per element, then `s[nblk]` = Σq, in b. llama.cpp's quantize_q8_1:
-/// d = amax / 127, q = round-half-even(x * 127 / amax). One thread per 32-element
-/// block; u0 = nblk.
+/// f32, then one int8 per element, then `s[nblk]` = Σq, in b, each row in its own such
+/// segment of `nblk * 10` words. llama.cpp's quantize_q8_1: d = amax / 127, q =
+/// round-half-even(x * 127 / amax). One thread per 32-element block; u0 = blocks in
+/// all, u1 = blocks a row (0: one row).
 pub inline fn quantizeQ81(e: Env) void {
-    const blk = k.elem(e) orelse return;
-    const nblk = e.u(0);
+    const all = k.elem(e) orelse return;
+    const nblk = if (e.u(1) == 0) e.u(0) else e.u(1);
+    const seg = (all / nblk) * nblk * 10;
+    const blk = all % nblk;
     var v: [32]f32 = undefined;
     var amax: f32 = 0;
     inline for (0..32) |i_| {
-        v[i_] = e.ld(.a, blk * 32 + @as(u32, @intCast(i_)));
+        v[i_] = e.ld(.a, all * 32 + @as(u32, @intCast(i_)));
         amax = @max(amax, @abs(v[i_]));
     }
     const id: f32 = if (amax != 0) 127.0 / amax else 0;
@@ -643,10 +706,10 @@ pub inline fn quantizeQ81(e: Env) void {
             sum += q;
             word |= (@as(u32, @bitCast(q)) & 0xFF) << @intCast(8 * j_);
         }
-        e.stW(.b, nblk + blk * 8 + @as(u32, @intCast(w_)), word);
+        e.stW(.b, seg + nblk + blk * 8 + @as(u32, @intCast(w_)), word);
     }
-    e.st(.b, blk, amax / 127.0);
-    e.st(.b, nblk * 9 + blk, @floatFromInt(sum));
+    e.st(.b, seg + blk, amax / 127.0);
+    e.st(.b, seg + nblk * 9 + blk, @floatFromInt(sum));
 }
 
 /// Elements a lane decodes at once in the f32 GEMVs: a group, or for the k-quants two,
@@ -670,7 +733,7 @@ inline fn unit(e: Env, comptime fmt: Fmt, base: u32, u: u32) Unit {
         const blk = base + (u >> 4) * 210;
         const j = (u & 15) * 16;
         var r: Unit = .{ .w = undefined, .d = 0, .m = 0 };
-        r.d = e.f16At(.a, blk + 208) * @as(f32, @floatFromInt(k.sext8(e.byte(.a, blk + 192 + (j >> 4)))));
+        r.d = e.f16At(.a, blk + 208) * @as(f32, @floatFromInt(k.sext8(e.byte(.a, blk + 192 + (j >> 4))))) * jitter(e, blk, salt_d);
         const half = j >> 7;
         const lshift: u5 = @intCast(((j >> 6) & 1) * 4);
         const hshift: u5 = @intCast(((j >> 5) & 3) * 2);
@@ -696,8 +759,8 @@ inline fn unit(e: Env, comptime fmt: Fmt, base: u32, u: u32) Unit {
     const sm = scaleMinK4(e, blk + 4, is);
     const dm = e.ldW(.a, blk >> 2);
     var r: Unit = .{ .w = undefined, .d = 0, .m = 0 };
-    r.d = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm)))))) * @as(f32, @floatFromInt(sm[0]));
-    r.m = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm >> 16)))))) * @as(f32, @floatFromInt(sm[1]));
+    r.d = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm)))))) * @as(f32, @floatFromInt(sm[0])) * jitter(e, blk, salt_d);
+    r.m = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, @truncate(dm >> 16)))))) * @as(f32, @floatFromInt(sm[1])) * jitter(e, blk, salt_dmin);
     const shift: u5 = @intCast((is & 1) * 4);
     const qw = (blk + @as(u32, if (q5) 48 else 16) + ((j >> 6) << 5) + (j & 31)) >> 2;
     const hw = (blk + 16 + (j & 31)) >> 2;
@@ -753,11 +816,19 @@ inline fn roundHalfEven(x: f32) i32 {
 ///
 /// `cols` must be a whole number of super-blocks, and `rows * rowBytes` must fit
 /// u32.
+/// How a q8 GEMV multiplies: `dp4a` (the instruction on PTX, the arithmetic on SPIR-V),
+/// or `OpSDot` on SPIR-V.
+const Dot = enum { dp4a, sdot };
+
 inline fn gemvQ(e: Env, comptime fmt: Fmt, comptime q8: bool) void {
+    return gemvQDot(e, fmt, q8, .dp4a);
+}
+
+inline fn gemvQDot(e: Env, comptime fmt: Fmt, comptime q8: bool, comptime dot: Dot) void {
     if (!q8) return gemvQ2(e, fmt);
     const rows = e.u(0);
     const cols = e.u(1);
-    const units = cols / group_elems;
+    const units = cols / (if (comptime q8Units(fmt, dot)) 16 else group_elems);
     const nblk = cols >> 5;
     const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
     const lane = e.sgLane();
@@ -768,7 +839,10 @@ inline fn gemvQ(e: Env, comptime fmt: Fmt, comptime q8: bool) void {
         const base = row * row_bytes;
         var acc: f32 = 0;
         var g = lane;
-        while (g < units) : (g += lanes) acc += dotQ8(e, fmt, group(e, fmt, .d, base, g), g, nblk);
+        while (g < units) : (g += lanes) acc += if (comptime q8Units(fmt, dot))
+            dotQ8Unit(e, fmt, dot, unit(e, fmt, base, g), g, nblk, 0)
+        else
+            dotQ8(e, fmt, dot, group(e, fmt, .d, base, g), g, nblk, 0);
         const total = k.sgSum(acc);
         if (lane == 0) e.st(.c, e.u(2) + row, total * e.f(0));
     }
@@ -843,11 +917,120 @@ inline fn gemvQN(e: Env, comptime fmt: Fmt) void {
     }
 }
 
+/// The q8 GEMV over up to four q8_1 activation rows, rows `u5 ..` of the staging (each
+/// its own segment): `y[u2 + t * u4 + row] = f0 * dot(W[row], x[u5 + t])` for t < u3.
+/// A row's sum runs in the one-row kernel's order, so it is bit-identical to a one-row
+/// launch, which is what lets a speculative verify match decode.
+inline fn gemvQ8N(e: Env, comptime fmt: Fmt, comptime dot: Dot) void {
+    const rows = e.u(0);
+    const cols = e.u(1);
+    const n = e.u(3);
+    const units = cols / (if (comptime q8Units(fmt, dot)) 16 else group_elems);
+    const nblk = cols >> 5;
+    const seg0 = e.u(5) * nblk * 10;
+    const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    var row = k.sgGlobal(e);
+    const step = k.sgTotal(e);
+    while (row < rows) : (row += step) {
+        const base = row * row_bytes;
+        var acc: [4]f32 = @splat(0);
+        var g = lane;
+        while (g < units) : (g += lanes) {
+            if (comptime q8Units(fmt, dot)) {
+                const un = unit(e, fmt, base, g);
+                inline for (0..4) |t| {
+                    if (t < n) acc[t] += dotQ8Unit(e, fmt, dot, un, g, nblk, seg0 + @as(u32, t) * nblk * 10);
+                }
+            } else {
+                const gr = group(e, fmt, .d, base, g);
+                inline for (0..4) |t| {
+                    if (t < n) acc[t] += dotQ8(e, fmt, dot, gr, g, nblk, seg0 + @as(u32, t) * nblk * 10);
+                }
+            }
+        }
+        inline for (0..4) |t| {
+            if (t < n) {
+                const total = k.sgSum(acc[t]);
+                if (lane == 0) e.st(.c, e.u(2) + @as(u32, t) * e.u(4) + row, total * e.f(0));
+            }
+        }
+    }
+}
+
+/// The `gemv_dual_<fmt>_sdot` entry body, as `.run`: one row, summed in `gemvQ8N`'s
+/// order, which `NoContraction` (`spv.withNoContraction`) keeps bit-identical to it.
+pub fn GemvQ8Sdot(comptime fmt: Fmt) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            gemvQDot(e, fmt, true, .sdot);
+        }
+    };
+}
+
+/// The `gemv4_dual_<fmt>_sdot` entry body, as `.run`.
+pub fn GemvQ8N(comptime fmt: Fmt) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            gemvQ8N(e, fmt, .sdot);
+        }
+    };
+}
+
 /// The `gemv4_dual_<fmt>` entry body, as `.run`.
 pub fn GemvN(comptime fmt: Fmt) type {
     return struct {
         pub inline fn run(e: Env) void {
             gemvQN(e, fmt);
+        }
+    };
+}
+
+/// Routed experts, one activation row per slot: `y[u2 + s * u0 + row] = f0 * dot(W_e[row],
+/// x[s / u5])` for slot s < u3, its expert e the word at c[s], the experts' weights back to
+/// back in slot a. `u4` workgroups take each slot. q8 reads the staged q8_1 segments,
+/// otherwise the f32 rows in b. A row's sum runs in the one-row kernels' order, so it is
+/// bit-identical to a launch per expert.
+inline fn gemvX(e: Env, comptime fmt: Fmt, comptime q8: bool) void {
+    const rows = e.u(0);
+    const cols = e.u(1);
+    const per = e.u(4);
+    const s = e.wgid() / per;
+    if (s >= e.u(3)) return;
+    const expert = e.ldW(.c, s);
+    const xr = s / e.u(5);
+    const units_q8 = comptime q8Units(fmt, .sdot);
+    const ue: u32 = if (!q8) unitElems(fmt) else if (units_q8) 16 else group_elems;
+    const units = cols / ue;
+    const nblk = cols >> 5;
+    const seg = xr * nblk * 10;
+    const row_bytes = (cols / blockElems(fmt)) * blockBytes(fmt);
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    const sgs = k.sgPerWg(e);
+    var row = (e.wgid() % per) * sgs + e.sgId();
+    const step = per * sgs;
+    while (row < rows) : (row += step) {
+        const base = (expert * rows + row) * row_bytes;
+        var acc: f32 = 0;
+        var g = lane;
+        while (g < units) : (g += lanes) acc += if (comptime !q8)
+            unitDotX(fmt, unit(e, fmt, base, g), unitX(e, fmt, xr * cols + g * ue))
+        else if (comptime units_q8)
+            dotQ8Unit(e, fmt, .sdot, unit(e, fmt, base, g), g, nblk, seg)
+        else
+            dotQ8(e, fmt, .sdot, group(e, fmt, .d, base, g), g, nblk, seg);
+        const total = k.sgSum(acc);
+        if (lane == 0) e.st(.c, e.u(2) + s * rows + row, total * e.f(0));
+    }
+}
+
+/// The `gemvx_dual_<fmt>` (f32) and `gemvx_dual_<fmt>_sdot` (q8) entry bodies, as `.run`.
+pub fn GemvX(comptime fmt: Fmt, comptime q8: bool) type {
+    return struct {
+        pub inline fn run(e: Env) void {
+            gemvX(e, fmt, q8);
         }
     };
 }

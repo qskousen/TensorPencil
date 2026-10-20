@@ -263,10 +263,7 @@ pub const Context = struct {
 ///
 /// `read` returns false to mean "not mine / could not read", the caller then
 /// falls back to the plain copy, so a missing or failing reader is never fatal.
-pub const WeightReader = struct {
-    ctx: *anyopaque,
-    read: *const fn (ctx: *anyopaque, dst: []u8, src: []const u8) bool,
-};
+pub const WeightReader = @import("../context.zig").WeightReader;
 
 /// Fans the host-side fill of one pinned staging slot out over several threads.
 ///

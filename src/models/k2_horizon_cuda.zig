@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const k2 = @import("k2_horizon.zig");
+const k2_dev = @import("k2_horizon_dev.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const Gguf = @import("tp_core").gguf.Gguf;
@@ -30,9 +31,12 @@ const routed_chunk = prefill_rows;
 /// How a batch's routed experts multiply. f16 dequantizes the group once and runs
 /// one f16 GEMM per expert; mmq/gemv are the packed q6_k kernels (`TP_K2_EXPERT_GEMM`).
 const ExpertGemm = enum { f16, mmq, gemv };
-/// Batches up to this size run a host-resident layer's experts on the CPU; larger
-/// ones upload the layer's experts to the staging buffers and run on the GPU.
+/// Batches up to this size run a host-resident layer's experts on the CPU; a larger
+/// one takes whichever of that and staging `host_cost` has measured cheaper.
 const cpu_small_max = 8;
+/// The largest batch the CPU takes from a host layer that could be staged instead; past a
+/// few hundred rows staging wins anyway, and the scratch is ~0.4 MB a row.
+const cpu_batch_max = 512;
 
 const HybridProfile = struct {
     enabled: bool,
@@ -358,6 +362,10 @@ pub const CudaLM = struct {
     host_experts: []bool,
     stage: ?Stage = null,
     cpu_rows: usize,
+    /// Set before the first batch that has to choose (`calibrateHost`).
+    host_cost: ?k2.HostCost = null,
+    /// Whether this batch stages its host layers; otherwise they run on the CPU.
+    batch_staged: bool = false,
     split: ?Split = null,
     boundary: ?bnd.Hook = null,
     io: ?std.Io = null,
@@ -618,7 +626,10 @@ pub const CudaLM = struct {
         defer self.gpa.free(x);
         try qwen3.embedTokens(self.lm.embed, ids, x);
         try self.be.tensorUpload(b.x.slice(0, x.len * 4), std.mem.sliceAsBytes(x));
-        if (seq > cpu_small_max and self.stage != null)
+        // Staging is decided for the whole batch: each staged layer queues the next.
+        if (seq > cpu_small_max and self.stage != null and self.host_cost == null) try self.calibrateHost();
+        self.batch_staged = seq > cpu_small_max and self.stage != null and (seq > self.cpu_rows or if (self.host_cost) |hc| !hc.onCpu(seq) else true);
+        if (self.batch_staged)
             if (self.nextStagedLayer(0)) |l| try self.stageQueue(l, null);
 
         for (self.lm.layers, 0..) |layer_weights, l| {
@@ -670,52 +681,76 @@ pub const CudaLM = struct {
     }
 
     fn forwardLayer(self: *CudaLM, layer: k2.Layer, l: usize, seq: usize) !void {
-        const c = self.cfg;
-        const b = &self.bufs;
-        const pos0 = self.len;
-        try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.attn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
-        try lin_cuda.linear(self.be, self.lin_plan, b.q, b.normed, seq, layer.q, null);
-        try lin_cuda.linear(self.be, self.lin_plan, b.k, b.normed, seq, layer.k, null);
-        const staged = seq > cpu_small_max and self.stagedLayer(l);
-        if (staged) self.stageWait(l);
-        if (layer.values) |values| {
-            if (staged)
-                try self.routedValues(values, b.normed, seq, b.v, self.stage.?.values.?)
-            else if (self.host_experts[l])
-                try self.cpuRoutedValues(values, seq, b.v)
-            else
-                try self.routedValues(values, b.normed, seq, b.v, null);
-        } else try lin_cuda.linear(self.be, self.lin_plan, b.v, b.normed, seq, layer.v.?, null);
-        try self.be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, c.head_dim / 2, self.sin_off, pos0);
-        try self.be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, c.head_dim / 2, self.sin_off, pos0);
-        try self.storeKv(self.k_cache[l].buf, pos0 * c.kvDim(), b.k, seq * c.kvDim());
-        try self.storeKv(self.v_cache[l].buf, pos0 * c.kvDim(), b.v, seq * c.kvDim());
-        try self.attention(l, seq, pos0);
-        if (layer.attn_gate) |gate| {
-            try lin_cuda.linear(self.be, self.lin_plan, b.gate, b.normed, seq, gate, null);
-            try self.be.opSoftplusGate(b.attn, b.gate, seq * c.qDim());
-        }
-        try lin_cuda.linear(self.be, self.lin_plan, b.tmp, b.attn, seq, layer.o, null);
-        try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
-
-        try self.be.groupRmsNorm(b.x, b.normed, try nbuf(self.be, layer.ffn_norm), seq, c.hidden, c.norm_groups, c.rms_eps);
-        if (layer.experts) |experts| {
-            if (staged) {
-                const st = self.stage.?;
-                try self.routedFfn(experts, b.normed, seq, b.tmp, .{ st.gate, st.up, st.down });
-                if (self.nextStagedLayer(l + 1)) |next| try self.stageQueue(next, try self.be.recordCompute());
-            } else if (self.host_experts[l])
-                try self.cpuRoutedFfn(experts, seq, b.tmp)
-            else
-                try self.routedFfn(experts, b.normed, seq, b.tmp, null);
-        } else {
-            try lin_cuda.linear(self.be, self.lin_plan, b.expert_a, b.normed, seq, layer.dense_gate.?, null);
-            try lin_cuda.linear(self.be, self.lin_plan, b.expert_b, b.normed, seq, layer.dense_up.?, null);
-            try self.be.siluMul(b.expert_a, b.expert_b, seq * c.intermediate);
-            try lin_cuda.linear(self.be, self.lin_plan, b.tmp, b.expert_a, seq, layer.dense_down.?, null);
-        }
-        try self.be.opAdd(b.x, b.tmp, seq * c.hidden);
+        var d: Dev = .{ .s = self, .cfg = self.cfg, .bufs = &self.bufs };
+        try k2_dev.layer(&d, layer, l, seq, self.len);
     }
+
+    /// `k2_horizon_dev`'s adapter. `staged` is the current layer's: its routed groups
+    /// came from the staging buffers (`layerBegin` waited for them).
+    const Dev = struct {
+        s: *CudaLM,
+        cfg: k2.Config,
+        bufs: *Bufs,
+        staged: bool = false,
+
+        pub fn groupNorm(d: *Dev, x: Buf, out: Buf, w: []const f32, seq: usize) !void {
+            const c = d.cfg;
+            try d.s.be.groupRmsNorm(x, out, try nbuf(d.s.be, w), seq, c.hidden, c.norm_groups, c.rms_eps);
+        }
+        pub fn linear(d: *Dev, y: Buf, x: Buf, seq: usize, w: Weight) !void {
+            try lin_cuda.linear(d.s.be, d.s.lin_plan, y, x, seq, w, null);
+        }
+        pub fn linears(d: *Dev, x: Buf, seq: usize, ys: []const Buf, ws: []const Weight) !void {
+            for (ys, ws) |y, w| try d.linear(y, x, seq, w);
+        }
+        pub fn siluMul(d: *Dev, a: Buf, b: Buf, n: usize) !void {
+            try d.s.be.siluMul(a, b, n);
+        }
+        pub fn add(d: *Dev, dst: Buf, src: Buf, n: usize) !void {
+            try d.s.be.opAdd(dst, src, n);
+        }
+        pub fn layerBegin(d: *Dev, l: usize, _: usize) !void {
+            d.staged = d.s.batch_staged and d.s.stagedLayer(l);
+            if (d.staged) d.s.stageWait(l);
+        }
+        pub fn values(d: *Dev, l: usize, v: k2.Values, seq: usize) !void {
+            const b = d.bufs;
+            if (d.staged)
+                try d.s.routedValues(v, b.normed, seq, b.v, d.s.stage.?.values.?)
+            else if (d.s.host_experts[l])
+                try d.s.cpuRoutedValues(v, seq, b.v)
+            else
+                try d.s.routedValues(v, b.normed, seq, b.v, null);
+        }
+        pub fn rope(d: *Dev, seq: usize, pos0: usize) !void {
+            const c = d.cfg;
+            const b = d.bufs;
+            try d.s.be.ropeHalf(b.q, d.s.freqs_d, seq, c.n_heads, c.head_dim / 2, d.s.sin_off, pos0);
+            try d.s.be.ropeHalf(b.k, d.s.freqs_d, seq, c.n_kv_heads, c.head_dim / 2, d.s.sin_off, pos0);
+        }
+        pub fn storeKv(d: *Dev, l: usize, seq: usize, pos0: usize) !void {
+            const c = d.cfg;
+            try d.s.storeKv(d.s.k_cache[l].buf, pos0 * c.kvDim(), d.bufs.k, seq * c.kvDim());
+            try d.s.storeKv(d.s.v_cache[l].buf, pos0 * c.kvDim(), d.bufs.v, seq * c.kvDim());
+        }
+        pub fn attention(d: *Dev, l: usize, seq: usize, pos0: usize) !void {
+            try d.s.attention(l, seq, pos0);
+        }
+        pub fn softplusGate(d: *Dev, n: usize) !void {
+            try d.s.be.opSoftplusGate(d.bufs.attn, d.bufs.gate, n);
+        }
+        pub fn experts(d: *Dev, l: usize, e: k2.Experts, seq: usize) !void {
+            const b = d.bufs;
+            if (d.staged) {
+                const st = d.s.stage.?;
+                try d.s.routedFfn(e, b.normed, seq, b.tmp, .{ st.gate, st.up, st.down });
+                if (d.s.nextStagedLayer(l + 1)) |next| try d.s.stageQueue(next, try d.s.be.recordCompute());
+            } else if (d.s.host_experts[l])
+                try d.s.cpuRoutedFfn(e, seq, b.tmp)
+            else
+                try d.s.routedFfn(e, b.normed, seq, b.tmp, null);
+        }
+    };
 
     fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const c = self.cfg;
@@ -754,6 +789,20 @@ pub const CudaLM = struct {
             .f16 => try self.be.opStoreKvF16(dst, dst_off, src, 0, n),
             .q8_0 => try self.be.opStoreKvQ8(dst, dst_off, src, 0, n),
         }
+    }
+
+    /// Time the first staged layer both ways (`k2.HostCost`): its routed blocks on the
+    /// CPU, and one stage of its groups with nothing to overlap.
+    fn calibrateHost(self: *CudaLM) !void {
+        const l = self.nextStagedLayer(0) orelse return;
+        const io = self.io orelse return error.SplitIoUnset;
+        const cpu = try k2.HostCost.cpuRowNs(io, self.gpa, self.cfg, self.lm.layers[l], &self.cpu_scratch, @min(k2.host_calibration_rows, self.cpu_rows));
+        const t0 = cuda.context.monoNs();
+        try self.stageQueue(l, null);
+        self.stageWait(l);
+        const up = cuda.context.monoNs() -| t0;
+        self.host_cost = .{ .cpu_row_ns = cpu, .upload_ns = @floatFromInt(up) };
+        std.log.info("[offload] k2 host layers: {d:.2} ms a row on the CPU, {d:.1} ms a layer to stage", .{ cpu / 1e6, @as(f64, @floatFromInt(up)) / 1e6 });
     }
 
     fn cpuRoutedValues(self: *CudaLM, values: k2.Values, seq: usize, out: Buf) !void {
@@ -830,49 +879,7 @@ pub const CudaLM = struct {
     fn selectRoutes(self: *CudaLM, logits_d: Buf, bias: []const f32, seq: usize, n_experts: usize, n_used: usize) !void {
         const logits = self.route_logits[0 .. seq * n_experts];
         try self.be.tensorDownload(logits_d.slice(0, logits.len * 4), std.mem.sliceAsBytes(logits));
-        for (0..seq) |t| {
-            const row = logits[t * n_experts ..][0..n_experts];
-            switch (self.cfg.gating) {
-                .sigmoid => ops.act.sigmoid(row),
-                .softmax => {
-                    var mx = -std.math.inf(f32);
-                    for (row) |v| mx = @max(mx, v);
-                    var sum: f32 = 0;
-                    for (row) |*v| {
-                        v.* = @exp(v.* - mx);
-                        sum += v.*;
-                    }
-                    for (row) |*v| v.* /= sum;
-                },
-            }
-            const ids = self.selected[t * n_used ..][0..n_used];
-            const weights = self.selected_weights[t * n_used ..][0..n_used];
-            @memset(weights, -std.math.inf(f32));
-            for (row, 0..) |prob, expert| {
-                const score = prob + bias[expert];
-                var at: usize = 0;
-                while (at < n_used and score <= weights[at]) : (at += 1) {}
-                if (at == n_used) continue;
-                var j = n_used - 1;
-                while (j > at) : (j -= 1) {
-                    weights[j] = weights[j - 1];
-                    ids[j] = ids[j - 1];
-                }
-                weights[at] = score;
-                ids[at] = expert;
-            }
-            var sum: f32 = 0;
-            for (ids, weights) |expert, *weight| {
-                weight.* = row[expert];
-                sum += weight.*;
-            }
-            if (self.cfg.normalize_weights) {
-                for (weights) |*weight| weight.* /= @max(sum, 6.103515625e-5);
-            }
-            if (self.cfg.expert_scale != 1) {
-                for (weights) |*weight| weight.* *= self.cfg.expert_scale;
-            }
-        }
+        k2.route(self.cfg, logits, bias, seq, n_experts, n_used, self.selected[0 .. seq * n_used], self.selected_weights[0 .. seq * n_used]);
     }
 
     /// One expert's rows for the per-expert fallback: ids then scales, one upload.
@@ -1271,16 +1278,19 @@ pub const CudaLM = struct {
     }
 
     /// A host layer needs either the staging buffers (GPU prefill) or a
-    /// full-width CPU scratch; the first migration after warm may find neither.
+    /// full-width CPU scratch; the first migration after warm may find neither. With
+    /// the staging buffers the CPU still takes a batch up to `cpu_batch_max` when
+    /// `host_cost` says it is cheaper.
     fn ensureHostPath(self: *CudaLM) void {
         if (self.stage == null and self.stageable()) self.stageAlloc() catch {
             self.stage = null;
         };
-        if (self.stage == null and self.cpu_rows < self.max_rows) {
-            if (k2.Scratch.init(self.gpa, self.cfg, self.max_rows)) |scratch| {
+        const rows = if (self.stage == null) self.max_rows else @min(self.max_rows, cpu_batch_max);
+        if (self.cpu_rows < rows) {
+            if (k2.Scratch.init(self.gpa, self.cfg, rows)) |scratch| {
                 self.cpu_scratch.deinit(self.gpa);
                 self.cpu_scratch = scratch;
-                self.cpu_rows = self.max_rows;
+                self.cpu_rows = rows;
             } else |_| {}
         }
     }
@@ -1410,6 +1420,7 @@ pub const CudaLM = struct {
         self.reserveExpertScratch();
         const stage_bytes: u64 = if (self.stageable()) self.stageBytesNeeded() else 0;
         const cpu_moe_layers = self.planCpuMoeLayers(stage_bytes);
+        if (cpu_moe_layers > 0) std.log.info("[offload] k2 experts of layers 0..{d} on the host", .{cpu_moe_layers});
         for (self.host_experts[0..cpu_moe_layers]) |*h| h.* = true;
         if (cpu_moe_layers > 0) self.ensureHostPath();
         for (self.lm.layers, 0..) |layer, l| {

@@ -16,9 +16,9 @@
 //! - other CSI/SS3 sequences (arrows..) -> swallowed
 //!
 //! The `Editor` is a pure byte-fed state machine (echo goes to a caller
-//! writer), so it is unit-testable without a terminal; `RawTty` holds the
-//! termios save/restore. The caller enables the terminal modes around each
-//! read (bracketed paste `CSI ?2004 h/l`, kitty keyboard `CSI >1u`/`CSI <u`
+//! writer), so it is unit-testable without a terminal; `core/rawtty.zig`
+//! puts the terminal in raw mode. The caller enables the terminal modes
+//! around each read (bracketed paste `CSI ?2004 h/l`, kitty keyboard `CSI >1u`/`CSI <u`
 //! unsupported terminals ignore both; Alt-Enter is the newline fallback
 //! there) so the tty is cooked again while the model generates and Ctrl-C
 //! keeps killing a running generation.
@@ -185,32 +185,6 @@ pub const Editor = struct {
     fn newline(self: *Editor, gpa: std.mem.Allocator, echo: *std.Io.Writer) !void {
         try self.buf.append(gpa, '\n');
         try echo.writeAll("\r\n");
-    }
-};
-
-/// Termios raw-mode guard: no canonical buffering, no echo (the Editor
-/// echoes), no ISIG (Ctrl-C is a byte; the editor turns it into a cancel
-/// so the tty can't die un-restored mid-input).
-pub const RawTty = struct {
-    fd: std.posix.fd_t,
-    saved: std.posix.termios,
-
-    pub fn enter(fd: std.posix.fd_t) !RawTty {
-        const saved = try std.posix.tcgetattr(fd);
-        var raw = saved;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ISIG = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        try std.posix.tcsetattr(fd, .NOW, raw);
-        return .{ .fd = fd, .saved = saved };
-    }
-
-    pub fn leave(self: *RawTty) void {
-        std.posix.tcsetattr(self.fd, .NOW, self.saved) catch {};
     }
 };
 

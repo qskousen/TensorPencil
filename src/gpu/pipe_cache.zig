@@ -9,6 +9,11 @@
 //! everything else on the machine.
 //! `vk-kernels-used` names every eltwise kernel a run has bound; `Context.init` compiles
 //! those on every core before the first forward, and the rest compile on first use.
+//!
+//! The pipelines `Context.init` builds outside the eltwise table (the coop GEMMs and the
+//! attention kernels) each have a file of their own instead, `vk-pipe-<uuid>-<hash of
+//! the pipeline's SPIR-V>.bin`: they take minutes to compile on some drivers, and in the
+//! per-build file every edit to an unrelated kernel would throw them away.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,16 +32,23 @@ pub fn path(buf: []u8, leaf: []const u8) ?[]const u8 {
     return null;
 }
 
-const prefix = "vk-pipelines-";
+pub const build_prefix = "vk-pipelines-";
+pub const pipe_prefix = "vk-pipe-";
 
 /// The cache file's name for a device's `pipelineCacheUUID` and this build's modules.
 pub fn fileName(buf: []u8, uuid: [16]u8, build: u64) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "{x}-{x:0>16}.bin", .{ uuid, build }) catch unreachable;
+    return std.fmt.bufPrint(buf, build_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, build }) catch unreachable;
 }
 
-/// Delete every pipeline cache in `dir` but the `keep` most recently written. Best
-/// effort: a file that will not go costs disk, not correctness.
-pub fn prune(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, keep: usize) void {
+/// One pipeline's own cache file, for the device and the pipeline's content hash.
+pub fn pipeFileName(buf: []u8, uuid: [16]u8, key: u64) []const u8 {
+    return std.fmt.bufPrint(buf, pipe_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, key }) catch unreachable;
+}
+
+/// Delete every `prefix` cache in `dir` but the `keep` most recently written. Best
+/// effort: a file that will not go costs disk, not correctness, and one pruned while
+/// still in use only costs that pipeline a compile.
+pub fn prune(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, comptime prefix: []const u8, keep: usize) void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
     const F = struct { name: []u8, mtime: i96 };
@@ -102,22 +114,30 @@ test "path names the tensorpencil cache directory" {
     try std.testing.expect(std.mem.endsWith(u8, p, "tensorpencil" ++ std.fs.path.sep_str ++ used_list));
     var nb: [96]u8 = undefined;
     try std.testing.expectEqualStrings("vk-pipelines-000102030405060708090a0b0c0d0e0f-00000000000000ab.bin", fileName(&nb, .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, 0xab));
+    try std.testing.expectEqualStrings("vk-pipe-000102030405060708090a0b0c0d0e0f-00000000000000ab.bin", pipeFileName(&nb, .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, 0xab));
 }
 
-test "prune keeps the newest caches and nothing else is touched" {
+test "prune keeps the newest caches of its kind and nothing else is touched" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const names = [_][]const u8{ "vk-pipelines-a-1.bin", "vk-pipelines-a-2.bin", "vk-pipelines-a-3.bin", "vk-kernels-used", "coop_tile" };
+    // The per-pipeline file is the oldest: a prune of build files must not take it.
+    const names = [_][]const u8{ "vk-pipe-a-9.bin", "vk-pipelines-a-1.bin", "vk-pipelines-a-2.bin", "vk-pipelines-a-3.bin", "vk-kernels-used", "coop_tile" };
     for (names, 0..) |n, i| {
         try tmp.dir.writeFile(io, .{ .sub_path = n, .data = "x" });
         // Distinct mtimes, oldest first.
         const t: std.Io.Timestamp = .{ .nanoseconds = @as(i96, @intCast(i + 1)) * std.time.ns_per_s };
-        try tmp.dir.setTimestamps(io, n, .{ .modify_timestamp = .{ .new = t } });
+        // Through a handle: 0.16's `Dir.setTimestamps` panics on Windows.
+        const f = try tmp.dir.openFile(io, n, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = t } });
     }
     var pbuf: [512]u8 = undefined;
     const dir_path = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
-    prune(std.testing.allocator, io, dir_path, 2);
+    prune(std.testing.allocator, io, dir_path, build_prefix, 2);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[1], .{}));
+    for ([_][]const u8{ names[0], names[2], names[3], names[4], names[5] }) |n| _ = try tmp.dir.statFile(io, n, .{});
+    prune(std.testing.allocator, io, dir_path, pipe_prefix, 0);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[0], .{}));
-    for (names[1..]) |n| _ = try tmp.dir.statFile(io, n, .{});
+    for (names[2..]) |n| _ = try tmp.dir.statFile(io, n, .{});
 }

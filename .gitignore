@@ -1,6 +1,8 @@
 /.idea/
 /.zig-cache/
 /zig-out/
+# tools/package_release.sh output.
+/dist/
 /zig-pkg/
 /scratch_out/
 /models/

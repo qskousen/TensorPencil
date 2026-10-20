@@ -171,6 +171,7 @@ pub const StructureType = enum(i32) {
     physical_device_properties_2 = 1000059001,
     physical_device_subgroup_properties = 1000094000,
     physical_device_subgroup_size_control_properties = 1000225000,
+    physical_device_float_controls_properties = 1000197000,
     pipeline_shader_stage_required_subgroup_size_create_info = 1000225001,
     physical_device_subgroup_size_control_features = 1000225002,
     physical_device_shader_integer_dot_product_features = 1000280000,
@@ -244,6 +245,8 @@ pub const ShaderModuleCreateFlags = Flags;
 pub const DescriptorSetLayoutCreateFlags = Flags;
 pub const PipelineLayoutCreateFlags = Flags;
 pub const PipelineShaderStageCreateFlags = Flags;
+/// VK_EXT_subgroup_size_control; needs its `computeFullSubgroups` feature.
+pub const PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: PipelineShaderStageCreateFlags = 0x2;
 pub const PipelineCreateFlags = Flags;
 pub const DescriptorPoolCreateFlags = Flags;
 pub const MemoryMapFlags = Flags;
@@ -559,6 +562,30 @@ pub const PhysicalDeviceSubgroupProperties = extern struct {
     supported_stages: ShaderStageFlags = 0,
     supported_operations: Flags = 0,
     quad_operations_in_all_stages: Bool32 = FALSE,
+};
+
+/// VK_KHR_shader_float_controls, core 1.2: which rounding and denormal modes a
+/// shader may ask for, per float width.
+pub const PhysicalDeviceFloatControlsProperties = extern struct {
+    s_type: StructureType = .physical_device_float_controls_properties,
+    p_next: ?*anyopaque = null,
+    denorm_behavior_independence: u32 = 0,
+    rounding_mode_independence: u32 = 0,
+    shader_signed_zero_inf_nan_preserve_float16: Bool32 = FALSE,
+    shader_signed_zero_inf_nan_preserve_float32: Bool32 = FALSE,
+    shader_signed_zero_inf_nan_preserve_float64: Bool32 = FALSE,
+    shader_denorm_preserve_float16: Bool32 = FALSE,
+    shader_denorm_preserve_float32: Bool32 = FALSE,
+    shader_denorm_preserve_float64: Bool32 = FALSE,
+    shader_denorm_flush_to_zero_float16: Bool32 = FALSE,
+    shader_denorm_flush_to_zero_float32: Bool32 = FALSE,
+    shader_denorm_flush_to_zero_float64: Bool32 = FALSE,
+    shader_rounding_mode_rte_float16: Bool32 = FALSE,
+    shader_rounding_mode_rte_float32: Bool32 = FALSE,
+    shader_rounding_mode_rte_float64: Bool32 = FALSE,
+    shader_rounding_mode_rtz_float16: Bool32 = FALSE,
+    shader_rounding_mode_rtz_float32: Bool32 = FALSE,
+    shader_rounding_mode_rtz_float64: Bool32 = FALSE,
 };
 
 pub const PhysicalDeviceSubgroupSizeControlProperties = extern struct {

@@ -7,13 +7,21 @@ const tp = @import("TensorPencil");
 const pipeline = tp.pipeline;
 const config = @import("config.zig");
 
+/// `auto` resolves to this machine's devices, so call it where the engine runs.
 pub fn toPipelineBackend(b: config.Backend) pipeline.Backend {
     return switch (b) {
         .cpu => .cpu,
         .vulkan => .vulkan,
         .zig_cuda => .zig_cuda,
         .cuda => .cuda,
+        .auto => pipeline.detectBackend(),
     };
+}
+
+/// The backend `b` names, or null for `auto`, which a client cannot resolve for a
+/// host it does not run on.
+pub fn explicitBackend(b: config.Backend) ?pipeline.Backend {
+    return if (b == .auto) null else toPipelineBackend(b);
 }
 
 pub fn fromPipelineBackend(b: pipeline.Backend) config.Backend {
@@ -170,6 +178,12 @@ test "clampDim rounds to multiple of 16 within bounds" {
     try std.testing.expectEqual(@as(usize, 256), clampDim(10));
     try std.testing.expectEqual(@as(usize, 4096), clampDim(99999));
     try std.testing.expectEqual(@as(usize, 512), clampDim(519));
+}
+
+test "auto names no backend a client could check, and resolves to one where it runs" {
+    try std.testing.expectEqual(@as(?pipeline.Backend, null), explicitBackend(.auto));
+    try std.testing.expectEqual(@as(?pipeline.Backend, .vulkan), explicitBackend(.vulkan));
+    try std.testing.expectEqual(pipeline.detectBackend(), toPipelineBackend(.auto));
 }
 
 test "the sampler and scheduler maps invert each other" {

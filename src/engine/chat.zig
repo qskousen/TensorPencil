@@ -30,33 +30,86 @@ const turn_stats = @import("shared").turn_stats;
 
 const qwen3 = tp.models.qwen3;
 const qwen3_cuda = tp.models.qwen3_cuda;
+const qwen3_gpu = tp.models.qwen3_gpu;
+const qwen35_gpu = tp.models.qwen35_gpu;
 const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
 const k2 = tp.models.k2_horizon;
 const k2_cuda = tp.models.k2_horizon_cuda;
+const k2_gpu = tp.models.k2_horizon_gpu;
 const vit35 = tp.models.vit35;
 const vit35_cuda = tp.models.vit35_cuda;
+const vit35_gpu = tp.models.vit35_gpu;
 const gemma3 = tp.models.gemma3;
 const gemma3_cuda = tp.models.gemma3_cuda;
+const gemma3_gpu = tp.models.gemma3_gpu;
 const gemma_vit = tp.models.gemma_vit;
 const gemma_vit_cuda = tp.models.gemma_vit_cuda;
+const gemma_vit_gpu = tp.models.gemma_vit_gpu;
 const gemma4 = tp.models.gemma4;
 const gemma4_cuda = tp.models.gemma4_cuda;
+const gemma4_gpu = tp.models.gemma4_gpu;
 const gemma4_vit = tp.models.gemma4_vit;
 const gemma4_vit_cuda = tp.models.gemma4_vit_cuda;
+const gemma4_vit_gpu = tp.models.gemma4_vit_gpu;
 const gemma4v_vit = tp.models.gemma4v_vit;
 const gemma4v_vit_cuda = tp.models.gemma4v_vit_cuda;
+const gemma4v_vit_gpu = tp.models.gemma4v_vit_gpu;
 
-/// The resident LLM + its vision tower, one variant per supported GGUF
-/// architecture. `model` retains a `*const lm`, so the bundle must live at a
-/// stable address (it does, inside the heap-pinned Session) and its tag is
-/// never reassigned after init.
+/// A model family's prompt, template, KV layout and vision conventions, which do
+/// not depend on the backend its stepper runs on.
+const Family = enum { qwen3, qwen35, k2_horizon, gemma3, gemma4 };
+
+/// The resident LLM, its stepper and its vision tower. `model` retains a
+/// `*const lm`, so a bundle must live at a stable address (it does, inside the
+/// heap-pinned Session).
+fn Bundle(comptime fam: Family, comptime be: device.Kind, comptime Lm: type, comptime Model: type, comptime Vit: type) type {
+    return struct {
+        pub const family = fam;
+        /// The device arm `model` and `vit` were built on.
+        pub const backend: std.meta.Tag(device.Device) = switch (be) {
+            .zig_cuda, .cuda => .cuda,
+            .vulkan => .vulkan,
+        };
+        lm: Lm,
+        model: Model,
+        vit: ?Vit = null,
+    };
+}
+
+/// `Stepper`, once it answers everything `Twin` (its family's CUDA stepper) does that
+/// the chat session calls (`llm.stepper`); a compile error naming what it lacks
+/// otherwise.
+fn Contracted(comptime Twin: type, comptime Stepper: type) type {
+    const gaps = tp.llm.stepper.missing(Twin, Stepper);
+    if (gaps.len != 0) {
+        var list: []const u8 = "";
+        for (gaps) |g| list = list ++ " " ++ g;
+        @compileError(@typeName(Stepper) ++ " lacks, against " ++ @typeName(Twin) ++ ":" ++ list);
+    }
+    return Stepper;
+}
+
+/// One arm per family and backend. Code that differs by family switches on
+/// `@TypeOf(a.*).family`, never on the arm, so a backend's arm needs no branch of
+/// its own. The tag is set once at init.
 const Arch = union(enum) {
-    qwen3: struct { lm: qwen3.CausalLM, model: qwen3_cuda.CudaLM, vit: ?NoVit = null },
-    qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
-    k2_horizon: struct { lm: k2.Model, model: k2_cuda.CudaLM, vit: ?NoVit = null },
-    gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
-    gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?Gemma4Vit = null },
+    qwen3: Bundle(.qwen3, .cuda, qwen3.CausalLM, qwen3_cuda.CudaLM, NoVit),
+    qwen35: Bundle(.qwen35, .cuda, qwen35.Model, qwen35_cuda.CudaLM, vit35.Vit),
+    k2_horizon: Bundle(.k2_horizon, .cuda, k2.Model, k2_cuda.CudaLM, NoVit),
+    gemma3: Bundle(.gemma3, .cuda, gemma3.Model, gemma3_cuda.CudaLM, gemma_vit.Vit),
+    gemma4: Bundle(.gemma4, .cuda, gemma4.Model, gemma4_cuda.CudaLM, Gemma4Vit),
+    qwen3_vk: Bundle(.qwen3, .vulkan, qwen3.CausalLM, Contracted(qwen3_cuda.CudaLM, qwen3_gpu.VulkanLM), NoVit),
+    qwen35_vk: Bundle(.qwen35, .vulkan, qwen35.Model, Contracted(qwen35_cuda.CudaLM, qwen35_gpu.VulkanLM), vit35.Vit),
+    gemma3_vk: Bundle(.gemma3, .vulkan, gemma3.Model, Contracted(gemma3_cuda.CudaLM, gemma3_gpu.VulkanLM), gemma_vit.Vit),
+    gemma4_vk: Bundle(.gemma4, .vulkan, gemma4.Model, Contracted(gemma4_cuda.CudaLM, gemma4_gpu.VulkanLM), Gemma4Vit),
+    k2_horizon_vk: Bundle(.k2_horizon, .vulkan, k2.Model, Contracted(k2_cuda.CudaLM, k2_gpu.VulkanLM), NoVit),
+
+    fn family(self: *const Arch) Family {
+        return switch (self.*) {
+            inline else => |*a| @TypeOf(a.*).family,
+        };
+    }
 };
 
 /// Either gemma4 vision tower, chosen by the mmproj's projector_type: the
@@ -80,7 +133,7 @@ const NoVit = struct {
         _ = self;
     }
 };
-const cuda = tp.gpu.cuda;
+const device = tp.llm.device;
 const engine = tp.llm.engine;
 const pause_gate = tp.ops.pause;
 const sample = tp.llm.sample;
@@ -406,7 +459,7 @@ pub const Options = struct {
     /// Weight-noise curve at load ("" = off), a `noise_curve` expression in the
     /// normalized layer depth. Applied to the backend in `init` rather than by the
     /// app, so a headless driver gets it too. Changing it later goes straight to
-    /// `be.weight_noise`, whose table the decode kernels re-read per launch, which
+    /// `dev.weightNoise()`, whose table the decode kernels re-read per launch, which
     /// is why there is no staged/pending twin here.
     weight_noise_curve: []const u8 = "",
     /// The shape's `a`: how much. Separate from the shape for the same reason the
@@ -552,7 +605,7 @@ pub const Session = struct {
     gguf: Gguf,
     arch: Arch,
     tok: Tokenizer,
-    be: *cuda.Backend,
+    dev: device.Device,
 
     ids: std.ArrayList(u32) = .empty,
     /// The token prefix produced at init (optional BOS + system prompt, with the
@@ -785,28 +838,25 @@ pub const Session = struct {
         errdefer self.tok.deinit();
         chat.applyTokenizer(&self.tok);
 
-        // The chat LLM runs on CUDA only for now. Both CUDA variants work (the
-        // decode driver is identical, hand-PTX kernels either way; libs just
-        // adds cuBLASLt/cuDNN). Non-CUDA selections error cleanly (the loader
-        // surfaces it) rather than silently falling back.
-        self.be = switch (cfg.backend) {
-            .zig_cuda => try cuda.Backend.init(arena),
-            .cuda => try cuda.Backend.initLibs(arena),
-            .cpu, .vulkan => return error.UnsupportedLlmBackend,
-        };
-        errdefer self.be.deinit();
+        // Non-CUDA selections error cleanly (the loader surfaces it) rather than
+        // silently falling back.
+        self.dev = try device.Device.init(arena, io, switch (cfg.backend) {
+            .zig_cuda => .zig_cuda,
+            .cuda => .cuda,
+            .vulkan => .vulkan,
+            .cpu => return error.UnsupportedLlmBackend,
+        });
+        errdefer self.dev.deinit();
         // Weight noise from the config, so a headless driver (chat-probe) perturbs
-        // identically. Live changes go straight to this atomic from the engine
+        // identically. Live changes go straight to this table from the engine
         // thread (`Driver.applySettings`).
-        self.be.weight_noise.seed = cfg.weight_noise_seed;
-        self.be.weight_noise.amount = cfg.weight_noise_amount;
-        self.be.weight_noise.setCurve(cfg.weight_noise_curve);
-        // Resident models keep weights pinned. K2 pins its fixed path during
-        // warmup, then streams only the routed experts.
-        self.be.pinAllWeights();
-        // Before the model allocates anything (see enableLlmMemTags): turns the
-        // one derived `scratch` residual into named per-component figures.
-        self.be.enableLlmMemTags();
+        const noise = self.dev.weightNoise();
+        noise.seed = cfg.weight_noise_seed;
+        noise.amount = cfg.weight_noise_amount;
+        noise.setCurve(cfg.weight_noise_curve);
+        // Weights stay pinned (K2 pins its fixed path during warmup, then streams
+        // only the routed experts), and every allocation is named by component.
+        self.dev.prepareForLlm();
 
         self.mmproj_gguf = null;
         self.vision_budget_tokens = cfg.vision_budget_tokens;
@@ -860,7 +910,47 @@ pub const Session = struct {
         // model retains a `*const lm` into the union, which is stable (self is
         // heap-pinned and the tag is set once). Vision towers are scoped
         // per-encode and never stay resident under the LLM.
-        if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
+        if (self.dev == .vulkan) {
+            if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
+                self.arch = .{ .qwen3_vk = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
+                const a = &self.arch.qwen3_vk;
+                errdefer a.lm.deinit();
+                if (self.mmproj_gguf != null)
+                    std.log.warn("mmproj configured, but this text-only model has no vision — disabled", .{});
+                a.model = try qwen3_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
+            } else if (std.mem.eql(u8, arch_str, "qwen35")) {
+                self.arch = .{ .qwen35_vk = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
+                const a = &self.arch.qwen35_vk;
+                errdefer a.lm.deinit();
+                if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
+                errdefer if (a.vit) |*v| v.deinit();
+                a.model = try qwen35_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
+            } else if (std.mem.eql(u8, arch_str, "gemma3")) {
+                self.arch = .{ .gemma3_vk = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
+                const a = &self.arch.gemma3_vk;
+                errdefer a.lm.deinit();
+                if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
+                errdefer if (a.vit) |*v| v.deinit();
+                a.model = try gemma3_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
+            } else if (std.mem.eql(u8, arch_str, "gemma4")) {
+                self.arch = .{ .gemma4_vk = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
+                const a = &self.arch.gemma4_vk;
+                errdefer a.lm.deinit();
+                try self.loadGemma4Vision(arena, a);
+                errdefer if (a.vit) |*v| v.deinit();
+                a.model = try gemma4_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
+            } else if (std.mem.eql(u8, arch_str, "k2-horizon")) {
+                self.arch = .{ .k2_horizon_vk = .{ .lm = try k2.Model.load(arena, &self.gguf), .model = undefined } };
+                const a = &self.arch.k2_horizon_vk;
+                errdefer a.lm.deinit();
+                if (self.mmproj_gguf != null)
+                    std.log.warn("mmproj configured, but K2 Horizon is text-only — disabled", .{});
+                a.model = try k2_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
+            } else {
+                std.log.err("chat on Vulkan runs qwen3, llama, qwen35, gemma3, gemma4 and k2-horizon models; {s} is not one", .{arch_str});
+                return error.UnsupportedLlmBackend;
+            }
+        } else if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
             // The plain llama/Mistral family reuses the qwen3 stack (qwen3.zig
             // un-permutes q/k at load, skips QK-norm); qwen3_cuda runs both.
             self.arch = .{ .qwen3 = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
@@ -869,28 +959,28 @@ pub const Session = struct {
             // qwen3 / llama here are text-only: no mmproj/vision tower.
             if (self.mmproj_gguf != null)
                 std.log.warn("mmproj configured, but this text-only model has no vision — disabled", .{});
-            a.model = try qwen3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap, @min(512, cap.max));
+            a.model = try qwen3_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap, @min(512, cap.max));
         } else if (std.mem.eql(u8, arch_str, "qwen35")) {
             self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.qwen35;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
-            a.model = try qwen35_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+            a.model = try qwen35_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "k2-horizon")) {
             self.arch = .{ .k2_horizon = .{ .lm = try k2.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.k2_horizon;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf != null)
                 std.log.warn("mmproj configured, but K2 Horizon is text-only — disabled", .{});
-            a.model = try k2_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+            a.model = try k2_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma3")) {
             self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma3;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
-            a.model = try gemma3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+            a.model = try gemma3_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma4")) {
             self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma4;
@@ -906,22 +996,9 @@ pub const Session = struct {
             // no images pays nothing for it however the budget is set. The LOCAL
             // KV ring still reserves its slack from this, since the ring modulus
             // is baked into position addressing and cannot be resized later.
-            if (self.vision_budget_tokens != 0) a.lm.cfg.image_budget = self.vision_budget_tokens;
-            // Vision tower dispatched by projector_type: "gemma4v" -> full SigLIP
-            // tower (31B), else the shallow "gemma4uv" embedder (12B). Encodes are
-            // scoped per image turn.
-            if (self.mmproj_gguf) |*mg| {
-                const pt = mg.getStr("clip.vision.projector_type") orelse return error.UnknownModelConfig;
-                if (std.mem.eql(u8, pt, "gemma4v")) {
-                    var v = try gemma4v_vit.Vit.load(arena, mg);
-                    if (self.vision_budget_tokens != 0) v.cfg.max_tokens = self.vision_budget_tokens;
-                    a.vit = .{ .v = v };
-                } else {
-                    a.vit = .{ .uv = try gemma4_vit.Vit.load(arena, mg) };
-                }
-            }
+            try self.loadGemma4Vision(arena, a);
             errdefer if (a.vit) |*v| v.deinit();
-            a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+            a.model = try gemma4_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else unreachable; // familyForArch above is the single arch gate: any
         // arch reaching here already passed it, and this dispatch covers the
         // same set (adding an arch means adding it to both, in lockstep,
@@ -930,8 +1007,8 @@ pub const Session = struct {
         // Read weight bytes from the checkpoint FILE rather than faulting the
         // mapping (no-op unless read_mode is .pread). Registered BEFORE
         // warmWeights below, which is what actually pulls them in.
-        session.useFileReads(self.be, &self.gguf);
-        if (self.mmproj_gguf) |*mg| session.useFileReads(self.be, mg);
+        self.dev.useFileReads(&self.gguf);
+        if (self.mmproj_gguf) |*mg| self.dev.useFileReads(mg);
 
         // Upload the weights NOW, while the UI is still showing "Loading...".
         // `Backend.cachedWeight` is lazy, so without this the one-time
@@ -1067,7 +1144,7 @@ pub const Session = struct {
             // A failed query must not resolve the fractions against a zero card:
             // that is a zero ceiling, and it would offload the model being loaded.
             // The budget fields stay 0, which every planner reads as "no ceiling".
-            if (self.be.ctx.memGetInfo()) |mi| {
+            if (self.dev.memInfo()) |mi| {
                 const total: f32 = @floatFromInt(mi.total);
                 self.vram_limit = @intFromFloat(cfg.vram_limit_frac * total);
                 self.vram_share = @intFromFloat(cfg.vram_split * total);
@@ -1082,7 +1159,7 @@ pub const Session = struct {
         }
 
         // Gemma prompts begin with a single BOS ({{ bos_token }}); ChatML has none.
-        if (self.arch == .gemma3 or self.arch == .gemma4) {
+        if (self.arch.family() == .gemma3 or self.arch.family() == .gemma4) {
             if (self.tok.specialId("<bos>")) |bos| try self.ids.append(gpa, bos);
         }
 
@@ -1102,9 +1179,9 @@ pub const Session = struct {
         // K2's template carries its tool-call syntax and effort markers; the hand
         // glue below cannot declare tools, so a template that fails to load
         // leaves the model without the image tool.
-        self.template = if (cfg.gemma4_canonical_template and self.arch == .gemma4)
+        self.template = if (cfg.gemma4_canonical_template and self.arch.family() == .gemma4)
             (chat_template.ChatTemplate.gemma4Canonical(arena) catch null)
-        else if (cfg.qwen35_fixed_template and self.arch == .qwen35)
+        else if (cfg.qwen35_fixed_template and self.arch.family() == .qwen35)
             (chat_template.ChatTemplate.qwen35Fixed(arena) catch null)
         else
             (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch |err| blk: {
@@ -1176,7 +1253,7 @@ pub const Session = struct {
         // recurrent state, and re-arms dynamic offload for the fresh small
         // context), so the LLM context must be current on this (UI) thread. All
         // GPU workers are joined above, so there's no concurrent device access.
-        self.be.bindThread();
+        self.dev.bindThread();
         self.image_evicted = false; // a fresh chat starts from the armed baseline
         switch (self.arch) {
             inline else => |*a| a.model.resetResidency(self.vram_budget) catch |err|
@@ -1213,7 +1290,7 @@ pub const Session = struct {
     /// Errors (error.KvDtypeUnsupported) if the active arch can't do `dtype`.
     pub fn rebuildContext(self: *Session, dtype: kv_cache.KvDtype) !void {
         if (self.busy()) return error.Busy;
-        self.be.bindThread();
+        self.dev.bindThread();
         switch (self.arch) {
             inline else => |*a| try a.model.reinitCache(dtype),
         }
@@ -1354,7 +1431,7 @@ pub const Session = struct {
     // so it runs ONLY on the worker (via `pollAndApply` at a token boundary) or
     // on the arbiter thread while the LLM is idle, never racing the worker.
     fn vpUsage(ctx: *anyopaque) u64 {
-        return fromCtx(ctx).be.deviceUsed();
+        return fromCtx(ctx).dev.deviceUsed();
     }
     /// Footprint with every offloaded layer promoted back, what the LLM would
     /// hold if nothing contended. Lets the arbiter tell "this LLM is small" from
@@ -1410,23 +1487,23 @@ pub const Session = struct {
     /// and the live TP_DUMP_VRAM sample so the two can never phrase it
     /// differently.
     pub fn memTagLine(self: *Session, buf: []u8) struct { text: []const u8, named: u64 } {
-        const tags = self.be.memTagBreakdown();
+        const tags = self.dev.memTagBreakdown();
         var named: u64 = 0;
         var w = std.Io.Writer.fixed(buf);
         for (tags, 0..) |v, i| {
             if (v == 0) continue;
             named += v;
-            const t: @TypeOf(self.be.ctx.mem_tag) = @enumFromInt(i);
+            const t: device.MemTag = @enumFromInt(i);
             w.print("{s} {d} + ", .{ t.name(), v >> 20 }) catch break;
         }
         return .{ .text = w.buffered(), .named = named };
     }
 
     pub fn logMemTags(self: *Session, proc_used: u64) void {
-        const used = self.be.deviceUsed();
+        const used = self.dev.deviceUsed();
         var buf: [320]u8 = undefined;
         const line = self.memTagLine(&buf);
-        const jit = self.be.jitStats();
+        const jit = self.dev.jitStats();
         std.log.info("[vram] LLM tagged: {s}unattributed {d} = {d} MiB · {d} PTX modules JIT'd in {d} ms", .{
             line.text, (used -| line.named) >> 20, used >> 20, jit.count, jit.ns / 1_000_000,
         });
@@ -1454,7 +1531,7 @@ pub const Session = struct {
     }
     fn vpApply(ctx: *anyopaque, target: u64) void {
         const self = fromCtx(ctx);
-        self.be.bindThread();
+        self.dev.bindThread();
         switch (self.arch) {
             inline else => |*a| {
                 // Snapshot residency around the settle so we can log exactly what
@@ -1550,8 +1627,8 @@ pub const Session = struct {
             std.log.info("[reclaim] declined: no VRAM budget (auto)", .{});
             return 0;
         }
-        self.be.bindThread();
-        const before = self.be.deviceUsed();
+        self.dev.bindThread();
+        const before = self.dev.deviceUsed();
         const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
         switch (self.arch) {
             inline else => |*a| {
@@ -1566,10 +1643,10 @@ pub const Session = struct {
                     a.model.offloadToBudget(before - needed) catch {}; // just enough
             },
         }
-        const freed = before -| self.be.deviceUsed();
+        const freed = before -| self.dev.deviceUsed();
         const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e6;
         std.log.info("[reclaim] needed={d}MB migrated LLM {d}MB→CPU in {d:.0}ms (LLM now {d}MB device)", .{
-            needed >> 20, freed >> 20, ms, self.be.deviceUsed() >> 20,
+            needed >> 20, freed >> 20, ms, self.dev.deviceUsed() >> 20,
         });
         if (freed > 0) self.image_evicted = true;
         return freed;
@@ -1669,7 +1746,7 @@ pub const Session = struct {
         self.pending.deinit(self.gpa);
         self.ids.deinit(self.gpa);
         self.initial_ids.deinit(self.gpa);
-        self.be.deinit();
+        self.dev.deinit();
         self.tok.deinit();
         switch (self.arch) {
             inline else => |*a| a.lm.deinit(),
@@ -1711,7 +1788,7 @@ pub const Session = struct {
     /// the controls otherwise light up for a Qwen, or for a QAT Gemma 4 whose q4_0
     /// linears have no noised kernels, and silently do nothing.
     pub fn weightNoiseSupported(self: *const Session) bool {
-        return session.weightNoiseSupported(&self.gguf);
+        return device.weightNoiseSupported(self.dev.backendKind(), &self.gguf);
     }
 
     /// Current context length in tokens (KV rows used).
@@ -1727,32 +1804,33 @@ pub const Session = struct {
     /// GPU or the CPU.
     pub fn ctxKvBytes(self: *Session) u64 {
         return switch (self.arch) {
-            // qwen3 is uniform full attention: every layer holds the whole context.
-            .qwen3 => |*a| 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
-            .qwen35 => |*a| 2 * @as(u64, a.model.cfg.nAttnLayers()) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
-            .k2_horizon => |*a| 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
-            // gemma3/gemma4 LOCAL (sliding-window) layers hold only a fixed ring
-            // (window + one prefill chunk), so their footprint plateaus instead
-            // of growing with the conversation; GLOBAL layers hold
-            // the full context. gemma4's KV dim also varies per layer.
-            .gemma3 => |*a| blk: {
-                const cfg = a.model.cfg;
-                const cached: u64 = a.model.cached();
-                const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
-                var rows: u64 = 0;
-                for (0..cfg.n_layers) |l| rows += if (cfg.isGlobal(l)) cached else @min(cached, ring);
-                break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(rows * cfg.kvDim()));
-            },
-            .gemma4 => |*a| blk: {
-                const cfg = a.model.cfg;
-                const cached: u64 = a.model.cached();
-                const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
-                var kv: u64 = 0;
-                for (0..cfg.n_layers) |l| {
-                    const layer_rows = if (cfg.isGlobal(l)) cached else @min(cached, ring);
-                    kv += layer_rows * cfg.kvDim(l);
-                }
-                break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(kv));
+            inline else => |*a| switch (@TypeOf(a.*).family) {
+                // qwen3 is uniform full attention: every layer holds the whole context.
+                .qwen3, .k2_horizon => 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
+                .qwen35 => 2 * @as(u64, a.model.cfg.nAttnLayers()) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
+                // gemma3/gemma4 LOCAL (sliding-window) layers hold only a fixed ring
+                // (window + one prefill chunk), so their footprint plateaus instead
+                // of growing with the conversation; GLOBAL layers hold
+                // the full context. gemma4's KV dim also varies per layer.
+                .gemma3 => blk: {
+                    const cfg = a.model.cfg;
+                    const cached: u64 = a.model.cached();
+                    const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
+                    var rows: u64 = 0;
+                    for (0..cfg.n_layers) |l| rows += if (cfg.isGlobal(l)) cached else @min(cached, ring);
+                    break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(rows * cfg.kvDim()));
+                },
+                .gemma4 => blk: {
+                    const cfg = a.model.cfg;
+                    const cached: u64 = a.model.cached();
+                    const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
+                    var kv: u64 = 0;
+                    for (0..cfg.n_layers) |l| {
+                        const layer_rows = if (cfg.isGlobal(l)) cached else @min(cached, ring);
+                        kv += layer_rows * cfg.kvDim(l);
+                    }
+                    break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(kv));
+                },
             },
         };
     }
@@ -2044,7 +2122,7 @@ pub const Session = struct {
         // CUDA contexts are per-thread; the model was loaded on the main
         // thread, so bind the backend's context to this worker before any
         // device op (else cuMemcpyHtoD fails with INVALID_CONTEXT).
-        self.be.bindThread();
+        self.dev.bindThread();
 
         const prep = self.prepareTurn() catch |err| {
             self.gen_err = err;
@@ -2406,9 +2484,8 @@ pub const Session = struct {
     /// The active family's image-placeholder expansion (vocab-derived), or null
     /// for a text-only arch. Mirrors the CLI's `imageExpandFor`.
     fn imageExpand(self: *Session) ?chat_template.ImageExpand {
-        return switch (self.arch) {
-            .qwen3 => null,
-            .k2_horizon => null,
+        return switch (self.arch.family()) {
+            .qwen3, .k2_horizon => null,
             .qwen35 => chat_template.ImageExpand.chatml(&self.tok),
             .gemma3 => chat_template.ImageExpand.gemma3(&self.tok),
             .gemma4 => chat_template.ImageExpand.gemma4(&self.tok),
@@ -2423,26 +2500,68 @@ pub const Session = struct {
     /// can be released immediately.
     fn encodeCurrentImages(self: *Session, out: *std.ArrayList(EncImg)) !void {
         switch (self.arch) {
-            .qwen3, .k2_horizon => {},
-            .qwen35 => |*a| for (self.turn_images.items) |im| {
-                var e = try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
+            inline else => |*a| for (self.turn_images.items) |im| try out.append(self.gpa, try self.encodeImage(a, im)),
+        }
+    }
+
+    /// A gemma4 bundle's vision budget and its tower, which the mmproj's projector type
+    /// names: "gemma4v" the full SigLIP tower (31B), else the shallow embedder (12B).
+    /// The budget sizes the LLM's image block (its activation rows and local ring
+    /// slack) and is fixed at load, which makes it a reload-triggering setting.
+    fn loadGemma4Vision(self: *Session, arena: std.mem.Allocator, a: anytype) !void {
+        if (self.vision_budget_tokens != 0) a.lm.cfg.image_budget = self.vision_budget_tokens;
+        const mg = if (self.mmproj_gguf) |*m| m else return;
+        const pt = mg.getStr("clip.vision.projector_type") orelse return error.UnknownModelConfig;
+        if (std.mem.eql(u8, pt, "gemma4v")) {
+            var v = try gemma4v_vit.Vit.load(arena, mg);
+            if (self.vision_budget_tokens != 0) v.cfg.max_tokens = self.vision_budget_tokens;
+            a.vit = .{ .v = v };
+        } else {
+            a.vit = .{ .uv = try gemma4_vit.Vit.load(arena, mg) };
+        }
+    }
+
+    /// One image through the bundle's tower on the device it was built on.
+    fn encodeImage(self: *Session, a: anytype, im: anytype) !EncImg {
+        const B = @TypeOf(a.*);
+        switch (comptime B.family) {
+            .qwen3, .k2_horizon => unreachable, // text-only: hasVit() is always false
+            .qwen35 => {
+                var e = switch (comptime B.backend) {
+                    .cuda => try vit35_cuda.encode(&a.vit.?, self.dev.cuda, self.gpa, im.rgb, im.width, im.height),
+                    .vulkan => try vit35_gpu.encode(&a.vit.?, self.dev.vulkan, self.gpa, im.rgb, im.width, im.height),
+                };
                 defer e.deinit(self.gpa);
-                try out.append(self.gpa, .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h });
+                return .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h };
             },
-            .gemma3 => |*a| for (self.turn_images.items) |im| {
-                var e = try gemma_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+            .gemma3 => {
+                var e = switch (comptime B.backend) {
+                    .cuda => try gemma_vit_cuda.encode(&a.vit.?, self.dev.cuda, self.io, self.gpa, im.rgb, im.width, im.height),
+                    .vulkan => blk: {
+                        var dev = try gemma_vit_gpu.VitGpu.load(self.gpa, &a.vit.?);
+                        defer dev.deinit();
+                        break :blk try dev.encode(self.dev.vulkan, self.io, self.gpa, im.rgb, im.width, im.height);
+                    },
+                };
                 defer e.deinit(self.gpa);
-                try out.append(self.gpa, .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h });
+                return .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h };
             },
-            .gemma4 => |*a| for (self.turn_images.items) |im| switch (a.vit.?) {
-                // gemma4 encoders return an owned embeds slice (no Encoded wrapper).
+            // The gemma4 encoders return an owned embeds slice.
+            .gemma4 => switch (a.vit.?) {
                 .uv => |*uv| {
-                    const r = try gemma4_vit_cuda.encode(uv, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
-                    try out.append(self.gpa, .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h });
+                    const r = switch (comptime B.backend) {
+                        .cuda => try gemma4_vit_cuda.encode(uv, self.dev.cuda, self.io, self.gpa, im.rgb, im.width, im.height),
+                        .vulkan => try gemma4_vit_gpu.encode(uv, self.dev.vulkan, self.io, self.gpa, im.rgb, im.width, im.height),
+                    };
+                    return .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
                 },
+                // The budget was applied to v.cfg.max_tokens at load (reload-gated).
                 .v => |*v| {
-                    const r = try gemma4v_vit_cuda.encode(v, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
-                    try out.append(self.gpa, .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h });
+                    const r = switch (comptime B.backend) {
+                        .cuda => try gemma4v_vit_cuda.encode(v, self.dev.cuda, self.io, self.gpa, im.rgb, im.width, im.height),
+                        .vulkan => try gemma4v_vit_gpu.encode(v, self.dev.vulkan, self.io, self.gpa, im.rgb, im.width, im.height),
+                    };
+                    return .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
                 },
             },
         }
@@ -2534,6 +2653,13 @@ pub const Session = struct {
             try self.template.?.renderIdsMM(&self.tok, self.gpa, ropts, exp.?, grids.items, &desired, &image_rows)
         else
             try self.template.?.renderIds(&self.tok, self.gpa, ropts, &desired);
+
+        // Every image this turn needs a placeholder the expansion recognised, or its
+        // embeds would have no rows to land in.
+        if (image_rows.items.len < cur_embeds.items.len) {
+            std.log.err("the chat template placed {d} image(s) for {d} attached; this model's image markers are not recognised", .{ image_rows.items.len, cur_embeds.items.len });
+            return error.ImagePlaceholderMissing;
+        }
 
         // What this turn's user message costs the prompt, for its footer.
         self.turn_prompt_tokens = self.measureTurnPrompt(ropts, msgs.items, exp, grids.items, desired.items.len);
@@ -2773,10 +2899,7 @@ pub const Session = struct {
                     std.log.warn("promote for image turn failed: {t}", .{err}),
             }
             switch (self.arch) {
-                .qwen3, .k2_horizon => unreachable, // text-only: hasVit() is always false here
-                .qwen35 => |*a| try self.imageTurn(a, false),
-                .gemma3 => |*a| try self.imageTurn(a, true),
-                .gemma4 => |*a| try self.imageTurnGemma4(a),
+                inline else => |*a| try self.imageTurn(a),
             }
         } else {
             try chat.appendUser(&self.tok, self.gpa, self.turn_text, &self.ids);
@@ -2792,56 +2915,22 @@ pub const Session = struct {
 
     /// Encode this turn's images on the arch's vision tower, build the
     /// interleaved segment layout (family-aware), and inject each image's
-    /// embeddings at its placeholder rows. `a` is a pointer to the active
-    /// arch bundle; `gemma` selects the (io-taking) gemma vision encoder.
-    fn imageTurn(self: *Session, a: anytype, comptime gemma: bool) !void {
-        const Enc = if (gemma) gemma_vit.Vit.Encoded else vit35.Vit.Encoded;
-        var encs: std.ArrayList(Enc) = .empty;
+    /// embeddings at its placeholder rows. `a` is the active arch bundle.
+    fn imageTurn(self: *Session, a: anytype) !void {
+        switch (comptime @TypeOf(a.*).family) {
+            .qwen3, .k2_horizon => unreachable, // text-only: hasVit() is always false
+            .qwen35, .gemma3, .gemma4 => {},
+        }
+        var encs: std.ArrayList(EncImg) = .empty;
         defer {
-            for (encs.items) |*e| e.deinit(self.gpa);
+            for (encs.items) |e| self.gpa.free(e.embeds);
             encs.deinit(self.gpa);
         }
         var segs: std.ArrayList(chat.Segment) = .empty;
         defer segs.deinit(self.gpa);
         for (self.turn_images.items) |im| {
-            const enc = if (gemma)
-                try gemma_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height)
-            else
-                try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
-            try encs.append(self.gpa, enc);
-            try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
-        }
-        if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
-        try session.prefillImageTurn(&a.model, &self.tok, self.gpa, &self.ids, segs.items, encs.items);
-    }
-
-    /// imageTurn for gemma4: encode each image with the active tower, the
-    /// "gemma4uv" unified embedder runs device-side via gemma4_vit_cuda, the
-    /// "gemma4v" SigLIP tower on CPU, then inject the projected embeddings into
-    /// the LLM at their placeholder rows. Otherwise identical to imageTurn.
-    fn imageTurnGemma4(self: *Session, a: anytype) !void {
-        // Both towers' Encoded types are structurally identical; a local struct
-        // lets one list carry either (prefillImageTurn is duck-typed).
-        const Enc = struct { embeds: []f32, grid_w: usize, grid_h: usize };
-        var encs: std.ArrayList(Enc) = .empty;
-        defer {
-            for (encs.items) |*e| self.gpa.free(e.embeds);
-            encs.deinit(self.gpa);
-        }
-        var segs: std.ArrayList(chat.Segment) = .empty;
-        defer segs.deinit(self.gpa);
-        for (self.turn_images.items) |im| {
-            const enc: Enc = switch (a.vit.?) {
-                .uv => |*uv| e: {
-                    const r = try gemma4_vit_cuda.encode(uv, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
-                    break :e .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
-                },
-                .v => |*v| e: {
-                    // Budget was applied to v.cfg.max_tokens at load (reload-gated).
-                    const r = try gemma4v_vit_cuda.encode(v, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
-                    break :e .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
-                },
-            };
+            const enc = try self.encodeImage(a, im);
+            errdefer self.gpa.free(enc.embeds);
             try encs.append(self.gpa, enc);
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }
@@ -3339,6 +3428,10 @@ test "weight noise arch list matches the steppers that publish a layer index" {
         .{ "qwen35", qwen35_cuda.CudaLM },
         .{ "gemma3", gemma3_cuda.CudaLM },
         .{ "gemma4", gemma4_cuda.CudaLM },
+        .{ "qwen3", qwen3_gpu.VulkanLM },
+        .{ "qwen35", qwen35_gpu.VulkanLM },
+        .{ "gemma3", gemma3_gpu.VulkanLM },
+        .{ "gemma4", gemma4_gpu.VulkanLM },
     };
     inline for (cases) |c| {
         const listed = session.archSupportsWeightNoise(c[0]);

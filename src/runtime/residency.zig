@@ -1,4 +1,4 @@
-//! Backend/model-agnostic CPU<->GPU layer-offload SCHEDULING for the CUDA
+//! Backend/model-agnostic CPU<->GPU layer-offload SCHEDULING for the GPU
 //! steppers. The dynamic-offload control flow (migrate-next, offload-until,
 //! promote-back) was byte-identical across qwen35_cuda and gemma3_cuda; this
 //! single-sources it, mirroring `transformer_gpu.decoderLayer`: the loop/order
@@ -11,7 +11,8 @@
 //!                             touched by the per-model hooks below):
 //!                               .dynamic: bool   .budget: u64
 //!                               .order: []usize  .next: usize
-//!   st.be                      the CUDA backend: `deviceUsed()` / `headroom()`,
+//!   st.be                      the device (a CUDA backend or a Vulkan context):
+//!                              `deviceUsed()` / `headroom()`, `memGetInfo()`,
 //!                              plus `pinnedWeightBytes()` /
 //!                              `evictableWeightBytes()` for `splitHostCount`
 //!   st.migrateLayer(l) !void   move layer l device->host, freeing its VRAM
@@ -44,6 +45,10 @@ pub const Snapshot = struct {
 /// Untyped so it coerces into both the steppers' `usize` promote costs and the
 /// `u64` byte budgets here.
 pub const promote_slack = 64 << 20;
+
+/// Which layers a CPU split sends to the host first: the attention-heavy ones, or
+/// the tail of the stack.
+pub const CpuSplitPolicy = enum { tail, attn };
 
 /// Device residency `st` is ACTUALLY holding right now, itemized.
 ///
@@ -275,7 +280,7 @@ pub fn snapshot(st: anytype) Snapshot {
         .n_cpu = if (st.split) |sp| sp.n_cpu else 0,
         .n_layers = st.cfg.n_layers,
         .device_mib = st.be.deviceUsed() >> 20,
-        .free_mib = st.be.ctx.freeMiB(),
+        .free_mib = st.be.freeMiB(),
     };
 }
 
@@ -332,7 +337,7 @@ pub fn offloadToBudget(st: anytype, target: u64) !void {
 /// physically hold is now clamped instead of being taken at face value.
 pub fn resolveBudget(st: anytype, vram_budget: u64) u64 {
     if (vram_budget == 0) return 0;
-    const mi = st.be.ctx.memGetInfo() orelse return vram_budget; // no card info: honour the flag as given
+    const mi = st.be.memGetInfo() orelse return vram_budget; // no card info: honour the flag as given
     const tracked = st.be.deviceUsed();
     const r = vram.resolve(.{ .ours_bytes = vram_budget }, .{
         .total = mi.total,

@@ -1947,8 +1947,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     // this normally says nothing, it stays because "which backends" is a
     // per-family fact (it was cpu-only for the SD family until its device kernels
     // landed) and the next architecture will arrive CPU-first.
-    const want = pipeline_map.toPipelineBackend(cfg.diff_backend);
-    if (!t.supports(want)) statusFmt(
+    if (pipeline_map.explicitBackend(cfg.diff_backend)) |want| if (!t.supports(want)) statusFmt(
         &buf,
         "{s} has no kernels for the {t} backend — pick another below, " ++
             "or generation will fail to load.",

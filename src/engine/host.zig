@@ -931,7 +931,7 @@ pub const Host = struct {
                 st.reason_close = r.close;
             }
             st.gen_err = if (s.gen_err) |e| @errorName(e) else "";
-            st.ctx_lost = s.be.ctx.isLost();
+            st.ctx_lost = s.dev.isLost();
             st.llm_busy = s.busy();
             st.turn_pending = s.turnPending();
             for (s.pendingAttachments()) |gi| {
@@ -1180,7 +1180,7 @@ pub const Host = struct {
             t.diff_off = d.offloadBytes();
         }
         if (self.drv.uiSession()) |s| {
-            t.llm_used = s.be.deviceUsed();
+            t.llm_used = s.dev.deviceUsed();
             t.limit = s.vram_limit;
             t.ctx_tokens = s.ctxTokens();
             t.ctx_kv = s.ctxKvBytes();
@@ -1188,7 +1188,7 @@ pub const Host = struct {
             t.layers_gpu = @intCast(res.gpu);
             t.layers_cpu = @intCast(res.cpu);
             t.llm_host = res.host_bytes;
-            if (t.vram_total == 0) if (s.be.ctx.memGetInfo()) |mi| {
+            if (t.vram_total == 0) if (s.dev.memInfo()) |mi| {
                 t.vram_total = mi.total;
                 t.vram_used = mi.total -| mi.free;
                 t.have_gpu = true;

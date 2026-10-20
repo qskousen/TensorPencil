@@ -429,6 +429,9 @@ pub inline fn sgGlobal(e: Env) u32 {
 pub inline fn sgTotal(e: Env) u32 {
     return e.nwg() * (table.row_wg / e.sgSize());
 }
+pub inline fn sgPerWg(e: Env) u32 {
+    return table.row_wg / e.sgSize();
+}
 
 // ---- shared math ------------------------------------------------------------
 
@@ -544,6 +547,20 @@ pub inline fn dp4a(w4: u32, x4: u32, acc: i32) i32 {
     var s = acc;
     inline for (0..4) |i| s += sext8(w4 >> @intCast(i * 8)) * sext8(x4 >> @intCast(i * 8));
     return s;
+}
+
+/// `dp4a` as SPIR-V's `OpSDot` over packed bytes, for the `_sdot` kernels alone: the
+/// capability it needs is added to their pipelines only, on a device that has it.
+pub inline fn sdot4(w4: u32, x4: u32, acc: i32) i32 {
+    if (is_ptx) return dp4a(w4, x4, acc);
+    const dot = asm (
+        \\%r = OpSDot %i32t %w %x PackedVectorFormat4x8Bit
+        : [r] "" (-> i32),
+        : [i32t] "t" (i32),
+          [w] "" (w4),
+          [x] "" (x4),
+    );
+    return acc + dot;
 }
 
 /// Per-byte `a - b`, no borrow between bytes. One instruction on PTX; on SPIR-V
@@ -742,6 +759,7 @@ const bodies = .{
     .{ "gather_rows", elt.gatherRows },
     .{ "scatter_add_rows", elt.scatterAddRows },
     .{ "moe_combine", elt.moeCombine },
+    .{ "moe_route", elt.moeRoute },
     .{ "gemv_combine", elt.gemvCombine },
     .{ "gemv_combine4", elt.gemvCombine4 },
     .{ "modulate_pr", At(elt.modulatePerRow, .f32).run },
@@ -837,6 +855,7 @@ const bodies = .{
     .{ "rmsnorm", At(rows.rmsnorm, .f32).run },
     .{ "qk_norm_rope", rows.qkNormRope },
     .{ "group_rmsnorm", rows.groupRmsnorm },
+    .{ "gemv_rows_f32", rows.gemvRowsF32 },
     .{ "rms_mod", At(rows.rmsMod, .f32).run },
     .{ "rms_mod_h16", At(rows.rmsModH16, .f32).run },
     .{ "layernorm", At(rows.layernorm, .f32).run },
@@ -845,52 +864,116 @@ const bodies = .{
     .{ "rowmax_i8", rows.rowmaxI8 },
     .{ "gemv_dual_q2_k", quant.gemvQ2_k },
     .{ "gemv_dual_q2_k_q8", quant.gemvQ2_kQ8 },
+    .{ "gemv_dual_q2_k_sdot", quant.GemvQ8Sdot(.q2_k).run },
     .{ "gemv_dual_q3_k", quant.gemvQ3_k },
     .{ "gemv_dual_q3_k_q8", quant.gemvQ3_kQ8 },
+    .{ "gemv_dual_q3_k_sdot", quant.GemvQ8Sdot(.q3_k).run },
     .{ "gemv_dual_q4_k", quant.gemvQ4_k },
     .{ "gemv_dual_q4_k_q8", quant.gemvQ4_kQ8 },
+    .{ "gemv_dual_q4_k_sdot", quant.GemvQ8Sdot(.q4_k).run },
     .{ "gemv_dual_q8_0", quant.gemvQ8_0 },
     .{ "gemv_dual_q8_0_q8", quant.gemvQ8_0Q8 },
+    .{ "gemv_dual_q8_0_sdot", quant.GemvQ8Sdot(.q8_0).run },
     .{ "gemv_dual_q4_0", quant.gemvQ4_0 },
     .{ "gemv_dual_q4_0_q8", quant.gemvQ4_0Q8 },
+    .{ "gemv_dual_q4_0_sdot", quant.GemvQ8Sdot(.q4_0).run },
     .{ "gemv_dual_iq4_nl", quant.gemvIq4Nl },
     .{ "gemv_dual_iq4_nl_q8", quant.gemvIq4NlQ8 },
+    .{ "gemv_dual_iq4_nl_sdot", quant.GemvQ8Sdot(.iq4_nl).run },
     .{ "gemv_dual_iq4_xs", quant.gemvIq4Xs },
     .{ "gemv_dual_iq4_xs_q8", quant.gemvIq4XsQ8 },
+    .{ "gemv_dual_iq4_xs_sdot", quant.GemvQ8Sdot(.iq4_xs).run },
     .{ "gemv_dual_q5_k", quant.gemvQ5_k },
     .{ "gemv_dual_q5_k_q8", quant.gemvQ5_kQ8 },
+    .{ "gemv_dual_q5_k_sdot", quant.GemvQ8Sdot(.q5_k).run },
     .{ "gemv_dual_q6_k", quant.gemvQ6_k },
     .{ "gemv_dual_q6_k_q8", quant.gemvQ6_kQ8 },
+    .{ "gemv_dual_q6_k_sdot", quant.GemvQ8Sdot(.q6_k).run },
     .{ "gemv_dual_q1_0", quant.gemvQ1_0 },
     .{ "gemv_dual_q1_0_q8", quant.gemvQ1_0Q8 },
+    .{ "gemv_dual_q1_0_sdot", quant.GemvQ8Sdot(.q1_0).run },
     .{ "gemv_dual_q2_0_g64", quant.gemvQ2_0G64 },
     .{ "gemv_dual_q2_0_g64_q8", quant.gemvQ2_0G64Q8 },
+    .{ "gemv_dual_q2_0_g64_sdot", quant.GemvQ8Sdot(.q2_0_g64).run },
     .{ "gemv_dual_q2_0_g128", quant.gemvQ2_0G128 },
     .{ "gemv_dual_q2_0_g128_q8", quant.gemvQ2_0G128Q8 },
+    .{ "gemv_dual_q2_0_g128_sdot", quant.GemvQ8Sdot(.q2_0_g128).run },
     .{ "gemv_dual_iq2_xxs", quant.gemvIq2Xxs },
     .{ "gemv_dual_iq2_xxs_q8", quant.gemvIq2XxsQ8 },
+    .{ "gemv_dual_iq2_xxs_sdot", quant.GemvQ8Sdot(.iq2_xxs).run },
     .{ "gemv_dual_iq2_xs", quant.gemvIq2Xs },
     .{ "gemv_dual_iq2_xs_q8", quant.gemvIq2XsQ8 },
+    .{ "gemv_dual_iq2_xs_sdot", quant.GemvQ8Sdot(.iq2_xs).run },
     .{ "gemv_dual_iq3_xxs", quant.gemvIq3Xxs },
     .{ "gemv_dual_iq3_xxs_q8", quant.gemvIq3XxsQ8 },
+    .{ "gemv_dual_iq3_xxs_sdot", quant.GemvQ8Sdot(.iq3_xxs).run },
     .{ "gemv_dual_iq3_s", quant.gemvIq3S },
     .{ "gemv_dual_iq3_s_q8", quant.gemvIq3SQ8 },
+    .{ "gemv_dual_iq3_s_sdot", quant.GemvQ8Sdot(.iq3_s).run },
     .{ "gemv4_dual_q2_k", quant.GemvN(.q2_k).run },
+    .{ "gemv4_dual_q2_k_sdot", quant.GemvQ8N(.q2_k).run },
     .{ "gemv4_dual_q3_k", quant.GemvN(.q3_k).run },
+    .{ "gemv4_dual_q3_k_sdot", quant.GemvQ8N(.q3_k).run },
     .{ "gemv4_dual_q4_k", quant.GemvN(.q4_k).run },
+    .{ "gemv4_dual_q4_k_sdot", quant.GemvQ8N(.q4_k).run },
     .{ "gemv4_dual_q8_0", quant.GemvN(.q8_0).run },
+    .{ "gemv4_dual_q8_0_sdot", quant.GemvQ8N(.q8_0).run },
     .{ "gemv4_dual_q4_0", quant.GemvN(.q4_0).run },
+    .{ "gemv4_dual_q4_0_sdot", quant.GemvQ8N(.q4_0).run },
     .{ "gemv4_dual_iq4_nl", quant.GemvN(.iq4_nl).run },
+    .{ "gemv4_dual_iq4_nl_sdot", quant.GemvQ8N(.iq4_nl).run },
     .{ "gemv4_dual_iq4_xs", quant.GemvN(.iq4_xs).run },
+    .{ "gemv4_dual_iq4_xs_sdot", quant.GemvQ8N(.iq4_xs).run },
     .{ "gemv4_dual_q5_k", quant.GemvN(.q5_k).run },
+    .{ "gemv4_dual_q5_k_sdot", quant.GemvQ8N(.q5_k).run },
     .{ "gemv4_dual_q6_k", quant.GemvN(.q6_k).run },
+    .{ "gemv4_dual_q6_k_sdot", quant.GemvQ8N(.q6_k).run },
     .{ "gemv4_dual_q1_0", quant.GemvN(.q1_0).run },
+    .{ "gemv4_dual_q1_0_sdot", quant.GemvQ8N(.q1_0).run },
     .{ "gemv4_dual_q2_0_g64", quant.GemvN(.q2_0_g64).run },
+    .{ "gemv4_dual_q2_0_g64_sdot", quant.GemvQ8N(.q2_0_g64).run },
     .{ "gemv4_dual_q2_0_g128", quant.GemvN(.q2_0_g128).run },
+    .{ "gemv4_dual_q2_0_g128_sdot", quant.GemvQ8N(.q2_0_g128).run },
     .{ "gemv4_dual_iq2_xxs", quant.GemvN(.iq2_xxs).run },
+    .{ "gemv4_dual_iq2_xxs_sdot", quant.GemvQ8N(.iq2_xxs).run },
     .{ "gemv4_dual_iq2_xs", quant.GemvN(.iq2_xs).run },
+    .{ "gemv4_dual_iq2_xs_sdot", quant.GemvQ8N(.iq2_xs).run },
     .{ "gemv4_dual_iq3_xxs", quant.GemvN(.iq3_xxs).run },
+    .{ "gemv4_dual_iq3_xxs_sdot", quant.GemvQ8N(.iq3_xxs).run },
     .{ "gemv4_dual_iq3_s", quant.GemvN(.iq3_s).run },
+    .{ "gemv4_dual_iq3_s_sdot", quant.GemvQ8N(.iq3_s).run },
+    .{ "gemvx_dual_q2_k", quant.GemvX(.q2_k, false).run },
+    .{ "gemvx_dual_q2_k_sdot", quant.GemvX(.q2_k, true).run },
+    .{ "gemvx_dual_q3_k", quant.GemvX(.q3_k, false).run },
+    .{ "gemvx_dual_q3_k_sdot", quant.GemvX(.q3_k, true).run },
+    .{ "gemvx_dual_q4_k", quant.GemvX(.q4_k, false).run },
+    .{ "gemvx_dual_q4_k_sdot", quant.GemvX(.q4_k, true).run },
+    .{ "gemvx_dual_q8_0", quant.GemvX(.q8_0, false).run },
+    .{ "gemvx_dual_q8_0_sdot", quant.GemvX(.q8_0, true).run },
+    .{ "gemvx_dual_q4_0", quant.GemvX(.q4_0, false).run },
+    .{ "gemvx_dual_q4_0_sdot", quant.GemvX(.q4_0, true).run },
+    .{ "gemvx_dual_iq4_nl", quant.GemvX(.iq4_nl, false).run },
+    .{ "gemvx_dual_iq4_nl_sdot", quant.GemvX(.iq4_nl, true).run },
+    .{ "gemvx_dual_iq4_xs", quant.GemvX(.iq4_xs, false).run },
+    .{ "gemvx_dual_iq4_xs_sdot", quant.GemvX(.iq4_xs, true).run },
+    .{ "gemvx_dual_q5_k", quant.GemvX(.q5_k, false).run },
+    .{ "gemvx_dual_q5_k_sdot", quant.GemvX(.q5_k, true).run },
+    .{ "gemvx_dual_q6_k", quant.GemvX(.q6_k, false).run },
+    .{ "gemvx_dual_q6_k_sdot", quant.GemvX(.q6_k, true).run },
+    .{ "gemvx_dual_q1_0", quant.GemvX(.q1_0, false).run },
+    .{ "gemvx_dual_q1_0_sdot", quant.GemvX(.q1_0, true).run },
+    .{ "gemvx_dual_q2_0_g64", quant.GemvX(.q2_0_g64, false).run },
+    .{ "gemvx_dual_q2_0_g64_sdot", quant.GemvX(.q2_0_g64, true).run },
+    .{ "gemvx_dual_q2_0_g128", quant.GemvX(.q2_0_g128, false).run },
+    .{ "gemvx_dual_q2_0_g128_sdot", quant.GemvX(.q2_0_g128, true).run },
+    .{ "gemvx_dual_iq2_xxs", quant.GemvX(.iq2_xxs, false).run },
+    .{ "gemvx_dual_iq2_xxs_sdot", quant.GemvX(.iq2_xxs, true).run },
+    .{ "gemvx_dual_iq2_xs", quant.GemvX(.iq2_xs, false).run },
+    .{ "gemvx_dual_iq2_xs_sdot", quant.GemvX(.iq2_xs, true).run },
+    .{ "gemvx_dual_iq3_xxs", quant.GemvX(.iq3_xxs, false).run },
+    .{ "gemvx_dual_iq3_xxs_sdot", quant.GemvX(.iq3_xxs, true).run },
+    .{ "gemvx_dual_iq3_s", quant.GemvX(.iq3_s, false).run },
+    .{ "gemvx_dual_iq3_s_sdot", quant.GemvX(.iq3_s, true).run },
     .{ "attn_rows_g2_f32", attn.AttnRowsG(.f32, 2).run },
     .{ "attn_rows_g2_f16", attn.AttnRowsG(.f16, 2).run },
     .{ "attn_rows_g2_q8", attn.AttnRowsG(.q8_0, 2).run },
@@ -1016,6 +1099,8 @@ comptime {
     if (bodies.len != table.entries.len) @compileError("dual.zig bodies and dual_table.zig entries differ in count");
     for (bodies, table.entries) |b_, t| {
         if (!std.mem.eql(u8, b_[0], t.name)) @compileError("dual.zig body order differs from dual_table.zig at " ++ b_[0]);
+        // On PTX an `_sdot` kernel is its `_q8` twin, which LLVM would merge into it.
+        if (is_ptx and std.mem.endsWith(u8, b_[0], "_sdot")) continue;
         @export(&Entry(b_[1]).run, .{ .name = b_[0] });
     }
 }

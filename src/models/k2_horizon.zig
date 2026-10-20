@@ -348,6 +348,15 @@ pub const Scratch = struct {
     expert_a: []f32,
     expert_b: []f32,
     expert_out: []f32,
+    expert_counts: []usize,
+    expert_starts: []usize,
+    /// One row per (token, selected expert) slot, packed by expert (`packSlots`).
+    slot_row: []usize,
+    slot_in: []f32,
+    slot_a: []f32,
+    slot_b: []f32,
+    slot_out: []f32,
+    jobs: []ops.matmul.BatchGemv,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config, seq: usize) !Scratch {
         const max_experts: usize = @max(cfg.n_experts, cfg.n_value_experts);
@@ -371,11 +380,19 @@ pub const Scratch = struct {
             .expert_a = try gpa.alloc(f32, @max(seq * max_inner, max_used * @max(cfg.expert_intermediate, cfg.kvDim()))),
             .expert_b = try gpa.alloc(f32, @max(seq * max_inner, max_used * @max(cfg.expert_intermediate, cfg.kvDim()))),
             .expert_out = try gpa.alloc(f32, @max(seq * max_out, max_used * max_out)),
+            .expert_counts = try gpa.alloc(usize, max_experts),
+            .expert_starts = try gpa.alloc(usize, max_experts),
+            .slot_row = try gpa.alloc(usize, seq * max_used),
+            .slot_in = try gpa.alloc(f32, seq * max_used * cfg.hidden),
+            .slot_a = try gpa.alloc(f32, seq * max_used * @max(cfg.expert_intermediate, cfg.kvDim())),
+            .slot_b = try gpa.alloc(f32, seq * max_used * cfg.expert_intermediate),
+            .slot_out = try gpa.alloc(f32, seq * max_used * cfg.hidden),
+            .jobs = try gpa.alloc(ops.matmul.BatchGemv, 2 * max_experts),
         };
     }
 
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (.{ "normed", "tmp", "q", "k", "v", "attn", "attn_gate", "route_logits", "selected", "selected_weights", "token_ids", "token_weights", "expert_in", "expert_a", "expert_b", "expert_out" }) |field|
+        inline for (.{ "normed", "tmp", "q", "k", "v", "attn", "attn_gate", "route_logits", "selected", "selected_weights", "token_ids", "token_weights", "expert_in", "expert_a", "expert_b", "expert_out", "expert_counts", "expert_starts", "slot_row", "slot_in", "slot_a", "slot_b", "slot_out", "jobs" }) |field|
             gpa.free(@field(self, field));
         self.* = undefined;
     }
@@ -455,7 +472,9 @@ fn layerForward(
     for (x, tmp) |*dst, add| dst.* += add;
 }
 
-fn route(
+/// Gate `logits` (per row of `n_experts`) in place and pick each row's `n_used` best by
+/// score plus `bias`, weighted as the config says.
+pub fn route(
     cfg: Config,
     logits: []f32,
     bias: []const f32,
@@ -520,10 +539,14 @@ pub fn routedValues(io: std.Io, gpa: std.mem.Allocator, cfg: Config, values: Val
 }
 
 pub fn routedValuesSelected(io: std.Io, gpa: std.mem.Allocator, cfg: Config, values: Values, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
-    if (seq == 1) if (routedValuesDecode(io, cfg, values, x, out, s, selected, weights)) |_| return else |err| switch (err) {
+    if (routedValuesSlots(io, gpa, cfg, values, x, seq, out, s, selected, weights)) |_| return else |err| switch (err) {
         error.QuantBackendUnavailable => {},
         else => return err,
-    };
+    }
+    try routedValuesPerExpert(io, gpa, cfg, values, x, seq, out, s, selected, weights);
+}
+
+fn routedValuesPerExpert(io: std.Io, gpa: std.mem.Allocator, cfg: Config, values: Values, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
     @memset(out, 0);
     for (values.weights, 0..) |w, e| {
         const n = gatherExpert(cfg.hidden, x, seq, selected, weights, cfg.n_value_experts_used, e, s);
@@ -545,10 +568,14 @@ pub fn routedFfnSparse(io: std.Io, gpa: std.mem.Allocator, cfg: Config, experts:
 }
 
 pub fn routedFfnSparseSelected(io: std.Io, gpa: std.mem.Allocator, cfg: Config, experts: Experts, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
-    if (seq == 1) if (routedFfnDecode(io, cfg, experts, x, out, s, selected, weights)) |_| return else |err| switch (err) {
+    if (routedFfnSlots(io, gpa, cfg, experts, x, seq, out, s, selected, weights)) |_| return else |err| switch (err) {
         error.QuantBackendUnavailable => {},
         else => return err,
-    };
+    }
+    try routedFfnPerExpert(io, gpa, cfg, experts, x, seq, out, s, selected, weights);
+}
+
+fn routedFfnPerExpert(io: std.Io, gpa: std.mem.Allocator, cfg: Config, experts: Experts, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
     @memset(out, 0);
     for (experts.gate, experts.up, experts.down, 0..) |gate_w, up_w, down_w, e| {
         const n = gatherExpert(cfg.hidden, x, seq, selected, weights, cfg.n_experts_used, e, s);
@@ -567,48 +594,163 @@ pub fn routedFfnSparseSelected(io: std.Io, gpa: std.mem.Allocator, cfg: Config, 
 /// One token: the selected experts' GEMVs as two threaded passes (gate+up, then
 /// down) instead of one fork/join per matrix. Block-quant experts only; anything
 /// else reports QuantBackendUnavailable and takes the general path.
-fn routedFfnDecode(io: std.Io, cfg: Config, experts: Experts, x: []const f32, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
-    const used = selected.len;
+
+
+
+/// Which way a host layer's routed blocks take a batch: on the CPU, or uploaded to the
+/// device. Calibrated once before the first batch that has to choose, then fixed, so every
+/// forward of a process runs the same arithmetic; `TP_K2_HOST_ROWS=N` pins it to "the
+/// CPU up to N rows" for an A/B across processes.
+pub const HostCost = struct {
+    cpu_row_ns: f64,
+    upload_ns: f64,
+
+    pub fn onCpu(self: HostCost, rows: usize) bool {
+        return self.cpu_row_ns * @as(f64, @floatFromInt(rows)) <= self.upload_ns;
+    }
+
+    /// The pinned policy, if the environment names one.
+    pub fn pinned() ?HostCost {
+        const raw = std.c.getenv("TP_K2_HOST_ROWS") orelse return null;
+        const rows = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return null;
+        return .{ .cpu_row_ns = 1, .upload_ns = @floatFromInt(rows) };
+    }
+
+    /// The CPU side per row, timed on `rows` synthetic rows through `layer`'s routed
+    /// blocks with the experts spread evenly, as a real batch's are. The second of two
+    /// passes: the first faults the mapped weights in, a cost only a process's first
+    /// batch pays.
+    pub fn cpuRowNs(io: std.Io, gpa: std.mem.Allocator, cfg: Config, layer: Layer, s: *Scratch, rows: usize) !f64 {
+        _ = try cpuPass(io, gpa, cfg, layer, s, rows);
+        return @as(f64, @floatFromInt(try cpuPass(io, gpa, cfg, layer, s, rows))) / @as(f64, @floatFromInt(rows));
+    }
+
+    fn cpuPass(io: std.Io, gpa: std.mem.Allocator, cfg: Config, layer: Layer, s: *Scratch, rows: usize) !i96 {
+        const x = s.normed[0 .. rows * cfg.hidden];
+        for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) * 0.01 - 0.08;
+        const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+        if (layer.values) |values| {
+            const used = cfg.n_value_experts_used;
+            synthRoutes(s, rows, used, cfg.n_value_experts);
+            try routedValuesSelected(io, gpa, cfg, values, x, rows, s.v[0 .. rows * cfg.kvDim()], s, s.selected[0 .. rows * used], s.selected_weights[0 .. rows * used]);
+        }
+        if (layer.experts) |experts| {
+            const used = cfg.n_experts_used;
+            synthRoutes(s, rows, used, cfg.n_experts);
+            try routedFfnSparseSelected(io, gpa, cfg, experts, x, rows, s.tmp[0 .. rows * cfg.hidden], s, s.selected[0 .. rows * used], s.selected_weights[0 .. rows * used]);
+        }
+        return std.Io.Clock.awake.now(io).nanoseconds - t0;
+    }
+
+    fn synthRoutes(s: *Scratch, rows: usize, used: usize, n_experts: usize) void {
+        for (0..rows) |t| for (0..used) |k| {
+            s.selected[t * used + k] = (t * 37 + k * (n_experts / used + 1)) % n_experts;
+            s.selected_weights[t * used + k] = 1.0 / @as(f32, @floatFromInt(used));
+        };
+    }
+};
+
+/// Rows `HostCost.cpuRowNs` times: near where the two ways cross, so a fixed cost does
+/// not read as a per-row one.
+pub const host_calibration_rows = 128;
+
+test "a host layer's batch takes the cheaper way" {
+    const hc: HostCost = .{ .cpu_row_ns = 300_000, .upload_ns = 60_000_000 };
+    try std.testing.expect(hc.onCpu(200));
+    try std.testing.expect(!hc.onCpu(201));
+}
+
+/// The routed blocks with the batch's slots packed by expert: each expert with fewer than
+/// `small_m_max` rows is one job of one threaded GEMV pass per linear (`quantGemvBatch`,
+/// every weight row read once for its rows), where a loop over experts paid a fork and
+/// join per matrix; one with more takes the GEMM. The slots then combine in each token's
+/// selection order, so a single row is exactly the decode step. QuantBackendUnavailable
+/// (ggml absent, `exact_activations`) comes before `out` is written.
+fn routedFfnSlots(io: std.Io, gpa: std.mem.Allocator, cfg: Config, experts: Experts, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
     const inter = cfg.expert_intermediate;
     const hidden = cfg.hidden;
     const dt = experts.gate[0].dtype;
     if (!dt.isBlockQuant() or experts.up[0].dtype != dt or experts.down[0].dtype != dt) return error.QuantBackendUnavailable;
-    var jobs: [2 * max_used_decode]ops.matmul.Gemv1 = undefined;
-    if (2 * used > jobs.len) return error.QuantBackendUnavailable;
-    for (selected, 0..) |e, k| {
-        jobs[2 * k] = .{ .y = s.expert_a[k * inter ..][0..inter], .x = x, .w = experts.gate[e].bytes };
-        jobs[2 * k + 1] = .{ .y = s.expert_b[k * inter ..][0..inter], .x = x, .w = experts.up[e].bytes };
-    }
-    try ops.matmul.quantGemvBatch(io, dt, jobs[0 .. 2 * used], inter, hidden);
-    ops.act.siluMul(s.expert_a[0 .. used * inter], s.expert_b[0 .. used * inter]);
-    for (selected, 0..) |e, k| jobs[k] = .{ .y = s.expert_out[k * hidden ..][0..hidden], .x = s.expert_a[k * inter ..][0..inter], .w = experts.down[e].bytes };
-    try ops.matmul.quantGemvBatch(io, dt, jobs[0..used], hidden, inter);
-    @memset(out, 0);
-    for (0..used) |k| {
-        const scale = weights[k];
-        for (out, s.expert_out[k * hidden ..][0..hidden]) |*d, v| d.* += v * scale;
-    }
+    const pk = packSlots(s, x, hidden, selected[0 .. seq * cfg.n_experts_used], cfg.n_experts_used, cfg.n_experts);
+    var n: usize = 0;
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m > 0 and m < ops.matmul.small_m_max) {
+        s.jobs[2 * n] = .{ .y = s.slot_a[r * inter ..][0 .. m * inter], .x = s.slot_in[r * hidden ..][0 .. m * hidden], .w = experts.gate[e].bytes, .m = m };
+        s.jobs[2 * n + 1] = .{ .y = s.slot_b[r * inter ..][0 .. m * inter], .x = s.slot_in[r * hidden ..][0 .. m * hidden], .w = experts.up[e].bytes, .m = m };
+        n += 1;
+    };
+    if (n > 0) try ops.matmul.quantGemvBatch(io, dt, s.jobs[0 .. 2 * n], inter, hidden);
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m >= ops.matmul.small_m_max) {
+        const xin = s.slot_in[r * hidden ..][0 .. m * hidden];
+        try expertMatmul(io, gpa, s.slot_a[r * inter ..][0 .. m * inter], xin, m, experts.gate[e]);
+        try expertMatmul(io, gpa, s.slot_b[r * inter ..][0 .. m * inter], xin, m, experts.up[e]);
+    };
+    ops.act.siluMul(s.slot_a[0 .. pk.rows * inter], s.slot_b[0 .. pk.rows * inter]);
+    n = 0;
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m > 0 and m < ops.matmul.small_m_max) {
+        s.jobs[n] = .{ .y = s.slot_out[r * hidden ..][0 .. m * hidden], .x = s.slot_a[r * inter ..][0 .. m * inter], .w = experts.down[e].bytes, .m = m };
+        n += 1;
+    };
+    if (n > 0) try ops.matmul.quantGemvBatch(io, dt, s.jobs[0..n], hidden, inter);
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m >= ops.matmul.small_m_max) {
+        try expertMatmul(io, gpa, s.slot_out[r * hidden ..][0 .. m * hidden], s.slot_a[r * inter ..][0 .. m * inter], m, experts.down[e]);
+    };
+    combineSlots(out, s.slot_out, s.slot_row, seq, cfg.n_experts_used, hidden, weights);
 }
 
-fn routedValuesDecode(io: std.Io, cfg: Config, values: Values, x: []const f32, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
-    const used = selected.len;
+fn routedValuesSlots(io: std.Io, gpa: std.mem.Allocator, cfg: Config, values: Values, x: []const f32, seq: usize, out: []f32, s: *Scratch, selected: []const usize, weights: []const f32) !void {
     const kv = cfg.kvDim();
+    const hidden = cfg.hidden;
     const dt = values.weights[0].dtype;
     if (!dt.isBlockQuant()) return error.QuantBackendUnavailable;
-    var jobs: [max_used_decode]ops.matmul.Gemv1 = undefined;
-    if (used > jobs.len) return error.QuantBackendUnavailable;
-    for (selected, 0..) |e, k| jobs[k] = .{ .y = s.expert_a[k * kv ..][0..kv], .x = x, .w = values.weights[e].bytes };
-    try ops.matmul.quantGemvBatch(io, dt, jobs[0..used], kv, cfg.hidden);
-    ops.act.silu(s.expert_a[0 .. used * kv]);
-    @memset(out, 0);
-    for (0..used) |k| {
-        const scale = weights[k];
-        for (out, s.expert_a[k * kv ..][0..kv]) |*d, v| d.* += v * scale;
-    }
+    const pk = packSlots(s, x, hidden, selected[0 .. seq * cfg.n_value_experts_used], cfg.n_value_experts_used, cfg.n_value_experts);
+    var n: usize = 0;
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m > 0 and m < ops.matmul.small_m_max) {
+        s.jobs[n] = .{ .y = s.slot_a[r * kv ..][0 .. m * kv], .x = s.slot_in[r * hidden ..][0 .. m * hidden], .w = values.weights[e].bytes, .m = m };
+        n += 1;
+    };
+    if (n > 0) try ops.matmul.quantGemvBatch(io, dt, s.jobs[0..n], kv, hidden);
+    for (pk.counts, pk.starts, 0..) |m, r, e| if (m >= ops.matmul.small_m_max) {
+        try expertMatmul(io, gpa, s.slot_a[r * kv ..][0 .. m * kv], s.slot_in[r * hidden ..][0 .. m * hidden], m, values.weights[e]);
+    };
+    ops.act.silu(s.slot_a[0 .. pk.rows * kv]);
+    combineSlots(out, s.slot_a, s.slot_row, seq, cfg.n_value_experts_used, kv, weights);
 }
 
-/// Selected experts per token the decode batch path handles inline.
-const max_used_decode = 16;
+const Packed = struct { rows: usize, counts: []const usize, starts: []const usize };
+
+/// Pack the slots by expert, token order within one: `slot_row[slot]` is the slot's row,
+/// and row r of `slot_in` the input of the token it routes.
+fn packSlots(s: *Scratch, x: []const f32, hidden: usize, selected: []const usize, used: usize, n_experts: usize) Packed {
+    const counts = s.expert_counts[0..n_experts];
+    const starts = s.expert_starts[0..n_experts];
+    @memset(counts, 0);
+    for (selected) |e| counts[e] += 1;
+    var acc: usize = 0;
+    for (counts, starts) |c, *st| {
+        st.* = acc;
+        acc += c;
+    }
+    @memset(counts, 0);
+    for (selected, 0..) |e, at| {
+        const r = starts[e] + counts[e];
+        counts[e] += 1;
+        s.slot_row[at] = r;
+        @memcpy(s.slot_in[r * hidden ..][0..hidden], x[at / used * hidden ..][0..hidden]);
+    }
+    return .{ .rows = selected.len, .counts = counts, .starts = starts };
+}
+
+/// out[t] = sum over k of weights[t * used + k] * rows[slot_row[t * used + k]], in k order.
+fn combineSlots(out: []f32, rows: []const f32, slot_row: []const usize, seq: usize, used: usize, width: usize, weights: []const f32) void {
+    @memset(out[0 .. seq * width], 0);
+    for (0..seq) |t| {
+        const dst = out[t * width ..][0..width];
+        for (0..used) |k| {
+            const scale = weights[t * used + k];
+            for (dst, rows[slot_row[t * used + k] * width ..][0..width]) |*d, v| d.* += v * scale;
+        }
+    }
+}
 
 fn expertMatmul(io: std.Io, gpa: std.mem.Allocator, y: []f32, x: []const f32, rows: usize, w: ops.matmul.Weight) !void {
     if (!w.dtype.isBlockQuant() or rows < ops.matmul.small_m_max) {

@@ -15,7 +15,7 @@ const ws = serve.ws;
 const queue = serve.queue;
 const wire = serve.wire;
 const x509 = serve.x509;
-const serve_tls = @import("serve_tls.zig");
+const serve_tls = @import("serve_tls");
 const Blake3 = std.crypto.hash.Blake3;
 
 const push_bytes: usize = 4 << 20;
@@ -150,6 +150,7 @@ const Acceptor = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    serve_tls.installClient();
     const io = init.io;
     const gpa = init.gpa;
     const now_sec = Io.Clock.real.now(io).toSeconds();

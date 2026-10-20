@@ -700,17 +700,9 @@ pub fn run(init: std.process.Init) !void {
         }
     }
 
-    // Load persisted settings (all fields default to unset / disabled).
-    const first_run = !config.Config.exists(init.io, gpa, init.environ_map, g_config_path);
+    // Load persisted settings (all fields default to unset / disabled; both
+    // backends to `auto`, which each host resolves from its own devices).
     g_config = config.Config.load(init.io, gpa, init.environ_map, g_config_path);
-    // The compiled-in backend default is NVIDIA's, which is a failed first launch
-    // on any other machine. With no settings file yet, take what the box has.
-    if (first_run) {
-        const be = pipeline_map.fromPipelineBackend(tp.pipeline.detectBackend());
-        g_config.llm_backend = be;
-        g_config.diff_backend = be;
-        std.log.info("no settings file yet: defaulting both backends to {t}", .{be});
-    }
     if (model_override) |m| g_config.llm_model.set(m);
     g_sync = sync.Syncer.init(g_gpa, g_io);
     g_hosts = try hosts.Hosts.init(g_gpa, g_io, g_environ, wakeupFrame, g_config_path, null);

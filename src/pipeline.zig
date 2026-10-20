@@ -169,16 +169,24 @@ pub const Backend = enum {
     }
 };
 
-/// The backend to DEFAULT to on a machine nobody has configured, from which
-/// driver libraries are installed: `zig_cuda` on an NVIDIA box, else `vulkan`,
-/// else `cpu`. A library being present is not proof a device is, so this picks a
-/// starting point; init still reports the truth. `cuda` is never chosen
-/// automatically because it additionally needs cuBLASLt and cuDNN 9.
+/// The backend to use where none is named, from the devices this machine has:
+/// `zig_cuda` with an NVIDIA device, else `vulkan` with a Vulkan GPU, else `cpu`.
+/// A driver library alone proves nothing (a box keeps `nvcuda.dll` from a card it
+/// no longer has). `cuda` is never chosen, since it also needs cuBLASLt and cuDNN
+/// 9. Probed once a process.
 pub fn detectBackend() Backend {
-    if (cuda.cu.driverPresent()) return .zig_cuda;
-    if (gpu_mod.context.loaderPresent()) return .vulkan;
-    return .cpu;
+    const known = detected_backend.load(.acquire);
+    if (known != 0) return @enumFromInt(known - 1);
+    const b: Backend = if (cuda.cu.deviceCount() > 0)
+        .zig_cuda
+    else if (gpu_mod.context.probeHeapBytes(std.heap.page_allocator) != null)
+        .vulkan
+    else
+        .cpu;
+    detected_backend.store(@as(u8, @intFromEnum(b)) + 1, .release);
+    return b;
 }
+var detected_backend: std.atomic.Value(u8) = .init(0);
 
 /// An activation chain's element type (`Options.vae_act`).
 pub const Act = gpu_mod.context.Dt;
@@ -3534,6 +3542,15 @@ pub const Family = enum {
             // latent cell, so there is nothing to pack and no parity to keep.
             // MOSS-Image is patch 1 on the same latent.
             .sd15, .sdxl, .sensenova, .mageflow, .moss_image => false,
+        };
+    }
+
+    /// Whether `encode` runs the denoiser's own weights, so swapping the denoiser
+    /// store changes the conditioning too.
+    pub fn conditionsFromDenoiser(self: Family) bool {
+        return switch (self) {
+            .sensenova => true,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow, .minimax_h3, .moss_image, .qwen_image21 => false,
         };
     }
 

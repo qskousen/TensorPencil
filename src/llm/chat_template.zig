@@ -132,10 +132,11 @@ pub const ImageExpand = struct {
 
     /// Gemma 3 layout: `<start_of_image>` -> itself + `<image_soft_token>`×N +
     /// `<end_of_image>` (the template emits `<start_of_image>` as the single
-    /// placeholder).
+    /// placeholder). Some conversions carry no `<image_soft_token>`; the rows'
+    /// embeddings are replaced either way, so the pad id stands in.
     pub fn gemma3(tok: *const Tokenizer) ?ImageExpand {
         const ph = tok.specialId("<start_of_image>") orelse return null;
-        const soft = tok.specialId("<image_soft_token>") orelse return null;
+        const soft = tok.specialId("<image_soft_token>") orelse tok.pad;
         const close = tok.specialId("<end_of_image>") orelse return null;
         var e: ImageExpand = .{ .placeholder = ph, .pad = soft };
         e.prefix_buf[0] = ph; // keep the <start_of_image> marker before the rows

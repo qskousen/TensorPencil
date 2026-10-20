@@ -1114,6 +1114,78 @@ pub inline fn moeCombine(e: Env) void {
     e.st(.a, i, acc);
 }
 
+const inf_f32: f32 = @bitCast(@as(u32, 0x7F800000));
+
+/// MoE routing, one subgroup per token t < u0: gate its row of the logits (a, u1 experts
+/// wide; sigmoid when u3 is 0, softmax when 1), take the u2 best by gate plus bias (b),
+/// highest first and the lower index on a tie, and write their ids as words to
+/// c[u4 + t * u2 ..] and their weights to c[u5 + t * u2 ..]: the gates, divided by their
+/// sum (at least 2^-14) when u6 is 1, times f0. That is `k2_horizon.route`'s selection,
+/// one pass per pick, each the best strictly below the last; the weights match it to
+/// rounding.
+pub inline fn moeRoute(e: Env) void {
+    const n = e.u(1);
+    const used = e.u(2);
+    const softmax = e.u(3) == 1;
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    var t = k.sgGlobal(e);
+    while (t < e.u(0)) : (t += k.sgTotal(e)) {
+        const row = t * n;
+        var mx: f32 = -inf_f32;
+        var total: f32 = 0;
+        if (softmax) {
+            var x = lane;
+            while (x < n) : (x += lanes) mx = @max(mx, e.ld(.a, row + x));
+            mx = k.sgMax(mx);
+            x = lane;
+            while (x < n) : (x += lanes) total += k.exp(e.ld(.a, row + x) - mx);
+            total = k.sgSum(total);
+        }
+        var last_score: f32 = inf_f32;
+        var last: f32 = -1;
+        var sum: f32 = 0;
+        var j: u32 = 0;
+        while (j < used) : (j += 1) {
+            var best_score: f32 = -inf_f32;
+            var best: f32 = 3.0e38;
+            var best_gate: f32 = 0;
+            var x = lane;
+            while (x < n) : (x += lanes) {
+                const v = e.ld(.a, row + x);
+                const gate = if (softmax) k.exp(v - mx) / total else k.sigmoid(v);
+                const score = gate + e.ld(.b, x);
+                const xf: f32 = @floatFromInt(x);
+                const below = j == 0 or score < last_score or (score == last_score and xf > last);
+                if (below and score > best_score) {
+                    best_score = score;
+                    best = xf;
+                    best_gate = gate;
+                }
+            }
+            const top = k.sgMax(best_score);
+            // The lowest index among the lanes holding the top score, as a max of negations.
+            const pick = -k.sgMax(if (best_score == top) -best else -3.0e38);
+            const gate = k.sgSum(if (best_score == top and best == pick) best_gate else 0);
+            last_score = top;
+            last = pick;
+            sum += gate;
+            if (lane == 0) {
+                e.stW(.c, e.u(4) + t * used + j, if (top == -inf_f32) n else @intFromFloat(pick));
+                e.st(.c, e.u(5) + t * used + j, gate);
+            }
+        }
+        if (lane == 0) {
+            const div = if (e.u(6) == 1) @max(sum, 6.103515625e-5) else 1;
+            j = 0;
+            while (j < used) : (j += 1) {
+                const at = e.u(5) + t * used + j;
+                e.st(.c, at, e.ld(.c, at) / div * e.f(0));
+            }
+        }
+    }
+}
+
 // ---- k-split GEMV reduce halves ----------------------------------------------
 
 /// d[u2 + col] = f0 * sum over u1 chunks of a[ch*u0 + col]. u0 = rows.

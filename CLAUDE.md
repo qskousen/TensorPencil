@@ -20,12 +20,12 @@ When working on code, if you notice a problem or a comment that is extraneous or
 - If there is ambiguity in a request, don't guess or assume; ask for clarification.
 - When adding a new feature or fixing a bug, add unit / integration tests as appropriate.
 - Make sure all tests are still passing after working on something. If they aren't, fix it - even if the test was previously broken.
-- **Default to `zig build test` (fast, ~15s CPU unit suite). Do NOT run `zig build test -Dintegration` unless you truly need it** — it runs the GPU device tests and real-model inference tests and takes ~11 minutes. Reach for `-Dintegration` only when your change touches GPU kernels / device code or the real-model LLM/parity paths, and even then prefer narrowing with `-Dtest-filter="<substring>"`.
+- **Default to `zig build test` (fast, ~15s CPU unit suite). Do NOT run `zig build test -Dintegration` unless you truly need it** — it runs the GPU device tests and real-model inference tests and takes ~17 minutes. Reach for `-Dintegration` only when your change touches GPU kernels / device code or the real-model LLM/parity paths, and even then prefer narrowing with `-Dtest-filter="<substring>"`.
 - If the user asks for something that may cause issues, push back and get confirmation before doing it.
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
 - There's no risk to trying big complicated work. We want to try unusual things. Be bold and adventerous.
 - However, bold is not the same as sprawling: keep it structured and organized, and generalize where generalizing is cheap.
-- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out. `zig build test -Dtarget=x86_64-windows` compiles the whole tree for Windows (it cannot run the binaries); the only expected failures are the system C libraries. `core/filemap.zig` (whole-file mapping), `core/dynlib.zig` (runtime library loading, which `std.DynLib` has no Windows arm for) and `core/diskspace.zig` (free space, which std wraps nowhere) are where the per-platform branches live; a new one belongs there rather than at a call site.
+- **Cross-platform code; don't lock ourselves into Linux-only.** Even where a subsystem currently only runs on Linux (e.g. the CUDA/NVIDIA backend), reach for portable std APIs (`std.Io` futex/mutex/sleep, `std.posix`, `std.Thread`) over raw Linux syscalls (`std.os.linux.*`) unless there's a real reason none of them fit — so a future macOS/Windows port isn't blocked by avoidable platform lock-in. If you must go platform-specific, gate it behind a comptime `builtin.os.tag` branch with a portable fallback and call it out. `zig build -Dtarget=x86_64-windows` builds every exe for Windows, libav and libvips included (from the pinned `*_win` packages, DLLs installed beside the exes), and `zig build test` there compiles every test binary but cannot run them; `tools/sync_windows.sh <user@host>` mirrors the working tree to a Windows box over OpenSSH for a native build and test run. `core/filemap.zig` (whole-file mapping), `core/dynlib.zig` (runtime library loading, which `std.DynLib` has no Windows arm for), `core/diskspace.zig` (free space, which std wraps nowhere) and `core/rawtty.zig` (raw keyboard input: termios or console modes) are where the per-platform branches live; a new one belongs there rather than at a call site.
 - After adding a new kernel feature like relo, supporting a new dtype like bf16 or qk_6 for a backend, or anything similar, check BACKEND.md and update it to reflect the current state.
 - Performance is CRITICAL, and we need to do what it takes to get there - don't skip out and do something easier if the hard work is what is needed.
 - **A negative/limiting conclusion requires a receipt.** Before claiming an optimization "isn't worth it," "won't help," "can't be done cleanly," or "is too fragile/expensive," you must have an ISOLATION measurement that removes exactly the component in question (e.g. disable the op and re-time) — not a proxy and not an assumption. State whether each claim is measured or assumed.
@@ -77,10 +77,13 @@ each has caught.
 - `zig build run-gui -- <args>` — `tp-gui`, the desktop GUI
 - `zig build test` — fast CPU unit suite (~15s). Integration tests are gated OFF.
 - `zig build test -Dintegration` — everything, including GPU device tests and real-model
-  parity tests (~11 min; needs a device and the `models/` checkpoints). Individual tests
+  parity tests (~17 min on the 3090; needs a device and the `models/` checkpoints). Individual tests
   self-skip when their device or file is absent. **`-Dintegration` defaults the build to
   ReleaseSafe** (Debug makes it ~6x slower and buys nothing: these tests are real models
   and real kernels, and ReleaseSafe keeps every assert). An explicit `-Doptimize=` wins.
+  The test binaries run ONE AT A TIME under it (each Run claims over half the memory):
+  side by side on one GPU under Windows one stopped answering the runner, and in series
+  they cost no more time.
 - `-Dmodel-root=<dir>` — where the real-model tests and device-command defaults find
   checkpoints (default `/mnt/watch/models/diffusion`, the `checkpoints/`, `vae/`,
   `text_encoders/` ... layout). A test that only checks the file exists runs in the
@@ -184,7 +187,7 @@ depend on one tier. `LIBRARY.md` has the detail.
 
 | module | root | holds |
 |---|---|---|
-| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the three per-platform shims (`filemap`, `dynlib`, `diskspace`) |
+| `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image, and the per-platform shims (`filemap`, `dynlib`, `diskspace`, `rawtty`) |
 | `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
 | `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
 | `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
@@ -321,15 +324,17 @@ the lock order lives.
 Cross-layer references are `@import("shared").config`, never a relative path: a test or
 probe rooted in one directory cannot `@import` a file above it. `src/serve/` is the
 protocol layer, pure std: `wire.zig` (the types), `link.zig` (a reader and writer pair
-behind a small vtable: a unix socket, the loopback fallback, or std's TLS client pinned
-to one certificate; `Through` is the writer whose flush reaches the socket, which the
+behind a small vtable: a unix socket, the loopback fallback, or a TLS link pinned to one
+certificate; `Through` is the writer whose flush reaches the socket, which the
 TLS layers' own writers do not), `httpc.zig` (the client half), `server.zig` (the
 engine-free routing: `GET /v1/hello`, `POST /v1/req`, `PUT /v1/upload`, the
 `GET /v1/events` WebSocket; any link that is not a unix socket must carry a bearer
 secret whose BLAKE3 hash the listener holds: the loopback cookie from the `ready`
-line, or the remote token, and a refused one waits a second before its 401). The TLS
-server end is tls.zig, kept in `src/serve_tls.zig` with the daemon so no test binary
-links it. Its tests run a fake backend over a loopback link in the fast suite.
+line, or the remote token, and a refused one waits a second before its 401). Both TLS
+ends are tls.zig, in `src/serve_tls.zig` (the `serve_tls` module) so no test binary links
+it; a binary that dials a remote host calls `serve_tls.installClient()`, or `connect`
+refuses `tp://`. Not std's client: on Windows it falls back to the OS certificate store
+past the pin. Its tests run a fake backend over a loopback link in the fast suite.
 `catalog-probe`, `chat-probe` and `driver-probe` link `engine` and `shared` with no
 dvui, which is what enforces that those layers stay free of it.
 
@@ -370,6 +375,17 @@ as one batch on every core (`PipeBatch`). Every compile is logged with its time.
 **A plain elementwise kernel is written once, in `src/gpu/kernels/dual.zig`**, which compiles
 to SPIR-V and to PTX and so reaches every GPU arm; only kernels needing shared memory or a
 subgroup reduce still live per backend (`gpu/kernels/eltwise.zig`, `gpu/cuda/elt.zig`).
+
+**Every Vulkan shader module is created through `Context.createModule` and every dispatch
+binds through `Context.bind`.** That is where a device's own rules apply: limits read from
+the device (a module over its shared memory is refused, its pipeline stays null and the
+routes read it as missing), SPIR-V patches it needs (`RoundingModeRTE` for f16 where
+supported), and a null pipeline becomes `KernelUnavailable` instead of a dispatch with
+nothing bound. A kernel's size is picked from what the device holds, never from a vendor.
+`verifyGemms` runs a known-answer product through every coop GEMM at startup and after a
+re-tile and drops one that answers wrong (a driver bug becomes a slower path, not garbage), and
+`adaptBatchCap` sizes each batched submission from measured time, since a watchdog (Windows TDR,
+2 s) resets the GPU on a long one and dispatch cost varies by orders of magnitude between cards.
 
 **Every convolution goes through `models/conv_cuda.zig` / `conv_gpu.zig`** (2-D, 1-D, 3-D,
 stride-k patch embeds): a gather, then the GEMM; never an im2col or a GEMM in a model file.

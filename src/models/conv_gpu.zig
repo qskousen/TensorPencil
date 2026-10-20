@@ -62,9 +62,9 @@ pub fn conv2d(
     act_div: f32,
 ) !void {
     std.debug.assert(src.dt != .f16 or act_div == 1.0);
-    // A checkpoint-order weight has only the coop arm: the f32 GEMM reads repacked f32.
-    const coop = ctx.pipe_coop_f16w != .null_handle and (cv.co >= coop_min_co or src.dt != .f32 or dst.dt != .f32 or cv.w == .torch);
-    if (!coop and cv.w == .torch) return error.UnsupportedDType;
+    // A bf16 operand needs the bf16 coop GEMM, which a device may lack beside the f16 one.
+    const coop_pipe = if (src.dt == .bf16 or dst.dt == .bf16) ctx.pipe_coop_bf16w else ctx.pipe_coop_f16w;
+    const coop = coop_pipe != .null_handle and (cv.co >= coop_min_co or src.dt != .f32 or dst.dt != .f32 or cv.w == .torch);
     // Every convolution in an LDM UNet carries a bias; `Conv2d` models the
     // general case, so pin the assumption here rather than in five call sites.
     const cb = cv.b orelse return error.MissingConvBias;
@@ -75,10 +75,17 @@ pub fn conv2d(
         std.debug.assert(mode == .stride1);
         const n = h * w;
         try lin_gpu.probeInput(ctx, src.*, n, cv.gemmWeight());
-        std.debug.assert(coop or bias_dev == null);
         if (coop) return ctx.opMatmulCoopConv(dst.*, 0, src.*, src.dt, n, cv, bias_buf, bias_off, div);
-        std.debug.assert(src.dt == .f32 and dst.dt == .f32); // unreachable: `coop` covers the rest
-        return ctx.opMatmul(dst.*, 0, src.*, 0, n, std.mem.sliceAsBytes(cv.krsc()), false, cv.co, cv.ci, 1.0, cb);
+        const out32 = try f32Out(ctx, dst, n * cv.co);
+        var x32 = src.*;
+        if (src.dt != .f32) {
+            try ctx.ensureDeviceBuffer(&ctx.stage_in32, n * cv.ci * 4);
+            x32 = ctx.stage_in32;
+            x32.dt = .f32;
+            try ctx.opElt(gpu_context.eltCopy(src.dt, .f32), src.*, x32, null, null, .{ .u0 = @intCast(n * cv.ci) }, n * cv.ci, 1, 1);
+        }
+        try ctx.opMatmulBuf(out32, 0, x32, 0, n, try ctx.convWeight32(cv), cv.co, cv.ci, if (bias_dev == null) cb else null);
+        return f32Finish(ctx, out32, dst, n, cv.co, bias_dev);
     }
     std.debug.assert(cv.k == 3);
 
@@ -118,6 +125,7 @@ pub fn conv2d(
         return;
     }
     try ctx.ensureDeviceBuffer(patch, band * patch_len * 4);
+    const out32 = if (coop) dst.* else try f32Out(ctx, dst, n_out * cv.co);
 
     var p0: usize = 0;
     while (p0 < n_out) : (p0 += band) {
@@ -140,11 +148,31 @@ pub fn conv2d(
             // The patch is f32, but its values are `src`'s, which pick the operand type.
             try ctx.opMatmulCoopConv(dst.*, p0 * cv.co, patch.*, src.dt, bn, cv, bias_buf, bias_off, div);
         } else {
-            std.debug.assert(bias_dev == null);
-            std.debug.assert(dst.dt == .f32);
-            try ctx.opMatmul(dst.*, p0 * cv.co * 4, patch.*, 0, bn, std.mem.sliceAsBytes(cv.krsc()), false, cv.co, patch_len, 1.0, cb);
+            try ctx.opMatmulBuf(out32, p0 * cv.co * 4, patch.*, 0, bn, try ctx.convWeight32(cv), cv.co, patch_len, if (bias_dev == null) cb else null);
         }
     }
+    if (!coop) try f32Finish(ctx, out32, dst, n_out, cv.co, bias_dev);
+}
+
+/// Where the f32 GEMM writes when it stands in for the coop one: `dst` itself when it
+/// is f32, else the context's staging, narrowed by `f32Finish`.
+fn f32Out(ctx: *Context, dst: *const DeviceBuffer, n: usize) !DeviceBuffer {
+    if (dst.dt == .f32) return dst.*;
+    try ctx.ensureDeviceBuffer(&ctx.stage_out32, n * 4);
+    var out = ctx.stage_out32;
+    out.dt = .f32;
+    return out;
+}
+
+/// The f32 GEMM's output made what the coop arm would have written: the device bias
+/// added (the f32 GEMM takes only a host one), then narrowed to `dst`'s width.
+fn f32Finish(ctx: *Context, out32: DeviceBuffer, dst: *DeviceBuffer, rows: usize, co: usize, bias_dev: ?BiasSlice) !void {
+    if (bias_dev) |bd| try ctx.opElt(gpu_context.eltAt("add_bias_rows", .f32), out32, bd.buf, null, null, .{
+        .u0 = @intCast(rows * co),
+        .u1 = @intCast(co),
+        .u3 = @intCast(bd.off),
+    }, rows * co, 1, 1);
+    if (dst.dt != .f32) try ctx.opElt(gpu_context.eltCopy(.f32, dst.dt), out32, dst.*, null, null, .{ .u0 = @intCast(rows * co) }, rows * co, 1, 1);
 }
 
 /// Whether this device needs its convs repacked to f32 before it can run them: only
@@ -409,6 +437,10 @@ test "gpu conv from the checkpoint's own tensor matches its repacked copy bit fo
     const io = testing.io;
     const ctx = try gpuCtx(gpa, io);
     defer ctx.deinit();
+    // Every weight lives to the end: the device weight caches key on the host pointer,
+    // so a freed one's address coming back would be served the old upload.
+    var weights = std.heap.ArenaAllocator.init(gpa);
+    defer weights.deinit();
     const dtype = @import("tp_core").dtype;
 
     var prng = std.Random.DefaultPrng.init(41);
@@ -433,16 +465,14 @@ test "gpu conv from the checkpoint's own tensor matches its repacked copy bit fo
         defer ctx.tensorDestroy(&src);
         try upload(ctx, &src, in);
         for ([_]@import("tp_core").dtype.DType{ .f32, .f16, .bf16 }) |wdt| {
-            const bytes = try gpa.alloc(u8, wdt.storageBytes(tw.len));
-            defer gpa.free(bytes);
+            const bytes = try weights.allocator().alloc(u8, wdt.storageBytes(tw.len));
             switch (wdt) {
                 .f32 => @memcpy(bytes, std.mem.sliceAsBytes(tw)),
                 .f16 => dtype.f32ToF16Row(tw, bytes),
                 else => dtype.f32ToBf16Row(tw, bytes),
             }
             const torch: Conv2d = .{ .w = .{ .torch = .{ .w = ops.matmul.Weight.init(bytes, wdt, co, ci * 9) } }, .b = bias, .co = co, .ci = ci, .k = 3, .pad = 1 };
-            const krsc = try torch.materialize(gpa);
-            defer gpa.free(krsc);
+            const krsc = try torch.materialize(weights.allocator());
             var repacked = torch;
             repacked.w = .{ .krsc = krsc };
             for ([3]SampleMode{ .stride1, .stride2, .upsample2x }) |mode| {

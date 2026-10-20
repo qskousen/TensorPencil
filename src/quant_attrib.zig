@@ -274,7 +274,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
     defer if (csv_file) |f| f.close(io);
 
     const measure = struct {
-        fn f(s: *pipeline.Session, g: std.mem.Allocator, a: std.mem.Allocator, m: *Mix, layers: []const []const u8, c: []pipeline.Cond, sn: []const Snapshot, sg: []const f32, sh: pipeline.LatentShape) ![]Point {
+        fn f(s: *pipeline.Session, g: std.mem.Allocator, a: std.mem.Allocator, m: *Mix, layers: []const []const u8, prompts: []const []const u8, c: []pipeline.Cond, sn: []const Snapshot, sg: []const f32, sh: pipeline.LatentShape) ![]Point {
             try m.select(g, layers);
             try s.replaceDenoiser(m.store());
             s.armDenoiserResidency();
@@ -282,8 +282,12 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
             const v = try g.alloc(f32, sh.elems());
             defer g.free(v);
             const steps = sn.len / c.len;
-            for (c, 0..) |cond, pi| {
-                var den = try s.denoiser(g, cond, null, 1.0, sh.h, sh.w, sg);
+            const own = s.family().conditionsFromDenoiser();
+            for (c, 0..) |dense_cond, pi| {
+                // Here the arm's own weights encode, or its encoder layers would read as free.
+                var arm_cond: ?pipeline.Cond = if (own) try s.encode(g, prompts[pi], .{}) else null;
+                defer if (arm_cond) |*ac| ac.deinit(g);
+                var den = try s.denoiser(g, arm_cond orelse dense_cond, null, 1.0, sh.h, sh.w, sg);
                 defer den.deinit(g);
                 for (0..steps) |i| {
                     const snap = sn[pi * steps + i];
@@ -299,7 +303,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
     const t0 = Io.Clock.real.now(io).nanoseconds;
     // Controls: the reload must read zero, and the whole file is what groups are read against.
     for ([_]struct { []const u8, []const []const u8 }{ .{ "control:dense", &.{} }, .{ "control:all", qlayers } }) |c| {
-        try arms.append(arena, .{ .label = c[0], .layers = c[1].len, .points = try measure(sess, gpa, arena, &mix, c[1], conds, snaps, sigmas, shape) });
+        try arms.append(arena, .{ .label = c[0], .layers = c[1].len, .points = try measure(sess, gpa, arena, &mix, c[1], opts.prompts, conds, snaps, sigmas, shape) });
         try report(out, arms.getLast(), null, t0, io);
     }
     const all_err = arms.items[1].mean();
@@ -316,7 +320,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
                 break :blk rest.items;
             },
         };
-        try arms.append(arena, .{ .label = label, .layers = members.len, .points = try measure(sess, gpa, arena, &mix, sel, conds, snaps, sigmas, shape) });
+        try arms.append(arena, .{ .label = label, .layers = members.len, .points = try measure(sess, gpa, arena, &mix, sel, opts.prompts, conds, snaps, sigmas, shape) });
         try report(out, arms.getLast(), if (opts.mode == .restore) all_err else null, t0, io);
         if (csv_file != null) try writeCsv(&csv_w.interface, arms.getLast());
     }

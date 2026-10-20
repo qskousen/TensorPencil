@@ -19,6 +19,7 @@
 //! a small chat model on A: a 31B beside a diffusion pipeline prefills at one
 //! token a second.
 const std = @import("std");
+const link = @import("serve").link;
 const Io = std.Io;
 const config = @import("shared").config;
 const catalog = @import("shared").catalog;
@@ -36,6 +37,7 @@ fn stemOf(path: []const u8) []const u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    @import("serve_tls").installClient();
     const arena = init.arena.allocator();
     const io = init.io;
     const gpa = std.heap.smp_allocator;
@@ -126,8 +128,8 @@ pub fn main(init: std.process.Init) !void {
     // user is sitting at. B is a listed host: one the client starts itself, or
     // the remote one the pairing string names.
     const stamp = Io.Clock.real.now(io).toSeconds();
-    const sock_a = try std.fmt.allocPrint(arena, "/tmp/tp-serve-probe-A-{d}.sock", .{stamp});
-    const sock_b = try std.fmt.allocPrint(arena, "/tmp/tp-serve-probe-B-{d}.sock", .{stamp});
+    const sock_a = try link.localPath(arena, io, init.environ_map, try std.fmt.allocPrint(arena, "probe-A-{d}.sock", .{stamp}));
+    const sock_b = try link.localPath(arena, io, init.environ_map, try std.fmt.allocPrint(arena, "probe-B-{d}.sock", .{stamp}));
     if (!cfg.addHost("B", pairing orelse sock_b, true).ok()) return error.HostListFull;
     const remote_b = pairing != null;
 

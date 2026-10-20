@@ -73,7 +73,7 @@ const queue = @import("serve").queue;
 const pairing = @import("serve").pairing;
 const blob = @import("serve").blob;
 const host_mod = @import("engine").host;
-const serve_tls = @import("serve_tls.zig");
+const serve_tls = @import("serve_tls");
 
 const log = std.log.scoped(.tp_serve);
 
@@ -94,6 +94,7 @@ const Ctx = struct {
     out_gen: std.atomic.Value(u32) = .init(0),
     events_attached: std.atomic.Value(bool) = .init(false),
     stop: std.atomic.Value(bool) = .init(false),
+    torn: std.atomic.Value(bool) = .init(false),
     /// Connections being served; one past `server.max_connections` is closed unserved.
     conns: std.atomic.Value(u32) = .init(0),
     watchdog: server.Watchdog,
@@ -181,15 +182,32 @@ const Ctx = struct {
         self.io.futexWake(u32, &self.out_gen.raw, std.math.maxInt(u32));
     }
 
-    /// Tear the engines down in order and leave. Runs on whichever thread saw
-    /// the reason; the main thread is parked in `accept` and exits with us.
+    /// Leave, from any thread but the main one, which is parked in `accept`: it is
+    /// woken to tear down, since closing a socket under a blocked accept is not
+    /// portable (`link.Listener.wake`). If it cannot be woken, this thread does it.
     fn shutdown(self: *Ctx, why: []const u8) noreturn {
-        if (self.stop.swap(true, .acq_rel)) {
-            // Another thread is already on it.
-            while (true) Io.sleep(self.io, .{ .nanoseconds = std.time.ns_per_s }, .real) catch {};
-        }
+        if (!self.beginStop(why)) park(self.io);
+        if (self.listener.wake()) park(self.io);
+        self.teardown();
+    }
+
+    /// The main thread's way out, a reason of its own or woken by `shutdown`.
+    fn finish(self: *Ctx, why: []const u8) noreturn {
+        _ = self.beginStop(why);
+        self.teardown();
+    }
+
+    /// Whether this is the first reason to stop.
+    fn beginStop(self: *Ctx, why: []const u8) bool {
+        if (self.stop.swap(true, .acq_rel)) return false;
         log.info("shutting down: {s}", .{why});
         self.wakeOut();
+        return true;
+    }
+
+    /// Tear the engines down in order and leave, once.
+    fn teardown(self: *Ctx) noreturn {
+        if (self.torn.swap(true, .acq_rel)) park(self.io);
         // The socket goes FIRST: freeing the engines takes seconds, and a
         // client arriving meanwhile must spawn a fresh host at this path, not
         // reach a dying one.
@@ -198,6 +216,10 @@ const Ctx = struct {
         std.process.exit(0);
     }
 };
+
+fn park(io: Io) noreturn {
+    while (true) Io.sleep(io, .{ .nanoseconds = std.time.ns_per_s }, .real) catch {};
+}
 
 var g_ctx: ?*Ctx = null;
 
@@ -428,12 +450,16 @@ pub fn main(init: std.process.Init) !void {
         t.detach();
     }
 
-    while (!ctx.stop.load(.acquire)) {
+    while (true) {
         const stream = listener.acceptStream() catch |err| {
-            if (ctx.stop.load(.acquire)) break;
-            log.err("accept: {t}", .{err});
-            break;
+            if (!ctx.stop.load(.acquire)) log.err("accept: {t}", .{err});
+            ctx.finish("listener closed");
         };
+        // The connection that woke us to stop.
+        if (ctx.stop.load(.acquire)) {
+            stream.close(io);
+            ctx.finish("");
+        }
         if (ctx.conns.load(.acquire) >= server.max_connections) {
             log.warn("refusing a connection: {d} already open", .{server.max_connections});
             stream.close(io);
@@ -447,7 +473,6 @@ pub fn main(init: std.process.Init) !void {
         };
         t.detach();
     }
-    ctx.shutdown("listener closed");
 }
 
 /// Whether `dirs` already names `dir`, by canonical path where both resolve.

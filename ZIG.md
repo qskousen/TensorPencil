@@ -921,3 +921,46 @@ A comptime generator returning `struct { inline fn run(...) void {...} }.run` as
 'auto'`. Return the struct TYPE and name `.run` where the body is wanted; a comptime
 parameter that takes a function accepts an inline one that way (the dual kernel table's
 `quant.GemvN(.q4_k).run`).
+
+## A Windows host: seven things that only break there
+
+- **`zig build` cannot emit a SPIR-V object on a Windows host** (`failed to write:
+  NotOpenForWriting`). Before moving a finished compile out of its temporary cache dir,
+  `Compilation.zig` closes the linker's output file, since Windows refuses to rename a dir
+  holding an open handle, and asks the linker to reopen it; the SPIR-V arm of
+  `link.File.makeWritable` is a no-op, so the module is written to a closed file. A direct
+  `zig build-obj` takes no such path, which is why `build.zig` compiles each kernel as a
+  Run of `zig build-obj` with every file under `src/gpu/kernels` as an input. Fixed in
+  0.17 (`.c, .spirv => ... openFile`); that is when the Run goes back to a Compile step.
+- **`Io.Dir.setTimestamps` is `@panic("TODO ...")` on Windows.** `File.setTimestamps`
+  works; open the file `.read_write`, and close it before anything tries to delete it,
+  since Windows will not delete an open file.
+- **LLVM writes IR text with CRLF on Windows** (`-femit-llvm-ir`), so a tool that parses
+  it line by line must strip `\r` (`tools/ptx_unalias.zig`).
+- **A socket read or write after the peer closes returns `error.Unexpected`**, unix or
+  TCP, and in Debug prints a stack trace first: `netReadWindows` / `netWriteWindows` map
+  neither `PIPE_DISCONNECTED` nor `LOCAL_DISCONNECT` (0.17 adds only `CONNECTION_RESET`
+  and `REMOTE_DISCONNECT`). Code that catches every error is correct, but the serve tests
+  then write to stderr while passing, so the Windows test run shows the cosmetic
+  `failed command:` line, and `tls-spike` prints a trace per deliberate disconnect.
+- **A unix socket's path must use `\` on Windows.** std binds it through AFD ioctls, which
+  pass the path to the socket driver untranslated, so `C:\...\Temp/x/local.sock` fails
+  as `OBJECT_PATH_NOT_FOUND` (`error.Unexpected`) though Win32 file calls accept the `/`.
+  Build socket paths with `std.fs.path.sep_str` (`link.localPath`), and never `/tmp`.
+- **An AF_UNIX connect that fails returns `error.Unexpected`**, a stack trace first in
+  Debug: `netConnectUnixWindows` maps no AFD connect status but `INSUFFICIENT_RESOURCES`,
+  so a socket path with nothing there (`CONNECTION_REFUSED`, 0xc0000236) reads as a
+  fault. `link.connect` checks the path exists before connecting, which turns the common
+  case into `FileNotFound`.
+- **Closing a listening socket under a blocked `accept` is `unreachable`**: Windows cancels
+  the accept, and `netAcceptWindows` has `.CANCELLED => unreachable` (a panic in Debug,
+  undefined behaviour in a release build). On Linux the same close does not even wake the
+  accept. A thread that wants the accepting one gone connects to the listener instead
+  (`link.Listener.wake`), and the accepting thread closes it itself.
+
+Two build-side notes from the same work: `linkSystemLibrary` for a foreign target still
+runs the HOST's pkg-config and adds Linux include paths, so a Windows target links its
+C libraries from the pinned `*_win` packages instead (`WinSdk` in `build.zig`); and the
+first `zig build` on a fresh Windows box once failed fetching ggml (`failed caching
+recompressed tarball ... FileNotFound`) where a manual `zig fetch` then succeeded and the
+build went through. The cause was not established.

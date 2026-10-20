@@ -1353,7 +1353,12 @@ test "a full table evicts its idlest transfer, keeping the partial, and old part
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = old_path, .data = "old" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = "new" });
     const week_ago: Io.Timestamp = .{ .nanoseconds = Io.Clock.real.now(io).nanoseconds - partial_max_age_ns - std.time.ns_per_day };
-    try Io.Dir.cwd().setTimestamps(io, old_path, .{ .modify_timestamp = .{ .new = week_ago } });
+    {
+        // Through a handle: 0.16's `Dir.setTimestamps` panics on Windows.
+        const old = try Io.Dir.cwd().openFile(io, old_path, .{ .mode = .read_write });
+        defer old.close(io);
+        try old.setTimestamps(io, .{ .modify_timestamp = .{ .new = week_ago } });
+    }
     var store = try Store.init(gpa, io, store_dir);
     defer store.deinit();
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, old_path, .{}));

@@ -521,16 +521,18 @@ fn matmulPacked(
     if (cancel.canceled(tok)) return error.Canceled;
 }
 
-/// One decode GEMV of a batch: y[rows] = W[rows][cols] (block-quant) @ x[cols].
-pub const Gemv1 = struct { y: []f32, x: []const f32, w: []const u8 };
+/// One weight's GEMVs in a batch: y[t][rows] = W[rows][cols] (block-quant) @ x[t][cols] for
+/// t < m. Each weight row is read once for its m dots.
+pub const BatchGemv = struct { y: []f32, x: []const f32, w: []const u8, m: usize = 1 };
 
 /// Many small block-quant GEMVs of one dtype and shape (a MoE layer's selected
 /// experts) as ONE threaded pass: every input is quantized once, then the rows
 /// of all jobs are split across the cores together, so a layer costs one
-/// fork/join instead of one per matrix.
-pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const Gemv1, rows: usize, cols: usize) Error!void {
+/// fork/join instead of one per matrix. Under `exact_activations` it refuses, and the
+/// caller's `matmul` fallback keeps the activation f32.
+pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const BatchGemv, rows: usize, cols: usize) Error!void {
     if (jobs.len == 0) return;
-    if (!quants.usesGgml(dt) or !have_ggml) return error.QuantBackendUnavailable;
+    if (exact_activations or !quants.usesGgml(dt) or !have_ggml) return error.QuantBackendUnavailable;
     return ggml_gemv.quantGemvBatch(io, dt, jobs, rows, cols);
 }
 
@@ -676,7 +678,8 @@ const ggml_gemv = if (have_ggml) struct {
 
     const BatchJob = struct {
         vd: ggml.c.ggml_vec_dot_t,
-        jobs: []const Gemv1,
+        jobs: []const BatchGemv,
+        first: []const usize,
         vy: []const u8,
         vy_bytes: usize,
         rows: usize,
@@ -694,17 +697,17 @@ const ggml_gemv = if (have_ggml) struct {
             const row0 = r % j.rows;
             const row1 = @min(j.rows, row0 + (r1 - r));
             const job = j.jobs[ji];
-            const vy = j.vy.ptr + ji * j.vy_bytes;
-            for (row0..row1) |row| {
+            const vy = j.vy.ptr + j.first[ji] * j.vy_bytes;
+            for (row0..row1) |row| for (0..job.m) |t| {
                 var acc: f32 = 0;
-                j.vd.?(@intCast(j.cols), &acc, 0, job.w.ptr + row * j.row_bytes, 0, vy, 0, 1);
-                job.y[row] = acc;
-            }
+                j.vd.?(@intCast(j.cols), &acc, 0, job.w.ptr + row * j.row_bytes, 0, vy + t * j.vy_bytes, 0, 1);
+                job.y[t * j.rows + row] = acc;
+            };
             r += row1 - row0;
         }
     }
 
-    pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const Gemv1, rows: usize, cols: usize) Error!void {
+    pub fn quantGemvBatch(io: std.Io, dt: DType, jobs: []const BatchGemv, rows: usize, cols: usize) Error!void {
         quants.ensureGgmlInit();
         const gtype = quants.ggmlType(dt) orelse unreachable;
         const wt = ggml.c.ggml_get_type_traits_cpu(gtype);
@@ -713,14 +716,22 @@ const ggml_gemv = if (have_ggml) struct {
         const row_bytes: usize = @intCast(ggml.c.ggml_row_size(gtype, @intCast(cols)));
         const vy_bytes: usize = @intCast(ggml.c.ggml_row_size(vdt, @intCast(cols)));
         const alloc = std.heap.c_allocator;
-        const vy = alloc.alloc(u8, jobs.len * vy_bytes) catch @panic("quantGemvBatch: OOM");
-        defer alloc.free(vy);
-        for (jobs, 0..) |job, i| {
-            std.debug.assert(job.w.len >= rows * row_bytes and job.x.len == cols and job.y.len == rows);
-            from_float(job.x.ptr, vy.ptr + i * vy_bytes, @intCast(cols));
+        // Job i's quantized rows start at row first[i] of vy.
+        const first = alloc.alloc(usize, jobs.len) catch @panic("quantGemvBatch: OOM");
+        defer alloc.free(first);
+        var vy_rows: usize = 0;
+        for (jobs, first) |job, *f| {
+            std.debug.assert(job.m >= 1 and job.w.len >= rows * row_bytes and job.x.len == job.m * cols and job.y.len == job.m * rows);
+            f.* = vy_rows;
+            vy_rows += job.m;
         }
+        const vy = alloc.alloc(u8, vy_rows * vy_bytes) catch @panic("quantGemvBatch: OOM");
+        defer alloc.free(vy);
+        for (jobs, first) |job, f| for (0..job.m) |t| {
+            from_float(job.x[t * cols ..].ptr, vy.ptr + (f + t) * vy_bytes, @intCast(cols));
+        };
         const tok = cancel.token;
-        const bj = BatchJob{ .vd = wt.*.vec_dot, .jobs = jobs, .vy = vy, .vy_bytes = vy_bytes, .rows = rows, .cols = cols, .row_bytes = row_bytes, .tok = tok };
+        const bj = BatchJob{ .vd = wt.*.vec_dot, .jobs = jobs, .first = first, .vy = vy, .vy_bytes = vy_bytes, .rows = rows, .cols = cols, .row_bytes = row_bytes, .tok = tok };
         const total = jobs.len * rows;
         const n_threads = std.Thread.getCpuCount() catch 1;
         const want: usize = if (n_threads == 1 or total < 128) 1 else n_threads;
@@ -1792,6 +1803,21 @@ test "matmul q2_0 on both paths, both block sizes" {
         try testBlockQuantAgainstNaive(37, NR + 5, KC + blk, dt, false); // packed, partial slice
         try testBlockQuantAgainstNaive(small_m_max, NR, 5120, dt, true); // packed, Bonsai's hidden
     }
+}
+
+test "quantGemvBatch refuses under exact_activations, so its caller keeps f32" {
+    if (!have_ggml) return error.SkipZigTest;
+    const dt: DType = .q4_k;
+    var w = [_]u8{0} ** (8 * 144);
+    var x = [_]f32{0} ** 256;
+    var y = [_]f32{0} ** 8;
+    const jobs = [_]BatchGemv{.{ .y = &y, .x = &x, .w = &w }};
+    const prev = exact_activations;
+    defer exact_activations = prev;
+    exact_activations = false;
+    try quantGemvBatch(std.testing.io, dt, &jobs, 8, 256);
+    exact_activations = true;
+    try std.testing.expectError(error.QuantBackendUnavailable, quantGemvBatch(std.testing.io, dt, &jobs, 8, 256));
 }
 
 test "exact_activations removes the small-m path's activation quantization" {

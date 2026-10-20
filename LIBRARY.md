@@ -147,7 +147,7 @@ main namespaces, low to high:
 | `tokenizer`, `sampler`, `image` | tokenization, sampling, image I/O + comparison metrics (`psnr`, `ssim`, `detailEnergy`) |
 | `llm` | LLM orchestration: chat templating, generation `engine`, `kv_cache`, speculative decode |
 | `pipeline` | the end-to-end diffusion pipeline, and the composable stages it is built from (`Session.encode` / `schedule` / `Session.denoiser` + `predict` / `Session.decode`), plus `Session.replaceDit` to swap the diffusion weights of a live session |
-| `filemap`, `dynlib`, `diskspace` | the per-platform shims: whole-file mapping, runtime library loading, free space |
+| `filemap`, `dynlib`, `diskspace`, `rawtty` | the per-platform shims: whole-file mapping, runtime library loading, free space, raw terminal input |
 
 ## The app tiers above the library
 

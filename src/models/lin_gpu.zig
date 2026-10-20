@@ -51,18 +51,22 @@ pub const Caps = struct {
     i4dec: bool,
     w4a8dec: bool,
     nvfp4dec: bool,
-    /// The fp8 cooperative GEMM (`opMatmulCoop`), f16 activation.
+    /// The fp8 cooperative GEMM (`opMatmulCoop`), f16 activation, either build.
     coop_fp8: bool,
+    /// What that GEMM's weight rows must be a multiple of (`Context.coop_wgn`).
+    fp8_rows: u32 = 256,
     /// The weight-only integer expansion (`opMatmulCoopIntWo`).
     wo_pack: bool = false,
     /// The f32 GEMM the W·A32 weight-only routes end in.
     f32_gemm: bool = false,
+    /// `OpSDot`, for the q8_1 decode GEMVs.
+    int_dot: bool = false,
 
     /// No device feature at all: what routing falls back to, for tests.
     pub const none: Caps = .{ .f16w = false, .bf16w = false, .i8 = false, .i4dec = false, .w4a8dec = false, .nvfp4dec = false, .coop_fp8 = false };
 
     pub fn fromContext(ctx: *const gpu.Context) Caps {
-        const has_i8 = ctx.pipe_coop_i8 != .null_handle or ctx.pipe_coop_i8_sh != .null_handle;
+        const has_i8 = ctx.hasI8Gemm();
         return .{
             .f16w = ctx.pipe_coop_f16w != .null_handle,
             .bf16w = ctx.pipe_coop_bf16w != .null_handle,
@@ -70,9 +74,11 @@ pub const Caps = struct {
             .i4dec = has_i8 and ctx.hasI4Decode(),
             .w4a8dec = has_i8 and ctx.hasW4A8Decode(),
             .nvfp4dec = ctx.hasNvfp4Decode(),
-            .coop_fp8 = ctx.pipe_coop != .null_handle,
+            .coop_fp8 = ctx.pipe_coop != .null_handle or ctx.fp8_wide,
+            .fp8_rows = ctx.coop_wgn,
             .wo_pack = ctx.pipe_wo_pack[0] != .null_handle,
             .f32_gemm = ctx.pipe_f32 != .null_handle,
+            .int_dot = ctx.has_int_dot,
         };
     }
 
@@ -109,11 +115,11 @@ pub const Caps = struct {
     pub fn dual(_: Caps, dt: DType) bool {
         return gpu.Context.dualGemv(dt);
     }
-    /// The q8_1 decode GEMV runs here, but its dot is four scalar products without
-    /// `OpSDot`, and the staging pass then costs more than it saves: measured 9%
-    /// slower than the f32 GEMV on a 4B decode.
-    pub fn dualQ8(_: Caps, _: DType) bool {
-        return false;
+    /// The q8_1 decode GEMV, where the device multiplies with `OpSDot`: without it the
+    /// dot is four scalar products and the staging pass costs more than it saves
+    /// (measured 9% slower than the f32 GEMV on a 4B decode).
+    pub fn dualQ8(c: Caps, _: DType) bool {
+        return c.int_dot and !gpu.Context.sdot_off;
     }
     /// A small batch reads each weight once per 4 rows, where the dequant GEMM expands
     /// the whole weight first.
@@ -138,12 +144,15 @@ pub const Caps = struct {
     pub fn w4a8(c: Caps) bool {
         return c.w4a8dec;
     }
-    /// The weight-only routes expand to either width, so they need both coop GEMMs.
-    pub fn intWeightOnly(c: Caps) bool {
-        return c.f16w and c.bf16w and c.wo_pack;
-    }
-    pub fn intWeightOnly32(c: Caps) bool {
-        return c.f32_gemm;
+    /// The 16-bit weight-only routes pack for the coop GEMM of their width; f32 runs
+    /// the plain f32 GEMM.
+    pub fn intWeightOnly(c: Caps, g: dual_lin.IntGemm) bool {
+        return switch (g) {
+            .w8a8 => unreachable,
+            .weight_only => c.bf16w and c.wo_pack,
+            .weight_only_f16 => c.f16w and c.wo_pack,
+            .weight_only_f32 => c.f32_gemm,
+        };
     }
     pub fn nvfp4(c: Caps) bool {
         return c.nvfp4dec;
@@ -155,12 +164,16 @@ pub const Caps = struct {
     pub fn denseGemm(c: Caps, _: DType) bool {
         return c.f16w or c.bf16w;
     }
+    /// A 16-bit weight widened to f32 for the f32 GEMM, where there is no 16-bit one.
+    pub fn wideGemm(c: Caps) bool {
+        return c.f32_gemm;
+    }
     pub fn denseGemmTakes(c: Caps, _: Weight) bool {
         return c.f16w or c.bf16w;
     }
-    /// `opMatmulCoop` tiles 128 rows and 64-wide k slabs.
+    /// `opMatmulCoop` tiles `fp8_rows` rows and 64-wide k slabs.
     pub fn fp8Gemm(c: Caps, w: Weight) bool {
-        return c.coop_fp8 and w.rows % 128 == 0 and w.cols % 64 == 0;
+        return c.coop_fp8 and w.rows % c.fp8_rows == 0 and w.cols % 64 == 0;
     }
     pub fn fp8Bf16(_: Caps) bool {
         return false;
@@ -176,6 +189,11 @@ pub const Caps = struct {
     }
     pub fn gemvF32(_: Caps) bool {
         return true;
+    }
+    /// The k-split GEMV fills a quarter-row of threads a chunk, which a 100-row router
+    /// leaves idle (44 us at one row), and the f32 GEMM tiles waste it (1 ms at 19).
+    pub fn f32Rows(_: Caps, w: Weight, m: usize) bool {
+        return w.rows <= 256 and w.cols % 4 == 0 and m <= 512;
     }
     /// What the kernel behind route `r` cannot take about `w`, or null.
     pub fn refuse(_: Caps, _: []const Weight, rot: bool, w: Weight, r: Route) ?Why {
@@ -491,14 +509,27 @@ pub const Lin = struct {
                 g.serial = serial_i8;
             },
             .q8 => {
-                std.debug.assert(m == 1);
-                try self.ctx.opGemvQuantizeX(xf, cols);
+                try self.ctx.opGemvQuantizeXRows(xf, m, cols);
                 serial_q8 +%= 1;
                 g.serial = serial_q8;
             },
             else => {},
         }
         return g;
+    }
+
+    /// `prep`'s q8 staging of `x[m][cols]`, for a caller that multiplies against it itself
+    /// (`opGemvExperts`); counted like `prep`'s, so a held group sees it was replaced.
+    pub fn stageQ8(self: *const Lin, x: Buf, m: usize, cols: usize) !Group {
+        try self.ctx.opGemvQuantizeXRows(x, m, cols);
+        serial_q8 +%= 1;
+        return .{ .x = x, .m = m, .cols = cols, .prep = .q8, .serial = serial_q8 };
+    }
+
+    /// Whether `g` is the q8 staging of `x[m]` still in place.
+    pub fn holdsQ8(_: *const Lin, g: ?Group, x: Buf, m: usize) bool {
+        const h = g orelse return false;
+        return h.prep == .q8 and h.serial == serial_q8 and h.x32 == null and h.x.buf == x.buf and h.x.off == x.off and h.m == m;
     }
 
     /// The common fp8 scale when every weight in `ws` runs the cooperative fp8 GEMM with
@@ -760,14 +791,19 @@ pub const Lin = struct {
                 try ctx.opMatmulCoopBf16(y, o.y_off, x, m, w.bytes, w.rows, w.cols, zb)
             else
                 try ctx.opMatmulCoopF16Wb(y, o.y_off, x, m, w.bytes, w.rows, w.cols, zb),
-            .gemm_f32 => try ctx.opMatmul(y, o.y_off * 4, x, o.x_off * 4, m, w.bytes, false, w.rows, w.cols, w.scale, o.bias),
+            .gemm_f32 => if (w.dtype == .f32)
+                try ctx.opMatmul(y, o.y_off * 4, x, o.x_off * 4, m, w.bytes, false, w.rows, w.cols, w.scale, o.bias)
+            else
+                try ctx.opMatmulWide(y, o.y_off * 4, x, o.x_off * 4, m, w.bytes, w.dtype, w.rows, w.cols, w.scale, o.bias),
             .gemm_fp8_f32 => try ctx.opMatmul(y, o.y_off * 4, x, o.x_off * 4, m, w.bytes, true, w.rows, w.cols, w.scale, o.bias),
             .gemm_bf16 => if (self.caps.bf16w)
                 try ctx.opMatmulCoopBf16(y, o.y_off, x, m, w.bytes, w.rows, w.cols, zb)
             else
                 try ctx.opMatmulCoopF16Wb(y, o.y_off, x, m, w.bytes, w.rows, w.cols, zb),
             .gemm_f16 => try ctx.opMatmulCoopF16Wh(y, o.y_off, x, m, w.bytes, w.rows, w.cols, zb),
-            .gemm_fp8 => {
+            .gemm_fp8 => if (ctx.fp8_wide)
+                try ctx.opMatmulFp8Wide(y, o.y_off, x, m, w.bytes, w.rows, w.cols, w.scale, zb)
+            else {
                 std.debug.assert(o.y_off == 0);
                 try ctx.opMatmulCoop(y, x, m, o.m_pad orelse std.mem.alignForward(usize, m, 128), w.bytes, w.rows, w.cols, w.scale);
                 folded = o.bias == null;
@@ -812,8 +848,12 @@ pub const Lin = struct {
                 try self.gemv(r, y, o.y_off, x, m, w);
                 folded = o.bias == null;
             },
-            .gemv_dual_q8 => {
-                try ctx.opGemvQuantDualQ8(w.dtype, y, o.y_off, w.bytes, w.scale, w.rows, w.cols);
+            .gemv_dual_q8, .gemv_dualn_q8 => {
+                try self.gemv(r, y, o.y_off, x, m, w);
+                folded = o.bias == null;
+            },
+            .gemv_f32_rows => {
+                try ctx.opGemvRowsF32(y, o.y_off, x, w.bytes, w.rows, w.cols, m, w.scale);
                 folded = o.bias == null;
             },
             // Routes for kernels this backend lacks; `Caps` never chooses them.
@@ -844,6 +884,12 @@ pub const Lin = struct {
             const wb = w.bytes[r0 * row_bytes ..][0 .. n * row_bytes];
             switch (r) {
                 .gemv_dual => try ctx.opGemvQuantDual(w.dtype, y, y_off + r0, x, wb, w.scale, n, w.cols),
+                // The q8 routes read the activation `prep` staged, not `x`.
+                .gemv_dual_q8 => try ctx.opGemvQuantDualQ8(w.dtype, y, y_off + r0, wb, w.scale, n, w.cols),
+                .gemv_dualn_q8 => {
+                    var t: usize = 0;
+                    while (t < m) : (t += 4) try ctx.opGemvQuantDualQ8N(w.dtype, y, t * w.rows + r0, w.rows, wb, w.scale, n, w.cols, t, @min(4, m - t));
+                },
                 .gemv_bf16, .gemv_fp8, .gemv_f32 => try ctx.opGemv(y, y_off + r0, x, self.partials[0], wb, wcode(w.dtype), n, w.cols, w.scale, self.nchunk),
                 .gemv_dualn => {
                     var t: usize = 0;
@@ -867,7 +913,7 @@ pub const Lin = struct {
 };
 
 /// The kernels' binding bound: a buffer is typed as 2^28 words.
-const max_binding: usize = 1 << 30;
+pub const max_binding: usize = 1 << 30;
 
 /// Hands `ops.matmul.probe` the activation a GEMM is about to read, so an activation
 /// capture works on this backend. Only for an f32 activation nothing has consumed.
@@ -950,6 +996,23 @@ test "dense formats route by row count" {
     try std.testing.expectEqual(@as(?Route, null), llmRoute(Caps.none, fake(.u8, 8, 8), 1));
 }
 
+test "a dense weight whose rows the grouped GEMV cannot tile takes the GEMM" {
+    // The grouped kernels decode eight rows a lane group (`opGemvPartial4`); a 100-row
+    // router at a 4-row batch computed 96 of them before this rule.
+    for ([_]DType{ .f32, .bf16, .f8_e4m3 }) |dt| {
+        try std.testing.expect(llmRoute(full, fake(dt, 100, 2560), 4).? != .gemv_f32n);
+        try std.testing.expect(llmRoute(full, fake(dt, 100, 2560), 4).? != .gemv_bf16n);
+        try std.testing.expect(llmRoute(full, fake(dt, 100, 2560), 4).? != .gemv_fp8n);
+    }
+    try std.testing.expectEqual(Route.gemv_f32n, llmRoute(full, fake(.f32, 1040, 2560), 4).?);
+}
+
+test "a skinny f32 weight takes the row GEMV at any batch it covers" {
+    for ([_]usize{ 1, 4, 19, 512 }) |m| try std.testing.expectEqual(Route.gemv_f32_rows, llmRoute(full, fake(.f32, 100, 2560), m).?);
+    try std.testing.expectEqual(Route.gemm_f32, llmRoute(full, fake(.f32, 100, 2560), 513).?);
+    try std.testing.expectEqual(Route.gemv_f32, llmRoute(full, fake(.f32, 4096, 4096), 1).?);
+}
+
 test "a diffusion plan takes every format the device has a kernel for" {
     const p: Plan = .{ .rot = true, .blockq = .auto };
     var q = fake(.i8, 4096, 4096);
@@ -992,4 +1055,40 @@ test "wcode reads bf16 and fp8 natively and everything else as f32" {
     try std.testing.expectEqual(gpu.WCode.bf16, wcode(.bf16));
     try std.testing.expectEqual(gpu.WCode.f8, wcode(.f8_e4m3));
     try std.testing.expectEqual(gpu.WCode.f32, wcode(.f32));
+}
+
+test "the fp8 GEMM takes only weights whose rows fill its workgroup tile" {
+    var c = full;
+    c.fp8_rows = 256;
+    try std.testing.expect(c.fp8Gemm(fake(.f8_e4m3, 512, 64)));
+    try std.testing.expect(!c.fp8Gemm(fake(.f8_e4m3, 384, 64)));
+    c.fp8_rows = 128;
+    try std.testing.expect(c.fp8Gemm(fake(.f8_e4m3, 384, 64)));
+}
+
+test "a 16-bit weight takes the f32 GEMM, widened, only where there is no 16-bit GEMM" {
+    const f32_only: Caps = .{ .f16w = false, .bf16w = false, .i8 = false, .i4dec = false, .w4a8dec = false, .nvfp4dec = false, .coop_fp8 = false, .f32_gemm = true };
+    const pol = (Plan{ .rot = true, .blockq = .auto }).policy();
+    for ([_]DType{ .f16, .bf16 }) |dt| {
+        try std.testing.expectEqual(@as(?Route, .gemm_f32), dual_lin.routeOf(Caps, f32_only, fake(dt, 4096, 4096), 1, pol));
+        try std.testing.expectEqual(@as(?Route, null), dual_lin.routeOf(Caps, Caps.none, fake(dt, 4096, 4096), 1, pol));
+    }
+    // An LLM batch: f16 has no other GEMM, bf16 keeps its grouped GEMV.
+    try std.testing.expectEqual(@as(?Route, .gemm_f32), llmRoute(f32_only, fake(.f16, 4096, 4096), 512));
+    try std.testing.expectEqual(@as(?Route, .gemv_bf16n), llmRoute(f32_only, fake(.bf16, 4096, 4096), 512));
+    try std.testing.expectEqual(@as(?Route, .gemm_bf16), dual_lin.routeOf(Caps, full, fake(.bf16, 4096, 4096), 1, pol));
+}
+
+test "a weight-only width the device has no GEMM for widens to f32, never narrows" {
+    var q = fake(.i8, 4096, 4096);
+    q.row_scale = &.{};
+    var no_bf = full;
+    no_bf.bf16w = false;
+    var pol = (Plan{ .rot = true, .blockq = .auto }).policy();
+    for ([_]dual_lin.IntGemm{ .weight_only, .weight_only_f16, .weight_only_f32 }, [_]Route{ .i8_wo, .i8_wo16, .i8_wo32 }, [_]Route{ .i8_wo32, .i8_wo16, .i8_wo32 }) |g, on_full, on_no_bf| {
+        pol.int8 = g;
+        try std.testing.expectEqual(@as(?Route, on_full), dual_lin.routeOf(Caps, full, q, 64, pol));
+        try std.testing.expectEqual(@as(?Route, on_no_bf), dual_lin.routeOf(Caps, no_bf, q, 64, pol));
+        try std.testing.expectEqual(@as(?Route, null), dual_lin.routeOf(Caps, Caps.none, q, 64, pol));
+    }
 }

@@ -16,7 +16,8 @@ const tp_core = @import("tp_core");
 const build_options = @import("build_options");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
-const coopmat = @import("coopmat.zig");
+const hazard = @import("hazard.zig");
+pub const coopmat = @import("coopmat.zig");
 
 /// Output rows the int8 cooperative GEMM stores per tile; a weight's rows must be a
 /// multiple of it.
@@ -375,11 +376,19 @@ pub var bench_bq_skip: enum { none, pack, expand } = .none;
 /// kernel (`diffusion-profile --ab prep3`).
 pub var force_i8_prep_3pass: bool = false;
 
+/// Every e4m3 code as f32, the table `dequant_fp8_*` decodes through.
+const fp8_table: [256]f32 = blk: {
+    @setEvalBranchQuota(100000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| v.* = tp_core.dtype.f8e4m3ToF32(@intCast(i));
+    break :blk t;
+};
+
 /// Which pass of the two-pass flash attention (`coopmat.buildFlashAttn`). Named rather than
 /// inline so a caller can pass it through `@call`.
 pub const FlashPass = enum { md, out };
 
-pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q3_k, gemv4_dual_q4_k, gemv4_dual_q8_0, gemv4_dual_q4_0, gemv4_dual_iq4_nl, gemv4_dual_iq4_xs, gemv4_dual_q5_k, gemv4_dual_q6_k, gemv4_dual_q1_0, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g128, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xs, gemv4_dual_iq3_xxs, gemv4_dual_iq3_s, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16, dup_up_add, dup_up_add_f16, dup_up_add_bf16, w6a8_decode, w6a8_decode_t };
+pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, moe_route, gemv_rows_f32, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q2_k_sdot, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q3_k_sdot, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q4_k_sdot, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q8_0_sdot, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_q4_0_sdot, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_nl_sdot, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_iq4_xs_sdot, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q5_k_sdot, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q6_k_sdot, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q1_0_sdot, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g64_sdot, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_q2_0_g128_sdot, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xxs_sdot, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq2_xs_sdot, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_xxs_sdot, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, gemv_dual_iq3_s_sdot, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q2_k_sdot, gemv4_dual_q3_k, gemv4_dual_q3_k_sdot, gemv4_dual_q4_k, gemv4_dual_q4_k_sdot, gemv4_dual_q8_0, gemv4_dual_q8_0_sdot, gemv4_dual_q4_0, gemv4_dual_q4_0_sdot, gemv4_dual_iq4_nl, gemv4_dual_iq4_nl_sdot, gemv4_dual_iq4_xs, gemv4_dual_iq4_xs_sdot, gemv4_dual_q5_k, gemv4_dual_q5_k_sdot, gemv4_dual_q6_k, gemv4_dual_q6_k_sdot, gemv4_dual_q1_0, gemv4_dual_q1_0_sdot, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g64_sdot, gemv4_dual_q2_0_g128, gemv4_dual_q2_0_g128_sdot, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xxs_sdot, gemv4_dual_iq2_xs, gemv4_dual_iq2_xs_sdot, gemv4_dual_iq3_xxs, gemv4_dual_iq3_xxs_sdot, gemv4_dual_iq3_s, gemv4_dual_iq3_s_sdot, gemvx_dual_q2_k, gemvx_dual_q2_k_sdot, gemvx_dual_q3_k, gemvx_dual_q3_k_sdot, gemvx_dual_q4_k, gemvx_dual_q4_k_sdot, gemvx_dual_q8_0, gemvx_dual_q8_0_sdot, gemvx_dual_q4_0, gemvx_dual_q4_0_sdot, gemvx_dual_iq4_nl, gemvx_dual_iq4_nl_sdot, gemvx_dual_iq4_xs, gemvx_dual_iq4_xs_sdot, gemvx_dual_q5_k, gemvx_dual_q5_k_sdot, gemvx_dual_q6_k, gemvx_dual_q6_k_sdot, gemvx_dual_q1_0, gemvx_dual_q1_0_sdot, gemvx_dual_q2_0_g64, gemvx_dual_q2_0_g64_sdot, gemvx_dual_q2_0_g128, gemvx_dual_q2_0_g128_sdot, gemvx_dual_iq2_xxs, gemvx_dual_iq2_xxs_sdot, gemvx_dual_iq2_xs, gemvx_dual_iq2_xs_sdot, gemvx_dual_iq3_xxs, gemvx_dual_iq3_xxs_sdot, gemvx_dual_iq3_s, gemvx_dual_iq3_s_sdot, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16, dup_up_add, dup_up_add_f16, dup_up_add_bf16, w6a8_decode, w6a8_decode_t };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("act_steer"),
     dualEntry("rmsnorm"),
@@ -480,6 +489,8 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gather_rows"),
     dualEntry("scatter_add_rows"),
     dualEntry("moe_combine"),
+    dualEntry("moe_route"),
+    dualEntry("gemv_rows_f32"),
     dualEntry("rope_imrope"),
     dualEntry("rope_imrope_pos"),
     dualEntry("rope_vision"),
@@ -547,36 +558,52 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("dequant_iq3_s_bf16"),
     dualEntry("gemv_dual_q2_k"),
     dualEntry("gemv_dual_q2_k_q8"),
+    dualEntry("gemv_dual_q2_k_sdot"),
     dualEntry("gemv_dual_q3_k"),
     dualEntry("gemv_dual_q3_k_q8"),
+    dualEntry("gemv_dual_q3_k_sdot"),
     dualEntry("gemv_dual_q4_k"),
     dualEntry("gemv_dual_q4_k_q8"),
+    dualEntry("gemv_dual_q4_k_sdot"),
     dualEntry("gemv_dual_q8_0"),
     dualEntry("gemv_dual_q8_0_q8"),
+    dualEntry("gemv_dual_q8_0_sdot"),
     dualEntry("gemv_dual_q4_0"),
     dualEntry("gemv_dual_q4_0_q8"),
+    dualEntry("gemv_dual_q4_0_sdot"),
     dualEntry("gemv_dual_iq4_nl"),
     dualEntry("gemv_dual_iq4_nl_q8"),
+    dualEntry("gemv_dual_iq4_nl_sdot"),
     dualEntry("gemv_dual_iq4_xs"),
     dualEntry("gemv_dual_iq4_xs_q8"),
+    dualEntry("gemv_dual_iq4_xs_sdot"),
     dualEntry("gemv_dual_q5_k"),
     dualEntry("gemv_dual_q5_k_q8"),
+    dualEntry("gemv_dual_q5_k_sdot"),
     dualEntry("gemv_dual_q6_k"),
     dualEntry("gemv_dual_q6_k_q8"),
+    dualEntry("gemv_dual_q6_k_sdot"),
     dualEntry("gemv_dual_q1_0"),
     dualEntry("gemv_dual_q1_0_q8"),
+    dualEntry("gemv_dual_q1_0_sdot"),
     dualEntry("gemv_dual_q2_0_g64"),
     dualEntry("gemv_dual_q2_0_g64_q8"),
+    dualEntry("gemv_dual_q2_0_g64_sdot"),
     dualEntry("gemv_dual_q2_0_g128"),
     dualEntry("gemv_dual_q2_0_g128_q8"),
+    dualEntry("gemv_dual_q2_0_g128_sdot"),
     dualEntry("gemv_dual_iq2_xxs"),
     dualEntry("gemv_dual_iq2_xxs_q8"),
+    dualEntry("gemv_dual_iq2_xxs_sdot"),
     dualEntry("gemv_dual_iq2_xs"),
     dualEntry("gemv_dual_iq2_xs_q8"),
+    dualEntry("gemv_dual_iq2_xs_sdot"),
     dualEntry("gemv_dual_iq3_xxs"),
     dualEntry("gemv_dual_iq3_xxs_q8"),
+    dualEntry("gemv_dual_iq3_xxs_sdot"),
     dualEntry("gemv_dual_iq3_s"),
     dualEntry("gemv_dual_iq3_s_q8"),
+    dualEntry("gemv_dual_iq3_s_sdot"),
     dualEntry("compact_acc"),
     dualEntry("attn_rows_f32"),
     dualEntry("attn_rows_f16"),
@@ -586,21 +613,69 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("gdn_delta_chunk_d128"),
     dualEntry("quantize_q8_1"),
     dualEntry("gemv4_dual_q2_k"),
+    dualEntry("gemv4_dual_q2_k_sdot"),
     dualEntry("gemv4_dual_q3_k"),
+    dualEntry("gemv4_dual_q3_k_sdot"),
     dualEntry("gemv4_dual_q4_k"),
+    dualEntry("gemv4_dual_q4_k_sdot"),
     dualEntry("gemv4_dual_q8_0"),
+    dualEntry("gemv4_dual_q8_0_sdot"),
     dualEntry("gemv4_dual_q4_0"),
+    dualEntry("gemv4_dual_q4_0_sdot"),
     dualEntry("gemv4_dual_iq4_nl"),
+    dualEntry("gemv4_dual_iq4_nl_sdot"),
     dualEntry("gemv4_dual_iq4_xs"),
+    dualEntry("gemv4_dual_iq4_xs_sdot"),
     dualEntry("gemv4_dual_q5_k"),
+    dualEntry("gemv4_dual_q5_k_sdot"),
     dualEntry("gemv4_dual_q6_k"),
+    dualEntry("gemv4_dual_q6_k_sdot"),
     dualEntry("gemv4_dual_q1_0"),
+    dualEntry("gemv4_dual_q1_0_sdot"),
     dualEntry("gemv4_dual_q2_0_g64"),
+    dualEntry("gemv4_dual_q2_0_g64_sdot"),
     dualEntry("gemv4_dual_q2_0_g128"),
+    dualEntry("gemv4_dual_q2_0_g128_sdot"),
     dualEntry("gemv4_dual_iq2_xxs"),
+    dualEntry("gemv4_dual_iq2_xxs_sdot"),
     dualEntry("gemv4_dual_iq2_xs"),
+    dualEntry("gemv4_dual_iq2_xs_sdot"),
     dualEntry("gemv4_dual_iq3_xxs"),
+    dualEntry("gemv4_dual_iq3_xxs_sdot"),
     dualEntry("gemv4_dual_iq3_s"),
+    dualEntry("gemv4_dual_iq3_s_sdot"),
+    dualEntry("gemvx_dual_q2_k"),
+    dualEntry("gemvx_dual_q2_k_sdot"),
+    dualEntry("gemvx_dual_q3_k"),
+    dualEntry("gemvx_dual_q3_k_sdot"),
+    dualEntry("gemvx_dual_q4_k"),
+    dualEntry("gemvx_dual_q4_k_sdot"),
+    dualEntry("gemvx_dual_q8_0"),
+    dualEntry("gemvx_dual_q8_0_sdot"),
+    dualEntry("gemvx_dual_q4_0"),
+    dualEntry("gemvx_dual_q4_0_sdot"),
+    dualEntry("gemvx_dual_iq4_nl"),
+    dualEntry("gemvx_dual_iq4_nl_sdot"),
+    dualEntry("gemvx_dual_iq4_xs"),
+    dualEntry("gemvx_dual_iq4_xs_sdot"),
+    dualEntry("gemvx_dual_q5_k"),
+    dualEntry("gemvx_dual_q5_k_sdot"),
+    dualEntry("gemvx_dual_q6_k"),
+    dualEntry("gemvx_dual_q6_k_sdot"),
+    dualEntry("gemvx_dual_q1_0"),
+    dualEntry("gemvx_dual_q1_0_sdot"),
+    dualEntry("gemvx_dual_q2_0_g64"),
+    dualEntry("gemvx_dual_q2_0_g64_sdot"),
+    dualEntry("gemvx_dual_q2_0_g128"),
+    dualEntry("gemvx_dual_q2_0_g128_sdot"),
+    dualEntry("gemvx_dual_iq2_xxs"),
+    dualEntry("gemvx_dual_iq2_xxs_sdot"),
+    dualEntry("gemvx_dual_iq2_xs"),
+    dualEntry("gemvx_dual_iq2_xs_sdot"),
+    dualEntry("gemvx_dual_iq3_xxs"),
+    dualEntry("gemvx_dual_iq3_xxs_sdot"),
+    dualEntry("gemvx_dual_iq3_s"),
+    dualEntry("gemvx_dual_iq3_s_sdot"),
     dualEntry("attn_rows_g2_f32"),
     dualEntry("attn_rows_g2_f16"),
     dualEntry("attn_rows_g2_q8"),
@@ -823,11 +898,13 @@ pub const Error = error{
     UnsupportedDType,
     /// A buffer view whose offset the device cannot bind (`Context.view`).
     UnalignedView,
+    /// A kernel the backend cannot do without needs more of the device than it has.
+    KernelExceedsDevice,
+    /// A dispatch whose pipeline this device never got (`createModule` refused it, or
+    /// its feature is absent): the caller falls back as for any kernel it lacks.
+    KernelUnavailable,
 } || spv.Error;
 
-/// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
-/// logical addressing, no workgroup ArrayStrides, see spv.zig) and create
-/// the module. All listed entry points get the same workgroup size.
 /// Which compiled module holds an `Elt` entry: eltwise.zig, or the dual-target
 /// dual.zig that the CUDA backend launches from the same source.
 const EltSrc = enum { eltwise, dual };
@@ -856,7 +933,60 @@ fn patchKernelModule(gpa: std.mem.Allocator, code: []const u8, caps: []const u32
     return spv.dedupeDecorations(gpa, stripped);
 }
 
-fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, code: []const u8, entries: []const EntrySize, caps: []const u32, ext: ?[]const u8, out: *vk.ShaderModule) Error!void {
+/// What a device demands of every shader module, read once at init.
+const ModuleRules = struct {
+    /// The float controls every module asks for, from what the device reports: f16
+    /// rounding to nearest even, and f16 gradual underflow, which an fp8 GEMM's folded
+    /// weight scale depends on and some drivers only give when asked.
+    float: spv.FloatModes = .{},
+    /// `maxComputeSharedMemorySize`.
+    max_shared: u64 = std.math.maxInt(u64),
+};
+
+/// Under `denormBehaviorIndependence` NONE every width must carry the same denorm mode,
+/// so f16 preservation is asked for only together with f32's.
+fn floatModes(fc: vk.PhysicalDeviceFloatControlsProperties) spv.FloatModes {
+    const none: u32 = 2;
+    const d16 = fc.shader_denorm_preserve_float16 == vk.TRUE;
+    const d32 = fc.shader_denorm_preserve_float32 == vk.TRUE;
+    const tied = fc.denorm_behavior_independence == none;
+    return .{
+        .rte16 = fc.shader_rounding_mode_rte_float16 == vk.TRUE,
+        .denorm16 = d16 and (!tied or d32),
+        .denorm32 = tied and d16 and d32,
+    };
+}
+
+/// Every shader module the backend creates goes through here, so a device's rules
+/// apply in one place. Null for a module this device cannot run as written (more
+/// workgroup memory than it has, or an array too large for a 32-bit size); the
+/// caller treats that as a kernel it lacks.
+fn createModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, rules: ModuleRules, name: []const u8, code: []align(4) const u8) Error!?vk.ShaderModule {
+    const array = try spv.largestArrayBytes(gpa, code);
+    if (array >= 1 << 32) {
+        std.log.err("vulkan: {s} declares a {d} B array, which wraps a 32-bit size; declare a buffer's array runtime-sized. It is not built", .{ name, array });
+        return null;
+    }
+    const shared = try spv.workgroupBytes(gpa, code);
+    if (shared > rules.max_shared) {
+        std.log.warn("vulkan: {s} needs {d} B of shared memory and this device has {d}; it is not built", .{ name, shared, rules.max_shared });
+        return null;
+    }
+    const patched = try spv.withFloatModes(gpa, code, rules.float);
+    defer gpa.free(patched);
+    const final = patched;
+    var module: vk.ShaderModule = .null_handle;
+    try check(d.CreateShaderModule(device, &.{ .code_size = final.len, .p_code = @ptrCast(final.ptr) }, null, &module));
+    const acc = try hazard.bindingAccess(gpa, final);
+    hazard.registry.put(.{ .device = @intFromEnum(device), .handle = @intFromEnum(module), .kind = .module }, acc);
+    if (Context.hazlog) std.log.info("vulkan hazard: {s} used {b:0>4} written {b:0>4}{s}", .{ name, acc.used, acc.written, if (acc.untracked) " UNTRACKED" else "" });
+    return module;
+}
+
+/// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
+/// logical addressing, no workgroup ArrayStrides, see spv.zig) and create
+/// the module. All listed entry points get the same workgroup size.
+fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, rules: ModuleRules, code: []const u8, entries: []const EntrySize, caps: []const u32, ext: ?[]const u8, out: *vk.ShaderModule) Error!void {
     var current = try gpa.alignedAlloc(u8, .of(u32), code.len);
     @memcpy(current, code);
     if (caps.len > 0) {
@@ -876,10 +1006,7 @@ fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Dev
     defer gpa.free(stripped);
     const patched = try spv.dedupeDecorations(gpa, stripped);
     defer gpa.free(patched);
-    try check(d.CreateShaderModule(device, &.{
-        .code_size = patched.len,
-        .p_code = @ptrCast(@alignCast(patched.ptr)),
-    }, null, out));
+    out.* = try createModule(gpa, d, device, rules, entries[0].name, patched) orelse return error.KernelExceedsDevice;
 }
 
 /// The Vulkan loader names, per platform. One list, so `loaderPresent` and the
@@ -911,7 +1038,8 @@ pub fn loaderPresent() bool {
 
 /// The device-local heap of the card a `Context` WOULD pick, without creating
 /// one: instance, enumerate, read, tear down. Null when there is no loader or
-/// no device with a compute queue.
+/// no GPU with a compute queue; a CPU exposed as a device (llvmpipe, SwiftShader)
+/// is not one.
 ///
 /// Exists because a host reports its card in telemetry long before anything
 /// loads a model, and the meter has to draw something. Reading it from a live
@@ -960,7 +1088,7 @@ pub fn probeHeapBytes(gpa: std.mem.Allocator) ?u64 {
         const has_compute = for (qprops[0..qcount]) |qp| {
             if (qp.queue_flags & vk.QueueFlagBits.compute != 0) break true;
         } else false;
-        if (!has_compute) continue;
+        if (!has_compute or p.device_type == .cpu) continue;
         const score: i32 = if (p.device_type == .discrete_gpu) 2 else 1;
         if (score <= best_score) continue;
         var mp: vk.PhysicalDeviceMemoryProperties = undefined;
@@ -976,8 +1104,29 @@ pub fn probeHeapBytes(gpa: std.mem.Allocator) ?u64 {
     return if (best > 0) best else null;
 }
 
+/// Coordinator hook for freeing VRAM another device context on the same card holds.
+/// Returns the bytes freed; 0 ends the ladder. The CUDA backend's hook is this type.
+pub const ForeignReclaim = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, needed: u64) u64,
+};
+
+/// A source of weight bytes that bypasses the checkpoint mapping (a positional file
+/// read). `read` returns false for bytes it does not own or could not read, and the
+/// caller copies from the mapping instead. The CUDA context's readers are this type.
+pub const WeightReader = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque, dst: []u8, src: []const u8) bool,
+};
+
+/// Set by the first `VK_ERROR_DEVICE_LOST` any call returns, and never cleared: a lost
+/// device stays lost. Process-wide because `check` sees no context; two devices in
+/// one process would share it.
+var device_lost: std.atomic.Value(bool) = .init(false);
+
 fn check(r: vk.Result) Error!void {
     if (r != .success) {
+        if (r == .error_device_lost) device_lost.store(true, .release);
         std.log.err("vulkan call failed: {t}", .{r});
         return error.VulkanFailed;
     }
@@ -995,6 +1144,14 @@ fn check(r: vk.Result) Error!void {
 /// Create one compute pipeline through `cache` and say whether it COMPILED (missed the
 /// cache): from the driver's creation feedback where the device has it, else from how
 /// long it took, which misreads a slow hit (each one still hashes the whole module).
+/// A pipeline does to its bindings what its module does.
+fn notePipelines(device: vk.Device, infos: []const vk.ComputePipelineCreateInfo, pipes: []const vk.Pipeline) void {
+    for (infos, pipes) |info, pipe| {
+        const acc = hazard.registry.get(.{ .device = @intFromEnum(device), .handle = @intFromEnum(info.stage.module), .kind = .module });
+        hazard.registry.put(.{ .device = @intFromEnum(device), .handle = @intFromEnum(pipe), .kind = .pipeline }, acc);
+    }
+}
+
 fn createPipe(io: std.Io, d: *const Dispatch, device: vk.Device, cache: vk.PipelineCache, feedback: bool, info_in: vk.ComputePipelineCreateInfo, out: *vk.Pipeline) Error!bool {
     var info = info_in;
     var fb: vk.PipelineCreationFeedback = .{};
@@ -1002,6 +1159,7 @@ fn createPipe(io: std.Io, d: *const Dispatch, device: vk.Device, cache: vk.Pipel
     if (feedback) info.p_next = &fbi;
     const t0 = std.Io.Clock.awake.now(io).nanoseconds;
     try check(d.CreateComputePipelines(device, cache, 1, @ptrCast(&info), null, @ptrCast(out)));
+    notePipelines(device, &.{info}, @as(*const [1]vk.Pipeline, out));
     if (fb.flags & vk.pipeline_creation_feedback_valid != 0) return fb.flags & vk.pipeline_creation_feedback_cache_hit == 0;
     return std.Io.Clock.awake.now(io).nanoseconds - t0 > compile_ns;
 }
@@ -1023,6 +1181,8 @@ fn createCoopPipe(
         .{ .required_subgroup_size = coop_sg orelse 0 };
     const info: vk.ComputePipelineCreateInfo = .{
         .stage = .{
+            // A coop kernel's warps are its subgroups, so a pinned width must also be full.
+            .flags = if (coop_sg != null) vk.PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT else 0,
             .module = module,
             .p_name = "main",
             .p_next = if (coop_sg != null) &sgs else null,
@@ -1034,19 +1194,47 @@ fn createCoopPipe(
 
 /// The pipelines `Context.init` builds outside the eltwise table, created together on
 /// every core (`run`). Nothing in init reads one before the batch runs, only the module
-/// it comes from, which is what lets them wait.
+/// it comes from, which is what lets them wait. Each has a cache file of its own, keyed
+/// on its SPIR-V (`pipe_cache.zig`), so an edit to another kernel leaves it cached.
 const PipeBatch = struct {
-    const Job = struct { module: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline };
+    const Job = struct { module: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline, name: []const u8, key: u64 };
+    /// What names and keys the pipeline of a module `module` made.
+    const Made = struct { module: vk.ShaderModule, name: []const u8, key: u64 };
     jobs: [32]Job = undefined,
     n: usize = 0,
+    made: [32]Made = undefined,
+    n_made: usize = 0,
 
-    fn add(b: *PipeBatch, module: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline) void {
-        b.jobs[b.n] = .{ .module = module, .layout = layout, .sg = sg, .out = out };
+    /// Bump when a batch pipeline's creation changes in a way its SPIR-V does not show.
+    const key_format = 1;
+
+    /// `createModule`, remembering the module's name and its code's hash.
+    fn module(b: *PipeBatch, gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, rules: ModuleRules, name: []const u8, code: []align(4) const u8) Error!?vk.ShaderModule {
+        const m = try createModule(gpa, d, device, rules, name, code) orelse return null;
+        b.made[b.n_made] = .{ .module = m, .name = name, .key = std.hash.Wyhash.hash(key_format, code) };
+        b.n_made += 1;
+        return m;
+    }
+
+    /// A module the device refused (`createModule`) leaves its pipeline null, which
+    /// every route reads as a kernel it lacks. The key leaves the layout out: the
+    /// driver's own key covers it, so a changed layout is a miss, never a stale pipeline.
+    fn add(b: *PipeBatch, m: vk.ShaderModule, layout: vk.PipelineLayout, sg: ?u32, out: *vk.Pipeline) void {
+        if (m == .null_handle) return;
+        const made = for (b.made[0..b.n_made]) |e| {
+            if (e.module == m) break e;
+        } else unreachable;
+        const lanes: u32 = sg orelse 0;
+        b.jobs[b.n] = .{ .module = m, .layout = layout, .sg = sg, .out = out, .name = made.name, .key = std.hash.Wyhash.hash(made.key, std.mem.asBytes(&lanes)) };
         b.n += 1;
     }
 
+    /// Where the per-pipeline files live, and the device they are for.
+    const Store = struct { dir: []const u8, uuid: [16]u8 };
+
     /// Create every queued pipeline; returns how many compiled (missed the cache).
-    fn run(b: *PipeBatch, io: std.Io, d: *const Dispatch, device: vk.Device, cache: vk.PipelineCache, feedback: bool) Error!usize {
+    /// Without a `store` they go through the shared `cache`.
+    fn run(b: *PipeBatch, io: std.Io, gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, cache: vk.PipelineCache, feedback: bool, store: ?Store) Error!usize {
         if (b.n == 0) return 0;
         const Run = struct {
             b: *PipeBatch,
@@ -1055,22 +1243,56 @@ const PipeBatch = struct {
             device: vk.Device,
             cache: vk.PipelineCache,
             feedback: bool,
+            store: ?Store,
             compiled: std.atomic.Value(usize) = .init(0),
             failed: std.atomic.Value(bool) = .init(false),
 
             fn work(r: *@This(), first: usize, step: usize) void {
                 var k = first;
                 while (k < r.b.n) : (k += step) {
-                    const j = r.b.jobs[k];
-                    const compiled = createCoopPipe(r.io, r.d, r.device, r.cache, r.feedback, j.module, j.layout, j.sg, j.out) catch {
+                    if (r.one(r.b.jobs[k]) catch {
                         r.failed.store(true, .monotonic);
                         continue;
-                    };
-                    if (compiled) _ = r.compiled.fetchAdd(1, .monotonic);
+                    }) _ = r.compiled.fetchAdd(1, .monotonic);
                 }
             }
+
+            /// One pipeline through its own cache file, written back when it compiled.
+            fn one(r: *@This(), j: Job) Error!bool {
+                // Off the caller's allocator: these run on many threads at once.
+                const fa = std.heap.page_allocator;
+                var path_buf: [1024]u8 = undefined;
+                var name_buf: [96]u8 = undefined;
+                const path: ?[]const u8 = if (r.store) |s|
+                    std.fmt.bufPrint(&path_buf, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ s.dir, pipe_cache_file.pipeFileName(&name_buf, s.uuid, j.key) }) catch null
+                else
+                    null;
+                var own: vk.PipelineCache = .null_handle;
+                if (path) |p| {
+                    const initial = pipe_cache_file.read(fa, r.io, p);
+                    defer if (initial) |bytes| fa.free(bytes);
+                    const data: []const u8 = initial orelse &.{};
+                    // Data the driver rejects (a corrupt file) is dropped, not fatal.
+                    if (r.d.CreatePipelineCache(r.device, &.{ .initial_data_size = data.len, .p_initial_data = data.ptr }, null, &own) != .success)
+                        try check(r.d.CreatePipelineCache(r.device, &.{}, null, &own));
+                }
+                defer if (own != .null_handle) r.d.DestroyPipelineCache(r.device, own, null);
+                const t0 = std.Io.Clock.awake.now(r.io).nanoseconds;
+                const compiled = try createCoopPipe(r.io, r.d, r.device, if (own != .null_handle) own else r.cache, r.feedback, j.module, j.layout, j.sg, j.out);
+                if (!compiled) return false;
+                const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(r.io).nanoseconds - t0)) / 1e9;
+                std.log.info("vulkan: compiled the {s} pipeline in {d:.1} s", .{ j.name, secs });
+                const p = path orelse return true;
+                var size: usize = 0;
+                if (r.d.GetPipelineCacheData(r.device, own, &size, null) != .success or size == 0) return true;
+                const bytes = fa.alloc(u8, size) catch return true;
+                defer fa.free(bytes);
+                if (r.d.GetPipelineCacheData(r.device, own, &size, bytes.ptr) != .success) return true;
+                pipe_cache_file.write(r.io, p, bytes[0..size]) catch |err| std.log.warn("vulkan: could not save the pipeline cache to {s}: {t}", .{ p, err });
+                return true;
+            }
         };
-        var r: Run = .{ .b = b, .io = io, .d = d, .device = device, .cache = cache, .feedback = feedback };
+        var r: Run = .{ .b = b, .io = io, .d = d, .device = device, .cache = cache, .feedback = feedback, .store = store };
         const max_threads = 32;
         const threads = @min(b.n, max_threads, std.Thread.getCpuCount() catch 1);
         const t0 = std.Io.Clock.awake.now(io).nanoseconds;
@@ -1084,11 +1306,16 @@ const PipeBatch = struct {
         const compiled = r.compiled.load(.monotonic);
         if (compiled > 0) {
             const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e9;
-            std.log.info("vulkan: compiled {d} GEMM and attention pipelines in {d:.1} s on {d} threads (new build or driver; cached from now on)", .{ compiled, secs, threads });
+            std.log.info("vulkan: compiled {d} GEMM and attention pipelines in {d:.1} s on {d} threads (new kernels or driver; cached from now on)", .{ compiled, secs, threads });
+            if (store) |s| pipe_cache_file.prune(gpa, io, s.dir, pipe_cache_file.pipe_prefix, keep_pipe_files);
         }
         return compiled;
     }
 };
+
+/// Per-pipeline cache files kept on disk: about seven generations of every batch
+/// pipeline changing.
+const keep_pipe_files = 128;
 
 const EltSet = std.StaticBitSet(elt_entry_sizes.len);
 
@@ -1102,6 +1329,9 @@ const EltMaker = struct {
     spv_dual: []align(4) const u8,
     io: std.Io,
     feedback: bool,
+    rules: ModuleRules,
+    /// The device has `OpSDot`, which only an `_sdot` kernel's cut module declares.
+    int_dot: bool,
 
     /// Whether it compiled (missed the cache). The driver is handed a module holding
     /// only this kernel: given the whole module it processes all of it per pipeline.
@@ -1113,8 +1343,17 @@ const EltMaker = struct {
         defer gpa.free(one);
         const sized = try spv.withLocalSize(gpa, one, es.name, es.x, es.y, 1);
         defer gpa.free(sized);
-        var module: vk.ShaderModule = .null_handle;
-        try check(m.d.CreateShaderModule(m.device, &.{ .code_size = sized.len, .p_code = @ptrCast(sized.ptr) }, null, &module));
+        const sdot = std.mem.endsWith(u8, es.name, "_sdot");
+        if (sdot and !m.int_dot) return error.KernelExceedsDevice;
+        // A decode row and a speculative verify's row must round alike, which only
+        // `NoContraction` holds across two kernels' shapes.
+        const dotted = if (sdot) dot: {
+            const capped = try spv.withCapabilities(gpa, sized, &.{ spv.cap_dot_product, spv.cap_dot_product_input_4x8_packed }, "SPV_KHR_integer_dot_product");
+            defer gpa.free(capped);
+            break :dot try spv.withNoContraction(gpa, capped);
+        } else sized;
+        defer if (sdot) gpa.free(dotted);
+        const module = try createModule(gpa, m.d, m.device, m.rules, es.name, dotted) orelse return error.KernelExceedsDevice;
         defer m.d.DestroyShaderModule(m.device, module, null);
         var name: [64:0]u8 = @splat(0);
         @memcpy(name[0..es.name.len], es.name);
@@ -1133,7 +1372,7 @@ const keep_pipeline_caches = 4;
 fn moduleHash() u64 {
     // Bump when how a kernel's module is built changes: an old file's entries then
     // stay with the old name and are pruned.
-    const module_format = 2;
+    const module_format = 3;
     var h = std.hash.Wyhash.init(module_format);
     h.update(eltwise_spv);
     h.update(dual_spv);
@@ -1296,7 +1535,12 @@ const WeightEntry = struct {
     last_use: u64,
     /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
     pinned: bool = false,
+    /// First-touch order, the weight's identity in the weight-noise key.
+    noise_id: u32 = 0,
 };
+
+/// One storage binding of a recorded descriptor set.
+const Bind = struct { buf: vk.Buffer = .null_handle, off: u64 = 0 };
 
 pub const Context = struct {
     gpa: std.mem.Allocator,
@@ -1325,6 +1569,22 @@ pub const Context = struct {
     /// Test hook: when nonzero, caps the budget headroom calculation so
     /// weight streaming can be forced without exhausting real VRAM.
     budget_override: u64 = 0,
+    /// The largest single allocation asked of `createBuffer`, which the residency
+    /// planner keeps free so a promote cannot starve the next forward's buffers.
+    max_alloc_bytes: u64 = 0,
+    /// The out-of-memory ladder's last rung, after this context's own cached weights.
+    foreign_reclaim: ?ForeignReclaim = null,
+    /// Set by `enableLlmMemTags`: the tag a cached weight is attributed to.
+    weight_tag: ?MemTag = null,
+    /// Where weight uploads read checkpoint bytes from first; see `WeightReader`.
+    weight_readers: [4]?WeightReader = @splat(null),
+    /// Pipelines compiled rather than loaded from the cache, and the time they took.
+    jit_count: u64 = 0,
+    jit_ns: u64 = 0,
+    /// The last `WeightEntry.noise_id` handed out.
+    noise_id_next: u32 = 0,
+    /// Weight noise for an LLM's block-quant kernels (`weight_noise.zig`).
+    weight_noise: @import("weight_noise.zig").WeightNoise = .{},
     /// `--vram-budget min`: keep no weight resident past the in-flight set.
     /// Independent of `budget_override`, which is a byte ceiling.
     min_weights: bool = false,
@@ -1368,6 +1628,13 @@ pub const Context = struct {
     /// after init (the tuner measures candidates on the live device) and every one
     /// still has to be checked against what the device actually allows.
     max_shared_bytes: u32 = 0,
+    module_rules: ModuleRules = .{},
+    /// Dispatches per batched submission, adapted to this device (`adaptBatchCap`).
+    batch_cap: u32 = 64,
+    /// A GEMM pipeline this device built answered `verifyGemms` wrong and was dropped.
+    gemm_check_failed: bool = false,
+    /// The fp8 coop GEMM's wg tile N width, which a weight's rows must be a multiple of.
+    coop_wgn: u32 = coopmat.coopWgn(coopmat.coop_warps8),
     /// `minStorageBufferOffsetAlignment`: what a view's offset must be a multiple of.
     storage_align: u64 = 256,
     max_wg_invocations: u32 = 0,
@@ -1395,16 +1662,28 @@ pub const Context = struct {
     fence: vk.Fence,
 
     /// Batch recording: while active, op* dispatches are recorded into `cmd`
-    /// one descriptor set per op from the preallocated ring, a global
-    /// compute->compute barrier between dispatches, and submitted once at
-    /// endBatch, so the queue stays fed and per-op fence waits disappear.
+    /// one descriptor set per op from the preallocated ring, a compute barrier
+    /// before each dispatch that touches what an earlier one wrote (`hazards`),
+    /// and submitted once at endBatch, so the queue stays fed and per-op fence
+    /// waits disappear.
     batch_pool: vk.DescriptorPool,
     batch_sets: []vk.DescriptorSet,
     batching: bool = false,
     batch_n: usize = 0,
     /// Countdown for `independent`: while > 1, opEnd skips the inter-dispatch
-    /// barrier so the group's dispatches may overlap on the device.
+    /// barrier so the group's dispatches may overlap on the device. Only read
+    /// with `full_barriers` on.
     indep_remaining: usize = 0,
+    hazards: hazard.Tracker = .{},
+    bound_pipe: vk.Pipeline = .null_handle,
+    bound_set: vk.DescriptorSet = .null_handle,
+    /// What each ring set was last written with, by its slot in `batch_sets`.
+    batch_binds: [][4]Bind,
+    set_slot: std.AutoHashMapUnmanaged(vk.DescriptorSet, u32),
+    ab_binds: [5]Bind = @splat(.{}),
+    /// DIAGNOSTIC (`TP_VK_NOBAR`): record no compute barrier at all. WRONG
+    /// ANSWERS, valid timing: the ceiling on what barriers cost.
+    no_barriers: bool = false,
 
     dsl: vk.DescriptorSetLayout,
     pipeline_layout: vk.PipelineLayout,
@@ -1439,10 +1718,8 @@ pub const Context = struct {
     /// Eltwise kernels this run bound, plus those earlier runs listed.
     elt_used: EltSet,
     elt_used_loaded: EltSet,
-    /// The device advertises `VK_KHR_shader_integer_dot_product`. Nothing reads
-    /// this any more: the kernels that used it went with the dp4a module, and the
-    /// negotiation is left in place because unpicking a `p_next` chain risks every
-    /// Vulkan path for no gain.
+    /// The device advertises `VK_KHR_shader_integer_dot_product`, so the `_sdot` decode
+    /// GEMVs (`OpSDot`) build here.
     has_int_dot: bool = false,
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
@@ -1455,6 +1732,10 @@ pub const Context = struct {
     desc_set_ab: vk.DescriptorSet,
     shader_coop: vk.ShaderModule = .null_handle,
     pipe_coop: vk.Pipeline = .null_handle,
+    /// fp8 runs as f16 weights through the f16-weight coop GEMM (`opMatmulFp8Wide`):
+    /// set where the coop multiply flushes f16 subnormals (`verifyGemms`), which the
+    /// scale `pipe_coop` folds into its activation puts much of a real checkpoint in.
+    fp8_wide: bool = false,
     /// fp8 coop GEMM with an f16 C store (exact under f16 accumulators;
     /// present iff pipe_coop is and coop_acc_h16 is on).
     shader_coop_c16: vk.ShaderModule = .null_handle,
@@ -1487,6 +1768,8 @@ pub const Context = struct {
     i8_prep_ok: bool = false,
     /// `coopmat.buildIntWoPack`, indexed by `woPackIndex`.
     shader_wo_pack: [4]vk.ShaderModule = @splat(.null_handle),
+    /// Rows per `pipe_wo_pack` workgroup, from `coopmat.woPackRows`.
+    wo_pack_rows: u32 = 32,
     pipe_wo_pack: [4]vk.Pipeline = @splat(.null_handle),
     /// `coopmat.buildAddRms` on the eltwise layout: residual add + hidden RMSNorm.
     shader_add_rms: vk.ShaderModule = .null_handle,
@@ -1496,11 +1779,6 @@ pub const Context = struct {
     pipe_scores: vk.Pipeline = .null_handle,
     shader_scores_vae: vk.ShaderModule = .null_handle,
     pipe_scores_vae: vk.Pipeline = .null_handle,
-    /// head_dim-512 variant, for the SD-family VAE's mid-block attention (one
-    /// head over all 512 channels). A separate module because `buildGemmScores`
-    /// unrolls the k-depth into the shader.
-    shader_scores_sd: vk.ShaderModule = .null_handle,
-    pipe_scores_sd: vk.Pipeline = .null_handle,
     shader_attn_out: vk.ShaderModule = .null_handle,
     pipe_attn_out: vk.Pipeline = .null_handle,
     shader_flash_md: vk.ShaderModule = .null_handle,
@@ -1516,11 +1794,20 @@ pub const Context = struct {
     y_buf: HostBuffer = .{},
     bias_buf: HostBuffer = .{},
     staging: HostBuffer = .{},
+    /// `uploadRecorded`'s ring, written from `batch_up_off` and free again once a
+    /// submission has waited; `downloadMany`'s landing area.
+    batch_up: HostBuffer = .{},
+    batch_up_off: u64 = 0,
+    batch_down: HostBuffer = .{},
     /// Device-local activation buffers (the shader never reads across PCIe).
     x_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     y_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// f16 activation scratch for the cooperative-matrix path.
     x_h16: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// f32 staging around the f32 GEMM where it stands in for the 16-bit one: an
+    /// activation widened to it, an output narrowed from it (`conv_gpu`).
+    stage_in32: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    stage_out32: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Column-padded f32 output scratch for the f16-weight coop path.
     y_pad: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Device-local scratch for raw (untransposed) weight uploads.
@@ -1583,8 +1870,18 @@ pub const Context = struct {
     /// Device-local transposed weight buffers, keyed by host weight pointer,
     /// LRU-evicted when the device memory budget runs out.
     weights: std.AutoHashMapUnmanaged(WeightKey, WeightEntry) = .empty,
+    /// Contiguous weight groups (a MoE layer's experts, one GGUF tensor), sorted by
+    /// address: a weight inside one binds as a view of the group's single buffer,
+    /// which keeps a model with thousands of experts under the driver's allocation
+    /// limit (often 4096).
+    weight_groups: std.ArrayListUnmanaged(WeightGroup) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Error!*Context {
+        if (getenv("TP_VK_FULLBAR") != null) full_barriers = true;
+        if (getenv("TP_VK_FP8_WIDE") != null) force_fp8_wide = true;
+        if (getenv("TP_VK_FP8_F32") != null) force_fp8_f32 = true;
+        if (getenv("TP_VK_NO_SDOT") != null) sdot_off = true;
+        if (getenv("TP_VK_HAZLOG") != null) hazlog = true;
         // Integration tests are gated behind `-Dintegration`: fail init in test
         // builds when it's off so the Vulkan tests self-skip (they `catch SkipZigTest`).
         if (builtin.is_test and !build_options.integration) return error.VulkanUnavailable;
@@ -1651,6 +1948,20 @@ pub const Context = struct {
             if (phys == .null_handle) return error.NoSuitableDevice;
         }
 
+        // What every shader module must be shaped to on this device (`createModule`).
+        const rules: ModuleRules = blk: {
+            var fc: vk.PhysicalDeviceFloatControlsProperties = .{};
+            if (gipa(instance, "vkGetPhysicalDeviceProperties2")) |p| {
+                const getp: vk.PfnGetPhysicalDeviceProperties2 = @ptrCast(p);
+                var props2: vk.PhysicalDeviceProperties2 = .{ .p_next = &fc };
+                getp(phys, &props2);
+            }
+            break :blk .{
+                .float = floatModes(fc),
+                .max_shared = props.limits.max_compute_shared_memory_size,
+            };
+        };
+
         // Cooperative matrix support: pick an f16xf16->f32 subgroup config for
         // the current fp8/f16 GEMM path, and separately record an
         // sint8xsint8->sint32 subgroup config for the int8 (convrot) path.
@@ -1696,7 +2007,13 @@ pub const Context = struct {
                                 coop_n = cp.n_size;
                                 coop_k = cp.k_size;
                             }
-                            if (coop_i8_m == 0 and cp.scope == .subgroup and cp.a_type == .sint8 and cp.b_type == .sint8 and
+                            // The int8 GEMM takes 8 or 16 for M and N and 16 or 32 for K;
+                            // the deepest K wins, then the widest fragment.
+                            const i8_usable = (cp.m_size == 16 or cp.m_size == 8) and
+                                (cp.n_size == 16 or cp.n_size == 8) and (cp.k_size == 16 or cp.k_size == 32);
+                            const i8_better = cp.k_size > coop_i8_k or
+                                (cp.k_size == coop_i8_k and cp.m_size * cp.n_size > coop_i8_m * coop_i8_n);
+                            if (i8_usable and i8_better and cp.scope == .subgroup and cp.a_type == .sint8 and cp.b_type == .sint8 and
                                 cp.c_type == .sint32 and cp.result_type == .sint32)
                             {
                                 coop_i8_m = cp.m_size;
@@ -1722,6 +2039,15 @@ pub const Context = struct {
                 }
             }
         }
+        // DIAGNOSTIC (`TP_VK_COOP=0`): no coop GEMMs, the path a device without them takes.
+        if (getenv("TP_VK_COOP")) |v| if (std.mem.eql(u8, std.mem.sliceTo(v, 0), "0")) {
+            coop_m = 0;
+            coop_n = 0;
+            coop_k = 0;
+            coop_i8_m = 0;
+            coop_i8_n = 0;
+            coop_i8_k = 0;
+        };
         if (dump_coop_configs) {
             std.log.info("selected f16 coop: {d}x{d}x{d}; int8 coop: {d}x{d}x{d}", .{
                 coop_m, coop_n, coop_k, coop_i8_m, coop_i8_n, coop_i8_k,
@@ -1853,7 +2179,7 @@ pub const Context = struct {
             // (chained after coop_features, which is always present when
             // coop_sg is set). Left disabled on wave32 devices.
             var sgc_features: vk.PhysicalDeviceSubgroupSizeControlFeatures =
-                .{ .subgroup_size_control = vk.TRUE };
+                .{ .subgroup_size_control = vk.TRUE, .compute_full_subgroups = vk.TRUE };
             if (coop_sg != null) coop_features.p_next = &sgc_features;
             // Native bf16 cooperative matrix: chain the bf16 feature after the
             // subgroup-size one (or coop_features if no sg control) when the
@@ -1894,10 +2220,16 @@ pub const Context = struct {
                 .queue_count = 1,
                 .p_queue_priorities = @ptrCast(&priority),
             };
-            var exts: [5][*:0]const u8 = undefined;
+            var exts: [6][*:0]const u8 = undefined;
             var ext_n: u32 = 0;
             if (coop_m != 0) {
                 exts[ext_n] = "VK_KHR_cooperative_matrix";
+                ext_n += 1;
+            }
+            // Not core at the 1.2 the instance asks for: without it the pin is
+            // invalid and a driver may run the coop kernels at their native width.
+            if (coop_sg != null) {
+                exts[ext_n] = "VK_EXT_subgroup_size_control";
                 ext_n += 1;
             }
             if (has_memory_budget) {
@@ -1961,13 +2293,13 @@ pub const Context = struct {
 
         // Shader modules (with LocalSize patched in).
         var shader_f8: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, matmul_f8_spv, &.{.{ .name = "matmul_f8", .x = wg_x, .y = wg_y }}, &.{}, null, &shader_f8);
+        try createKernelModule(gpa, &d, device, rules, matmul_f8_spv, &.{.{ .name = "matmul_f8", .x = wg_x, .y = wg_y }}, &.{}, null, &shader_f8);
         errdefer d.DestroyShaderModule(device, shader_f8, null);
         var shader_f32: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, matmul_f32_spv, &.{.{ .name = "matmul_f32", .x = wg_x, .y = wg_y }}, &.{}, null, &shader_f32);
+        try createKernelModule(gpa, &d, device, rules, matmul_f32_spv, &.{.{ .name = "matmul_f32", .x = wg_x, .y = wg_y }}, &.{}, null, &shader_f32);
         errdefer d.DestroyShaderModule(device, shader_f32, null);
         var shader_tr: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, transpose_spv, &.{
+        try createKernelModule(gpa, &d, device, rules, transpose_spv, &.{
             .{ .name = "transpose_f8", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "transpose_f32", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "transpose_bf16", .x = tr_wg_x, .y = tr_wg_y },
@@ -2060,6 +2392,7 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_f32, .p_name = "matmul_f32" }, .layout = pipeline_layout },
             };
             try check(d.CreateComputePipelines(device, pipe_cache, infos.len, &infos, null, &pipes));
+            notePipelines(device, &infos, pipes[0..infos.len]);
         }
         errdefer for (pipes) |p| d.DestroyPipeline(device, p, null);
 
@@ -2110,6 +2443,7 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_tr, .p_name = "repack_iq4_nl" }, .layout = pipeline_layout_tr },
             };
             try check(d.CreateComputePipelines(device, pipe_cache, infos.len, &infos, null, &pipes_tr));
+            notePipelines(device, &infos, pipes_tr[0..infos.len]);
         }
         errdefer for (pipes_tr) |pp| d.DestroyPipeline(device, pp, null);
 
@@ -2136,7 +2470,8 @@ pub const Context = struct {
         var pipes_e: [elt_entry_sizes.len]vk.Pipeline = @splat(vk.Pipeline.null_handle);
         var elt_used: EltSet = .initEmpty();
         if (persist) readUsedKernels(gpa, io, &elt_used);
-        const warm_compiled = warmElt(io, &.{ .d = &d, .device = device, .cache = pipe_cache, .layout = pipeline_layout_e, .spv_e = spv_e, .spv_dual = spv_dual, .io = io, .feedback = has_feedback }, elt_used, &pipes_e);
+        const t_warm = std.Io.Clock.awake.now(io).nanoseconds;
+        const warm_compiled = warmElt(io, &.{ .d = &d, .device = device, .cache = pipe_cache, .layout = pipeline_layout_e, .spv_e = spv_e, .spv_dual = spv_dual, .io = io, .feedback = has_feedback, .rules = rules, .int_dot = has_int_dot }, elt_used, &pipes_e);
         errdefer for (pipes_e) |pp| d.DestroyPipeline(device, pp, null);
 
 
@@ -2145,7 +2480,7 @@ pub const Context = struct {
         // (a=q,b=k,c=v,d=out,e=bounds), and one persistent descriptor set (the
         // 5 buffers are stable within a forward, so no ring is needed).
         var shader_ab: vk.ShaderModule = .null_handle;
-        try createKernelModule(gpa, &d, device, attn_batched_spv, &.{.{ .name = "attn_batched", .x = 64, .y = 1 }}, &.{}, null, &shader_ab);
+        try createKernelModule(gpa, &d, device, rules, attn_batched_spv, &.{.{ .name = "attn_batched", .x = 64, .y = 1 }}, &.{}, null, &shader_ab);
         errdefer d.DestroyShaderModule(device, shader_ab, null);
         var dsl_ab: vk.DescriptorSetLayout = .null_handle;
         {
@@ -2175,6 +2510,7 @@ pub const Context = struct {
         {
             const info = [1]vk.ComputePipelineCreateInfo{.{ .stage = .{ .module = shader_ab, .p_name = "attn_batched" }, .layout = pipeline_layout_ab }};
             try check(d.CreateComputePipelines(device, pipe_cache, 1, &info, null, @ptrCast(&pipe_ab)));
+            notePipelines(device, &info, @as(*const [1]vk.Pipeline, &pipe_ab));
         }
         errdefer d.DestroyPipeline(device, pipe_ab, null);
         var pool_ab: vk.DescriptorPool = .null_handle;
@@ -2236,10 +2572,16 @@ pub const Context = struct {
         }
         const coop_warp_tile = want_m;
         const coop_warp_tile_n = want_n;
+        // The fp8 GEMM's preferred 8 warps when this device holds their shared memory.
+        const fp8_warps8 = coop_shape_ok and coopmat.coop_warps8 and fits: {
+            const probe = try coopmat.buildGemmShared(gpa, false, true, coopmat.coop_acc_h16, false, false, coop_m, coop_n, 64, 64);
+            defer gpa.free(probe);
+            break :fits try spv.workgroupBytes(gpa, probe) <= rules.max_shared;
+        };
         if (coop_shape_ok) {
             inline for (.{
-                .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, false, &shader_coop },
-                .{ true, false, false, false, &shader_coop_f16w },
+                .{ false, fp8_warps8, coopmat.coop_acc_h16, false, &shader_coop, "coop GEMM, fp8" },
+                .{ true, false, false, false, &shader_coop_f16w, "coop GEMM, f16 weights" },
             }) |v| {
                 // v[0] is b_f16: only the f16-weight variant goes through
                 // coopF16WDispatch, which is the dispatch that derives its grid from the
@@ -2247,31 +2589,22 @@ pub const Context = struct {
                 // so it stays at 64 until that one is parameterized too.
                 const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3], false, coop_m, coop_n, if (v[0]) coop_warp_tile else 64, if (v[0]) coop_warp_tile_n else 64);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, v[4]));
+                v[4].* = try batch.module(gpa, &d, device, rules, v[5], code) orelse .null_handle;
             }
             // f16 C store rides the fp8 pipe's toggles; it only exists (and
             // is only exact) with f16 accumulators, which is a device property:
             // Intel Alchemist advertises f32/s32 accumulate only, so asking for an
             // f16 accumulator there requests a config the driver never offered.
             if (coopmat.coop_acc_h16 and coop_acc_f16) {
-                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true, false, coop_m, coop_n, 64, 64);
+                const code = try coopmat.buildGemmShared(gpa, false, fp8_warps8, true, true, false, coop_m, coop_n, 64, 64);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, &shader_coop_c16));
+                shader_coop_c16 = try batch.module(gpa, &d, device, rules, "coop GEMM, f16 C", code) orelse .null_handle;
             }
             // Native bf16 f16-weight-style GEMM (f16-weight path with bf16 A/B).
             if (coop_bf16) {
                 const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true, coop_m, coop_n, coop_warp_tile, coop_warp_tile_n);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, &shader_coop_bf16w));
+                shader_coop_bf16w = try batch.module(gpa, &d, device, rules, "coop GEMM, bf16", code) orelse .null_handle;
             }
         }
         errdefer if (shader_coop != .null_handle) d.DestroyShaderModule(device, shader_coop, null);
@@ -2307,7 +2640,7 @@ pub const Context = struct {
         if (getenv("TP_COOP_I8_TILE_N")) |v| {
             i8_want_n = std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch i8_want_m;
         }
-        const i8_shape_ok = coop_i8_k == 32 and (coop_i8_m == 16 or coop_i8_m == 8) and
+        const i8_shape_ok = (coop_i8_k == 32 or coop_i8_k == 16) and (coop_i8_m == 16 or coop_i8_m == 8) and
             (coop_i8_n == 16 or coop_i8_n == 8);
         if (i8_shape_ok and !coopI8TileFits(i8_want_m, i8_want_n, coop_i8_m, coop_i8_n, i8_nwarps, props.limits.max_compute_shared_memory_size, props.limits.max_compute_work_group_invocations)) {
             std.log.warn("coop int8 warp tile {d}x{d} is not expressible on this device (frag {d}x{d}); using 64x64", .{ i8_want_m, i8_want_n, coop_i8_m, coop_i8_n });
@@ -2324,10 +2657,7 @@ pub const Context = struct {
         if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32) {
             const code = try coopmat.buildGemmI8(gpa, coopmat.i8_mt, coopmat.i8_nt);
             defer gpa.free(code);
-            try check(d.CreateShaderModule(device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &shader_coop_i8));
+            shader_coop_i8 = try batch.module(gpa, &d, device, rules, "coop int8 GEMM", code) orelse .null_handle;
             batch.add(shader_coop_i8, pipeline_layout, coop_sg, &pipe_coop_i8);
         }
         errdefer if (shader_coop_i8 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8, null);
@@ -2342,18 +2672,15 @@ pub const Context = struct {
         var shader_coop_i8_fs16: vk.ShaderModule = .null_handle;
         var pipe_coop_i8_fs16: vk.Pipeline = .null_handle;
         if (i8_shape_ok and coopmat.i8_shared) {
-            // (fuse_scale, c_h16, shader*, pipe*): raw-s32, fused-f32, fused-f16.
+            // (fuse_scale, c_h16, shader*, pipe*, name): raw-s32, fused-f32, fused-f16.
             inline for (.{
-                .{ false, false, &shader_coop_i8_sh, &pipe_coop_i8_sh },
-                .{ true, false, &shader_coop_i8_fs, &pipe_coop_i8_fs },
-                .{ true, true, &shader_coop_i8_fs16, &pipe_coop_i8_fs16 },
+                .{ false, false, &shader_coop_i8_sh, &pipe_coop_i8_sh, "coop int8 GEMM, s32 out" },
+                .{ true, false, &shader_coop_i8_fs, &pipe_coop_i8_fs, "coop int8 GEMM, f32 out" },
+                .{ true, true, &shader_coop_i8_fs16, &pipe_coop_i8_fs16, "coop int8 GEMM, f16 out" },
             }) |cfg| {
-                const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], coop_i8_m, coop_i8_n, i8_want_m, i8_want_n);
+                const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], coop_i8_m, coop_i8_n, coop_i8_k, i8_want_m, i8_want_n);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, cfg[2]));
+                cfg[2].* = try batch.module(gpa, &d, device, rules, cfg[4], code) orelse .null_handle;
                 batch.add(cfg[2].*, pipeline_layout, coop_sg, cfg[3]);
             }
         }
@@ -2369,17 +2696,15 @@ pub const Context = struct {
         var pipe_wo_pack: [4]vk.Pipeline = @splat(.null_handle);
         errdefer for (shader_wo_pack) |sh| if (sh != .null_handle) d.DestroyShaderModule(device, sh, null);
         errdefer for (pipe_wo_pack) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
-        if (shader_coop_f16w != .null_handle) {
+        const wo_pack_rows = coopmat.woPackRows(rules.max_shared);
+        if (shader_coop_f16w != .null_handle) if (wo_pack_rows) |wr| {
             for (0..4) |i| {
-                const code = try coopmat.buildIntWoPack(gpa, i & 2 != 0, i & 1 != 0);
+                const code = try coopmat.buildIntWoPack(gpa, wr, i & 2 != 0, i & 1 != 0);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, &shader_wo_pack[i]));
+                shader_wo_pack[i] = try batch.module(gpa, &d, device, rules, "weight-only pack", code) orelse .null_handle;
                 batch.add(shader_wo_pack[i], pipeline_layout, null, &pipe_wo_pack[i]);
             }
-        }
+        };
 
         var shader_add_rms: vk.ShaderModule = .null_handle;
         var pipe_add_rms: vk.Pipeline = .null_handle;
@@ -2387,10 +2712,7 @@ pub const Context = struct {
             const wg = @min(1024, props.limits.max_compute_work_group_invocations, props.limits.max_compute_work_group_size[0]);
             const code = try coopmat.buildAddRms(gpa, wg);
             defer gpa.free(code);
-            try check(d.CreateShaderModule(device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &shader_add_rms));
+            shader_add_rms = try batch.module(gpa, &d, device, rules, "add+rmsnorm", code) orelse .null_handle;
             errdefer d.DestroyShaderModule(device, shader_add_rms, null);
             batch.add(shader_add_rms, pipeline_layout_e, null, &pipe_add_rms);
         }
@@ -2399,54 +2721,43 @@ pub const Context = struct {
 
         // Attention-scores GEMM on the same cooperative-matrix support; uses
         // the eltwise pipeline layout (same 4-buffer set, EltPush-sized push).
-        // Two head_dim variants: 128 (DiT) and 384 (VAE mid-block).
+        // Two head_dim variants: 128 (DiT) and 384 (the Wan VAE's mid-block).
         var shader_scores: vk.ShaderModule = .null_handle;
         var pipe_scores: vk.Pipeline = .null_handle;
         var shader_scores_vae: vk.ShaderModule = .null_handle;
         var pipe_scores_vae: vk.Pipeline = .null_handle;
-        var shader_scores_sd: vk.ShaderModule = .null_handle;
-        var pipe_scores_sd: vk.Pipeline = .null_handle;
         // buildGemmScores, buildFlashAttn and buildGemmAttnOut still hardcode 16-row
         // fragments, so they need the exact 16x16x16 shape, not merely "the f16 GEMM
         // built". Keying these off shader_coop would compile a 16x16 shader on a device
         // whose f16 GEMM resolved to 8x8. The SD UNet does not use them (its attention
         // is the attn_batched shader), so they stay off on such a device.
         const coop_shape_16 = coop_m == 16 and coop_n == 16 and coop_k == 16;
-        if (shader_coop != .null_handle and coop_shape_16) {
-            inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae }, .{ 512, &shader_scores_sd } }) |v| {
+        if (coop_shape_16) {
+            inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae } }) |v| {
                 const code = try coopmat.buildGemmScores(gpa, v[0], coopmat.scores_stage_k);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, v[1]));
+                v[1].* = try batch.module(gpa, &d, device, rules, std.fmt.comptimePrint("attention scores, head {d}", .{v[0]}), code) orelse .null_handle;
             }
         }
         errdefer if (shader_scores != .null_handle) d.DestroyShaderModule(device, shader_scores, null);
         errdefer if (shader_scores_vae != .null_handle) d.DestroyShaderModule(device, shader_scores_vae, null);
-        errdefer if (shader_scores_sd != .null_handle) d.DestroyShaderModule(device, shader_scores_sd, null);
         if (shader_scores != .null_handle) {
             inline for (.{
                 .{ shader_scores, &pipe_scores },
                 .{ shader_scores_vae, &pipe_scores_vae },
-                .{ shader_scores_sd, &pipe_scores_sd },
             }) |v| {
                 batch.add(v[0], pipeline_layout_e, coop_sg, v[1]);
             }
         }
         errdefer if (pipe_scores != .null_handle) d.DestroyPipeline(device, pipe_scores, null);
         errdefer if (pipe_scores_vae != .null_handle) d.DestroyPipeline(device, pipe_scores_vae, null);
-        errdefer if (pipe_scores_sd != .null_handle) d.DestroyPipeline(device, pipe_scores_sd, null);
 
         var shader_attn_out: vk.ShaderModule = .null_handle;
         var pipe_attn_out: vk.Pipeline = .null_handle;
-        if (shader_coop != .null_handle and coop_shape_16) {
+        if (coop_shape_16) {
             const code = try coopmat.buildGemmAttnOut(gpa);
             defer gpa.free(code);
-            try check(d.CreateShaderModule(device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &shader_attn_out));
+            shader_attn_out = try batch.module(gpa, &d, device, rules, "attention out", code) orelse .null_handle;
         }
         errdefer if (shader_attn_out != .null_handle) d.DestroyShaderModule(device, shader_attn_out, null);
         if (shader_attn_out != .null_handle) {
@@ -2460,17 +2771,14 @@ pub const Context = struct {
         var pipe_flash_md: vk.Pipeline = .null_handle;
         var shader_flash_out: vk.ShaderModule = .null_handle;
         var pipe_flash_out: vk.Pipeline = .null_handle;
-        if (shader_coop != .null_handle and coop_shape_16) {
+        if (coop_shape_16) {
             inline for (.{
-                .{ coopmat.buildFlashMd, &shader_flash_md, &pipe_flash_md },
-                .{ coopmat.buildFlashOut, &shader_flash_out, &pipe_flash_out },
+                .{ coopmat.buildFlashMd, &shader_flash_md, &pipe_flash_md, "flash attention, max and sum" },
+                .{ coopmat.buildFlashOut, &shader_flash_out, &pipe_flash_out, "flash attention, out" },
             }) |v| {
                 const code = try v[0](gpa);
                 defer gpa.free(code);
-                try check(d.CreateShaderModule(device, &.{
-                    .code_size = code.len,
-                    .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, v[1]));
+                v[1].* = try batch.module(gpa, &d, device, rules, v[3], code) orelse .null_handle;
                 batch.add(v[1].*, pipeline_layout_e, coop_sg, v[2]);
             }
         }
@@ -2527,8 +2835,18 @@ pub const Context = struct {
                 .p_set_layouts = layouts.ptr,
             }, batch_sets.ptr));
         }
+        const batch_binds = try gpa.alloc([4]Bind, batch_ring);
+        errdefer gpa.free(batch_binds);
+        @memset(batch_binds, @splat(.{}));
+        var set_slot: std.AutoHashMapUnmanaged(vk.DescriptorSet, u32) = .empty;
+        errdefer set_slot.deinit(gpa);
+        for (batch_sets, 0..) |set, k| try set_slot.put(gpa, set, @intCast(k));
 
-        const batch_compiled = try batch.run(io, &d, device, pipe_cache, has_feedback);
+        const warm_ns: u64 = if (warm_compiled > 0) @intCast(std.Io.Clock.awake.now(io).nanoseconds - t_warm) else 0;
+        const t_batch = std.Io.Clock.awake.now(io).nanoseconds;
+        const batch_store: ?PipeBatch.Store = if (cache_path) |p| if (std.fs.path.dirname(p)) |dir| .{ .dir = dir, .uuid = props.pipeline_cache_uuid } else null else null;
+        const batch_compiled = try batch.run(io, gpa, &d, device, pipe_cache, has_feedback, batch_store);
+        const batch_ns: u64 = if (batch_compiled > 0) @intCast(std.Io.Clock.awake.now(io).nanoseconds - t_batch) else 0;
 
         const self = try gpa.create(Context);
         self.* = .{
@@ -2549,6 +2867,8 @@ pub const Context = struct {
             // 2 x 2 grid: both wg dimensions are 2 warp tiles.
             .io = io,
             .max_shared_bytes = props.limits.max_compute_shared_memory_size,
+            .module_rules = rules,
+            .coop_wgn = coopmat.coopWgn(fp8_warps8),
             .storage_align = props.limits.min_storage_buffer_offset_alignment,
             .max_wg_invocations = props.limits.max_compute_work_group_invocations,
             .coop_i8_wg_m = 2 * i8_want_m,
@@ -2567,6 +2887,9 @@ pub const Context = struct {
             .fence = fence,
             .batch_pool = batch_pool,
             .batch_sets = batch_sets,
+            .batch_binds = batch_binds,
+            .set_slot = set_slot,
+            .no_barriers = getenv("TP_VK_NOBAR") != null,
             .dsl = dsl,
             .pipeline_layout = pipeline_layout,
             .shader_f8 = shader_f8,
@@ -2590,6 +2913,8 @@ pub const Context = struct {
             .pipe_cache = pipe_cache,
             .pipe_cache_path = pipe_cache_path,
             .pipe_cache_dirty = warm_compiled > 0 or batch_compiled > 0,
+            .jit_count = warm_compiled + batch_compiled,
+            .jit_ns = warm_ns + batch_ns,
             .has_feedback = has_feedback,
             .elt_used = elt_used,
             .elt_used_loaded = elt_used,
@@ -2613,6 +2938,7 @@ pub const Context = struct {
             .i8_prep_ok = i8_shape_ok and coopmat.i8_shared,
             .shader_wo_pack = shader_wo_pack,
             .pipe_wo_pack = pipe_wo_pack,
+            .wo_pack_rows = wo_pack_rows orelse 32,
             .shader_add_rms = shader_add_rms,
             .pipe_add_rms = pipe_add_rms,
             .shader_coop_c16 = shader_coop_c16,
@@ -2625,8 +2951,6 @@ pub const Context = struct {
             .pipe_scores = pipe_scores,
             .shader_scores_vae = shader_scores_vae,
             .pipe_scores_vae = pipe_scores_vae,
-            .shader_scores_sd = shader_scores_sd,
-            .pipe_scores_sd = pipe_scores_sd,
             .shader_attn_out = shader_attn_out,
             .pipe_attn_out = pipe_attn_out,
             .shader_flash_md = shader_flash_md,
@@ -2660,6 +2984,7 @@ pub const Context = struct {
         {
             self.screenCoopTiles(gpa);
         }
+        self.verifyGemms();
         if (getenv("TP_VK_PROFILE") != null) profStart(self, props.limits.timestamp_period);
         return self;
     }
@@ -2678,6 +3003,7 @@ pub const Context = struct {
             self.freeDeviceBuffer(wb.db);
         }
         self.weights.deinit(self.gpa);
+        self.weight_groups.deinit(self.gpa);
         {
             var sit = self.small_bufs.valueIterator();
             while (sit.next()) |sb| {
@@ -2685,16 +3011,18 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.finite_flag, &self.deq_rows, &self.q8_act, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.wo32_t, &self.wo32_r, &self.wo32_p, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.finite_flag, &self.deq_rows, &self.q8_act, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.stage_in32, &self.stage_out32, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.wo32_t, &self.wo32_r, &self.wo32_p, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
         }
-        for ([_]*HostBuffer{ &self.x_buf, &self.y_buf, &self.bias_buf, &self.staging }) |hb| {
+        for ([_]*HostBuffer{ &self.x_buf, &self.y_buf, &self.bias_buf, &self.staging, &self.batch_up, &self.batch_down }) |hb| {
             self.destroyHostBuffer(hb);
         }
         self.d.DestroyDescriptorPool(self.device, self.batch_pool, null);
         self.gpa.free(self.batch_sets);
+        self.gpa.free(self.batch_binds);
+        self.set_slot.deinit(self.gpa);
         self.d.DestroyDescriptorPool(self.device, self.desc_pool, null);
         self.d.DestroyPipeline(self.device, self.pipe_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_f32, null);
@@ -2740,9 +3068,7 @@ pub const Context = struct {
         if (self.pipe_scores != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores, null);
         if (self.shader_scores != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores, null);
         if (self.pipe_scores_vae != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_vae, null);
-        if (self.pipe_scores_sd != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_sd, null);
         if (self.shader_scores_vae != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores_vae, null);
-        if (self.shader_scores_sd != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores_sd, null);
         if (self.pipe_attn_out != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_attn_out, null);
         if (self.shader_attn_out != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_attn_out, null);
         if (self.pipe_flash_md != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_flash_md, null);
@@ -2781,13 +3107,15 @@ pub const Context = struct {
     /// whether coop GEMMs are active, and how the device's subgroup width was
     /// reconciled with the kernels'. Purely informational.
     pub fn writeCoopStatus(self: *const Context, w: *std.Io.Writer) !void {
-        const coop_on = self.pipe_coop != .null_handle;
+        const coop_on = self.pipe_coop != .null_handle or self.pipe_coop_f16w != .null_handle or self.hasI8Gemm();
         if (coop_on and self.coop_pinned_subgroup != 0) {
             try w.print("coopmat: on (subgroup pinned to {d}, device native {d})\n", .{
                 self.coop_pinned_subgroup, self.subgroup_size,
             });
         } else if (coop_on) {
             try w.print("coopmat: on (native subgroup {d})\n", .{self.subgroup_size});
+        } else if (self.gemm_check_failed) {
+            try w.print("coopmat: off (its GEMMs failed their known-answer checks on this device); register/f32 path\n", .{});
         } else if (self.coop_disabled_by_subgroup) {
             try w.print("coopmat: off (device subgroup {d} not pinnable to {d}); register/f32 fallback\n", .{
                 self.subgroup_size, coopmat.subgroup_lanes,
@@ -2795,6 +3123,10 @@ pub const Context = struct {
         } else {
             try w.print("coopmat: off (not supported by device); register/f32 path\n", .{});
         }
+        try w.print("f16: rounding {s}, subnormals {s}\n", .{
+            if (self.module_rules.float.rte16) "rte" else "driver default",
+            if (self.module_rules.float.denorm16) "preserved" else "driver default",
+        });
     }
 
     fn findMemoryType(self: *const Context, type_bits: u32, flags: u32) Error!u32 {
@@ -2805,6 +3137,176 @@ pub const Context = struct {
             }
         }
         return error.NoSuitableDevice;
+    }
+
+    pub const CoopProbe = struct {
+        /// The 16x16x16 product came back exact.
+        correct: bool,
+        /// The `SubgroupSize` the shader saw.
+        lanes: u32,
+    };
+
+    /// Runs `coopmat.buildCoopProbe`: `subgroups` subgroups of `lanes` invocations,
+    /// the width pinned through the pipeline or left to the driver, each multiplying a
+    /// known A and B, from storage or through workgroup memory.
+    /// Asks the device what a coop config's properties only claim. Needs a 16x16x16
+    /// f16 config.
+    pub fn coopProbe(self: *Context, lanes: u32, pin: bool, subgroups: u32, via_shared: bool, a_stride: u32, iters: u32, a_offset: u32, bitcast: bool) Error!CoopProbe {
+        const gpa = self.gpa;
+        var a: [256]f16 = undefined;
+        var b: [256]f16 = undefined;
+        for (0..16) |i| for (0..16) |k| {
+            a[i * 16 + k] = @floatFromInt(@as(i32, @intCast((i + 2 * k) % 5)) - 2);
+            b[i * 16 + k] = @floatFromInt(@as(i32, @intCast((3 * i + k) % 7)) - 3);
+        };
+        var bufs: [4]DeviceBuffer = undefined;
+        var made: usize = 0;
+        defer for (bufs[0..made]) |*db| self.tensorDestroy(db);
+        for ([_]u64{ 512, 512, 1024 * subgroups, 1024 }, 0..) |size, i| {
+            bufs[i] = try self.tensorCreate(size);
+            made += 1;
+        }
+        try self.tensorUpload(bufs[0], std.mem.sliceAsBytes(&a));
+        try self.tensorUpload(bufs[1], std.mem.sliceAsBytes(&b));
+
+        const code = coopmat.buildCoopProbe(gpa, lanes, subgroups, via_shared, a_stride, iters, a_offset, bitcast) catch return error.OutOfMemory;
+        defer gpa.free(code);
+        const module = try createModule(gpa, &self.d, self.device, self.module_rules, "coop probe", code) orelse return error.KernelExceedsDevice;
+        defer self.d.DestroyShaderModule(self.device, module, null);
+        var pipe: vk.Pipeline = .null_handle;
+        _ = try createCoopPipe(self.io, &self.d, self.device, .null_handle, false, module, self.pipeline_layout, if (pin) lanes else null, &pipe);
+        defer self.d.DestroyPipeline(self.device, pipe, null);
+
+        try self.opBegin();
+        const set = self.bindViews(bufs);
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout, set);
+        self.dispatch(1, 1, 1);
+        try self.opEnd();
+
+        const c = try gpa.alloc(f32, 256 * subgroups);
+        defer gpa.free(c);
+        try self.tensorDownload(bufs[2], std.mem.sliceAsBytes(c));
+        var d: [1]f32 = undefined;
+        try self.tensorDownload(bufs[3], std.mem.sliceAsBytes(&d));
+        var correct = true;
+        for (0..subgroups) |sg| for (0..16) |i| for (0..16) |j| {
+            var want: f32 = 0;
+            for (0..16) |k| want += @as(f32, a[i * 16 + k]) * @as(f32, b[k * 16 + j]);
+            if (c[sg * 256 + i * 16 + j] != want * @as(f32, @floatFromInt(iters))) correct = false;
+        };
+        return .{ .correct = correct, .lanes = @intFromFloat(d[0]) };
+    }
+
+    /// Every dispatch binds through here, so a pipeline the device lacks is an error,
+    /// never a dispatch with nothing bound.
+    fn bind(self: *Context, cb: vk.CommandBuffer, pipe: vk.Pipeline) Error!void {
+        if (pipe == .null_handle) return error.KernelUnavailable;
+        self.d.CmdBindPipeline(cb, .compute, pipe);
+        if (cb == self.cmd) self.bound_pipe = pipe;
+    }
+
+    /// Bind `set` on `cmd`, remembering it for the next `dispatch`.
+    fn bindSet(self: *Context, layout: vk.PipelineLayout, set: vk.DescriptorSet) void {
+        var s = set;
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, layout, 0, 1, @ptrCast(&s), 0, null);
+        self.bound_set = set;
+    }
+
+    /// Every dispatch on `cmd` goes through here: inside a batch it first records the
+    /// barrier, if any, that what it touches needs.
+    fn dispatch(self: *Context, x: u32, y: u32, z: u32) void {
+        if (self.batching and !full_barriers and !self.no_barriers) self.orderDispatch();
+        self.d.CmdDispatch(self.cmd, x, y, z);
+    }
+
+    fn bindsOf(self: *const Context, set: vk.DescriptorSet) ?[]const Bind {
+        if (set == .null_handle) return null;
+        if (set == self.desc_set_ab) return &self.ab_binds;
+        const k = self.set_slot.get(set) orelse return null;
+        return &self.batch_binds[k];
+    }
+
+    fn orderDispatch(self: *Context) void {
+        const acc = hazard.registry.get(.{ .device = @intFromEnum(self.device), .handle = @intFromEnum(self.bound_pipe), .kind = .pipeline });
+        const binds = self.bindsOf(self.bound_set);
+        if (acc.untracked or binds == null) {
+            // Unknown accesses: wait for everything before, and make the next wait.
+            if (self.hazards.pending()) self.computeBarrier();
+            self.hazards.poisoned = true;
+            return;
+        }
+        var uses: [hazard.max_bindings]hazard.Use = undefined;
+        var n: usize = 0;
+        for (binds.?, 0..) |b, i| {
+            const bit = @as(u8, 1) << @intCast(i);
+            if (acc.used & bit == 0) continue;
+            uses[n] = .{ .range = .{ .buf = @intFromEnum(b.buf), .lo = b.off }, .write = acc.written & bit != 0 };
+            n += 1;
+        }
+        if (self.hazards.conflicts(uses[0..n])) {
+            if (hazlog) self.logConflict(uses[0..n]);
+            self.computeBarrier();
+        }
+        self.hazards.record(uses[0..n]);
+    }
+
+    /// DIAGNOSTIC (`TP_VK_HAZLOG`): count each conflict as one on the same offset of a
+    /// buffer (a likely real dependency) or on another offset of it (possibly only
+    /// the unknown extent).
+    pub var hazlog = false;
+    pub var stat_conflict_same: u64 = 0;
+    pub var stat_conflict_other: u64 = 0;
+    pub var stat_conflict_poison: u64 = 0;
+    pub var stat_conflict_raw: u64 = 0;
+    pub var stat_conflict_war: u64 = 0;
+    pub var stat_conflict_waw: u64 = 0;
+
+    fn logConflict(self: *const Context, uses: []const hazard.Use) void {
+        const t = &self.hazards;
+        if (t.poisoned) {
+            stat_conflict_poison += 1;
+            return;
+        }
+        // Read-after-write first: it is the one a reuse of scratch cannot remove.
+        for (uses) |u| if (!u.write) for (t.writes[0..t.n_writes]) |r| if (r.buf == u.range.buf) {
+            if (r.lo == u.range.lo) stat_conflict_same += 1 else stat_conflict_other += 1;
+            stat_conflict_raw += 1;
+            return;
+        };
+        for (uses) |u| {
+            const lists = [2][]const hazard.Range{ t.writes[0..t.n_writes], if (u.write) t.reads[0..t.n_reads] else &.{} };
+            for (lists, 0..) |l, k| for (l) |r| {
+                if (r.buf != u.range.buf) continue;
+                if (r.lo == u.range.lo) stat_conflict_same += 1 else stat_conflict_other += 1;
+                if (k == 0) stat_conflict_waw += 1 else stat_conflict_war += 1;
+                return;
+            };
+        }
+    }
+
+    /// Order every earlier dispatch's writes before every later dispatch.
+    fn computeBarrier(self: *Context) void {
+        const bar: vk.MemoryBarrier = .{
+            .src_access_mask = vk.Access.shader_write,
+            .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
+        };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&bar), 0, null, 0, null);
+        self.hazards.clear();
+        stat_barriers += 1;
+    }
+
+    /// Before a batch is submitted: what it wrote is ordered before anything a later
+    /// submission records, compute or copy.
+    fn closeHazards(self: *Context) void {
+        if (full_barriers or self.no_barriers or !self.hazards.pending()) return;
+        const bar: vk.MemoryBarrier = .{
+            .src_access_mask = vk.Access.shader_write,
+            .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write | vk.Access.transfer_read | vk.Access.transfer_write,
+        };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader | vk.PipelineStage.transfer, 0, 1, @ptrCast(&bar), 0, null, 0, null);
+        self.hazards.clear();
+        stat_barriers += 1;
     }
 
     fn createBuffer(self: *Context, size: u64, usage: u32, mem_flags: u32) Error!DeviceBuffer {
@@ -2828,13 +3330,16 @@ pub const Context = struct {
                 var db = db_raw;
                 db.tag = self.mem_tag;
                 self.device_used += size;
+                self.max_alloc_bytes = @max(self.max_alloc_bytes, size);
                 if (self.track_tags) self.mem_tag_used[@intFromEnum(self.mem_tag)] += size;
                 return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return err;
                 // Degrade to weight re-uploads instead of failing: drop the
-                // least-recently-used cached weight buffer and retry.
-                if (!self.evictOneWeight()) return err;
+                // least-recently-used cached weight buffer and retry, then ask
+                // whoever else holds the card.
+                if (self.evictOneWeight()) continue;
+                if (self.requestForeignRoom(size) == 0) return err;
             }
         }
     }
@@ -2869,6 +3374,46 @@ pub const Context = struct {
     /// Enable MEASURED per-component device-memory attribution (VRAM meter).
     pub fn enableMemTags(self: *Context) void {
         self.track_tags = true;
+    }
+
+    /// Attribution for an LLM, as the CUDA backend's: the standing tag is `lm_act`,
+    /// and the weight cache, the KV and the dequant staging name themselves. What the
+    /// context already holds is seeded into `other`, since a free decrements a tag
+    /// whether tagging was on at the allocation or not. Before the model allocates.
+    pub fn enableLlmMemTags(self: *Context) void {
+        self.track_tags = true;
+        self.weight_tag = .lm_weights;
+        self.mem_tag_used[@intFromEnum(MemTag.other)] = self.device_used;
+        self.mem_tag = .lm_act;
+    }
+
+    /// Switch the standing tag to `tag` on an LLM context, returning the one to
+    /// restore with `setMemTag`; a no-op on any other context.
+    pub fn llmTag(self: *Context, tag: MemTag) MemTag {
+        const prev = self.mem_tag;
+        if (self.weight_tag != null) self.mem_tag = tag;
+        return prev;
+    }
+
+    fn retag(self: *Context, db: *DeviceBuffer, tag: MemTag) void {
+        if (self.track_tags) {
+            self.mem_tag_used[@intFromEnum(db.tag)] -|= db.size;
+            self.mem_tag_used[@intFromEnum(tag)] += db.size;
+        }
+        db.tag = tag;
+    }
+
+    fn cacheWeight(self: *Context, key: WeightKey, uploaded: DeviceBuffer, pin_bytes: u64) Error!void {
+        var db = uploaded;
+        if (self.weight_tag) |t| self.retag(&db, t);
+        self.noise_id_next +%= 1;
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(pin_bytes), .noise_id = self.noise_id_next });
+    }
+
+    /// `ensureDeviceBuffer` for a dequant staging buffer, attributed as one on an LLM.
+    fn ensureStaging(self: *Context, db: *DeviceBuffer, size: u64) Error!void {
+        try self.ensureDeviceBuffer(db, size);
+        if (self.weight_tag != null and db.tag != .lm_dequant) self.retag(db, .lm_dequant);
     }
 
     /// Free resident weights so the footprint fits `budget` (GUI VRAM limit
@@ -2918,10 +3463,58 @@ pub const Context = struct {
     /// routes may read it differently (an LLM weight decodes through the GEMV layout and
     /// prefills through the coop one), so the layout is part of the key; a pointer alone
     /// would serve one route the other's copy.
-    const WeightLayout = enum(u8) { kmajor, raw, f16_from_f32, bf16_coop, f16_from_bf16, bf16_from_f32, f16_from_conv, bf16_from_conv };
+    const WeightLayout = enum(u8) { kmajor, raw, f16_from_f32, bf16_coop, f16_from_bf16, bf16_from_f32, f16_from_conv, bf16_from_conv, f32_from_16, f32_from_conv };
 
     /// The length is part of it: a row slice starts at its whole weight's address.
-    const WeightKey = struct { ptr: usize, len: usize, layout: WeightLayout };
+    /// `src` is the format a decode read, for a key whose layout does not imply it: the
+    /// same address freed and refilled with another format must not hit.
+    const WeightKey = struct { ptr: usize, len: usize, layout: WeightLayout, src: u8 = 0 };
+
+    const WeightGroup = struct { ptr: usize, len: usize };
+
+    /// Record `group` as one weight group (`weight_groups`); its buffer uploads on first
+    /// use like any weight, and comes back the same way if the cache evicts it.
+    pub fn registerWeightGroup(self: *Context, group: []const u8) Error!void {
+        const g: WeightGroup = .{ .ptr = @intFromPtr(group.ptr), .len = group.len };
+        var at: usize = 0;
+        while (at < self.weight_groups.items.len and self.weight_groups.items[at].ptr < g.ptr) at += 1;
+        if (at < self.weight_groups.items.len and self.weight_groups.items[at].ptr == g.ptr) {
+            self.weight_groups.items[at].len = @max(self.weight_groups.items[at].len, g.len);
+            return;
+        }
+        self.weight_groups.insert(self.gpa, at, g) catch return error.OutOfMemory;
+    }
+
+    /// Upload a registered group now.
+    pub fn warmWeightGroup(self: *Context, group: []const u8) Error!void {
+        _ = try self.weightBufferRaw(group);
+    }
+
+    fn groupOf(self: *const Context, bytes: []const u8) ?WeightGroup {
+        const p = @intFromPtr(bytes.ptr);
+        var lo: usize = 0;
+        var hi: usize = self.weight_groups.items.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (self.weight_groups.items[mid].ptr <= p) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const g = self.weight_groups.items[lo - 1];
+        return if (p + bytes.len <= g.ptr + g.len) g else null;
+    }
+
+    /// The raw-layout device copy of `bytes`: a view of its group's buffer where it lies
+    /// in a registered group at a bindable offset, else its own buffer.
+    fn weightRaw(self: *Context, bytes: []const u8) Error!DeviceBuffer {
+        if (self.groupOf(bytes)) |g| {
+            const off = @intFromPtr(bytes.ptr) - g.ptr;
+            if (off % self.storage_align == 0) {
+                const whole = @as([*]const u8, @ptrFromInt(g.ptr))[0..g.len];
+                return .{ .buf = try self.weightBufferRaw(whole), .mem = .null_handle, .size = bytes.len, .off = off };
+            }
+        }
+        return .{ .buf = try self.weightBufferRaw(bytes), .mem = .null_handle, .size = 0 };
+    }
 
     fn weightKey(bytes: anytype, layout: WeightLayout) WeightKey {
         return .{ .ptr = @intFromPtr(bytes.ptr), .len = std.mem.sliceAsBytes(bytes).len, .layout = layout };
@@ -2933,7 +3526,32 @@ pub const Context = struct {
     /// and transposed on the GPU (kernels/transpose.zig), no CPU-side work
     /// beyond the staging memcpy.
     fn weightBuffer(self: *Context, bytes: []const u8, esize: u64, rows: usize, cols: usize) Error!vk.Buffer {
-        const key = weightKey(bytes, .kmajor);
+        return self.weightBufferAs(weightKey(bytes, .kmajor), bytes, esize, rows, cols);
+    }
+
+    /// A 16-bit (f16 or bf16) weight widened to f32 on the host once, in `weightBuffer`'s
+    /// layout for the f32 GEMM, cached under the source weight's own address: what a
+    /// device with no 16-bit GEMM runs one on.
+    fn weightBufferWidened(self: *Context, bytes: []const u8, dt: tp_core.dtype.DType, rows: usize, cols: usize) Error!vk.Buffer {
+        var key = weightKey(bytes, .f32_from_16);
+        key.src = @intFromEnum(dt);
+        if (self.weights.getPtr(key)) |e| {
+            self.use_counter += 1;
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const wide = transient.alloc(f32, rows * cols) catch return error.OutOfMemory;
+        defer transient.free(wide);
+        switch (dt) {
+            .f16 => tp_core.dtype.f16ToF32Row(bytes[0 .. wide.len * 2], wide, 1.0),
+            .bf16 => tp_core.dtype.bf16ToF32Row(bytes[0 .. wide.len * 2], wide, 1.0),
+            else => return error.UnsupportedDType,
+        }
+        return self.weightBufferAs(key, std.mem.sliceAsBytes(wide), 4, rows, cols);
+    }
+
+    /// `weightBuffer` under a key the caller chose, for a weight uploaded from a copy.
+    fn weightBufferAs(self: *Context, key: WeightKey, bytes: []const u8, esize: u64, rows: usize, cols: usize) Error!vk.Buffer {
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -2964,7 +3582,7 @@ pub const Context = struct {
         var off: u64 = 0;
         while (off < bytes.len) {
             const n: u64 = @min(chunk, bytes.len - off);
-            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
+            self.copyWeight(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
             try self.beginCmdBuf(cb);
             const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
             self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
@@ -3010,7 +3628,7 @@ pub const Context = struct {
                 else => self.pipe_tr_f32,
             };
             try self.beginCmdBuf(cb);
-            self.d.CmdBindPipeline(cb, .compute, tr_pipe);
+            try self.bind(cb, tr_pipe);
             self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
             self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
             self.d.CmdDispatch(
@@ -3030,7 +3648,7 @@ pub const Context = struct {
             try self.submitAndWaitBuf(cb);
         }
 
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        try self.cacheWeight(key, db, total);
         return db.buf;
     }
 
@@ -3061,14 +3679,14 @@ pub const Context = struct {
         var off: u64 = 0;
         while (off < bytes.len) {
             const n: u64 = @min(chunk, bytes.len - off);
-            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
+            self.copyWeight(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
             try self.beginCmdBuf(cb);
             const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
             self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
             try self.submitAndWaitBuf(cb);
             off += n;
         }
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        try self.cacheWeight(key, db, total);
         return db.buf;
     }
 
@@ -3146,6 +3764,68 @@ pub const Context = struct {
             self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
             try self.submitAndWaitBuf(cb);
             off += n;
+        }
+    }
+
+    /// `tensorUploadAt` that waits for nothing inside a batch: `bytes` go to a host ring
+    /// and the copy is recorded in the batch between full barriers, so every op before it
+    /// is done with `db` and every op after it reads the new bytes.
+    pub fn uploadRecorded(self: *Context, db: DeviceBuffer, dst_off: u64, bytes: []const u8) Error!void {
+        if (!self.batching) return self.tensorUploadAt(db, dst_off, bytes);
+        const n: u64 = bytes.len;
+        var at = std.mem.alignForward(u64, self.batch_up_off, 16);
+        if (at + n > self.batch_up.size) {
+            // Growing frees a buffer the recording may still copy from.
+            if (self.batch_up_off != 0) try self.flushBatch();
+            _ = try self.ensureHostBuffer(&self.batch_up, n);
+            at = 0;
+        }
+        @memcpy(self.batch_up.mapped.?[@intCast(at)..][0..@intCast(n)], bytes);
+        self.batch_up_off = at + n;
+        const before: vk.MemoryBarrier = .{
+            .src_access_mask = vk.Access.shader_write,
+            .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write | vk.Access.transfer_write,
+        };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader | vk.PipelineStage.transfer, 0, 1, @ptrCast(&before), 0, null, 0, null);
+        const region: vk.BufferCopy = .{ .src_offset = at, .dst_offset = db.off + dst_off, .size = n };
+        self.d.CmdCopyBuffer(self.cmd, self.batch_up.buf, db.buf, 1, @ptrCast(&region));
+        const after: vk.MemoryBarrier = .{
+            .src_access_mask = vk.Access.transfer_write,
+            .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
+        };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.transfer, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&after), 0, null, 0, null);
+        self.hazards.clear();
+        stat_barriers += 2;
+    }
+
+    pub const Download = struct { db: DeviceBuffer, off: u64 = 0, out: []u8 };
+
+    /// Several downloads for one wait: inside a batch the copies are recorded after its
+    /// work, so the one submission runs both.
+    pub fn downloadMany(self: *Context, parts: []const Download) Error!void {
+        if (!self.batching) {
+            for (parts) |p| try self.tensorDownloadAt(p.db, p.off, p.out);
+            return;
+        }
+        var total: u64 = 0;
+        for (parts) |p| total += std.mem.alignForward(u64, p.out.len, 16);
+        const mapped = try self.ensureHostBuffer(&self.batch_down, total);
+        const before: vk.MemoryBarrier = .{ .src_access_mask = vk.Access.shader_write, .dst_access_mask = vk.Access.transfer_read };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.transfer, 0, 1, @ptrCast(&before), 0, null, 0, null);
+        var at: u64 = 0;
+        for (parts) |p| {
+            const region: vk.BufferCopy = .{ .src_offset = p.db.off + p.off, .dst_offset = at, .size = p.out.len };
+            self.d.CmdCopyBuffer(self.cmd, p.db.buf, self.batch_down.buf, 1, @ptrCast(&region));
+            at += std.mem.alignForward(u64, p.out.len, 16);
+        }
+        const to_host: vk.MemoryBarrier = .{ .src_access_mask = vk.Access.transfer_write, .dst_access_mask = vk.Access.host_read };
+        self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.transfer, vk.PipelineStage.host, 0, 1, @ptrCast(&to_host), 0, null, 0, null);
+        stat_barriers += 2;
+        try self.flushBatch();
+        at = 0;
+        for (parts) |p| {
+            @memcpy(p.out, mapped[@intCast(at)..][0..p.out.len]);
+            at += std.mem.alignForward(u64, p.out.len, 16);
         }
     }
 
@@ -3250,10 +3930,7 @@ pub const Context = struct {
     pub fn view(self: *const Context, db: DeviceBuffer, off: u64, bytes: u64) Error!DeviceBuffer {
         std.debug.assert(db.size == 0 or off + bytes <= db.size);
         const at = db.off + off;
-        if (at % self.storage_align != 0) {
-            std.log.err("vulkan: a view at byte {d} is not a multiple of the device's storage alignment {d}", .{ at, self.storage_align });
-            return error.UnalignedView;
-        }
+        if (at % self.storage_align != 0) return error.UnalignedView;
         return .{ .buf = db.buf, .mem = .null_handle, .size = bytes, .off = at, .tag = db.tag, .dt = db.dt };
     }
 
@@ -3277,6 +3954,7 @@ pub const Context = struct {
     fn bind4Off(self: *Context, bufs: [4]vk.Buffer, offs: [4]u64) vk.DescriptorSet {
         const set = if (self.batching) blk: {
             const s = self.batch_sets[self.batch_n];
+            for (&self.batch_binds[self.batch_n], bufs, offs) |*b, buf, off| b.* = .{ .buf = buf, .off = off };
             self.batch_n += 1;
             break :blk s;
         } else self.desc_set;
@@ -3317,6 +3995,26 @@ pub const Context = struct {
     ) Error!void {
         const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
         return self.opMatmulB(y, y_off, x, x_off, m, w_bytes, dtype_f8, rows, cols, scale, bias_buf);
+    }
+
+    /// `opMatmul` for an f16 or bf16 weight on the f32 GEMM, for a device that has no
+    /// 16-bit one: the weight is widened once (`weightBufferWidened`).
+    pub fn opMatmulWide(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: u64,
+        x: DeviceBuffer,
+        x_off: u64,
+        m: usize,
+        w_bytes: []const u8,
+        dt: tp_core.dtype.DType,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        bias: ?[]const f32,
+    ) Error!void {
+        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
+        return self.opMatmulW(y, y_off, x, x_off, m, try self.weightBufferWidened(w_bytes, dt, rows, cols), false, rows, cols, scale, bias_buf);
     }
 
     fn opMatmulB(
@@ -3363,12 +4061,11 @@ pub const Context = struct {
             .scale = scale,
         };
         try self.opBegin();
-        var set = self.bind4Off(.{ w_buf, x.buf, y.buf, bias_buf }, .{ 0, x.off + x_off, y.off + y_off, 0 });
-        self.d.CmdBindPipeline(self.cmd, .compute, if (dtype_f8) self.pipe_f8 else self.pipe_f32);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bind4Off(.{ w_buf, x.buf, y.buf, bias_buf }, .{ 0, x.off + x_off, y.off + y_off, 0 });
+        try self.bind(self.cmd, if (dtype_f8) self.pipe_f8 else self.pipe_f32);
+        self.bindSet(self.pipeline_layout, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, @sizeOf(Push), &push);
-        self.d.CmdDispatch(
-            self.cmd,
+        self.dispatch(
             @intCast(std.math.divCeil(usize, rows, wg_x * tile_n) catch unreachable),
             @intCast(std.math.divCeil(usize, m, wg_y * tile_m) catch unreachable),
             1,
@@ -3490,6 +4187,10 @@ pub const Context = struct {
         const total = seq_q * n_heads * head_dim;
         try self.opElt(.attn_merge, scratch, null, null, out, .{ .u0 = @intCast(total), .u1 = @intCast(head_dim), .u2 = @intCast(nsplit) }, total, 1, 1);
     }
+
+    /// Decode block-quant GEMVs on the f32 GEMV even where the device has `OpSDot`
+    /// (`lin_gpu.Caps.dualQ8`): the A/B arm.
+    pub var sdot_off = false;
 
     /// DIAGNOSTIC: `opAttnRows` may take the grouped kernel. The two are bit-identical,
     /// which this is how to check.
@@ -3667,7 +4368,7 @@ pub const Context = struct {
         // Two dependent recorded ops, must not sit inside an `independent`
         // group, which would elide the barrier between them.
         std.debug.assert(self.indep_remaining == 0);
-        try self.ensureDeviceBuffer(&self.x_h16, m_pad * cols * 2);
+        try self.ensureStaging(&self.x_h16, m_pad * cols * 2);
 
         // x f32 -> f16 with the weight scale folded in (zero pad rows).
         try self.opElt(.f32_to_h16, x, null, null, self.x_h16, .{
@@ -3694,18 +4395,18 @@ pub const Context = struct {
         c16: bool,
     ) Error!void {
         std.debug.assert(if (c16) self.pipe_coop_c16 != .null_handle else self.pipe_coop != .null_handle);
-        std.debug.assert(rows % coopmat.coop_wgn == 0 and cols % 64 == 0 and m_pad % 128 == 0);
+        std.debug.assert(rows % self.coop_wgn == 0 and cols % 64 == 0 and m_pad % 128 == 0);
         const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), @intCast(rows) };
         try self.opBegin();
         // The kernel stages both operands through workgroup memory via
         // uvec4 views: binding 0 = activations, binding 3 = raw fp8
         // weights (binding 1 is unused; the layout still needs a buffer).
-        var set = self.bindViews(.{ x16, x16, y, raw(w_buf) });
-        self.d.CmdBindPipeline(self.cmd, .compute, if (c16) self.pipe_coop_c16 else self.pipe_coop);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ x16, x16, y, raw(w_buf) });
+        try self.bind(self.cmd, if (c16) self.pipe_coop_c16 else self.pipe_coop);
+        self.bindSet(self.pipeline_layout, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows / coopmat.coop_wgn), @intCast(m_pad / 128), 1);
+        self.dispatch(@intCast(rows / self.coop_wgn), @intCast(m_pad / 128), 1);
         try self.opEnd();
     }
 
@@ -3730,7 +4431,7 @@ pub const Context = struct {
         // Either kernel is enough. The register-tiled one still hardcodes 16-row
         // fragments, so a device with only 8x8 (Alchemist) has the shared one alone and
         // must not be required to have both.
-        std.debug.assert(self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle);
+        std.debug.assert(self.hasI8Gemm());
         const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
@@ -3746,17 +4447,17 @@ pub const Context = struct {
         if (!use_sh and (self.pipe_coop_i8 == .null_handle or
             m_pad % mtile != 0 or rows % ntile != 0 or cols % 32 != 0)) return error.UnsupportedDType;
         try self.opBegin();
-        var set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(try self.dummyBuf()) });
+        const set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(try self.dummyBuf()) });
         if (use_sh) {
-            self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8_sh);
-            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+            try self.bind(self.cmd, self.pipe_coop_i8_sh);
+            self.bindSet(self.pipeline_layout, set);
             self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-            self.d.CmdDispatch(self.cmd, @intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
+            self.dispatch(@intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
         } else {
-            self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8);
-            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+            try self.bind(self.cmd, self.pipe_coop_i8);
+            self.bindSet(self.pipeline_layout, set);
             self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-            self.d.CmdDispatch(self.cmd, @intCast(rows / ntile), @intCast(m_pad / mtile), 1);
+            self.dispatch(@intCast(rows / ntile), @intCast(m_pad / mtile), 1);
         }
         try self.opEnd();
     }
@@ -3789,11 +4490,11 @@ pub const Context = struct {
         const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
         try self.opBegin();
-        var set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(scale_buf) });
-        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ raw(w_buf), x_i8, y, raw(scale_buf) });
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
+        self.dispatch(@intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
         try self.opEnd();
         return true;
     }
@@ -3861,10 +4562,10 @@ pub const Context = struct {
         const prep_pipe = try self.i8PrepPipe(cols);
         if (prep_pipe != .null_handle) {
             try self.opBegin();
-            var set = self.bindViews(.{ x, self.i8_x, self.i8_scale, raw(try self.dummyBuf()) });
-            self.d.CmdBindPipeline(self.cmd, .compute, prep_pipe);
-            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-            self.d.CmdDispatch(self.cmd, @intCast(m), 1, 1);
+            const set = self.bindViews(.{ x, self.i8_x, self.i8_scale, raw(try self.dummyBuf()) });
+            try self.bind(self.cmd, prep_pipe);
+            self.bindSet(self.pipeline_layout, set);
+            self.dispatch(@intCast(m), 1, 1);
             try self.opEnd();
             return;
         }
@@ -3927,7 +4628,13 @@ pub const Context = struct {
     /// device without either must be REFUSED rather than fall through to the fp8 arm,
     /// which would read the packed nibbles as e4m3 and render a blank image.
     pub fn hasW4A8Decode(self: *const Context) bool {
-        return self.pipe_coop_i8 != .null_handle;
+        return self.hasI8Gemm();
+    }
+
+    /// Either int8 coop GEMM: `opI8GemmBuf` and `opMatmulCoopI8` take whichever exists
+    /// (a device whose s8 config is 16 deep, or 8x8, has the shared one alone).
+    pub fn hasI8Gemm(self: *const Context) bool {
+        return self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle;
     }
 
     /// Bytes of k-major int8 scratch a W4A8 weight of this shape decodes into.
@@ -4014,9 +4721,9 @@ pub const Context = struct {
     }
 
     /// Whether a nibble-packed int4-convrot weight can be decoded on the device instead of
-    /// being widened to int8 at load. Needs the int8 coop pipeline the decode feeds.
+    /// being widened to int8 at load. Needs the int8 coop GEMM the decode feeds.
     pub fn hasI4Decode(self: *const Context) bool {
-        return self.pipe_coop_i8 != .null_handle;
+        return self.hasI8Gemm();
     }
 
     /// Bytes of k-major int8 scratch an int4 weight of this shape decodes into. Identical
@@ -4056,7 +4763,7 @@ pub const Context = struct {
     pub fn opI8GemmBuf(self: *Context, y: DeviceBuffer, w_buf_in: ?vk.Buffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize) Error!void {
         // Either kernel suffices; the register-tiled one is 16-fragment-only, so a device
         // with just the shared kernel (8x8 fragments) must not be required to have both.
-        std.debug.assert(self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle);
+        std.debug.assert(self.hasI8Gemm());
         std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
         const m = self.i8_m;
         const ws_buf: DeviceBuffer = .{
@@ -4169,7 +4876,8 @@ pub const Context = struct {
             .krsc => |s| return self.weightBuffer16From32(s, cv.co, cv.patchLen(), bf),
             .torch => |t| t,
         };
-        const key = weightKey(t.w.bytes, if (bf) .bf16_from_conv else .f16_from_conv);
+        var key = weightKey(t.w.bytes, if (bf) .bf16_from_conv else .f16_from_conv);
+        key.src = @intFromEnum(t.w.dtype);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -4181,6 +4889,35 @@ pub const Context = struct {
         };
         defer transient.free(krsc);
         return self.upload16(key, krsc, cv.co, cv.patchLen(), bf);
+    }
+
+    /// A conv's weight for the f32 GEMM, in `weightBuffer`'s layout, from either form: a
+    /// repacked `krsc` one as is, a checkpoint-order one decoded once and cached under
+    /// the checkpoint bytes' own address, so no f32 copy stays on the host.
+    pub fn convWeight32(self: *Context, cv: ops.conv.Conv2d) Error!vk.Buffer {
+        const t = switch (cv.w) {
+            .krsc => |s| return self.weightBuffer(std.mem.sliceAsBytes(s), 4, cv.co, cv.patchLen()),
+            .torch => |t| t,
+        };
+        var key = weightKey(t.w.bytes, .f32_from_conv);
+        key.src = @intFromEnum(t.w.dtype);
+        if (self.weights.getPtr(key)) |e| {
+            self.use_counter += 1;
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const krsc = cv.materialize(transient) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedDType,
+        };
+        defer transient.free(krsc);
+        return self.weightBufferAs(key, std.mem.sliceAsBytes(krsc), 4, cv.co, cv.patchLen());
+    }
+
+    /// `opMatmul` against a weight already in `weightBuffer`'s layout on the device.
+    pub fn opMatmulBuf(self: *Context, y: DeviceBuffer, y_off: u64, x: DeviceBuffer, x_off: u64, m: usize, w_buf: vk.Buffer, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
+        return self.opMatmulW(y, y_off, x, x_off, m, w_buf, false, rows, cols, 1.0, bias_buf);
     }
 
     /// `w` `[rows][cols]` f32 to the coop GEMM's 16-bit k-major padded layout on the
@@ -4233,7 +4970,7 @@ pub const Context = struct {
             off += n;
         }
 
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(bytes.len) });
+        try self.cacheWeight(key, db, bytes.len);
         return db.buf;
     }
 
@@ -4282,7 +5019,7 @@ pub const Context = struct {
         var off: u64 = 0;
         while (off < w_bytes.len) {
             const n: u64 = @min(chunk, w_bytes.len - off);
-            @memcpy(mapped[0..@intCast(n)], w_bytes[@intCast(off)..][0..@intCast(n)]);
+            self.copyWeight(mapped[0..@intCast(n)], w_bytes[@intCast(off)..][0..@intCast(n)]);
             try self.beginCmdBuf(cb);
             const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
             self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
@@ -4317,7 +5054,7 @@ pub const Context = struct {
                 .k_pad = @intCast(k_pad),
             };
             try self.beginCmdBuf(cb);
-            self.d.CmdBindPipeline(cb, .compute, tr_pipe);
+            try self.bind(cb, tr_pipe);
             self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
             self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
             self.d.CmdDispatch(
@@ -4337,7 +5074,7 @@ pub const Context = struct {
             try self.submitAndWaitBuf(cb);
         }
 
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        try self.cacheWeight(key, db, total);
         return db.buf;
     }
 
@@ -4599,8 +5336,9 @@ pub const Context = struct {
     /// the f16-weight coop GEMM it feeds; without both a caller must REFUSE rather than
     /// fall through to the fp8 arm, which would read the packed nibbles as e4m3 and render
     /// a blank image with no error.
+    /// The decode emits bf16 and `opMatmulNvfp4` runs the bf16 coop GEMM on it.
     pub fn hasNvfp4Decode(self: *const Context) bool {
-        return self.pipe_coop_f16w != .null_handle;
+        return self.pipe_coop_bf16w != .null_handle;
     }
 
     /// Padded N (output-column) extent of the f16 coop GEMM. EVERY producer of a
@@ -4641,19 +5379,13 @@ pub const Context = struct {
         {
             const code = try coopmat.buildGemmShared(gpa, true, false, false, false, false, self.coop_m, self.coop_n, wm, wn);
             defer gpa.free(code);
-            try check(self.d.CreateShaderModule(self.device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &new_f16w));
+            new_f16w = try createModule(gpa, &self.d, self.device, self.module_rules, "coop GEMM, f16 weights", code) orelse return error.KernelExceedsDevice;
             _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, new_f16w, self.pipeline_layout, sg, &new_f16w_pipe);
         }
         if (self.pipe_coop_bf16w != .null_handle) {
             const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true, self.coop_m, self.coop_n, wm, wn);
             defer gpa.free(code);
-            try check(self.d.CreateShaderModule(self.device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &new_bf16w));
+            new_bf16w = try createModule(gpa, &self.d, self.device, self.module_rules, "coop GEMM, bf16", code) orelse return error.KernelExceedsDevice;
             _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, new_bf16w, self.pipeline_layout, sg, &new_bf16w_pipe);
         }
 
@@ -4671,7 +5403,8 @@ pub const Context = struct {
         // cached was laid out for the OLD coopNPad. Drop the cache so each is rebuilt.
         self.coop_wg_m = 2 * wm;
         self.coop_wg_n = 2 * wn;
-        self.evictWeights();
+        // Also empties the weight cache.
+        self.verifyGemms();
     }
 
     pub fn coopCacheKey(self: *const Context) []const u8 {
@@ -4685,6 +5418,278 @@ pub const Context = struct {
     /// ~1.5x, which needs careful multi-shape timing, to the explicit command.
     ///
     /// Best effort throughout: any failure leaves the tile that was already resolved.
+    /// Known-answer checks of the GEMM pipelines this device built: a small product of
+    /// integers through each, against the host. One that answers wrong is destroyed, with
+    /// every pipeline built the same way, so the routes read it as missing and fall back
+    /// rather than render garbage on a driver nobody here has run. Runs after init and
+    /// after a re-tile, and leaves nothing cached, so no later weight can be served the
+    /// test's upload from a recycled address.
+    pub fn verifyGemms(self: *Context) void {
+        defer self.evictWeights();
+        const Check = struct { name: []const u8, pipes: []const *vk.Pipeline, run: *const fn (*Context) Error!bool, flush: bool = false };
+        const checks = [_]Check{
+            .{ .name = "coop GEMM, f16 weights", .pipes = &.{&self.pipe_coop_f16w}, .run = gemmCheckF16W },
+            .{ .name = "coop GEMM, bf16", .pipes = &.{&self.pipe_coop_bf16w}, .run = gemmCheckBf16W },
+            .{ .name = "coop GEMM, fp8", .pipes = &.{ &self.pipe_coop, &self.pipe_coop_c16 }, .run = gemmCheckFp8 },
+            .{ .name = "coop GEMM, fp8 at a checkpoint's weight scale", .pipes = &.{ &self.pipe_coop, &self.pipe_coop_c16 }, .run = gemmCheckFp8Subnormal, .flush = true },
+            .{ .name = "coop GEMM, f16 C", .pipes = &.{&self.pipe_coop_c16}, .run = gemmCheckC16 },
+            .{ .name = "coop int8 GEMM", .pipes = &.{&self.pipe_coop_i8}, .run = gemmCheckI8Reg },
+            .{ .name = "coop int8 shared GEMM", .pipes = &.{ &self.pipe_coop_i8_sh, &self.pipe_coop_i8_fs, &self.pipe_coop_i8_fs16 }, .run = gemmCheckI8Shared },
+        };
+        var flushes = false;
+        for (checks) |c| {
+            if (c.pipes[0].* == .null_handle) continue;
+            // The forced arms drop the folded fp8 GEMM as a flushing device would.
+            const ok = !(c.flush and (force_fp8_wide or force_fp8_f32)) and (c.run(self) catch false);
+            if (ok) continue;
+            if (c.flush) {
+                // The plain fp8 check passed, so the multiply works and only the folded
+                // scale's subnormals were lost: what `opMatmulFp8Wide` avoids.
+                flushes = !force_fp8_f32;
+            } else {
+                std.log.warn("vulkan: {s} failed its known-answer check on this device; it is not used", .{c.name});
+                self.gemm_check_failed = true;
+            }
+            _ = self.d.DeviceWaitIdle(self.device);
+            for (c.pipes) |p| {
+                if (p.* != .null_handle) self.d.DestroyPipeline(self.device, p.*, null);
+                p.* = .null_handle;
+            }
+        }
+        if (flushes and self.pipe_coop_f16w != .null_handle) {
+            self.fp8_wide = true;
+            if ((gemmCheckFp8(self) catch false) and (gemmCheckFp8Subnormal(self) catch false)) {
+                std.log.info("vulkan: this device's coop multiply flushes f16 subnormals; fp8 runs as f16 weights on the f16-weight GEMM", .{});
+            } else {
+                std.log.warn("vulkan: coop GEMM, fp8 as f16 weights failed its known-answer check on this device; it is not used", .{});
+                self.gemm_check_failed = true;
+                self.fp8_wide = false;
+            }
+        }
+    }
+
+    /// DIAGNOSTIC (`TP_VK_FP8_WIDE`): treat the device as flushing f16 subnormals, so a
+    /// card that keeps them can run and time `opMatmulFp8Wide`.
+    pub var force_fp8_wide = false;
+    /// DIAGNOSTIC (`TP_VK_FP8_F32`): no fp8 coop GEMM at all, so fp8 takes the f32 GEMM,
+    /// as a flushing device did before `fp8_wide`: the arm that one is timed against.
+    pub var force_fp8_f32 = false;
+
+    /// The product the checks hold a GEMM to: integers small enough that every
+    /// operand format holds them exactly and an f32 sum is exact.
+    const gemm_check = struct {
+        const m = 32;
+        const m_pad = 128;
+        const cols = 64;
+        const rows = 256; // a multiple of every fp8 workgroup width
+        fn x(t: usize, k: usize) f32 {
+            return @floatFromInt(@as(i32, @intCast((t * 7 + k * 3) % 9)) - 4);
+        }
+        fn w(r: usize, k: usize) f32 {
+            return @floatFromInt(@as(i32, @intCast((r * 5 + k) % 7)) - 3);
+        }
+        fn want(t: usize, r: usize) f32 {
+            var sum: f32 = 0;
+            for (0..cols) |k| sum += x(t, k) * w(r, k);
+            return sum;
+        }
+        fn weights(gpa: std.mem.Allocator) ![]f32 {
+            const ws = try gpa.alloc(f32, rows * cols);
+            for (0..rows) |r| for (0..cols) |k| {
+                ws[r * cols + k] = w(r, k);
+            };
+            return ws;
+        }
+        fn acts(gpa: std.mem.Allocator) ![]f32 {
+            const xs = try gpa.alloc(f32, m * cols);
+            for (0..m) |t| for (0..cols) |k| {
+                xs[t * cols + k] = x(t, k);
+            };
+            return xs;
+        }
+        /// `y` is `[m or more][rows]` f32.
+        fn matches(y: []const f32) bool {
+            for (0..m) |t| for (0..rows) |r| {
+                if (y[t * rows + r] != want(t, r)) return false;
+            };
+            return true;
+        }
+        /// The e4m3 byte holding `v` exactly.
+        fn e4m3(v: f32) u8 {
+            for (0..256) |b| if (tp_core.dtype.f8e4m3ToF32(@intCast(b)) == v) return @intCast(b);
+            unreachable;
+        }
+    };
+
+    /// Runs `gemm` (which writes f32 `[m][rows]` into the buffer it is handed) on the
+    /// check's activations and compares.
+    fn gemmCheckF32Out(self: *Context, gemm: *const fn (*Context, DeviceBuffer, DeviceBuffer, []const f32) Error!void) Error!bool {
+        const G = gemm_check;
+        const xs = G.acts(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(xs);
+        const ws = G.weights(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ws);
+        var x_d = try self.tensorCreate(xs.len * 4);
+        defer self.tensorDestroy(&x_d);
+        try self.tensorUpload(x_d, std.mem.sliceAsBytes(xs));
+        var y_d = try self.tensorCreate(G.m_pad * G.rows * 4);
+        defer self.tensorDestroy(&y_d);
+        try gemm(self, y_d, x_d, ws);
+        const y = self.gpa.alloc(f32, G.m_pad * G.rows) catch return error.OutOfMemory;
+        defer self.gpa.free(y);
+        try self.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        return G.matches(y);
+    }
+
+    fn gemmCheckF16W(self: *Context) Error!bool {
+        return self.gemmCheckF32Out(struct {
+            fn run(c: *Context, y: DeviceBuffer, x: DeviceBuffer, ws: []const f32) Error!void {
+                const zeros: [gemm_check.rows]f32 = @splat(0);
+                try c.opMatmulCoopF16W(y, 0, x, gemm_check.m, ws, gemm_check.rows, gemm_check.cols, &zeros);
+            }
+        }.run);
+    }
+
+    fn gemmCheckBf16W(self: *Context) Error!bool {
+        return self.gemmCheckF32Out(struct {
+            fn run(c: *Context, y: DeviceBuffer, x: DeviceBuffer, ws: []const f32) Error!void {
+                const zeros: [gemm_check.rows]f32 = @splat(0);
+                const wb = c.gpa.alloc(u8, ws.len * 2) catch return error.OutOfMemory;
+                defer c.gpa.free(wb);
+                tp_core.dtype.f32ToBf16Row(ws, wb);
+                try c.opMatmulCoopBf16(y, 0, x, gemm_check.m, wb, gemm_check.rows, gemm_check.cols, &zeros);
+            }
+        }.run);
+    }
+
+    /// Static, because a bias reaches the device by host pointer (`smallBuffer`).
+    const check_zero_bias: [gemm_check.rows]f32 = @splat(0);
+
+    /// The fp8 GEMM the checks hold to the known answer: whichever build this device runs.
+    fn fp8CheckGemm(self: *Context, y: DeviceBuffer, x: DeviceBuffer, wb: []const u8, scale: f32) Error!void {
+        const G = gemm_check;
+        if (self.fp8_wide) return self.opMatmulFp8Wide(y, 0, x, G.m, wb, G.rows, G.cols, scale, &check_zero_bias);
+        return self.opMatmulCoop(y, x, G.m, G.m_pad, wb, G.rows, G.cols, scale);
+    }
+
+    fn gemmCheckFp8(self: *Context) Error!bool {
+        return self.gemmCheckF32Out(struct {
+            fn run(c: *Context, y: DeviceBuffer, x: DeviceBuffer, ws: []const f32) Error!void {
+                const wb = c.gpa.alloc(u8, ws.len) catch return error.OutOfMemory;
+                defer c.gpa.free(wb);
+                for (ws, wb) |v, *b| b.* = gemm_check.e4m3(v);
+                try c.fp8CheckGemm(y, x, wb, 1.0);
+            }
+        }.run);
+    }
+
+    /// A weight scale of 2^-17 folds the activations into f16 subnormals, where a real
+    /// checkpoint's 1e-3 scale puts many of them; every product and partial sum stays
+    /// exact, so the result is exact only where the device keeps subnormals.
+    fn gemmCheckFp8Subnormal(self: *Context) Error!bool {
+        const G = gemm_check;
+        const scale = std.math.ldexp(@as(f32, 1), -17);
+        const xs = G.acts(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(xs);
+        const ws = G.weights(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ws);
+        const wb = self.gpa.alloc(u8, ws.len) catch return error.OutOfMemory;
+        defer self.gpa.free(wb);
+        for (ws, wb) |v, *b| b.* = G.e4m3(v);
+        var x_d = try self.tensorCreate(xs.len * 4);
+        defer self.tensorDestroy(&x_d);
+        try self.tensorUpload(x_d, std.mem.sliceAsBytes(xs));
+        var y_d = try self.tensorCreate(G.m_pad * G.rows * 4);
+        defer self.tensorDestroy(&y_d);
+        try self.fp8CheckGemm(y_d, x_d, wb, scale);
+        const y = self.gpa.alloc(f32, G.m_pad * G.rows) catch return error.OutOfMemory;
+        defer self.gpa.free(y);
+        try self.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        for (0..G.m) |t| for (0..G.rows) |r| {
+            if (y[t * G.rows + r] == G.want(t, r) * scale) continue;
+            // The wide route stages nothing in `x_h16` to inspect.
+            if (self.fp8_wide) return false;
+            // Which half lost them: the f32 to f16 conversion or the multiply.
+            const h = self.gpa.alloc(f16, G.m * G.cols) catch return false;
+            defer self.gpa.free(h);
+            try self.tensorDownload(try self.view(self.x_h16, 0, h.len * 2), std.mem.sliceAsBytes(h));
+            var kept = true;
+            for (xs, h) |v, got| kept = kept and got == @as(f16, @floatCast(v * scale));
+            std.log.warn("vulkan: f16 subnormals are lost in the {s}", .{if (kept) "fp8 coop multiply" else "f32 to f16 conversion"});
+            return false;
+        };
+        return true;
+    }
+
+    /// The fp8 GEMM storing f16, on activations already in f16.
+    fn gemmCheckC16(self: *Context) Error!bool {
+        const G = gemm_check;
+        const x16 = self.gpa.alloc(f16, G.m_pad * G.cols) catch return error.OutOfMemory;
+        defer self.gpa.free(x16);
+        @memset(x16, 0);
+        for (0..G.m) |t| for (0..G.cols) |k| {
+            x16[t * G.cols + k] = @floatCast(G.x(t, k));
+        };
+        const wb = self.gpa.alloc(u8, G.rows * G.cols) catch return error.OutOfMemory;
+        defer self.gpa.free(wb);
+        for (0..G.rows) |r| for (0..G.cols) |k| {
+            wb[r * G.cols + k] = G.e4m3(G.w(r, k));
+        };
+        var x_d = try self.tensorCreate(x16.len * 2);
+        defer self.tensorDestroy(&x_d);
+        try self.tensorUpload(x_d, std.mem.sliceAsBytes(x16));
+        var y_d = try self.tensorCreate(G.m_pad * G.rows * 2);
+        defer self.tensorDestroy(&y_d);
+        try self.opMatmulCoopH16(y_d, x_d, G.m_pad, wb, G.rows, G.cols, true);
+        const y16 = self.gpa.alloc(f16, G.m_pad * G.rows) catch return error.OutOfMemory;
+        defer self.gpa.free(y16);
+        try self.tensorDownload(y_d, std.mem.sliceAsBytes(y16));
+        for (0..G.m) |t| for (0..G.rows) |r| {
+            if (@as(f32, y16[t * G.rows + r]) != @as(f32, @as(f16, @floatCast(G.want(t, r))))) return false;
+        };
+        return true;
+    }
+
+    /// The raw int8 GEMM at a shape `opMatmulCoopI8` gives to the kernel under test:
+    /// `m` 64 takes the register-tiled one, 128 the shared-memory one.
+    fn gemmCheckI8(self: *Context, m: usize) Error!bool {
+        const G = gemm_check;
+        const n: usize = if (m == 64) 64 else 128;
+        const xb = self.gpa.alloc(i8, m * G.cols) catch return error.OutOfMemory;
+        defer self.gpa.free(xb);
+        for (0..m) |t| for (0..G.cols) |k| {
+            xb[t * G.cols + k] = @intFromFloat(G.x(t, k));
+        };
+        const wb = self.gpa.alloc(i8, n * G.cols) catch return error.OutOfMemory;
+        defer self.gpa.free(wb);
+        for (0..n) |r| for (0..G.cols) |k| {
+            wb[r * G.cols + k] = @intFromFloat(G.w(r, k));
+        };
+        var x_d = try self.tensorCreate(xb.len);
+        defer self.tensorDestroy(&x_d);
+        try self.tensorUpload(x_d, std.mem.sliceAsBytes(xb));
+        var y_d = try self.tensorCreate(m * n * 4);
+        defer self.tensorDestroy(&y_d);
+        try self.opMatmulCoopI8(y_d, x_d, m, null, std.mem.sliceAsBytes(wb), n, G.cols);
+        const y = self.gpa.alloc(i32, m * n) catch return error.OutOfMemory;
+        defer self.gpa.free(y);
+        try self.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        for (0..m) |t| for (0..n) |r| {
+            var want: i32 = 0;
+            for (0..G.cols) |k| want += @as(i32, xb[t * G.cols + k]) * wb[r * G.cols + k];
+            if (y[t * n + r] != want) return false;
+        };
+        return true;
+    }
+
+    fn gemmCheckI8Reg(self: *Context) Error!bool {
+        return self.gemmCheckI8(64);
+    }
+
+    fn gemmCheckI8Shared(self: *Context) Error!bool {
+        return self.gemmCheckI8(128);
+    }
+
     fn screenCoopTiles(self: *Context, gpa: std.mem.Allocator) void {
         const t_start = std.Io.Clock.real.now(self.io);
         // How much better than the 64x64 default a tile must measure before this coarse
@@ -4827,12 +5832,9 @@ pub const Context = struct {
         };
         const sg: ?u32 = if (self.coop_pinned_subgroup != 0) self.coop_pinned_subgroup else null;
         inline for (.{ .{ false, false }, .{ true, false }, .{ true, true } }, 0..) |cfg, i| {
-            const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], self.coop_i8_m, self.coop_i8_n, wm, wn);
+            const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], self.coop_i8_m, self.coop_i8_n, self.coop_i8_k, wm, wn);
             defer gpa.free(code);
-            try check(self.d.CreateShaderModule(self.device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &mods[i]));
+            mods[i] = try createModule(gpa, &self.d, self.device, self.module_rules, "coop int8 shared GEMM", code) orelse return error.KernelExceedsDevice;
             _ = try createCoopPipe(self.io, &self.d, self.device, self.pipe_cache, self.has_feedback, mods[i], self.pipeline_layout, sg, &pipes[i]);
         }
 
@@ -4850,8 +5852,9 @@ pub const Context = struct {
         self.shader_coop_i8_fs16 = mods[2];
         self.coop_i8_wg_m = 2 * wm;
         self.coop_i8_wg_n = (nwarps / 2) * wn;
-        // Cached k-major int8 weights were transposed for the previous tile's stride.
-        self.evictWeights();
+        // Cached k-major int8 weights were transposed for the previous tile's stride;
+        // this also empties the cache.
+        self.verifyGemms();
     }
 
     fn coopF16WDispatch(
@@ -4871,6 +5874,25 @@ pub const Context = struct {
         /// held one, so it takes 1.
         act_div: f32,
     ) Error!void {
+        return self.coopF16WDispatchOut(y, y_off, x, m, w_buf, rows, cols, bias_buf, bias_off, bf16_ab, act_div, 1.0);
+    }
+
+    /// `coopF16WDispatch` with the product multiplied by `out_scale` before the bias.
+    fn coopF16WDispatchOut(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w_buf: vk.Buffer,
+        rows: usize,
+        cols: usize,
+        bias_buf: vk.Buffer,
+        bias_off: usize,
+        bf16_ab: bool,
+        act_div: f32,
+        out_scale: f32,
+    ) Error!void {
         // x and y are read and written at their own `dt`; the GEMM between is f16 (or
         // bf16) operands into an f32 accumulator whatever they are.
         std.debug.assert(x.dt != .f16 or act_div == 1.0);
@@ -4882,7 +5904,7 @@ pub const Context = struct {
             .u2 = @intCast(n_pad),
             .u3 = @intCast(y_off),
             .u4 = @intCast(bias_off),
-            .f0 = act_div,
+            .f0 = act_div * out_scale,
         }, m * rows, 1, 1);
     }
 
@@ -4910,7 +5932,7 @@ pub const Context = struct {
             .n_pad = self.coopNPad(rows),
             .k_pad = std.mem.alignForward(usize, cols, 64),
         };
-        try self.ensureDeviceBuffer(&self.x_h16, sh.m_pad * sh.k_pad * 2);
+        try self.ensureStaging(&self.x_h16, sh.m_pad * sh.k_pad * 2);
         try self.ensureDeviceBuffer(&self.y_pad, sh.m_pad * sh.n_pad * 4);
         return sh;
     }
@@ -4942,11 +5964,11 @@ pub const Context = struct {
         const k_pad = sh.k_pad;
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
         try self.opBegin();
-        var set = self.bindViews(.{ self.x_h16, self.x_h16, self.y_pad, raw(w_buf) });
-        self.d.CmdBindPipeline(self.cmd, .compute, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ self.x_h16, self.x_h16, self.y_pad, raw(w_buf) });
+        try self.bind(self.cmd, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
+        self.bindSet(self.pipeline_layout, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(n_pad / self.coop_wg_n), @intCast(m_pad / self.coop_wg_m), 1);
+        self.dispatch(@intCast(n_pad / self.coop_wg_n), @intCast(m_pad / self.coop_wg_m), 1);
         try self.opEnd();
     }
 
@@ -5027,6 +6049,13 @@ pub const Context = struct {
         return dt.isBlockQuant();
     }
 
+    /// Whether this dtype's kernels honour `weight_noise`: every block quant, whose
+    /// decode is the dual GEMV and whose batched route the dequant expansion, and both
+    /// draw it. The CUDA backend's answer is its own.
+    pub fn weightNoiseSupported(dt: @import("tp_core").dtype.DType) bool {
+        return dualGemv(dt);
+    }
+
     /// The codebook blob the four IQ formats decode through, as a raw weight
     /// buffer (`iq_grid.blob` is a stable comptime address, so the pointer-keyed
     /// weight cache holds it like any other). Null for every format whose decode
@@ -5061,12 +6090,14 @@ pub const Context = struct {
             else => return error.UnsupportedDType,
         };
         const tbl = try self.iqTable(dt);
-        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        const w_db = try self.weightRaw(w_bytes);
         try self.opElt(entry, w_db, x, y, tbl, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(cols),
             .u2 = @intCast(y_off),
             .f0 = scale,
+            .u6 = self.noiseKey(w_bytes),
+            .f1 = self.weight_noise.sigma(),
         }, (rows + 1) / 2, 1, 1); // two rows a subgroup (`quant.gemvQ2`)
     }
 
@@ -5079,7 +6110,7 @@ pub const Context = struct {
             else => return error.UnsupportedDType,
         };
         const tbl = try self.iqTable(dt);
-        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        const w_db = try self.weightRaw(w_bytes);
         try self.opElt(entry, w_db, x, y, tbl, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(cols),
@@ -5087,16 +6118,112 @@ pub const Context = struct {
             .u3 = @intCast(n),
             .u4 = @intCast(y_pitch),
             .f0 = scale,
+            .u6 = self.noiseKey(w_bytes),
+            .f1 = self.weight_noise.sigma(),
         }, rows, 1, 1);
     }
 
     /// Stage a decode activation `x` (f32[cols]) as q8_1 blocks in `q8_act`, for any
     /// number of `opGemvQuantDualQ8` against it.
     pub fn opGemvQuantizeX(self: *Context, x: DeviceBuffer, cols: usize) Error!void {
+        return self.opGemvQuantizeXRows(x, 1, cols);
+    }
+
+    /// `opGemvQuantizeX` for `m` rows of `x`, each in its own segment of `q8_act` (the
+    /// one-row layout), for `opGemvQuantDualQ8N`.
+    pub fn opGemvQuantizeXRows(self: *Context, x: DeviceBuffer, m: usize, cols: usize) Error!void {
         std.debug.assert(cols % 32 == 0);
         const nblk = cols / 32;
-        try self.ensureDeviceBuffer(&self.q8_act, nblk * 8 + cols);
-        try self.opElt(.quantize_q8_1, x, self.q8_act, null, null, .{ .u0 = @intCast(nblk) }, nblk, 1, 1);
+        try self.ensureDeviceBuffer(&self.q8_act, m * (nblk * 8 + cols));
+        try self.opElt(.quantize_q8_1, x, self.q8_act, null, null, .{ .u0 = @intCast(m * nblk), .u1 = @intCast(nblk) }, m * nblk, 1, 1);
+    }
+
+    /// `opGemvQuantDualQ8` over `n` <= 4 staged rows from `first`, each bit-identical to a
+    /// one-row launch: `y[y_off + t * y_pitch + row]`. Needs `OpSDot` (`has_int_dot`).
+    pub fn opGemvQuantDualQ8N(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, y_pitch: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, first: usize, n: usize) Error!void {
+        std.debug.assert(self.has_int_dot and cols % dt.blockElems() == 0 and n >= 1 and n <= 4);
+        std.debug.assert(self.q8_act.size >= (first + n) * (cols / 32 * 8 + cols));
+        const entry: Elt = switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| @field(Elt, "gemv4_dual_" ++ @tagName(t) ++ "_sdot"),
+            else => return error.UnsupportedDType,
+        };
+        const tbl = try self.iqTable(dt);
+        const w_db = try self.weightRaw(w_bytes);
+        try self.opElt(entry, w_db, self.q8_act, y, tbl, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .u3 = @intCast(n),
+            .u4 = @intCast(y_pitch),
+            .u5 = @intCast(first),
+            .f0 = scale,
+            .u6 = self.noiseKey(w_bytes),
+            .f1 = self.weight_noise.sigma(),
+        }, rows, 1, 1);
+    }
+
+    /// Routed experts, one activation row per slot: `y[y_off + s * rows + row] = scale *
+    /// dot(W_e[row], x[s / x_div])` for each slot s < `slots`, e the u32 at word s of `y`'s
+    /// buffer (where `opMoeRoute` wrote it) and `w_bytes` every expert's weights back to
+    /// back. `x` null reads the q8_1 rows `opGemvQuantizeXRows` staged (needs `OpSDot`),
+    /// otherwise the f32 rows of `x`. Each row is bit-identical to the one-row launch on
+    /// that expert's weights. Runs without weight noise.
+    pub fn opGemvExperts(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: ?DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, slots: usize, x_div: usize) Error!void {
+        std.debug.assert(cols % dt.blockElems() == 0 and slots >= 1 and x_div >= 1);
+        std.debug.assert(!self.weight_noise.on());
+        if (x == null) std.debug.assert(self.has_int_dot and self.q8_act.size >= (slots - 1) / x_div * (cols / 32 * 10 * 4) + cols / 32 * 10 * 4);
+        const entry: Elt = switch (dt) {
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| if (x == null)
+                @field(Elt, "gemvx_dual_" ++ @tagName(t) ++ "_sdot")
+            else
+                @field(Elt, "gemvx_dual_" ++ @tagName(t)),
+            else => return error.UnsupportedDType,
+        };
+        const tbl = try self.iqTable(dt);
+        const w_db = try self.weightRaw(w_bytes);
+        const per = dual_table.rowGroups(rows);
+        try self.opElt(entry, w_db, x orelse self.q8_act, y, tbl, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .u3 = @intCast(slots),
+            .u4 = @intCast(per),
+            .u5 = @intCast(x_div),
+            .f0 = scale,
+        }, slots * per * dual_table.row_wg / dual_table.host_sg, 1, 1);
+    }
+
+    /// `y[y_off + t * rows + row] = scale * dot(W[row], x[t])` for `m` rows of x, W f32
+    /// row-major, one subgroup a weight row (`Caps.f32Rows`).
+    pub fn opGemvRowsF32(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, rows: usize, cols: usize, m: usize, scale: f32) Error!void {
+        std.debug.assert(cols % 4 == 0 and w_bytes.len == rows * cols * 4);
+        try self.opElt(.gemv_rows_f32, try self.weightRaw(w_bytes), x, y, null, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .u3 = @intCast(m),
+            .u4 = @intCast(rows),
+            .f0 = scale,
+        }, rows, 1, 1);
+    }
+
+    pub const MoeGating = enum(u32) { sigmoid = 0, softmax = 1 };
+
+    /// Route `seq` rows of `logits` (`n_experts` wide) to their `used` best experts by gate
+    /// plus `bias`, on the device: ids as u32 words at `out[ids_off + t * used ..]`, weights
+    /// at `out[w_off + t * used ..]`, normalized to their sum when `normalize`, times
+    /// `scale`. The selection is `k2_horizon.route`'s.
+    pub fn opMoeRoute(self: *Context, logits: DeviceBuffer, bias: DeviceBuffer, out: DeviceBuffer, seq: usize, n_experts: usize, used: usize, gating: MoeGating, normalize: bool, scale: f32, ids_off: usize, w_off: usize) Error!void {
+        try self.opElt(.moe_route, logits, bias, out, null, .{
+            .u0 = @intCast(seq),
+            .u1 = @intCast(n_experts),
+            .u2 = @intCast(used),
+            .u3 = @intFromEnum(gating),
+            .u4 = @intCast(ids_off),
+            .u5 = @intCast(w_off),
+            .u6 = @intFromBool(normalize),
+            .f0 = scale,
+        }, seq, 1, 1);
     }
 
     /// `opGemvQuantDual` against the q8_1 activation `opGemvQuantizeX` staged: four
@@ -5104,16 +6231,23 @@ pub const Context = struct {
     pub fn opGemvQuantDualQ8(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         std.debug.assert(cols % dt.blockElems() == 0 and self.q8_act.size >= cols / 32 * 4 + cols);
         const entry: Elt = switch (dt) {
-            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| @field(Elt, "gemv_dual_" ++ @tagName(t) ++ "_q8"),
+            // `OpSDot` where the device has it, bit-identical to `opGemvQuantDualQ8N`'s rows
+            // (both `NoContraction`); the `_q8` twin's dot is four scalar products.
+            inline .q2_k, .q3_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q4_k, .q5_k, .q6_k, .q1_0, .q2_0_g64, .q2_0_g128 => |t| if (self.has_int_dot)
+                @field(Elt, "gemv_dual_" ++ @tagName(t) ++ "_sdot")
+            else
+                @field(Elt, "gemv_dual_" ++ @tagName(t) ++ "_q8"),
             else => return error.UnsupportedDType,
         };
         const tbl = try self.iqTable(dt);
-        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        const w_db = try self.weightRaw(w_bytes);
         try self.opElt(entry, w_db, self.q8_act, y, tbl, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(cols),
             .u2 = @intCast(y_off),
             .f0 = scale,
+            .u6 = self.noiseKey(w_bytes),
+            .f1 = self.weight_noise.sigma(),
         }, rows, 1, 1);
     }
 
@@ -5125,12 +6259,12 @@ pub const Context = struct {
     /// barriers.
     fn quantWeight16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, comptime bf16: bool) Error!vk.Buffer {
         std.debug.assert(cols % 32 == 0);
-        try self.ensureDeviceBuffer(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
+        try self.ensureStaging(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
         if (bench_bq_skip == .expand) return self.deq_f16k.buf;
         // GGUF weights carry no per-tensor scale, and the dequantizers take none.
         std.debug.assert(scale == 1.0);
-        try self.ensureDeviceBuffer(&self.deq_rows, rows * cols * 2);
-        const w_db: DeviceBuffer = .{ .buf = try self.weightBufferRaw(w_bytes), .mem = .null_handle, .size = 0 };
+        try self.ensureStaging(&self.deq_rows, rows * cols * 2);
+        const w_db = try self.weightRaw(w_bytes);
         const entry: Elt = switch (dt) {
             inline .q8_0,
             .q4_0,
@@ -5149,10 +6283,14 @@ pub const Context = struct {
             .q2_0_g64,
             .q2_0_g128,
             => |t| @field(Elt, "dequant_" ++ @tagName(t) ++ (if (bf16) "_bf16" else "_f16")),
+            .f8_e4m3 => if (bf16) .dequant_fp8_bf16 else .dequant_fp8_f16,
             else => return error.UnsupportedDType,
         };
         const elems = rows * cols;
-        try self.opElt(entry, w_db, self.deq_rows, try self.iqTable(dt), null, .{ .u0 = @intCast(elems) }, elems / 2, 1, 1);
+        // fp8 decodes through its e4m3 table, unscaled (`f0`): every e4m3 value is exact
+        // at 16 bits, and the per-tensor scale is the caller's to apply after the GEMM.
+        const tbl: ?DeviceBuffer = if (dt == .f8_e4m3) .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(&fp8_table)), .mem = .null_handle, .size = 0 } else try self.iqTable(dt);
+        try self.opElt(entry, w_db, self.deq_rows, tbl, null, .{ .u0 = @intCast(elems), .u6 = self.noiseKey(w_bytes), .f0 = 1.0, .f1 = self.weight_noise.sigma() }, elems / 2, 1, 1);
         if (bench_bq_skip == .pack) return self.deq_f16k.buf;
 
         const pairs = self.coopNPad(rows) / 2;
@@ -5164,6 +6302,17 @@ pub const Context = struct {
             .u3 = @intCast(pairs),
         }, pairs * chunks, 1, 1);
         return self.deq_f16k.buf;
+    }
+
+    /// fp8 GEMM for a device whose coop multiply flushes f16 subnormals (`fp8_wide`):
+    /// `y[m][rows] = scale * (x @ Wᵀ) + bias`, the e4m3 weight expanded per call to f16
+    /// (exact, unscaled) and run on the f16-weight coop GEMM, whose tile the device
+    /// chose. The activation is staged unscaled, so nothing lands in a subnormal that
+    /// the folded `pipe_coop` would have put there. `y_off` in elements.
+    pub fn opMatmulFp8Wide(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32) Error!void {
+        std.debug.assert(self.fp8_wide and self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.quantWeight16K(.f8_e4m3, w_bytes, rows, cols, 1.0, false);
+        return self.coopF16WDispatchOut(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, scale);
     }
 
     /// Block-quant tensor-core GEMM: `y[m][rows] = dequant(W) @ x`, the weight
@@ -5232,15 +6381,15 @@ pub const Context = struct {
             .w4a8 => |q| try self.w4a8Decode(q.packed_bytes, q.s_rel, q.levels, rows, cols, q.group_size),
         };
         const n_pad = self.coopNPad(rows);
-        try self.ensureDeviceBuffer(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
+        try self.ensureStaging(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
         const sc = try self.smallBuffer(std.mem.sliceAsBytes(row_scale));
         const push: [4]u32 = .{ @intCast(std.mem.alignForward(usize, rows, tile_n) / 4), @intCast(rows), @intCast(n_pad), @intCast(cols) };
         try self.opBegin();
-        var set = self.bindViews(.{ raw(wbuf), self.deq_f16k, raw(sc), raw(try self.dummyBuf()) });
-        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ raw(wbuf), self.deq_f16k, raw(sc), raw(try self.dummyBuf()) });
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast((rows + 31) / 32), @intCast((cols + 255) / 256), 1);
+        self.dispatch(@intCast(std.math.divCeil(usize, rows, self.wo_pack_rows) catch unreachable), @intCast((cols + 255) / 256), 1);
         try self.opEnd();
         return self.coopF16WDispatch(y, y_off, x, m, self.deq_f16k.buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf16, 1.0);
     }
@@ -5249,12 +6398,12 @@ pub const Context = struct {
     /// in one dispatch: a layer's residual add and hidden-size norm (`coopmat.buildAddRms`).
     pub fn opAddRmsNorm(self: *Context, x: DeviceBuffer, t: ?DeviceBuffer, w: DeviceBuffer, out: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
         try self.opBegin();
-        var set = self.bindViews(.{ x, t orelse x, w, out });
+        const set = self.bindViews(.{ x, t orelse x, w, out });
         const push: EltPush = .{ .u1 = @intCast(dim), .u2 = @intFromBool(t != null), .f0 = eps };
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_add_rms);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        try self.bind(self.cmd, self.pipe_add_rms);
+        self.bindSet(self.pipeline_layout_e, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows), 1, 1);
+        self.dispatch(@intCast(rows), 1, 1);
         try self.opEnd();
     }
 
@@ -5310,22 +6459,23 @@ pub const Context = struct {
     /// full f32 copy of the activation through global memory). Exposed so a bench can state
     /// which path it measured instead of inferring it from the timing.
     pub fn hasFusedI8Prep(self: *const Context, cols: usize) bool {
-        return self.i8_prep_ok and coopmat.fusedPrepChunk(cols) != null;
+        if (self.i8_prep.get(@intCast(cols))) |p| if (p.pipe == .null_handle) return false;
+        return self.i8_prep_ok and coopmat.fusedPrepPlan(cols, self.module_rules.max_shared) != null;
     }
 
     /// The fused int8 prep for `cols`, built on first use; `.null_handle` where it has no
-    /// build (`hasFusedI8Prep`), which takes the 3-pass chain.
+    /// build (`hasFusedI8Prep`) or the device refused it, which takes the 3-pass chain.
     fn i8PrepPipe(self: *Context, cols: usize) Error!vk.Pipeline {
         if (force_i8_prep_3pass or !self.hasFusedI8Prep(cols)) return .null_handle;
         const key: u32 = @intCast(cols);
         if (self.i8_prep.get(key)) |p| return p.pipe;
-        const code = coopmat.buildFusedPrepI8(self.gpa, key) catch return error.OutOfMemory;
+        const code = coopmat.buildFusedPrepI8(self.gpa, key, self.module_rules.max_shared) catch return error.OutOfMemory;
         defer self.gpa.free(code);
-        var shader: vk.ShaderModule = .null_handle;
-        try check(self.d.CreateShaderModule(self.device, &.{
-            .code_size = code.len,
-            .p_code = @ptrCast(@alignCast(code.ptr)),
-        }, null, &shader));
+        const shader = try createModule(self.gpa, &self.d, self.device, self.module_rules, "fused int8 prep", code) orelse {
+            // Remembered, so the width is not rebuilt and refused on every call.
+            self.i8_prep.put(self.gpa, key, .{ .shader = .null_handle, .pipe = .null_handle }) catch return error.OutOfMemory;
+            return .null_handle;
+        };
         errdefer self.d.DestroyShaderModule(self.device, shader, null);
         var pipe: vk.Pipeline = .null_handle;
         const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
@@ -5399,20 +6549,6 @@ pub const Context = struct {
         return self.opAttnScoresPipe(self.pipe_scores, s, q16, k16, push, gx, gy, gz);
     }
 
-    /// head_dim-512 variant (the SD-family VAE's mid-block attention).
-    pub fn opAttnScoresSd(
-        self: *Context,
-        s: DeviceBuffer,
-        q16: DeviceBuffer,
-        k16: DeviceBuffer,
-        push: EltPush,
-        gx: usize,
-        gy: usize,
-        gz: usize,
-    ) Error!void {
-        return self.opAttnScoresPipe(self.pipe_scores_sd, s, q16, k16, push, gx, gy, gz);
-    }
-
     /// head_dim-384 variant (Wan VAE mid-block attention).
     pub fn opAttnScoresVae(
         self: *Context,
@@ -5441,11 +6577,11 @@ pub const Context = struct {
         std.debug.assert(pipe != .null_handle);
         try self.opBegin();
         // Binding 3 is the same S buffer viewed as u32 (coalesced copy-out).
-        var set = self.bindViews(.{ k16, q16, s, s });
-        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ k16, q16, s, s });
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout_e, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, @intCast(gx), @intCast(gy), @intCast(gz));
+        self.dispatch(@intCast(gx), @intCast(gy), @intCast(gz));
         try self.opEnd();
     }
 
@@ -5470,11 +6606,11 @@ pub const Context = struct {
         };
         std.debug.assert(pipe != .null_handle);
         try self.opBegin();
-        var set = self.bindViews(.{ k16, q16, out, v16 });
-        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ k16, q16, out, v16 });
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout_e, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, 1, @intCast(gy), @intCast(gz));
+        self.dispatch(1, @intCast(gy), @intCast(gz));
         try self.opEnd();
     }
 
@@ -5493,11 +6629,11 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_attn_out != .null_handle);
         try self.opBegin();
-        var set = self.bindViews(.{ s, v16, out, md });
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_attn_out);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        const set = self.bindViews(.{ s, v16, out, md });
+        try self.bind(self.cmd, self.pipe_attn_out);
+        self.bindSet(self.pipeline_layout_e, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
-        self.d.CmdDispatch(self.cmd, 1, @intCast(gy), @intCast(gz));
+        self.dispatch(1, @intCast(gy), @intCast(gz));
         try self.opEnd();
     }
 
@@ -5508,12 +6644,14 @@ pub const Context = struct {
     fn eltPipe(self: *Context, which: Elt) Error!vk.Pipeline {
         const i = @intFromEnum(which);
         if (self.pipes_e[i] == .null_handle) {
-            const m: EltMaker = .{ .d = &self.d, .device = self.device, .cache = self.pipe_cache, .layout = self.pipeline_layout_e, .spv_e = self.spv_e, .spv_dual = self.spv_dual, .io = self.io, .feedback = self.has_feedback };
+            const m: EltMaker = .{ .d = &self.d, .device = self.device, .cache = self.pipe_cache, .layout = self.pipeline_layout_e, .spv_e = self.spv_e, .spv_dual = self.spv_dual, .io = self.io, .feedback = self.has_feedback, .rules = self.module_rules, .int_dot = self.has_int_dot };
             const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
             const compiled = try m.create(i, &self.pipes_e[i]);
             const dt = std.Io.Clock.awake.now(self.io).nanoseconds - t0;
             if (compiled) {
                 self.pipe_cache_dirty = true;
+                self.jit_count += 1;
+                self.jit_ns += @intCast(dt);
                 std.log.info("vulkan: compiled GPU kernel {t} in {d} ms (first use with this build and driver; cached from now on)", .{ which, @divTrunc(dt, std.time.ns_per_ms) });
             }
         }
@@ -5536,7 +6674,7 @@ pub const Context = struct {
                 break :save;
             };
             std.log.info("vulkan: saved pipeline cache ({d} MB) to {s}", .{ size >> 20, p });
-            if (std.fs.path.dirname(p)) |dir| pipe_cache_file.prune(self.gpa, self.io, dir, keep_pipeline_caches);
+            if (std.fs.path.dirname(p)) |dir| pipe_cache_file.prune(self.gpa, self.io, dir, pipe_cache_file.build_prefix, keep_pipeline_caches);
         }
         if (self.elt_used.eql(self.elt_used_loaded)) return;
         var text: std.ArrayList(u8) = .empty;
@@ -5567,19 +6705,18 @@ pub const Context = struct {
         const dummy = try self.dummyBuf();
         const es = elt_entry_sizes[@intFromEnum(which)];
         try self.opBegin();
-        var set = self.bindViews(.{
+        const set = self.bindViews(.{
             a orelse raw(dummy),
             b orelse raw(dummy),
             c orelse raw(dummy),
             dd orelse raw(dummy),
         });
-        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        try self.bind(self.cmd, pipe);
+        self.bindSet(self.pipeline_layout_e, set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
         // A row kernel takes its ROW count in total_x, one subgroup per row.
         const gx = if (es.rows) dual_table.rowGroups(total_x) else std.math.divCeil(usize, total_x, es.x) catch unreachable;
-        self.d.CmdDispatch(
-            self.cmd,
+        self.dispatch(
             @intCast(gx),
             @intCast(std.math.divCeil(usize, @max(total_y, 1), es.y) catch unreachable),
             @intCast(@max(total_z, 1)),
@@ -5597,8 +6734,9 @@ pub const Context = struct {
         const bufs = [5]DeviceBuffer{ q, k, v, out, bounds };
         var bi: [5]vk.DescriptorBufferInfo = undefined;
         var wr: [5]vk.WriteDescriptorSet = undefined;
-        for (&bi, &wr, bufs, 0..) |*b_, *w_, buf, i| {
+        for (&bi, &wr, bufs, &self.ab_binds, 0..) |*b_, *w_, buf, *ab, i| {
             b_.* = .{ .buffer = buf.buf, .offset = buf.off };
+            ab.* = .{ .buf = buf.buf, .off = buf.off };
             w_.* = .{
                 .dst_set = self.desc_set_ab,
                 .dst_binding = @intCast(i),
@@ -5620,11 +6758,11 @@ pub const Context = struct {
     /// fills the GPU for short-sequence encoders.
     pub fn attnBatchedDispatch(self: *Context, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         try self.opBegin();
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_ab);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_ab, 0, 1, @ptrCast(&self.desc_set_ab), 0, null);
+        try self.bind(self.cmd, self.pipe_ab);
+        self.bindSet(self.pipeline_layout_ab, self.desc_set_ab);
         const push: AttnBatchedPush = .{ .u0 = @intCast(total), .u1 = @intCast(n_heads), .u2 = @intCast(kv_heads), .u3 = @intCast(hd), .f0 = scale };
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout_ab, vk.ShaderStage.compute, 0, @sizeOf(AttnBatchedPush), &push);
-        self.d.CmdDispatch(self.cmd, @intCast((total * n_heads + 63) / 64), 1, 1);
+        self.dispatch(@intCast((total * n_heads + 63) / 64), 1, 1);
         try self.opEnd();
     }
 
@@ -5738,6 +6876,75 @@ pub const Context = struct {
         }
     }
 
+    /// The per-call scratch, each grown to the largest call it served and kept: the
+    /// host-visible staging (allocated like device memory and counted with it), then
+    /// the device buffers.
+    const host_scratch_fields = [_][]const u8{ "x_buf", "y_buf", "bias_buf", "staging" };
+    const scratch_fields = [_][]const u8{
+        "x_dev",       "y_dev",       "x_h16",  "stage_in32", "stage_out32", "y_pad",   "raw_dev",
+        "deq_rows",    "q8_act",      "deq_f16k", "i8_xr",    "i8_scale",    "i8_x",    "i8_acc",
+        "i8_acc1",     "i8_acc2",     "i8_acc3", "i8_partials", "wo32_t",    "wo32_r",  "wo32_p",
+        "i8_scalecat", "w4a8_t",      "i4_t",   "nvfp4_w16",
+    };
+    pub const ScratchMark = [host_scratch_fields.len + scratch_fields.len]u64;
+
+    /// The scratch sizes now, for `releaseScratchGrown`.
+    pub fn scratchMark(self: *const Context) ScratchMark {
+        var m: ScratchMark = undefined;
+        inline for (host_scratch_fields ++ scratch_fields, 0..) |f, i| m[i] = @field(self, f).size;
+        return m;
+    }
+
+    /// Free every scratch buffer that grew since `mark`: what a one-off forward (a
+    /// vision tower) sized must not stay resident under the model that runs next, which
+    /// regrows what it needs. Not inside a batch.
+    pub fn releaseScratchGrown(self: *Context, mark: ScratchMark) void {
+        std.debug.assert(!self.batching);
+        var waited = false;
+        inline for (host_scratch_fields, 0..) |f, i| {
+            const hb = &@field(self, f);
+            if (hb.size > mark[i]) {
+                if (!waited) {
+                    _ = self.d.DeviceWaitIdle(self.device);
+                    waited = true;
+                }
+                self.destroyHostBuffer(hb);
+            }
+        }
+        inline for (scratch_fields, host_scratch_fields.len..) |f, i| {
+            const db = &@field(self, f);
+            if (db.size > mark[i]) {
+                if (!waited) {
+                    _ = self.d.DeviceWaitIdle(self.device);
+                    waited = true;
+                }
+                const dt = db.dt;
+                self.freeDeviceBuffer(db.*);
+                db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+                db.dt = dt;
+            }
+        }
+    }
+
+    /// Free the device copy `smallBuffer` holds of any vector inside `bytes`: one keyed
+    /// on a freed host address serves its stale contents to whatever lands there next.
+    pub fn evictSmallRange(self: *Context, bytes: []const u8) void {
+        const lo = @intFromPtr(bytes.ptr);
+        const hi = lo + bytes.len;
+        var waited = false;
+        while (true) {
+            var it = self.small_bufs.keyIterator();
+            const key = while (it.next()) |k| {
+                if (k.* >= lo and k.* < hi) break k.*;
+            } else return;
+            if (!waited) {
+                _ = self.d.DeviceWaitIdle(self.device);
+                waited = true;
+            }
+            self.freeDeviceBuffer(self.small_bufs.fetchRemove(key).?.value);
+        }
+    }
+
     pub fn evictToFree(self: *Context, want: u64) u64 {
         if (want == 0) return 0;
         if (self.batching) self.flushBatch() catch {};
@@ -5767,6 +6974,97 @@ pub const Context = struct {
     /// the weight-pin budget so a model that fits stays fully resident.
     pub fn liveVram(self: *Context) u64 {
         return self.liveHeadroom();
+    }
+
+    // The accounting the residency planner reads, with the CUDA backend's meaning.
+
+    /// Room for another allocation, under an explicit budget if one is set.
+    pub fn headroom(self: *Context) u64 {
+        return self.budgetHeadroom();
+    }
+
+    pub fn deviceUsed(self: *const Context) u64 {
+        return self.device_used;
+    }
+
+    /// Bytes held by pinned cached weights (the resident model).
+    pub fn pinnedWeightBytes(self: *const Context) u64 {
+        return self.pinned_bytes;
+    }
+
+    /// Bytes held by unpinned cached weights, which free themselves under pressure.
+    pub fn evictableWeightBytes(self: *const Context) u64 {
+        var n: u64 = 0;
+        var it = self.weights.valueIterator();
+        while (it.next()) |w| if (!w.pinned) {
+            n += w.db.size;
+        };
+        return n;
+    }
+
+    pub fn largestAllocation(self: *const Context) u64 {
+        return self.max_alloc_bytes;
+    }
+
+    /// Bytes the dequant GEMMs' staging holds, sized to the widest weight expanded.
+    pub fn dequantScratchBytes(self: *const Context) u64 {
+        return self.deq_f16k.size + self.deq_rows.size + self.x_h16.size;
+    }
+
+    pub fn freeMiB(self: *Context) u64 {
+        const mi = self.memGetInfo() orelse return 0;
+        return mi.free >> 20;
+    }
+
+    /// A Vulkan device is not bound to a thread; this matches the CUDA backend's call.
+    pub fn bindThread(self: *Context) void {
+        _ = self;
+    }
+
+    pub fn isLost(self: *const Context) bool {
+        _ = self;
+        return device_lost.load(.acquire);
+    }
+
+    /// Ask the coordinator to free `needed` bytes another context holds; the bytes
+    /// it freed. Reachable without a failed allocation, for the residency planner.
+    pub fn requestForeignRoom(self: *Context, needed: u64) u64 {
+        const fr = self.foreign_reclaim orelse return 0;
+        const got = fr.call(fr.ctx, needed);
+        if (got != 0) std.log.info("[vram] cross-context reclaim: needed {d} MiB, another context freed {d} MiB ({d} MiB now free)", .{
+            needed >> 20, got >> 20, self.freeMiB(),
+        });
+        return got;
+    }
+
+    /// Register a source of weight bytes. Ignored once the slots are full: the copy
+    /// from the mapping is always correct, so running out costs speed only.
+    pub fn addWeightReader(self: *Context, wr: WeightReader) void {
+        for (&self.weight_readers) |*slot| if (slot.* == null) {
+            slot.* = wr;
+            return;
+        };
+    }
+
+    fn copyWeight(self: *const Context, dst: []u8, src: []const u8) void {
+        for (self.weight_readers) |maybe| if (maybe) |wr| {
+            if (wr.read(wr.ctx, dst, src)) return;
+        };
+        @memcpy(dst, src);
+    }
+
+    /// The weight-noise key of the raw weight `w_bytes` for the coming launch, 0 when the
+    /// noise is off. The decode GEMVs and the dequant read the same raw entry, so a
+    /// forward's decode and prefill see one perturbed model.
+    fn noiseKey(self: *const Context, w_bytes: []const u8) u32 {
+        if (!self.weight_noise.on()) return 0;
+        const e = self.weights.get(weightKey(w_bytes, .raw)) orelse return 0;
+        return self.weight_noise.key(e.noise_id);
+    }
+
+    /// Free every device copy of the weight `bytes` (the CUDA backend's name).
+    pub fn evictWeightBytes(self: *Context, bytes: []const u8) void {
+        self.evictWeightRange(bytes);
     }
 
     /// How many more bytes we may allocate before hitting the device
@@ -5917,6 +7215,12 @@ pub const Context = struct {
     /// submit time is CPU RECORDING, which is what says whether this backend is
     /// bound by the GPU, by the driver, or by the fence.
     pub var stat_ops: u64 = 0;
+    /// Record a compute barrier after every batched dispatch instead of only where
+    /// `hazards` finds a conflict (`TP_VK_FULLBAR`): the A/B arm, and the fallback
+    /// if tracking is ever in doubt.
+    pub var full_barriers: bool = false;
+    /// Compute barriers recorded: without `full_barriers`, the conflicts found.
+    pub var stat_barriers: u64 = 0;
     pub var stat_submits: u64 = 0;
     pub var stat_submit_ns: u64 = 0;
 
@@ -5963,30 +7267,53 @@ pub const Context = struct {
         try self.beginCmd();
         self.batching = true;
         self.batch_n = 0;
+        self.hazards.clear();
     }
 
     /// Submit everything recorded since beginBatch and wait for completion.
     pub fn endBatch(self: *Context) Error!void {
         std.debug.assert(self.batching);
         std.debug.assert(self.indep_remaining == 0); // group left open
+        self.closeHazards();
         self.batching = false;
         try self.submitAndWait();
+        self.batch_up_off = 0;
     }
 
     /// Abandon an in-progress batch (error paths): the recorded commands are
     /// dropped; the command buffer is reset on next use.
     pub fn abortBatch(self: *Context) void {
         self.batching = false;
+        self.batch_up_off = 0;
         self.indep_remaining = 0;
+        self.hazards.clear();
     }
 
     /// Submit the recording so far, wait, and resume with a fresh command
     /// buffer and descriptor ring.
     fn flushBatch(self: *Context) Error!void {
         std.debug.assert(self.batching);
+        const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
+        self.closeHazards();
         try self.submitAndWait();
+        self.batch_up_off = 0;
+        self.adaptBatchCap(@intCast(std.Io.Clock.awake.now(self.io).nanoseconds - t0));
         try self.beginCmd();
         self.batch_n = 0;
+    }
+
+    /// Keeps a submission near `batch_target_ns` on whatever device this is: a watchdog
+    /// resets the GPU when one runs for seconds (Windows TDR at 2 s, NVIDIA's
+    /// preemption timeout), and how many dispatches that is varies by orders of
+    /// magnitude between cards. Shrinks in proportion when a submission ran long,
+    /// doubles while they run short.
+    fn adaptBatchCap(self: *Context, took_ns: u64) void {
+        if (took_ns > batch_target_ns) {
+            const scaled = @as(u64, self.batch_cap) * batch_target_ns / took_ns;
+            self.batch_cap = @intCast(@max(batch_cap_min, scaled));
+        } else if (took_ns < batch_target_ns / 2 and self.batch_n >= self.batch_cap) {
+            self.batch_cap = @min(batch_flush_limit, self.batch_cap * 2);
+        }
     }
 
     /// Per-op prologue: outside a batch, start the one-shot command buffer;
@@ -5999,19 +7326,20 @@ pub const Context = struct {
         }
     }
 
-    /// Longest recording per submission. Uncapped batches trip the display
-    /// GPU's preemption watchdog (NVRM Xid 109 CTX SWITCH TIMEOUT) once a
-    /// single submission runs for seconds; ~64 dispatches keeps submissions
-    /// around 100 ms while still eliding ~98% of the fence waits.
+    /// Most dispatches per submission, which a fast GPU reaches within a few
+    /// submissions (`adaptBatchCap`); it still elides ~98% of the fence waits.
     const batch_flush_limit = 512;
+    const batch_cap_min = 4;
+    /// What a submission is held to: far under any watchdog.
+    const batch_target_ns: u64 = 250 * std.time.ns_per_ms;
 
     /// Declare that the next `n` recorded ops are pairwise independent (no
     /// op reads or writes a buffer another op in the group writes): no
     /// barrier is recorded between them, so their dispatches may overlap on
     /// the device, the tail waves of one fill with the next. One barrier is
-    /// still recorded after the group's last op. A mid-group flush (ring or
-    /// dispatch cap) is harmless: submit-and-wait is a stronger sync than
-    /// the elided barrier. Sync (non-batched) mode ignores grouping.
+    /// still recorded after the group's last op. Read only under
+    /// `full_barriers`: otherwise `hazards` decides from the bindings, which
+    /// cannot be told a wrong count. Sync (non-batched) mode ignores grouping.
     pub fn independent(self: *Context, n: usize) void {
         std.debug.assert(self.indep_remaining == 0);
         self.indep_remaining = n;
@@ -6025,14 +7353,8 @@ pub const Context = struct {
         const in_group = self.indep_remaining > 1;
         if (self.indep_remaining > 0) self.indep_remaining -= 1;
         if (self.batching) {
-            // DIAGNOSTIC (`TP_VK_NOBAR`): drop the barrier entirely. WRONG
-            // ANSWERS, valid timing, and the isolation that measured what these
-            // cost: an LLM decode runs 2.6x faster without them (9B q6_k 8.4 ->
-            // 21.6 tok/s, 27B mixed 3.9 -> 6.7), so a full global drain between
-            // every pair of the ~633 dispatches a token issues is where this
-            // backend's time goes -- not submission, which batching shows is
-            // worth 10%. See BACKEND.md §5.
-            if (!in_group and getenv("TP_VK_NOBAR") == null) {
+            // With hazard tracking on, `dispatch` already recorded what this needs.
+            if (full_barriers and !in_group and !self.no_barriers) {
                 const bar: vk.MemoryBarrier = if (getenv("TP_VK_BAR0") != null) .{
                     .src_access_mask = 0,
                     .dst_access_mask = 0,
@@ -6041,9 +7363,10 @@ pub const Context = struct {
                     .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
                 };
                 self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&bar), 0, null, 0, null);
+                stat_barriers += 1;
             }
             self.profStamp();
-            if (self.batch_n >= batch_flush_limit) try self.flushBatch();
+            if (self.batch_n >= self.batch_cap) try self.flushBatch();
         } else {
             self.profStamp();
             try self.submitAndWait();
@@ -6177,11 +7500,10 @@ pub const Context = struct {
             };
             self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.transfer, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
         }
-        self.d.CmdBindPipeline(self.cmd, .compute, if (dtype_f8) self.pipe_f8 else self.pipe_f32);
-        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&self.desc_set), 0, null);
+        try self.bind(self.cmd, if (dtype_f8) self.pipe_f8 else self.pipe_f32);
+        self.bindSet(self.pipeline_layout, self.desc_set);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, @sizeOf(Push), &push);
-        self.d.CmdDispatch(
-            self.cmd,
+        self.dispatch(
             @intCast(std.math.divCeil(usize, rows, wg_x * tile_n) catch unreachable),
             @intCast(std.math.divCeil(usize, m, wg_y * tile_m) catch unreachable),
             1,
@@ -6211,6 +7533,170 @@ pub const Context = struct {
         @memcpy(std.mem.sliceAsBytes(y), self.y_buf.mapped.?[0..y_size]);
     }
 };
+
+// Inside one batch: a copy reads what the first recorded upload wrote, the second upload
+// waits for that read, and one download returns both buffers.
+test "recorded uploads order against the batch's dispatches, and downloadMany waits once" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const n = 4096;
+    var a = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&a);
+    var b = try ctx.tensorCreate(n * 4);
+    defer ctx.tensorDestroy(&b);
+    var ones: [n]f32 = undefined;
+    var twos: [n]f32 = undefined;
+    for (&ones, &twos, 0..) |*o, *t, i| {
+        o.* = @floatFromInt(i);
+        t.* = -@as(f32, @floatFromInt(i));
+    }
+    try ctx.tensorUpload(a, std.mem.sliceAsBytes(&twos));
+    const submits = Context.stat_submits;
+    try ctx.beginBatch();
+    try ctx.opElt(.copy, b, a, null, null, .{ .u0 = n }, n, 1, 1);
+    try ctx.uploadRecorded(a, 0, std.mem.sliceAsBytes(&ones));
+    try ctx.opElt(.copy, a, b, null, null, .{ .u0 = n }, n, 1, 1);
+    try ctx.uploadRecorded(a, 0, std.mem.sliceAsBytes(&twos));
+    var got_a: [n]f32 = undefined;
+    var got_b: [n]f32 = undefined;
+    try ctx.downloadMany(&.{ .{ .db = a, .out = std.mem.sliceAsBytes(&got_a) }, .{ .db = b, .out = std.mem.sliceAsBytes(&got_b) } });
+    try ctx.endBatch();
+    try std.testing.expectEqualSlices(f32, &ones, &got_b);
+    try std.testing.expectEqualSlices(f32, &twos, &got_a);
+    // The download's submission and the empty one that ends the batch.
+    try std.testing.expectEqual(submits + 2, Context.stat_submits);
+}
+
+// Slots read their activation rows in pairs (x_div 2) and their experts out of order;
+// every row must be byte-identical to the one-row launch decode runs on that expert.
+test "a routed-expert GEMV row is the one-row GEMV on its expert, every format, f32 and q8" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const DType = tp_core.dtype.DType;
+    const rows = 64;
+    const cols = 512;
+    const experts = 3;
+    const ids = [_]u32{ 2, 0, 1, 2 };
+    const slots = ids.len;
+    const ids_words = 64;
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    const wf = try gpa.alloc(f32, experts * rows * cols);
+    defer gpa.free(wf);
+    for (wf) |*v| v.* = rnd.floatNorm(f32) * 0.05;
+    const xs = try gpa.alloc(f32, 2 * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = rnd.floatNorm(f32);
+    var x = try ctx.tensorCreate(xs.len * 4);
+    defer ctx.tensorDestroy(&x);
+    try ctx.tensorUpload(x, std.mem.sliceAsBytes(xs));
+    var y = try ctx.tensorCreate((ids_words + slots * rows) * 4);
+    defer ctx.tensorDestroy(&y);
+    try ctx.tensorUpload(y, std.mem.sliceAsBytes(&ids));
+    var ref = try ctx.tensorCreate(slots * rows * 4);
+    defer ctx.tensorDestroy(&ref);
+    const got = try gpa.alloc(f32, slots * rows);
+    defer gpa.free(got);
+    const want = try gpa.alloc(f32, slots * rows);
+    defer gpa.free(want);
+    // Each format's group lives to the end: the weight cache keys on the host pointer.
+    var groups: std.ArrayList([]align(8) u8) = .empty;
+    defer {
+        for (groups.items) |g| gpa.free(g);
+        groups.deinit(gpa);
+    }
+    var covered: usize = 0;
+    for ([_]DType{ .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_0, .q4_0, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s }) |dt| {
+        const per = dt.storageBytes(rows * cols);
+        const group = try gpa.alignedAlloc(u8, .of(u64), per * experts);
+        try groups.append(gpa, group);
+        _ = tp_core.quants.quantizeChunk(dt, wf, group, experts * rows, cols, null) catch continue;
+        covered += 1;
+        try ctx.registerWeightGroup(group);
+        for ([_]bool{ false, true }) |q8| {
+            if (q8 and !ctx.has_int_dot) continue;
+            errdefer std.debug.print("{t} {s}\n", .{ dt, if (q8) "q8" else "f32" });
+            if (q8) try ctx.opGemvQuantizeXRows(x, 2, cols);
+            try ctx.opGemvExperts(dt, y, ids_words, if (q8) null else x, group, 1.0, rows, cols, slots, 2);
+            try ctx.tensorDownload(try ctx.view(y, ids_words * 4, slots * rows * 4), std.mem.sliceAsBytes(got));
+            for (ids, 0..) |e, sl| {
+                const xr = try ctx.view(x, sl / 2 * cols * 4, cols * 4);
+                const w = group[e * per ..][0..per];
+                if (q8) {
+                    try ctx.opGemvQuantizeX(xr, cols);
+                    try ctx.opGemvQuantDualQ8(dt, ref, sl * rows, w, 1.0, rows, cols);
+                } else try ctx.opGemvQuantDual(dt, ref, sl * rows, xr, w, 1.0, rows, cols);
+            }
+            try ctx.tensorDownload(ref, std.mem.sliceAsBytes(want));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+        }
+    }
+    // ggml quantizes everything here but the two codebook formats that need an imatrix.
+    try std.testing.expect(covered >= 12);
+}
+
+test "a weight inside a registered group binds as a view, bit-identical to its own buffer" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const dt: tp_core.dtype.DType = .q4_0;
+    const rows = 256;
+    const cols = 1024;
+    const experts = 4;
+    const per = dt.storageBytes(rows * cols);
+    const group = try gpa.alignedAlloc(u8, .of(u64), per * experts);
+    defer gpa.free(group);
+    var prng = std.Random.DefaultPrng.init(3);
+    prng.random().bytes(group);
+    var off: usize = 0;
+    while (off < group.len) : (off += dt.blockBytes()) std.mem.writeInt(u16, group[off..][0..2], 0x2A66, .little);
+    // The same expert's bytes, copied, as a weight of its own.
+    const alone = try gpa.dupe(u8, group[2 * per ..][0..per]);
+    defer gpa.free(alone);
+    const xs = try gpa.alloc(f32, cols);
+    defer gpa.free(xs);
+    for (xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) - 6;
+    var x = try ctx.tensorCreate(cols * 4);
+    defer ctx.tensorDestroy(&x);
+    try ctx.tensorUpload(x, std.mem.sliceAsBytes(xs));
+    var y = try ctx.tensorCreate(2 * rows * 4);
+    defer ctx.tensorDestroy(&y);
+    try ctx.registerWeightGroup(group);
+    const before = ctx.weights.count();
+    try ctx.opGemvQuantDual(dt, y, 0, x, group[2 * per ..][0..per], 1.0, rows, cols);
+    try ctx.opGemvQuantDual(dt, y, 0, x, group[3 * per ..][0..per], 1.0, rows, cols);
+    // Two experts, one upload: the group's.
+    try std.testing.expectEqual(before + 1, ctx.weights.count());
+    try ctx.opGemvQuantDual(dt, y, 0, x, group[2 * per ..][0..per], 1.0, rows, cols);
+    try ctx.opGemvQuantDual(dt, y, rows, x, alone, 1.0, rows, cols);
+    const got = try gpa.alloc(f32, 2 * rows);
+    defer gpa.free(got);
+    try ctx.tensorDownload(y, std.mem.sliceAsBytes(got));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(got[rows..]), std.mem.sliceAsBytes(got[0..rows]));
+}
+
+test "every eltwise and dual kernel's bindings are tracked, and it writes only what it binds" {
+    const gpa = std.testing.allocator;
+    const dual_caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic, spv.cap_storage_buffer_16bit };
+    const spv_e = try patchKernelModule(gpa, eltwise_spv, &.{}, null);
+    defer gpa.free(spv_e);
+    const spv_dual = try patchKernelModule(gpa, dual_spv, &dual_caps, null);
+    defer gpa.free(spv_dual);
+    for (elt_entry_sizes) |es| {
+        const one = try spv.forEntry(gpa, if (es.src == .dual) spv_dual else spv_e, es.name);
+        defer gpa.free(one);
+        const acc = try hazard.bindingAccess(gpa, one);
+        errdefer std.debug.print("{s}: used {b:0>4} written {b:0>4} untracked {}\n", .{ es.name, acc.used, acc.written, acc.untracked });
+        try std.testing.expect(!acc.untracked);
+        try std.testing.expect(acc.written != 0);
+        try std.testing.expect(acc.written & ~acc.used == 0);
+    }
+}
 
 // GPU tests run only when a Vulkan device is actually present, and only
 // when opted in via the `testdata/gpu-tests` marker: the NVIDIA 580 driver
@@ -6854,7 +8340,53 @@ test "gpu a buffer view binds, uploads and downloads at its offset" {
     try std.testing.expectEqual(@as(f32, at - 1), got[at - 1]);
     try std.testing.expectEqual(@as(f32, 1), got[at]);
     try std.testing.expectEqual(@as(f32, at + len), got[at + len]);
-    try std.testing.expectError(error.UnalignedView, ctx.view(whole, 4, 4));
+    // Misaligned for this device: half its own alignment, where it demands more than 4.
+    if (ctx.storage_align > 4) try std.testing.expectError(error.UnalignedView, ctx.view(whole, ctx.storage_align / 2, 4));
+}
+
+test "gpu fused and 3-pass int8 prep hand the GEMM the same int8 activations" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const m = 37;
+    const cols = 3072;
+    if (!ctx.hasFusedI8Prep(cols)) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(5);
+    const xs = try gpa.alloc(f32, m * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = prng.random().floatNorm(f32) * 3;
+    var x_d = try ctx.tensorCreate(xs.len * 4);
+    defer ctx.tensorDestroy(&x_d);
+    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(xs));
+    var q: [2][]i8 = undefined;
+    var sc: [2][]f32 = undefined;
+    defer for (q, sc) |a, b| {
+        gpa.free(a);
+        gpa.free(b);
+    };
+    defer force_i8_prep_3pass = false;
+    for (0..2) |path| {
+        force_i8_prep_3pass = path == 1;
+        try ctx.opI8PrepR(x_d, m, cols, true);
+        q[path] = try gpa.alloc(i8, m * cols);
+        sc[path] = try gpa.alloc(f32, m);
+        try ctx.tensorDownload(ctx.i8_x, std.mem.sliceAsBytes(q[path]));
+        try ctx.tensorDownload(ctx.i8_scale, std.mem.sliceAsBytes(sc[path]));
+    }
+    var differ: usize = 0;
+    var worst: i32 = 0;
+    for (q[0], q[1]) |a, b| if (a != b) {
+        differ += 1;
+        worst = @max(worst, @as(i32, @intCast(@abs(@as(i32, a) - b))));
+    };
+    // The two compute the rotation in different orders, so a row's maximum, and its
+    // scale, can land an ulp apart; the int8 values may not differ at all.
+    var worst_ulp: u32 = 0;
+    for (sc[0], sc[1]) |a, b| worst_ulp = @max(worst_ulp, @abs(@as(i32, @bitCast(a)) - @as(i32, @bitCast(b))));
+    errdefer std.debug.print("int8 prep: {d}/{d} values differ (worst by {d}); scales up to {d} ulp apart\n", .{ differ, m * cols, worst, worst_ulp });
+    try std.testing.expectEqual(@as(usize, 0), differ);
+    try std.testing.expect(worst_ulp <= 1);
 }
 
 test "gpu block-quant prefill GEMM matches cpu reference" {
@@ -7334,6 +8866,56 @@ test "gpu matmul matches cpu reference" {
                 try std.testing.expectApproxEqAbs(wantf, y[t * crows + r], tol);
             }
         }
+    }
+
+    // The head-384 scores kernel, whose k-depth is a loop where 128's is unrolled.
+    if (ctx.pipe_scores_vae != .null_handle) {
+        const seq = 200;
+        const seq_pad = 256;
+        const n_heads = 2;
+        const hd = 384;
+        const scale: f32 = 0.25;
+        const q = try gpa.alloc(f32, seq * n_heads * hd);
+        defer gpa.free(q);
+        for (q) |*v| v.* = rand.floatNorm(f32);
+        const k = try gpa.alloc(f32, seq * n_heads * hd);
+        defer gpa.free(k);
+        for (k) |*v| v.* = rand.floatNorm(f32);
+        var q_d = try ctx.tensorCreate(seq_pad * n_heads * hd * 4);
+        defer ctx.tensorDestroy(&q_d);
+        var q16_d = try ctx.tensorCreate(seq_pad * n_heads * hd * 2);
+        defer ctx.tensorDestroy(&q16_d);
+        var k_d = try ctx.tensorCreate(seq * n_heads * hd * 4);
+        defer ctx.tensorDestroy(&k_d);
+        var k16_d = try ctx.tensorCreate(n_heads * hd * seq_pad * 2);
+        defer ctx.tensorDestroy(&k16_d);
+        var s_d = try ctx.tensorCreate(n_heads * seq_pad * seq_pad * 2);
+        defer ctx.tensorDestroy(&s_d);
+        try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+        try ctx.opElt(.f32_to_h16, q_d, null, null, q16_d, .{ .u0 = seq_pad * n_heads * hd / 2, .u1 = seq * n_heads * hd, .f0 = scale }, seq_pad * n_heads * hd / 2, 1, 1);
+        try ctx.opElt(.gather_kmajor_h16, k_d, null, null, k16_d, .{ .u0 = n_heads * hd * seq_pad / 2, .u1 = hd, .u2 = seq_pad, .u3 = seq, .u4 = n_heads }, n_heads * hd * seq_pad / 2, 1, 1);
+        try ctx.opAttnScoresVae(s_d, q16_d, k16_d, .{
+            .u0 = n_heads * hd,
+            .u1 = seq_pad,
+            .u2 = 0,
+            .u3 = 1,
+            .u4 = hd * seq_pad,
+            .u5 = seq_pad * seq_pad,
+        }, seq_pad / 128, seq_pad / 128, n_heads);
+        const s16 = try gpa.alloc(f16, n_heads * seq_pad * seq_pad);
+        defer gpa.free(s16);
+        try ctx.tensorDownload(s_d, std.mem.sliceAsBytes(s16));
+        for (0..n_heads) |h| for (0..seq) |qi| for (0..seq) |ji| {
+            var want: f64 = 0;
+            for (0..hd) |kk| {
+                const qa: f16 = @floatCast(q[(qi * n_heads + h) * hd + kk] * scale);
+                const ka: f16 = @floatCast(k[(ji * n_heads + h) * hd + kk]);
+                want += @as(f64, @floatCast(qa)) * @as(f64, @floatCast(ka));
+            }
+            const got: f32 = @floatCast(s16[(h * seq_pad + qi) * seq_pad + ji]);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 3e-2);
+        };
     }
 
     // Tensor-core attention scores vs an f16-rounded CPU reference.
@@ -8049,7 +9631,14 @@ test "gpu Mage-VAE kernels match their CPU references" {
         defer ctx.tensorDestroy(&s_d);
         var m_d = try ctx.tensorCreate(dim * 4);
         defer ctx.tensorDestroy(&m_d);
-        try ctx.opElt(.col_mean, m_d, s_d, null, null, .{ .u0 = dim, .u1 = rows }, dim, 1, 1);
+        // Two stages, as `mage_vae_gpu` runs it: scaled partial sums per chunk of rows,
+        // then their sum. A chunk below `rows` so both stages do something.
+        const chunk = 8;
+        const chunks = (rows + chunk - 1) / chunk;
+        var p_d = try ctx.tensorCreate(chunks * dim * 4);
+        defer ctx.tensorDestroy(&p_d);
+        try ctx.opElt(.col_mean, p_d, s_d, null, null, .{ .u0 = chunks * dim, .u1 = rows, .u2 = chunk, .u3 = dim, .f0 = 1.0 / @as(f32, rows) }, chunks * dim, 1, 1);
+        try ctx.opElt(.col_mean, m_d, p_d, null, null, .{ .u0 = dim, .u1 = chunks, .u2 = chunks, .u3 = dim, .f0 = 1 }, dim, 1, 1);
         const mean = try gpa.alloc(f32, dim);
         defer gpa.free(mean);
         try ctx.tensorDownload(m_d, std.mem.sliceAsBytes(mean));

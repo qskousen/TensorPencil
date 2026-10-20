@@ -59,7 +59,7 @@ const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 /// Which layers a hybrid CPU/GPU split pushes to the host. qwen3 is uniform
 /// attention, so both policies reduce to a descending-layer order (last layer
 /// migrates first); kept for interface parity with qwen35_cuda.
-pub const CpuSplitPolicy = enum { tail, attn };
+pub const CpuSplitPolicy = residency.CpuSplitPolicy;
 
 /// The encoder's tap stack `[seq][enc.tapCount()][hidden]` (see `qwen3_enc_dev`).
 /// Every GEMM goes through `lin_cuda` under `lin_cuda.encoder_gemm`, so a format with no

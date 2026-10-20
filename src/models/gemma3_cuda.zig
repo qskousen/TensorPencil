@@ -100,24 +100,7 @@ fn usesRing(cfg: gemma3.Config, l: usize) bool {
     return enable_local_ring and !cfg.isGlobal(l);
 }
 
-/// One contiguous copy between a ring buffer (row = pos%ring) and a linear
-/// host buffer (row = absolute pos). `abs` is the absolute position of the
-/// first row, `dev` the ring row it maps to, `n` the row count.
-const RingSeg = struct { abs: usize, dev: usize, n: usize };
-
-/// The (up to two) segments covering the live positions `[max(0,len-ring), len)`
-/// of a ring, split where the ring wraps. Used to translate a LOCAL layer's KV
-/// between its device ring and the linear host shadow on offload/promote.
-fn ringSegments(len: usize, ring: usize) [2]RingSeg {
-    const start = if (len > ring) len - ring else 0;
-    const total = len - start; // <= ring
-    const first_dev = start % ring;
-    const n1 = @min(total, ring - first_dev);
-    return .{
-        .{ .abs = start, .dev = first_dev, .n = n1 },
-        .{ .abs = start + n1, .dev = 0, .n = total - n1 },
-    };
-}
+const ringSegments = kvmod.ringSegments;
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
@@ -1242,30 +1225,6 @@ const Bufs = struct {
         self.* = undefined;
     }
 };
-
-test "ringSegments covers the live window contiguously" {
-    // For each (len, ring), the segments must tile [max(0,len-ring), len)
-    // exactly, mapping each absolute position to ring row pos%ring, with no
-    // segment wrapping the ring boundary.
-    const cases = [_][2]usize{
-        .{ 5, 8 }, .{ 8, 8 }, .{ 9, 8 }, .{ 16, 8 }, .{ 17, 8 }, .{ 20, 8 },
-        .{ 1000, 1152 }, .{ 1152, 1152 }, .{ 1153, 1152 }, .{ 3000, 1152 },
-    };
-    for (cases) |c| {
-        const len = c[0];
-        const ring = c[1];
-        const start = if (len > ring) len - ring else 0;
-        var abs = start;
-        for (ringSegments(len, ring)) |s| {
-            if (s.n == 0) continue;
-            try std.testing.expectEqual(abs, s.abs); // contiguous, no gap
-            try std.testing.expectEqual(abs % ring, s.dev); // ring row of abs
-            try std.testing.expect(s.dev + s.n <= ring); // no wrap within a segment
-            abs += s.n;
-        }
-        try std.testing.expectEqual(len, abs); // covered exactly up to len
-    }
-}
 
 // Gated on -Dintegration + a CUDA device + the real 12B checkpoint: greedy
 // regeneration after `restoreCheckpoint` must be TOKEN-IDENTICAL. The geometry

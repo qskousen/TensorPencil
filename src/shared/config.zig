@@ -313,15 +313,16 @@ pub const Scheduler = enum(u8) {
     }
 };
 
-/// Compute backend. Mirrors `pipeline.Backend`; kept here so the config data
-/// model stays free of an engine dependency (app.zig maps it across). Diffusion
-/// supports all four; the chat LLM only supports the two CUDA variants today
-/// (non-CUDA selections error at load, see chat.Session.init).
+/// Compute backend. Mirrors `pipeline.Backend`, plus `auto`, which the machine
+/// running the engine resolves from its own devices (`pipeline.detectBackend`);
+/// kept here so the config data model stays free of an engine dependency
+/// (`pipeline_map` maps it across). New values go last: the wire carries the number.
 pub const Backend = enum(u8) {
     cpu,
     vulkan,
     zig_cuda,
     cuda,
+    auto,
 
     fn fromStr(s: []const u8) ?Backend {
         inline for (@typeInfo(Backend).@"enum".fields) |f| {
@@ -957,11 +958,11 @@ pub const Config = struct {
     vram_limit_frac: f32 = 0.95,
     /// Compute backend for the chat LLM. Only the CUDA variants work today
     /// (non-CUDA errors cleanly at load). Changing it forces a reload.
-    llm_backend: Backend = .zig_cuda,
+    llm_backend: Backend = .auto,
     /// Compute backend for image generation. Independent of `llm_backend`, the
     /// two run as separate backend objects, so e.g. LLM on CUDA + diffusion on
     /// Vulkan is fine. Changing it rebuilds the diffusion session live.
-    diff_backend: Backend = .zig_cuda,
+    diff_backend: Backend = .auto,
     /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
     vae_decode: VaeDecode = .auto,
     /// The precision dial of the text encoder, the denoiser and the VAE. Per render:
@@ -1615,6 +1616,14 @@ pub const Config = struct {
             return cfg;
         }
 
+        // JSON that does not parse (a hand edit, a truncated write, another version's
+        // field) is set aside, never migrated: the legacy parser finds nothing in it,
+        // and the save after it would write the defaults over every setting.
+        if (looksLikeJson(bytes)) {
+            setAside(io, gpa, path);
+            return cfg;
+        }
+
         // Legacy `key = value` fallback: parse, then rewrite as JSON in place.
         var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
@@ -1630,6 +1639,24 @@ pub const Config = struct {
         cfg.save(io, gpa, environ, path_override) catch |err|
             std.log.warn("config: migrate to JSON failed: {t}", .{err});
         return cfg;
+    }
+
+    fn looksLikeJson(bytes: []const u8) bool {
+        const t = std.mem.trimStart(u8, bytes, " \t\r\n");
+        return t.len > 0 and t[0] == '{';
+    }
+
+    /// Move an unreadable settings file to `<path>.unparsed-<unix seconds>`.
+    fn setAside(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
+        const secs = @divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s);
+        const dest = std.fmt.allocPrint(gpa, "{s}.unparsed-{d}", .{ path, secs }) catch return;
+        defer gpa.free(dest);
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.rename(path, cwd, dest, io)) |_| {
+            std.log.warn("config: {s} is not readable; kept as {s}, starting from defaults", .{ path, dest });
+        } else |err| {
+            std.log.warn("config: {s} is not readable and could not be moved aside ({t}); starting from defaults", .{ path, err });
+        }
     }
 
     /// Bring a loaded file up to `settings_version`. Every version so far reads
@@ -2168,6 +2195,40 @@ test "multi-line system prompt survives a JSON save/load round-trip" {
     try std.testing.expectEqualStrings("line one\nline two\\end \"quoted\"", b.system_prompt.slice());
 }
 
+// A model_dirs list of plain strings, as a hand edit writes it: a load that once rewrote
+// the whole file as defaults.
+test "load sets an unreadable JSON file aside and writes nothing over it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "unparsed");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    const bad = "{\n  \"llm_model\": \"/m.gguf\",\n  \"model_dirs\": [\"/models\"]\n}\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = bad });
+    const cfg = Config.load(io, gpa, &environ, file);
+    try std.testing.expect(cfg.llm_model.opt() == null);
+
+    // Nothing at the path, and the original bytes beside it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, file, .{}));
+    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var found = false;
+    while (try it.next(io)) |e| {
+        if (!std.mem.startsWith(u8, e.name, file) or e.name.len == file.len) continue;
+        const kept = try dir.readFileAlloc(io, e.name, gpa, .limited(64 * 1024));
+        defer gpa.free(kept);
+        dir.deleteFile(io, e.name) catch {};
+        try std.testing.expectEqualStrings(bad, kept);
+        try std.testing.expect(std.mem.indexOf(u8, e.name, ".unparsed-") != null);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "load migrates a legacy key=value file to JSON in place" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2230,9 +2291,9 @@ test "apply parses vram meter fractions, clamps to [0,1], tolerates junk" {
 
 test "apply parses backends and vae_decode, tolerates junk" {
     var cfg: Config = .{};
-    // Defaults.
-    try std.testing.expectEqual(Backend.zig_cuda, cfg.llm_backend);
-    try std.testing.expectEqual(Backend.zig_cuda, cfg.diff_backend);
+    // Defaults: each host picks from its own devices.
+    try std.testing.expectEqual(Backend.auto, cfg.llm_backend);
+    try std.testing.expectEqual(Backend.auto, cfg.diff_backend);
     try std.testing.expectEqual(VaeDecode.auto, cfg.vae_decode);
 
     cfg.apply("llm_backend", "cuda");
@@ -2241,6 +2302,9 @@ test "apply parses backends and vae_decode, tolerates junk" {
     try std.testing.expectEqual(Backend.cuda, cfg.llm_backend);
     try std.testing.expectEqual(Backend.vulkan, cfg.diff_backend);
     try std.testing.expectEqual(VaeDecode.cpu_tiled, cfg.vae_decode);
+
+    cfg.apply("llm_backend", "auto");
+    try std.testing.expectEqual(Backend.auto, cfg.llm_backend);
 
     // Unrecognized values leave the field unchanged.
     cfg.apply("diff_backend", "bogus");

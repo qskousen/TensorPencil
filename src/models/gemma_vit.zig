@@ -129,6 +129,10 @@ pub const Vit = struct {
     /// mm.input_projection [proj_dim][dim], no bias.
     mm_proj: Weight,
 
+    fn blockName(buf: []u8, i: usize, proj: []const u8, kind: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "v.blk.{d}.{s}.{s}", .{ i, proj, kind });
+    }
+
     pub fn load(gpa: std.mem.Allocator, g: *const Gguf) !Vit {
         const cfg = try Config.detect(g);
         const store: WeightStore = .{ .gguf = g };
@@ -143,6 +147,13 @@ pub const Vit = struct {
 
         const blocks = try alloc.alloc(Block, cfg.n_blocks);
         for (blocks, 0..) |*blk, i| {
+            // Early mmproj conversions name the two MLP projections the other way
+            // round; the shape says which is which.
+            var nbuf: [64]u8 = undefined;
+            const down_name = try std.fmt.bufPrint(&nbuf, "v.blk.{d}.ffn_down.weight", .{i});
+            const swapped = if (store.get(down_name)) |v| v.info.shape.slice().len == 2 and v.info.shape.slice()[0] == cfg.ffn else false;
+            const up_n = if (swapped) "ffn_down" else "ffn_up";
+            const down_n = if (swapped) "ffn_up" else "ffn_down";
             blk.* = .{
                 .ln1_w = try loader.indexedVector(alloc, store, "v.blk.", i, "ln1.weight", cfg.dim),
                 .ln1_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ln1.bias", cfg.dim),
@@ -156,10 +167,10 @@ pub const Vit = struct {
                 .out_b = try loader.indexedVector(alloc, store, "v.blk.", i, "attn_out.bias", cfg.dim),
                 .ln2_w = try loader.indexedVector(alloc, store, "v.blk.", i, "ln2.weight", cfg.dim),
                 .ln2_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ln2.bias", cfg.dim),
-                .up = try loader.indexedMatrix(store, "v.blk.", i, "ffn_up.weight", cfg.ffn, cfg.dim),
-                .up_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ffn_up.bias", cfg.ffn),
-                .down = try loader.indexedMatrix(store, "v.blk.", i, "ffn_down.weight", cfg.dim, cfg.ffn),
-                .down_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ffn_down.bias", cfg.dim),
+                .up = try loader.matrix(store, try blockName(&nbuf, i, up_n, "weight"), cfg.ffn, cfg.dim),
+                .up_b = try loader.vector(alloc, store, try blockName(&nbuf, i, up_n, "bias"), cfg.ffn),
+                .down = try loader.matrix(store, try blockName(&nbuf, i, down_n, "weight"), cfg.dim, cfg.ffn),
+                .down_b = try loader.vector(alloc, store, try blockName(&nbuf, i, down_n, "bias"), cfg.dim),
             };
         }
 

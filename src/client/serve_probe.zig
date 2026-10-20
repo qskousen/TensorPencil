@@ -84,8 +84,9 @@ pub fn main(init: std.process.Init) !void {
     // host the user is sitting at, and the probe's OWN config, so the child
     // reads the scratch settings and caches its catalog index beside them
     // rather than in the user's config directory.
-    var sock_buf: [128]u8 = undefined;
-    const sock_path = socket orelse try std.fmt.bufPrint(&sock_buf, "/tmp/tp-serve-probe-{d}.sock", .{Io.Clock.real.now(io).toSeconds()});
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "probe-{d}.sock", .{Io.Clock.real.now(io).toSeconds()});
+    const sock_path = socket orelse try link.localPath(arena, io, init.environ_map, name);
     const child_args = [_][]const u8{ "--config", path };
     var remote = if (socket != null)
         try Remote.connect(gpa, io, .{ .unix = sock_path }, noop)

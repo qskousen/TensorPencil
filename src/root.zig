@@ -10,6 +10,7 @@ pub const tensor = @import("tp_core").tensor;
 pub const filemap = @import("tp_core").filemap;
 pub const dynlib = @import("tp_core").dynlib;
 pub const diskspace = @import("tp_core").diskspace;
+pub const rawtty = @import("tp_core").rawtty;
 pub const safetensors = @import("tp_core").safetensors;
 pub const gguf = @import("tp_core").gguf;
 pub const quants = @import("tp_core").quants;
