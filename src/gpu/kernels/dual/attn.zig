@@ -51,14 +51,26 @@ inline fn span(e: Env, t: u32, nsplit: u32, i: u32) Span {
     return .{ .kv0 = kv0, .kv1 = @min(kv0 + chunk, end), .ring = e.u(6) >> 16 };
 }
 
+/// The keys chunk `i` of row `t` reads under `attn_bounded`: the row's own `[start,
+/// end)` from a u32 table in d, u5 words in and u6 rows long (starts, then ends), past
+/// the partials this pass writes. Split `nsplit` ways.
+inline fn boundedSpan(e: Env, t: u32, nsplit: u32, i: u32) Span {
+    const start = e.ldW(.d, e.u(5) + t);
+    const end = e.ldW(.d, e.u(5) + e.u(6) + t);
+    const chunk = (end - start + nsplit - 1) / nsplit;
+    const kv0 = @min(start + i * chunk, end);
+    return .{ .kv0 = kv0, .kv1 = @min(kv0 + chunk, end), .ring = 0 };
+}
+
 /// Flash-decoding split pass for `seq_q` queries over the keys `span` gives query `t`:
 /// one subgroup per (query, head, KV chunk), the head dim across its lanes. Writes the
 /// unnormalized partial (m, sum, acc[hd]) to d at [row][hd + 2], rows ordered (query,
 /// head, chunk), which `attnMerge` reads.
 /// a = q [seq_q][heads][hd], b = k, c = v ([row][kv_heads][hd]), d = scratch.
 /// u0 = seq_q * heads * nsplit, u1 = heads, u2 = kv_heads, u3 = hd, u4 = nsplit,
-/// u5 = kv_len0, u6 and f1 as `span`. f0 = scale.
-pub inline fn attnRows(e: Env, comptime fmt: KvFmt) void {
+/// u5 = kv_len0, u6 and f1 as `span`. f0 = scale. With `bounded`, u5/u6 are
+/// `boundedSpan`'s instead: an encoder's rows each attending their own range.
+pub inline fn attnRows(e: Env, comptime fmt: KvFmt, comptime bounded: bool) void {
     const heads = e.u(1);
     const kv_heads = e.u(2);
     const hd = e.u(3);
@@ -72,7 +84,7 @@ pub inline fn attnRows(e: Env, comptime fmt: KvFmt) void {
         const h = qh % heads;
         const t = qh / heads;
         const kvh = h / (heads / kv_heads);
-        const sp = span(e, t, nsplit, i);
+        const sp = if (bounded) boundedSpan(e, t, nsplit, i) else span(e, t, nsplit, i);
         const qbase = qh * hd;
         const out = row * (hd + 2);
         var d0: u32 = 0;
@@ -188,13 +200,16 @@ pub fn AttnRowsG(comptime fmt: KvFmt, comptime G: u32) type {
 }
 
 pub inline fn attnRowsF32(e: Env) void {
-    attnRows(e, .f32);
+    attnRows(e, .f32, false);
 }
 pub inline fn attnRowsF16(e: Env) void {
-    attnRows(e, .f16);
+    attnRows(e, .f16, false);
 }
 pub inline fn attnRowsQ8(e: Env) void {
-    attnRows(e, .q8_0);
+    attnRows(e, .q8_0, false);
+}
+pub inline fn attnBounded(e: Env) void {
+    attnRows(e, .f32, true);
 }
 
 /// Merge `attnRows`' partials: d[qh * hd + ch] over the nsplit chunks of query-head

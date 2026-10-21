@@ -1,9 +1,11 @@
 //! Host halves the encoder tower walks share (`embed_*_dev.zig`, over `tower_cuda.Dev`
-//! / `tower_gpu.Dev`): a ragged batch's row layout and its attention bounds, and the
-//! rotate-half table the device RoPE reads.
+//! / `tower_gpu.Dev`): a ragged batch's row layout and its attention bounds, the
+//! rotate-half table the device RoPE reads, and the walk over a model's host buffers
+//! that eviction uses.
 
 const std = @import("std");
 const ops = @import("tp_ops");
+const Weight = ops.matmul.Weight;
 
 /// Items packed back to back: item `i` is rows `[off[i], off[i + 1])`.
 pub const Ragged = struct {
@@ -40,13 +42,29 @@ pub const Ragged = struct {
     /// Caller frees.
     pub fn bounds(self: Ragged, gpa: std.mem.Allocator) ![]u32 {
         const out = try gpa.alloc(u32, 2 * self.total);
-        for (0..self.items()) |i| for (self.off[i]..self.off[i + 1]) |r| {
-            out[r] = @intCast(self.off[i]);
-            out[self.total + r] = @intCast(self.off[i + 1]);
-        };
+        self.boundsInto(out, 0);
         return out;
     }
+
+    /// `bounds` into `out` [2 * total]; a nonzero `radius` also clips each row to the
+    /// keys within `radius` positions of it, either side.
+    pub fn boundsInto(self: Ragged, out: []u32, radius: usize) void {
+        std.debug.assert(out.len == 2 * self.total);
+        for (0..self.items()) |i| for (self.off[i]..self.off[i + 1]) |r| {
+            const lo = self.off[i];
+            const hi = self.off[i + 1];
+            out[r] = @intCast(if (radius == 0) lo else @max(lo, r -| radius));
+            out[self.total + r] = @intCast(if (radius == 0) hi else @min(hi, r + radius + 1));
+        };
+    }
 };
+
+/// Key chunks per row for `attentionRows`: enough subgroups in flight to fill a GPU,
+/// at least 32 keys a chunk, at most 16 chunks.
+pub fn attnSplit(rows: usize, heads: usize, longest: usize) usize {
+    const want = std.math.divCeil(usize, 4096, rows * heads) catch unreachable;
+    return std.math.clamp(@min(want, longest / 32), 1, 16);
+}
 
 /// `[cos | sin]` rotate-half table over `rows` positions; the sine half starts at
 /// `rows * head_dim / 2`. Caller frees.
@@ -58,4 +76,29 @@ pub fn ropeTable(gpa: std.mem.Allocator, rows: usize, head_dim: usize, theta: f6
     @memcpy(flat[0 .. rows * half], f.cos);
     @memcpy(flat[rows * half ..], f.sin);
     return flat;
+}
+
+/// Hand `sink` every host buffer of `model` a device cache can key on: `weight(bytes)`
+/// for each `Weight` and `?Weight` field, `vector(bytes)` for each f32 slice, recursing
+/// into slices of structs and optional structs. Both device caches key on host
+/// addresses, so a model freed without this leaves copies that the next buffer at the
+/// same address is served.
+pub fn forEachHostBuffer(model: anytype, sink: anytype) void {
+    inline for (@typeInfo(@TypeOf(model.*)).@"struct".field_names) |name| visit(&@field(model.*, name), sink);
+}
+
+fn visit(p: anytype, sink: anytype) void {
+    const F = @TypeOf(p.*);
+    if (F == Weight) return sink.weight(p.bytes);
+    if (F == ?Weight) return if (p.*) |w| sink.weight(w.bytes);
+    if (F == []const f32 or F == []f32) return sink.vector(std.mem.sliceAsBytes(p.*));
+    switch (@typeInfo(F)) {
+        .pointer => |pi| if (pi.size == .slice and @typeInfo(pi.child) == .@"struct") {
+            for (p.*) |*e| forEachHostBuffer(e, sink);
+        },
+        .optional => |o| if (@typeInfo(o.child) == .@"struct") {
+            if (p.*) |*v| forEachHostBuffer(v, sink);
+        },
+        else => {},
+    }
 }

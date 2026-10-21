@@ -5,6 +5,7 @@
 //! host pointer, so nothing is dequantized or copied).
 
 const std = @import("std");
+const tower = @import("tower.zig");
 const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const Weight = @import("tp_ops").matmul.Weight;
@@ -79,22 +80,36 @@ pub const Dev = struct {
         }, n, 1, 1);
     }
 
-    /// Unmasked attention over `rows` rows; with `bounds` it is block-diagonal, through
-    /// the buffers `bindAttention` bound.
-    pub fn attention(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, rows: usize, bounds: ?Buf, heads: usize, kv_heads: usize, hd: usize) !void {
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        if (bounds != null) return d.ctx.attnBatchedDispatch(rows, heads, kv_heads, hd, scale);
+    /// Unmasked attention over `rows` rows; with `bounds` each row attends its own
+    /// `[start | end]` range, read `bounds_off` words into the buffer `bindAttention`
+    /// bound with the others.
+    pub fn attention(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, rows: usize, bounds: ?Buf, bounds_off: usize, heads: usize, kv_heads: usize, hd: usize, qk_scale: f32) !void {
+        if (bounds != null) return d.ctx.attnBatchedDispatch(rows, heads, kv_heads, hd, qk_scale, bounds_off);
         try d.ctx.opElt(.attn_full, q, k, v, out, .{
             .u0 = @intCast(rows),
             .u1 = @intCast(heads),
             .u2 = @intCast(kv_heads),
             .u3 = @intCast(hd),
-            .f0 = scale,
+            .f0 = qk_scale,
         }, rows * heads, 1, 1);
+    }
+
+    pub fn uploadWordsAt(d: Dev, b: Buf, off_words: usize, data: []const u32) !void {
+        try d.ctx.tensorUploadAt(b, off_words * 4, std.mem.sliceAsBytes(data));
+    }
+
+    /// Row r attends keys `[start, end)` from the u32 table `bounds_off` words into
+    /// `scratch`, split `nsplit` ways (`Context.opAttnBounded`).
+    pub fn attentionRows(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, scratch: Buf, bounds_off: usize, rows: usize, heads: usize, kv_heads: usize, hd: usize, nsplit: usize, qk_scale: f32) !void {
+        try d.ctx.opAttnBounded(q, k, v, out, scratch, bounds_off, rows, heads, kv_heads, hd, nsplit, qk_scale);
     }
 
     pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
         try d.ctx.opElt(.add, x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+
+    pub fn scale(d: Dev, x: Buf, n: usize, s: f32) !void {
+        try d.ctx.opElt(.scale_f32, x, x, null, null, .{ .u0 = @intCast(n), .f0 = s }, n, 1, 1);
     }
 
     pub fn layerNorm(d: Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32) !void {
@@ -134,28 +149,22 @@ pub const Scope = struct {
     }
 };
 
-/// Free every device copy made of `model`'s weights and vectors: its `Weight`,
-/// `?Weight` and f32-slice fields, and those of each struct in a slice field. A tower
-/// that runs this after an encode leaves nothing resident under the LLM, and no cache
-/// entry keyed on a host pointer its owner may free.
+/// Free every device copy made of `model`'s weights and vectors
+/// (`tower.forEachHostBuffer`). A tower that runs this after an encode leaves nothing
+/// resident under the LLM, and no cache entry keyed on a host pointer its owner may free.
 pub fn evictModel(ctx: *gpu.Context, model: anytype) void {
-    inline for (@typeInfo(@TypeOf(model.*)).@"struct".field_names) |name| evictField(ctx, &@field(model.*, name));
+    tower.forEachHostBuffer(model, Evict{ .ctx = ctx });
 }
 
-fn evictField(ctx: *gpu.Context, p: anytype) void {
-    const F = @TypeOf(p.*);
-    if (F == Weight) return ctx.evictWeightBytes(p.bytes);
-    if (F == ?Weight) return if (p.*) |w| ctx.evictWeightBytes(w.bytes);
-    if (F == []const f32 or F == []f32) {
-        const b = std.mem.sliceAsBytes(p.*);
-        ctx.evictSmallRange(b);
-        ctx.evictWeightBytes(b);
-        return;
+const Evict = struct {
+    ctx: *gpu.Context,
+
+    pub fn weight(e: Evict, bytes: []const u8) void {
+        e.ctx.evictWeightBytes(bytes);
     }
-    switch (@typeInfo(F)) {
-        .pointer => |pi| if (pi.size == .slice and @typeInfo(pi.child) == .@"struct") {
-            for (p.*) |*e| evictModel(ctx, e);
-        },
-        else => {},
+
+    pub fn vector(e: Evict, bytes: []const u8) void {
+        e.ctx.evictSmallRange(bytes);
+        e.ctx.evictWeightBytes(bytes);
     }
-}
+};

@@ -199,7 +199,7 @@ fn block(d: anytype, s: anytype, g: Geom, total: usize, b: Block) !void {
     try d.linear(s.q, s.normed, total, Weight.init(b.qkv[0..seg], .f32, w, w), b.qkv_b[0..w]);
     try d.linear(s.k, s.normed, total, Weight.init(b.qkv[seg .. 2 * seg], .f32, w, w), b.qkv_b[w .. 2 * w]);
     try d.linear(s.v, s.normed, total, Weight.init(b.qkv[2 * seg .. 3 * seg], .f32, w, w), b.qkv_b[2 * w .. 3 * w]);
-    try d.attention(s.q, s.k, s.v, s.big, total, s.bounds, g.heads, g.heads, g.hd);
+    try d.attention(s.q, s.k, s.v, s.big, total, s.bounds, 0, g.heads, g.heads, g.hd, 1.0 / @sqrt(@as(f32, @floatFromInt(g.hd))));
     try d.linear(s.t, s.big, total, Weight.init(b.out, .f32, w, w), b.out_b);
     try d.add(s.x, s.t, total * w);
 

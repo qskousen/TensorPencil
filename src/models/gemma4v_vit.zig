@@ -1,6 +1,7 @@
-//! Gemma 4 vision tower (mmproj GGUF, arch "clip", projector "gemma4v"): a
+//! Gemma 4 vision tower (mmproj GGUF, arch "clip", projector "gemma4v"; or a
+//! transformers `Gemma4VisionModel` in safetensors, as EmbeddingGemma 2 ships it): a
 //! full SigLIP-style encoder + the Gemma-4 multimodal projector. CPU forward,
-//! f32 compute over the Q8_0/F16/F32 mmproj weights. Ported from llama.cpp
+//! f32 compute over the checkpoint's weights. Ported from llama.cpp
 //! tools/mtmd (models/gemma4v.cpp + clip.cpp build_vit + mtmd-image smart_resize).
 //!
 //! This is distinct from BOTH the shallow "gemma4uv" embedder (`gemma4_vit.zig`,
@@ -8,9 +9,11 @@
 //! LayerNorm / GELU-tanh / no QK-norm / learned-pos-only). gemma4v adds, per
 //! block: RMSNorm sandwich norms (ln1 + attn_post_norm + ln2 + ffn_post_norm),
 //! per-head QK-RMSNorm, a 2-D neox RoPE (theta 100, head split x/y), a weightless
-//! V-RMSNorm, attention with scale = 1.0 (NOT 1/sqrt(hd)), and a GeGLU-quick FFN.
+//! V-RMSNorm, attention with scale = 1.0 (NOT 1/sqrt(hd)), and a GeGLU FFN (quick
+//! GELU as llama.cpp runs it, tanh GELU as transformers does: `Config.act`).
 //! The projector is: 3x3 average-pool "merge" -> x*sqrt(dim) -> (x - std_bias) *
-//! std_scale -> weightless RMSNorm -> mm.input_projection (dim -> proj_dim).
+//! std_scale (absent in EmbeddingGemma 2) -> weightless RMSNorm -> input projection
+//! (dim -> proj_dim).
 //!
 //! Preprocessing follows Google's `gemma4_vision_token_budget` reference: an
 //! aspect-preserving resize (NO crop, NO letterbox/pad) to a 48-aligned grid
@@ -18,7 +21,9 @@
 //! (`Budget` presets 70/140/280/560/1120; default 280). Scale factor
 //! f = sqrt(nMax*48^2 / (w*h)); each dim floored to a multiple of 48. Pixels are
 //! normalized to 2*(p/255) - 1. (This differs from llama.cpp's dyn_size, which
-//! adds min-pixel clamping and a black-bar letterbox we deliberately drop.)
+//! adds min-pixel clamping and a black-bar letterbox we deliberately drop.) The
+//! resize itself is `Config.resize`: transformers' processor uses an antialiased
+//! bicubic, the GGUF path an align-corners bilinear.
 //!
 //! Image tokens are injected UNSCALED at their placeholder positions (like the
 //! other Gemma towers); the number of tokens per image is variable.
@@ -28,6 +33,7 @@ const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
 const loader = @import("loader.zig");
+const image = @import("tp_core").image;
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
@@ -60,6 +66,9 @@ pub const Budget = enum {
     }
 };
 
+pub const Act = enum { gelu_quick, gelu_tanh };
+pub const Resize = enum { bilinear, antialias_bicubic };
+
 pub const Config = struct {
     dim: usize,
     n_heads: usize,
@@ -77,6 +86,8 @@ pub const Config = struct {
     /// `--vision-budget`, GUI); `detect` seeds the `high` default.
     max_tokens: usize,
     eps: f32,
+    act: Act = .gelu_quick,
+    resize: Resize = .bilinear,
 
     pub fn headDim(self: Config) usize {
         return self.dim / self.n_heads;
@@ -143,6 +154,7 @@ pub const Vit = struct {
     pos_size: usize,
     blocks: []Block,
     /// Projector post-pool affine (per channel, dim entries): (x - bias) * scale.
+    /// Empty when the checkpoint has none.
     std_bias: []const f32,
     std_scale: []const f32,
     /// mm.input_projection [proj_dim][dim] (standard [out,in] orientation).
@@ -202,6 +214,99 @@ pub const Vit = struct {
             .blocks = blocks,
             .std_bias = std_bias,
             .std_scale = std_scale,
+            .mm_proj = mm_proj,
+        };
+    }
+
+    /// Load a transformers `Gemma4VisionModel` whose tensors sit under `prefix`
+    /// (`vision_tower.` in EmbeddingGemma 2), with `proj` the projector's linear
+    /// (`embed_vision.embedding_projection.weight`). The shapes give the geometry; the
+    /// rest is the transformers default: tanh GELU, antialiased bicubic resize, rope
+    /// base 100, a 3x3 merge, no standardization.
+    pub fn loadSafetensors(gpa: std.mem.Allocator, store: WeightStore, comptime prefix: []const u8, proj: []const u8) !Vit {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const shape = struct {
+            fn of(st: WeightStore, name: []const u8) !@import("tp_core").tensor.Shape {
+                return (st.get(name) orelse return error.MissingTensor).info.shape;
+            }
+        }.of;
+        const in_proj_s = try shape(store, prefix ++ "patch_embedder.input_proj.weight");
+        const pos_s = try shape(store, prefix ++ "patch_embedder.position_embedding_table");
+        const qn_s = try shape(store, prefix ++ "encoder.layers.0.self_attn.q_norm.weight");
+        const gate0_s = try shape(store, prefix ++ "encoder.layers.0.mlp.gate_proj.linear.weight");
+        const proj_s = try shape(store, proj);
+        const in_proj = in_proj_s.slice();
+        const pos_shape = pos_s.slice();
+        const qn = qn_s.slice();
+        const gate0 = gate0_s.slice();
+        const proj_shape = proj_s.slice();
+        if (in_proj.len != 2 or pos_shape.len != 3 or pos_shape[0] != 2 or qn.len != 1 or gate0.len != 2 or proj_shape.len != 2) return error.ShapeMismatch;
+        const dim = in_proj[0];
+        const patch: usize = std.math.sqrt(in_proj[1] / 3);
+        if (3 * patch * patch != in_proj[1] or pos_shape[2] != dim or dim % qn[0] != 0 or proj_shape[1] != dim) return error.ShapeMismatch;
+        var n_blocks: usize = 0;
+        var nbuf: [128]u8 = undefined;
+        while (store.get(try std.mem.print(&nbuf, prefix ++ "encoder.layers.{d}.input_layernorm.weight", .{n_blocks})) != null) n_blocks += 1;
+
+        const cfg: Config = .{
+            .dim = dim,
+            .n_heads = dim / qn[0],
+            .ffn = gate0[0],
+            .n_blocks = n_blocks,
+            .patch = patch,
+            .proj_dim = proj_shape[0],
+            .merge = 3,
+            .rope_theta = 100.0,
+            .max_tokens = Budget.high.tokens(),
+            .eps = 1e-6,
+            .act = .gelu_tanh,
+            .resize = .antialias_bicubic,
+        };
+
+        // transformers flattens a patch as (y, x, channel); the GGUF conv weight and
+        // `patchMatrix` use (channel, y, x).
+        const kdim = 3 * patch * patch;
+        const hf = try loader.vector(alloc, store, prefix ++ "patch_embedder.input_proj.weight", dim * kdim);
+        const patch_w = try alloc.alloc(f32, dim * kdim);
+        for (0..dim) |o| for (0..patch) |ky| for (0..patch) |kx| for (0..3) |c| {
+            patch_w[o * kdim + (c * patch + ky) * patch + kx] = hf[o * kdim + (ky * patch + kx) * 3 + c];
+        };
+        const pos_embd = try loader.vector(alloc, store, prefix ++ "patch_embedder.position_embedding_table", 2 * pos_shape[1] * dim);
+
+        const hd = cfg.headDim();
+        const p = prefix ++ "encoder.layers.";
+        const blocks = try alloc.alloc(Block, n_blocks);
+        for (blocks, 0..) |*blk, i| {
+            blk.* = .{
+                .ln1_w = try loader.indexedVector(alloc, store, p, i, "input_layernorm.weight", dim),
+                .q = try loader.indexedMatrix(store, p, i, "self_attn.q_proj.linear.weight", dim, dim),
+                .k = try loader.indexedMatrix(store, p, i, "self_attn.k_proj.linear.weight", dim, dim),
+                .v = try loader.indexedMatrix(store, p, i, "self_attn.v_proj.linear.weight", dim, dim),
+                .out = try loader.indexedMatrix(store, p, i, "self_attn.o_proj.linear.weight", dim, dim),
+                .q_norm = try loader.indexedVector(alloc, store, p, i, "self_attn.q_norm.weight", hd),
+                .k_norm = try loader.indexedVector(alloc, store, p, i, "self_attn.k_norm.weight", hd),
+                .attn_post_norm_w = try loader.indexedVector(alloc, store, p, i, "post_attention_layernorm.weight", dim),
+                .ln2_w = try loader.indexedVector(alloc, store, p, i, "pre_feedforward_layernorm.weight", dim),
+                .gate = try loader.indexedMatrix(store, p, i, "mlp.gate_proj.linear.weight", cfg.ffn, dim),
+                .up = try loader.indexedMatrix(store, p, i, "mlp.up_proj.linear.weight", cfg.ffn, dim),
+                .down = try loader.indexedMatrix(store, p, i, "mlp.down_proj.linear.weight", dim, cfg.ffn),
+                .ffn_post_norm_w = try loader.indexedVector(alloc, store, p, i, "post_feedforward_layernorm.weight", dim),
+            };
+        }
+        const mm_proj = try loader.matrix(store, proj, cfg.proj_dim, dim);
+
+        return .{
+            .arena = arena,
+            .cfg = cfg,
+            .patch_w = patch_w,
+            .pos_embd = pos_embd,
+            .pos_size = pos_shape[1],
+            .blocks = blocks,
+            .std_bias = &.{},
+            .std_scale = &.{},
             .mm_proj = mm_proj,
         };
     }
@@ -291,11 +396,14 @@ pub const Vit = struct {
             ops.norm.rmsNorm(s.tmp, s.tmp, blk.attn_post_norm_w, cfg.eps);
             for (x, s.tmp) |*xi, ti| xi.* += ti;
 
-            // --- FFN (GeGLU-quick) ---
+            // --- FFN (GeGLU) ---
             ops.norm.rmsNorm(s.normed, x, blk.ln2_w, cfg.eps);
             try ops.matmul.matmul(io, gpa, s.gate, s.normed, np, blk.gate, null);
             try ops.matmul.matmul(io, gpa, s.up, s.normed, np, blk.up, null);
-            ops.act.geluQuickMul(s.gate, s.up);
+            switch (cfg.act) {
+                .gelu_quick => ops.act.geluQuickMul(s.gate, s.up),
+                .gelu_tanh => ops.act.geluTanhMul(s.gate, s.up),
+            }
             try ops.matmul.matmul(io, gpa, s.tmp, s.gate, np, blk.down, null);
             ops.norm.rmsNorm(s.tmp, s.tmp, blk.ffn_post_norm_w, cfg.eps);
             for (x, s.tmp) |*xi, ti| xi.* += ti;
@@ -326,7 +434,9 @@ pub const Vit = struct {
         const target = targetSize(width, height, cfg.alignPx(), cfg.max_tokens);
         const gx = target.w / cfg.patch;
         const gy = target.h / cfg.patch;
-        const patches = try patchMatrix(gpa, rgb, width, height, target.w, target.h, cfg.patch, gx, gy);
+        const chw = try preprocess(gpa, cfg.resize, rgb, width, height, target.w, target.h);
+        defer gpa.free(chw);
+        const patches = try patchMatrix(gpa, chw, target.w, target.h, cfg.patch, gx, gy);
         return .{ .patches = patches, .gx = gx, .gy = gy };
     }
 
@@ -339,7 +449,7 @@ pub const Vit = struct {
         const target = targetSize(width, height, cfg.alignPx(), cfg.max_tokens);
         const tw = target.w;
         const th = target.h;
-        const chw = try preprocess(gpa, rgb, width, height, tw, th);
+        const chw = try preprocess(gpa, cfg.resize, rgb, width, height, tw, th);
         defer gpa.free(chw);
         const out = try gpa.alloc(u8, tw * th * 3);
         errdefer gpa.free(out);
@@ -399,8 +509,11 @@ pub const Vit = struct {
                         for (dst, src) |*d, sv| d.* += sv;
                     }
                 }
-                // avg-pool, x*sqrt(dim), then per-channel std affine.
-                for (dst, self.std_bias, self.std_scale) |*d, b, sc| d.* = (d.* * inv * sqrt_dim - b) * sc;
+                // avg-pool, x*sqrt(dim), then the per-channel std affine if any.
+                for (dst) |*d| d.* *= inv * sqrt_dim;
+                if (self.std_bias.len != 0) for (dst, self.std_bias, self.std_scale) |*d, b, sc| {
+                    d.* = (d.* - b) * sc;
+                };
             }
         }
         // embedding_pre_projection_norm: weightless RMS over dim.
@@ -466,18 +579,20 @@ fn targetSize(w: usize, h: usize, alignp: usize, max_tokens: usize) Size {
     const hf: f64 = @floatFromInt(h);
     const t: f64 = @floatFromInt(max_tokens * alignp * alignp); // nMax * m^2
     const f = @sqrt(t / (wf * hf));
-    const wb = @max(alignp, @as(usize, @intFromFloat(@floor(f * wf / m))) * alignp);
-    const hb = @max(alignp, @as(usize, @intFromFloat(@floor(f * hf / m))) * alignp);
+    const wb = @as(usize, @intFromFloat(@floor(f * wf / m))) * alignp;
+    const hb = @as(usize, @intFromFloat(@floor(f * hf / m))) * alignp;
+    // A side that floors to nothing gets one block, and the other keeps the aspect
+    // ratio up to the budget's longest row (transformers' Gemma 4 processor).
+    if (hb == 0) return .{ .w = @min((w / h) * alignp, max_tokens * alignp), .h = alignp };
+    if (wb == 0) return .{ .w = alignp, .h = @min((h / w) * alignp, max_tokens * alignp) };
     return .{ .w = wb, .h = hb };
 }
 
 /// Build the im2col patch matrix ([gx*gy][3*patch*patch], row-major patch order)
 /// from preprocessed planar CHW pixels. Row layout is [c][ky][kx], matching the
 /// GGUF conv weight [dim][c*patch*patch].
-fn patchMatrix(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize, patch: usize, gx: usize, gy: usize) ![]f32 {
+fn patchMatrix(gpa: std.mem.Allocator, chw: []const f32, tw: usize, th: usize, patch: usize, gx: usize, gy: usize) ![]f32 {
     const kdim = 3 * patch * patch;
-    const chw = try preprocess(gpa, rgb, sw, sh, tw, th);
-    defer gpa.free(chw);
     const patches = try gpa.alloc(f32, gx * gy * kdim);
     errdefer gpa.free(patches);
     for (0..gy) |grow| {
@@ -497,8 +612,27 @@ fn patchMatrix(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw
 /// Resize `rgb` (interleaved, sw x sh) DIRECTLY to `tw` x `th` (no crop, no pad
 /// Google's `gemma4_vision_token_budget` uses a plain aspect-preserving canvas
 /// resize; `tw`/`th` already encode the near-source aspect) and normalize to
-/// planar CHW f32 with `2*(p/255) - 1`. Align-corners bilinear in f32.
-fn preprocess(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize) ![]f32 {
+/// planar CHW f32 with `2*(p/255) - 1`.
+fn preprocess(gpa: std.mem.Allocator, mode: Resize, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize) ![]f32 {
+    return switch (mode) {
+        .bilinear => preprocessBilinear(gpa, rgb, sw, sh, tw, th),
+        .antialias_bicubic => preprocessAa(gpa, rgb, sw, sh, tw, th),
+    };
+}
+
+/// transformers' processor: no resize when the size already fits.
+fn preprocessAa(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize) ![]f32 {
+    const resized = if (sw == tw and sh == th) rgb else try image.resizeAntialiasBicubic(gpa, rgb, sw, sh, tw, th);
+    defer if (resized.ptr != rgb.ptr) gpa.free(resized);
+    const out = try gpa.alloc(f32, 3 * tw * th);
+    for (0..tw * th) |i| for (0..3) |c| {
+        out[c * tw * th + i] = 2.0 * (@as(f32, @floatFromInt(resized[i * 3 + c])) / 255.0) - 1.0;
+    };
+    return out;
+}
+
+/// Align-corners bilinear in f32.
+fn preprocessBilinear(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize) ![]f32 {
     const out = try gpa.alloc(f32, 3 * tw * th);
     errdefer gpa.free(out);
     const x_ratio: f64 = if (tw > 1) @as(f64, @floatFromInt(sw - 1)) / @as(f64, @floatFromInt(tw - 1)) else 0;

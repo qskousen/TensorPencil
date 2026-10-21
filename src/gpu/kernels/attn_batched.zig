@@ -5,8 +5,10 @@
 //! (the per-item bounds table) that the shared 4-buffer eltwise layout can't.
 //!
 //! Binding layout (set 0): a=q, b=k, c=v, d=out (each the packed
-//! [total, heads*hd] / [total, kv*hd] batch activation), e=bounds (u32[2*total]).
-//! Push: u0=total, u1=n_heads, u2=n_kv, u3=hd, f0=scale.
+//! [total, heads*hd] / [total, kv*hd] batch activation), e=bounds (u32[2*total]
+//! starting u4 words in, so one buffer can hold several tables).
+//! Push: u0=total, u1=n_heads, u2=n_kv, u3=hd, f0=scale, u4=bounds offset.
+//! Heads up to `max_hd` wide; the dispatch refuses wider.
 
 const abi = @import("abi.zig");
 const gpu = @import("std").spirv;
@@ -20,7 +22,10 @@ const Push = extern struct {
     u2: u32,
     u3: u32,
     f0: f32,
+    u4: u32,
 };
+
+pub const max_hd = 512;
 
 const a = abi.buffer(FBuf, "a", 0);
 const b = abi.buffer(FBuf, "b", 1);
@@ -42,11 +47,11 @@ export fn attn_batched() callconv(abi.kernel) void {
     const q_global = idx / n_heads;
     const head = idx % n_heads;
     const kvh = head / (n_heads / n_kv);
-    const start = e.data[q_global];
-    const end = e.data[total + q_global];
+    const start = e.data[pc.u4 + q_global];
+    const end = e.data[pc.u4 + total + q_global];
     const qb = idx * hd;
     const kvdim = n_kv * hd;
-    var acc: [256]f32 = undefined;
+    var acc: [max_hd]f32 = undefined;
     var t: u32 = 0;
     while (t < hd) : (t += 1) acc[t] = 0;
     var mx: f32 = -3.4e38;

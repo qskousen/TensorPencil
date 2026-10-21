@@ -1024,6 +1024,7 @@ const bodies = .{
     .{ "dup_up_add_bf16", At(elt.dupUpAdd, .bf16).run },
     .{ "w6a8_decode", elt.w6a8Decode },
     .{ "w6a8_decode_t", elt.w6a8DecodeT },
+    .{ "attn_bounded", attn.attnBounded },
 };
 
 comptime {

@@ -28,8 +28,15 @@ fn nbuf(be: *Backend, weights: []const f32) !Buf {
 /// Same contract as gemma4v_vit.Vit.encode.
 pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
     be.weightScopeBegin();
+    defer be.weightScopeEnd();
+    return encodeResident(vit, be, io, gpa, rgb, width, height);
+}
+
+/// `encode` leaving the converted weights cached on the device, for a caller that
+/// encodes many images (an embedding index). The weights borrow `vit`, which must
+/// outlive them.
+pub fn encodeResident(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Vit.Encoded {
     defer {
-        be.weightScopeEnd();
         be.freeAttnScratch();
         be.freeConvScratch();
     }
@@ -122,6 +129,10 @@ const Dev = struct {
 
     pub fn geluQuickMul(d: *Dev, g: Buf, u: Buf, n: usize) !void {
         try d.be.geluQuickMul(g, u, n);
+    }
+
+    pub fn geluMul(d: *Dev, g: Buf, u: Buf, n: usize) !void {
+        try d.be.geluMul(g, u, n);
     }
 
     /// Each of q and k projected, per-head normed, roped and padded to 128; v projected,

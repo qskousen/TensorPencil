@@ -154,10 +154,36 @@ Notes:
 - `io: std.Io` + `gpa` come from your `main`/worker. `TextEncoder`/`ImageEncoder`
   own their model + tokenizer (mmap ~1.2 GB) — **open once, reuse**. They are
   `*const` for the embed calls but not internally synchronized: one per worker
-  thread, or guard with a mutex. `embedTextBatch` currently loops (throughput comes
-  from each forward's internal threading).
+  thread, or guard with a mutex. `embedTextBatch` / `embedImageBatch` run one fused
+  forward over the batch.
 - Output is **always L2-normalized 768-d** (`tp.embed.dim == 768`). Do **not**
-  re-normalize.
+  re-normalize, except after Matryoshka truncation (`tp.embed.truncate` does it).
+
+### EmbeddingGemma 2: text and images in one space
+
+`DIFFKEEP_GEMMA2.md` has the model and its validation. One encoder replaces the text
+encoder, the SigLIP2 text tower and the SigLIP2 visual tower: a text query ranks images
+directly, so there is one table and no rank fusion. Its vectors are a new space; both
+indexes need re-embedding.
+
+```zig
+var mm = try tp.embed.MultimodalEncoder.open(gpa, io, "Models/embeddinggemma-2", backend);
+defer mm.deinit();
+
+const q = try mm.embedText(gpa, "a red fox at dusk", .{ .role = .query });
+defer gpa.free(q);
+
+// Any-size interleaved RGB8: the encoder resizes to its 280-token budget itself,
+// so skip the SigLIP 224² libvips step. No prompt for images.
+const iv = try mm.embedImage(gpa, .{ .pixels = rgb, .width = w, .height = h });
+defer gpa.free(iv);
+
+// 256-d storage: truncate both sides the same way.
+const q256 = tp.embed.truncate(q, 256);
+```
+
+Text-only use is `TextEncoder.open(gpa, io, .embeddinggemma2, dir, backend)`; its
+prompts and frame are EmbeddingGemma 300M's.
 
 <details><summary>Low-level API (only if you need to bypass the façade)</summary>
 

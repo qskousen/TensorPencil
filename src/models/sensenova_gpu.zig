@@ -201,7 +201,7 @@ fn attentionAt(ctx: *Context, cfg: Config, b: LayerBufs, rows: usize, seq_kv: us
     if (!tc) {
         // The bounds buffer is the mask. `Workspace`/`PrefixWs` fill an unmasked one
         // with `[0, seq_kv)` for every row, so this arm never needs a second kernel.
-        return ctx.attnBatchedDispatch(rows, heads, n_kv, hd, scale);
+        return ctx.attnBatchedDispatch(rows, heads, n_kv, hd, scale, 0);
     }
     const q_pad = std.mem.alignForward(usize, rows, flash_tile);
     const kv_pad = std.mem.alignForward(usize, seq_kv, flash_tile);

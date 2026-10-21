@@ -5,6 +5,7 @@
 //! compression level 4, split into 64 KiB IDAT chunks.
 
 const std = @import("std");
+const safetensors = @import("safetensors.zig");
 const flate = std.compress.flate;
 
 const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
@@ -467,6 +468,150 @@ test "resizeBicubic matches torch's interpolate" {
 }
 
 const bicubic_fixtures_json = @embedFile("assets/bicubic_fixtures.json");
+
+/// Antialiased bicubic resize of interleaved RGB8, as torchvision's
+/// `resize(uint8, BICUBIC, antialias=True)` (PIL's filter) computes it, which is how
+/// the Gemma 4 image processors size an image. Caller frees. What is silent when
+/// wrong:
+/// - the cubic coefficient is -0.5 here, not the -0.75 of `resizeBicubic`;
+/// - a downscale widens the filter by the scale factor, so each output averages
+///   every source pixel under it instead of sampling four;
+/// - weights are fixed point (int16, as many fraction bits as the axis's largest
+///   weight allows), and the horizontal pass is rounded to u8 before the vertical.
+///
+/// Pinned by tools/gen_embeddinggemma2_image.py.
+pub fn resizeAntialiasBicubic(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, dw: usize, dh: usize) ![]u8 {
+    std.debug.assert(rgb.len == 3 * sw * sh and dw > 0 and dh > 0);
+    var cx = try AaAxis.init(gpa, sw, dw);
+    defer cx.deinit(gpa);
+    var cy = try AaAxis.init(gpa, sh, dh);
+    defer cy.deinit(gpa);
+
+    const mid = try gpa.alloc(u8, 3 * dw * sh);
+    defer gpa.free(mid);
+    for (0..sh) |y| for (0..dw) |x| {
+        const taps = cx.taps(x);
+        for (0..3) |c| {
+            var acc: i64 = @as(i64, 1) << @intCast(cx.precision - 1);
+            for (taps.w, 0..) |w, t| acc += @as(i64, rgb[(y * sw + taps.start + t) * 3 + c]) * w;
+            mid[(y * dw + x) * 3 + c] = clampU8(acc >> @intCast(cx.precision));
+        }
+    };
+    const out = try gpa.alloc(u8, 3 * dw * dh);
+    errdefer gpa.free(out);
+    for (0..dh) |y| {
+        const taps = cy.taps(y);
+        for (0..dw) |x| for (0..3) |c| {
+            var acc: i64 = @as(i64, 1) << @intCast(cy.precision - 1);
+            for (taps.w, 0..) |w, t| acc += @as(i64, mid[((taps.start + t) * dw + x) * 3 + c]) * w;
+            out[(y * dw + x) * 3 + c] = clampU8(acc >> @intCast(cy.precision));
+        };
+    }
+    return out;
+}
+
+fn clampU8(v: i64) u8 {
+    return @intCast(std.math.clamp(v, 0, 255));
+}
+
+/// Per-output tap ranges and fixed-point weights along one axis.
+const AaAxis = struct {
+    start: []usize,
+    len: []usize,
+    w: []i32, // [out][ksize]
+    ksize: usize,
+    precision: u5,
+
+    fn init(gpa: std.mem.Allocator, in: usize, out: usize) !AaAxis {
+        const scale = @as(f64, @floatFromInt(in)) / @as(f64, @floatFromInt(out));
+        const filter_scale = @max(scale, 1.0);
+        const support = 2.0 * filter_scale;
+        const ksize: usize = @intFromFloat(@ceil(support) * 2 + 1);
+        const start = try gpa.alloc(usize, out);
+        errdefer gpa.free(start);
+        const len = try gpa.alloc(usize, out);
+        errdefer gpa.free(len);
+        const wf = try gpa.alloc(f64, out * ksize);
+        defer gpa.free(wf);
+        @memset(wf, 0);
+        var max_w: f64 = 0;
+        for (0..out) |i| {
+            const center = scale * (@as(f64, @floatFromInt(i)) + 0.5);
+            const lo: usize = @intFromFloat(@max(center - support + 0.5, 0));
+            const hi: usize = @min(@as(usize, @intFromFloat(@max(center + support + 0.5, 0))), in);
+            start[i] = lo;
+            len[i] = hi - lo;
+            const row = wf[i * ksize ..][0..len[i]];
+            var total: f64 = 0;
+            for (row, 0..) |*w, j| {
+                w.* = cubicAa((@as(f64, @floatFromInt(j + lo)) - center + 0.5) / filter_scale);
+                total += w.*;
+            }
+            for (row) |*w| {
+                w.* /= total;
+                max_w = @max(max_w, w.*);
+            }
+        }
+        var precision: u5 = 0;
+        while (precision < 22) : (precision += 1) {
+            const next: i64 = @intFromFloat(0.5 + max_w * @as(f64, @floatFromInt(@as(i64, 1) << (precision + 1))));
+            if (next >= 1 << 15) break;
+        }
+        const w = try gpa.alloc(i32, out * ksize);
+        errdefer gpa.free(w);
+        const one: f64 = @floatFromInt(@as(i64, 1) << precision);
+        for (w, wf) |*d, s| {
+            const v = s * one;
+            d.* = @intFromFloat(if (v < 0) v - 0.5 else v + 0.5);
+        }
+        return .{ .start = start, .len = len, .w = w, .ksize = ksize, .precision = precision };
+    }
+
+    fn deinit(self: *AaAxis, gpa: std.mem.Allocator) void {
+        gpa.free(self.start);
+        gpa.free(self.len);
+        gpa.free(self.w);
+    }
+
+    fn taps(self: AaAxis, i: usize) struct { start: usize, w: []const i32 } {
+        return .{ .start = self.start[i], .w = self.w[i * self.ksize ..][0..self.len[i]] };
+    }
+};
+
+/// PIL's bicubic filter, a = -0.5.
+fn cubicAa(x0: f64) f64 {
+    const a: f64 = -0.5;
+    const x = @abs(x0);
+    if (x < 1) return ((a + 2) * x - (a + 3)) * x * x + 1;
+    if (x < 2) return (((x - 5) * x + 8) * x - 4) * a;
+    return 0;
+}
+
+test "resizeAntialiasBicubic matches torchvision" {
+    const gpa = std.testing.allocator;
+    var st = try safetensors.SafeTensors.initFromSlice(gpa, resize_aa_fixture);
+    defer st.deinit();
+    const src = (try st.require("src")).bytes;
+    const sh = 120;
+    const sw = 160;
+    try std.testing.expectEqual(@as(usize, 3 * sw * sh), src.len);
+    for ([_]struct { name: []const u8, h: usize, w: usize }{ .{ .name = "down", .h = 48, .w = 96 }, .{ .name = "up", .h = 144, .w = 208 } }) |c| {
+        const want = (try st.require(c.name)).bytes;
+        const got = try resizeAntialiasBicubic(gpa, src, sw, sh, c.w, c.h);
+        defer gpa.free(got);
+        var diff: usize = 0;
+        var maxd: u8 = 0;
+        for (want, got) |a, b| {
+            const d = if (a > b) a - b else b - a;
+            maxd = @max(maxd, d);
+            if (d != 0) diff += 1;
+        }
+        errdefer std.debug.print("{s}: {d} of {d} bytes differ, max {d}\n", .{ c.name, diff, want.len, maxd });
+        try std.testing.expectEqual(@as(usize, 0), diff);
+    }
+}
+
+const resize_aa_fixture = @embedFile("assets/resize_aa_bicubic.safetensors");
 
 /// `planarF32ToRgb8` for a decoder that already works channel-last, i.e. whose
 /// output is `[h][w][3]` f32 in [-1, 1] (`mage_vae`). Same mapping, no transpose.

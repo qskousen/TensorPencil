@@ -8,6 +8,7 @@
 //! the mmap-stable CPU model), where a scope would re-upload a whole model per call.
 
 const std = @import("std");
+const tower = @import("tower.zig");
 const lin_cuda = @import("lin_cuda.zig");
 const cuda = @import("tp_gpu").cuda;
 const Weight = @import("tp_ops").matmul.Weight;
@@ -73,16 +74,29 @@ pub const Dev = struct {
         try d.be.ropeHalf(x.viewF32(row0 * stride), freqs, rows, heads, half, sin_off, 0);
     }
 
-    /// Unmasked attention over `rows` rows; with `bounds` (per-row `[start | end]`) it is
-    /// block-diagonal, one item per range.
-    pub fn attention(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, rows: usize, bounds: ?Buf, heads: usize, kv_heads: usize, hd: usize) !void {
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        if (bounds) |bd| return d.be.opAttnBatched(q, k, v, out, bd, rows, heads, kv_heads, hd, scale);
-        try d.be.attn(q, k, v, out, rows, rows, heads, kv_heads, hd, scale, false);
+    /// Unmasked attention over `rows` rows; with `bounds` each row attends its own
+    /// `[start | end]` range, read `bounds_off` words into `bounds`.
+    pub fn attention(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, rows: usize, bounds: ?Buf, bounds_off: usize, heads: usize, kv_heads: usize, hd: usize, qk_scale: f32) !void {
+        if (bounds) |bd| return d.be.opAttnBatched(q, k, v, out, bd.viewBytes(bounds_off * 4), rows, heads, kv_heads, hd, qk_scale);
+        try d.be.attn(q, k, v, out, rows, rows, heads, kv_heads, hd, qk_scale, false);
+    }
+
+    pub fn uploadWordsAt(d: Dev, b: Buf, off_words: usize, data: []const u32) !void {
+        try d.be.tensorUpload(b.slice(off_words * 4, data.len * 4), std.mem.sliceAsBytes(data));
+    }
+
+    /// Row r attends keys `[start, end)` from the u32 table `bounds_off` words into
+    /// `scratch`, split `nsplit` ways (`Backend.opAttnBounded`).
+    pub fn attentionRows(d: Dev, q: Buf, k: Buf, v: Buf, out: Buf, scratch: Buf, bounds_off: usize, rows: usize, heads: usize, kv_heads: usize, hd: usize, nsplit: usize, qk_scale: f32) !void {
+        try d.be.opAttnBounded(q, k, v, out, scratch, bounds_off, rows, heads, kv_heads, hd, nsplit, qk_scale);
     }
 
     pub fn add(d: Dev, x: Buf, y: Buf, n: usize) !void {
         try d.be.opAdd(x, y, n);
+    }
+
+    pub fn scale(d: Dev, x: Buf, n: usize, s: f32) !void {
+        try d.be.opScale(x, s, n);
     }
 
     pub fn layerNorm(d: Dev, x: Buf, y: Buf, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32) !void {
@@ -100,5 +114,23 @@ pub const Dev = struct {
 
     pub fn geluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
         try d.be.geluMul(g, u, n);
+    }
+};
+
+/// Free every device copy made of `model`'s weights and vectors
+/// (`tower.forEachHostBuffer`), before the host buffers they key on are freed.
+pub fn evictModel(be: *Backend, model: anytype) void {
+    tower.forEachHostBuffer(model, Evict{ .be = be });
+}
+
+const Evict = struct {
+    be: *Backend,
+
+    pub fn weight(e: Evict, bytes: []const u8) void {
+        e.be.evictWeightRange(bytes);
+    }
+
+    pub fn vector(e: Evict, bytes: []const u8) void {
+        e.be.evictWeightRange(bytes);
     }
 };

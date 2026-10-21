@@ -7,7 +7,7 @@
 //!
 //! The adapter holds `b` (`x`, `normed`, `proj`, `big`, `up`, `t`; sized by its
 //! `setup`, which also uploads the rope tables and per-token positions) and supplies
-//! `linear`, `rms`, `add`, `geluQuickMul`, `attention` (q/k/v with their norms and rope
+//! `linear`, `rms`, `add`, `geluQuickMul`, `geluMul`, `attention` (q/k/v with their norms and rope
 //! and the attention itself, returning the buffer holding the compact `[np][dim]`
 //! output) and the transfers.
 
@@ -50,7 +50,10 @@ pub fn encode(d: anytype, vit: *const Vit, io: std.Io, gpa: std.mem.Allocator, r
         try d.rms(b.x, b.normed, blk.ln2_w, np, dim);
         try d.linear(b.big, b.normed, np, blk.gate);
         try d.linear(b.up, b.normed, np, blk.up);
-        try d.geluQuickMul(b.big, b.up, np * cfg.ffn);
+        switch (cfg.act) {
+            .gelu_quick => try d.geluQuickMul(b.big, b.up, np * cfg.ffn),
+            .gelu_tanh => try d.geluMul(b.big, b.up, np * cfg.ffn),
+        }
         try d.linear(b.t, b.big, np, blk.down);
         try d.rms(b.t, b.t, blk.ffn_post_norm_w, np, dim);
         try d.add(b.x, b.t, np * dim);

@@ -67,8 +67,10 @@ pub const Mode = enum { fresh, cached };
 
 /// Per-layer dimensions the caller resolves (uniform for qwen3/gemma3, per-layer
 /// for gemma4's varying head_dim/KV geometry) plus the sliding window (0 = full
-/// causal, also used for global layers). The RoPE table for the layer is passed
-/// separately as `freqs` (the caller selects global vs local).
+/// attention, also used for global layers). A bidirectional `.fresh` pass reads the
+/// window as a radius, keys within `sliding_window` positions either side. The RoPE
+/// table for the layer is passed separately as `freqs` (the caller selects global vs
+/// local).
 pub const Dims = struct {
     hidden: usize,
     n_heads: usize,
@@ -187,8 +189,7 @@ pub fn layerForward(
         // `.fresh` full-sequence encode. Causal by default (Qwen text encoder,
         // an autoregressive LM used as an encoder); `bidirectional` flips it to
         // a non-causal encoder (EmbeddingGemma / bidirectional embedding towers)
-        // where every position attends the whole sequence. No KV prefix exists
-        // here, so seq_kv == seq and causal=false is a plain full attention.
+        // where every position attends the whole sequence, or its window radius.
         try ops.attention.attention(io, gpa, attn_out, qkv.q, qkv.k, qkv.v, .{
             .seq_q = seq,
             .seq_kv = seq,
@@ -197,7 +198,8 @@ pub fn layerForward(
             .head_dim = dims.head_dim,
             .causal = !bidirectional,
             .scale = spec.attn_scale,
-            .window = dims.sliding_window,
+            .window = if (bidirectional) 0 else dims.sliding_window,
+            .radius = if (bidirectional) dims.sliding_window else 0,
         });
     }
     try ops.matmul.matmul(io, gpa, tmp, attn_out, seq, layer.o, null);
@@ -259,7 +261,8 @@ pub fn layerForwardBatchedFresh(
             .head_dim = dims.head_dim,
             .causal = !bidirectional,
             .scale = spec.attn_scale,
-            .window = dims.sliding_window,
+            .window = if (bidirectional) 0 else dims.sliding_window,
+            .radius = if (bidirectional) dims.sliding_window else 0,
         });
     }
     try ops.matmul.matmul(io, gpa, tmp, attn_out, total, layer.o, null);

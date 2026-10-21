@@ -77,7 +77,7 @@ pub fn embed(d: anytype, cpu: *const es.Model, gpa: std.mem.Allocator, ids_list:
             try d.rope(q, freqs, rg.off[i], rg.len(i), heads, w, hd / 2, sin_off);
             try d.rope(k, freqs, rg.off[i], rg.len(i), heads, w, hd / 2, sin_off);
         }
-        try d.attention(q, k, v, attn, total, bounds, heads, heads, hd);
+        try d.attention(q, k, v, attn, total, bounds, 0, heads, heads, hd, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
         try d.linear(t, attn, total, Weight.init(l.o.bytes, .f32, w, w), l.o_bias);
         try d.add(x, t, total * w);
         try d.layerNorm(x, x, l.attn_ln_w, l.attn_ln_b, total, w, cfg.ln_eps);

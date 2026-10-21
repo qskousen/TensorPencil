@@ -2,11 +2,15 @@
 //!
 //! Streaming formulation: scores for one (head, query) pair at a time, so
 //! memory is O(seq_kv) per task instead of O(seq^2). Activations are
-//! [seq, n_heads * head_dim] row-major, matching the rest of the engine.
+//! [seq, n_heads * head_dim] row-major, matching the rest of the engine. A long
+//! plain non-causal attention (a ViT, a VAE mid-block) instead runs per head as two
+//! GEMMs around a row softmax (`attentionGemm`), the streaming loop being a dot
+//! product per key.
 
 const std = @import("std");
 const vmath = @import("vmath.zig");
 const cancel = @import("cancel.zig");
+const matmul = @import("matmul.zig");
 
 pub const Params = struct {
     seq_q: usize,
@@ -42,6 +46,10 @@ pub const Params = struct {
     /// window, so extending kv_end never clips a legitimate prefix key).
     /// Requires causal (image prefill is always a causal-model prefill).
     bidirectional: bool = false,
+    /// Local attention for a non-causal encoder: query i attends the keys j with
+    /// |i - j| <= radius (HF's bidirectional sliding window). 0 = disabled.
+    /// Requires !causal and seq_q == seq_kv.
+    radius: usize = 0,
     /// Ring-buffer KV storage (gemma3/gemma4 LOCAL layers, TODO lever 1): 0 =
     /// linear (row = absolute position). When > 0, key/value for absolute
     /// position j lives at row `j % ring`, so k/v hold `ring` rows instead of
@@ -49,7 +57,10 @@ pub const Params = struct {
     ring: usize = 0,
 };
 
-pub const Error = error{OutOfMemory} || std.Io.Cancelable;
+pub const Error = matmul.Error;
+
+/// The size from which a plain non-causal attention runs as GEMMs.
+const gemm_min_scores = 1 << 16;
 
 /// out[seq_q, n_heads*head_dim] = softmax(q k^T * scale) v, per head.
 /// KV head h_kv = h / (n_heads / n_kv_heads) (repeat_interleave semantics).
@@ -72,11 +83,16 @@ pub fn attention(
     std.debug.assert(p.n_heads % p.n_kv_heads == 0);
     if (p.causal) std.debug.assert(p.seq_q <= p.seq_kv);
     if (p.bidirectional) std.debug.assert(p.causal);
+    if (p.radius != 0) std.debug.assert(!p.causal and p.seq_q == p.seq_kv);
     if (p.key_mask) |mask| std.debug.assert(mask.len == p.seq_kv);
     if (p.kv_end) |e| {
         std.debug.assert(e.len == p.seq_q);
         for (e) |x| std.debug.assert(x <= p.seq_kv);
     }
+
+    const plain = !p.causal and !p.bidirectional and p.key_mask == null and p.kv_end == null and
+        p.window == 0 and p.radius == 0 and p.ring == 0;
+    if (plain and p.seq_q * p.seq_kv >= gemm_min_scores) return attentionGemm(io, gpa, out, q, k, v, p);
 
     // Split each head's queries into chunks so even single-head attention
     // (the VAE mid-block: 1 head over all spatial positions) parallelizes.
@@ -115,6 +131,93 @@ pub fn attention(
     if (cancel.canceled(tok)) return error.Canceled;
 }
 
+/// Per KV head: K `[seq_kv][hd]` and V transposed `[hd][seq_kv]` gathered once, then
+/// for each query head on it and each chunk of queries, `S = (Q * scale) K^T`, a row
+/// softmax, and `O = P V`. Chunks keep `S` to about 16 MiB.
+fn attentionGemm(io: std.Io, gpa: std.mem.Allocator, out: []f32, q: []const f32, k: []const f32, v: []const f32, p: Params) Error!void {
+    const hd = p.head_dim;
+    const rep_ = p.n_heads / p.n_kv_heads;
+    const scale = p.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const qc = std.math.clamp((4 << 20) / p.seq_kv, 1, p.seq_q);
+    const kh = try gpa.alloc(f32, p.seq_kv * hd);
+    defer gpa.free(kh);
+    const vt = try gpa.alloc(f32, hd * p.seq_kv);
+    defer gpa.free(vt);
+    const qh = try gpa.alloc(f32, qc * hd);
+    defer gpa.free(qh);
+    const sc = try gpa.alloc(f32, qc * p.seq_kv);
+    defer gpa.free(sc);
+    const oh = try gpa.alloc(f32, qc * hd);
+    defer gpa.free(oh);
+    const kv_stride = p.n_kv_heads * hd;
+    const q_stride = p.n_heads * hd;
+
+    for (0..p.n_kv_heads) |hk| {
+        for (0..p.seq_kv) |j| {
+            const src_k = k[j * kv_stride + hk * hd ..][0..hd];
+            @memcpy(kh[j * hd ..][0..hd], src_k);
+            for (v[j * kv_stride + hk * hd ..][0..hd], 0..) |x, d| vt[d * p.seq_kv + j] = x;
+        }
+        const kw = matmul.Weight.fromF32(kh, p.seq_kv, hd);
+        const vw = matmul.Weight.fromF32(vt, hd, p.seq_kv);
+        for (hk * rep_..(hk + 1) * rep_) |h| {
+            var q0: usize = 0;
+            while (q0 < p.seq_q) : (q0 += qc) {
+                const n = @min(qc, p.seq_q - q0);
+                for (0..n) |i| for (q[(q0 + i) * q_stride + h * hd ..][0..hd], qh[i * hd ..][0..hd]) |x, *d| {
+                    d.* = x * scale;
+                };
+                const s = sc[0 .. n * p.seq_kv];
+                try matmul.matmul(io, gpa, s, qh[0 .. n * hd], n, kw, null);
+                try softmaxRows(io, s, n, p.seq_kv);
+                try matmul.matmul(io, gpa, oh[0 .. n * hd], s, n, vw, null);
+                for (0..n) |i| @memcpy(out[(q0 + i) * q_stride + h * hd ..][0..hd], oh[i * hd ..][0..hd]);
+            }
+        }
+    }
+}
+
+/// `softmaxRow` over `n` rows of `len`, spread over the cores.
+fn softmaxRows(io: std.Io, s: []f32, n: usize, len: usize) Error!void {
+    const tasks = @min(n, 2 * (std.Thread.getCpuCount() catch 1));
+    if (tasks <= 1) {
+        softmaxSpan(s, 0, n, len);
+        return;
+    }
+    const per = std.math.divCeil(usize, n, tasks) catch unreachable;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var r: usize = 0;
+    while (r < n) : (r += per) group.async(io, softmaxSpan, .{ s, r, @min(r + per, n), len });
+    try group.await(io);
+}
+
+fn softmaxSpan(s: []f32, r0: usize, r1: usize, len: usize) void {
+    for (r0..r1) |i| softmaxRow(s[i * len ..][0..len]);
+}
+
+fn softmaxRow(row: []f32) void {
+    var mx = -std.math.inf(f32);
+    for (row) |x| mx = @max(mx, x);
+    var sum: f32 = 0;
+    const vlen = vmath.vlen;
+    const mv: vmath.Vec = @splat(mx);
+    var acc: vmath.Vec = @splat(0);
+    var j: usize = 0;
+    while (j + vlen <= row.len) : (j += vlen) {
+        const e = vmath.expVec(@as(vmath.Vec, row[j..][0..vlen].*) - mv);
+        row[j..][0..vlen].* = e;
+        acc += e;
+    }
+    sum = @reduce(.Add, acc);
+    while (j < row.len) : (j += 1) {
+        row[j] = @exp(row[j] - mx);
+        sum += row[j];
+    }
+    const inv = 1.0 / sum;
+    for (row) |*x| x.* *= inv;
+}
+
 fn headTask(
     out: []f32,
     q: []const f32,
@@ -141,9 +244,13 @@ fn headTask(
         // lower bound tracks it too. A bidirectional block extends only the
         // upper bound forward to the full sequence (keys added after the query).
         const causal_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
-        const kv_end = if (p.kv_end) |e| @as(usize, e[i]) else if (p.bidirectional) p.seq_kv else causal_end;
+        var kv_end = if (p.kv_end) |e| @as(usize, e[i]) else if (p.bidirectional) p.seq_kv else causal_end;
         // Sliding window: drop keys older than `window` positions back.
-        const kv_start = if (p.window != 0 and causal_end > p.window) causal_end - p.window else 0;
+        var kv_start = if (p.window != 0 and causal_end > p.window) causal_end - p.window else 0;
+        if (p.radius != 0) {
+            kv_start = i -| p.radius;
+            kv_end = @min(kv_end, i + p.radius + 1);
+        }
 
         var max_score = -std.math.inf(f32);
         for (kv_start..kv_end) |j| {
@@ -447,6 +554,64 @@ test "bidirectional window bounds only the backward reach" {
     for (0..2) |h| for (0..4) |d| {
         try std.testing.expectApproxEqAbs(attn_v[2 * 4 + d], out[2 * 8 + h * 4 + d], 3e-6);
     };
+}
+
+test "the GEMM path matches the streaming one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // Long enough to take the GEMM path, GQA, a head width off any SIMD multiple.
+    const p: Params = .{ .seq_q = 300, .seq_kv = 300, .n_heads = 4, .n_kv_heads = 2, .head_dim = 40, .scale = 0.3 };
+    try std.testing.expect(p.seq_q * p.seq_kv >= gemm_min_scores);
+    var rng = std.Random.DefaultPrng.init(7);
+    const r = rng.random();
+    const q = try gpa.alloc(f32, p.seq_q * p.n_heads * p.head_dim);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, p.seq_kv * p.n_kv_heads * p.head_dim);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, k.len);
+    defer gpa.free(v);
+    for (q) |*x| x.* = r.floatNorm(f32);
+    for (k) |*x| x.* = r.floatNorm(f32);
+    for (v) |*x| x.* = r.floatNorm(f32);
+    const want = try gpa.alloc(f32, q.len);
+    defer gpa.free(want);
+    const got = try gpa.alloc(f32, q.len);
+    defer gpa.free(got);
+    // A key mask of all-true forces the streaming loop with the same math.
+    const mask = try gpa.alloc(bool, p.seq_kv);
+    defer gpa.free(mask);
+    @memset(mask, true);
+    var ps = p;
+    ps.key_mask = mask;
+    try attention(io, gpa, want, q, k, v, ps);
+    try attention(io, gpa, got, q, k, v, p);
+    var maxd: f32 = 0;
+    for (want, got) |a, b| maxd = @max(maxd, @abs(a - b));
+    errdefer std.debug.print("gemm vs streaming: max abs {d}\n", .{maxd});
+    try std.testing.expect(maxd < 1e-5);
+}
+
+test "radius clips both directions" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const p: Params = .{ .seq_q = 3, .seq_kv = 3, .n_heads = 2, .n_kv_heads = 1, .head_dim = 4 };
+    var out: [24]f32 = undefined;
+    var rp = p;
+    rp.radius = 1;
+    try attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, rp);
+    // Row 1 reaches every key, so it is the unmasked row.
+    var full: [24]f32 = undefined;
+    try attention(io, gpa, &full, &attn_q, &attn_k, &attn_v, p);
+    for (8..16) |i| try std.testing.expectApproxEqAbs(full[i], out[i], 3e-6);
+    // Row 0 sees keys {0, 1} and row 2 sees {1, 2}: full attention over those two.
+    var two: [16]f32 = undefined;
+    const p2: Params = .{ .seq_q = 2, .seq_kv = 2, .n_heads = 2, .n_kv_heads = 1, .head_dim = 4 };
+    try attention(io, gpa, &two, attn_q[0..16], attn_k[0..8], attn_v[0..8], p2);
+    for (0..8) |i| try std.testing.expectApproxEqAbs(two[i], out[i], 3e-6);
+    try attention(io, gpa, &two, attn_q[8..24], attn_k[4..12], attn_v[4..12], p2);
+    for (0..8) |i| try std.testing.expectApproxEqAbs(two[8 + i], out[16 + i], 3e-6);
+    // Teeth: the clipped rows differ from the unmasked ones.
+    try std.testing.expect(@abs(full[0] - out[0]) > 1e-4);
 }
 
 test "cached decode attention matches the full causal rows" {

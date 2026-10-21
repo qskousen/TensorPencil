@@ -834,16 +834,24 @@ per-backend adapter.
 | **Qwen3-VL `vit35`** (SigLIP, 2-D RoPE) | ✅ | ✅ | ✅ | ✅ | `vit35{,_dev,_gpu,_cuda}.zig` | bf16 blocks/proj, f32 patch |
 | **Gemma 3 `gemma_vit`** (SigLIP-So400m) | ✅ | ✅ | ✅ | ✅ | `gemma_vit{,_dev,_gpu,_cuda}.zig` | f16 blocks (vulkan: →f32 at load) |
 | **Gemma 4 `gemma4_vit`** (shallow `gemma4uv` embedder, 12B) | ✅ | ✅ | ✅ | ✅ | `gemma4_vit{,_dev,_gpu,_cuda}.zig` | f32 patch, bf16 proj |
-| **Gemma 4 `gemma4v_vit`** (full SigLIP tower, 31B) | ✅ | ✅ | ✅ | ✅ | `gemma4v_vit{,_dev,_gpu,_cuda}.zig` | Q8_0/F16 blocks, f32 patch |
+| **Gemma 4 `gemma4v_vit`** (full SigLIP tower, 31B; EmbeddingGemma 2's) | ✅ | ✅ | ✅ | ✅ | `gemma4v_vit{,_dev,_gpu,_cuda}.zig` | Q8_0/F16 blocks (GGUF), bf16 (safetensors), f32 patch |
 
 - tp-gui image chat runs on Vulkan for qwen35, gemma3 and gemma4. tp-llm's interactive
   `@image` is CUDA-only; a one-shot `--image` takes the Vulkan tower.
 - A Vulkan tower leaves nothing resident after an encode (`tower_gpu.Scope`).
 - **`gemma4v`** (`projector_type "gemma4v"`): 27-block SigLIP, per-head QK-RMSNorm, 2-D neox
-  RoPE θ=100, weightless V-norm, `kq_scale = 1.0`, GeGLU-quick FFN, RMS sandwich norms, 3×3
+  RoPE θ=100, weightless V-norm, `kq_scale = 1.0`, GeGLU FFN, RMS sandwich norms, 3×3
   avg-pool merge, `std_bias`/`std_scale` affine, one `mm.input_projection`. Blocks run on
   the device, the projection on the host. ⚠️ Its GPU output is looser against the f32 CPU
-  tower than gemma3's (the peaked `kq_scale = 1.0` softmax under f16 attention).
+  tower than gemma3's: the f16 GEMM rounding compounds over 27 blocks (measured per depth in
+  `gemma4v_vit_cuda.zig`'s test). EmbeddingGemma 2's 16-block tower agrees to 0.999997.
+- The same tower loads from a transformers `Gemma4VisionModel` (`Vit.loadSafetensors`,
+  EmbeddingGemma 2), which differs in three settings (`Config`): tanh GELU where the GGUF
+  path runs llama.cpp's quick GELU, torchvision's antialiased bicubic resize
+  (`image.resizeAntialiasBicubic`) where the GGUF path runs an align-corners bilinear, and
+  no std affine. ⚠️ On EmbeddingGemma 2's tower, quick GELU in place of tanh moves the worst
+  soft token to cosine 0.9934 against transformers; the GGUF 31B path is unmeasured
+  against transformers.
 - **Preprocess follows `gemma4_vision_token_budget`**: aspect-preserving resize to a
   48-aligned grid sized to a post-merge token budget, then `2·p/255 − 1`. Set by
   `--vision-budget low|medium|high|ultra|max|<tokens>` or tp-gui "Vision detail" (presets
@@ -854,6 +862,40 @@ per-backend adapter.
 
 Gates: `vit35-test`, `gemma-vit-test`, `gemma4-vit-test` (every arm against the CPU, a hash
 per arm).
+
+### 5A. Embedding encoders (`tp.embed`, `src/embed.zig`)
+
+Encoder-only towers ending in one L2-normalized 768-d vector, each device forward written
+once over `tower_cuda.Dev` / `tower_gpu.Dev`. Linears run in the checkpoint's dtype; the
+pooling heads run on the host.
+
+| Encoder | cpu | vulkan | zig-cuda | cuda | Files | Reference |
+|---|---|---|---|---|---|---|
+| Snowflake Arctic Embed M v2.0 | ✅ | ✅ | ✅ | ✅ | `embed_snowflake{,_dev,_gpu,_cuda}.zig` | ONNX |
+| EmbeddingGemma 300M | ✅ | ✅ | ✅ | ✅ | `embed_gemma{,_dev,_gpu,_cuda}.zig` | ONNX |
+| **EmbeddingGemma 2**, text | ✅ | ✅ | ✅ | ✅ | `embed_gemma2{,_dev,_gpu,_cuda}.zig` | sentence-transformers (`tools/gen_embeddinggemma2.py`) |
+| **EmbeddingGemma 2**, image | ✅ | ✅ | ✅ | ✅ | + `gemma4v_vit*` | (`tools/gen_embeddinggemma2_image.py`) |
+| SigLIP2 ViT-B-16 text / visual | ✅ | ✅ | ✅ | ✅ | `embed_siglip{,_dev,_gpu,_cuda}.zig` | ONNX |
+
+- Attention: Snowflake, EmbeddingGemma 300M and SigLIP2 run the one-thread-per-row
+  `attn_batched` kernel (heads up to 512). EmbeddingGemma 2 runs `attn_bounded` (`dual/`,
+  both arms): one subgroup per (row, head, key chunk) over the row's `[start | end)` from a
+  table at the scratch's tail, then `attn_merge`. The table carries both the item bounds
+  of a ragged batch and the bidirectional sliding window (`Ragged.boundsInto`). On a
+  284-row image body it is 0.42 ms a layer against `attn_batched`'s 24.5.
+- The Gemma 4 vision tower's Vulkan attention runs `attn_gpu`'s tensor-core path with
+  heads zero-padded to 128 (`opAttnBounded` without tensor cores), like CUDA's: 1.7 s ->
+  84 ms on a 2520-patch image. On the 31B gate it moves Vulkan's min token cosine from
+  0.9955 (f32) to 0.9926, CUDA's arms read 0.9936 / 0.9954.
+- CPU: a plain non-causal attention of 64k+ scores runs per head as two GEMMs around a
+  threaded row softmax (`ops/attention.zig` `attentionGemm`): EmbeddingGemma 2's CPU
+  image tower 5.9 s -> 1.45 s.
+- A GPU encoder's weights stay resident; `deinit` evicts them (`tower.forEachHostBuffer`),
+  because both device caches key on host addresses the model then frees.
+- EmbeddingGemma 2's audio tower and video input are not implemented.
+
+Gates: the `embed*` tests under `-Dintegration` (CPU against the reference, each device
+forward against the CPU, batched against per-item); `zig build embed-bench` times them.
 
 ---
 

@@ -4060,6 +4060,16 @@ pub const Backend = struct {
         try self.dualElems("attn_merge", scratch, null, null, out, .{ @intCast(total), @intCast(hd), @intCast(nsplit), 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
+    /// `Context.opAttnBounded` on CUDA: the same dual kernel and scratch layout.
+    pub fn opAttnBounded(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, bounds_off: usize, rows: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        const n = rows * n_heads * nsplit;
+        try self.dualRows("attn_bounded", q, k, v, scratch, .{ @intCast(n), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(bounds_off), @intCast(rows) }, .{ scale, 0 }, n);
+        const total = rows * n_heads * hd;
+        try self.dualElems("attn_merge", scratch, null, null, out, .{ @intCast(total), @intCast(hd), @intCast(nsplit), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     /// Per-head delta-net gates: decay = exp(a*softplus(alpha+dt)),
     /// beta = sigmoid(beta_in).
     pub fn opGdnGates(self: *Backend, alpha_beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize) Error!void {
@@ -5861,6 +5871,8 @@ pub const Backend = struct {
     pub fn opAttnBatched(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, bounds: DeviceBuffer, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
+        // The accumulator is a 2 KB local array.
+        if (hd > 512) return error.UnsupportedWidth;
         const f = try self.eltFn(elt.attn_batched_ptx, "attn_batched");
         var p0 = q.ptr();
         var p1 = k.ptr();

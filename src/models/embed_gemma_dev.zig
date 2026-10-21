@@ -83,7 +83,7 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
             try d.rope(q, freqs, rg.off[i], rg.len(i), heads, qd, half, sin_off);
             try d.rope(k, freqs, rg.off[i], rg.len(i), kvh, kvd, half, sin_off);
         }
-        try d.attention(q, k, v, attn, total, bounds, heads, kvh, hd);
+        try d.attention(q, k, v, attn, total, bounds, 0, heads, kvh, hd, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
         try d.linear(t, attn, total, Weight.init(l.o.bytes, .f32, w, qd), null);
         // The sandwich: the post-attention norm runs BEFORE the residual add.
         try d.rmsNorm(t, t, l.post_attn_norm, total, w, eps);

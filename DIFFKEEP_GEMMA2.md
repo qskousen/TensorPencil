@@ -1,6 +1,4 @@
-# DIFFKEEP_GEMMA2.md: EmbeddingGemma 2 for DiffKeep (deferred)
-
-Status: ON HOLD until the LoRA-for-every-family/backend hoist is done.
+# DIFFKEEP_GEMMA2.md: EmbeddingGemma 2 for DiffKeep
 
 Goal: replace DiffKeep's encoder set (A1 Snowflake, A2 EmbeddingGemma 300M, B/C SigLIP2,
 see `DIFFKEEP.md`) with ONE model, EmbeddingGemma 2, after it passes a retrieval-quality
@@ -9,50 +7,71 @@ check on DiffKeep's own `search_quality_corpus`.
 Scope: TP computes vectors and nothing else. Storage, indexing, KNN and ranking stay in
 DiffKeep, as in `DIFFKEEP.md`.
 
-## The model
+## Status
 
-Google DeepMind, released 2026-10-06, Apache 2.0, `google/embeddinggemma-2` (safetensors).
-Facts below are from the model card and launch coverage; verify against `config.json`
-before porting.
+Text and image are implemented on CPU, Vulkan and CUDA, behind
+`tp.embed.MultimodalEncoder` (text and images into one space) and
+`tp.embed.TextEncoder(.embeddinggemma2)` (text only). Audio and video are not.
 
-- One 768-d space for text, code, image, video, audio. A text query retrieves a picture
-  directly, so the two-space Reciprocal-Rank-Fusion setup DiffKeep runs today is no longer needed.
-- Modular, one checkpoint: 270M text core (about 130M transformer + 140M embedding table),
-  optional 170M vision encoder, optional 300M audio encoder. Any subset shares the space.
-- Text core: Gemma 4 lineage, BIDIRECTIONAL, 24 layers, width 512, 5:1 local:global with a
-  1024 window, mean pool, dense 512 -> 768. Our A2 port (`Gemma3TextModel`, bidirectional)
-  and the Gemma 4 LLM path are the starting points.
-- 8K context. Image: 280 tokens by default (70-1120 configurable). Video: 140/frame at
-  1 fps. Audio: 25 tokens/s, mono 16 kHz.
-- Matryoshka: truncate to 512/256/128, then RE-NORMALIZE. 256 is near-lossless
-  (MTEB en 68.46 -> 67.78); 128 collapses multimodal (MMEB 59.01 -> 45.65). 256 is the likely output size.
-- Task prefixes are required; leaving them off degrades quality silently.
-  Query: `task: search result | query: {q}`. Document: `title: {t} | text: {body}`.
-  Symmetric: `task: classification | query: {x}` on both sides.
-- f16 gives NaN or silently degraded embeddings (activation range). bf16 on GPU, f32 on CPU.
+| check | result |
+|---|---|
+| text vs sentence-transformers, 7 cases incl. 1378 tokens | cosine >= 0.9999999 (bf16 control: 0.99995) |
+| tokenizer + prompt + frame vs transformers ids | exact |
+| image vs sentence-transformers, 3 PNGs (down, up, 1:4.7) | cosine >= 0.99999994 |
+| resize vs torchvision | byte-exact |
+| device vs CPU, both backends | text >= 0.9999 every case (0.999999 on the one read out), images >= 0.999996 |
 
-Open questions:
-- Does the vision tower match Gemma 4's? If yes, mostly reuse; if not, a new ViT.
-- Audio and video: in scope for DiffKeep, or text + image only (440M)?
-- Does TP take image preprocessing (variable token budget) or does DiffKeep's libvips
-  path keep it?
+Weights: `google/embeddinggemma-2` (Apache 2.0, ungated, 1.49 GB bf16) in
+`../DiffKeep/Models/embeddinggemma-2/`. The fixture generators need transformers from main
+and sentence-transformers >= 6.1; the overlay venv at `/dump/venv-eg2` has them.
 
-## Where it runs
+## The model, from its config and transformers' code
 
-- Query text: CPU. About 130M of transformer on a few dozen tokens should be a few ms
-  (estimated, not measured), avoids contention with diffusion/LLM on the GPU, and
-  needs no device load.
-- Bulk encoding: GPU through the VRAM arbiter, CPU fallback. Google quotes 37 ms/image
-  on an M5 Pro GPU at a 70-token budget.
-- Image-to-image queries: either.
-- CPU and GPU vectors differ by float noise only; encoding the library on one and querying on the
-  other is fine with the same weights.
+- Text core (`models/embed_gemma2.zig`): 24 bidirectional Gemma 4 layers, width 512, 4
+  query heads. Local layers: head 256, 2 KV heads, rope 1e4, keys within 512 positions
+  either side (`|q - k| <= 512`). Every 6th layer global: head 512, 1 KV head, rope 1e6.
+  Attention scale 1.0, weightless V norm, norm weights without Gemma 3's +1.
+- Per-layer inputs: one projection of the input embeddings to 24 x 512, normed, gating a
+  third residual block per layer, then a per-layer scalar. No per-layer token table.
+- Head: final norm, 512 -> 768 projection, mean pool over every token, L2 normalize.
+- Image (`models/gemma4v_vit.zig`, shared with Gemma 4 chat): 16-block Gemma 4 ViT, patch
+  16, tanh GELU, 3x3 pool to 280 tokens by default, weightless RMS norm, 768 -> 512 into the
+  text model as `<bos> <|image> soft... <image|> <eos>`. Images take no prompt.
+- Matryoshka: truncate to 512/256/128 and RE-NORMALIZE (`tp.embed.truncate`). The model
+  card puts 256 near-lossless; 128 is text-only quality.
+- Prompts: query `task: search result | query: {q}`, document `title: none | text: {doc}`.
 
-## First steps when this resumes
+## Measured cost (RTX 3090 shared with another process, ReleaseFast, ms/item)
 
-1. `tools/gen_embeddinggemma2.py`: run sentence-transformers on a fixed corpus (text,
-   images; prefixes on; 768 and 256), write the fixture, as for A1/A2/B/C.
-2. Text core on CPU against it, reusing the A2 port; then vision.
-3. Retrieval-quality A/B vs the current four encoders on `search_quality_corpus`. Replace
-   only on a win.
-4. GPU path for bulk encoding; update `BACKEND.md` and `DIFFKEEP_INTEGRATION.md`.
+| | batch 1 | batch 16 |
+|---|---|---|
+| CPU | 26.4 | 8.4 |
+| CUDA | 55.7 | 4.8 |
+| Vulkan | 58.6 | 4.5 |
+
+Text at ~16 tokens via `zig build embed-bench -- --model gemma2`. About 20-25% over
+EmbeddingGemma 300M. Single queries are fastest on the CPU; bulk encoding on the GPU.
+
+Images, 1024x768 RGB8 in (`--model gemma2-image [--budget N] [--stages]`), ms/image:
+
+| tokens | CPU | CUDA batch 1 | CUDA batch 8 | Vulkan batch 1 | Vulkan batch 8 |
+|---|---|---|---|---|---|
+| 280 (default) | 1657 | 123 | 110 | 145 | 129 |
+| 140 | 642 | | 55 | | 61 |
+| 70 | 279 | | 32 | | 36 |
+
+At 280 a CUDA image is preprocessing 14 ms (CPU resize), the vision tower 69 ms and the
+text body 34 ms; batching only amortizes the text body, since the tower runs per image.
+A budget changes the vectors, so an index is built at one budget; its retrieval cost
+is unmeasured.
+
+## Next
+
+1. Retrieval-quality A/B against the current four encoders on `search_quality_corpus`
+   (DiffKeep side). Replace only on a win.
+2. DiffKeep swaps to `MultimodalEncoder`: one table, no rank fusion, and a re-embed of
+   both indexes (a new space).
+3. Image throughput: batch the vision tower (one image per call now) and overlap the CPU
+   resize with the device. Pick a token budget by retrieval quality, not speed alone.
+4. Audio (Gemma 4 conformer, 300M) and video (frames through the image tower), if DiffKeep
+   wants them.

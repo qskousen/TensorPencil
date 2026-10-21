@@ -377,3 +377,20 @@
   4. The prefix's text runs on Vulkan go through the per-thread `attn_causal_batched`.
      Fine at a prompt's length and run once per conditioning; long prompts or image
      prefixes want the tensor-core path with a causal row bound.
+- EmbeddingGemma 2 (`DIFFKEEP_GEMMA2.md`), what is left:
+  - the audio tower (a Gemma 4 conformer, 300M, `gemma4_audio` in transformers) and video
+    (frames through the image tower at 140 tokens each, one `<|image>` block per frame).
+  - the image tower encodes one image per call, so batching only amortizes the text body
+    (CUDA 123 -> 110 ms/image). Batching the tower and overlapping the 14 ms CPU resize
+    with the device are the next levers; the CUDA tower is 55 ms of device time at 280
+    tokens, linears ~15 TFLOP/s.
+  - the GGUF `gemma4v` path (Gemma 4 chat) runs quick GELU and an align-corners bilinear
+    resize, both from llama.cpp. On EmbeddingGemma 2's tower, quick GELU in place of
+    transformers' tanh drops the worst soft token to cosine 0.9934; the 31B tower has not
+    been compared with transformers. Settle it against a transformers Gemma 4 run.
+  - EmbeddingGemma 300M (`embed_gemma.zig`) still asserts `seq <= 512` for its window. The
+    `radius` path EmbeddingGemma 2 uses would lift it, once Gemma 3's own bidirectional
+    window rule in transformers is confirmed to be `|q - k| <= w` as well.
+- `anima.zig`'s "the Anima adapter and DiT match ComfyUI on a real checkpoint" leaks one
+  1,647,358-byte allocation (no stack trace) at HEAD too, which fails the `-Dintegration`
+  step with every test green. Not yet traced.
