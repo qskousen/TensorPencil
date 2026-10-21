@@ -21,6 +21,7 @@
 //! own `jsonStringify`/`jsonParse` so they (de)serialize as a plain string /
 //! variable-length array rather than a raw byte/element array.
 const std = @import("std");
+const repeat = @import("TensorPencil").strings.repeat;
 const builtin = @import("builtin");
 const known_folders = @import("known-folders");
 const link = @import("serve").link;
@@ -61,8 +62,8 @@ pub const Preview = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?Preview {
-        inline for (@typeInfo(Preview).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Preview).@"enum".field_names, @typeInfo(Preview).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -98,8 +99,8 @@ pub const TaesdSize = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?TaesdSize {
-        inline for (@typeInfo(TaesdSize).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(TaesdSize).@"enum".field_names, @typeInfo(TaesdSize).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -123,8 +124,8 @@ pub const PromptSyntax = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?PromptSyntax {
-        inline for (@typeInfo(PromptSyntax).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(PromptSyntax).@"enum".field_names, @typeInfo(PromptSyntax).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -148,8 +149,8 @@ pub const CondShape = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?CondShape {
-        inline for (@typeInfo(CondShape).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(CondShape).@"enum".field_names, @typeInfo(CondShape).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -171,8 +172,8 @@ pub const Emphasis = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?Emphasis {
-        inline for (@typeInfo(Emphasis).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Emphasis).@"enum".field_names, @typeInfo(Emphasis).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -198,8 +199,8 @@ pub const Compat = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?Compat {
-        inline for (@typeInfo(Compat).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Compat).@"enum".field_names, @typeInfo(Compat).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -247,8 +248,8 @@ pub const Sampler = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?Sampler {
-        inline for (@typeInfo(Sampler).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Sampler).@"enum".field_names, @typeInfo(Sampler).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -306,8 +307,8 @@ pub const Scheduler = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?Scheduler {
-        inline for (@typeInfo(Scheduler).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Scheduler).@"enum".field_names, @typeInfo(Scheduler).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -325,8 +326,8 @@ pub const Backend = enum(u8) {
     auto,
 
     fn fromStr(s: []const u8) ?Backend {
-        inline for (@typeInfo(Backend).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Backend).@"enum".field_names, @typeInfo(Backend).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -358,8 +359,8 @@ pub const WeightRead = enum(u8) {
     buffered,
 
     fn fromStr(s: []const u8) ?WeightRead {
-        inline for (@typeInfo(WeightRead).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(WeightRead).@"enum".field_names, @typeInfo(WeightRead).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -371,8 +372,8 @@ pub const KvDtype = enum(u8) {
     q8_0,
 
     fn fromStr(s: []const u8) ?KvDtype {
-        inline for (@typeInfo(KvDtype).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(KvDtype).@"enum".field_names, @typeInfo(KvDtype).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -401,8 +402,8 @@ pub const VisionBudget = enum(u8) {
     }
 
     fn fromStr(s: []const u8) ?VisionBudget {
-        inline for (@typeInfo(VisionBudget).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(VisionBudget).@"enum".field_names, @typeInfo(VisionBudget).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -418,8 +419,8 @@ pub const VaeDecode = enum(u8) {
     cpu_tiled,
 
     fn fromStr(s: []const u8) ?VaeDecode {
-        inline for (@typeInfo(VaeDecode).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(VaeDecode).@"enum".field_names, @typeInfo(VaeDecode).@"enum".field_values) |name, value| {
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(value);
         }
         return null;
     }
@@ -535,7 +536,7 @@ fn defaultNoiseCurves() NoiseCurveList {
 pub fn FixedList(comptime T: type, comptime cap: usize) type {
     return struct {
         const Self = @This();
-        items: [cap]T = [_]T{.{}} ** cap,
+        items: [cap]T = @splat(.{}),
         count: usize = 0,
 
         /// The live entries.
@@ -580,7 +581,7 @@ pub const NoiseCurveList = FixedList(NoiseCurve, max_noise_curves);
 pub fn TextBuf(comptime cap: usize) type {
     return struct {
         const Self = @This();
-        data: [cap]u8 = [_]u8{0} ** cap,
+        data: [cap]u8 = @splat(0),
 
         /// Comptime constructor for a default value (asserts it fits).
         pub fn lit(comptime s: []const u8) Self {
@@ -1156,7 +1157,7 @@ pub const Config = struct {
             const ep = link.Endpoint.parse(where) orelse return .bad_pairing;
             if (ep != .tls or ep.tls.cert_b64.len >= max_cert_b64) return .bad_pairing;
             var hp_buf: [max_path]u8 = undefined;
-            h.socket.set(std.fmt.bufPrint(&hp_buf, "{s}:{d}", .{ ep.tls.host, ep.tls.port }) catch return .bad_pairing);
+            h.socket.set(std.mem.print(&hp_buf, "{s}:{d}", .{ ep.tls.host, ep.tls.port }) catch return .bad_pairing);
             h.cert.set(ep.tls.cert_b64);
             h.token.set(&link.secretHex(ep.tls.token));
             h.spawn = false;
@@ -1178,7 +1179,7 @@ pub const Config = struct {
 
     pub fn removeHost(self: *Config, i: usize) void {
         if (i >= self.hosts.count) return;
-        std.mem.copyForwards(HostEntry, self.hosts.items[i .. self.hosts.count - 1], self.hosts.items[i + 1 .. self.hosts.count]);
+        @memmove(self.hosts.items[i .. self.hosts.count - 1], self.hosts.items[i + 1 .. self.hosts.count]);
         self.hosts.count -= 1;
         self.hosts.items[self.hosts.count] = .{};
     }
@@ -1260,7 +1261,7 @@ pub const Config = struct {
     /// Returns whether one was removed.
     pub fn removePresetNamed(self: *Config, raw_name: []const u8) bool {
         const i = self.findPreset(raw_name) orelse return false;
-        std.mem.copyForwards(Preset, self.presets.items[i .. self.presets.count - 1], self.presets.items[i + 1 .. self.presets.count]);
+        @memmove(self.presets.items[i .. self.presets.count - 1], self.presets.items[i + 1 .. self.presets.count]);
         self.presets.count -= 1;
         self.presets.items[self.presets.count] = .{};
         return true;
@@ -1306,7 +1307,7 @@ pub const Config = struct {
     /// Remove the curve named `raw_name`. Returns whether one was removed.
     pub fn removeNoiseCurveNamed(self: *Config, raw_name: []const u8) bool {
         const i = self.findNoiseCurve(raw_name) orelse return false;
-        std.mem.copyForwards(NoiseCurve, self.noise_curves.items[i .. self.noise_curves.count - 1], self.noise_curves.items[i + 1 .. self.noise_curves.count]);
+        @memmove(self.noise_curves.items[i .. self.noise_curves.count - 1], self.noise_curves.items[i + 1 .. self.noise_curves.count]);
         self.noise_curves.count -= 1;
         self.noise_curves.items[self.noise_curves.count] = .{};
         return true;
@@ -1344,7 +1345,7 @@ pub const Config = struct {
     /// Remove the system prompt named `raw_name`. Returns whether one was removed.
     pub fn removeSysPromptNamed(self: *Config, raw_name: []const u8) bool {
         const i = self.findSysPrompt(raw_name) orelse return false;
-        std.mem.copyForwards(SysPrompt, self.sys_prompts.items[i .. self.sys_prompts.count - 1], self.sys_prompts.items[i + 1 .. self.sys_prompts.count]);
+        @memmove(self.sys_prompts.items[i .. self.sys_prompts.count - 1], self.sys_prompts.items[i + 1 .. self.sys_prompts.count]);
         self.sys_prompts.count -= 1;
         self.sys_prompts.items[self.sys_prompts.count] = .{};
         return true;
@@ -1388,7 +1389,7 @@ pub const Config = struct {
 
     pub fn removeModelDir(self: *Config, i: usize) void {
         if (i >= self.model_dirs.count) return;
-        std.mem.copyForwards(ModelDir, self.model_dirs.items[i .. self.model_dirs.count - 1], self.model_dirs.items[i + 1 .. self.model_dirs.count]);
+        @memmove(self.model_dirs.items[i .. self.model_dirs.count - 1], self.model_dirs.items[i + 1 .. self.model_dirs.count]);
         self.model_dirs.count -= 1;
         self.model_dirs.items[self.model_dirs.count] = .{};
     }
@@ -1400,7 +1401,7 @@ pub const Config = struct {
         if (self.model_dirs.count > 0) return;
         for ([_]*const PathBuf{ &self.llm_model, &self.vision_tower, &self.diffusion_model, &self.text_encoder, &self.text_encoder_2, &self.vae, &self.taesd }) |pb| {
             const p = pb.opt() orelse continue;
-            if (std.fs.path.dirname(p)) |d| _ = self.addModelDir(d);
+            if (std.Io.Dir.path.dirname(p)) |d| _ = self.addModelDir(d);
         }
     }
 
@@ -1472,7 +1473,7 @@ pub const Config = struct {
             return;
         };
         if (self.class_towers.count >= max_class_towers) {
-            std.mem.copyForwards(ClassTower, self.class_towers.items[0 .. max_class_towers - 1], self.class_towers.items[1..max_class_towers]);
+            @memmove(self.class_towers.items[0 .. max_class_towers - 1], self.class_towers.items[1..max_class_towers]);
             self.class_towers.count -= 1;
         }
         const c = &self.class_towers.items[self.class_towers.count];
@@ -1495,7 +1496,7 @@ pub const Config = struct {
     pub fn dirPath(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) !?[]u8 {
         const base = (try known_folders.getPath(io, gpa, environ, .local_configuration)) orelse return null;
         defer gpa.free(base);
-        return try std.fs.path.join(gpa, &.{ base, app_dir });
+        return try std.Io.Dir.path.join(gpa, &.{ base, app_dir });
     }
 
     /// Resolve the full config file path. An explicit `override` (e.g. from
@@ -1506,7 +1507,7 @@ pub const Config = struct {
         if (override) |p| return try gpa.dupe(u8, p);
         const dir = (try dirPath(io, gpa, environ)) orelse return null;
         defer gpa.free(dir);
-        return try std.fs.path.join(gpa, &.{ dir, file_name });
+        return try std.Io.Dir.path.join(gpa, &.{ dir, file_name });
     }
 
     /// Whether a settings file already exists. The caller uses it to tell a first
@@ -1526,8 +1527,8 @@ pub const Config = struct {
     pub fn siblingPath(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, override: ?[]const u8, name: []const u8) !?[]u8 {
         const cfg_path = (try filePath(io, gpa, environ, override)) orelse return null;
         defer gpa.free(cfg_path);
-        const dir = std.fs.path.dirname(cfg_path) orelse ".";
-        return try std.fs.path.join(gpa, &.{ dir, name });
+        const dir = std.Io.Dir.path.dirname(cfg_path) orelse ".";
+        return try std.Io.Dir.path.join(gpa, &.{ dir, name });
     }
 
     /// The default image-output directory: `<Pictures>/TensorPencil`
@@ -1536,7 +1537,7 @@ pub const Config = struct {
     fn defaultOutputDir(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) !?[]u8 {
         const base = (try known_folders.getPath(io, gpa, environ, .pictures)) orelse return null;
         defer gpa.free(base);
-        return try std.fs.path.join(gpa, &.{ base, "TensorPencil" });
+        return try std.Io.Dir.path.join(gpa, &.{ base, "TensorPencil" });
     }
 
     /// Fill an unset output dir with the platform default so the settings view
@@ -1627,7 +1628,7 @@ pub const Config = struct {
         // Legacy `key = value` fallback: parse, then rewrite as JSON in place.
         var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
-            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..eq], " \t\r");
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
             cfg.apply(key, val);
@@ -1649,7 +1650,7 @@ pub const Config = struct {
     /// Move an unreadable settings file to `<path>.unparsed-<unix seconds>`.
     fn setAside(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
         const secs = @divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s);
-        const dest = std.fmt.allocPrint(gpa, "{s}.unparsed-{d}", .{ path, secs }) catch return;
+        const dest = gpa.print("{s}.unparsed-{d}", .{ path, secs }) catch return;
         defer gpa.free(dest);
         const cwd = std.Io.Dir.cwd();
         if (cwd.rename(path, cwd, dest, io)) |_| {
@@ -1794,7 +1795,7 @@ pub const Config = struct {
         const json = try std.json.Stringify.valueAlloc(gpa, self.*, .{ .whitespace = .indent_2 });
         defer gpa.free(json);
 
-        if (std.fs.path.dirname(path)) |dir| {
+        if (std.Io.Dir.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -1803,10 +1804,10 @@ pub const Config = struct {
         // The file holds every remote host's token and pinned certificate, so
         // it is the user's alone. A create does not touch an existing file's
         // mode, which is why it is set either way.
-        const perms: std.Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+        const perms: std.Io.Dir.Permissions = if (builtin.target.os.tag == .windows) .default_file else .fromMode(0o600);
         const f = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = perms });
         defer f.close(io);
-        if (builtin.os.tag != .windows) f.setPermissions(io, perms) catch {};
+        if (builtin.target.os.tag != .windows) f.setPermissions(io, perms) catch {};
         try f.writeStreamingAll(io, json);
     }
 };
@@ -1841,15 +1842,15 @@ pub const HostSettings = Subset(Config, &host_fields);
 
 fn Subset(comptime T: type, comptime names: []const []const u8) type {
     @setEvalBranchQuota(20_000);
-    const src = @typeInfo(T).@"struct".fields;
+    const src = @typeInfo(T).@"struct";
     var types: [names.len]type = undefined;
-    var attrs: [names.len]std.builtin.Type.StructField.Attributes = undefined;
+    var attrs: [names.len]std.lang.Type.Struct.FieldAttributes = undefined;
     for (names, &types, &attrs) |name, *ty, *at| {
-        const f = for (src) |f| {
-            if (std.mem.eql(u8, f.name, name)) break f;
+        const i = for (src.field_names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) break i;
         } else @compileError("Config has no field named " ++ name);
-        ty.* = f.type;
-        at.* = .{ .default_value_ptr = f.default_value_ptr, .@"align" = f.alignment };
+        ty.* = src.field_types[i];
+        at.* = src.field_attrs[i];
     }
     return @Struct(.auto, null, names, &types, &attrs);
 }
@@ -1911,11 +1912,11 @@ fn parsePreset(val: []const u8) ?Preset {
 /// same cwd, a fixed filename races across binaries and flakes.
 fn testFile(buf: []u8, comptime tag: []const u8) []const u8 {
     // `std.posix.system` has no getpid on Windows, where the pid is a DWORD.
-    const pid: u32 = if (@import("builtin").os.tag == .windows)
+    const pid: u32 = if (@import("builtin").target.os.tag == .windows)
         std.os.windows.GetCurrentProcessId()
     else
         @intCast(std.posix.system.getpid());
-    return std.fmt.bufPrint(buf, ".gui-config-{s}-test.{d}", .{ tag, pid }) catch unreachable;
+    return std.mem.print(buf, ".gui-config-{s}-test.{d}", .{ tag, pid }) catch unreachable;
 }
 
 test "PathBuf opt/set round-trips and reports empty as null" {
@@ -2224,7 +2225,7 @@ test "load sets an unreadable JSON file aside and writes nothing over it" {
         defer gpa.free(kept);
         dir.deleteFile(io, e.name) catch {};
         try std.testing.expectEqualStrings(bad, kept);
-        try std.testing.expect(std.mem.indexOf(u8, e.name, ".unparsed-") != null);
+        try std.testing.expect(std.mem.find(u8, e.name, ".unparsed-") != null);
         found = true;
     }
     try std.testing.expect(found);
@@ -2515,7 +2516,7 @@ test "preset lines parse, tolerate junk, and cap at max_presets" {
     // The table caps at max_presets; extra lines are dropped.
     for (0..max_presets) |i| {
         var name_buf: [max_preset_name]u8 = undefined;
-        const line = std.fmt.bufPrint(&name_buf, "p{d}|1|20|1|0|1|64|0|0", .{i}) catch unreachable;
+        const line = std.mem.print(&name_buf, "p{d}|1|20|1|0|1|64|0|0", .{i}) catch unreachable;
         cfg.apply("preset", line);
     }
     try std.testing.expectEqual(@as(usize, max_presets), cfg.presets.count);
@@ -2594,7 +2595,7 @@ test "model folders: add dedupes and caps, remove shifts, seed reads parents" {
     var i: usize = 0;
     while (c.model_dirs.count < max_model_dirs) : (i += 1) {
         var buf: [32]u8 = undefined;
-        try std.testing.expect(c.addModelDir(try std.fmt.bufPrint(&buf, "/d/{d}", .{i})));
+        try std.testing.expect(c.addModelDir(try std.mem.print(&buf, "/d/{d}", .{i})));
     }
     try std.testing.expect(!c.addModelDir("/one/too/many"));
 
@@ -2634,7 +2635,7 @@ test "family sides and class towers: get-or-create, remember, round-trip" {
     var i: usize = 0;
     while (i < max_class_towers) : (i += 1) {
         var buf: [32]u8 = undefined;
-        c.rememberClassTower(try std.fmt.bufPrint(&buf, "arch{d}|1", .{i}), choice_none);
+        c.rememberClassTower(try std.mem.print(&buf, "arch{d}|1", .{i}), choice_none);
     }
     try std.testing.expectEqual(@as(usize, max_class_towers), c.class_towers.count);
     try std.testing.expect(c.classTower("gemma4|5376") == null);
@@ -2646,7 +2647,7 @@ test "family sides and class towers: get-or-create, remember, round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var pbuf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
+    const path = try std.mem.print(&pbuf, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
     var env: Environ = .init(gpa);
     defer env.deinit();
     _ = c.addModelDir("/models");
@@ -2691,7 +2692,7 @@ test "family loras: add dedupes, remove keeps order, table caps" {
     var full: Config = .{};
     var buf: [64]u8 = undefined;
     for (0..max_family_loras) |i| {
-        const path = try std.fmt.bufPrint(&buf, "/l/{d}.safetensors", .{i});
+        const path = try std.mem.print(&buf, "/l/{d}.safetensors", .{i});
         try std.testing.expect(full.addFamilyLora("sensenova", path) != null);
     }
     try std.testing.expect(full.addFamilyLora("sensenova", "/l/one-too-many.safetensors") == null);
@@ -2769,7 +2770,7 @@ test "upsertSysPrompt caps at max_sys_prompts" {
     var cfg: Config = .{};
     for (0..max_sys_prompts + 3) |i| {
         var name_buf: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "p{d}", .{i}) catch unreachable;
+        const name = std.mem.print(&name_buf, "p{d}", .{i}) catch unreachable;
         // Returns false once the table is full.
         const ok = cfg.upsertSysPrompt(name, "text");
         try std.testing.expectEqual(i < max_sys_prompts, ok);
@@ -2887,7 +2888,7 @@ test "HostSettings carries every host field and none of the client's" {
     _ = cfg.addModelDir("/c/models");
     cfg.cfg_scale = 4.5;
     _ = cfg.addHost("beta", "/c/run/beta.sock", true);
-    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("far", "tp://lydia:7777/AAAA#" ++ ("5e" ** 32), true));
+    try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("far", "tp://lydia:7777/AAAA#" ++ repeat("5e", 32), true));
 
     const h = hostSettings(&cfg);
     inline for (host_fields) |name| {
@@ -2907,7 +2908,7 @@ test "HostSettings carries every host field and none of the client's" {
     defer gpa.free(json);
     for ([_][]const u8{ "\"output_dir\"", "\"win_", "\"viewer_", "\"studio_", "\"sys_prompts\"", "\"presets\"", "\"noise_curves\"", "\"model_dirs\"", "\"family_sides\"", "\"class_towers\"", "\"hosts\"", "/c/", "secret", "mine", "beta", "lydia", "5e5e5e" }) |needle| {
         errdefer std.debug.print("client data on the wire: {s}\n", .{needle});
-        try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
+        try std.testing.expect(std.mem.find(u8, json, needle) == null);
     }
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2936,7 +2937,7 @@ test "a settings file from before the version key loads, keeps its values and is
     var environ: Environ = .init(gpa);
     defer environ.deinit();
     var pbuf: [256]u8 = undefined;
-    const file = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/settings.json", .{tmp.sub_path});
+    const file = try std.mem.print(&pbuf, ".zig-cache/tmp/{s}/settings.json", .{tmp.sub_path});
     // As the app wrote it before the key existed: a few of each side's fields.
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data =
         \\{"llm_model":"/m/llm.gguf","diffusion_model":"/m/dit.safetensors",
@@ -2964,7 +2965,7 @@ test "a settings file from before the version key loads, keeps its values and is
 
 test "a pairing string becomes a remote host entry whose endpoint carries the pin and token" {
     var cfg: Config = .{};
-    const token_hex = "0f" ** 32;
+    const token_hex = repeat("0f", 32);
     try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("far", "tp://[fd7a::8]:7777/MIIBcert_-#" ++ token_hex, true));
     const e = cfg.hostEntry("far").?;
     try std.testing.expect(e.remote());
@@ -2994,8 +2995,8 @@ test "a pairing string becomes a remote host entry whose endpoint carries the pi
 
 test "re-pairing a host under the name it already has takes the new token" {
     var cfg: Config = .{};
-    const old_hex = "0f" ** 32;
-    const new_hex = "a3" ** 32;
+    const old_hex = repeat("0f", 32);
+    const new_hex = repeat("a3", 32);
     try std.testing.expectEqual(Config.AddHost.added, cfg.addHost("lydia", "tp://10.0.0.130:7777/MIIBold#" ++ old_hex, false));
     // What is set ON the host, as the meter rail leaves it.
     cfg.hostEntryMut("lydia").?.vram_split = 0.42;
@@ -3032,7 +3033,7 @@ test "re-pairing a host under the name it already has takes the new token" {
     try std.testing.expectEqual(Config.AddHost.no_target, cfg.addHost("x", "", true));
     for (0..max_hosts) |i| {
         var buf: [8]u8 = undefined;
-        _ = cfg.addHost(try std.fmt.bufPrint(&buf, "h{d}", .{i}), "/run/x.sock", true);
+        _ = cfg.addHost(try std.mem.print(&buf, "h{d}", .{i}), "/run/x.sock", true);
     }
     try std.testing.expectEqual(Config.AddHost.list_full, cfg.addHost("one-more", "/run/x.sock", true));
     inline for (.{ .added, .repaired, .no_name, .no_target, .bad_pairing, .list_full }) |r| {
@@ -3052,10 +3053,10 @@ test "nothing parses a Config without a big stack under it" {
     const src = @embedFile("config.zig");
     var n: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "parseFromSlice")) |at| : (i = at + 1) {
+    while (std.mem.findPos(u8, src, i, "parseFromSlice")) |at| : (i = at + 1) {
         // Only the ones whose type argument is `Config`; other types are small.
         const tail = src[at..@min(at + 64, src.len)];
-        if (std.mem.indexOf(u8, tail, "(Config,") != null) n += 1;
+        if (std.mem.find(u8, tail, "(Config,") != null) n += 1;
     }
     errdefer std.debug.print("found {d} direct Config parses, expected 3\n", .{n});
     try std.testing.expectEqual(@as(usize, 3), n);

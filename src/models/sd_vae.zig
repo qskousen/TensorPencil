@@ -501,7 +501,7 @@ pub const Decoder = struct {
     /// `decoder.mid.block_1.norm1.weight`, which reports the missing tensor by name.
     pub fn detectNaming(store: WeightStore, prefix: []const u8) Naming {
         var buf: [200]u8 = undefined;
-        const nm = std.fmt.bufPrint(&buf, "{s}decoder.mid_block.resnets.0.norm1.weight", .{prefix}) catch return .ldm;
+        const nm = std.mem.print(&buf, "{s}decoder.mid_block.resnets.0.norm1.weight", .{prefix}) catch return .ldm;
         return if (store.get(nm) != null) .diffusers else .ldm;
     }
 
@@ -813,7 +813,7 @@ const Loader = struct {
     /// Whether a tensor (named relative to the store prefix) is present.
     fn has(l: Loader, rel: []const u8) bool {
         var buf: [200]u8 = undefined;
-        const nm = std.fmt.bufPrint(&buf, "{s}{s}", .{ l.pfx, rel }) catch return false;
+        const nm = std.mem.print(&buf, "{s}{s}", .{ l.pfx, rel }) catch return false;
         return l.store.get(nm) != null;
     }
 
@@ -883,7 +883,7 @@ const Loader = struct {
         var buf: [200]u8 = undefined;
         // Relative base: the inner helpers add the store prefix themselves (a
         // pre-prefixed base doubles it, and the symptom is a missing tensor).
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         return .{
             .norm1 = try l.groupNorm("{s}.norm1", .{base}, in_ch),
             .conv1 = try l.conv("{s}.conv1", .{base}, out_ch, in_ch, 3, 1, 1),
@@ -900,7 +900,7 @@ const Loader = struct {
 
     fn attn(l: Loader, comptime fmt: []const u8, args: anytype, ch: usize) !AttnBlock {
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         // diffusers stores these four as `nn.Linear` rather than 1x1 convolutions.
         // Same bytes, same order; `conv` accepts the 2-D shape when k == 1.
         if (l.naming == .diffusers) return .{
@@ -1124,7 +1124,7 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
 
     // SD1.5, unit weight on channel 0 at pixel 0 -> factors[0]; a large value at
     // pixel 1 -> clamped white on R.
-    var z15 = [_]f32{0} ** (latent_channels * plane);
+    var z15: [(latent_channels * plane)]f32 = @splat(0);
     z15[0] = 1;
     z15[1] = 10;
     latentPreviewInto(&rgb, &z15, 1, plane, &latent_rgb_factors_sd15, latent_rgb_bias_sd15);
@@ -1132,7 +1132,7 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
     try testing.expectEqual(@as(u8, 255), rgb[3]);
 
     // SDXL, an all-zero latent -> the bias alone (SD1.5's would give a flat 127).
-    const z_xl = [_]f32{0} ** (latent_channels * plane);
+    const z_xl: [(latent_channels * plane)]f32 = @splat(0);
     latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sdxl, latent_rgb_bias_sdxl);
     try testing.expectEqualSlices(u8, &.{ 141, 125, 127 }, rgb[0..3]);
     latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sd15, latent_rgb_bias_sd15);
@@ -1171,9 +1171,9 @@ test "the 16-channel Flux/Z-Image VAE decoder matches ComfyUI's AutoencoderKL" {
     // attends over 1024 positions.
     for ([_]usize{ 0, 1 }) |ci| {
         var kb: [32]u8 = undefined;
-        const z_planar = try (try ref.require(try std.fmt.bufPrint(&kb, "vae.{d}.z", .{ci}))).toF32Alloc(gpa);
+        const z_planar = try (try ref.require(try std.mem.print(&kb, "vae.{d}.z", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(z_planar);
-        const want_planar = try (try ref.require(try std.fmt.bufPrint(&kb, "vae.{d}.rgb", .{ci}))).toF32Alloc(gpa);
+        const want_planar = try (try ref.require(try std.mem.print(&kb, "vae.{d}.rgb", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(want_planar);
 
         const zc = flux.z_channels;
@@ -1291,10 +1291,10 @@ test "the Flux2 latent fold matches ComfyUI's AutoencodingEngineLegacy.decode" {
     };
     var buf: [32]u8 = undefined;
     for (cases) |c| {
-        const zv = try st.require(try std.fmt.bufPrint(&buf, "{s}.z", .{c.name}));
+        const zv = try st.require(try std.mem.print(&buf, "{s}.z", .{c.name}));
         const z = try zv.toF32Alloc(gpa);
         defer gpa.free(z);
-        const wv = try st.require(try std.fmt.bufPrint(&buf, "{s}.out", .{c.name}));
+        const wv = try st.require(try std.mem.print(&buf, "{s}.out", .{c.name}));
         const want = try wv.toF32Alloc(gpa);
         defer gpa.free(want);
 

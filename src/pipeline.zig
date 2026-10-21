@@ -119,7 +119,7 @@ const dit_gpu = @import("tp_models").models.dit_gpu;
 const dit_cuda = @import("tp_models").models.dit_cuda;
 const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
 const cuda = @import("tp_gpu").cuda;
-/// std.posix.getenv is gone in 0.16 and we link libc (see backend.zig).
+/// std.posix.getenv is gone and we link libc (see backend.zig).
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const wan_vae = @import("tp_models").models.wan_vae;
 const clip_tok = @import("tp_core").clip_tokenizer;
@@ -176,14 +176,14 @@ pub const Backend = enum {
 /// 9. Probed once a process.
 pub fn detectBackend() Backend {
     const known = detected_backend.load(.acquire);
-    if (known != 0) return @enumFromInt(known - 1);
+    if (known != 0) return @fromBackingInt(@intCast(known - 1));
     const b: Backend = if (cuda.cu.deviceCount() > 0)
         .zig_cuda
     else if (gpu_mod.context.probeHeapBytes(std.heap.page_allocator) != null)
         .vulkan
     else
         .cpu;
-    detected_backend.store(@as(u8, @intFromEnum(b)) + 1, .release);
+    detected_backend.store(@as(u8, @backingInt(b)) + 1, .release);
     return b;
 }
 var detected_backend: std.atomic.Value(u8) = .init(0);
@@ -943,7 +943,7 @@ pub fn buildA1111Params(
     cc: CompatConfig,
 ) ![]u8 {
     const neg_line = if (negative.len > 0)
-        try std.fmt.allocPrint(gpa, "Negative prompt: {s}\n", .{negative})
+        try gpa.print("Negative prompt: {s}\n", .{negative})
     else
         try gpa.dupe(u8, "");
     defer gpa.free(neg_line);
@@ -953,9 +953,9 @@ pub fn buildA1111Params(
     // An explicit choice wins; otherwise name the
     // family's default, and drop the field entirely when even that is unknown.
     const sched_line = if (sched) |sc|
-        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{sc.a1111Name()})
+        try gpa.print("Schedule type: {s}, ", .{sc.a1111Name()})
     else if (fam) |f|
-        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{defaultSchedulerFor(f).a1111Name()})
+        try gpa.print("Schedule type: {s}, ", .{defaultSchedulerFor(f).a1111Name()})
     else
         try gpa.dupe(u8, "");
     defer gpa.free(sched_line);
@@ -966,7 +966,7 @@ pub fn buildA1111Params(
     // Only under `.a1111`, under `.comfy` there is exactly one weighting form, so the
     // field would imply a choice that does not exist.
     const emph_line = if (syntax == .a1111)
-        try std.fmt.allocPrint(gpa, ", Emphasis: {s}", .{switch (emphasis) {
+        try gpa.print(", Emphasis: {s}", .{switch (emphasis) {
             .original => "Original",
             .no_norm => "No norm",
             .ignore => "Ignore",
@@ -996,9 +996,7 @@ pub fn buildA1111Params(
         try extra.print(gpa, ", Quantize timesteps: {s}", .{if (cc.quantize_timestep) "True" else "False"});
     }
 
-    return std.fmt.allocPrint(
-        gpa,
-        "{s}\n{s}Steps: {d}, Sampler: {s}, {s}CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}, Prompt syntax: {s}{s}{s}{s}",
+    return gpa.print("{s}\n{s}Steps: {d}, Sampler: {s}, {s}CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}, Prompt syntax: {s}{s}{s}{s}",
         .{ prompt, neg_line, steps, samp.a1111Name(), sched_line, cfg, seed, width, height, model_name, syntax_name, emph_line, compat_line, extra.items },
     );
 }
@@ -1017,7 +1015,7 @@ pub fn buildA1111Params(
 /// clip.
 pub fn appendClipParams(gpa: std.mem.Allocator, base: []u8, shifts: minimax_h3.Shifts) ![]u8 {
     defer gpa.free(base);
-    return std.fmt.allocPrint(gpa, "{s}, Shift: {d:.4}, Audio shift: {d:.4}", .{ base, shifts.video, shifts.audio });
+    return gpa.print("{s}, Shift: {d:.4}, Audio shift: {d:.4}", .{ base, shifts.video, shifts.audio });
 }
 
 /// One LoRA as the metadata block records it.
@@ -1249,7 +1247,7 @@ pub const HashCache = struct {
         const digest = try self.digestOf(io, path);
         const took = std.Io.Clock.real.now(io).nanoseconds - t0;
         var hex_buf: [64]u8 = undefined;
-        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{digest[0..]}) catch unreachable;
+        const hex = std.mem.print(&hex_buf, "{x}", .{digest[0..]}) catch unreachable;
 
         writeSidecar(io, side, hex) catch |err| std.log.warn(
             "could not write {s} ({t}); this file will be hashed again next time",
@@ -1293,12 +1291,12 @@ pub const HashCache = struct {
 /// names differ only by extension would share a sidecar, which is a wrinkle in
 /// the convention itself, not something to fix here.
 fn sidecarPath(buf: []u8, path: []const u8) ![]const u8 {
-    const dir = std.fs.path.dirname(path);
-    const stem = std.fs.path.stem(path);
+    const dir = std.Io.Dir.path.dirname(path);
+    const stem = std.Io.Dir.path.stem(path);
     return if (dir) |d|
-        std.fmt.bufPrint(buf, "{s}{c}{s}.sha256", .{ d, std.fs.path.sep, stem })
+        std.mem.print(buf, "{s}{c}{s}.sha256", .{ d, std.Io.Dir.path.sep, stem })
     else
-        std.fmt.bufPrint(buf, "{s}.sha256", .{stem});
+        std.mem.print(buf, "{s}.sha256", .{stem});
 }
 
 /// Write `hex` to `path` through a temp file and a rename, so a reader never
@@ -1310,7 +1308,7 @@ fn sidecarPath(buf: []u8, path: []const u8) ![]const u8 {
 fn writeSidecar(io: std.Io, path: []const u8, hex: []const u8) !void {
     std.debug.assert(hex.len == 64);
     var tmp_buf: [520]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    const tmp = try std.mem.print(&tmp_buf, "{s}.tmp", .{path});
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = tmp, .data = hex });
     errdefer cwd.deleteFile(io, tmp) catch {};
@@ -1732,7 +1730,7 @@ pub const CondNoise = struct {
         var h = std.hash.Wyhash.init(0x436f_6e64_4e6f_6973); // "CondNois"
         const base = self.seed orelse render_seed;
         h.update(std.mem.asBytes(&base));
-        h.update(&[_]u8{@intFromEnum(pt)});
+        h.update(&[_]u8{@backingInt(pt)});
         h.update(text);
         return h.final();
     }
@@ -2989,8 +2987,10 @@ pub const Container = union(enum) {
     /// wherever the path came from the user; a speculative open of a defaulted
     /// path stays on `open`, where a miss is expected and not reported.
     pub fn openNamed(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
-        errdefer |err| std.log.err("cannot open {s}: {t}", .{ path, err });
-        return open(gpa, io, path);
+        return open(gpa, io, path) catch |err| {
+            std.log.err("cannot open {s}: {t}", .{ path, err });
+            return err;
+        };
     }
 
     fn isGgufIn(io: std.Io, dir: std.Io.Dir, path: []const u8) !bool {
@@ -3921,8 +3921,8 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     for ((componentSpec(.zimage, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
-        const cap = std.fmt.bufPrint(&b1, "{s}cap_embedder.1.weight", .{pfx}) catch continue;
-        const ref = std.fmt.bufPrint(&b2, "{s}noise_refiner.0.attention.k_norm.weight", .{pfx}) catch continue;
+        const cap = std.mem.print(&b1, "{s}cap_embedder.1.weight", .{pfx}) catch continue;
+        const ref = std.mem.print(&b2, "{s}noise_refiner.0.attention.k_norm.weight", .{pfx}) catch continue;
         if (store.get(cap) != null and store.get(ref) != null) return .zimage;
     }
     // Anima. This is ComfyUI's own test, and it is the LLM ADAPTER, not anything
@@ -3941,7 +3941,7 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     // the shape of a "this is not an Anima model" error.
     for ((componentSpec(.anima, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
-        const ad = std.fmt.bufPrint(&b1, "{s}" ++ anima_probe, .{pfx}) catch continue;
+        const ad = std.mem.print(&b1, "{s}" ++ anima_probe, .{pfx}) catch continue;
         if (store.get(ad) != null) return .anima;
     }
     // MiniMax H3, and this is ComfyUI's own test: BOTH patch projections. One
@@ -3952,8 +3952,8 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     for ((componentSpec(.minimax_h3, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
-        const vid = std.fmt.bufPrint(&b1, "{s}" ++ minimax_h3_video_probe, .{pfx}) catch continue;
-        const aud = std.fmt.bufPrint(&b2, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
+        const vid = std.mem.print(&b1, "{s}" ++ minimax_h3_video_probe, .{pfx}) catch continue;
+        const aud = std.mem.print(&b2, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
         if (store.get(vid) != null and store.get(aud) != null) return .minimax_h3;
     }
     // SenseNova U1.5, and this is ComfyUI's own test: the generation vision
@@ -3964,8 +3964,8 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     for ((componentSpec(.sensenova, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [128]u8 = undefined;
         var b2: [128]u8 = undefined;
-        const vis = std.fmt.bufPrint(&b1, "{s}" ++ sensenova_vision_probe, .{pfx}) catch continue;
-        const gen = std.fmt.bufPrint(&b2, "{s}" ++ sensenova_gen_probe, .{pfx}) catch continue;
+        const vis = std.mem.print(&b1, "{s}" ++ sensenova_vision_probe, .{pfx}) catch continue;
+        const gen = std.mem.print(&b2, "{s}" ++ sensenova_gen_probe, .{pfx}) catch continue;
         if (store.get(vis) != null and store.get(gen) != null) return .sensenova;
     }
     // Mage-Flow, and this is ComfyUI's own test, WIDTHS INCLUDED: `txt_norm` plus
@@ -3977,8 +3977,8 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     for ((componentSpec(.mageflow, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
-        const tn = std.fmt.bufPrint(&b1, "{s}" ++ mageflow.probe, .{pfx}) catch continue;
-        const po = std.fmt.bufPrint(&b2, "{s}proj_out.weight", .{pfx}) catch continue;
+        const tn = std.mem.print(&b1, "{s}" ++ mageflow.probe, .{pfx}) catch continue;
+        const po = std.mem.print(&b2, "{s}proj_out.weight", .{pfx}) catch continue;
         const tv = store.get(tn) orelse continue;
         const pv = store.get(po) orelse continue;
         const ts = tv.info.shape.slice();
@@ -3990,15 +3990,15 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     for ((componentSpec(.moss_image, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
-        const a = std.fmt.bufPrint(&b1, "{s}" ++ moss_image.probe, .{pfx}) catch continue;
-        const b = std.fmt.bufPrint(&b2, "{s}" ++ moss_image.probe2, .{pfx}) catch continue;
+        const a = std.mem.print(&b1, "{s}" ++ moss_image.probe, .{pfx}) catch continue;
+        const b = std.mem.print(&b2, "{s}" ++ moss_image.probe2, .{pfx}) catch continue;
         if (store.get(a) != null and store.get(b) != null) return .moss_image;
     }
     // Qwen-Image 2.1, ComfyUI's test: all five of its tensors.
     pfx: for ((componentSpec(.qwen_image21, .denoiser) catch unreachable).prefixes) |pfx| {
         for (qwen_image21.probes) |probe| {
             var b: [128]u8 = undefined;
-            const name = std.fmt.bufPrint(&b, "{s}{s}", .{ pfx, probe }) catch continue :pfx;
+            const name = std.mem.print(&b, "{s}{s}", .{ pfx, probe }) catch continue :pfx;
             if (store.get(name) == null) continue :pfx;
         }
         return .qwen_image21;
@@ -10710,7 +10710,7 @@ test "the live preview follows the family's own latent format" {
     defer for (prev) |p| gpa.free(p);
     const of = struct {
         fn f(pv: []const []u8, fam: Family) []const u8 {
-            return pv[@intFromEnum(fam)];
+            return pv[@backingInt(fam)];
         }
     }.f;
     // Each family uses its OWN factors: sharing SD1.5's for SDXL is not a crash, just a
@@ -11279,7 +11279,7 @@ test "container style is orthogonal to family: bundled, split, and explicit over
         /// A one-tensor safetensors file under `name`.
         fn file(buf: []u8, name: []const u8) ![]u8 {
             var hdr: [512]u8 = undefined;
-            const header = try std.fmt.bufPrint(&hdr, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}", .{name});
+            const header = try std.mem.print(&hdr, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}", .{name});
             std.mem.writeInt(u64, buf[0..8], header.len, .little);
             @memcpy(buf[8..][0..header.len], header);
             @memset(buf[8 + header.len ..][0..8], 0);
@@ -11727,10 +11727,10 @@ test "a clip's parameters block records both shifts" {
     const out = try appendClipParams(gpa, base, .{ .video = 1.0, .audio = 0.25 });
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "prompt\nSteps: 4"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "Shift: 1.0000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Audio shift: 0.2500") != null);
+    try std.testing.expect(std.mem.find(u8, out, "Shift: 1.0000") != null);
+    try std.testing.expect(std.mem.find(u8, out, "Audio shift: 0.2500") != null);
     // The image path must be untouched: this only ever appends.
-    try std.testing.expect(std.mem.indexOf(u8, out, "Audio shift").? > std.mem.indexOf(u8, out, "Shift:").?);
+    try std.testing.expect(std.mem.find(u8, out, "Audio shift").? > std.mem.find(u8, out, "Shift:").?);
 }
 
 test "latent shape is the family's own, spatial downscale included" {

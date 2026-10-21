@@ -1365,9 +1365,9 @@ test "the deterministic samplers match ComfyUI, including the two-evaluation one
     for (plain.array.items) |t| {
         const obj = t.object;
         const name = obj.get("name").?.string;
-        const kind: Kind = if (std.mem.indexOf(u8, name, "_2m_") != null)
+        const kind: Kind = if (std.mem.find(u8, name, "_2m_") != null)
             .dpmpp_2m
-        else if (std.mem.indexOf(u8, name, "_heun2_") != null)
+        else if (std.mem.find(u8, name, "_heun2_") != null)
             .heun
         else
             .dpm_2;
@@ -1845,7 +1845,7 @@ test "the ancestral samplers match ComfyUI's own, both families, one and two sta
     const two = parsed.value.object.get("ancestral2") orelse return error.SkipZigTest;
     for (two.array.items) |t| {
         const name = t.object.get("name").?.string;
-        const kind: Kind = if (std.mem.indexOf(u8, name, "_dpm2a_") != null) .dpm_2_ancestral else .dpmpp_2s_ancestral;
+        const kind: Kind = if (std.mem.find(u8, name, "_dpm2a_") != null) .dpm_2_ancestral else .dpmpp_2s_ancestral;
         try checkTrajectory(gpa, t.object, kind, traj_tol);
     }
 }

@@ -296,7 +296,7 @@ fn scan(a: std.mem.Allocator, src: []const u8) Error![]Chunk {
             // a string (e.g. Mistral's `{{- "}}" }}`) is cut mid-string. Comments
             // (`{# #}`) have no expression grammar, so a plain scan is fine.
             const close_at = (if (marker == '#')
-                std.mem.indexOfPos(u8, src, j, close)
+                std.mem.findPos(u8, src, j, close)
             else
                 findTagClose(src, j, close)) orelse {
                 return Error.JinjaParse;
@@ -1369,7 +1369,7 @@ const Interp = struct {
         switch (container) {
             .str => |s| {
                 if (needle != .str) return false;
-                return std.mem.indexOf(u8, s, needle.str) != null;
+                return std.mem.find(u8, s, needle.str) != null;
             },
             .list => |l| {
                 for (l.items.items) |it| if (self.valueEql(it, needle)) return true;
@@ -1762,7 +1762,7 @@ const Interp = struct {
             }
             return .{ .list = l };
         }
-        return self.rt(std.fmt.allocPrint(self.a, "unknown filter '{s}'", .{name}) catch "unknown filter");
+        return self.rt(self.a.print("unknown filter '{s}'", .{name}) catch "unknown filter");
     }
 
     /// Apply a Jinja test to an already-evaluated value with unevaluated arg
@@ -1835,8 +1835,8 @@ const Interp = struct {
             .undef => "",
             .none => "None",
             .boolean => |b| if (b) "True" else "False",
-            .int => |i| try std.fmt.allocPrint(self.a, "{d}", .{i}),
-            .float => |f| try std.fmt.allocPrint(self.a, "{d}", .{f}),
+            .int => |i| try self.a.print("{d}", .{i}),
+            .float => |f| try self.a.print("{d}", .{f}),
             .list, .dict, .macro, .builtin => self.rtS("cannot stringify this value"),
         };
     }

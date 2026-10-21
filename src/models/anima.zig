@@ -177,11 +177,11 @@ pub fn detectConfig(store: WeightStore) !Config {
     const pfx = trunkPrefix(store);
     var buf: [128]u8 = undefined;
     var cfg = anima_2b;
-    const xe = store.get(try std.fmt.bufPrint(&buf, "{s}x_embedder.proj.1.weight", .{pfx})) orelse return error.MissingTensor;
+    const xe = store.get(try std.mem.print(&buf, "{s}x_embedder.proj.1.weight", .{pfx})) orelse return error.MissingTensor;
     const shape = xe.info.shape.slice();
     if (shape.len != 2 or shape[0] != cfg.dim or shape[1] != cfg.patchDim()) return error.UnsupportedCheckpoint;
     var n: usize = 0;
-    while (store.get(try std.fmt.bufPrint(&buf, "{s}blocks.{d}.mlp.layer1.weight", .{ pfx, n })) != null) n += 1;
+    while (store.get(try std.mem.print(&buf, "{s}blocks.{d}.mlp.layer1.weight", .{ pfx, n })) != null) n += 1;
     if (n == 0) return error.MissingTensor;
     cfg.n_layers = n;
     return cfg;
@@ -1525,13 +1525,13 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
             // lives under the deepest tag and is shared across depths. The generator
             // draws them once for exactly this reason, a per-depth draw would make
             // the "depth trend" a comparison of two unrelated forwards.
-            const tag = try std.fmt.bufPrint(&kb, "dit{d}.{d}", .{ n_layers, ci });
+            const tag = try std.mem.print(&kb, "dit{d}.{d}", .{ n_layers, ci });
             var inb: [64]u8 = undefined;
-            const in_tag = try std.fmt.bufPrint(&inb, "dit{d}.{d}", .{ ref_layers[0], ci });
+            const in_tag = try std.mem.print(&inb, "dit{d}.{d}", .{ ref_layers[0], ci });
             var nb: [64]u8 = undefined;
             const key = struct {
                 fn f(buf: []u8, t: []const u8, suffix: []const u8) ![]u8 {
-                    return std.fmt.bufPrint(buf, "{s}.{s}", .{ t, suffix });
+                    return std.mem.print(buf, "{s}.{s}", .{ t, suffix });
                 }
             }.f;
 
@@ -1636,12 +1636,12 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
                     const pidx = try refIds(gpa, &ref, try key(&nb, in_tag, "prompt_index"));
                     defer gpa.free(pidx);
                     const pi = pidx[0];
-                    const cond = try (try ref.require(try std.fmt.bufPrint(&nb, "te.cond.{d}", .{pi}))).toF32Alloc(gpa);
+                    const cond = try (try ref.require(try std.mem.print(&nb, "te.cond.{d}", .{pi}))).toF32Alloc(gpa);
                     defer gpa.free(cond);
                     const n_src = cond.len / cfg.adapter.source_dim;
-                    const t5 = try refIds(gpa, &ref, try std.fmt.bufPrint(&nb, "te.t5_ids.{d}", .{pi}));
+                    const t5 = try refIds(gpa, &ref, try std.mem.print(&nb, "te.t5_ids.{d}", .{pi}));
                     defer gpa.free(t5);
-                    const t5w = try (try ref.require(try std.fmt.bufPrint(&nb, "te.t5_weights.{d}", .{pi}))).toF32Alloc(gpa);
+                    const t5w = try (try ref.require(try std.mem.print(&nb, "te.t5_weights.{d}", .{pi}))).toF32Alloc(gpa);
                     defer gpa.free(t5w);
 
                     const raw = try model.adapter.forward(io, gpa, cond, n_src, t5, null, null);
@@ -1743,11 +1743,11 @@ test "the Anima text encoder matches ComfyUI's Qwen3-0.6B tap" {
     var nb: [64]u8 = undefined;
     for (0..prompts.len) |pi| {
         // Both tokenizations of the real prompts, through the whole prompt path.
-        const want_q = try refIds(gpa, &ref, try std.fmt.bufPrint(&nb, "te.qwen_ids.{d}", .{pi}));
+        const want_q = try refIds(gpa, &ref, try std.mem.print(&nb, "te.qwen_ids.{d}", .{pi}));
         defer gpa.free(want_q);
-        const want_t5 = try refIds(gpa, &ref, try std.fmt.bufPrint(&nb, "te.t5_ids.{d}", .{pi}));
+        const want_t5 = try refIds(gpa, &ref, try std.mem.print(&nb, "te.t5_ids.{d}", .{pi}));
         defer gpa.free(want_t5);
-        const want_c = try (try ref.require(try std.fmt.bufPrint(&nb, "te.cond.{d}", .{pi}))).toF32Alloc(gpa);
+        const want_c = try (try ref.require(try std.mem.print(&nb, "te.cond.{d}", .{pi}))).toF32Alloc(gpa);
         defer gpa.free(want_c);
 
         const got_t5 = try t5.encode(gpa, prompts[pi]);

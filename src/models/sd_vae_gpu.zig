@@ -78,8 +78,8 @@ const Bufs = struct {
     ao: DeviceBuffer = none,
 
     fn deinit(self: *Bufs, ctx: *Context) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| {
-            ctx.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| {
+            ctx.tensorDestroy(&@field(self, name));
         }
     }
 };

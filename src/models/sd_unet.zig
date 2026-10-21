@@ -542,7 +542,7 @@ const Loader = struct {
         // `model.diffusion_model.model.diffusion_model.input_blocks...`, which surfaces
         // as a missing tensor rather than as the naming bug it is.
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         // The names are positional inside LDM's `nn.Sequential`s: in_layers is
         // [GroupNorm, SiLU, Conv], out_layers is [GroupNorm, SiLU, Dropout, Conv].
         const in_norm = try l.groupNorm("{s}.in_layers.0", .{base}, in_ch);
@@ -576,7 +576,7 @@ const Loader = struct {
 
     fn spatial(l: Loader, comptime fmt: []const u8, args: anytype, ch: usize, depth: usize) !SpatialTransformer {
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args); // relative; see `res`
+        const base = try std.mem.print(&buf, fmt, args); // relative; see `res`
         const norm = try l.groupNorm("{s}.norm", .{base}, ch);
         const proj_in = try l.proj("{s}.proj_in", .{base}, ch);
         const blocks = try l.alloc.alloc(TransformerBlock, depth);

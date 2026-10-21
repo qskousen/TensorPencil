@@ -35,8 +35,8 @@ const chat = tp.llm.chat;
 pub const Family = model_spec.Family;
 pub const Component = model_spec.Component;
 
-const family_count = @typeInfo(Family).@"enum".fields.len;
-const component_count = @typeInfo(Component).@"enum".fields.len;
+const family_count = @typeInfo(Family).@"enum".field_names.len;
+const component_count = @typeInfo(Component).@"enum".field_names.len;
 
 /// A chat model. `class` is the menu group it belongs to ("Gemma 4 31B"): the
 /// architecture's display name plus the size, because that is how people name
@@ -75,10 +75,10 @@ pub const Slots = struct {
     bits: [family_count][component_count]bool = @splat(@splat(false)),
 
     pub fn has(self: Slots, fam: Family, comp: Component) bool {
-        return self.bits[@intFromEnum(fam)][@intFromEnum(comp)];
+        return self.bits[@backingInt(fam)][@backingInt(comp)];
     }
     pub fn set(self: *Slots, fam: Family, comp: Component) void {
-        self.bits[@intFromEnum(fam)][@intFromEnum(comp)] = true;
+        self.bits[@backingInt(fam)][@backingInt(comp)] = true;
     }
     pub fn any(self: Slots) bool {
         for (self.bits) |row| for (row) |b| if (b) return true;
@@ -91,7 +91,7 @@ pub const Preview = struct {
     fams: [family_count]bool = @splat(false),
 
     pub fn has(self: Preview, fam: Family) bool {
-        return self.fams[@intFromEnum(fam)];
+        return self.fams[@backingInt(fam)];
     }
     pub fn any(self: Preview) bool {
         for (self.fams) |b| if (b) return true;
@@ -108,7 +108,7 @@ pub const Lora = struct {
     info: model_spec.LoraInfo = .{},
 
     pub fn has(self: Lora, fam: Family) bool {
-        return self.fams[@intFromEnum(fam)];
+        return self.fams[@backingInt(fam)];
     }
     pub fn any(self: Lora) bool {
         for (self.fams) |b| if (b) return true;
@@ -141,8 +141,8 @@ pub const Entry = struct {
     /// The file name without its extension, what a menu shows.
     pub fn stem(self: *const Entry) []const u8 {
         if (self.name.len > 0) return self.name;
-        const base = std.fs.path.basename(self.path);
-        return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const base = std.Io.Dir.path.basename(self.path);
+        return base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len];
     }
 
     pub fn id(self: *const Entry) ModelId {
@@ -226,13 +226,13 @@ pub fn fileId(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ModelId {
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     var c = try pipeline.Container.openHeader(gpa, io, path);
     defer c.deinit();
-    const base = std.fs.path.basename(path);
-    const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+    const base = std.Io.Dir.path.basename(path);
+    const stem = base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len];
     return modelId(stem, st.size, headerHash(&c));
 }
 
 pub fn idText(id: ModelId, buf: *[id_text_len]u8) []const u8 {
-    return std.fmt.bufPrint(buf, id_prefix ++ "{x:0>16}", .{id}) catch unreachable;
+    return std.mem.print(buf, id_prefix ++ "{x:0>16}", .{id}) catch unreachable;
 }
 
 pub fn parseId(text: []const u8) ?ModelId {
@@ -331,8 +331,8 @@ pub const Catalog = struct {
     pub fn refName(self: *const Catalog, ref: []const u8) []const u8 {
         if (self.resolve(ref)) |e| return e.stem();
         if (parseId(ref) != null) return "a model no host has";
-        const base = std.fs.path.basename(ref);
-        return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const base = std.Io.Dir.path.basename(ref);
+        return base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len];
     }
 
     // ── Queries ─────────────────────────────────────────────────────────────
@@ -475,7 +475,7 @@ pub const Catalog = struct {
 
     /// Families with at least one checkpoint, in enum order.
     pub fn families(self: *const Catalog) std.EnumSet(Family) {
-        var set = std.EnumSet(Family).initEmpty();
+        var set = std.EnumSet(Family).empty;
         for (self.entries) |*e| if (e.ckpt) |c| set.insert(c.family);
         return set;
     }
@@ -554,7 +554,7 @@ pub const Catalog = struct {
         const doc: Index = .{ .version = index_version, .rules = rules_version, .entries = self.entries };
         const json = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
         defer gpa.free(json);
-        if (std.fs.path.dirname(path)) |dir| {
+        if (std.Io.Dir.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -576,7 +576,7 @@ pub const Catalog = struct {
 // ── Scanning ────────────────────────────────────────────────────────────────
 
 fn isModelFile(name: []const u8) bool {
-    const ext = std.fs.path.extension(name);
+    const ext = std.Io.Dir.path.extension(name);
     return std.ascii.eqlIgnoreCase(ext, ".gguf") or std.ascii.eqlIgnoreCase(ext, ".safetensors");
 }
 
@@ -639,7 +639,7 @@ pub fn scan(
             if (!isModelFile(ent.basename)) continue;
             const st = ent.dir.statFile(io, ent.basename, .{}) catch continue;
             if (st.kind != .file) continue;
-            const path = try std.fs.path.join(a, &.{ folder, ent.path });
+            const path = try std.Io.Dir.path.join(a, &.{ folder, ent.path });
             if ((try seen.getOrPut(gpa, path)).found_existing) continue;
             try classifyOrReuse(a, gpa, io, &list, prev, path, st, &rep);
         }
@@ -678,7 +678,7 @@ fn classifyOrReuse(
 pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []const u8, size: u64, mtime_ns: i64) !Entry {
     var e: Entry = .{ .path = path, .size = size, .mtime_ns = mtime_ns };
     var c = pipeline.Container.openHeader(gpa, io, path) catch |err| {
-        e.note = try std.fmt.allocPrint(a, "unreadable: {t}", .{err});
+        e.note = try a.print("unreadable: {t}", .{err});
         return e;
     };
     defer c.deinit();
@@ -715,31 +715,31 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
         e.ckpt = .{ .family = fam, .contents = model_spec.scan(store, fam) };
     } else |_| {}
 
-    inline for (@typeInfo(Family).@"enum".fields) |ff| {
-        const fam: Family = @enumFromInt(ff.value);
+    inline for (@typeInfo(Family).@"enum".field_values) |value| {
+        const fam: Family = @fromBackingInt(value);
         inline for ([_]Component{ .conditioner, .conditioner2, .decoder, .decoder2 }) |comp| {
             if (model_spec.storeFits(store, fam, comp)) e.side.set(fam, comp);
         }
-        if (model_spec.previewFits(store, fam)) e.preview.fams[ff.value] = true;
+        if (model_spec.previewFits(store, fam)) e.preview.fams[value] = true;
     }
 
     // A LoRA is not a checkpoint and shares no tensor with one, so this is its
     // own pass rather than another `Component`.
     if (model_spec.loraScan(store)) |info| {
         var l: Lora = .{ .info = info };
-        inline for (@typeInfo(Family).@"enum".fields) |ff| {
-            if (model_spec.loraFits(store, @enumFromInt(ff.value))) l.fams[ff.value] = true;
+        inline for (@typeInfo(Family).@"enum".field_values) |value| {
+            if (model_spec.loraFits(store, @fromBackingInt(value))) l.fams[value] = true;
         }
         e.lora = l;
     }
 
     if (e.unused()) {
         if (e.tower) |t| {
-            if (t.arch == null) e.note = try std.fmt.allocPrint(a, "vision projector '{s}' has no tower here", .{t.projector});
+            if (t.arch == null) e.note = try a.print("vision projector '{s}' has no tower here", .{t.projector});
         } else if (e.lora) |l| {
-            e.note = try std.fmt.allocPrint(a, "lora ({d} weights, rank {d}) matches no architecture here", .{ l.info.targets, l.info.rank });
+            e.note = try a.print("lora ({d} weights, rank {d}) matches no architecture here", .{ l.info.targets, l.info.rank });
         } else if (unsupported_arch) |arch| {
-            e.note = try std.fmt.allocPrint(a, "architecture '{s}' is not supported", .{arch});
+            e.note = try a.print("architecture '{s}' is not supported", .{arch});
         } else {
             e.note = "not a model this build knows";
         }
@@ -747,18 +747,18 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
     // A tower is listed under its LLM, so on its own it is not "unused"; only an
     // unsupported projector leaves it with nowhere to go.
     if (e.tower) |t| if (t.arch == null and e.note.len == 0) {
-        e.note = try std.fmt.allocPrint(a, "vision projector '{s}' has no tower here", .{t.projector});
+        e.note = try a.print("vision projector '{s}' has no tower here", .{t.projector});
     };
     // Likewise an LLM this build cannot run keeps its class (so it is shown greyed
     // in its group) and gets the note.
     if (e.llm) |l| if (!l.supported and e.note.len == 0) {
-        e.note = try std.fmt.allocPrint(a, "architecture '{s}' is not supported", .{l.arch});
+        e.note = try a.print("architecture '{s}' is not supported", .{l.arch});
     };
     return e;
 }
 
 fn archKey(buf: []u8, arch: []const u8, key: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, key }) catch "";
+    return std.mem.print(buf, "{s}.{s}", .{ arch, key }) catch "";
 }
 
 fn llmInfo(a: std.mem.Allocator, g: *const tp.gguf.Gguf, store: tp.weights.WeightStore, arch: []const u8) !Llm {
@@ -774,15 +774,15 @@ fn llmInfo(a: std.mem.Allocator, g: *const tp.gguf.Gguf, store: tp.weights.Weigh
         .blocks = blocks,
         .supported = label != null,
         .vision = chat.archHasVision(arch),
-        .class = try std.fmt.allocPrint(a, "{s} {s}", .{ label orelse arch, size_label }),
+        .class = try a.print("{s} {s}", .{ label orelse arch, size_label }),
     };
 }
 
 /// Quantizers spell the same model "4B" and "4.0B"; the zero fraction is noise
 /// that would split one class in two. Owned by `a`.
 fn sizeLabel(a: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, s, ".0")) |dot| if (dot + 3 == s.len and std.ascii.isUpper(s[dot + 2])) {
-        return std.fmt.allocPrint(a, "{s}{c}", .{ s[0..dot], s[dot + 2] });
+    if (std.mem.find(u8, s, ".0")) |dot| if (dot + 3 == s.len and std.ascii.isUpper(s[dot + 2])) {
+        return a.print("{s}{c}", .{ s[0..dot], s[dot + 2] });
     };
     return a.dupe(u8, s);
 }
@@ -794,8 +794,8 @@ fn paramLabel(a: std.mem.Allocator, store: tp.weights.WeightStore) ![]const u8 {
         const v = store.get(n) orelse continue;
         params += v.info.shape.count();
     }
-    if (params >= 1_000_000_000) return std.fmt.allocPrint(a, "{d}B", .{(params + 500_000_000) / 1_000_000_000});
-    return std.fmt.allocPrint(a, "{d}M", .{(params + 500_000) / 1_000_000});
+    if (params >= 1_000_000_000) return a.print("{d}B", .{(params + 500_000_000) / 1_000_000_000});
+    return a.print("{d}M", .{(params + 500_000) / 1_000_000});
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -862,12 +862,12 @@ const Tree = struct {
     fn init(gpa: std.mem.Allocator) !Tree {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const root = try gpa.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
         return .{ .tmp = tmp, .root = root };
     }
 
     fn put(self: *Tree, io: std.Io, sub: []const u8, data: []const u8) !void {
-        if (std.fs.path.dirname(sub)) |d| self.tmp.dir.createDirPath(io, d) catch {};
+        if (std.Io.Dir.path.dirname(sub)) |d| self.tmp.dir.createDirPath(io, d) catch {};
         try self.tmp.dir.writeFile(io, .{ .sub_path = sub, .data = data });
     }
 
@@ -1013,7 +1013,7 @@ test "scan classifies every fixture by what the engine says it is" {
     const bert = entryNamed(&cat, "nomic-embed");
     try testing.expect(!bert.isChatModel());
     try testing.expect(bert.llm != null and !bert.llm.?.supported);
-    try testing.expect(std.mem.indexOf(u8, bert.note, "bert") != null);
+    try testing.expect(std.mem.find(u8, bert.note, "bert") != null);
 
     const sdxl = entryNamed(&cat, "dreamshaperXL");
     try testing.expectEqual(Family.sdxl, sdxl.ckpt.?.family);
@@ -1095,9 +1095,9 @@ test "a folder inside another listed folder, or a named file, is one entry" {
     const io = testing.io;
     var tree = try fixtureTree(gpa, io);
     defer tree.deinit(gpa);
-    const sub = try std.fs.path.join(gpa, &.{ tree.root, "llm" });
+    const sub = try std.Io.Dir.path.join(gpa, &.{ tree.root, "llm" });
     defer gpa.free(sub);
-    const one = try std.fs.path.join(gpa, &.{ tree.root, "vae", "ae.safetensors" });
+    const one = try std.Io.Dir.path.join(gpa, &.{ tree.root, "vae", "ae.safetensors" });
     defer gpa.free(one);
 
     var rep: ScanReport = .{};
@@ -1111,7 +1111,7 @@ test "a folder inside another listed folder, or a named file, is one entry" {
     defer solo.deinit();
     try testing.expectEqual(@as(usize, 1), solo.entries.len);
     try testing.expect(solo.entries[0].side.has(.zimage, .decoder));
-    const two = try std.fs.path.join(gpa, &.{ tree.root, "vae", "sdxl.vae.safetensors" });
+    const two = try std.Io.Dir.path.join(gpa, &.{ tree.root, "vae", "sdxl.vae.safetensors" });
     defer gpa.free(two);
     try solo.append(gpa, io, two);
     try solo.append(gpa, io, one);
@@ -1128,7 +1128,7 @@ test "index round trip, and a rescan reuses unchanged files" {
     var cat = try scan(gpa, io, &.{tree.root}, &.{}, null, null);
     defer cat.deinit();
 
-    const idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "catalog.json" });
+    const idx = try std.Io.Dir.path.join(gpa, &.{ tree.root, "index", "catalog.json" });
     defer gpa.free(idx);
     try cat.save(io, gpa, idx);
     var loaded = Catalog.load(gpa, io, idx);
@@ -1172,14 +1172,14 @@ test "index round trip, and a rescan reuses unchanged files" {
     // that: size and mtime still match, so `scan` reuses the entry. Both the
     // pre-envelope bare array and a wrong version number take that path.
     try tree.put(io, "index/old.json", "[{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}]");
-    const old_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "old.json" });
+    const old_idx = try std.Io.Dir.path.join(gpa, &.{ tree.root, "index", "old.json" });
     defer gpa.free(old_idx);
     var bare = Catalog.load(gpa, io, old_idx);
     defer bare.deinit();
     try testing.expectEqual(@as(usize, 0), bare.entries.len);
 
     try tree.put(io, "index/v0.json", "{\"version\":0,\"entries\":[{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}]}");
-    const v0_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "v0.json" });
+    const v0_idx = try std.Io.Dir.path.join(gpa, &.{ tree.root, "index", "v0.json" });
     defer gpa.free(v0_idx);
     var v0 = Catalog.load(gpa, io, v0_idx);
     defer v0.deinit();
@@ -1190,14 +1190,12 @@ test "index round trip, and a rescan reuses unchanged files" {
     // shaped right and every one of them answers with the roles that build knew.
     // The version is the live one, so this keeps testing the rules stamp after a
     // hand bump instead of quietly retesting the version check.
-    const other_rules = try std.fmt.allocPrint(
-        gpa,
-        "{{\"version\":{d},\"rules\":{d},\"entries\":[{{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}}]}}",
+    const other_rules = try gpa.print("{{\"version\":{d},\"rules\":{d},\"entries\":[{{\"path\":\"/x.safetensors\",\"size\":1,\"mtime_ns\":1}}]}}",
         .{ Catalog.index_version, Catalog.rules_version +% 1 },
     );
     defer gpa.free(other_rules);
     try tree.put(io, "index/rules.json", other_rules);
-    const rules_idx = try std.fs.path.join(gpa, &.{ tree.root, "index", "rules.json" });
+    const rules_idx = try std.Io.Dir.path.join(gpa, &.{ tree.root, "index", "rules.json" });
     defer gpa.free(rules_idx);
     var rules = Catalog.load(gpa, io, rules_idx);
     defer rules.deinit();
@@ -1230,15 +1228,15 @@ test "a wire catalog with hidden paths names files by id and stem, and the ids r
     const json = try cat.toWireJsonAlloc(gpa, true);
     defer gpa.free(json);
     // Nothing of the disk layout crosses: the root's name appears nowhere.
-    try testing.expect(std.mem.indexOf(u8, json, tree.root) == null);
+    try testing.expect(std.mem.find(u8, json, tree.root) == null);
     var wire = try Catalog.fromJson(gpa, json);
     defer wire.deinit();
     try testing.expectEqual(cat.entries.len, wire.entries.len);
     for (wire.entries) |*w| {
         errdefer std.debug.print("wire entry {s} / {s}\n", .{ w.path, w.name });
         const id = parseId(w.path) orelse return error.TestUnexpectedResult;
-        try testing.expect(std.mem.indexOfAny(u8, w.path, "/\\") == null);
-        try testing.expect(std.mem.indexOfAny(u8, w.name, "/\\") == null);
+        try testing.expect(std.mem.findAny(u8, w.path, "/\\") == null);
+        try testing.expect(std.mem.findAny(u8, w.name, "/\\") == null);
         // The same file at home: same stem, same roles, and the id text a
         // client would put in its settings resolves to it.
         const home = cat.byId(id) orelse return error.TestUnexpectedResult;
@@ -1278,7 +1276,7 @@ test "a wire catalog with hidden paths names files by id and stem, and the ids r
     // The plain form is the index document itself.
     const plain = try cat.toWireJsonAlloc(gpa, false);
     defer gpa.free(plain);
-    try testing.expect(std.mem.indexOf(u8, plain, tree.root) != null);
+    try testing.expect(std.mem.find(u8, plain, tree.root) != null);
 }
 
 // A reference is a path or an id text, and an id is not a name. Every label in

@@ -1,3 +1,23 @@
+- Zig 0.17 port, what is left:
+  - Three SPIR-V backend bugs to report upstream (Codeberg), each with a minimal repro: an
+    access chain into an array at a comptime-known index is typed as a pointer to the
+    array (`spv.fixAccessChainTypes` repairs it; drop the pass once fixed, the
+    well-typed-modules test in `gpu/context.zig` says when); a signed-to-unsigned
+    `@intCast` emits no conversion, so a `/` or `%` on it is invalid (`convt1dCa` uses
+    `@bitCast`); inline-asm `OpDecorate` on a variable is dropped without an error.
+  - A native Windows build (redpc has only Zig 0.16): build.zig compiles the SPIR-V
+    kernels as Compile steps again, which 0.16 could not do on a Windows host, and a
+    Windows test run finds the pinned DLLs through a PATH entry that is relative to the
+    build root.
+  - `@SpirvType(.runtime_array)` can declare a buffer without the fixed `[1 << 28]f32`
+    bound the kernels carry (see `spv.largestArrayBytes`).
+  - Vulkan decode on gemma-4 12B q4_0 is within ~1.5% of the 0.16 build (it was 3.5%
+    before `dual.zig`'s entry kept its body out of line); per-kernel GPU time is within
+    1-2%, at the noise of `TP_VK_PROFILE`. Not chased further.
+  - `NoContraction` on the f32 quant GEMVs (needed so a routed row equals its one-row
+    GEMV bit for bit under 0.17) costs ~2.3% on that path (`vk-gemv-bench` f32 column).
+  - `forEntry` cuts are built from a whole-module copy per kernel at load (5.9 MB
+    mmaps, extra kernel time at setup); cutting from one shared parse would save it.
 - weight dispatch (`dual_lin`, `lin_cuda` / `lin_gpu`, `conv_cuda` / `conv_gpu`), what is left:
   - the SD LoRA sidecar costs +12-16% per step on SDXL; ~9.5 ms/step of B side on SD1.5
     768² is not yet attributed between its GEMM, the `lo` bf16 pass and launch count.

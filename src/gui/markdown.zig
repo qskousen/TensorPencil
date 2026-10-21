@@ -147,13 +147,13 @@ const LineClass = enum { blank, fence, heading, rule, list_item, quote, text };
 
 /// The line beginning at `pos` (which must be a line start), without the '\n'.
 fn lineAt(src: []const u8, pos: usize) []const u8 {
-    const nl = std.mem.indexOfScalarPos(u8, src, pos, '\n') orelse src.len;
+    const nl = std.mem.findScalarPos(u8, src, pos, '\n') orelse src.len;
     return src[pos..nl];
 }
 
 /// Position of the next line start after the line beginning at `pos`.
 fn lineEnd(src: []const u8, pos: usize) usize {
-    const nl = std.mem.indexOfScalarPos(u8, src, pos, '\n') orelse return src.len;
+    const nl = std.mem.findScalarPos(u8, src, pos, '\n') orelse return src.len;
     return nl + 1;
 }
 
@@ -406,7 +406,7 @@ pub const SpanIterator = struct {
     /// `[text](url)`, label styling is not nested (rendered as link text).
     fn link(self: *SpanIterator) ?Span {
         const open = self.pos;
-        const rb = std.mem.indexOfScalarPos(u8, self.src, open + 1, ']') orelse {
+        const rb = std.mem.findScalarPos(u8, self.src, open + 1, ']') orelse {
             self.pos += 1;
             return null;
         };
@@ -414,13 +414,13 @@ pub const SpanIterator = struct {
             self.pos += 1;
             return null;
         }
-        const rp = std.mem.indexOfScalarPos(u8, self.src, rb + 2, ')') orelse {
+        const rp = std.mem.findScalarPos(u8, self.src, rb + 2, ')') orelse {
             self.pos += 1;
             return null;
         };
         const label = self.src[open + 1 .. rb];
         const url = std.mem.trim(u8, self.src[rb + 2 .. rp], " ");
-        if (label.len == 0 or url.len == 0 or std.mem.indexOfScalar(u8, url, '\n') != null) {
+        if (label.len == 0 or url.len == 0 or std.mem.findScalar(u8, url, '\n') != null) {
             self.pos += 1;
             return null;
         }
@@ -446,7 +446,7 @@ pub const SpanIterator = struct {
         }
         var end = at + scheme;
         while (end < self.src.len and !isSpace(self.src[end]) and self.src[end] != '<' and self.src[end] != '"') end += 1;
-        while (end > at + scheme and std.mem.indexOfScalar(u8, ").,;:!?'`", self.src[end - 1]) != null) end -= 1;
+        while (end > at + scheme and std.mem.findScalar(u8, ").,;:!?'`", self.src[end - 1]) != null) end -= 1;
         if (end == at + scheme) {
             self.pos += 1;
             return null;

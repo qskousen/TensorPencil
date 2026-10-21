@@ -19,6 +19,7 @@
 //! unloaded engine. Those are the cases that break layout, so they are the
 //! ones worth having in the picture.
 const std = @import("std");
+const repeat = @import("TensorPencil").strings.repeat;
 const dvui = @import("dvui");
 const Backend = @import("backend");
 const style = @import("style.zig");
@@ -52,9 +53,9 @@ var g_tab: shell.Tab = .chat;
 var g_rail_tab: queue_rail.Tab = .queue;
 var g_expanded: bool = true;
 var g_selected_tile: ?usize = null;
-var g_input: [256]u8 = [_]u8{0} ** 256;
+var g_input: [256]u8 = @splat(0);
 var g_noise_sel: usize = 1;
-var g_noise_amt: [16]u8 = [_]u8{0} ** 16;
+var g_noise_amt: [16]u8 = @splat(0);
 const noise_names = [_][]const u8{ "flat", "front", "front steep", "first 40%", "bell", "late (corrupts)" };
 /// The front-loaded curve the field shows, sampled for the preview: high at the
 /// first layer, zero at the LM head. Hardcoded rather than evaluated so the probe
@@ -269,7 +270,7 @@ fn frame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
     });
     defer root.deinit();
 
@@ -364,17 +365,17 @@ fn chatColumn(h: f32) void {
             var tl = dvui.textLayout(@src(), .{}, .{
                 .expand = .horizontal,
                 .background = true,
-                .color_fill = C.sunken,
-                .color_border = style.tint(C.blue, 120),
+                .color_fill = .{ .color = C.sunken },
+                .color_border = .{ .color = style.tint(C.blue, 120) },
                 .border = .{ .x = 2 },
-                .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
+                .corners = style.R.tab_right,
                 .margin = .{ .h = 6 },
                 .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
                 .font = F.mono,
-                .color_text = C.text_dim,
+                .color_text = .{ .color = C.text_dim },
             });
             defer tl.deinit();
-            fonts.addStyled(tl, "<image width=\"1216\" height=\"832\" steps=\"34\" seed=\"8812\">a lighthouse in heavy fog at dawn, desaturated, backlit beam, melancholy</image>", .{}, .{ .font = F.mono, .color_text = C.text_dim });
+            fonts.addStyled(tl, "<image width=\"1216\" height=\"832\" steps=\"34\" seed=\"8812\">a lighthouse in heavy fog at dawn, desaturated, backlit beam, melancholy</image>", .{}, .{ .font = F.mono, .color_text = .{ .color = C.text_dim } });
         }
 
         bubbles.toolCard(@src(), .{
@@ -413,9 +414,9 @@ fn composer(h: f32) void {
         .min_size_content = .{ .h = h },
         .max_size_content = .height(h),
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
         .border = style.Edge.top,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .x = 30, .y = 12, .w = 30, .h = 18 },
     });
     defer box.deinit();
@@ -457,7 +458,7 @@ fn composer(h: f32) void {
         .border = .{},
         .padding = .{},
         .font = F.input,
-        .color_text = C.text_hi,
+        .color_text = .{ .color = C.text_hi },
         .theme = style.noFocusTheme(),
         .min_size_content = .{ .h = 20 },
         .max_size_content = .size(.{ .w = 160, .h = 90 }),
@@ -466,7 +467,7 @@ fn composer(h: f32) void {
     _ = bubbles.inputEnd(&f, cm, cb);
 }
 
-fn gap(src: std.builtin.SourceLocation, id: usize, h: f32) void {
+fn gap(src: std.lang.SourceLocation, id: usize, h: f32) void {
     _ = dvui.spacer(src, .{ .id_extra = id, .min_size_content = .{ .h = h } });
 }
 
@@ -604,9 +605,9 @@ fn statusBar(st: VramState, id: usize) void {
         .min_size_content = .{ .h = L.status_h },
         .max_size_content = .height(L.status_h),
         .background = true,
-        .color_fill = C.chrome,
+        .color_fill = .{ .color = C.chrome },
         .border = style.Edge.top,
-        .color_border = style.hairline,
+        .color_border = .{ .color = style.hairline },
         .padding = .{ .x = 14, .y = 9, .w = 14, .h = 10 },
     });
     defer bar.deinit();
@@ -707,7 +708,7 @@ fn hostsFrame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
     });
     defer root.deinit();
 
@@ -730,7 +731,7 @@ fn statesFrame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
     });
     defer root.deinit();
 
@@ -754,9 +755,9 @@ var probe_cfg: config.Config = blk: {
     // Two hosts, so the Hosts section draws its rows and not just the add form:
     // one healthy and one in trouble, which are the two colors that row has.
     _ = c.addHost("attic", "/run/user/1000/tensorpencil-qt/attic.sock", true);
-    _ = c.addHost("lydia", "tp://10.0.0.130:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ ("3c" ** 32), false);
+    _ = c.addHost("lydia", "tp://10.0.0.130:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ repeat("3c", 32), false);
     // Just pasted and answered, not applied: the one row whose news is good.
-    _ = c.addHost("cellar", "tp://10.0.0.9:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ ("7a" ** 32), false);
+    _ = c.addHost("cellar", "tp://10.0.0.9:7777/MIIBJDCBzKADAgECAhBuvy7FDePdICB9_bN_VedD#" ++ repeat("7a", 32), false);
     break :blk c;
 };
 
@@ -770,15 +771,15 @@ fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
     vae.side.set(.krea2, .decoder);
     vae.side.set(.anima, .decoder);
     var taew: catalog.Entry = .{ .path = "/models/vae_approx/taew2_1.safetensors", .size = 1, .mtime_ns = 1 };
-    taew.preview.fams[@intFromEnum(catalog.Family.krea2)] = true;
+    taew.preview.fams[@backingInt(catalog.Family.krea2)] = true;
     // Two SenseNova LoRAs, so the LoRA section draws with one row on and one
     // still on offer in the add dropdown. Both of its states in one frame.
     var turbo: catalog.Entry = .{ .path = "/models/loras/sensenovaU158BMot_8StepTurboLora.safetensors", .size = 1, .mtime_ns = 1 };
     turbo.lora = .{ .info = .{ .targets = 294, .rank = 128, .depth = 42 } };
-    turbo.lora.?.fams[@intFromEnum(catalog.Family.sensenova)] = true;
+    turbo.lora.?.fams[@backingInt(catalog.Family.sensenova)] = true;
     var style_lora: catalog.Entry = .{ .path = "/models/loras/sensenovaInkWash_v2.safetensors", .size = 1, .mtime_ns = 1 };
     style_lora.lora = .{ .info = .{ .targets = 168, .rank = 64, .depth = 42 } };
-    style_lora.lora.?.fams[@intFromEnum(catalog.Family.sensenova)] = true;
+    style_lora.lora.?.fams[@backingInt(catalog.Family.sensenova)] = true;
     return catalog.Catalog.fromEntries(gpa, &.{
         .{ .path = "/models/llm/Gemma-4-31B-it-Q4_K_M.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
         .{ .path = "/models/llm/Gemma-4-Dark-Thoughts-31B.i1-Q4_K_S.gguf", .size = 1, .mtime_ns = 1, .llm = llm },
@@ -912,7 +913,7 @@ fn hostCatalog(gpa: std.mem.Allocator, full: *const catalog.Catalog, keep: []con
     var list: std.ArrayList(catalog.Entry) = .empty;
     defer list.deinit(gpa);
     for (full.entries) |*e| {
-        for (keep) |k| if (std.mem.indexOf(u8, e.path, k) != null) {
+        for (keep) |k| if (std.mem.find(u8, e.path, k) != null) {
             try list.append(gpa, e.*);
             break;
         };
@@ -1065,7 +1066,7 @@ fn studioFrame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
     });
     defer root.deinit();
 
@@ -1193,7 +1194,7 @@ pub fn main(init: std.process.Init) !void {
             // `--click=X,Y`, in physical pixels, matching the captured PNG. One
             // argument because this loop walks values, not indexes.
             const v = arg["--click=".len..];
-            const comma = std.mem.indexOfScalar(u8, v, ',') orelse return error.InvalidArgs;
+            const comma = std.mem.findScalar(u8, v, ',') orelse return error.InvalidArgs;
             click_pt = .{
                 .x = try std.fmt.parseFloat(f32, v[0..comma]),
                 .y = try std.fmt.parseFloat(f32, v[comma + 1 ..]),
@@ -1269,12 +1270,12 @@ pub fn main(init: std.process.Init) !void {
 
     const win_opts: Backend.InitOptions = .{
         .io = init.io,
-        .allocator = gpa,
         .size = .{ .w = @floatFromInt(w), .h = @floatFromInt(h) },
         .vsync = false,
         .title = "ui-probe",
         .hidden = true,
         .environ_map = init.environ_map,
+        .persist_window_geometry = false,
     };
     // The window is never shown, so a display is only worth having for the
     // fidelity of it: SDL picks no driver at all without one, and its dummy

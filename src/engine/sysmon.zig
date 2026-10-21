@@ -33,7 +33,7 @@ fn parseCpuLine(line: []const u8) ?CpuTimes {
 /// allocation, no `std.Io` threading, the status bar samples these every frame).
 /// Null off Linux, where neither file exists and there is no equivalent to read.
 fn readSysFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     const fd = std.os.linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     if (std.posix.errno(fd) != .SUCCESS) return null;
     const ifd: i32 = @intCast(fd);
@@ -45,7 +45,7 @@ fn readSysFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
 
 fn readProcStat(buf: []u8) ?CpuTimes {
     const bytes = readSysFile("/proc/stat", buf) orelse return null;
-    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    const nl = std.mem.findScalar(u8, bytes, '\n') orelse bytes.len;
     return parseCpuLine(bytes[0..nl]);
 }
 
@@ -106,7 +106,7 @@ pub const DrmMeter = struct {
     pub const Sample = struct { util: f32 = 0, clock_mhz: u32 = 0, found: bool = false };
 
     pub fn sample(self: *DrmMeter, io: std.Io, now_ns: i96) Sample {
-        if (builtin.os.tag != .linux) return .{};
+        if (builtin.target.os.tag != .linux) return .{};
         var pdev: [24]u8 = @splat(0);
         var pdev_len: usize = 0;
         var cur: [max_clients]Client = @splat(.{});
@@ -157,7 +157,7 @@ pub const DrmMeter = struct {
             if (ent.kind != .file) continue;
             var buf: [4096]u8 = undefined;
             const bytes = dir.readFile(io, ent.name, &buf) catch continue;
-            if (std.mem.indexOf(u8, bytes, "drm-driver:") == null) continue;
+            if (std.mem.find(u8, bytes, "drm-driver:") == null) continue;
             any = true;
             const id = fieldU64(bytes, "drm-client-id:") orelse continue;
             var dup = false;
@@ -184,7 +184,7 @@ pub const DrmMeter = struct {
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "drm-engine-")) continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             const v = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
             if (!std.mem.endsWith(u8, v, " ns")) continue;
             total += std.fmt.parseInt(u64, v[0 .. v.len - 3], 10) catch 0;
@@ -193,9 +193,9 @@ pub const DrmMeter = struct {
     }
 
     fn fieldText(bytes: []const u8, key: []const u8) ?[]const u8 {
-        const at = std.mem.indexOf(u8, bytes, key) orelse return null;
+        const at = std.mem.find(u8, bytes, key) orelse return null;
         const rest = bytes[at + key.len ..];
-        const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
         return std.mem.trim(u8, rest[0..end], " \t\r");
     }
 
@@ -211,9 +211,9 @@ pub const DrmMeter = struct {
         var it = dir.iterate();
         while (it.next(io) catch null) |ent| {
             if (!std.mem.startsWith(u8, ent.name, "card")) continue;
-            if (std.mem.indexOfScalar(u8, ent.name, '-') != null) continue; // a connector
+            if (std.mem.findScalar(u8, ent.name, '-') != null) continue; // a connector
             var path: [96]u8 = undefined;
-            const uevent = std.fmt.bufPrintZ(&path, "/sys/class/drm/{s}/device/uevent", .{ent.name}) catch continue;
+            const uevent = std.mem.printSentinel(&path, "/sys/class/drm/{s}/device/uevent", .{ent.name}, 0) catch continue;
             var buf: [1024]u8 = undefined;
             const bytes = readSysFile(uevent, &buf) orelse continue;
             const slot = fieldText(bytes, "PCI_SLOT_NAME=") orelse continue;
@@ -228,7 +228,7 @@ pub const DrmMeter = struct {
     fn clockMhz(self: *const DrmMeter) u32 {
         if (self.card_len == 0) return 0;
         var path: [96]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path, "/sys/class/drm/{s}/gt_act_freq_mhz", .{self.card[0..self.card_len]}) catch return 0;
+        const p = std.mem.printSentinel(&path, "/sys/class/drm/{s}/gt_act_freq_mhz", .{self.card[0..self.card_len]}, 0) catch return 0;
         var buf: [32]u8 = undefined;
         const bytes = readSysFile(p, &buf) orelse return 0;
         return std.fmt.parseInt(u32, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch 0;
@@ -320,7 +320,7 @@ pub const Nvml = struct {
     proc_layout: enum { v2, v1 },
 
     pub fn open() ?Nvml {
-        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+        var lib = dynlib.openFirst(switch (builtin.target.os.tag) {
             .windows => &.{"nvml.dll"},
             else => &.{ "libnvidia-ml.so.1", "libnvidia-ml.so" },
         }) orelse return null;
@@ -376,9 +376,9 @@ pub const Nvml = struct {
     ///
     /// `procUsed` for our own process, what the meter actually wants.
     pub fn selfUsed(self: *Nvml) ?u64 {
-        // `std.posix.getpid` doesn't exist in 0.16; `std.posix.system` is the
+        // std has no `posix.getpid`; `std.posix.system` is the
         // portable spelling of the syscall, and has no getpid on Windows.
-        const pid: u32 = if (builtin.os.tag == .windows)
+        const pid: u32 = if (builtin.target.os.tag == .windows)
             std.os.windows.GetCurrentProcessId()
         else
             @intCast(std.posix.system.getpid());

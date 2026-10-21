@@ -390,7 +390,7 @@ pub const VulkanLM = struct {
                 break;
             };
         }
-        const zeros = [_]u32{0} ** 2;
+        const zeros: [2]u32 = @splat(0);
         self.forwardChunk(zeros[0..1], true) catch |err| std.log.warn("k2 vulkan warm-up: {t}", .{err});
         self.truncate(0);
         // Always dynamic, so KV growth migrates layers instead of failing; the card is

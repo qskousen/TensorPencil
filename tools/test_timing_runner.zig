@@ -44,7 +44,10 @@ pub fn main(init: std.process.Init) !void {
         // Per-test std.testing setup, the same the stock runner does: without it
         // `testing.io`'s thread pool has no allocator and the first threaded
         // matmul segfaults inside Io.Threaded.groupAsync.
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,
@@ -120,7 +123,7 @@ const Trace = struct {
     fn line(t: *Trace, io: std.Io, what: []const u8, name: []const u8) void {
         var buf: [512]u8 = undefined;
         const ms = @divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms);
-        const text = std.fmt.bufPrint(&buf, "{d} {s} {s}\n", .{ ms, what, name }) catch return;
+        const text = std.mem.print(&buf, "{d} {s} {s}\n", .{ ms, what, name }) catch return;
         t.file.writePositionalAll(io, text, t.file.length(io) catch return) catch return;
     }
 };

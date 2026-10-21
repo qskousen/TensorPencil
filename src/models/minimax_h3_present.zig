@@ -159,13 +159,13 @@ pub fn build(
         switch (item) {
             .image => |g| {
                 n_image += 1;
-                try addText(alloc, tok, &ids, try std.fmt.bufPrint(&buf, "<Picture {d}>: ", .{n_image}));
+                try addText(alloc, tok, &ids, try std.mem.print(&buf, "<Picture {d}>: ", .{n_image}));
                 try addBlock(alloc, &ids, &blocks, &grids, g);
             },
             .audio => {
                 // Label only: audio never enters the vision tower.
                 n_audio += 1;
-                try addText(alloc, tok, &ids, try std.fmt.bufPrint(&buf, "<Audio {d}>: ", .{n_audio}));
+                try addText(alloc, tok, &ids, try std.mem.print(&buf, "<Audio {d}>: ", .{n_audio}));
             },
             .video => |v| {
                 if (v.timestamps.len != v.blocks) return error.BadPresentation;
@@ -173,13 +173,13 @@ pub fn build(
                 // packs its rows in.
                 if (v.soundtrack) {
                     n_audio += 1;
-                    try addText(alloc, tok, &ids, try std.fmt.bufPrint(&buf, "<Audio {d}>: ", .{n_audio}));
+                    try addText(alloc, tok, &ids, try std.mem.print(&buf, "<Audio {d}>: ", .{n_audio}));
                 }
                 n_video += 1;
-                try addText(alloc, tok, &ids, try std.fmt.bufPrint(&buf, "<Video {d}>: ", .{n_video}));
+                try addText(alloc, tok, &ids, try std.mem.print(&buf, "<Video {d}>: ", .{n_video}));
                 for (v.timestamps) |ts| {
                     // One decimal, matching the reference's "%.1f seconds".
-                    try addText(alloc, tok, &ids, try std.fmt.bufPrint(&buf, "<{d:.1} seconds>", .{ts}));
+                    try addText(alloc, tok, &ids, try std.mem.print(&buf, "<{d:.1} seconds>", .{ts}));
                     try addBlock(alloc, &ids, &blocks, &grids, v.grid);
                 }
             },
@@ -243,17 +243,17 @@ test "reference ordinals count per type, not globally" {
     const text = try tok.decodeAlloc(gpa, p.ids);
     defer gpa.free(text);
     errdefer std.debug.print("presented: {s}\n", .{text});
-    try testing.expect(std.mem.indexOf(u8, text, "<Picture 1>: ") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "<Audio 1>: ") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "<Picture 2>: ") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "<Audio 2>") == null);
+    try testing.expect(std.mem.find(u8, text, "<Picture 1>: ") != null);
+    try testing.expect(std.mem.find(u8, text, "<Audio 1>: ") != null);
+    try testing.expect(std.mem.find(u8, text, "<Picture 2>: ") != null);
+    try testing.expect(std.mem.find(u8, text, "<Audio 2>") == null);
     // ...and the ordering is request order, so Audio 1 sits between the pictures.
-    const pic1 = std.mem.indexOf(u8, text, "<Picture 1>").?;
-    const aud1 = std.mem.indexOf(u8, text, "<Audio 1>").?;
-    const pic2 = std.mem.indexOf(u8, text, "<Picture 2>").?;
+    const pic1 = std.mem.find(u8, text, "<Picture 1>").?;
+    const aud1 = std.mem.find(u8, text, "<Audio 1>").?;
+    const pic2 = std.mem.find(u8, text, "<Picture 2>").?;
     try testing.expect(pic1 < aud1 and aud1 < pic2);
     // The prompt comes last.
-    try testing.expect(std.mem.indexOf(u8, text, "a prompt").? > pic2);
+    try testing.expect(std.mem.find(u8, text, "a prompt").? > pic2);
 
     // Two blocks, one per IMAGE: the audio reference contributes a label only.
     try testing.expectEqual(@as(usize, 2), p.blocks.len);
@@ -279,12 +279,12 @@ test "a reference video's soundtrack is labelled before the video itself" {
     const text = try tok.decodeAlloc(gpa, p.ids);
     defer gpa.free(text);
     errdefer std.debug.print("presented: {s}\n", .{text});
-    const aud1 = std.mem.indexOf(u8, text, "<Audio 1>: ").?;
-    const vid1 = std.mem.indexOf(u8, text, "<Video 1>: ").?;
-    const aud2 = std.mem.indexOf(u8, text, "<Audio 2>: ").?;
+    const aud1 = std.mem.find(u8, text, "<Audio 1>: ").?;
+    const vid1 = std.mem.find(u8, text, "<Video 1>: ").?;
+    const aud2 = std.mem.find(u8, text, "<Audio 2>: ").?;
     try testing.expect(aud1 < vid1);
     try testing.expect(vid1 < aud2);
-    try testing.expect(std.mem.indexOf(u8, text, "<Video 2>") == null);
+    try testing.expect(std.mem.find(u8, text, "<Video 2>") == null);
     // Two blocks, one per temporal pair; neither audio label contributes one.
     try testing.expectEqual(@as(usize, 2), p.blocks.len);
 }
@@ -347,11 +347,11 @@ test "a reference video labels its soundtrack before itself, one block per pair"
     const text = try tok.decodeAlloc(gpa, p.ids);
     defer gpa.free(text);
     errdefer std.debug.print("presented: {s}\n", .{text});
-    const aud1 = std.mem.indexOf(u8, text, "<Audio 1>").?;
-    const vid1 = std.mem.indexOf(u8, text, "<Video 1>").?;
+    const aud1 = std.mem.find(u8, text, "<Audio 1>").?;
+    const vid1 = std.mem.find(u8, text, "<Video 1>").?;
     try testing.expect(aud1 < vid1);
-    try testing.expect(std.mem.indexOf(u8, text, "<0.0 seconds>") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "<2.0 seconds>") != null);
+    try testing.expect(std.mem.find(u8, text, "<0.0 seconds>") != null);
+    try testing.expect(std.mem.find(u8, text, "<2.0 seconds>") != null);
 
     // Three blocks, all sharing the video's grid, ascending and non-overlapping.
     try testing.expectEqual(@as(usize, 3), p.blocks.len);

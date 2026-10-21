@@ -11,6 +11,7 @@
 //! binary frames: a client streams a frame of any size, and a 4 MiB image
 //! costs a delta a few milliseconds on a local socket.
 const std = @import("std");
+const repeat = @import("tp_core").strings.repeat;
 const Io = std.Io;
 const wire = @import("wire.zig");
 const queue = @import("queue.zig");
@@ -206,7 +207,7 @@ fn serveBlob(gpa: std.mem.Allocator, io: Io, req: *std.http.Server.Request, be: 
         defer gpa.free(path);
         if (be.fileAdded) |f| f(be.ctx, path);
         var out: [512]u8 = undefined;
-        const body = std.fmt.bufPrint(&out, "{{\"name\":\"{s}\"}}", .{std.fs.path.basename(path)}) catch "{}";
+        const body = std.mem.print(&out, "{{\"name\":\"{s}\"}}", .{std.Io.Dir.path.basename(path)}) catch "{}";
         return req.respond(body, .{ .extra_headers = &json_headers });
     } else if (method == .DELETE and verb.len == 0) {
         store.abort(hex);
@@ -223,7 +224,7 @@ fn servePull(gpa: std.mem.Allocator, io: Io, req: *std.http.Server.Request, be: 
     const offers = be.offers orelse return req.respond("", .{ .status = .not_found });
     const resolve = be.offerPath orelse return req.respond("", .{ .status = .not_found });
     const rest = req.head.target["/v1/pull/".len..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return req.respond("", .{ .status = .not_found });
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return req.respond("", .{ .status = .not_found });
     const id = rest[0..slash];
     const verb = rest[slash + 1 ..];
     if (req.head.method != .GET) return req.respond("", .{ .status = .method_not_allowed });
@@ -626,7 +627,7 @@ const Acceptor = struct {
     be: Backend,
     stop: *std.atomic.Value(bool),
     opts: Options = .{},
-    threads: [32]?std.Thread = .{null} ** 32,
+    threads: [32]?std.Thread = @splat(null),
     main: ?std.Thread = null,
 
     fn start(self: *Acceptor) !void {
@@ -743,7 +744,7 @@ test "hello, a request, an upload and two event frames cross a loopback link" {
     acc.finish(io);
 
     try testing.expectEqual(@as(usize, 1), fake.requests.items.len);
-    try testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"chat_submit\"") != null);
+    try testing.expect(std.mem.find(u8, fake.requests.items[0], "\"chat_submit\"") != null);
     try testing.expectEqual(@as(usize, 1), fake.uploads.items.len);
     try testing.expectEqual(wire.BinHeader.Kind.rgb_upload, fake.uploads.items[0].bin.hdr.kind);
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, fake.uploads.items[0].bin.payload);
@@ -1011,7 +1012,7 @@ test "a model crosses the link in chunks, survives a cut mid-chunk, and lands in
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const store_dir = try std.fs.path.join(gpa, &.{ root, "models" });
+    const store_dir = try std.Io.Dir.path.join(gpa, &.{ root, "models" });
     defer gpa.free(store_dir);
     var store = try blob.Store.init(gpa, io, store_dir);
     defer store.deinit();
@@ -1026,7 +1027,7 @@ test "a model crosses the link in chunks, survives a cut mid-chunk, and lands in
     // 11 chunks of 64 KiB, cut after 3.5 of them.
     const cb: u64 = blob.min_chunk_bytes;
     const total = try blob.writeTestModel(io, tmp.dir, "sent.safetensors", 10 * @as(usize, @intCast(cb)) + 12344, 11);
-    const src = try std.fs.path.join(gpa, &.{ root, "sent.safetensors" });
+    const src = try std.Io.Dir.path.join(gpa, &.{ root, "sent.safetensors" });
     defer gpa.free(src);
     var sender = try blob.Sender.init(gpa, io, src, .{ .chunk_bytes = cb, .cut_after_bytes = 3 * cb + cb / 2 });
     defer sender.deinit();
@@ -1044,7 +1045,7 @@ test "a model crosses the link in chunks, survives a cut mid-chunk, and lands in
     // `bytes_done` moved nothing: every byte counted once.
     try testing.expectEqual(@as(u64, total), prog.bytes_moved.load(.acquire));
 
-    const final = try std.fs.path.join(gpa, &.{ store_dir, "sent.safetensors" });
+    const final = try std.Io.Dir.path.join(gpa, &.{ store_dir, "sent.safetensors" });
     defer gpa.free(final);
     const a = try Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(4 << 20));
     defer gpa.free(a);
@@ -1056,7 +1057,7 @@ test "a model crosses the link in chunks, survives a cut mid-chunk, and lands in
 
     // A stranger to the store: 404 for a digest nobody announced.
     const c = try link_mod.connect(gpa, io, listener.endpoint);
-    const r = try httpc.request(gpa, c, "GET", "/v1/blob/" ++ ("ab" ** 32) ++ "/have", "", "", 4096);
+    const r = try httpc.request(gpa, c, "GET", "/v1/blob/" ++ repeat("ab", 32) ++ "/have", "", "", 4096);
     defer gpa.free(r.body);
     try testing.expectEqual(@as(u16, 404), r.status);
     fake.wakeAll();
@@ -1075,9 +1076,9 @@ test "a model comes BACK over the link, checked the same way, and a file the hos
     // What the host holds, and where the puller puts what it gets.
     const cb: u64 = blob.min_chunk_bytes;
     const total = try blob.writeTestModel(io, tmp.dir, "held.safetensors", 6 * @as(usize, @intCast(cb)) + 4096, 23);
-    const src = try std.fs.path.join(gpa, &.{ root, "held.safetensors" });
+    const src = try std.Io.Dir.path.join(gpa, &.{ root, "held.safetensors" });
     defer gpa.free(src);
-    const dest_dir = try std.fs.path.join(gpa, &.{ root, "incoming" });
+    const dest_dir = try std.Io.Dir.path.join(gpa, &.{ root, "incoming" });
     defer gpa.free(dest_dir);
     try Io.Dir.cwd().createDirPath(io, dest_dir);
 
@@ -1106,7 +1107,7 @@ test "a model comes BACK over the link, checked the same way, and a file the hos
 
     // The file that landed is the file the host holds, byte for byte, under the
     // name the host called it: a puller names nothing itself.
-    const final = try std.fs.path.join(gpa, &.{ dest_dir, "held.safetensors" });
+    const final = try std.Io.Dir.path.join(gpa, &.{ dest_dir, "held.safetensors" });
     defer gpa.free(final);
     const want = try Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(4 << 20));
     defer gpa.free(want);

@@ -182,9 +182,9 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     if (fam == .qwen_image21 and comp == .decoder) {
         // The Wan 2.2 video VAE has the same nesting at 48 channels and a 3-tap time
         // axis; the loader takes only 64 at temporal kernel 1.
-        const root = v.info.name[0 .. std.mem.indexOf(u8, v.info.name, "decoder.") orelse return false];
+        const root = v.info.name[0 .. std.mem.find(u8, v.info.name, "decoder.") orelse return false];
         var buf: [256]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "{s}decoder.conv1.weight", .{root}) catch return false;
+        const name = std.mem.print(&buf, "{s}decoder.conv1.weight", .{root}) catch return false;
         const c = store.get(name) orelse return false;
         const cd = c.info.shape.slice();
         return cd.len == 5 and cd[1] == tp.models.qwen_image21.latent_channels and cd[2] == 1;
@@ -192,9 +192,9 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     if (comp != .conditioner) return true;
     if (fam == .moss_image) {
         // A Qwen3.5 at the width the released DiT reads; any depth runs.
-        const root = v.info.name[0 .. std.mem.indexOf(u8, v.info.name, "layers.") orelse return false];
+        const root = v.info.name[0 .. std.mem.find(u8, v.info.name, "layers.") orelse return false];
         var buf: [256]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{root}) catch return false;
+        const name = std.mem.print(&buf, "{s}embed_tokens.weight", .{root}) catch return false;
         const e = store.get(name) orelse return false;
         const ed = e.info.shape.slice();
         return ed.len == 2 and ed[1] == tp.models.moss_image.txt_dim;
@@ -231,12 +231,12 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
 /// What a probed tensor name sits under, up to the language tower's own
 /// `model.`: empty for a split file, the container's prefix for a bundled one.
 fn containerPrefix(name: []const u8) []const u8 {
-    return name[0 .. std.mem.indexOf(u8, name, "model.") orelse 0];
+    return name[0 .. std.mem.find(u8, name, "model.") orelse 0];
 }
 
 fn layerNormExists(store: tp.weights.WeightStore, root: []const u8, layer: usize) bool {
     var buf: [256]u8 = undefined;
-    const name = std.fmt.bufPrint(&buf, "{s}layers.{d}.input_layernorm.weight", .{ root, layer }) catch return false;
+    const name = std.mem.print(&buf, "{s}layers.{d}.input_layernorm.weight", .{ root, layer }) catch return false;
     return store.get(name) != null;
 }
 
@@ -374,10 +374,10 @@ fn layerIndex(name: []const u8) ?u32 {
     var best: ?u32 = null;
     for ([_][]const u8{ "layers.", "blocks." }) |key| {
         var from: usize = 0;
-        while (std.mem.indexOfPos(u8, name, from, key)) |at| {
+        while (std.mem.findPos(u8, name, from, key)) |at| {
             const rest = name[at + key.len ..];
             from = at + key.len;
-            const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+            const end = std.mem.findScalar(u8, rest, '.') orelse rest.len;
             const n = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
             best = @max(best orelse 0, n);
         }
@@ -467,11 +467,11 @@ fn loraTargetFits(store: tp.weights.WeightStore, prefix: []const u8, probe: []co
     const lora = tp.models.lora;
     var buf: [512]u8 = undefined;
     for (lora.dialects) |d| {
-        const a = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix, probe, d.a }) catch continue;
+        const a = std.mem.print(&buf, "{s}{s}{s}", .{ prefix, probe, d.a }) catch continue;
         const av = store.get(a) orelse continue;
         const ad = av.info.shape.slice();
         if (ad.len != 2 or ad[1] != in_dim) return false;
-        const b = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix, probe, d.b }) catch return false;
+        const b = std.mem.print(&buf, "{s}{s}{s}", .{ prefix, probe, d.b }) catch return false;
         const bv = store.get(b) orelse return false;
         const bd = bv.info.shape.slice();
         return bd.len == 2 and bd[0] == out_dim and bd[1] == ad[0];
@@ -833,8 +833,8 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
     const narrowed = [_]Narrowed{
         .{ .fam = .minimax_h3, .devices = &.{} },
     };
-    inline for (@typeInfo(Family).@"enum".fields) |f| {
-        const fam: Family = @enumFromInt(f.value);
+    inline for (@typeInfo(Family).@"enum".field_values) |value| {
+        const fam: Family = @fromBackingInt(value);
         const t = traits(fam);
         // Every family runs on the CPU, without exception, that is the floor.
         try std.testing.expect(t.supports(.cpu));
@@ -854,8 +854,8 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
 }
 
 test "traits: each family has a label, a resolution and a positive step count" {
-    inline for (@typeInfo(Family).@"enum".fields) |f| {
-        const t = traits(@enumFromInt(f.value));
+    inline for (@typeInfo(Family).@"enum".field_values) |value| {
+        const t = traits(@fromBackingInt(value));
         try std.testing.expect(t.label.len > 0);
         try std.testing.expect(t.short.len > 0 and t.short.len < t.label.len);
         try std.testing.expect(t.width > 0 and t.height > 0);
@@ -949,7 +949,7 @@ test "loraFits accepts a SenseNova sidecar and refuses a wrong-width one" {
     // a LoRA that patches only some layers is fine, which the next case pins.
     {
         var buf: [256]u8 = undefined;
-        const deep = try std.fmt.bufPrint(&buf, "diffusion_model.language_model.model.layers.{d}.self_attn.q_proj_mot_gen.lora_down.weight", .{cfg.n_layers});
+        const deep = try std.mem.print(&buf, "diffusion_model.language_model.model.layers.{d}.self_attn.q_proj_mot_gen.lora_down.weight", .{cfg.n_layers});
         const bytes = try stFile(gpa, &.{
             .{ .name = deep, .dims = &.{ rank, cfg.dim } },
         });
@@ -1139,7 +1139,7 @@ test "the GUI sees a GGUF text encoder as carrying a conditioner" {
     // llama.cpp's spelling, which `canonicalName` maps to a BARE `embed_tokens.weight`
     // no `model.` to restore. That is the whole bug in one tensor name.
     try b.tensor("token_embd.weight", &.{ 4, 2 }, 0, 0);
-    const file = try b.finish(&([_]u8{0} ** 32));
+    const file = try b.finish(&@as([32]u8, @splat(0)));
     defer gpa.free(file);
     var g = try tp.gguf.Gguf.initFromSlice(gpa, file);
     defer g.deinit();
@@ -1181,8 +1181,8 @@ test "componentFits tells the two Qwen3 encoders and the two KL VAEs apart" {
 
 test "Contents.has covers every component" {
     const c: Contents = .{ .denoiser = true, .decoder = true, .conditioner2 = true };
-    inline for (@typeInfo(Component).@"enum".fields) |f| {
-        const comp: Component = @enumFromInt(f.value);
+    inline for (@typeInfo(Component).@"enum".field_values) |value| {
+        const comp: Component = @fromBackingInt(value);
         const want = switch (comp) {
             .denoiser, .decoder, .conditioner2 => true,
             // both left false above, so a `has` that ignored its argument fails
@@ -1228,7 +1228,7 @@ test "Cache keys a side probe on the family too" {
     try std.testing.expectEqual(@as(?Family, .sd15), cache.fam_key);
 }
 
-/// libc getenv (std.posix.getenv is gone in 0.16; the module links libc via
+/// libc getenv (std.posix.getenv is gone; the module links libc via
 /// TensorPencil). Only used by the opt-in test below.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -1261,8 +1261,8 @@ test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
     const tower = "model.visual.patch_embed.proj.weight";
     var nb: [80]u8 = undefined;
     var fb: [80]u8 = undefined;
-    const nested_norm = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.input_layernorm.weight", .{last});
-    const flat_norm = try std.fmt.bufPrint(&fb, "model.layers.{d}.input_layernorm.weight", .{last});
+    const nested_norm = try std.mem.print(&nb, "model.language_model.layers.{d}.input_layernorm.weight", .{last});
+    const flat_norm = try std.mem.print(&fb, "model.layers.{d}.input_layernorm.weight", .{last});
 
     const check = struct {
         fn f(bytes: []u8, what: []const u8, want_krea2: bool) !void {
@@ -1281,7 +1281,7 @@ test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
             // 1e6 where the diffusion model was trained against 5e6.
             const vl = tp.models.qwen3.Config.vl_4b;
             var pb: [96]u8 = undefined;
-            const embed = try std.fmt.bufPrint(&pb, "{s}embed_tokens.weight", .{vl.resolvePrefix(store)});
+            const embed = try std.mem.print(&pb, "{s}embed_tokens.weight", .{vl.resolvePrefix(store)});
             try std.testing.expectEqual(want_krea2, store.get(embed) != null);
         }
     }.f;
@@ -1322,9 +1322,9 @@ test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
         var pnb: [96]u8 = undefined;
         var tb: [96]u8 = undefined;
         const bytes = try stFile(gpa, &.{
-            .{ .name = try std.fmt.bufPrint(&eb, "text_encoders.model.embed_tokens.weight", .{}), .dims = &.{ 4, hidden } },
-            .{ .name = try std.fmt.bufPrint(&pnb, "text_encoders.{s}", .{flat_norm}), .dims = &.{hidden} },
-            .{ .name = try std.fmt.bufPrint(&tb, "text_encoders.{s}", .{tower}), .dims = &.{ 2, 2 } },
+            .{ .name = try std.mem.print(&eb, "text_encoders.model.embed_tokens.weight", .{}), .dims = &.{ 4, hidden } },
+            .{ .name = try std.mem.print(&pnb, "text_encoders.{s}", .{flat_norm}), .dims = &.{hidden} },
+            .{ .name = try std.mem.print(&tb, "text_encoders.{s}", .{tower}), .dims = &.{ 2, 2 } },
         });
         defer gpa.free(bytes);
         var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
@@ -1343,8 +1343,8 @@ test "loraFits takes a diffusers-spelled Qwen-Image 2.1 LoRA and nothing else cl
     for ([_][]const u8{ "transformer.", "" }) |pfx| {
         var na: [128]u8 = undefined;
         var nb: [128]u8 = undefined;
-        const a = try std.fmt.bufPrint(&na, "{s}transformer_blocks.0.attn.to_q.lora_A.weight", .{pfx});
-        const b = try std.fmt.bufPrint(&nb, "{s}transformer_blocks.0.attn.to_q.lora_B.weight", .{pfx});
+        const a = try std.mem.print(&na, "{s}transformer_blocks.0.attn.to_q.lora_A.weight", .{pfx});
+        const b = try std.mem.print(&nb, "{s}transformer_blocks.0.attn.to_q.lora_B.weight", .{pfx});
         const bytes = try stFile(gpa, &.{
             .{ .name = a, .dims = &.{ rank, d } },
             .{ .name = b, .dims = &.{ d, rank } },

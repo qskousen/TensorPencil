@@ -8,6 +8,7 @@
 //! round-trip test walk every variant of both unions without knowing them.
 const std = @import("std");
 const core = @import("tp_core");
+const repeat = core.strings.repeat;
 // The three prompt and compat enums live in pipeline.zig, so this is the one
 // import here that reaches above tp_core.
 const pipeline = @import("TensorPencil").pipeline;
@@ -47,7 +48,7 @@ pub const CurveBuf = FixedStr(max_curve);
 pub fn FixedStr(comptime cap: usize) type {
     return struct {
         const Self = @This();
-        data: [cap]u8 = [_]u8{0} ** cap,
+        data: [cap]u8 = @splat(0),
 
         pub fn slice(self: *const Self) []const u8 {
             return std.mem.sliceTo(&self.data, 0);
@@ -81,7 +82,7 @@ pub const max_steer_text = 96;
 /// One conditioning-steering term on the wire. Fixed storage for the same reason
 /// `CurveBuf` is: `RenderParams` is held BY VALUE on a queued image.
 pub const SteerSpec = struct {
-    text: [max_steer_text]u8 = [_]u8{0} ** max_steer_text,
+    text: [max_steer_text]u8 = @splat(0),
     scale: f32 = 0,
     mode: pipeline.CondNoise.Mode = .prompt,
 
@@ -569,17 +570,17 @@ pub fn decode(comptime T: type, arena: std.mem.Allocator, bytes: []const u8) !T 
 const testing = std.testing;
 
 fn roundTrip(comptime U: type) !void {
-    inline for (@typeInfo(U).@"union".fields) |f| {
-        const v = if (f.type == void) @unionInit(U, f.name, {}) else @unionInit(U, f.name, .{});
+    inline for (@typeInfo(U).@"union".field_names, @typeInfo(U).@"union".field_types) |name, FieldType| {
+        const v = if (FieldType == void) @unionInit(U, name, {}) else @unionInit(U, name, .{});
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const once = try encodeAlloc(a, v);
         const back = try decode(U, a, once);
         const twice = try encodeAlloc(a, back);
-        errdefer std.debug.print("{s}: {s} != {s}\n", .{ f.name, once, twice });
+        errdefer std.debug.print("{s}: {s} != {s}\n", .{ name, once, twice });
         try testing.expectEqualStrings(once, twice);
-        try testing.expectEqualStrings(f.name, @tagName(back));
+        try testing.expectEqualStrings(name, @tagName(back));
     }
 }
 
@@ -647,7 +648,7 @@ test "BinHeader is 32 bytes with the fields where the other end expects them" {
     try testing.expectEqual(@as(usize, 16), @offsetOf(BinHeader, "rev"));
     try testing.expectEqual(@as(usize, 28), @offsetOf(BinHeader, "len"));
     const h: BinHeader = .{ .kind = .image_rgba, .id = 1, .rev = 2, .w = 3, .h = 4, .len = 5 };
-    const bytes: [32]u8 = @bitCast(h);
+    const bytes = std.mem.toBytes(h);
     try testing.expectEqualSlices(u8, "TPB1", bytes[0..4]);
 }
 
@@ -662,7 +663,7 @@ test "a conditioning-noise curve survives the wire as a string" {
     const json = try encodeAlloc(gpa, p);
     defer gpa.free(json);
     // A plain JSON string, not 192 numbers.
-    try testing.expect(std.mem.indexOf(u8, json, "\"clamp(a*(1-t),0,1)\"") != null);
+    try testing.expect(std.mem.find(u8, json, "\"clamp(a*(1-t),0,1)\"") != null);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -674,6 +675,6 @@ test "a conditioning-noise curve survives the wire as a string" {
 
     // Over capacity truncates rather than overflowing, and stays nul-terminated.
     var big: CurveBuf = .{};
-    big.set("x" ** (max_curve * 2));
+    big.set(repeat("x", max_curve * 2));
     try testing.expectEqual(max_curve - 1, big.slice().len);
 }

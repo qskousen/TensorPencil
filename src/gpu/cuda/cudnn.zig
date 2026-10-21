@@ -178,7 +178,7 @@ pub const Api = struct {
     /// dlopen cuDNN's dispatch shim and resolve the symbols (handle lifecycle +
     /// the backend-graph API used for fused SDPA attention).
     pub fn load() Error!Api {
-        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+        var lib = dynlib.openFirst(switch (builtin.target.os.tag) {
             .windows => &.{ "cudnn64_9.dll", "cudnn64_8.dll" },
             else => &.{ "libcudnn.so.9", "/usr/lib/x86_64-linux-gnu/libcudnn.so.9", "libcudnn.so" },
         }) orelse return error.CudnnError;

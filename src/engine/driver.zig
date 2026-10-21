@@ -55,7 +55,7 @@ pub const Urgent = struct {
     img_cancel_all: std.atomic.Value(bool) = .init(false),
     /// Image ids to cancel, 0 = free slot. A producer claims a free slot by
     /// cmpxchg; when none is free the cancel goes through the inbox instead.
-    img_cancel: [img_cancel_slots]std.atomic.Value(u64) = [_]std.atomic.Value(u64){.init(0)} ** img_cancel_slots,
+    img_cancel: [img_cancel_slots]std.atomic.Value(u64) = @splat(.init(0)),
     /// 0 unchanged, 1 pause, 2 resume.
     llm_pause: std.atomic.Value(u8) = .init(0),
     img_pause: std.atomic.Value(u8) = .init(0),

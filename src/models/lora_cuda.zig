@@ -304,8 +304,8 @@ test "a range resolves to the factor that contains it, and a straddle does not" 
     // The device asks for a fused linear's pieces; a range that spanned two
     // factors would silently read the wrong B rows if this returned the first
     // match instead of refusing.
-    const a_bytes = [_]u8{0} ** (128 * 32 * 2);
-    const b_bytes = [_]u8{0} ** (64 * 128 * 2);
+    const a_bytes: [(128 * 32 * 2)]u8 = @splat(0);
+    const b_bytes: [(64 * 128 * 2)]u8 = @splat(0);
     var factors: [3]lora.Factor = undefined;
     for (&factors, 0..) |*f, i| f.* = .{
         .a = bf16Weight(&a_bytes, 128, 32),
@@ -326,8 +326,8 @@ test "a range resolves to the factor that contains it, and a straddle does not" 
 test "device support is refused by shape rather than discovered at a launch" {
     // A width off the GEMM's slab makes its tiles read past the factor. Refusing
     // here keeps that a fallback instead of a bad device access.
-    const ok_a = [_]u8{0} ** (128 * 64 * 2);
-    const ok_b = [_]u8{0} ** (256 * 128 * 2);
+    const ok_a: [(128 * 64 * 2)]u8 = @splat(0);
+    const ok_b: [(256 * 128 * 2)]u8 = @splat(0);
     var f: lora.Factor = .{
         .a = bf16Weight(&ok_a, 128, 64),
         .b = bf16Weight(&ok_b, 256, 128),
@@ -356,7 +356,7 @@ test "device support is refused by shape rather than discovered at a launch" {
     try testing.expect(!supported(&t));
 
     // f32 factors: no bf16 GEMM to read them.
-    const f32_a = [_]u8{0} ** (128 * 64 * 4);
+    const f32_a: [(128 * 64 * 4)]u8 = @splat(0);
     var fw = bf16Weight(&ok_a, 128, 64);
     fw = Weight.init(&f32_a, .f32, 128, 64);
     f = .{ .a = fw, .b = bf16Weight(&ok_b, 256, 128), .out_off = 0 };

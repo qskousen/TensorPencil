@@ -42,7 +42,7 @@ const Fake = struct {
     out_gen: std.atomic.Value(u32) = .init(0),
     attached: std.atomic.Value(bool) = .init(false),
     requests: std.atomic.Value(u32) = .init(0),
-    upload_digest: [32]u8 = .{0} ** 32,
+    upload_digest: [32]u8 = @splat(0),
     upload_len: usize = 0,
 
     fn backend(self: *Fake) server.Backend {
@@ -119,7 +119,7 @@ const Acceptor = struct {
     stop: *const std.atomic.Value(bool),
     n: usize,
     opts: server.Options,
-    threads: [8]?std.Thread = .{null} ** 8,
+    threads: [8]?std.Thread = @splat(null),
     handshake_failures: std.atomic.Value(u32) = .init(0),
 
     fn run(self: *Acceptor) void {

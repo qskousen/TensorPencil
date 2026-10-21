@@ -727,7 +727,7 @@ pub const Hosts = struct {
                 // Its own catalog cache: two children on one disk finishing a
                 // scan together must not write one file.
                 var name_buf: [config.max_host_name + 16]u8 = undefined;
-                const fname = std.fmt.bufPrint(&name_buf, "catalog-{s}.json", .{s.name}) catch "catalog-host.json";
+                const fname = std.mem.print(&name_buf, "catalog-{s}.json", .{s.name}) catch "catalog-host.json";
                 if (config.Config.siblingPath(self.io, gpa, self.environ, self.config_path, fname) catch null) |p| {
                     errdefer gpa.free(p);
                     try args.append(gpa, try gpa.dupe(u8, "--index"));
@@ -1495,11 +1495,11 @@ pub const Hosts = struct {
     /// Null while there is nothing to say yet.
     fn outcomeText(buf: []u8, im: *const mirror.Image) ?[]const u8 {
         return switch (im.status()) {
-            .done => std.fmt.bufPrint(buf, "[image tool] finished: {d}×{d}, seed {d}", .{
+            .done => std.mem.print(buf, "[image tool] finished: {d}×{d}, seed {d}", .{
                 im.info.width, im.info.height, im.info.req_seed,
             }) catch null,
             .canceled => "[image tool] canceled by the user",
-            .failed => std.fmt.bufPrint(buf, "[image tool] failed: {s}", .{
+            .failed => std.mem.print(buf, "[image tool] failed: {s}", .{
                 mirror.failureText(im.info.failure),
             }) catch null,
             .pending, .generating, .suspended => null,
@@ -1942,7 +1942,7 @@ test "a remote host is not told settings until this machine's own catalog can na
     remote_entry.name.set("far");
     remote_entry.socket.set("far:7777");
     remote_entry.cert.set("AA");
-    remote_entry.token.set(&[_]u8{'0'} ** 64);
+    remote_entry.token.set(&@as([64]u8, @splat('0')));
     const b = try h.addSlot("far", remote_entry);
 
     var cfg: config.Config = .{};
@@ -1986,7 +1986,7 @@ test "a remote host is told model ids, a local one paths, and only a remote host
     remote_entry.name.set("far");
     remote_entry.socket.set("lydia:7777");
     remote_entry.cert.set("AA");
-    remote_entry.token.set(&[_]u8{'0'} ** 64);
+    remote_entry.token.set(&@as([64]u8, @splat('0')));
     const b = try h.addSlot("far", remote_entry);
     // It has the VAE (same stem and size) but not the checkpoint.
     try setCatalog(b, &.{.{ .path = "id:x", .name = "vae", .size = 300, .mtime_ns = 9 }});
@@ -2058,7 +2058,7 @@ test "a host is short of the chat model only while it carries the chat" {
     remote_entry.name.set("far");
     remote_entry.socket.set("lydia:7777");
     remote_entry.cert.set("AA");
-    remote_entry.token.set(&[_]u8{'0'} ** 64);
+    remote_entry.token.set(&@as([64]u8, @splat('0')));
     const b = try h.addSlot("far", remote_entry);
     var r = fakeRemote();
     b.remote = &r;
@@ -2799,8 +2799,8 @@ test "a render the model asks for is placed like any other and reported back to 
     try feedEvent(b, .{ .img = .{ .id = 77, .client_ref = sent.client_ref, .status = .done, .width = 512, .height = 512, .req_seed = 5 } });
     h.pump(&cfg);
     const note = (try sentRequest(&ra, arena.allocator(), 1)).chat_note;
-    try testing.expect(std.mem.indexOf(u8, note.text, "finished") != null);
-    try testing.expect(std.mem.indexOf(u8, note.text, "512") != null);
+    try testing.expect(std.mem.find(u8, note.text, "finished") != null);
+    try testing.expect(std.mem.find(u8, note.text, "512") != null);
     // Once, however many passes run.
     h.pump(&cfg);
     try testing.expectEqual(@as(usize, 2), ra.outbox.items.items.len);

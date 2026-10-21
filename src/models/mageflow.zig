@@ -157,7 +157,7 @@ pub const DiT = struct {
     /// silent wrong answer.
     pub fn rankIn(store: WeightStore) usize {
         var buf: [96]u8 = undefined;
-        const nm = std.fmt.bufPrint(&buf, "{s}modulation_down.weight", .{prefixIn(store)}) catch return 0;
+        const nm = std.mem.print(&buf, "{s}modulation_down.weight", .{prefixIn(store)}) catch return 0;
         const view = store.get(nm) orelse return 0;
         return view.info.elemCount() / features;
     }
@@ -168,7 +168,7 @@ pub const DiT = struct {
         var n: usize = 0;
         while (n < max_blocks) : (n += 1) {
             var buf: [96]u8 = undefined;
-            const nm = std.fmt.bufPrint(&buf, "{s}transformer_blocks.{d}.img_mod.1.weight", .{ pfx, n }) catch return n;
+            const nm = std.mem.print(&buf, "{s}transformer_blocks.{d}.img_mod.1.weight", .{ pfx, n }) catch return n;
             if (store.get(nm) == null) return n;
         }
         return n;
@@ -898,7 +898,7 @@ fn checkAgainstRef(
         var kb: [64]u8 = undefined;
         const key = struct {
             fn f(buf: []u8, c: []const u8, suffix: []const u8) []const u8 {
-                return std.fmt.bufPrint(buf, "{s}.{s}", .{ c, suffix }) catch unreachable;
+                return std.mem.print(buf, "{s}.{s}", .{ c, suffix }) catch unreachable;
             }
         }.f;
 

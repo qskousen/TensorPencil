@@ -40,7 +40,7 @@ pub fn statusLine(m: *const mirror.Mirror, u: *const models.Union, buf: []u8) []
         unusable += 1;
     };
     const n_hosts = models.count(u.up);
-    return std.fmt.bufPrint(buf, "{d} model files{s}, {d} of no use here{s}", .{
+    return std.mem.print(buf, "{d} model files{s}, {d} of no use here{s}", .{
         u.cat.entries.len,
         if (n_hosts > 1) " across the hosts" else "",
         unusable,
@@ -116,12 +116,12 @@ pub fn where(arena: std.mem.Allocator, u: *const models.Union, r: *const models.
 
     if (models.first(runs)) |only| {
         if (models.count(runs) == 1) return .{ .note = u.nameOf(only) };
-        return .{ .note = std.fmt.allocPrint(arena, "{d} of {d}", .{ models.count(runs), n_up }) catch "" };
+        return .{ .note = arena.print("{d} of {d}", .{ models.count(runs), n_up }) catch "" };
     }
     // Held somewhere up, but no machine has everything it needs to run it.
     if (models.first(held)) |only| {
         const who = if (models.count(held) == 1) u.nameOf(only) else "";
-        return .{ .note = std.fmt.allocPrint(arena, "{s}{s}missing files", .{
+        return .{ .note = arena.print("{s}{s}missing files", .{
             who,
             if (who.len > 0) " · " else "",
         }) catch "missing files" };
@@ -131,7 +131,7 @@ pub fn where(arena: std.mem.Allocator, u: *const models.Union, r: *const models.
     if (models.first(r.on)) |only| {
         return .{
             .greyed = true,
-            .note = std.fmt.allocPrint(arena, "only on {s} (down)", .{u.nameOf(only)}) catch "host down",
+            .note = arena.print("only on {s} (down)", .{u.nameOf(only)}) catch "host down",
         };
     }
     return .{};
@@ -179,8 +179,8 @@ pub fn imageMenu(arena: std.mem.Allocator, cfg: *const config.Config, u: *const 
     const sel = cat.resolve(cfg.diffusion_model.slice());
     var groups: std.ArrayList(model_menu.Group) = .empty;
     const fams = cat.families();
-    inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
-        const fam: catalog.Family = @enumFromInt(ff.value);
+    inline for (@typeInfo(catalog.Family).@"enum".field_values) |value| {
+        const fam: catalog.Family = @fromBackingInt(value);
         if (fams.contains(fam)) {
             const idx = cat.checkpoints(arena, fam) catch return menu;
             const items = arena.alloc(model_menu.Item, idx.len) catch return menu;

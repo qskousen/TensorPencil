@@ -61,9 +61,11 @@ pub const schedule = @import("schedule.zig");
 pub const sampler = @import("sampler.zig");
 pub const spec_limits = @import("spec_limits.zig");
 pub const prof = @import("prof.zig");
+pub const strings = @import("strings.zig");
 
 test {
     _ = dtype;
+    _ = strings;
     _ = nfc;
     _ = init_defaults;
     _ = tensor;

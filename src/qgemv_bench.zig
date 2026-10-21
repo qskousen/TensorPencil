@@ -140,10 +140,10 @@ fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
             var ms: [2]f64 = .{ 0, 0 };
             for (0..2) |pass| {
                 tp.models.dual_lin.decode_dp4a = pass == 0;
-                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("gemv");
+                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null) catch @panic("gemv");
                 be.prof.reset();
-                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("gemv");
-                ms[pass] = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null) catch @panic("gemv");
+                ms[pass] = (be.prof.ms[@backingInt(Cat.matmul)] + be.prof.ms[@backingInt(Cat.elt)]) / iters;
             }
             tp.models.dual_lin.decode_dp4a = true;
 
@@ -153,10 +153,10 @@ fn decodeGemv(gpa: std.mem.Allocator, be: *Backend) !void {
             var dual_ms: f64 = 0;
             if (Backend.dualGemvSupported(dt) and !Backend.dualGemvOnly(dt)) {
                 tp.models.dual_lin.dual_decode = true;
-                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("dual");
+                for (0..warmup) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null) catch @panic("dual");
                 be.prof.reset();
-                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null, .{}) catch @panic("dual");
-                dual_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                for (0..iters) |_| lin_llm.linear(be, .llm, y_d, x_d, 1, w, null) catch @panic("dual");
+                dual_ms = (be.prof.ms[@backingInt(Cat.matmul)] + be.prof.ms[@backingInt(Cat.elt)]) / iters;
                 tp.models.dual_lin.dual_decode = false;
             }
             const gbs = @as(f64, @floatFromInt(q.len)) / (ms[0] * 1e-3) / 1e9;
@@ -220,8 +220,8 @@ pub fn main(init: std.process.Init) !void {
                 be.prof.reset();
                 if (hasGroupedKernel(k.dt))
                     for (0..iters) |_| grouped(be, k.dt, x_d, y_d, q, n, rows, cols);
-                const grouped_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
-                const quant_ms = be.prof.ms[@intFromEnum(Cat.elt)] / iters;
+                const grouped_ms = be.prof.ms[@backingInt(Cat.matmul)] / iters;
+                const quant_ms = be.prof.ms[@backingInt(Cat.elt)] / iters;
 
                 // MMQ (q4_k only for now): correctness vs the dequant+GEMM path,
                 // then timing. Not bit-exact, the activations go through int8,
@@ -252,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
                         for (0..warmup) |_| be.opMatmulQuantMmq(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmq");
                         be.prof.reset();
                         for (0..iters) |_| be.opMatmulQuantMmq(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmq");
-                        mmq_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                        mmq_ms = (be.prof.ms[@backingInt(Cat.matmul)] + be.prof.ms[@backingInt(Cat.elt)]) / iters;
                     }
 
                     // Pipe-tiled MMQ (128x128, MT=4/NT=8), needs rows % 128 == 0.
@@ -268,7 +268,7 @@ pub fn main(init: std.process.Init) !void {
                         for (0..warmup) |_| be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
                         be.prof.reset();
                         for (0..iters) |_| be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
-                        pipe_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                        pipe_ms = (be.prof.ms[@backingInt(Cat.matmul)] + be.prof.ms[@backingInt(Cat.elt)]) / iters;
                     }
                 }
 
@@ -277,8 +277,8 @@ pub fn main(init: std.process.Init) !void {
                 // opMatmulQuant now charges the weight expansion to .dequant and
                 // the activation convert + tensor-core GEMM to .matmul, so the
                 // two halves of the m>1 fallback are separable.
-                const deq_ms = be.prof.ms[@intFromEnum(Cat.dequant)] / iters;
-                const mm_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
+                const deq_ms = be.prof.ms[@backingInt(Cat.dequant)] / iters;
+                const mm_ms = be.prof.ms[@backingInt(Cat.matmul)] / iters;
                 const gemm_ms = deq_ms + mm_ms;
 
                 _ = grouped_ms;

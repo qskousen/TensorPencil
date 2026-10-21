@@ -1555,21 +1555,21 @@ const Bufs = struct {
         };
         var done: usize = 0;
         errdefer {
-            inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-                if (i < done) be.tensorDestroy(&@field(s, f.name));
+            inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+                if (i < done) be.tensorDestroy(&@field(s, name));
             }
         }
-        inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-            be.noteBuf(f.name, sizes[i] * 4);
-            @field(s, f.name) = try be.tensorCreate(sizes[i] * 4);
+        inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+            be.noteBuf(name, sizes[i] * 4);
+            @field(s, name) = try be.tensorCreate(sizes[i] * 4);
             done = i + 1;
         }
         return s;
     }
 
     fn deinit(s: *Bufs, be: *Backend) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| {
-            be.tensorDestroy(&@field(s, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| {
+            be.tensorDestroy(&@field(s, name));
         }
         s.* = undefined;
     }

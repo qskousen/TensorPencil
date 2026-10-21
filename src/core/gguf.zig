@@ -245,10 +245,10 @@ pub const Gguf = struct {
     /// present, but no tensor has bytes (`get` returns an empty slice).
     header_only: bool = false,
     /// Canonical tensor name -> info, in file order.
-    index: std.StringArrayHashMapUnmanaged(TensorInfo),
+    index: std.array_hash_map.String(TensorInfo),
     /// Metadata key -> value, in file order. Keys/strings point into the
     /// file bytes; formatted canonical names live in the arena.
-    kv: std.StringArrayHashMapUnmanaged(Value),
+    kv: std.array_hash_map.String(Value),
     alignment: usize,
     version: u32,
     arena: std.heap.ArenaAllocator,
@@ -352,7 +352,7 @@ pub const Gguf = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var kv: std.StringArrayHashMapUnmanaged(Value) = .empty;
+        var kv: std.array_hash_map.String(Value) = .empty;
         for (0..@intCast(n_kv)) |_| {
             const key = try r.str();
             const t = try r.int(u32);
@@ -493,7 +493,7 @@ pub const Gguf = struct {
         const payload_len = total - data_start;
         const payload: []const u8 = if (file_len == null) data[data_start..] else &.{};
 
-        var index: std.StringArrayHashMapUnmanaged(TensorInfo) = .empty;
+        var index: std.array_hash_map.String(TensorInfo) = .empty;
         try index.ensureTotalCapacity(alloc, raw_infos.len);
         for (raw_infos) |ri| {
             const n_elems = ri.shape.count();
@@ -640,7 +640,7 @@ pub const Gguf = struct {
     pub fn contextLength(self: *const Gguf) ?u64 {
         const arch = self.getStr("general.architecture") orelse return null;
         var buf: [64]u8 = undefined;
-        const key = std.fmt.bufPrint(&buf, "{s}.context_length", .{arch}) catch return null;
+        const key = std.mem.print(&buf, "{s}.context_length", .{arch}) catch return null;
         return self.getUint(key);
     }
 };
@@ -712,8 +712,8 @@ const gemma4_layer_suffix_map = [_][2][]const u8{
 /// block quants: `comfy.gguf.orig_shape.<raw name>`, an array of dimensions in
 /// row-major (torch) order, already the order this reader uses, so no reversal.
 /// Null when absent or malformed.
-fn origShape(kv: *const std.StringArrayHashMapUnmanaged(Value), alloc: std.mem.Allocator, raw_name: []const u8) ?tensors.Shape {
-    const key = std.fmt.allocPrint(alloc, "comfy.gguf.orig_shape.{s}", .{raw_name}) catch return null;
+fn origShape(kv: *const std.array_hash_map.String(Value), alloc: std.mem.Allocator, raw_name: []const u8) ?tensors.Shape {
+    const key = alloc.print("comfy.gguf.orig_shape.{s}", .{raw_name}) catch return null;
     const v = kv.get(key) orelse return null;
     const arr = switch (v) {
         .arr => |a| a,
@@ -741,7 +741,7 @@ pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8
     if (std.mem.eql(u8, raw, "output.weight")) return "lm_head.weight";
     if (std.mem.startsWith(u8, raw, "blk.")) {
         const rest = raw["blk.".len..];
-        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return raw;
+        const dot = std.mem.findScalar(u8, rest, '.') orelse return raw;
         const layer = rest[0..dot];
         const suffix = rest[dot + 1 ..];
         _ = std.fmt.parseInt(u32, layer, 10) catch return raw;
@@ -753,12 +753,12 @@ pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8
             &layer_suffix_map;
         for (map) |entry| {
             if (std.mem.eql(u8, suffix, entry[0])) {
-                return std.fmt.allocPrint(alloc, "layers.{s}.{s}", .{ layer, entry[1] });
+                return alloc.print("layers.{s}.{s}", .{ layer, entry[1] });
             }
         }
         // Unmapped per-layer tensors (e.g. qwen35's ssm_* / attn_qkv) keep
         // their llama.cpp suffix under the layers.N. prefix.
-        return std.fmt.allocPrint(alloc, "layers.{s}.{s}", .{ layer, suffix });
+        return alloc.print("layers.{s}.{s}", .{ layer, suffix });
     }
     return raw;
 }
@@ -954,7 +954,7 @@ test "openHeader grows past a short first chunk and keeps no bytes" {
     try b.kvStr("general.architecture", "qwen3");
     try b.kvStr("general.size_label", "4B");
     try b.tensor("token_embd.weight", &.{ 4, 2 }, 0, 0);
-    const file = try b.finish(&([_]u8{0} ** 32));
+    const file = try b.finish(&@as([32]u8, @splat(0)));
     defer gpa.free(file);
     try tmp.dir.writeFile(io, .{ .sub_path = "m.gguf", .data = file });
 
@@ -994,7 +994,7 @@ test "reject malformed gguf" {
         var b = try TestBuilder.init(gpa, 3, 1, 0);
         defer b.deinit();
         try b.tensor("t", &.{4}, 99, 0);
-        const file = try b.finish(&[_]u8{0} ** 64);
+        const file = try b.finish(&@as([64]u8, @splat(0)));
         defer gpa.free(file);
         try std.testing.expectError(error.UnsupportedTensorType, Gguf.initFromSlice(gpa, file));
     }
@@ -1002,7 +1002,7 @@ test "reject malformed gguf" {
         var b = try TestBuilder.init(gpa, 3, 1, 0);
         defer b.deinit();
         try b.tensor("t", &.{64}, 0, 0);
-        const file = try b.finish(&[_]u8{0} ** 16);
+        const file = try b.finish(&@as([16]u8, @splat(0)));
         defer gpa.free(file);
         try std.testing.expectError(error.InvalidOffsets, Gguf.initFromSlice(gpa, file));
     }
@@ -1010,7 +1010,7 @@ test "reject malformed gguf" {
         var b = try TestBuilder.init(gpa, 3, 1, 0);
         defer b.deinit();
         try b.tensor("t", &.{ 16, 2 }, 8, 0);
-        const file = try b.finish(&[_]u8{0} ** 68);
+        const file = try b.finish(&@as([68]u8, @splat(0)));
         defer gpa.free(file);
         try std.testing.expectError(error.InvalidShape, Gguf.initFromSlice(gpa, file));
     }
@@ -1019,7 +1019,7 @@ test "reject malformed gguf" {
         defer b.deinit();
         try b.tensor("t", &.{4}, 0, 0);
         try b.tensor("t", &.{4}, 0, 32);
-        const file = try b.finish(&[_]u8{0} ** 64);
+        const file = try b.finish(&@as([64]u8, @splat(0)));
         defer gpa.free(file);
         try std.testing.expectError(error.DuplicateTensor, Gguf.initFromSlice(gpa, file));
     }
@@ -1027,7 +1027,7 @@ test "reject malformed gguf" {
         var b = try TestBuilder.init(gpa, 3, 1, 0);
         defer b.deinit();
         try b.tensor("t", &.{4}, 0, 8);
-        const file = try b.finish(&[_]u8{0} ** 64);
+        const file = try b.finish(&@as([64]u8, @splat(0)));
         defer gpa.free(file);
         try std.testing.expectError(error.InvalidOffsets, Gguf.initFromSlice(gpa, file));
     }

@@ -310,7 +310,7 @@ pub const Api = struct {
 
     /// The driver library names, per platform. One list, so a probe and a load
     /// cannot disagree about what counts as present.
-    const driver_names: []const []const u8 = switch (builtin.os.tag) {
+    const driver_names: []const []const u8 = switch (builtin.target.os.tag) {
         .windows => &.{"nvcuda.dll"},
         else => &.{ "libcuda.so.1", "libcuda.so" },
     };

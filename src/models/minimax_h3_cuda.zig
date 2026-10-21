@@ -386,7 +386,7 @@ test "a fused weight's row slice is a contiguous view with its own scales" {
     // is finite and wrong, so the two must move together; and `row_off` is
     // what tells the LoRA sidecar which rows of the fused factor are this view's.
     const a = std.testing.allocator;
-    const bytes = [_]u8{0} ** 24;
+    const bytes: [24]u8 = @splat(0);
     const scales = [_]f32{ 1, 2, 3, 4, 5, 6 };
     var w = Weight.init(&bytes, .i8, 6, 4);
     w.row_scale = &scales;
@@ -426,9 +426,9 @@ test "modulation offsets are distinct per block, timestep and tag" {
     defer seen.deinit();
     for (0..2) |b| {
         for (0..n_labels) |t| {
-            inline for (@typeInfo(minimax_h3.Tag).@"enum".fields) |f| {
+            inline for (@typeInfo(minimax_h3.Tag).@"enum".field_values) |value| {
                 for (0..6) |slot| {
-                    const off = minimax_h3_dev.modOff(cfg, n_labels, b, t, @enumFromInt(f.value), slot);
+                    const off = minimax_h3_dev.modOff(cfg, n_labels, b, t, @fromBackingInt(value), slot);
                     try std.testing.expect(!seen.contains(off));
                     try seen.put(off, {});
                 }

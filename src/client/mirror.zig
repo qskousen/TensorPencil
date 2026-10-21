@@ -187,7 +187,7 @@ fn dupeDeep(gpa: std.mem.Allocator, comptime T: type, v: T) T {
         },
         .@"struct" => |st| {
             var out = v;
-            inline for (st.fields) |f| @field(out, f.name) = dupeDeep(gpa, f.type, @field(v, f.name));
+            inline for (st.field_names, st.field_types) |name, FieldType| @field(out, name) = dupeDeep(gpa, FieldType, @field(v, name));
             return out;
         },
         .array => |a| {
@@ -207,7 +207,7 @@ fn freeDeep(gpa: std.mem.Allocator, comptime T: type, v: T) void {
             for (v) |e| freeDeep(gpa, p.child, e);
             gpa.free(v);
         },
-        .@"struct" => |st| inline for (st.fields) |f| freeDeep(gpa, f.type, @field(v, f.name)),
+        .@"struct" => |st| inline for (st.field_names, st.field_types) |name, FieldType| freeDeep(gpa, FieldType, @field(v, name)),
         .array => |a| for (v) |e| freeDeep(gpa, a.child, e),
         .optional => |o| if (v) |x| freeDeep(gpa, o.child, x),
         else => {},
@@ -770,7 +770,7 @@ pub const Mirror = struct {
             const px = im.pixels orelse continue;
             held += 1;
             if (held <= keep or im.saved_path == null) continue;
-            if (std.mem.indexOfScalar(ImageId, pins, im.info.id) != null) continue;
+            if (std.mem.findScalar(ImageId, pins, im.info.id) != null) continue;
             freed += px.len;
             self.gpa.free(px);
             im.pixels = null;
@@ -1057,7 +1057,7 @@ test "a restarted host leaves finished pictures, fails the rest, and the transcr
     try testing.expectEqual(unfetched.info.id, w[0].attachments[0]);
     // And it encodes: the same bytes a client's adopt would carry.
     const bytes = try wire.encodeAlloc(arena.allocator(), wire.Request{ .chat_adopt = .{ .messages = w } });
-    try testing.expect(std.mem.indexOf(u8, bytes, "\"here\"") != null);
+    try testing.expect(std.mem.find(u8, bytes, "\"here\"") != null);
 }
 
 test "a finished render this daemon never made cannot be waited for" {
@@ -1161,7 +1161,7 @@ test "the oldest pictures already on disk keep only their thumbnails" {
     for (0..4) |i| {
         const px = try gpa.alloc(u8, 4);
         @memset(px, 7);
-        const saved: ?[]u8 = if (i == 3) null else try std.fmt.allocPrint(gpa, "/out/{d}.png", .{i});
+        const saved: ?[]u8 = if (i == 3) null else try gpa.print("/out/{d}.png", .{i});
         const id = m.addLocal(.{ .status = .done, .width = 1, .height = 1 }, px, saved);
         const im = m.byId(id).?;
         im.preview = try gpa.alloc(u8, 4);

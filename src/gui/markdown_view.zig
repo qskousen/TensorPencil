@@ -37,7 +37,7 @@ pub const Opts = struct {
 /// Render `text` as markdown into the current parent (typically a chat
 /// bubble box). Creates one or more widgets; ids derive from `src` +
 /// `opts.id_extra` + an internal counter.
-pub fn render(src: std.builtin.SourceLocation, text: []const u8, opts: Opts) void {
+pub fn render(src: std.lang.SourceLocation, text: []const u8, opts: Opts) void {
     var r: Renderer = .{ .src = src, .opts = opts };
     defer r.flushProse();
     var it = md.blocks(text);
@@ -51,7 +51,7 @@ pub fn render(src: std.builtin.SourceLocation, text: []const u8, opts: Opts) voi
 }
 
 const Renderer = struct {
-    src: std.builtin.SourceLocation,
+    src: std.lang.SourceLocation,
     opts: Opts,
     /// Open prose layout, lazily created; flushed before each code card so
     /// widgets appear in document order (an open layout is the current
@@ -122,9 +122,9 @@ const Renderer = struct {
                 const level: usize = @min(li.indent / 2, 3);
                 var buf: [32]u8 = undefined;
                 const marker = if (li.number) |num|
-                    std.fmt.bufPrint(&buf, "{s}{d}. ", .{ "        "[0 .. level * 2], num }) catch "1. "
+                    std.mem.print(&buf, "{s}{d}. ", .{ "        "[0 .. level * 2], num }) catch "1. "
                 else
-                    std.fmt.bufPrint(&buf, "{s}{s} ", .{
+                    std.mem.print(&buf, "{s}{s} ", .{
                         "        "[0 .. level * 2],
                         switch (level) {
                             0 => "•",
@@ -138,22 +138,22 @@ const Renderer = struct {
             .quote => |q| {
                 // Blockquote: an accent bar glyph per line, dimmed text.
                 var o = self.opts.prose;
-                o.color_text = (self.opts.prose.color_text orelse theme.text).lerp(theme.fill, 0.35);
+                o.color_text = .{ .color = (if (self.opts.prose.color_text) |c| c.toColor() else theme.text).lerp(theme.fill, 0.35) };
                 var lines = std.mem.splitScalar(u8, q, '\n');
                 var first = true;
                 while (lines.next()) |line| {
                     if (!first) tl.addText("\n", o);
                     first = false;
                     var bar = o;
-                    bar.color_text = theme.focus;
+                    bar.color_text = .{ .color = theme.focus };
                     fonts.addStyled(tl, "▎", .{}, bar);
                     self.emitSpans(tl, md.stripQuote(line), .{}, o);
                 }
             },
             .rule => {
                 var o = self.opts.prose;
-                o.color_text = (self.opts.prose.color_text orelse theme.text).lerp(theme.fill, 0.6);
-                fonts.addStyled(tl, "─" ** 26, .{}, o);
+                o.color_text = .{ .color = (if (self.opts.prose.color_text) |c| c.toColor() else theme.text).lerp(theme.fill, 0.6) };
+                fonts.addStyled(tl, "──────────────────────────", .{}, o);
             },
         }
     }
@@ -175,13 +175,13 @@ const Renderer = struct {
             var so = o;
             if (style.code) {
                 // Inline code: per-run background highlight.
-                so.color_fill = theme.fill.lerp(theme.text, 0.14);
+                so.color_fill = .{ .color = theme.fill.lerp(theme.text, 0.14) };
             }
             if (span.link) |url| {
                 // Underlined accent run that opens the URL. Single run (no
                 // emoji splitting): link text is overwhelmingly ASCII and a
                 // click region shouldn't fragment.
-                so.color_text = theme.focus;
+                so.color_text = .{ .color = theme.focus };
                 const base = so.font orelse theme.font_body;
                 so.font = base.withUnderline(.{});
                 if (tl.addTextClick(span.text, so)) |click| {
@@ -201,8 +201,8 @@ const Renderer = struct {
             .id_extra = self.nextId(),
             .expand = .horizontal,
             .background = true,
-            .color_fill = theme.fill.lerp(theme.text, 0.10),
-            .corner_radius = dvui.Rect.all(6),
+            .color_fill = .{ .color = theme.fill.lerp(theme.text, 0.10) },
+            .corners = .round(6),
             .padding = dvui.Rect.all(6),
             .margin = .{ .y = 4, .h = 4 },
         });
@@ -220,7 +220,7 @@ const Renderer = struct {
                 dvui.label(self.src, "{s}", .{c.lang}, .{
                     .id_extra = self.nextId(),
                     .font = dvui.themeGet().font_mono.withSize(11),
-                    .color_text = theme.text.lerp(theme.fill, 0.4),
+                    .color_text = .{ .color = theme.text.lerp(theme.fill, 0.4) },
                     .gravity_y = 0.5,
                     .padding = .{},
                     .margin = .{},
@@ -231,7 +231,7 @@ const Renderer = struct {
                 .id_extra = self.nextId(),
                 .gravity_x = 1.0,
                 .min_size_content = .{ .h = 14 },
-                .color_text = theme.text.lerp(theme.fill, 0.4),
+                .color_text = .{ .color = theme.text.lerp(theme.fill, 0.4) },
                 .padding = dvui.Rect.all(2),
                 .margin = .{},
                 .data_out = &wd,

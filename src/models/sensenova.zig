@@ -206,8 +206,7 @@ pub fn buildPrompt(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     if (text.len == 0) {
         return gpa.dupe(u8, "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<img>");
     }
-    return std.fmt.allocPrint(gpa,
-        "<|im_start|>system\n{s}<|im_end|>\n" ++
+    return gpa.print("<|im_start|>system\n{s}<|im_end|>\n" ++
         "<|im_start|>user\n{s}<|im_end|>\n" ++
         "<|im_start|>assistant\n<think>\n\n</think>\n\n<img>", .{ system_message, text });
 }
@@ -426,7 +425,7 @@ fn appendBlock(gpa: std.mem.Allocator, ids: *std.ArrayList(u32), g: [2]usize) !v
 fn appendLabel(gpa: std.mem.Allocator, ids: *std.ArrayList(u32), index: usize) !void {
     try ids.appendSlice(gpa, &.{ tok_image_label, tok_hyphen });
     var buf: [8]u8 = undefined;
-    const digits = std.fmt.bufPrint(&buf, "{d}", .{index + 1}) catch unreachable;
+    const digits = std.mem.print(&buf, "{d}", .{index + 1}) catch unreachable;
     for (digits) |d| try ids.append(gpa, tok_digit_zero + (d - '0'));
     try ids.append(gpa, tok_colon);
 }
@@ -1838,13 +1837,13 @@ test "the canvas pads replicate to 16 then circular to 32" {
     defer st.deinit();
     for (0..3) |i| {
         var kb: [32]u8 = undefined;
-        const in_v = try st.require(try std.fmt.bufPrint(&kb, "pad.{d}.in", .{i}));
+        const in_v = try st.require(try std.mem.print(&kb, "pad.{d}.in", .{i}));
         const shape = in_v.info.shape.slice();
         const h = shape[1];
         const w = shape[2];
         const x = try in_v.toF32Alloc(gpa);
         defer gpa.free(x);
-        const want = try (try st.require(try std.fmt.bufPrint(&kb, "pad.{d}.out", .{i}))).toF32Alloc(gpa);
+        const want = try (try st.require(try std.mem.print(&kb, "pad.{d}.out", .{i}))).toF32Alloc(gpa);
         defer gpa.free(want);
 
         const got = try padCanvas(gpa, u15_8b, x, 3, h, w);
@@ -1861,7 +1860,7 @@ test "the sigma schedule matches the upstream flow shift" {
     defer st.deinit();
     for ([_]f32{ 1.0, 3.0 }) |shift| {
         var kb: [32]u8 = undefined;
-        const want = try (try st.require(try std.fmt.bufPrint(&kb, "sigmas.{d}", .{@as(u32, @intFromFloat(shift))}))).toF32Alloc(gpa);
+        const want = try (try st.require(try std.mem.print(&kb, "sigmas.{d}", .{@as(u32, @intFromFloat(shift))}))).toF32Alloc(gpa);
         defer gpa.free(want);
         const got = try sigmaSchedule(gpa, want.len - 1, shift);
         defer gpa.free(got);
@@ -1889,7 +1888,7 @@ test "the whole forward matches ComfyUI at reduced width" {
 
     for (0..2) |ci| {
         var kb: [48]u8 = undefined;
-        const ids = try refIds(gpa, &st, try std.fmt.bufPrint(&kb, "fwd.{d}.ids", .{ci}));
+        const ids = try refIds(gpa, &st, try std.mem.print(&kb, "fwd.{d}.ids", .{ci}));
         defer gpa.free(ids);
 
         var layout = try plainLayout(gpa, ids);
@@ -1901,7 +1900,7 @@ test "the whole forward matches ComfyUI at reduced width" {
         const kv_dim = tiny.kvDim();
         for (0..tiny.n_layers) |li| {
             for ([_][]const u8{ "k", "v" }) |which| {
-                const ref_hm = try (try st.require(try std.fmt.bufPrint(&kb, "pre.{d}.{s}.{d}", .{ ci, which, li }))).toF32Alloc(gpa);
+                const ref_hm = try (try st.require(try std.mem.print(&kb, "pre.{d}.{s}.{d}", .{ ci, which, li }))).toF32Alloc(gpa);
                 defer gpa.free(ref_hm);
                 const want = try gpa.alloc(f32, ref_hm.len);
                 defer gpa.free(want);
@@ -1914,15 +1913,15 @@ test "the whole forward matches ComfyUI at reduced width" {
             }
         }
 
-        const x_v = try st.require(try std.fmt.bufPrint(&kb, "fwd.{d}.x", .{ci}));
+        const x_v = try st.require(try std.mem.print(&kb, "fwd.{d}.x", .{ci}));
         const shape = x_v.info.shape.slice();
         const h = shape[1];
         const w = shape[2];
         const x = try x_v.toF32Alloc(gpa);
         defer gpa.free(x);
-        const t = try (try st.require(try std.fmt.bufPrint(&kb, "fwd.{d}.t", .{ci}))).toF32Alloc(gpa);
+        const t = try (try st.require(try std.mem.print(&kb, "fwd.{d}.t", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(t);
-        const want = try (try st.require(try std.fmt.bufPrint(&kb, "fwd.{d}.v", .{ci}))).toF32Alloc(gpa);
+        const want = try (try st.require(try std.mem.print(&kb, "fwd.{d}.v", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(want);
 
         const got = try gpa.alloc(f32, want.len);
@@ -1952,7 +1951,7 @@ test "tokenization matches ComfyUI's own SenseNova tokenizer" {
 
     for (parsed.value, 0..) |text, i| {
         var kb: [32]u8 = undefined;
-        const want = try refIds(gpa, &st, try std.fmt.bufPrint(&kb, "tok.{d}", .{i}));
+        const want = try refIds(gpa, &st, try std.mem.print(&kb, "tok.{d}", .{i}));
         defer gpa.free(want);
         const got = try tokenize(gpa, &tok, text);
         defer gpa.free(got);
@@ -1990,11 +1989,11 @@ test "reference blocks splice into the user turn with a block-causal mask" {
 
     for (parsed.value, 0..) |c, i| {
         var kb: [32]u8 = undefined;
-        const want_ids = try refIds(gpa, &st, try std.fmt.bufPrint(&kb, "edit.{d}.ids", .{i}));
+        const want_ids = try refIds(gpa, &st, try std.mem.print(&kb, "edit.{d}.ids", .{i}));
         defer gpa.free(want_ids);
-        const want_thw = try refIds(gpa, &st, try std.fmt.bufPrint(&kb, "edit.{d}.thw", .{i}));
+        const want_thw = try refIds(gpa, &st, try std.mem.print(&kb, "edit.{d}.thw", .{i}));
         defer gpa.free(want_thw);
-        const allow = (try st.require(try std.fmt.bufPrint(&kb, "edit.{d}.allow", .{i}))).bytes;
+        const allow = (try st.require(try std.mem.print(&kb, "edit.{d}.allow", .{i}))).bytes;
 
         var got = try editLayout(gpa, base, c.grids, c.image_only);
         defer got.deinit(gpa);
@@ -2065,8 +2064,8 @@ test "the unconditional prompt is not the conditional one with an empty turn" {
     try testing.expect(neg.len < 16);
     try testing.expect(pos.len > 200);
     // The primed empty thought block is in the conditional prompt only.
-    try testing.expect(std.mem.indexOfScalar(u32, pos, tok_think_open) != null);
-    try testing.expect(std.mem.indexOfScalar(u32, neg, tok_think_open) == null);
+    try testing.expect(std.mem.findScalar(u32, pos, tok_think_open) != null);
+    try testing.expect(std.mem.findScalar(u32, neg, tok_think_open) == null);
 }
 
 const edit_ref_path = "src/models/assets/sensenova_edit_ref.safetensors";
@@ -2149,7 +2148,7 @@ test "the edit conditioning matches ComfyUI on a real checkpoint" {
     for ([_]usize{ 0, layers - 1 }) |li| {
         var kb: [16]u8 = undefined;
         for ([_][]const u8{ "k", "v" }) |which| {
-            const hm = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.{d}", .{ which, li }))).toF32Alloc(gpa);
+            const hm = try (try ref.require(try std.mem.print(&kb, "{s}.{d}", .{ which, li }))).toF32Alloc(gpa);
             defer gpa.free(hm);
             const want = try gpa.alloc(f32, hm.len);
             defer gpa.free(want);
@@ -2246,7 +2245,7 @@ test "the edit prefix matches ComfyUI at the full 42 layers" {
     for ([_]usize{ 0, cfg.n_layers - 1 }) |li| {
         var kb: [16]u8 = undefined;
         for ([_][]const u8{ "k", "v" }) |which| {
-            const hm = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.{d}", .{ which, li }))).toF32Alloc(gpa);
+            const hm = try (try ref.require(try std.mem.print(&kb, "{s}.{d}", .{ which, li }))).toF32Alloc(gpa);
             defer gpa.free(hm);
             const want = try gpa.alloc(f32, hm.len);
             defer gpa.free(want);

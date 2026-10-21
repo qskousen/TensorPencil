@@ -90,7 +90,7 @@ pub fn jitterAt(
         .dst = dst,
         .addr = addr,
         .wbase = wbase,
-        .salt = @intFromEnum(draw),
+        .salt = @backingInt(draw),
         .h = h,
         .t = t,
         .u = u,
@@ -148,7 +148,7 @@ pub fn emitJitter(b: *ptx.Builder, s: Scratch, dst: []const u8, addr: []const u8
         .dst = dst,
         .addr = addr,
         .wbase = wbase,
-        .salt = @intFromEnum(draw),
+        .salt = @backingInt(draw),
         .h = s.h,
         .t = s.t,
         .u = s.u,
@@ -162,7 +162,7 @@ pub fn emitJitter(b: *ptx.Builder, s: Scratch, dst: []const u8, addr: []const u8
 pub fn factor(offset: u32, key: u32, draw: Draw, sigma: f32) f32 {
     var h: u32 = offset;
     h ^= key;
-    h ^= @intFromEnum(draw);
+    h ^= @backingInt(draw);
     h *%= 0x9E3779B1;
     h ^= h >> 15;
     h *%= 0x85EBCA6B;

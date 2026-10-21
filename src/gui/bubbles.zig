@@ -114,18 +114,18 @@ pub const ToolActions = struct {
 };
 
 /// A right-aligned user message. The 3px bottom-right corner is the tail.
-pub fn userBubble(src: std.builtin.SourceLocation, text: []const u8) void {
+pub fn userBubble(src: std.lang.SourceLocation, text: []const u8) void {
     var wrap = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal });
     defer wrap.deinit();
     var b = dvui.box(@src(), .{ .dir = .vertical }, .{
         .gravity_x = 1.0,
         .max_size_content = .width(L.bubble_max),
         .background = true,
-        .color_fill = C.bubble_user,
+        .color_fill = .{ .color = C.bubble_user },
         .border = style.Edge.all,
-        .color_border = style.hairline,
+        .color_border = .{ .color = style.hairline },
         // tl, tr, br, bl — the tail is the small one.
-        .corner_radius = .{ .x = 10, .y = 10, .w = 3, .h = 10 },
+        .corners = style.R.bubble_user,
         .padding = .{ .x = 14, .y = 11, .w = 14, .h = 11 },
     });
     defer b.deinit();
@@ -134,15 +134,15 @@ pub fn userBubble(src: std.builtin.SourceLocation, text: []const u8) void {
         .background = false,
         .padding = .{},
         .font = F.prose,
-        .color_text = C.text_hi,
+        .color_text = .{ .color = C.text_hi },
     });
     defer tl.deinit();
-    fonts.addStyled(tl, text, .{}, .{ .font = F.prose, .color_text = C.text_hi });
+    fonts.addStyled(tl, text, .{}, .{ .font = F.prose, .color_text = .{ .color = C.text_hi } });
 }
 
 /// Agent prose: no bubble, no avatar, just a measure limit. Markdown-rendered,
 /// since that is what the model emits.
-pub fn agentProse(src: std.builtin.SourceLocation, text: []const u8) void {
+pub fn agentProse(src: std.lang.SourceLocation, text: []const u8) void {
     var wrap = dvui.box(src, .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .max_size_content = .width(L.prose_max),
@@ -152,13 +152,13 @@ pub fn agentProse(src: std.builtin.SourceLocation, text: []const u8) void {
         .background = false,
         .padding = .{},
         .font = F.prose,
-        .color_text = C.text,
+        .color_text = .{ .color = C.text },
     } });
 }
 
 /// The tool-call card: header (amber tag, meta, disclosure), a grid of tiles,
 /// and the action row.
-pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) void {
+pub fn toolCard(src: std.lang.SourceLocation, tc: ToolCall, cb: ToolActions) void {
     var wrap = dvui.box(src, .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = tc.id_extra });
     defer wrap.deinit();
 
@@ -166,10 +166,10 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         .expand = .horizontal,
         .max_size_content = .width(L.card_max),
         .background = true,
-        .color_fill = C.card,
+        .color_fill = .{ .color = C.card },
         .border = style.Edge.all,
-        .color_border = style.hairline_hi,
-        .corner_radius = R.card,
+        .color_border = .{ .color = style.hairline_hi },
+        .corners = R.card,
     });
     defer card.deinit();
 
@@ -181,9 +181,9 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
             // a background on, so the card's own surface has to be named or it
             // gets the theme's.
             .background = true,
-            .color_fill = C.card,
+            .color_fill = .{ .color = C.card },
             .border = style.Edge.bottom,
-            .color_border = style.hairline_soft,
+            .color_border = .{ .color = style.hairline_soft },
             .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 },
         });
         defer hdr.deinit();
@@ -191,17 +191,17 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         // The tag is amber because a tool call is the machine acting.
         dvui.labelNoFmt(@src(), tc.name, .{}, .{
             .font = F.mono,
-            .color_text = C.amber,
+            .color_text = .{ .color = C.amber },
             .background = true,
-            .color_fill = style.over(C.card, C.amber, 0.12),
-            .corner_radius = dvui.Rect.all(4),
+            .color_fill = .{ .color = style.over(C.card, C.amber, 0.12) },
+            .corners = .round(4),
             .padding = .{ .x = 6, .y = 4, .w = 6, .h = 4 },
             .margin = .{ .w = 9 },
             .gravity_y = 0.5,
         });
         dvui.labelNoFmt(@src(), tc.meta, .{}, .{
             .font = F.mono,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
             .padding = .{},
             .gravity_y = 0.5,
         });
@@ -211,9 +211,9 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .background = false,
-                .color_fill_hover = style.hover_wash,
-                .color_fill_press = style.hover_wash,
-                .corner_radius = R.chip,
+                .color_fill_hover = .{ .color = style.hover_wash },
+                .color_fill_press = .{ .color = style.hover_wash },
+                .corners = R.chip,
                 .padding = .{ .x = 5, .y = 3, .w = 5, .h = 3 },
                 .margin = .{},
             });
@@ -225,7 +225,7 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                 style.mark(@src(), if (tc.expanded) .disclosure_open else .disclosure, 9, C.text_dim, .{ .margin = .{ .w = 4 } });
                 dvui.labelNoFmt(@src(), "prompt", .{}, .{
                     .font = F.mono,
-                    .color_text = C.text_dim,
+                    .color_text = .{ .color = C.text_dim },
                     .padding = .{},
                     .gravity_y = 0.5,
                 });
@@ -241,9 +241,9 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         var det = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .horizontal,
             .background = true,
-            .color_fill = C.sunken,
+            .color_fill = .{ .color = C.sunken },
             .border = style.Edge.bottom,
-            .color_border = style.hairline_soft,
+            .color_border = .{ .color = style.hairline_soft },
             .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 },
         });
         defer det.deinit();
@@ -252,10 +252,10 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
             .background = false,
             .padding = .{},
             .font = F.code,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
         });
         defer tl.deinit();
-        fonts.addStyled(tl, tc.prompt, .{}, .{ .font = F.code, .color_text = C.text_dim });
+        fonts.addStyled(tl, tc.prompt, .{}, .{ .font = F.code, .color_text = .{ .color = C.text_dim } });
     }
 
     // ---- tiles
@@ -303,8 +303,8 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                     // No glow and no scale on selection: a 1.5px blue edge is
                     // enough, and anything else makes the grid jump.
                     .border = if (sel) dvui.Rect.all(1.5) else .{},
-                    .color_border = C.blue,
-                    .corner_radius = R.chip,
+                    .color_border = .{ .color = C.blue },
+                    .corners = R.chip,
                 });
                 const crs = cellbox.data().contentRectScale();
                 var cancel = false;
@@ -326,7 +326,7 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
                         dashedSlot(crs.r, crs.s, style.hairline_soft);
                         dvui.labelNoFmt(@src(), "file gone", .{}, .{
                             .font = F.mono_row,
-                            .color_text = C.text_ghost,
+                            .color_text = .{ .color = C.text_ghost },
                             .gravity_x = 0.5,
                             .gravity_y = 0.5,
                             .padding = .{},
@@ -364,7 +364,7 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
         if (tc.busy and tc.status.len > 0) {
             dvui.labelNoFmt(@src(), tc.status, .{}, .{
                 .font = F.mono,
-                .color_text = C.amber, // the machine is working
+                .color_text = .{ .color = C.amber }, // the machine is working
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .padding = .{},
@@ -376,19 +376,19 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
             const line = if (tc.gone == 1)
                 "1 image is no longer on disk"
             else
-                std.fmt.bufPrint(&buf, "{d} images are no longer on disk", .{tc.gone}) catch "images are no longer on disk";
+                std.mem.print(&buf, "{d} images are no longer on disk", .{tc.gone}) catch "images are no longer on disk";
             dvui.labelNoFmt(@src(), line, .{}, .{
                 .font = F.mono,
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .padding = .{},
             });
         } else if (tc.selected) |sel| {
             var buf: [32]u8 = undefined;
-            dvui.labelNoFmt(@src(), std.fmt.bufPrint(&buf, "render {d:0>2} selected", .{sel + 1}) catch "", .{}, .{
+            dvui.labelNoFmt(@src(), std.mem.print(&buf, "render {d:0>2} selected", .{sel + 1}) catch "", .{}, .{
                 .font = F.mono,
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .padding = .{},
@@ -398,14 +398,14 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
 }
 
 /// The light-on-dark primary action. Never amber: a button is the user acting.
-pub fn primaryButton(src: std.builtin.SourceLocation, label: []const u8, enabled: bool) bool {
+pub fn primaryButton(src: std.lang.SourceLocation, label: []const u8, enabled: bool) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .background = true,
-        .color_fill = if (enabled) C.text_hi else C.raised,
-        .color_fill_hover = if (enabled) C.text_hi.lighten(-6) else C.raised,
-        .color_fill_press = if (enabled) C.text_hi.lighten(-12) else C.raised,
-        .corner_radius = R.button,
+        .color_fill = .{ .color = if (enabled) C.text_hi else C.raised },
+        .color_fill_hover = .{ .color = if (enabled) C.text_hi.lighten(-6) else C.raised },
+        .color_fill_press = .{ .color = if (enabled) C.text_hi.lighten(-12) else C.raised },
+        .corners = R.button,
         .padding = .{ .x = 12, .y = 7, .w = 12, .h = 7 },
         .margin = .{ .w = 8 },
         .gravity_y = 0.5,
@@ -414,7 +414,7 @@ pub fn primaryButton(src: std.builtin.SourceLocation, label: []const u8, enabled
     bw.drawBackground();
     dvui.labelNoFmt(@src(), label, .{}, .{
         .font = F.ui,
-        .color_text = if (enabled) C.text_ink else C.text_ghost,
+        .color_text = .{ .color = if (enabled) C.text_ink else C.text_ghost },
         .padding = .{},
         .gravity_x = 0.5,
         .gravity_y = 0.5,
@@ -425,17 +425,17 @@ pub fn primaryButton(src: std.builtin.SourceLocation, label: []const u8, enabled
     return clicked and enabled;
 }
 
-pub fn secondaryButton(src: std.builtin.SourceLocation, id: usize, label: []const u8, enabled: bool) bool {
+pub fn secondaryButton(src: std.lang.SourceLocation, id: usize, label: []const u8, enabled: bool) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .id_extra = id,
         .background = true,
-        .color_fill = C.raised_dim,
-        .color_fill_hover = C.raised_dim.lighten(6),
-        .color_fill_press = C.raised_dim.lighten(12),
+        .color_fill = .{ .color = C.raised_dim },
+        .color_fill_hover = .{ .color = C.raised_dim.lighten(6) },
+        .color_fill_press = .{ .color = C.raised_dim.lighten(12) },
         .border = style.Edge.all,
-        .color_border = style.hairline,
-        .corner_radius = R.button,
+        .color_border = .{ .color = style.hairline },
+        .corners = R.button,
         .padding = .{ .x = 12, .y = 7, .w = 12, .h = 7 },
         .margin = .{ .w = 8 },
         .gravity_y = 0.5,
@@ -444,7 +444,7 @@ pub fn secondaryButton(src: std.builtin.SourceLocation, id: usize, label: []cons
     bw.drawBackground();
     dvui.labelNoFmt(@src(), label, .{}, .{
         .font = F.ui,
-        .color_text = if (enabled) C.text else C.text_ghost,
+        .color_text = .{ .color = if (enabled) C.text else C.text_ghost },
         .padding = .{},
         .gravity_x = 0.5,
         .gravity_y = 0.5,
@@ -457,7 +457,7 @@ pub fn secondaryButton(src: std.builtin.SourceLocation, id: usize, label: []cons
 
 /// A picture fitted into its tile, whatever shape it is. A preview arrives at a
 /// fraction of the final size, so this grows as well as shrinks.
-fn tilePixels(src: std.builtin.SourceLocation, px: Px, cw: f32, ch: f32) void {
+fn tilePixels(src: std.lang.SourceLocation, px: Px, cw: f32, ch: f32) void {
     const fw: f32 = @floatFromInt(px.w);
     const fh: f32 = @floatFromInt(px.h);
     if (fw <= 0 or fh <= 0) return;
@@ -471,27 +471,27 @@ fn tilePixels(src: std.builtin.SourceLocation, px: Px, cw: f32, ch: f32) void {
         .gravity_y = 0.5,
         .min_size_content = sz,
         .max_size_content = .size(sz),
-        .corner_radius = R.chip,
+        .corners = R.chip,
     });
 }
 
 /// The strip along the bottom of a tile a host is working on: what step it is
 /// on, and the bar. Amber, because this is the machine working.
-fn liveStrip(src: std.builtin.SourceLocation, r: Rendering) void {
+fn liveStrip(src: std.lang.SourceLocation, r: Rendering) void {
     var strip = dvui.box(src, .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .gravity_y = 1.0,
         .background = true,
-        .color_fill = style.tint(C.canvas, 205),
+        .color_fill = .{ .color = style.tint(C.canvas, 205) },
         // Square on top, following the tile's own corners below.
-        .corner_radius = .{ .x = 0, .y = 0, .w = 5, .h = 5 },
+        .corners = style.R.drawer,
         .padding = .{ .x = 8, .y = 4, .w = 8, .h = 5 },
     });
     defer strip.deinit();
 
     if (r.label.len > 0) dvui.labelNoFmt(@src(), r.label, .{}, .{
         .font = F.mono_row,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
     });
     const frac: f32 = if (r.steps > 0)
@@ -503,20 +503,20 @@ fn liveStrip(src: std.builtin.SourceLocation, r: Rendering) void {
 
 /// Stop this one render, in the corner of the tile it is happening in. The wash
 /// under it is what keeps it visible over a bright picture.
-fn tileCancel(src: std.builtin.SourceLocation) bool {
+fn tileCancel(src: std.lang.SourceLocation) bool {
     var wrap = dvui.box(src, .{ .dir = .horizontal }, .{
         .gravity_x = 1.0,
         .background = true,
-        .color_fill = style.tint(C.canvas, 190),
-        .corner_radius = R.chip,
+        .color_fill = .{ .color = style.tint(C.canvas, 190) },
+        .corners = R.chip,
         .margin = dvui.Rect.all(5),
     });
     defer wrap.deinit();
     return dvui.buttonIcon(@src(), "cancel", dvui.entypo.cross, .{}, .{}, .{
         .min_size_content = .{ .w = 12, .h = 12 },
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .background = false,
-        .corner_radius = R.chip,
+        .corners = R.chip,
         .padding = dvui.Rect.all(3),
         .margin = .{},
     });
@@ -531,14 +531,14 @@ fn dashedSlot(r: dvui.Rect.Physical, scale: f32, color: dvui.Color) void {
     var x = r.x;
     while (x < r.x + r.w) : (x += dash + gap) {
         const w = @min(dash, r.x + r.w - x);
-        (dvui.Rect.Physical{ .x = x, .y = r.y, .w = w, .h = th }).fill(.{}, .{ .color = color });
-        (dvui.Rect.Physical{ .x = x, .y = r.y + r.h - th, .w = w, .h = th }).fill(.{}, .{ .color = color });
+        (dvui.Rect.Physical{ .x = x, .y = r.y, .w = w, .h = th }).fill(.{}, .{ .color = .{ .color = color } });
+        (dvui.Rect.Physical{ .x = x, .y = r.y + r.h - th, .w = w, .h = th }).fill(.{}, .{ .color = .{ .color = color } });
     }
     var y = r.y;
     while (y < r.y + r.h) : (y += dash + gap) {
         const h = @min(dash, r.y + r.h - y);
-        (dvui.Rect.Physical{ .x = r.x, .y = y, .w = th, .h = h }).fill(.{}, .{ .color = color });
-        (dvui.Rect.Physical{ .x = r.x + r.w - th, .y = y, .w = th, .h = h }).fill(.{}, .{ .color = color });
+        (dvui.Rect.Physical{ .x = r.x, .y = y, .w = th, .h = h }).fill(.{}, .{ .color = .{ .color = color } });
+        (dvui.Rect.Physical{ .x = r.x + r.w - th, .y = y, .w = th, .h = h }).fill(.{}, .{ .color = .{ .color = color } });
     }
 }
 
@@ -610,7 +610,7 @@ fn noopCtx(_: *anyopaque) void {}
 
 /// The quick-settings row. These three are the only knobs a beginner needs;
 /// everything else lives in Studio, and the link says so.
-pub fn quickRow(src: std.builtin.SourceLocation, m: Composer, cb: ComposerActions) void {
+pub fn quickRow(src: std.lang.SourceLocation, m: Composer, cb: ComposerActions) void {
     var row = dvui.box(src, .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .margin = .{ .h = 10 },
@@ -632,9 +632,9 @@ pub fn quickRow(src: std.builtin.SourceLocation, m: Composer, cb: ComposerAction
         .gravity_x = 1.0,
         .gravity_y = 0.5,
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .corner_radius = R.chip,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .corners = R.chip,
         .padding = .{ .x = 5, .y = 3, .w = 5, .h = 3 },
         .margin = .{},
     });
@@ -645,7 +645,7 @@ pub fn quickRow(src: std.builtin.SourceLocation, m: Composer, cb: ComposerAction
         defer lr.deinit();
         dvui.labelNoFmt(@src(), "All settings in Studio", .{}, .{
             .font = F.ui_sm,
-            .color_text = C.text_ghost,
+            .color_text = .{ .color = C.text_ghost },
             .padding = .{},
             .gravity_y = 0.5,
         });
@@ -667,14 +667,14 @@ pub const InputFrame = struct {
 /// `focused` lights the frame's own edge. The entry inside is stripped of
 /// chrome, so its built-in focus ring would otherwise sit a pixel off the text
 /// (see style.noFocusTheme, which the caller should hand the entry).
-pub fn inputBegin(src: std.builtin.SourceLocation, focused: bool) InputFrame {
+pub fn inputBegin(src: std.lang.SourceLocation, focused: bool) InputFrame {
     return .{ .box = dvui.box(src, .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .background = true,
-        .color_fill = C.sunken,
+        .color_fill = .{ .color = C.sunken },
         .border = style.Edge.all,
-        .color_border = if (focused) C.blue else style.hairline_hi,
-        .corner_radius = R.input,
+        .color_border = .{ .color = if (focused) C.blue else style.hairline_hi },
+        .corners = R.input,
         .padding = .{ .x = 14, .y = 12, .w = 12, .h = 12 },
     }) };
 }
@@ -684,7 +684,7 @@ pub fn inputBegin(src: std.builtin.SourceLocation, focused: bool) InputFrame {
 /// strength field beside it, dimmed while off so it is visibly inert rather than
 /// missing. Deliberately here and not in the quick-settings row above: this is a
 /// knob you reach for mid-conversation, per message, the way you reach for Send.
-fn noiseControls(src: std.builtin.SourceLocation, nz: Noise, cb: ComposerActions) void {
+fn noiseControls(src: std.lang.SourceLocation, nz: Noise, cb: ComposerActions) void {
     var row = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5, .margin = .{ .w = 8 } });
     defer row.deinit();
 
@@ -735,7 +735,7 @@ fn noiseControls(src: std.builtin.SourceLocation, nz: Noise, cb: ComposerActions
     if (res.committed) cb.on_noise_amount(cb.ctx);
     if (!res.editing) {
         var tmp: [16]u8 = undefined;
-        const want = std.fmt.bufPrint(&tmp, "{d}", .{nz.amount}) catch "";
+        const want = std.mem.print(&tmp, "{d}", .{nz.amount}) catch "";
         if (!std.mem.eql(u8, std.mem.sliceTo(nz.amount_buf, 0), want)) {
             @memset(nz.amount_buf, 0);
             @memcpy(nz.amount_buf[0..@min(want.len, nz.amount_buf.len - 1)], want);
@@ -751,9 +751,9 @@ pub fn inputEnd(f: *InputFrame, m: Composer, cb: ComposerActions) bool {
         ref.init(@src(), .{}, .{
             .gravity_y = 0.5,
             .background = false,
-            .color_fill_hover = style.hover_wash,
-            .color_fill_press = style.hover_wash,
-            .corner_radius = R.chip,
+            .color_fill_hover = .{ .color = style.hover_wash },
+            .color_fill_press = .{ .color = style.hover_wash },
+            .corners = R.chip,
             .padding = .{ .x = 6, .y = 4, .w = 6, .h = 4 },
             .margin = .{ .w = 8 },
         });
@@ -765,7 +765,7 @@ pub fn inputEnd(f: *InputFrame, m: Composer, cb: ComposerActions) bool {
             style.mark(@src(), .plus, 10, C.text_ghost, .{ .margin = .{ .w = 3 } });
             dvui.labelNoFmt(@src(), "reference", .{}, .{
                 .font = F.mono,
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .padding = .{},
                 .gravity_y = 0.5,
             });

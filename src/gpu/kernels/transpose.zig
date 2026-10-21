@@ -7,7 +7,8 @@
 //! words: fp8 bytes for `transpose_f8`, f32 bits for `transpose_f32`.
 //! Dispatch: x = ceil((stride/4) / wg), y = cols (one k per y).
 
-const gpu = @import("std").gpu;
+const abi = @import("abi.zig");
+const gpu = @import("std").spirv;
 
 const Words = extern struct { w: [1 << 28]u32 };
 
@@ -18,34 +19,12 @@ pub const Push = extern struct {
     k_pad: u32, // bf16_to_f16_coopw only (the f8/f32 transposes ignore it)
 };
 
-extern var src: Words addrspace(.storage_buffer);
-extern var dst: Words addrspace(.storage_buffer);
-extern var pc: Push addrspace(.push_constant);
-
-inline fn decorate() void {
-    asm volatile (
-        \\OpDecorate %wt Block
-        \\OpMemberDecorate %wt 0 Offset 0
-        \\OpDecorate %pt Block
-        \\OpMemberDecorate %pt 0 Offset 0
-        \\OpMemberDecorate %pt 1 Offset 4
-        \\OpMemberDecorate %pt 2 Offset 8
-        \\OpMemberDecorate %pt 3 Offset 12
-        \\OpDecorate %s DescriptorSet 0
-        \\OpDecorate %s Binding 0
-        \\OpDecorate %d DescriptorSet 0
-        \\OpDecorate %d Binding 1
-        :
-        : [wt] "t" (Words),
-          [pt] "t" (Push),
-          [s] "" (&src),
-          [d] "" (&dst),
-    );
-}
+const src = abi.buffer(Words, "src", 0);
+const dst = abi.buffer(Words, "dst", 1);
+const pc = abi.pushConstants(Push, "pc");
 
 /// One output u32 (4 fp8 columns at one k) per invocation.
-export fn transpose_f8() callconv(.spirv_kernel) void {
-    decorate();
+export fn transpose_f8() callconv(abi.kernel) void {
     const col_base = gpu.global_invocation_id[0] * 4;
     const k = gpu.global_invocation_id[1];
     if (col_base >= pc.stride or k >= pc.cols) return;
@@ -67,8 +46,7 @@ export fn transpose_f8() callconv(.spirv_kernel) void {
 /// each, packed two columns per u32. Twin of `transpose_f8` (which packs four
 /// 1-byte columns). One output u32 (2 columns at one k) per invocation; x =
 /// column-pair in [0, stride/2), y = k in [0, cols).
-export fn transpose_bf16() callconv(.spirv_kernel) void {
-    decorate();
+export fn transpose_bf16() callconv(abi.kernel) void {
     const col_base = gpu.global_invocation_id[0] * 2;
     const k = gpu.global_invocation_id[1];
     if (col_base >= pc.stride or k >= pc.cols) return;
@@ -93,8 +71,7 @@ export fn transpose_bf16() callconv(.spirv_kernel) void {
 /// multiple of 4 and j is constant across the 4 bytes, so they are exactly rows
 /// {base..base+3} at column j. Pad rows (>= `rows`) and the 4-byte tail contribute
 /// zero. rows = real rows, stride = row_bytes, cols = total output words (bound).
-export fn transpose_grp32() callconv(.spirv_kernel) void {
-    decorate();
+export fn transpose_grp32() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.cols) return;
     const row_bytes = pc.stride;
@@ -137,8 +114,7 @@ inline fn srcF16(q: u32) f32 { // q is 2-byte aligned within a u32 word
     return @floatCast(@as(f16, @bitCast(bits)));
 }
 
-export fn repack_q8_0() callconv(.spirv_kernel) void {
-    decorate();
+export fn repack_q8_0() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const rows = pc.rows;
     const cols = pc.cols;
@@ -161,8 +137,7 @@ export fn repack_q8_0() callconv(.spirv_kernel) void {
     dst.w[gbase + 256 + r] = @bitCast(srcF16(sbase));
 }
 
-export fn repack_iq4_nl() callconv(.spirv_kernel) void {
-    decorate();
+export fn repack_iq4_nl() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const rows = pc.rows;
     const cols = pc.cols;
@@ -192,8 +167,7 @@ export fn repack_iq4_nl() callconv(.spirv_kernel) void {
 }
 
 /// One f32 element per invocation.
-export fn transpose_f32() callconv(.spirv_kernel) void {
-    decorate();
+export fn transpose_f32() callconv(abi.kernel) void {
     const col = gpu.global_invocation_id[0];
     const k = gpu.global_invocation_id[1];
     if (col >= pc.stride or k >= pc.cols) return;
@@ -207,8 +181,7 @@ export fn transpose_f32() callconv(.spirv_kernel) void {
 /// the whole conversion + transpose runs at device bandwidth instead of a
 /// single CPU thread. One output u32 (two adjacent r as packed f16) per
 /// invocation. x = r-pair in [0, stride/2), y = k in [0, k_pad).
-export fn bf16_to_f16_coopw() callconv(.spirv_kernel) void {
-    decorate();
+export fn bf16_to_f16_coopw() callconv(abi.kernel) void {
     const rp = gpu.global_invocation_id[0];
     const k = gpu.global_invocation_id[1];
     if (rp * 2 >= pc.stride or k >= pc.k_pad) return;
@@ -232,8 +205,7 @@ export fn bf16_to_f16_coopw() callconv(.spirv_kernel) void {
 /// GEMM). Same layout as bf16_to_f16_coopw but the 16-bit bits are copied
 /// VERBATIM (bf16 in, bf16 out), no conversion, so the tensor cores consume
 /// the raw checkpoint values. Two adjacent r packed per output u32.
-export fn bf16_coopw() callconv(.spirv_kernel) void {
-    decorate();
+export fn bf16_coopw() callconv(abi.kernel) void {
     const rp = gpu.global_invocation_id[0];
     const k = gpu.global_invocation_id[1];
     if (rp * 2 >= pc.stride or k >= pc.k_pad) return;

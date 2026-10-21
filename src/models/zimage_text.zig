@@ -71,7 +71,7 @@ test "the Z-Image template tokenizes exactly like ComfyUI's ZImageTokenizer" {
     const prompts = [_][]const u8{ "a photograph of an astronaut riding a horse", "" };
     for (prompts, 0..) |text, i| {
         var kb: [32]u8 = undefined;
-        const bytes = (try ref.require(try std.fmt.bufPrint(&kb, "te.tokens.{d}", .{i}))).bytes;
+        const bytes = (try ref.require(try std.mem.print(&kb, "te.tokens.{d}", .{i}))).bytes;
 
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(gpa);
@@ -121,7 +121,7 @@ test "the Z-Image text encoder matches ComfyUI's Qwen3-4B penultimate state" {
         defer gpa.free(got);
 
         var kb: [32]u8 = undefined;
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "te.cond.{d}", .{i}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "te.cond.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(want);
         try testing.expectEqual(want.len, got.len);
 

@@ -318,7 +318,7 @@ pub const AudioDecoder = struct {
         var n_stages: usize = 0;
         while (true) : (n_stages += 1) {
             var buf: [96]u8 = undefined;
-            const nm = std.fmt.bufPrint(&buf, "decoder.ups.{d}.0.weight", .{n_stages}) catch break;
+            const nm = std.mem.print(&buf, "decoder.ups.{d}.0.weight", .{n_stages}) catch break;
             if (store.get(nm) == null) break;
         }
         if (n_stages == 0) return error.MissingTensor;
@@ -326,7 +326,7 @@ pub const AudioDecoder = struct {
         var n_res: usize = 0;
         while (true) : (n_res += 1) {
             var buf: [96]u8 = undefined;
-            const nm = std.fmt.bufPrint(&buf, "decoder.resblocks.{d}.convs1.0.weight", .{n_res}) catch break;
+            const nm = std.mem.print(&buf, "decoder.resblocks.{d}.convs1.0.weight", .{n_res}) catch break;
             if (store.get(nm) == null) break;
         }
         if (n_res == 0 or n_res % n_stages != 0) return error.UnsupportedCheckpoint;
@@ -362,7 +362,7 @@ pub const AudioDecoder = struct {
             var n_conv: usize = 0;
             while (true) : (n_conv += 1) {
                 var buf: [96]u8 = undefined;
-                const nm = std.fmt.bufPrint(&buf, "decoder.resblocks.{d}.convs1.{d}.weight", .{ i, n_conv }) catch break;
+                const nm = std.mem.print(&buf, "decoder.resblocks.{d}.convs1.{d}.weight", .{ i, n_conv }) catch break;
                 if (store.get(nm) == null) break;
             }
             rb.convs1 = try alloc.alloc(Conv1d, n_conv);
@@ -436,7 +436,7 @@ const L = struct {
 
     fn tensor(l: L, comptime fmt: []const u8, args: anytype) !weights_mod.TensorView {
         var buf: [128]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         return l.store.get(nm) orelse {
             std.log.err("minimax_h3_audio: missing tensor {s}", .{nm});
             return error.MissingTensor;

@@ -1559,11 +1559,13 @@ pub inline fn convt1dCa(e: Env) void {
     const oc = i % out_ch;
     const P: i32 = @as(i32, @intCast(i / out_ch)) + @as(i32, @intFromFloat(e.f(0)));
     var acc = e.ld(.d, oc);
-    var j: u32 = @as(u32, @intCast(P)) % stride;
+    // `@bitCast`, not `@intCast`: the SPIR-V backend emits a signed-to-unsigned
+    // `@intCast` as no conversion at all, and a division's operands must match.
+    var j: u32 = @as(u32, @bitCast(P)) % stride;
     while (j < e.u(4)) : (j += stride) {
         const pj = P - @as(i32, @intCast(j));
         if (pj < 0) continue;
-        const sidx = @as(u32, @intCast(pj)) / stride;
+        const sidx = @as(u32, @bitCast(pj)) / stride;
         if (sidx >= e.u(3)) continue;
         var ic: u32 = 0;
         while (ic < in_ch) : (ic += 1) {

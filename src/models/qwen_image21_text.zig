@@ -95,14 +95,14 @@ test "the Qwen-Image 2.1 template tokenizes and strips exactly like ComfyUI" {
     defer prompts.deinit();
     for (prompts.value, 0..) |text, i| {
         var kb: [24]u8 = undefined;
-        const want = try refIds(gpa, &ref, try std.fmt.bufPrint(&kb, "tokens.{d}", .{i}));
+        const want = try refIds(gpa, &ref, try std.mem.print(&kb, "tokens.{d}", .{i}));
         defer gpa.free(want);
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(gpa);
         try buildIds(&tok, gpa, text, &got);
         errdefer std.debug.print("prompt {d}:\n want {any}\n got  {any}\n", .{ i, want, got.items });
         try std.testing.expectEqualSlices(u32, want, got.items);
-        const rows = (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{i}))).info.elemCount() / qwen3.Config.vl_8b.hidden;
+        const rows = (try ref.require(try std.mem.print(&kb, "cond.{d}", .{i}))).info.elemCount() / qwen3.Config.vl_8b.hidden;
         try std.testing.expectEqual(rows, got.items.len - stripOffset(got.items));
     }
 }
@@ -126,11 +126,11 @@ test "the Qwen-Image 2.1 text encoder matches ComfyUI on the real checkpoint" {
     const hidden = qwen3.Config.vl_8b.hidden;
     for (0..2) |i| {
         var kb: [24]u8 = undefined;
-        const ids = try refIds(gpa, &ref, try std.fmt.bufPrint(&kb, "tokens.{d}", .{i}));
+        const ids = try refIds(gpa, &ref, try std.mem.print(&kb, "tokens.{d}", .{i}));
         defer gpa.free(ids);
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(want);
-        const normed = try (try ref.require(try std.fmt.bufPrint(&kb, "cond_normed.{d}", .{i}))).toF32Alloc(gpa);
+        const normed = try (try ref.require(try std.mem.print(&kb, "cond_normed.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(normed);
         const full = try enc.encode(io, gpa, ids, null);
         defer gpa.free(full);

@@ -11,9 +11,7 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("av_helper.h");
-});
+const c = @import("c");
 
 pub const Error = error{ MuxOpenFailed, MuxWriteFailed, MuxFinishFailed };
 

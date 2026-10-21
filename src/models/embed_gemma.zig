@@ -114,7 +114,7 @@ pub const Model = struct {
 
         var pbuf: [1024]u8 = undefined;
 
-        var body_st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/model.safetensors", .{dir}));
+        var body_st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/model.safetensors", .{dir}));
         errdefer body_st.deinit();
         const store: WeightStore = .{ .safetensors = &body_st };
 
@@ -140,11 +140,11 @@ pub const Model = struct {
             };
         }
 
-        var dense1_st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/2_Dense/model.safetensors", .{dir}));
+        var dense1_st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/2_Dense/model.safetensors", .{dir}));
         errdefer dense1_st.deinit();
         const dense1 = try loader.matrix(.{ .safetensors = &dense1_st }, "linear.weight", proj_hidden, cfg.hidden);
 
-        var dense2_st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/3_Dense/model.safetensors", .{dir}));
+        var dense2_st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/3_Dense/model.safetensors", .{dir}));
         errdefer dense2_st.deinit();
         const dense2 = try loader.matrix(.{ .safetensors = &dense2_st }, "linear.weight", cfg.hidden, proj_hidden);
 

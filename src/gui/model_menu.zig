@@ -65,7 +65,7 @@ pub const Chip = struct {
 /// or a click elsewhere closes, and focus moving into a nested submenu is not a
 /// close. Tracking "open" by hand with the focused subwindow closed the whole
 /// menu the moment the pointer entered a group's file list.
-pub fn chip(src: std.builtin.SourceLocation, c: Chip, menu: Menu, id_extra: usize) ?Pick {
+pub fn chip(src: std.lang.SourceLocation, c: Chip, menu: Menu, id_extra: usize) ?Pick {
     var pick: ?Pick = null;
     var m = dvui.menu(src, .horizontal, .{
         .id_extra = id_extra,
@@ -80,11 +80,11 @@ pub fn chip(src: std.builtin.SourceLocation, c: Chip, menu: Menu, id_extra: usiz
     const text_color = if (c.warn) C.amber else if (c.empty) C.text_ghost else C.text_dim;
     var mi = dvui.menuItem(@src(), .{ .submenu = true, .focus_as_outline = true }, .{
         .background = true,
-        .color_fill = C.chip_hi,
-        .color_fill_hover = C.chip_hi.lighten(5),
+        .color_fill = .{ .color = C.chip_hi },
+        .color_fill_hover = .{ .color = C.chip_hi.lighten(5) },
         .border = style.Edge.all,
-        .color_border = style.hairline,
-        .corner_radius = style.R.button,
+        .color_border = .{ .color = style.hairline },
+        .corners = style.R.button,
         .padding = .{ .x = 9, .y = 6, .w = 6, .h = 6 },
         .gravity_y = 0.5,
     });
@@ -96,8 +96,8 @@ pub fn chip(src: std.builtin.SourceLocation, c: Chip, menu: Menu, id_extra: usiz
                 .min_size_content = .{ .w = 6, .h = 6 },
                 .max_size_content = .{ .w = 6, .h = 6 },
                 .background = true,
-                .color_fill = C.meter_gpu,
-                .corner_radius = dvui.Rect.all(3),
+                .color_fill = .{ .color = C.meter_gpu },
+                .corners = .round(3),
                 .margin = .{ .w = 6 },
                 .gravity_y = 0.5,
             });
@@ -105,14 +105,14 @@ pub fn chip(src: std.builtin.SourceLocation, c: Chip, menu: Menu, id_extra: usiz
         }
         dvui.labelNoFmt(@src(), c.label, .{}, .{
             .font = style.F.mono,
-            .color_text = text_color,
+            .color_text = .{ .color = text_color },
             .padding = .{},
             .gravity_y = 0.5,
         });
         if (c.note.len > 0) {
             dvui.labelNoFmt(@src(), c.note, .{}, .{
                 .font = style.F.ui_sm,
-                .color_text = C.text_faint,
+                .color_text = .{ .color = C.text_faint },
                 .padding = .{},
                 .margin = .{ .x = 6 },
                 .gravity_y = 0.5,
@@ -149,8 +149,8 @@ fn menuBody(menu: Menu) ?Pick {
             .id_extra = gi,
             .expand = .horizontal,
             .font = style.F.ui,
-            .color_text = if (g.greyed) C.text_ghost else C.text,
-            .corner_radius = style.R.chip,
+            .color_text = .{ .color = if (g.greyed) C.text_ghost else C.text },
+            .corners = style.R.chip,
         };
         if (dvui.menuItemLabel(@src(), g.label, .{ .submenu = true }, opts)) |r| {
             var fw = dvui.floatingMenu(@src(), .{ .from = r, .avoid = .horizontal }, .{});
@@ -164,7 +164,7 @@ fn menuBody(menu: Menu) ?Pick {
     if (menu.groups.len == 0 and menu.empty_note.len > 0) {
         dvui.labelNoFmt(@src(), menu.empty_note, .{}, .{
             .font = style.F.ui_sm,
-            .color_text = C.text_ghost,
+            .color_text = .{ .color = C.text_ghost },
             .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
         });
     }
@@ -182,18 +182,18 @@ fn menuBody(menu: Menu) ?Pick {
 /// because the press closed the menu chain before the release arrived. Measured
 /// by swapping the two on the same menu. A text layout built by hand skips
 /// `processEvents`, so it claims nothing and the row still picks.
-fn pickRow(src: std.builtin.SourceLocation, label: []const u8, selected: bool, greyed: bool, note: []const u8, id_extra: usize) bool {
+fn pickRow(src: std.lang.SourceLocation, label: []const u8, selected: bool, greyed: bool, note: []const u8, id_extra: usize) bool {
     var mi = dvui.menuItem(src, .{}, .{
         .id_extra = id_extra,
         .expand = .horizontal,
-        .corner_radius = style.R.chip,
+        .corners = style.R.chip,
     });
     defer mi.deinit();
     const color = if (greyed) C.text_ghost else if (selected) C.blue else C.text;
     const note_color = if (greyed) C.text_ghost else C.text_faint;
     fonts.richLineNote(@src(), label, note, note_color, mi.style().strip().override(.{
         .font = style.F.ui,
-        .color_text = color,
+        .color_text = .{ .color = color },
     }));
     return !greyed and mi.activeRect() != null;
 }

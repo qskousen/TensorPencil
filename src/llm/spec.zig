@@ -463,7 +463,7 @@ pub fn generateTree(
         const max_depth = @min(model.remaining() - 1, opts.max_new_tokens - n);
         const cap = if (max_depth == 0) 0 else n_max - 1;
         const m = if (cap == 0) 0 else drafter.proposeTree(ids.items, node_tokens[1 .. 1 + cap], node_parents[1 .. 1 + cap], max_depth);
-        if (std.debug.runtime_safety) validateTree(node_parents[0 .. 1 + m], max_depth);
+        if (comptime @import("builtin").mode.runtimeSafety()) validateTree(node_parents[0 .. 1 + m], max_depth);
         if (opts.spec_stats) |s| {
             s.drafted += m;
             s.forwards += 1;
@@ -1077,8 +1077,8 @@ test "spec sampling matches the vanilla distribution" {
     const trials = 400;
     const steps = 4;
     // Token histogram over all emitted positions, vanilla vs spec.
-    var hist_vanilla = [_]usize{0} ** 8;
-    var hist_spec = [_]usize{0} ** 8;
+    var hist_vanilla: [8]usize = @splat(0);
+    var hist_spec: [8]usize = @splat(0);
 
     for (0..trials) |seed| {
         const opts: engine.Options = .{

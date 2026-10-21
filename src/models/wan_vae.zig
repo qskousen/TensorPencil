@@ -225,7 +225,7 @@ pub const Decoder = struct {
                 idx += 1;
             }
             if (stage.up) {
-                const name = try std.fmt.allocPrint(alloc, "decoder.upsamples.{d}.resample.1", .{idx});
+                const name = try alloc.print("decoder.upsamples.{d}.resample.1", .{idx});
                 ups[idx] = .{ .up = try loadConvAs(.keep, alloc, store, name, stage.out, stage.out / 2, 3) };
                 idx += 1;
             }
@@ -277,22 +277,22 @@ pub const Decoder = struct {
         var c = c1[0];
         var stage: usize = 0;
         while (true) : (stage += 1) {
-            const base = try std.fmt.allocPrint(alloc, "decoder.upsamples.{d}.upsamples", .{stage});
+            const base = try alloc.print("decoder.upsamples.{d}.upsamples", .{stage});
             var n_res: usize = 0;
-            while (store.get(try std.fmt.allocPrint(alloc, "{s}.{d}.residual.2.weight", .{ base, n_res })) != null) n_res += 1;
+            while (store.get(try alloc.print("{s}.{d}.residual.2.weight", .{ base, n_res })) != null) n_res += 1;
             if (n_res == 0) break;
-            const rs = try std.fmt.allocPrint(alloc, "{s}.{d}.resample.1", .{ base, n_res });
-            const up = store.get(try std.fmt.allocPrint(alloc, "{s}.weight", .{rs})) != null;
+            const rs = try alloc.print("{s}.{d}.resample.1", .{ base, n_res });
+            const up = store.get(try alloc.print("{s}.weight", .{rs})) != null;
             const stage_in = c;
             if (up) try ups.append(alloc, .save);
             for (0..n_res) |j| {
-                const co = (store.get(try std.fmt.allocPrint(alloc, "{s}.{d}.residual.2.weight", .{ base, j })).?).info.shape.slice()[0];
+                const co = (store.get(try alloc.print("{s}.{d}.residual.2.weight", .{ base, j })).?).info.shape.slice()[0];
                 try ups.append(alloc, .{ .res = try loadRes(alloc, store, base, j, c, co) });
                 c = co;
             }
             if (up) {
                 try ups.append(alloc, .{ .up = try loadConvAs(.keep, alloc, store, rs, c, c, 3) });
-                const tc = try std.fmt.allocPrint(alloc, "{s}.{d}.time_conv.weight", .{ base, n_res });
+                const tc = try alloc.print("{s}.{d}.time_conv.weight", .{ base, n_res });
                 const d: DupUp = .{ .ci = stage_in, .co = c, .ft = if (store.get(tc) != null) 2 else 1 };
                 if ((d.co * d.ft * 4) % d.ci != 0) return error.ShapeMismatch;
                 try ups.append(alloc, .{ .dup_add = d });
@@ -696,8 +696,8 @@ pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: [
 /// `loadConv` with the weight kept in checkpoint order where every reader converts it
 /// (`quant_weight.convWeights`) under `.keep`.
 pub fn loadConvAs(form: Form, alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
-    const wname = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
-    const bname = try std.fmt.allocPrint(alloc, "{s}.bias", .{prefix});
+    const wname = try alloc.print("{s}.weight", .{prefix});
+    const bname = try alloc.print("{s}.bias", .{prefix});
     const wview = st.get(wname) orelse return error.MissingTensor;
 
     const shape = wview.info.shape.slice();
@@ -740,12 +740,12 @@ pub fn loadConvAs(form: Form, alloc: std.mem.Allocator, st: weights_mod.WeightSt
 }
 
 fn loadRes(alloc: std.mem.Allocator, st: weights_mod.WeightStore, base: []const u8, idx: usize, ci: usize, co: usize) !ResBlock {
-    const p = try std.fmt.allocPrint(alloc, "{s}.{d}", .{ base, idx });
-    const n1 = try std.fmt.allocPrint(alloc, "{s}.residual.0.gamma", .{p});
-    const c1 = try std.fmt.allocPrint(alloc, "{s}.residual.2", .{p});
-    const n2 = try std.fmt.allocPrint(alloc, "{s}.residual.3.gamma", .{p});
-    const c2 = try std.fmt.allocPrint(alloc, "{s}.residual.6", .{p});
-    const sc = try std.fmt.allocPrint(alloc, "{s}.shortcut", .{p});
+    const p = try alloc.print("{s}.{d}", .{ base, idx });
+    const n1 = try alloc.print("{s}.residual.0.gamma", .{p});
+    const c1 = try alloc.print("{s}.residual.2", .{p});
+    const n2 = try alloc.print("{s}.residual.3.gamma", .{p});
+    const c2 = try alloc.print("{s}.residual.6", .{p});
+    const sc = try alloc.print("{s}.shortcut", .{p});
     return .{
         .norm1 = try loadGamma(alloc, st, n1, ci),
         .conv1 = try loadConvAs(.keep, alloc, st, c1, ci, co, 3),
@@ -829,7 +829,7 @@ test "decode matches comfyui reference" {
 
 fn stageErr(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const f32, c: usize, n: usize) !f32 {
     var buf: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, "testdata/vae_stage_{s}.bin", .{name});
+    const path = try std.mem.print(&buf, "testdata/vae_stage_{s}.bin", .{name});
     const ref = try readF32File(gpa, io, path, c * n);
     defer gpa.free(ref);
     var max_err: f32 = 0;
@@ -897,7 +897,7 @@ test "decode stage parity" {
             .save, .dup_add => unreachable,
         }
         var namebuf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&namebuf, "up{d}", .{i});
+        const name = try std.mem.print(&namebuf, "up{d}", .{i});
         try checkStage(gpa, io, name, x, c, h * w);
     }
     gpa.free(x);

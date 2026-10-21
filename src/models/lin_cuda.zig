@@ -609,7 +609,7 @@ pub fn addBias(be: *Backend, y: Buf, m: usize, rows: usize, b: []const f32) !voi
 
 /// Rows `[row0, row0 + n)` of an f32 `[rows][width]` buffer.
 fn rowsOf(b: Buf, width: usize, row0: usize, n: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + row0 * width * 4), .mem = b.mem, .size = n * width * 4 };
+    return .{ .buf = @fromBackingInt(@intCast(@backingInt(b.buf) + row0 * width * 4)), .mem = b.mem, .size = n * width * 4 };
 }
 
 /// Hand the activation, widened to f32, to `ops.matmul.probe` (an activation capture),
@@ -912,9 +912,9 @@ test "the block-quant route policy sends each format to the GEMM that suits it" 
 test "a block quant whose shape misses the int8 decode floor takes the bf16 route" {
     // q4_k: 144 bytes per 256 elements. Z-Image's 3840-wide reduction is 15 groups of
     // 256, so the chunked decode (1024-wide chunks) cannot cover it; krea2's 6144 can.
-    const wide = [_]u8{0} ** (128 * 6144 / 256 * 144);
+    const wide: [(128 * 6144 / 256 * 144)]u8 = @splat(0);
     try std.testing.expectEqual(@as(?Route, .blockq_i8), routeOf(Weight.init(&wide, .q4_k, 128, 6144), .auto));
-    const narrow = [_]u8{0} ** (128 * 3840 / 256 * 144);
+    const narrow: [(128 * 3840 / 256 * 144)]u8 = @splat(0);
     try std.testing.expectEqual(@as(?Route, .blockq_bf16), routeOf(Weight.init(&narrow, .q4_k, 128, 3840), .auto));
     // The same shape under `mmq` is fine: the MMQ tile is 256 columns.
     try std.testing.expectEqual(@as(?Route, .blockq_mmq), routeOf(Weight.init(&narrow, .q4_k, 128, 3840), .mmq));
@@ -925,9 +925,9 @@ test "a block quant whose shape misses the int8 decode floor takes the bf16 rout
 }
 
 test "weight-only routes an integer convrot weight to its bf16 twin and nothing else" {
-    const bf = [_]u8{0} ** (128 * 256 * 2);
+    const bf: [(128 * 256 * 2)]u8 = @splat(0);
     var q = Weight.init(bf[0 .. 128 * 256], .i8, 128, 256);
-    q.row_scale = &([_]f32{1} ** 128);
+    q.row_scale = &@as([128]f32, @splat(1));
     q.convrot = 256;
     const dense = Weight.init(&bf, .bf16, 128, 256);
     var p = check(&.{ q, dense }, .{ .blockq = .auto }).ok;
@@ -1032,22 +1032,22 @@ test "the int4 row decode reads nibbles as the CPU does" {
 }
 
 test "check refuses what the kernels cannot pair and accepts the rest" {
-    const bf = [_]u8{0} ** (128 * 256 * 2);
+    const bf: [(128 * 256 * 2)]u8 = @splat(0);
     var lins = [_]Weight{ Weight.init(&bf, .bf16, 128, 256), Weight.init(bf[0 .. 128 * 256], .i8, 128, 256) };
-    lins[1].row_scale = &([_]f32{1} ** 128);
+    lins[1].row_scale = &@as([128]f32, @splat(1));
     // Plain int8 beside dense: fine, prep unrotated.
     try std.testing.expectEqual(false, check(&lins, .{ .blockq = .auto }).ok.rot);
     lins[1].convrot = 256;
     try std.testing.expectEqual(true, check(&lins, .{ .blockq = .auto }).ok.rot);
     // int4 without the rotation has no prep.
     var w4 = Weight.init(bf[0 .. 128 * 256 / 2], .i4, 128, 256);
-    w4.row_scale = &([_]f32{1} ** 128);
+    w4.row_scale = &@as([128]f32, @splat(1));
     try std.testing.expectEqual(Why.int4_unrotated, check(&.{w4}, .{ .blockq = .auto }).refused.why);
     w4.convrot = 256;
     try std.testing.expect(check(&.{w4}, .{ .blockq = .auto }) == .ok);
     // A width the int8 GEMM's launch geometry cannot take.
     var odd = Weight.init(bf[0 .. 120 * 256], .i8, 120, 256);
-    odd.row_scale = &([_]f32{1} ** 120);
+    odd.row_scale = &@as([120]f32, @splat(1));
     odd.tag = "blk.3.wq";
     const r = check(&.{odd}, .{ .blockq = .auto }).refused;
     try std.testing.expectEqual(Why.int_shape, r.why);
@@ -1056,7 +1056,7 @@ test "check refuses what the kernels cannot pair and accepts the rest" {
     try std.testing.expectEqual(Why.no_kernel, check(&.{Weight.init(bf[0 .. 128 * 256], .u8, 128, 256)}, .{ .blockq = .auto }).refused.why);
     // A rotated and an unrotated int8 linear in one model have no shared prep.
     var flat = Weight.init(bf[0 .. 128 * 256], .i8, 128, 256);
-    flat.row_scale = &([_]f32{1} ** 128);
+    flat.row_scale = &@as([128]f32, @splat(1));
     try std.testing.expectEqual(Why.mixed_convrot, check(&.{ lins[1], flat }, .{ .blockq = .auto }).refused.why);
 }
 

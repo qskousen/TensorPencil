@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
     // reads the scratch settings and caches its catalog index beside them
     // rather than in the user's config directory.
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "probe-{d}.sock", .{Io.Clock.real.now(io).toSeconds()});
+    const name = try std.mem.print(&name_buf, "probe-{d}.sock", .{Io.Clock.real.now(io).toSeconds()});
     const sock_path = socket orelse try link.localPath(arena, io, init.environ_map, name);
     const child_args = [_][]const u8{ "--config", path };
     var remote = if (socket != null)

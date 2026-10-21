@@ -107,7 +107,7 @@ Plans for the future:
 
 ## Running it
 
-Requires Zig 0.16.0 and a few system C libraries. `zig build` (the two CLIs) needs:
+Requires Zig 0.17.0 and a few system C libraries. `zig build` (the two CLIs) needs:
 
 - **libvips** — image decode for `tp-llm`'s `--image` / `@mentions`
 - **libavformat / libavcodec / libavutil / libswscale / libswresample** (ffmpeg) — clip
@@ -127,11 +127,6 @@ On Arch: `pacman -S pkgconf libvips ffmpeg` (plus `libx11 libxcursor libxi wayla
 GUI).
 
 ggml can be turned off with `-Dggml=false`, but then it won't be able to use gguf files at all.
-
-If your distro is new enough to ship gcc 16 / recent binutils (Arch, CachyOS), Zig 0.16's ELF
-linker cannot process the `.sframe` relocations in its crt startup objects and every
-libc-linked build fails. Run `tools/patch-crt.sh` once; the build picks up the patched crt
-automatically after that.
 
 Backends other than `cpu` require additional *runtime* libraries (DLOpen'd, you don't need them when compiling):
 

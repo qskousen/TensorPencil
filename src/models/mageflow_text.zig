@@ -329,7 +329,7 @@ test "the Mage-Flow template tokenizes exactly like ComfyUI's MageFlowTokenizer"
     const prompts = [_][]const u8{ "a red apple on a wooden table", "" };
     for (prompts, 0..) |text, i| {
         var kb: [32]u8 = undefined;
-        const v = try ref.require(try std.fmt.bufPrint(&kb, "tokens.{d}", .{i}));
+        const v = try ref.require(try std.mem.print(&kb, "tokens.{d}", .{i}));
         const want = std.mem.bytesAsSlice(i32, v.bytes);
 
         var ids: std.ArrayList(u32) = .empty;
@@ -464,7 +464,7 @@ test "the Mage-Flow-Edit turn matches ComfyUI: tower, splice, mrope and deepstac
 
         var kb: [32]u8 = undefined;
         for (enc.deepstack, 0..) |got, i| {
-            const w = try (try ref.require(try std.fmt.bufPrint(&kb, "edit.deepstack.{d}", .{i}))).toF32Alloc(gpa);
+            const w = try (try ref.require(try std.mem.print(&kb, "edit.deepstack.{d}", .{i}))).toF32Alloc(gpa);
             defer gpa.free(w);
             const r = relL2(w, got);
             errdefer std.debug.print("deepstack {d} rel L2 {e:.4}\n", .{ i, r });
@@ -556,9 +556,9 @@ test "Mage-Flow conditions on the NORMED final hidden state" {
         const row = enc.cfg.hidden;
         const got = full[off * row ..];
 
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(want);
-        const nonorm = try (try ref.require(try std.fmt.bufPrint(&kb, "cond_nonorm.{d}", .{i}))).toF32Alloc(gpa);
+        const nonorm = try (try ref.require(try std.mem.print(&kb, "cond_nonorm.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(nonorm);
         try testing.expectEqual(want.len, got.len);
 

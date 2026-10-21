@@ -193,7 +193,7 @@ pub const Config = struct {
         // export, at the top level (`visual.`).
         for ([_][]const u8{ "model.visual.", "visual." }) |at| {
             var buf: [160]u8 = undefined;
-            const name = std.fmt.bufPrint(&buf, "{s}{s}patch_embed.proj.weight", .{ container, at }) catch return false;
+            const name = std.mem.print(&buf, "{s}{s}patch_embed.proj.weight", .{ container, at }) catch return false;
             if (store.get(name) != null) return true;
         }
         return false;
@@ -204,7 +204,7 @@ pub const Config = struct {
     /// resolved once against the file rather than taken from the variant.
     pub fn resolvePrefix(self: Config, store: WeightStore) []const u8 {
         var buf: [96]u8 = undefined;
-        if (std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{self.prefix})) |name| {
+        if (std.mem.print(&buf, "{s}embed_tokens.weight", .{self.prefix})) |name| {
             if (store.get(name) != null) return self.prefix;
         } else |_| {}
         // The same rule `detect` and `model_spec.storeFits` apply: only the
@@ -225,7 +225,7 @@ pub const Config = struct {
             // on `model.`; the vision tower says which model it belongs to.
             for ([2][]const u8{ preset.prefix, "model." }) |pfx| {
                 var buf: [96]u8 = undefined;
-                const name = std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{pfx}) catch continue;
+                const name = std.mem.print(&buf, "{s}embed_tokens.weight", .{pfx}) catch continue;
                 const view = store.get(name) orelse continue;
                 const shape = view.info.shape.slice();
                 if (shape.len != 2 or shape[0] != vocab_size or shape[1] != preset.hidden) continue;
@@ -252,7 +252,7 @@ pub const Config = struct {
         var kbuf: [64]u8 = undefined;
         const key = struct {
             fn f(buf: []u8, pfx: []const u8, suffix: []const u8) []const u8 {
-                return std.fmt.bufPrint(buf, "{s}.{s}", .{ pfx, suffix }) catch unreachable;
+                return std.mem.print(buf, "{s}.{s}", .{ pfx, suffix }) catch unreachable;
             }
         }.f;
         if (g.getUint(key(&kbuf, p, "block_count"))) |block_count| {
@@ -568,7 +568,7 @@ pub const TextEncoder = struct {
         // `model.`; the rest of the file is spelled the same either way.
         cfg.prefix = cfg.resolvePrefix(store);
         var nbuf: [96]u8 = undefined;
-        const embed_name = try std.fmt.bufPrint(&nbuf, "{s}embed_tokens.weight", .{cfg.prefix});
+        const embed_name = try std.mem.print(&nbuf, "{s}embed_tokens.weight", .{cfg.prefix});
         const embed_view = try store.require(embed_name);
         if (embed_view.info.elemCount() != cfg.vocab * cfg.hidden) return error.ShapeMismatch;
         const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
@@ -581,7 +581,7 @@ pub const TextEncoder = struct {
         const layers = try loadLayersCfg(alloc, store, cfg, taps[taps.len - 1]);
 
         const final_norm: ?[]const f32 = if (variant.appliesFinalNorm())
-            try loadNormNamed(alloc, store, try std.fmt.bufPrint(&nbuf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden)
+            try loadNormNamed(alloc, store, try std.mem.print(&nbuf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden)
         else
             null;
 
@@ -786,14 +786,14 @@ pub const CausalLM = struct {
         const alloc = arena.allocator();
 
         var buf: [96]u8 = undefined;
-        const embed_view = try store.require(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
+        const embed_view = try store.require(try std.mem.print(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
         const eshape = embed_view.info.shape.slice();
         if (eshape.len != 2 or eshape[0] != cfg.vocab or eshape[1] != cfg.hidden)
             return error.ShapeMismatch;
         const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
 
         var head = embed;
-        if (store.get(try std.fmt.bufPrint(&buf, "{s}lm_head.weight", .{cfg.prefix}))) |hv| {
+        if (store.get(try std.mem.print(&buf, "{s}lm_head.weight", .{cfg.prefix}))) |hv| {
             const hshape = hv.info.shape.slice();
             if (hshape.len != 2 or hshape[0] != cfg.vocab or hshape[1] != cfg.hidden)
                 return error.ShapeMismatch;
@@ -801,7 +801,7 @@ pub const CausalLM = struct {
         }
 
         const layers = try loadLayersCfg(alloc, store, cfg, cfg.n_layers);
-        const final_norm = try loadNormNamed(alloc, store, try std.fmt.bufPrint(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
+        const final_norm = try loadNormNamed(alloc, store, try std.mem.print(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
 
         return .{ .arena = arena, .cfg = cfg, .embed = embed, .head = head, .layers = layers, .final_norm = final_norm };
     }
@@ -1072,7 +1072,7 @@ fn loadQK(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usiz
 
 fn loadNorm(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
     var buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
+    const name = try std.mem.print(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     return loadNormNamed(alloc, store, name, len);
 }
 
@@ -1084,13 +1084,13 @@ fn loadNormNamed(alloc: std.mem.Allocator, store: WeightStore, name: []const u8,
 
 fn loadWeight(store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
+    const name = try std.mem.print(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     return loadWeightNamed(null, store, name, rows, cols);
 }
 
 fn loadLayerWeight(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
+    const name = try std.mem.print(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     return loadWeightNamed(alloc, store, name, rows, cols);
 }
 
@@ -1112,7 +1112,7 @@ fn loadWeightNamed(alloc: ?std.mem.Allocator, store: WeightStore, name: []const 
 
     var scale_buf: [112]u8 = undefined;
     if (scale_buf.len < name.len + 6) return error.NameTooLong;
-    const scale_name = try std.fmt.bufPrint(&scale_buf, "{s}_scale", .{name});
+    const scale_name = try std.mem.print(&scale_buf, "{s}_scale", .{name});
 
     if (view.info.dtype == .i8 or view.info.dtype == .i4) {
         const a = alloc orelse return error.UnsupportedDType;
@@ -1184,8 +1184,8 @@ test "the deepstack injection spans are summed, not indexed by row" {
 test "each encoder variant's tap list is consistent with its own body" {
     // Every variant, enumerated from the enum rather than listed, so a new one
     // cannot be added without answering these questions.
-    inline for (@typeInfo(Variant).@"enum".fields) |f| {
-        const v: Variant = @enumFromInt(f.value);
+    inline for (@typeInfo(Variant).@"enum".field_values) |value| {
+        const v: Variant = @fromBackingInt(value);
         const cfg = v.config();
         const taps = v.taps();
         errdefer std.debug.print("variant {t}: n_layers={d} taps={any}\n", .{ v, cfg.n_layers, taps });
@@ -1324,7 +1324,7 @@ test "the H3 conditioning encoder matches the reference at a toy width" {
         defer for (ds[0..n_ds]) |d| gpa.free(d);
         while (n_ds < ds.len) {
             var nb: [48]u8 = undefined;
-            const dv = try st.require(try std.fmt.bufPrint(&nb, "in.deepstack.{d}", .{n_ds}));
+            const dv = try st.require(try std.mem.print(&nb, "in.deepstack.{d}", .{n_ds}));
             ds[n_ds] = try dv.toF32Alloc(gpa);
             n_ds += 1;
         }

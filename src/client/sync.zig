@@ -430,8 +430,8 @@ pub const Syncer = struct {
     }
 
     fn stemOf(path: []const u8) []const u8 {
-        const base = std.fs.path.basename(path);
-        return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const base = std.Io.Dir.path.basename(path);
+        return base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len];
     }
 };
 
@@ -445,7 +445,7 @@ test "a transfer to an unreachable host fails, keeps its row, and frees on the n
     var e: config.HostEntry = .{ .spawn = false };
     e.socket.set("127.0.0.1:1");
     e.cert.set("AA");
-    e.token.set(&[_]u8{'0'} ** 64);
+    e.token.set(&@as([64]u8, @splat('0')));
     try testing.expect(e.remote());
 
     try s.start("far", e, "/nonexistent/model.safetensors");
@@ -475,7 +475,7 @@ test "a transfer waiting to retry an unreachable host is cancelled at once" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
     _ = try blob.writeTestModel(io, tmp.dir, "m.safetensors", 4096, 1);
-    const path = try std.fs.path.join(gpa, &.{ root, "m.safetensors" });
+    const path = try std.Io.Dir.path.join(gpa, &.{ root, "m.safetensors" });
     defer gpa.free(path);
 
     var s = Syncer.init(gpa, io);
@@ -483,7 +483,7 @@ test "a transfer waiting to retry an unreachable host is cancelled at once" {
     var e: config.HostEntry = .{ .spawn = false };
     e.socket.set("127.0.0.1:1");
     e.cert.set("AA");
-    e.token.set(&[_]u8{'0'} ** 64);
+    e.token.set(&@as([64]u8, @splat('0')));
     try s.start("far", e, path);
     const j = s.forHost("far").?;
     // Left alone the job would sit in its 1, 2, 4, 8 s backoff for 15 s.
@@ -508,9 +508,9 @@ test "a second file for a busy host waits its turn, and is not missing there mea
     defer gpa.free(root);
     _ = try blob.writeTestModel(io, tmp.dir, "a.safetensors", 4096, 1);
     _ = try blob.writeTestModel(io, tmp.dir, "b.safetensors", 4096, 2);
-    const pa = try std.fs.path.join(gpa, &.{ root, "a.safetensors" });
+    const pa = try std.Io.Dir.path.join(gpa, &.{ root, "a.safetensors" });
     defer gpa.free(pa);
-    const pb = try std.fs.path.join(gpa, &.{ root, "b.safetensors" });
+    const pb = try std.Io.Dir.path.join(gpa, &.{ root, "b.safetensors" });
     defer gpa.free(pb);
 
     var s = Syncer.init(gpa, io);
@@ -519,7 +519,7 @@ test "a second file for a busy host waits its turn, and is not missing there mea
     var e: config.HostEntry = .{ .spawn = false };
     e.socket.set("127.0.0.1:1");
     e.cert.set("AA");
-    e.token.set(&[_]u8{'0'} ** 64);
+    e.token.set(&@as([64]u8, @splat('0')));
     try s.start("far", e, pa);
     try s.start("far", e, pb);
     try s.start("far", e, pb);

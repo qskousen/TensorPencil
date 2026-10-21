@@ -173,14 +173,25 @@ pub const F = struct {
 // ---------------------------------------------------------------- geometry
 
 pub const R = struct {
-    pub const chip = dvui.Rect.all(5);
-    pub const button = dvui.Rect.all(6);
-    pub const panel = dvui.Rect.all(7); // queue rows, New chat
-    pub const seg = dvui.Rect.all(8); // segmented-toggle well
-    pub const card = dvui.Rect.all(9);
-    pub const input = dvui.Rect.all(10);
-    pub const track = dvui.Rect.all(2); // vram bar, sparkline well
-    pub const none = dvui.Rect.all(0);
+    pub const chip: dvui.CornerRect = .round(5);
+    pub const button: dvui.CornerRect = .round(6);
+    pub const panel: dvui.CornerRect = .round(7); // queue rows, New chat
+    pub const seg: dvui.CornerRect = .round(8); // segmented-toggle well
+    pub const card: dvui.CornerRect = .round(9);
+    pub const input: dvui.CornerRect = .round(10);
+    pub const track: dvui.CornerRect = .round(2); // vram bar, sparkline well
+    pub const none: dvui.CornerRect = .square;
+    /// A user bubble: its tail corner is the bottom-right one.
+    pub const bubble_user: dvui.CornerRect = .{ .tl = .round(10), .tr = .round(10), .br = .round(3), .bl = .round(10) };
+    /// A tab attached along its left edge.
+    pub const tab_right: dvui.CornerRect = .{ .tl = .square, .tr = .round(6), .br = .round(6), .bl = .square };
+    /// A drawer hanging from the edge above it.
+    pub const drawer: dvui.CornerRect = .{ .tl = .square, .tr = .square, .br = .round(5), .bl = .round(5) };
+
+    /// Fully rounded ends for a widget `h` tall.
+    pub fn pill(h: f32) dvui.CornerRect {
+        return .round(h / 2);
+    }
 };
 
 /// Fixed band sizes. The chat column is what flexes.
@@ -229,7 +240,6 @@ pub fn theme() dvui.Theme {
         .font_heading = role(fonts.sans, 12.5, 1.4, .bold),
         .font_title = role(fonts.sans, 15, 1.3, .bold),
         .font_mono = F.mono,
-        .max_default_corner_radius = 8,
         .control = .{
             .fill = C.raised,
             .fill_hover = C.raised.lighten(6),
@@ -324,10 +334,10 @@ pub const Mark = enum {
 };
 
 /// Draw a mark inline at `size` logical px in `color`.
-pub fn mark(src: std.builtin.SourceLocation, m: Mark, size: f32, color: Color, opts: dvui.Options) void {
+pub fn mark(src: std.lang.SourceLocation, m: Mark, size: f32, color: Color, opts: dvui.Options) void {
     var o = opts;
     o.min_size_content = .{ .w = size, .h = size };
-    o.color_text = color;
+    o.color_text = .{ .color = color };
     if (o.gravity_y == null) o.gravity_y = 0.5;
     dvui.icon(src, @tagName(m), m.tvg(), .{}, o);
 }
@@ -354,24 +364,24 @@ pub const ChipOpts = struct {
 /// A small bordered pill: model names in the title bar, quick settings in the
 /// composer. Returns true when clicked (only meaningful for `dropdown` chips,
 /// but a plain chip reports it too so a caller can make one interactive).
-pub fn chip(src: std.builtin.SourceLocation, text: []const u8, o: ChipOpts) bool {
+pub fn chip(src: std.lang.SourceLocation, text: []const u8, o: ChipOpts) bool {
     var wd: dvui.WidgetData = undefined;
     return chipEx(src, text, o, &wd);
 }
 
 /// `chip` that also reports its `WidgetData`, so a caller can anchor a floating
 /// menu to the chip's own rect.
-pub fn chipEx(src: std.builtin.SourceLocation, text: []const u8, o: ChipOpts, out: *dvui.WidgetData) bool {
+pub fn chipEx(src: std.lang.SourceLocation, text: []const u8, o: ChipOpts, out: *dvui.WidgetData) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .id_extra = o.id_extra,
         .background = true,
-        .color_fill = o.fill,
-        .color_fill_hover = o.fill.lighten(5),
-        .color_fill_press = o.fill.lighten(10),
+        .color_fill = .{ .color = o.fill },
+        .color_fill_hover = .{ .color = o.fill.lighten(5) },
+        .color_fill_press = .{ .color = o.fill.lighten(10) },
         .border = Edge.all,
-        .color_border = o.border,
-        .corner_radius = R.button,
+        .color_border = .{ .color = o.border },
+        .corners = R.button,
         .padding = .{ .x = 9, .y = 6, .w = if (o.dropdown) 6 else 9, .h = 6 },
         .margin = .{ .x = o.margin_x },
         .gravity_y = 0.5,
@@ -383,7 +393,7 @@ pub fn chipEx(src: std.builtin.SourceLocation, text: []const u8, o: ChipOpts, ou
         defer row.deinit();
         dvui.labelNoFmt(@src(), text, .{}, .{
             .font = o.font,
-            .color_text = o.text,
+            .color_text = .{ .color = o.text },
             .padding = .{},
             .gravity_y = 0.5,
         });
@@ -404,7 +414,7 @@ pub fn chipEx(src: std.builtin.SourceLocation, text: []const u8, o: ChipOpts, ou
 /// composer at the foot of the window, where downward means most of the list is
 /// off-screen and the control reads as broken. `.avoid = .vertical` flips it
 /// above when there is no room below.
-pub fn chipDropdown(src: std.builtin.SourceLocation, entries: []const []const u8, choice: *usize, o: ChipOpts) bool {
+pub fn chipDropdown(src: std.lang.SourceLocation, entries: []const []const u8, choice: *usize, o: ChipOpts) bool {
     var changed = false;
     var wrap = dvui.box(src, .{ .dir = .horizontal }, .{ .id_extra = o.id_extra });
     defer wrap.deinit();
@@ -430,7 +440,7 @@ pub fn chipDropdown(src: std.builtin.SourceLocation, entries: []const []const u8
                 .id_extra = i,
                 .expand = .horizontal,
                 .font = o.font,
-                .corner_radius = R.chip,
+                .corners = R.chip,
             }) != null) {
                 choice.* = i;
                 changed = true;
@@ -465,7 +475,7 @@ pub const InputResult = struct {
 /// A chip-shaped text field with a dimmed, non-editable suffix ("1.8 MP").
 /// Same skin as `chip`, so a typed value and a picked one read as the same
 /// kind of control.
-pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8, width: f32, o: ChipOpts) InputResult {
+pub fn chipInput(src: std.lang.SourceLocation, buf: []u8, suffix: []const u8, width: f32, o: ChipOpts) InputResult {
     var res: InputResult = .{};
     // Focus is shown on the CHIP's edge, not the entry's. Whether the entry had
     // focus is known from last frame, which is enough: the ring is decoration,
@@ -474,10 +484,10 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
     var box = dvui.box(src, .{ .dir = .horizontal }, .{
         .id_extra = o.id_extra,
         .background = true,
-        .color_fill = o.fill,
+        .color_fill = .{ .color = o.fill },
         .border = Edge.all,
-        .color_border = if (was_focused) C.blue else o.border,
-        .corner_radius = R.button,
+        .color_border = .{ .color = if (was_focused) C.blue else o.border },
+        .corners = R.button,
         .padding = .{ .x = 9, .y = 5, .w = 9, .h = 5 },
         .margin = .{ .x = o.margin_x },
         .gravity_y = 0.5,
@@ -499,7 +509,7 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
         .min_size_content = .{ .w = width, .h = o.font.lineHeight() },
         .max_size_content = .width(width),
         .font = o.font,
-        .color_text = o.text_input orelse C.text_hi,
+        .color_text = .{ .color = o.text_input orelse C.text_hi },
         .gravity_y = 0.5,
         .theme = noFocusTheme(),
     });
@@ -534,7 +544,7 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
 
     dvui.labelNoFmt(@src(), suffix, .{}, .{
         .font = o.font,
-        .color_text = o.text,
+        .color_text = .{ .color = o.text },
         .padding = .{},
         .margin = .{ .x = 4 },
         .gravity_y = 0.5,
@@ -544,14 +554,14 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
 
 /// The Chat|Studio well: a sunken track with one lit segment. `active` is an
 /// index into `labels`; returns the index the user picked, or null.
-pub fn segmented(src: std.builtin.SourceLocation, labels: []const []const u8, active: usize) ?usize {
+pub fn segmented(src: std.lang.SourceLocation, labels: []const []const u8, active: usize) ?usize {
     var picked: ?usize = null;
     var well = dvui.box(src, .{ .dir = .horizontal }, .{
         .background = true,
-        .color_fill = C.seg_track,
+        .color_fill = .{ .color = C.seg_track },
         .border = Edge.all,
-        .color_border = hairline,
-        .corner_radius = R.seg,
+        .color_border = .{ .color = hairline },
+        .corners = R.seg,
         .padding = dvui.Rect.all(2),
         .gravity_y = 0.5,
     });
@@ -563,10 +573,10 @@ pub fn segmented(src: std.builtin.SourceLocation, labels: []const []const u8, ac
         bw.init(@src(), .{}, .{
             .id_extra = i,
             .background = on,
-            .color_fill = C.text_hi,
-            .color_fill_hover = if (on) C.text_hi else hover_wash,
-            .color_fill_press = if (on) C.text_hi else hover_wash,
-            .corner_radius = R.button,
+            .color_fill = .{ .color = C.text_hi },
+            .color_fill_hover = .{ .color = if (on) C.text_hi else hover_wash },
+            .color_fill_press = .{ .color = if (on) C.text_hi else hover_wash },
+            .corners = R.button,
             .padding = .{ .x = 12, .y = 6, .w = 12, .h = 6 },
             .margin = if (i == 0) .{} else .{ .x = 2 },
         });
@@ -574,7 +584,7 @@ pub fn segmented(src: std.builtin.SourceLocation, labels: []const []const u8, ac
         bw.drawBackground();
         dvui.labelNoFmt(@src(), lbl, .{}, .{
             .font = F.ui,
-            .color_text = if (on) C.text_ink else C.text_dim,
+            .color_text = .{ .color = if (on) C.text_ink else C.text_dim },
             .padding = .{},
             .gravity_x = 0.5,
             .gravity_y = 0.5,
@@ -615,10 +625,10 @@ pub fn ellipsize(buf: []u8, text: []const u8, font: dvui.Font, max_w: f32) []con
 }
 
 /// An uppercase mono section head (TODAY, RECENT).
-pub fn sectionHead(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Options) void {
+pub fn sectionHead(src: std.lang.SourceLocation, text: []const u8, opts: dvui.Options) void {
     var o = opts;
     o.font = F.mono_hd;
-    o.color_text = C.text_ghost;
+    o.color_text = .{ .color = C.text_ghost };
     if (o.padding == null) o.padding = .{ .x = 8, .h = 7 };
     dvui.labelNoFmt(src, text, .{}, o);
 }
@@ -646,7 +656,7 @@ pub const Collapsible = struct {
     }
 };
 
-pub fn collapsibleBegin(src: std.builtin.SourceLocation, title: []const u8, flag: *bool, o: CollapsibleOpts) Collapsible {
+pub fn collapsibleBegin(src: std.lang.SourceLocation, title: []const u8, flag: *bool, o: CollapsibleOpts) Collapsible {
     const outer = dvui.box(src, .{ .dir = .vertical }, .{
         .id_extra = o.id_extra,
         .expand = .horizontal,
@@ -657,9 +667,9 @@ pub fn collapsibleBegin(src: std.builtin.SourceLocation, title: []const u8, flag
     hdr.init(@src(), .{}, .{
         .expand = .horizontal,
         .background = false,
-        .color_fill_hover = hover_wash,
-        .color_fill_press = hover_wash,
-        .corner_radius = R.chip,
+        .color_fill_hover = .{ .color = hover_wash },
+        .color_fill_press = .{ .color = hover_wash },
+        .corners = R.chip,
         .padding = .{ .x = 6, .y = 6, .w = 6, .h = 6 },
         .margin = .{},
     });
@@ -671,13 +681,13 @@ pub fn collapsibleBegin(src: std.builtin.SourceLocation, title: []const u8, flag
         mark(@src(), if (flag.*) .disclosure_open else .disclosure, 9, C.text_dim, .{ .margin = .{ .w = 6 } });
         dvui.labelNoFmt(@src(), title, .{}, .{
             .font = F.mono_hd,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
             .padding = .{},
             .gravity_y = 0.5,
         });
         if (!flag.* and o.summary.len > 0) dvui.labelNoFmt(@src(), o.summary, .{}, .{
             .font = F.mono,
-            .color_text = C.text_faint,
+            .color_text = .{ .color = C.text_faint },
             .padding = .{},
             .gravity_x = 1.0,
             .gravity_y = 0.5,
@@ -705,12 +715,12 @@ pub fn collapsibleEnd(c: *Collapsible) void {
 
 /// A vertical hairline the height of its parent's content, for splitting groups
 /// inside a bar.
-pub fn vsep(src: std.builtin.SourceLocation) void {
+pub fn vsep(src: std.lang.SourceLocation) void {
     var b = dvui.box(src, .{ .dir = .vertical }, .{
         .expand = .vertical,
         .min_size_content = .{ .w = 1 },
         .background = true,
-        .color_fill = hairline,
+        .color_fill = .{ .color = hairline },
         .margin = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
     });
     b.deinit();
@@ -721,7 +731,7 @@ pub fn vsep(src: std.builtin.SourceLocation) void {
 /// texture so it stays correct at any DPI and needs no startup asset.
 pub fn hatch(r: dvui.Rect.Physical, fg: Color, bg: Color, period: f32) void {
     if (r.w <= 0 or r.h <= 0) return;
-    r.fill(.{}, .{ .color = bg });
+    r.fill(.{}, .{ .color = .{ .color = bg } });
 
     const prev = dvui.clip(r);
     defer dvui.clipSet(prev);
@@ -739,20 +749,20 @@ pub fn hatch(r: dvui.Rect.Physical, fg: Color, bg: Color, period: f32) void {
         pb.addPoint(.{ .x = x + r.h, .y = r.y });
         pb.addPoint(.{ .x = x + r.h + w, .y = r.y });
         pb.addPoint(.{ .x = x + w, .y = r.y + r.h });
-        pb.build().fillConvex(.{ .color = fg });
+        pb.build().fillConvex(.{ .color = .{ .color = fg } });
     }
 }
 
 /// A rolling bar chart. `values` are 0..1, oldest first; drawn bottom-aligned
 /// inside a sunken well. One manual pass, because 26 widgets per meter × 3
 /// meters × 60 fps is a lot of layout for a graph.
-pub fn sparkline(src: std.builtin.SourceLocation, values: []const f32, color: Color, h: f32) void {
+pub fn sparkline(src: std.lang.SourceLocation, values: []const f32, color: Color, h: f32) void {
     var well = dvui.box(src, .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .min_size_content = .{ .h = h },
         .background = true,
-        .color_fill = C.spark_bg,
-        .corner_radius = R.track,
+        .color_fill = .{ .color = C.spark_bg },
+        .corners = R.track,
         .padding = dvui.Rect.all(2),
     });
     defer well.deinit();
@@ -772,14 +782,14 @@ pub fn sparkline(src: std.builtin.SourceLocation, values: []const f32, color: Co
             .w = bw,
             .h = bh,
         };
-        bar.fill(.{}, .{ .color = color });
+        bar.fill(.{}, .{ .color = .{ .color = color } });
     }
 }
 
 /// One 86px telemetry meter: a label/value header over a sparkline well. The
 /// number and the history ARE the meter — no clock speeds, no `x / y GB`, no
 /// second progress bar. `values` are 0..1, oldest first.
-pub fn historyMeter(src: std.builtin.SourceLocation, id: usize, label: []const u8, value: f32, values: []const f32, color: Color) void {
+pub fn historyMeter(src: std.lang.SourceLocation, id: usize, label: []const u8, value: f32, values: []const f32, color: Color) void {
     var b = dvui.box(src, .{ .dir = .vertical }, .{
         .id_extra = id,
         .min_size_content = .{ .w = 86 },
@@ -794,14 +804,14 @@ pub fn historyMeter(src: std.builtin.SourceLocation, id: usize, label: []const u
         defer hdr.deinit();
         dvui.labelNoFmt(@src(), label, .{}, .{
             .font = F.mono_legend,
-            .color_text = C.text_faint,
+            .color_text = .{ .color = C.text_faint },
             .padding = .{},
             .gravity_y = 0.5,
         });
         var buf: [8]u8 = undefined;
-        dvui.labelNoFmt(@src(), std.fmt.bufPrint(&buf, "{d:.0}%", .{value * 100}) catch "", .{}, .{
+        dvui.labelNoFmt(@src(), std.mem.print(&buf, "{d:.0}%", .{value * 100}) catch "", .{}, .{
             .font = F.mono_val,
-            .color_text = color,
+            .color_text = .{ .color = color },
             .padding = .{},
             .gravity_x = 1.0,
             .gravity_y = 0.5,
@@ -813,14 +823,14 @@ pub fn historyMeter(src: std.builtin.SourceLocation, id: usize, label: []const u
 /// The app's one progress bar: a sunken track with an AMBER fill, because a
 /// running job is the machine working. Drawn by hand rather than through
 /// `dvui.progress`, whose fill colour is the theme's and would be blue.
-pub fn progressTrack(src: std.builtin.SourceLocation, frac: f32, h: f32) void {
+pub fn progressTrack(src: std.lang.SourceLocation, frac: f32, h: f32) void {
     var t = dvui.box(src, .{}, .{
         .expand = .horizontal,
         .min_size_content = .{ .h = h },
         .max_size_content = .height(h),
         .background = true,
-        .color_fill = C.meter_track,
-        .corner_radius = dvui.Rect.all(h / 2),
+        .color_fill = .{ .color = C.meter_track },
+        .corners = R.pill(h),
         .margin = .{ .y = 4 },
     });
     defer t.deinit();
@@ -832,16 +842,16 @@ pub fn progressTrack(src: std.builtin.SourceLocation, frac: f32, h: f32) void {
         .w = r.w * std.math.clamp(frac, 0, 1),
         .h = r.h,
     };
-    fill.fill(.{}, .{ .color = C.amber });
+    fill.fill(.{}, .{ .color = .{ .color = C.amber } });
 }
 
 /// A 6×6 legend swatch.
-pub fn swatch(src: std.builtin.SourceLocation, color: Color) void {
+pub fn swatch(src: std.lang.SourceLocation, color: Color) void {
     var b = dvui.box(src, .{}, .{
         .min_size_content = .{ .w = 6, .h = 6 },
         .background = true,
-        .color_fill = color,
-        .corner_radius = dvui.Rect.all(1),
+        .color_fill = .{ .color = color },
+        .corners = .round(1),
         .gravity_y = 0.5,
         .margin = .{ .w = 5 },
     });

@@ -125,7 +125,7 @@ pub const SafeTensors = struct {
     header_only: bool = false,
     /// Tensor name -> info, in header order. Names point into the header
     /// bytes (or the arena), valid until deinit.
-    index: std.StringArrayHashMapUnmanaged(TensorInfo),
+    index: std.array_hash_map.String(TensorInfo),
     /// Optional __metadata__ string map from the header.
     metadata: ?std.json.ObjectMap,
     arena: std.heap.ArenaAllocator,
@@ -226,7 +226,7 @@ pub const SafeTensors = struct {
             return error.InvalidHeader;
         if (root != .object) return error.InvalidHeader;
 
-        var index: std.StringArrayHashMapUnmanaged(TensorInfo) = .empty;
+        var index: std.array_hash_map.String(TensorInfo) = .empty;
         var metadata: ?std.json.ObjectMap = null;
         // High-water mark of the declared tensor ranges, checked against the payload
         // length below.
@@ -381,7 +381,7 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
     if (bytes.len != dt.storageBytes(out.len)) return error.LengthMismatch;
     switch (dt) {
         .f32 => {
-            if (comptime builtin.cpu.arch.endian() == .little) {
+            if (comptime builtin.target.cpu.arch.endian() == .little) {
                 @memcpy(std.mem.sliceAsBytes(out), bytes);
             } else {
                 for (out, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
@@ -477,7 +477,7 @@ test "reject malformed files" {
         const header =
             \\{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}
         ;
-        const bytes = try buildTestFile(gpa, header, &[_]u8{0} ** 4);
+        const bytes = try buildTestFile(gpa, header, &@as([4]u8, @splat(0)));
         defer gpa.free(bytes);
         try std.testing.expectError(error.InvalidOffsets, SafeTensors.initFromSlice(gpa, bytes));
     }
@@ -487,7 +487,7 @@ test "reject malformed files" {
         const header =
             \\{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}
         ;
-        const bytes = try buildTestFile(gpa, header, &[_]u8{0} ** 4);
+        const bytes = try buildTestFile(gpa, header, &@as([4]u8, @splat(0)));
         defer gpa.free(bytes);
         try std.testing.expectError(error.InvalidOffsets, SafeTensors.initFromSlice(gpa, bytes));
     }
@@ -497,7 +497,7 @@ test "reject malformed files" {
         const header =
             \\{"t":{"dtype":"Q4_K","shape":[2],"data_offsets":[0,8]}}
         ;
-        const bytes = try buildTestFile(gpa, header, &[_]u8{0} ** 8);
+        const bytes = try buildTestFile(gpa, header, &@as([8]u8, @splat(0)));
         defer gpa.free(bytes);
         try std.testing.expectError(error.UnknownDType, SafeTensors.initFromSlice(gpa, bytes));
     }
@@ -507,7 +507,7 @@ test "reject malformed files" {
         const header =
             \\{"t":{"dtype":"F32","shape":[-2],"data_offsets":[0,8]}}
         ;
-        const bytes = try buildTestFile(gpa, header, &[_]u8{0} ** 8);
+        const bytes = try buildTestFile(gpa, header, &@as([8]u8, @splat(0)));
         defer gpa.free(bytes);
         try std.testing.expectError(error.InvalidShape, SafeTensors.initFromSlice(gpa, bytes));
     }
@@ -556,7 +556,7 @@ test "openHeader reads the table and metadata, and no bytes" {
         \\{"__metadata__":{"format":"pt"},
         \\ "w":{"dtype":"BF16","shape":[2,3],"data_offsets":[0,12]}}
     ;
-    const payload = [_]u8{0xaa} ** 12;
+    const payload: [12]u8 = @splat(0xaa);
     const bytes = try buildTestFile(gpa, header, &payload);
     defer gpa.free(bytes);
     try tmp.dir.writeFile(io, .{ .sub_path = "h.safetensors", .data = bytes });

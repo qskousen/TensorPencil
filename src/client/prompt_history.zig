@@ -30,7 +30,7 @@ pub const file_name = "prompts.tpp";
 
 /// A library longer than this is refused rather than read. A real one is
 /// kilobytes; anything at this scale is the wrong file.
-pub const max_file_bytes: std.Io.Limit = @enumFromInt(8 << 20);
+pub const max_file_bytes: std.Io.Limit = @fromBackingInt(@intCast(8 << 20));
 
 /// Oldest entries past this are dropped on save, so the file cannot grow without
 /// bound on a machine that has been generating for a year.
@@ -75,7 +75,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError![]Entry {
     const line = struct {
         fn next(b: []const u8, p: *usize) ParseError![]const u8 {
             if (p.* >= b.len) return error.Truncated;
-            const nl = std.mem.indexOfScalarPos(u8, b, p.*, '\n') orelse return error.Truncated;
+            const nl = std.mem.findScalarPos(u8, b, p.*, '\n') orelse return error.Truncated;
             const out = b[p.*..nl];
             p.* = nl + 1;
             return out;
@@ -155,7 +155,7 @@ pub const Store = struct {
             std.log.warn("prompts: cannot create {s}: {t} — prompts will not be saved", .{ dir, err });
             return;
         };
-        self.path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, file_name }) catch return;
+        self.path = gpa.print("{s}/{s}", .{ dir, file_name }) catch return;
         self.rescan(gpa, io);
     }
 
@@ -359,7 +359,7 @@ test "the library is capped, dropping the oldest" {
     defer s.deinit(gpa);
     var buf: [32]u8 = undefined;
     for (0..max_entries + 10) |i| {
-        const p = try std.fmt.bufPrint(&buf, "prompt {d}", .{i});
+        const p = try std.mem.print(&buf, "prompt {d}", .{i});
         _ = s.record(gpa, undefined, @intCast(i + 1), p, "");
     }
     try std.testing.expectEqual(max_entries, s.entries.items.len);

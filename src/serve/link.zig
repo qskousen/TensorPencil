@@ -17,6 +17,7 @@
 //! certificate store when the pinned bundle lacks the presented issuer, which
 //! lets any OS-trusted certificate past the pin, and the token with it.
 const std = @import("std");
+const repeat = @import("tp_core").strings.repeat;
 const builtin = @import("builtin");
 const Io = std.Io;
 const x509 = @import("x509.zig");
@@ -185,7 +186,7 @@ pub const HostPort = struct { host: []const u8, port: u16 };
 
 /// `host:port`, with an IPv6 literal in brackets (`[::1]:7777`).
 pub fn splitHostPort(text: []const u8) ?HostPort {
-    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, text, ':') orelse return null;
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return null;
     var host = text[0..colon];
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
@@ -248,7 +249,7 @@ pub const Endpoint = union(enum) {
                 .unix => |p| try w.print("unix {s}", .{p}),
                 .loopback => |l| try w.print("loopback {d}", .{l.port}),
                 .tls => |t| {
-                    const v6 = std.mem.indexOfScalar(u8, t.host, ':') != null;
+                    const v6 = std.mem.findScalar(u8, t.host, ':') != null;
                     try w.print("tp://{s}{s}{s}:{d}", .{ if (v6) "[" else "", t.host, if (v6) "]" else "", t.port });
                 },
                 .tcp => |port| try w.print("tcp {d}", .{port}),
@@ -270,9 +271,9 @@ pub const Endpoint = union(enum) {
         }
         if (std.mem.startsWith(u8, t, "tp://")) {
             const rest = t[5..];
-            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+            const slash = std.mem.findScalar(u8, rest, '/') orelse return null;
             const hp = splitHostPort(rest[0..slash]) orelse return null;
-            const hash = std.mem.indexOfScalar(u8, rest, '#') orelse return null;
+            const hash = std.mem.findScalar(u8, rest, '#') orelse return null;
             if (hash <= slash + 1) return null;
             const token = parseSecretHex(rest[hash + 1 ..]) orelse return null;
             return .{ .tls = .{ .host = hp.host, .port = hp.port, .cert_b64 = rest[slash + 1 .. hash], .token = token } };
@@ -442,16 +443,16 @@ pub fn localPath(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ
     const user = env.get("USER") orelse env.get("USERNAME") orelse "tp";
     // The native separator: Windows hands a unix socket's path to its socket driver
     // as is, and that driver takes no '/'.
-    const sep = std.fs.path.sep_str;
-    const dir = try std.fmt.allocPrint(gpa, "{s}" ++ sep ++ "tensorpencil-{s}", .{ base, user });
+    const sep = std.Io.Dir.path.sep_str;
+    const dir = try gpa.print("{s}" ++ sep ++ "tensorpencil-{s}", .{ base, user });
     defer gpa.free(dir);
-    const perms: Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
+    const perms: Io.Dir.Permissions = if (builtin.target.os.tag == .windows) .default_dir else .fromMode(0o700);
     _ = try Io.Dir.cwd().createDirPathStatus(io, dir, perms);
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         const st = try Io.Dir.cwd().statFile(io, dir, .{});
         if (st.kind != .directory or st.permissions.toMode() & 0o077 != 0) return error.UnsafeSocketDir;
     }
-    return std.fmt.allocPrint(gpa, "{s}" ++ sep ++ "{s}", .{ dir, name });
+    return gpa.print("{s}" ++ sep ++ "{s}", .{ dir, name });
 }
 
 test "an endpoint's text form parses back" {
@@ -461,7 +462,7 @@ test "an endpoint's text form parses back" {
     try std.testing.expectEqualStrings("/run/x.sock", Endpoint.parse(w.buffered()).?.unix);
     var buf2: [128]u8 = undefined;
     var w2: Io.Writer = .fixed(&buf2);
-    const cookie: Secret = .{7} ** 32;
+    const cookie: Secret = @splat(7);
     try w2.print("{f}", .{Endpoint{ .loopback = .{ .port = 4321, .cookie = cookie } }});
     const lb = Endpoint.parse(w2.buffered()).?.loopback;
     try std.testing.expectEqual(@as(u16, 4321), lb.port);
@@ -473,7 +474,7 @@ test "an endpoint's text form parses back" {
 }
 
 test "the public form of an endpoint carries no secret" {
-    const cookie: Secret = .{0x5c} ** 32;
+    const cookie: Secret = @splat(0x5c);
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try w.print("{f}", .{(Endpoint{ .loopback = .{ .port = 4321, .cookie = cookie } }).public()});
@@ -481,11 +482,11 @@ test "the public form of an endpoint carries no secret" {
     var w2: Io.Writer = .fixed(&buf);
     try w2.print("{f}", .{(Endpoint{ .tls = .{ .host = "fd7a::8", .port = 7777, .cert_b64 = "MIIB", .token = cookie } }).public()});
     try std.testing.expectEqualStrings("tp://[fd7a::8]:7777", w2.buffered());
-    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), &secretHex(cookie)) == null);
+    try std.testing.expect(std.mem.find(u8, w2.buffered(), &secretHex(cookie)) == null);
 }
 
 test "a pairing string round-trips, brackets an IPv6 host, and refuses a short token" {
-    const token: Secret = .{0xab} ** 32;
+    const token: Secret = @splat(0xab);
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try w.print("{f}", .{Endpoint{ .tls = .{ .host = "lydia", .port = 7777, .cert_b64 = "MIIB_-cert", .token = token } }});
@@ -502,8 +503,8 @@ test "a pairing string round-trips, brackets an IPv6 host, and refuses a short t
     try std.testing.expectEqualStrings("fd7a::8", Endpoint.parse(w6.buffered()).?.tls.host);
 
     try std.testing.expectEqual(@as(?Endpoint, null), Endpoint.parse("tp://lydia:7777/AA#abab"));
-    try std.testing.expectEqual(@as(?Endpoint, null), Endpoint.parse("tp://lydia/AA#" ++ ("ab" ** 32)));
-    try std.testing.expectEqual(@as(?Endpoint, null), Endpoint.parse("tp://lydia:7777/#" ++ ("ab" ** 32)));
+    try std.testing.expectEqual(@as(?Endpoint, null), Endpoint.parse("tp://lydia/AA#" ++ repeat("ab", 32)));
+    try std.testing.expectEqual(@as(?Endpoint, null), Endpoint.parse("tp://lydia:7777/#" ++ repeat("ab", 32)));
     try std.testing.expectEqual(@as(?HostPort, null), splitHostPort("nohost"));
     try std.testing.expectEqualStrings("::1", splitHostPort("[::1]:80").?.host);
 }
@@ -513,7 +514,7 @@ test "the certificate in a pairing string decodes to the DER it was made from" {
     const enc = std.base64.url_safe_no_pad.Encoder;
     var b64: [16]u8 = undefined;
     const text = enc.encode(&b64, &der);
-    const t: Endpoint.Tls = .{ .host = "h", .port = 1, .cert_b64 = text, .token = .{0} ** 32 };
+    const t: Endpoint.Tls = .{ .host = "h", .port = 1, .cert_b64 = text, .token = @splat(0) };
     var out: [max_cert_der]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &der, try t.certDer(&out));
 }
@@ -526,7 +527,7 @@ test "wake brings a thread blocked in accept back" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fs.path.join(a, &.{ dir, "wake.sock" });
+    const path = try std.Io.Dir.path.join(a, &.{ dir, "wake.sock" });
     defer a.free(path);
     const Waiter = struct {
         done: std.atomic.Value(bool) = .init(false),
@@ -573,7 +574,7 @@ test "a unix socket with nothing at its path is FileNotFound" {
     const a = std.testing.allocator;
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fs.path.join(a, &.{ dir, "nobody.sock" });
+    const path = try std.Io.Dir.path.join(a, &.{ dir, "nobody.sock" });
     defer a.free(path);
     try std.testing.expectError(error.FileNotFound, connect(a, io, .{ .unix = path }));
 }

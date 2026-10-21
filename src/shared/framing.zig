@@ -144,9 +144,9 @@ pub fn megapixelsOf(w: usize, h: usize) f64 {
 /// Format a budget the way it is typed: up to two decimals, no trailing zeros.
 pub fn formatMp(buf: []u8, mp: f64) []const u8 {
     var tmp: [32]u8 = undefined;
-    const t = std.fmt.bufPrint(&tmp, "{d:.2}", .{mp}) catch return "";
+    const t = std.mem.print(&tmp, "{d:.2}", .{mp}) catch return "";
     var end = t.len;
-    if (std.mem.indexOfScalar(u8, t, '.') != null) {
+    if (std.mem.findScalar(u8, t, '.') != null) {
         while (end > 0 and t[end - 1] == '0') end -= 1;
         if (end > 0 and t[end - 1] == '.') end -= 1;
     }

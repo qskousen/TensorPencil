@@ -138,7 +138,7 @@ pub fn conv2d(
         .extent_h = if (mode == .upsample2x) oh else h,
         .out_w = ow,
         .first = 0,
-        .mode = @intFromEnum(mode),
+        .mode = @backingInt(mode),
     };
     // The patch gathered straight into the GEMM's 16-bit operand, unless an activation
     // capture needs the f32 patch the GEMM is equivalent to.
@@ -159,7 +159,7 @@ pub fn conv2d(
         // `h` here is the tap EXTENT, not the source height: when upsampling the taps
         // live in the output grid, and that is where the conv pads (see `im2col_sd`).
         const ext_h = if (mode == .upsample2x) oh else h;
-        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, ext_h, p0, ow, @intFromEnum(mode));
+        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, ext_h, p0, ow, @backingInt(mode));
         // Per band, not per convolution: the accumulator sums over rows, so N banded
         // calls contribute exactly the rows one unbanded call would.
         try lin_cuda.probeInput(be, patch.*, bn, cv.gemmWeight());

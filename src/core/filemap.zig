@@ -18,7 +18,7 @@ pub const Error = error{MapFailed};
 pub const Mapping = []align(std.heap.page_size_min) const u8;
 
 pub fn map(handle: std.Io.File.Handle, len: usize) Error!Mapping {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const section = CreateFileMappingW(handle, null, PAGE_READONLY, 0, 0, null) orelse
             return error.MapFailed;
         // The view keeps the section alive, so nothing needs the handle after this.
@@ -38,7 +38,7 @@ pub fn map(handle: std.Io.File.Handle, len: usize) Error!Mapping {
 }
 
 pub fn unmap(m: Mapping) void {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         _ = UnmapViewOfFile(@ptrCast(m.ptr));
         return;
     }
@@ -48,7 +48,7 @@ pub fn unmap(m: Mapping) void {
 /// Ask the OS to read the whole mapping in now, in large requests, rather than
 /// faulting it a page at a time. Best-effort: failure is not reported anywhere.
 pub fn willNeed(m: Mapping) void {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         var range = [1]MemoryRangeEntry{.{ .base = @constCast(@ptrCast(m.ptr)), .len = m.len }};
         // Windows 8+; an older loader without it just faults as before.
         _ = PrefetchVirtualMemory(current_process, 1, &range, 0);

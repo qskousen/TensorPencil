@@ -304,7 +304,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
     // Controls: the reload must read zero, and the whole file is what groups are read against.
     for ([_]struct { []const u8, []const []const u8 }{ .{ "control:dense", &.{} }, .{ "control:all", qlayers } }) |c| {
         try arms.append(arena, .{ .label = c[0], .layers = c[1].len, .points = try measure(sess, gpa, arena, &mix, c[1], opts.prompts, conds, snaps, sigmas, shape) });
-        try report(out, arms.getLast(), null, t0, io);
+        try report(out, arms.last().?, null, t0, io);
     }
     const all_err = arms.items[1].mean();
 
@@ -321,8 +321,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
             },
         };
         try arms.append(arena, .{ .label = label, .layers = members.len, .points = try measure(sess, gpa, arena, &mix, sel, opts.prompts, conds, snaps, sigmas, shape) });
-        try report(out, arms.getLast(), if (opts.mode == .restore) all_err else null, t0, io);
-        if (csv_file != null) try writeCsv(&csv_w.interface, arms.getLast());
+        try report(out, arms.last().?, if (opts.mode == .restore) all_err else null, t0, io);
+        if (csv_file != null) try writeCsv(&csv_w.interface, arms.last().?);
     }
     if (csv_file != null) {
         for (arms.items[0..2]) |a| try writeCsv(&csv_w.interface, a);

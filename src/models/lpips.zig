@@ -95,8 +95,8 @@ pub const Lpips = struct {
             const ci = if (i == 0) 3 else chns[i - 1];
             const co = chns[i];
 
-            const wname = try std.fmt.allocPrint(a, "features.{d}.weight", .{feature_idx[i]});
-            const bname = try std.fmt.allocPrint(a, "features.{d}.bias", .{feature_idx[i]});
+            const wname = try a.print("features.{d}.weight", .{feature_idx[i]});
+            const bname = try a.print("features.{d}.bias", .{feature_idx[i]});
             const wv = st.get(wname) orelse return error.MissingTensor;
             const shape = wv.info.shape.slice();
             if (shape.len != 4 or shape[0] != co or shape[1] != ci or shape[2] != spec.k or shape[3] != spec.k)
@@ -119,7 +119,7 @@ pub const Lpips = struct {
                 .pad = spec.pad,
             };
 
-            const lname = try std.fmt.allocPrint(a, "lin.{d}.weight", .{i});
+            const lname = try a.print("lin.{d}.weight", .{i});
             const lv = st.get(lname) orelse return error.MissingTensor;
             const lw = try lv.toF32Alloc(a);
             if (lw.len != co) return error.ShapeMismatch;

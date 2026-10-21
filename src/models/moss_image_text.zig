@@ -105,7 +105,7 @@ test "the Qwen3.5 tokenizer matches ComfyUI's on a hard corpus" {
     defer corpus.deinit();
     for (corpus.value, 0..) |text, i| {
         var kb: [16]u8 = undefined;
-        const want = try refIds(gpa, &ref, try std.fmt.bufPrint(&kb, "ids.{d}", .{i}));
+        const want = try refIds(gpa, &ref, try std.mem.print(&kb, "ids.{d}", .{i}));
         defer gpa.free(want);
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(gpa);
@@ -126,7 +126,7 @@ test "the MOSS-Image template tokenizes exactly like ComfyUI's" {
     defer prompts.deinit();
     for (prompts.value, 0..) |text, i| {
         var kb: [16]u8 = undefined;
-        const want = try refIds(gpa, &ref, try std.fmt.bufPrint(&kb, "tokens.{d}", .{i}));
+        const want = try refIds(gpa, &ref, try std.mem.print(&kb, "tokens.{d}", .{i}));
         defer gpa.free(want);
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(gpa);
@@ -155,9 +155,9 @@ test "the MOSS-Image text encoder matches ComfyUI on the real checkpoint" {
 
     for (0..2) |i| {
         var kb: [16]u8 = undefined;
-        const ids = try refIds(gpa, &ref, try std.fmt.bufPrint(&kb, "tokens.{d}", .{i}));
+        const ids = try refIds(gpa, &ref, try std.mem.print(&kb, "tokens.{d}", .{i}));
         defer gpa.free(ids);
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "cond.{d}", .{i}))).toF32Alloc(gpa);
         defer gpa.free(want);
         const got = try enc.encodeIds(io, gpa, ids);
         defer gpa.free(got);

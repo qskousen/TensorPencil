@@ -56,7 +56,7 @@ fn frame() void {
     var scroll = dvui.scrollArea(@src(), .{}, .{
         .expand = .both,
         .background = true,
-        .color_fill = dvui.themeGet().fill,
+        .color_fill = .{ .color = dvui.themeGet().fill },
     });
     defer scroll.deinit();
     markdown_view.render(@src(), doc, .{ .prose = .{ .padding = dvui.Rect.all(8) } });
@@ -72,12 +72,12 @@ pub fn main(init: std.process.Init) !void {
 
     var back = try Backend.initWindow(.{
         .io = init.io,
-        .allocator = gpa,
         .size = .{ .w = 720, .h = 1080 },
         .vsync = false,
         .title = "md-probe",
         .hidden = true,
         .environ_map = init.environ_map,
+        .persist_window_geometry = false,
     });
     defer back.deinit();
 

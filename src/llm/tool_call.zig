@@ -67,10 +67,10 @@ pub const Split = struct {
 const Close = struct { at: usize, len: usize };
 
 fn findClose(body: []const u8, expected: []const u8) ?Close {
-    var best: ?Close = if (std.mem.indexOf(u8, body, expected)) |at| .{ .at = at, .len = expected.len } else null;
+    var best: ?Close = if (std.mem.find(u8, body, expected)) |at| .{ .at = at, .len = expected.len } else null;
     if (!std.mem.startsWith(u8, expected, "</ifm|think")) return best;
     for ([_][]const u8{ "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>" }) |close| {
-        const at = std.mem.indexOf(u8, body, close) orelse continue;
+        const at = std.mem.find(u8, body, close) orelse continue;
         if (best == null or at < best.?.at) best = .{ .at = at, .len = close.len };
     }
     return best;
@@ -128,8 +128,8 @@ pub fn splitThought(text: []const u8, r: ?Reasoning, primed: bool) Split {
 /// an earlier user turn quoting `</think>` must not decide this.
 pub fn endsInsideThought(prompt_tail: []const u8, r: ?Reasoning) bool {
     const rr = r orelse return false;
-    const last_open = std.mem.lastIndexOf(u8, prompt_tail, rr.open);
-    const last_close = std.mem.lastIndexOf(u8, prompt_tail, rr.close);
+    const last_open = std.mem.findLast(u8, prompt_tail, rr.open);
+    const last_close = std.mem.findLast(u8, prompt_tail, rr.close);
     const o = last_open orelse return false;
     return if (last_close) |c| o > c else true;
 }
@@ -188,9 +188,9 @@ const k2_wrap_close = "</ifm|tool_calls>";
 /// mid-line (`...\n\n<tool_call>\n<function=...`). The reasoning-block guard is what
 /// keeps a merely-contemplated call from firing here.
 pub fn nextBlock(buf: []const u8) Found {
-    const qa = std.mem.indexOf(u8, buf, open_tag);
-    const ka = std.mem.indexOf(u8, buf, k2_open);
-    const kw = std.mem.indexOf(u8, buf, k2_wrap_open);
+    const qa = std.mem.find(u8, buf, open_tag);
+    const ka = std.mem.find(u8, buf, k2_open);
+    const kw = std.mem.find(u8, buf, k2_wrap_open);
     // K2's wrapper may have arrived before its first call: everything from it on
     // is pending.
     const k_first = if (ka) |k| (if (kw) |w| @min(w, k) else k) else kw;
@@ -198,7 +198,7 @@ pub fn nextBlock(buf: []const u8) Found {
     if (k_first != null and (qa == null or k_first.? < qa.?)) return nextK2Block(buf, k_first.?);
     const a = qa.?;
     const body_start = a + open_tag.len;
-    const b = std.mem.indexOfPos(u8, buf, body_start, close_tag) orelse
+    const b = std.mem.findPos(u8, buf, body_start, close_tag) orelse
         return .{ .partial = .{ .text_before = buf[0..a] } };
     return .{ .block = .{
         .text_before = buf[0..a],
@@ -211,10 +211,10 @@ pub fn nextBlock(buf: []const u8) Found {
 /// the block spans a leading wrapper open and a trailing wrapper close when they
 /// are adjacent to the call, so neither leaks into the surrounding text.
 fn nextK2Block(buf: []const u8, first: usize) Found {
-    const a = std.mem.indexOfPos(u8, buf, first, k2_open) orelse
+    const a = std.mem.findPos(u8, buf, first, k2_open) orelse
         return .{ .partial = .{ .text_before = buf[0..first] } };
     const body_start = a + k2_open.len;
-    const b = std.mem.indexOfPos(u8, buf, body_start, k2_close) orelse
+    const b = std.mem.findPos(u8, buf, body_start, k2_close) orelse
         return .{ .partial = .{ .text_before = buf[0..first] } };
     var before_end = a;
     const lead = std.mem.trimEnd(u8, buf[0..a], " \t\r\n");
@@ -239,21 +239,21 @@ pub const K2Args = struct {
     rest: []const u8,
 
     pub fn next(self: *K2Args) ?K2Arg {
-        const ks = std.mem.indexOf(u8, self.rest, "<ifm|arg_key>") orelse return null;
+        const ks = std.mem.find(u8, self.rest, "<ifm|arg_key>") orelse return null;
         const key_start = ks + "<ifm|arg_key>".len;
-        const key_end = std.mem.indexOfPos(u8, self.rest, key_start, "</ifm|arg_key>") orelse return null;
+        const key_end = std.mem.findPos(u8, self.rest, key_start, "</ifm|arg_key>") orelse return null;
         var pos = key_end + "</ifm|arg_key>".len;
         var type_name: ?[]const u8 = null;
         const t = std.mem.trimStart(u8, self.rest[pos..], " \t\r\n");
         if (std.mem.startsWith(u8, t, "<ifm|arg_type>")) {
             const ts = self.rest.len - t.len + "<ifm|arg_type>".len;
-            const te = std.mem.indexOfPos(u8, self.rest, ts, "</ifm|arg_type>") orelse return null;
+            const te = std.mem.findPos(u8, self.rest, ts, "</ifm|arg_type>") orelse return null;
             type_name = std.mem.trim(u8, self.rest[ts..te], " \t\r\n");
             pos = te + "</ifm|arg_type>".len;
         }
-        const vs0 = std.mem.indexOfPos(u8, self.rest, pos, "<ifm|arg_value>") orelse return null;
+        const vs0 = std.mem.findPos(u8, self.rest, pos, "<ifm|arg_value>") orelse return null;
         const vs = vs0 + "<ifm|arg_value>".len;
-        const ve = std.mem.indexOfPos(u8, self.rest, vs, "</ifm|arg_value>") orelse self.rest.len;
+        const ve = std.mem.findPos(u8, self.rest, vs, "</ifm|arg_value>") orelse self.rest.len;
         const arg: K2Arg = .{ .key = std.mem.trim(u8, self.rest[key_start..key_end], " \t\r\n"), .type_name = type_name, .value = self.rest[vs..ve] };
         self.rest = self.rest[@min(self.rest.len, ve + "</ifm|arg_value>".len)..];
         return arg;
@@ -263,7 +263,7 @@ pub const K2Args = struct {
 /// The function name a K2 body opens with (its first line), or null.
 pub fn k2Name(body: []const u8) ?[]const u8 {
     const t = std.mem.trimStart(u8, body, " \t\r\n");
-    const end = std.mem.indexOfAny(u8, t, "\r\n<") orelse t.len;
+    const end = std.mem.findAny(u8, t, "\r\n<") orelse t.len;
     const name = std.mem.trim(u8, t[0..end], " \t");
     return if (name.len == 0) null else name;
 }
@@ -285,7 +285,7 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Call {
     const t = std.mem.trim(u8, body, " \t\r\n");
     if (t.len == 0) return error.EmptyToolCall;
     if (t[0] == '{') return parseJson(gpa, t);
-    if (std.mem.indexOf(u8, t, "<ifm|arg_key>") != null) return parseK2(gpa, body);
+    if (std.mem.find(u8, t, "<ifm|arg_key>") != null) return parseK2(gpa, body);
     return parseXml(gpa, body);
 }
 
@@ -348,9 +348,9 @@ pub fn parseAll(gpa: std.mem.Allocator, buf: []const u8, out: *std.ArrayList(Cal
 
 /// `<function=NAME>` + zero or more `<parameter=KEY>VALUE</parameter>`.
 fn parseXml(gpa: std.mem.Allocator, body: []const u8) !Call {
-    const fs = std.mem.indexOf(u8, body, "<function=") orelse return error.NoFunctionTag;
+    const fs = std.mem.find(u8, body, "<function=") orelse return error.NoFunctionTag;
     const name_start = fs + "<function=".len;
-    const name_end = std.mem.indexOfScalarPos(u8, body, name_start, '>') orelse return error.NoFunctionTag;
+    const name_end = std.mem.findScalarPos(u8, body, name_start, '>') orelse return error.NoFunctionTag;
     const name = std.mem.trim(u8, body[name_start..name_end], " \t\r\n");
     if (name.len == 0) return error.NoFunctionTag;
 
@@ -363,14 +363,14 @@ fn parseXml(gpa: std.mem.Allocator, body: []const u8) !Call {
     // A `</function>` bounds the parameter list, so a stray `<parameter=` in
     // trailing prose cannot be swept in. Absent (truncated generation), the rest
     // of the body is the list.
-    const limit = std.mem.indexOfPos(u8, body, pos, "</function>") orelse body.len;
+    const limit = std.mem.findPos(u8, body, pos, "</function>") orelse body.len;
     var n: usize = 0;
-    while (std.mem.indexOfPos(u8, body[0..limit], pos, "<parameter=")) |ps| {
+    while (std.mem.findPos(u8, body[0..limit], pos, "<parameter=")) |ps| {
         const key_start = ps + "<parameter=".len;
-        const key_end = std.mem.indexOfScalarPos(u8, body[0..limit], key_start, '>') orelse break;
+        const key_end = std.mem.findScalarPos(u8, body[0..limit], key_start, '>') orelse break;
         const key = std.mem.trim(u8, body[key_start..key_end], " \t\r\n");
         const val_start = key_end + 1;
-        const val_end = std.mem.indexOfPos(u8, body[0..limit], val_start, "</parameter>") orelse limit;
+        const val_end = std.mem.findPos(u8, body[0..limit], val_start, "</parameter>") orelse limit;
         const val = stripDelimiterNewlines(body[val_start..val_end]);
         if (key.len > 0) {
             if (n > 0) try w.writeAll(", ");

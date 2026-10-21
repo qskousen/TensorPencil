@@ -1,6 +1,6 @@
 //! Kernels with ONE source for both GPU arms: this file compiles to SPIR-V for the
 //! Vulkan `Context` (self-hosted backend, like eltwise.zig) and to PTX for the CUDA
-//! `Backend` (LLVM, then build.zig's ptx_unalias + zig cc lowering).
+//! `Backend` (the LLVM backend's assembly).
 //!
 //! Every entry shares the eltwise launch ABI: four f32 buffers a..d, seven u32
 //! u0..u6 and two f32 f0,f1. On Vulkan those are the storage-buffer bindings and
@@ -25,11 +25,12 @@
 //! (per subgroup-row); each documents its slots and scalars.
 
 const std = @import("std");
+const abi = @import("abi.zig");
 const builtin = @import("builtin");
-const gpu = std.gpu;
+const gpu = std.spirv;
 const table = @import("dual_table.zig");
 
-pub const is_ptx = builtin.cpu.arch == .nvptx64;
+pub const is_ptx = builtin.target.cpu.arch == .nvptx64;
 
 pub const Slot = enum { a, b, c, d };
 
@@ -42,108 +43,34 @@ pub const Dt = table.Dt;
 
 const FBuf = extern struct { data: [1 << 28]f32 };
 const Push = extern struct { u0: u32, u1: u32, u2: u32, u3: u32, u4: u32, u5: u32, f0: f32, f1: f32, u6: u32 };
-extern var a: FBuf addrspace(.storage_buffer);
-extern var b: FBuf addrspace(.storage_buffer);
-extern var c: FBuf addrspace(.storage_buffer);
-extern var d: FBuf addrspace(.storage_buffer);
+const a = abi.buffer(FBuf, "a", 0);
+const b = abi.buffer(FBuf, "b", 1);
+const c = abi.buffer(FBuf, "c", 2);
+const d = abi.buffer(FBuf, "d", 3);
 /// A `vec4` ALIAS of binding 1, the activation slot: logical addressing has no
 /// pointer to re-cast, so a whole-quad load has to come from a second variable
 /// on the same binding with a wider element type (the trick `dp4a.zig` used for
 /// its u16 weight view). Without it `ld4` is four scalar loads, and these GEMVs
 /// are bound by load instructions.
 const VBuf = extern struct { data: [1 << 26]@Vector(4, f32) };
-extern var bv: VBuf addrspace(.storage_buffer);
+const bv = abi.buffer(VBuf, "bv", 1);
 /// 16-bit aliases of every binding, for `ldT` / `stT`: f16 as itself, bf16 as its bits.
 const HBuf = extern struct { data: [1 << 29]f16 };
 const UBuf = extern struct { data: [1 << 29]u16 };
-extern var ah: HBuf addrspace(.storage_buffer);
-extern var bh: HBuf addrspace(.storage_buffer);
-extern var ch: HBuf addrspace(.storage_buffer);
-extern var dh: HBuf addrspace(.storage_buffer);
-extern var au: UBuf addrspace(.storage_buffer);
-extern var bu: UBuf addrspace(.storage_buffer);
-extern var cu: UBuf addrspace(.storage_buffer);
-extern var du: UBuf addrspace(.storage_buffer);
-extern var pc: Push addrspace(.push_constant);
-// Subgroup builtins std.gpu does not declare; the BuiltIn decorations are in
-// `decorate`.
-extern const sg_size: u32 addrspace(.input);
-extern const sg_lane: u32 addrspace(.input);
-extern const sg_id: u32 addrspace(.input);
-
-inline fn decorate() void {
-    asm volatile (
-        \\OpDecorate %ft Block
-        \\OpMemberDecorate %ft 0 Offset 0
-        \\OpDecorate %pt Block
-        \\OpMemberDecorate %pt 0 Offset 0
-        \\OpMemberDecorate %pt 1 Offset 4
-        \\OpMemberDecorate %pt 2 Offset 8
-        \\OpMemberDecorate %pt 3 Offset 12
-        \\OpMemberDecorate %pt 4 Offset 16
-        \\OpMemberDecorate %pt 5 Offset 20
-        \\OpMemberDecorate %pt 6 Offset 24
-        \\OpMemberDecorate %pt 7 Offset 28
-        \\OpMemberDecorate %pt 8 Offset 32
-        \\OpDecorate %ba DescriptorSet 0
-        \\OpDecorate %ba Binding 0
-        \\OpDecorate %bb DescriptorSet 0
-        \\OpDecorate %bb Binding 1
-        \\OpDecorate %bc DescriptorSet 0
-        \\OpDecorate %bc Binding 2
-        \\OpDecorate %bd DescriptorSet 0
-        \\OpDecorate %bd Binding 3
-        \\OpDecorate %vt Block
-        \\OpMemberDecorate %vt 0 Offset 0
-        \\OpDecorate %bv DescriptorSet 0
-        \\OpDecorate %bv Binding 1
-        \\OpDecorate %ht Block
-        \\OpMemberDecorate %ht 0 Offset 0
-        \\OpDecorate %ut Block
-        \\OpMemberDecorate %ut 0 Offset 0
-        \\OpDecorate %ah DescriptorSet 0
-        \\OpDecorate %ah Binding 0
-        \\OpDecorate %bh DescriptorSet 0
-        \\OpDecorate %bh Binding 1
-        \\OpDecorate %ch DescriptorSet 0
-        \\OpDecorate %ch Binding 2
-        \\OpDecorate %dh DescriptorSet 0
-        \\OpDecorate %dh Binding 3
-        \\OpDecorate %au DescriptorSet 0
-        \\OpDecorate %au Binding 0
-        \\OpDecorate %bu DescriptorSet 0
-        \\OpDecorate %bu Binding 1
-        \\OpDecorate %cu DescriptorSet 0
-        \\OpDecorate %cu Binding 2
-        \\OpDecorate %du DescriptorSet 0
-        \\OpDecorate %du Binding 3
-        \\OpDecorate %ss BuiltIn SubgroupSize
-        \\OpDecorate %sl BuiltIn SubgroupLocalInvocationId
-        \\OpDecorate %si BuiltIn SubgroupId
-        :
-        : [ft] "t" (FBuf),
-          [pt] "t" (Push),
-          [ba] "" (&a),
-          [bb] "" (&b),
-          [bc] "" (&c),
-          [bd] "" (&d),
-          [vt] "t" (VBuf),
-          [bv] "" (&bv),
-          [ht] "t" (HBuf),
-          [ut] "t" (UBuf),
-          [ah] "" (&ah),
-          [bh] "" (&bh),
-          [ch] "" (&ch),
-          [dh] "" (&dh),
-          [au] "" (&au),
-          [bu] "" (&bu),
-          [cu] "" (&cu),
-          [du] "" (&du),
-          [ss] "" (&sg_size),
-          [sl] "" (&sg_lane),
-          [si] "" (&sg_id),
-    );
-}
+const ah = abi.buffer(HBuf, "ah", 0);
+const bh = abi.buffer(HBuf, "bh", 1);
+const ch = abi.buffer(HBuf, "ch", 2);
+const dh = abi.buffer(HBuf, "dh", 3);
+const au = abi.buffer(UBuf, "au", 0);
+const bu = abi.buffer(UBuf, "bu", 1);
+const cu = abi.buffer(UBuf, "cu", 2);
+const du = abi.buffer(UBuf, "du", 3);
+const pc = abi.pushConstants(Push, "pc");
+// Subgroup builtins std.spirv does not declare. The compiler decorates an input
+// by its name, so these names are fixed.
+extern const subgroup_size: u32 addrspace(.input);
+extern const subgroup_local_invocation_id: u32 addrspace(.input);
+extern const subgroup_id: u32 addrspace(.input);
 
 /// `body`, which takes the activations' element type, at `dt`, as an entry body.
 fn At2(comptime body: anytype, comptime in: Dt, comptime out: Dt) type {
@@ -411,13 +338,13 @@ pub const Env = if (is_ptx) struct {
         return gpu.num_workgroups[0];
     }
     pub inline fn sgSize(_: Env) u32 {
-        return sg_size;
+        return subgroup_size;
     }
     pub inline fn sgLane(_: Env) u32 {
-        return sg_lane;
+        return subgroup_local_invocation_id;
     }
     pub inline fn sgId(_: Env) u32 {
-        return sg_id;
+        return subgroup_id;
     }
 };
 
@@ -670,8 +597,13 @@ const attn = @import("dual/attn.zig");
 
 fn Entry(comptime body: anytype) type {
     return struct {
-        fn spv() callconv(.spirv_kernel) void {
-            decorate();
+        // The body stays a function of its own: inlined into the entry point (Zig
+        // 0.17's default), the NVIDIA driver built the q4_0/q6_k/iq GEMVs 4-9% slower
+        // from otherwise identical SPIR-V.
+        fn spv() callconv(abi.kernel) void {
+            @call(.never_inline, spvBody, .{});
+        }
+        fn spvBody() void {
             body(.{});
         }
         fn ptx(pa: G, pb: G, pc_: G, pd: G, k0: u32, k1: u32, k2: u32, k3: u32, k4: u32, k5: u32, k6: u32, g0: f32, g1: f32) callconv(.nvptx_kernel) void {

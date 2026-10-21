@@ -73,7 +73,7 @@ pub const Queue = struct {
 
 /// A binary frame's wire form: the 32-byte header, then the payload.
 pub fn binHeaderBytes(hdr: wire.BinHeader) [@sizeOf(wire.BinHeader)]u8 {
-    return @bitCast(hdr);
+    return std.mem.toBytes(hdr);
 }
 
 pub const BinFrameError = error{ ShortFrame, BadMagic, BadKind, BadDims, OutOfMemory };
@@ -86,18 +86,18 @@ pub fn binFrameFromBytes(gpa: std.mem.Allocator, bytes: []u8) BinFrameError!Fram
     if (bytes.len < n) return error.ShortFrame;
     var hb: [n]u8 = undefined;
     @memcpy(&hb, bytes[0..n]);
-    // The enum field is checked as an integer BEFORE the bit cast makes it one.
+    // The enum field is checked as an integer BEFORE the reinterpret makes it one.
     const magic = std.mem.readInt(u32, hb[@offsetOf(wire.BinHeader, "magic")..][0..4], .little);
     if (magic != wire.BinHeader.magic_value) return error.BadMagic;
     const raw_kind = std.mem.readInt(u16, hb[@offsetOf(wire.BinHeader, "kind")..][0..2], .little);
     if (std.enums.fromInt(wire.BinHeader.Kind, raw_kind) == null) return error.BadKind;
-    const hdr: wire.BinHeader = @bitCast(hb);
+    const hdr = std.mem.bytesToValue(wire.BinHeader, &hb);
     // The dimensions and the length are what consumers size their pixel
     // arithmetic from, so they are held to the payload here rather than at each
     // of them.
     if (hdr.w > wire.BinHeader.max_edge or hdr.h > wire.BinHeader.max_edge) return error.BadDims;
     if (hdr.len != bytes.len - n) return error.ShortFrame;
-    std.mem.copyForwards(u8, bytes, bytes[n..]);
+    @memmove(bytes[0 .. bytes.len - n], bytes[n..]);
     const payload = try gpa.realloc(bytes, bytes.len - n);
     return .{ .bin = .{ .hdr = hdr, .payload = payload } };
 }

@@ -86,7 +86,7 @@ fn dumpCudaProf(be: *tp.gpu.cuda.Backend) void {
     var tot: f64 = 0;
     for (be.prof.ms) |ms| tot += ms;
     p("  [cuda per-op profile, sync-per-op] total {d:.2} ms over one batch\n", .{tot});
-    for (std.meta.fieldNames(tp.gpu.cuda.Backend.ProfCat), be.prof.ms, be.prof.n) |name, ms, n| {
+    for (@typeInfo(tp.gpu.cuda.Backend.ProfCat).@"enum".field_names, be.prof.ms, be.prof.n) |name, ms, n| {
         if (n == 0) continue;
         const per = ms / @as(f64, @floatFromInt(n));
         const pct = if (tot > 0) 100.0 * ms / tot else 0;
@@ -104,7 +104,7 @@ fn buildTexts(gpa: std.mem.Allocator, count: usize, seq: usize) ![][]const u8 {
     for (texts, 0..) |*t, i| {
         var buf: std.ArrayList(u8) = .empty;
         for (0..reps) |_| try buf.appendSlice(gpa, base);
-        const suffix = try std.fmt.allocPrint(gpa, "#{d}", .{i});
+        const suffix = try gpa.print("#{d}", .{i});
         try buf.appendSlice(gpa, suffix);
         t.* = try buf.toOwnedSlice(gpa);
     }

@@ -523,7 +523,7 @@ pub const Tokenizer = struct {
         var byte_id: [256]u32 = undefined;
         for (0..256) |b| {
             var buf: [6]u8 = undefined;
-            const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
+            const hex = std.mem.print(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
             byte_id[b] = text_id.get(hex) orelse text_id.get(&[_]u8{@intCast(b)}) orelse unk;
         }
 
@@ -606,7 +606,7 @@ pub const Tokenizer = struct {
         var byte_id: [256]u32 = undefined;
         for (0..256) |b| {
             var buf: [6]u8 = undefined;
-            const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
+            const hex = std.mem.print(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
             byte_id[b] = text_id.get(hex) orelse text_id.get(&[_]u8{@intCast(b)}) orelse unk;
         }
 
@@ -620,7 +620,7 @@ pub const Tokenizer = struct {
             if (mv != .str) return error.InvalidMerges;
             const word = mv.str;
             if (word.len < 2) return error.InvalidMerges;
-            const pos = (std.mem.indexOfScalarPos(u8, word, 1, ' ')) orelse return error.InvalidMerges;
+            const pos = (std.mem.findScalarPos(u8, word, 1, ' ')) orelse return error.InvalidMerges;
             const left = word[0..pos];
             const right = word[pos + 1 ..];
             const key = try alloc.alloc(u8, left.len + 1 + right.len);
@@ -782,7 +782,7 @@ pub const Tokenizer = struct {
         var byte_id: [256]u32 = undefined;
         for (0..256) |b| {
             var buf: [6]u8 = undefined;
-            const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
+            const hex = std.mem.print(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
             byte_id[b] = text_id.get(hex) orelse text_id.get(&[_]u8{@intCast(b)}) orelse unk;
         }
 
@@ -802,7 +802,7 @@ pub const Tokenizer = struct {
                     right = pair.items[1].string;
                 },
                 .string => |s| {
-                    const pos = std.mem.indexOfScalar(u8, s, ' ') orelse return error.InvalidMerges;
+                    const pos = std.mem.findScalar(u8, s, ' ') orelse return error.InvalidMerges;
                     left = s[0..pos];
                     right = s[pos + 1 ..];
                 },
@@ -1016,7 +1016,7 @@ pub const Tokenizer = struct {
     ) !void {
         var pair_buf: [2048]u8 = undefined; // left ++ right, concatenated
         var right_buf: [1024]u8 = undefined;
-        const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidMerges;
+        const space = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidMerges;
         const left_n = try decodeTokenKey(line[0..space], pair_buf[0..1024]);
         const right_n = try decodeTokenKey(line[space + 1 ..], &right_buf);
         const left = raw_to_id.get(pair_buf[0..left_n]) orelse return error.InvalidMerges;
@@ -1102,7 +1102,7 @@ pub const Tokenizer = struct {
             // Earliest special-token occurrence from i.
             var next_special: ?struct { pos: usize, idx: usize } = null;
             for (self.specials, 0..) |st, idx| {
-                if (std.mem.indexOfPos(u8, text, i, st.text)) |pos| {
+                if (std.mem.findPos(u8, text, i, st.text)) |pos| {
                     if (next_special == null or pos < next_special.?.pos or
                         (pos == next_special.?.pos and st.text.len > self.specials[next_special.?.idx].text.len))
                     {
@@ -1366,7 +1366,7 @@ pub const Tokenizer = struct {
                 .tok => try next.append(gpa, f),
                 .raw => |r| {
                     var start: usize = 0;
-                    while (std.mem.indexOfPos(u8, r, start, sp.text)) |pos| {
+                    while (std.mem.findPos(u8, r, start, sp.text)) |pos| {
                         if (pos > start) try next.append(gpa, .{ .raw = r[start..pos] });
                         try next.append(gpa, .{ .tok = sp.id });
                         start = pos + sp.text.len;
@@ -1484,7 +1484,7 @@ pub const Tokenizer = struct {
                 .tok => try next.append(gpa, f),
                 .raw => |r| {
                     var start: usize = 0;
-                    while (std.mem.indexOfPos(u8, r, start, sp.text)) |pos| {
+                    while (std.mem.findPos(u8, r, start, sp.text)) |pos| {
                         if (pos > start) try next.append(gpa, .{ .raw = r[start..pos] });
                         try next.append(gpa, .{ .tok = sp.id });
                         start = pos + sp.text.len;

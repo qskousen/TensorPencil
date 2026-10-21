@@ -572,10 +572,10 @@ pub const Host = struct {
         const d = &(self.drv.diffuser orelse return self.actFailed("no image model"));
         const stem = std.mem.trim(u8, dr.name, " \t");
         if (stem.len == 0) return self.actFailed("needs a name");
-        if (std.mem.indexOfAny(u8, stem, "/\\") != null) return self.actFailed("the name cannot be a path");
+        if (std.mem.findAny(u8, stem, "/\\") != null) return self.actFailed("the name cannot be a path");
 
         const dir = self.out_dir.opt() orelse return self.actFailed("no model folder to write into");
-        const path = std.fmt.allocPrint(gpa, "{s}/{s}.actd", .{ dir, stem }) catch return self.actFailed("out of memory");
+        const path = gpa.print("{s}/{s}.actd", .{ dir, stem }) catch return self.actFailed("out of memory");
         defer gpa.free(path);
 
         var a_list: std.ArrayList([]const u8) = .empty;
@@ -594,7 +594,7 @@ pub const Host = struct {
         d.deriveActDirs(gpa, self.io, a_list.items, b_list.items, dr.size, dr.steps, path) catch |err| {
             std.log.err("act-derive failed: {t}", .{err});
             var buf: [96]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "{t}", .{err}) catch "failed";
+            const text = std.mem.print(&buf, "{t}", .{err}) catch "failed";
             self.emit(.{ .act_derived = .{ .err = text } });
             return;
         };
@@ -786,7 +786,7 @@ pub const Host = struct {
                         gpa.destroy(gi);
                         break;
                     },
-                    .status = .init(@intFromEnum(diffuser.GenStatus.done)),
+                    .status = .init(@backingInt(diffuser.GenStatus.done)),
                     .wake = self.drv.wake,
                     .io = self.io,
                 };
@@ -1247,7 +1247,7 @@ fn firstKey(bytes: []const u8) ?[]const u8 {
     while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
     if (i >= bytes.len or bytes[i] != '"') return null;
     const start = i + 1;
-    const end = std.mem.indexOfScalarPos(u8, bytes, start, '"') orelse return null;
+    const end = std.mem.findScalarPos(u8, bytes, start, '"') orelse return null;
     return bytes[start..end];
 }
 
@@ -1514,7 +1514,7 @@ test "an ack drops the image it names, and one for an unknown id is a no-op" {
             const d = &h.drv.diffuser.?;
             const gi = try h.gpa.create(diffuser.GenImage);
             gi.* = .{ .prompt = try h.gpa.dupe(u8, "p"), .wake = TestHost.noop, .io = h.io };
-            gi.status = .init(@intFromEnum(diffuser.GenStatus.done));
+            gi.status = .init(@backingInt(diffuser.GenStatus.done));
             try d.enqueue(gi);
             const id = gi.id;
 

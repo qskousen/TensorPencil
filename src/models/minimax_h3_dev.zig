@@ -78,7 +78,7 @@ pub fn padRows(rows: usize) usize {
 /// host (`buildModTable`), because the kernel applies neither.
 pub fn modOff(cfg: minimax_h3.Config, n_labels: usize, block: usize, t_row: usize, tag: minimax_h3.Tag, slot: usize) usize {
     std.debug.assert(t_row < n_labels and slot < 6);
-    return (((block * n_labels + t_row) * 3 + @intFromEnum(tag)) * 6 + slot) * cfg.hidden;
+    return (((block * n_labels + t_row) * 3 + @backingInt(tag)) * 6 + slot) * cfg.hidden;
 }
 
 const Ctx = struct {

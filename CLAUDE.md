@@ -9,7 +9,7 @@
 - `zig build` produces no output on success; any output indicates a warning or error.
 - **NEVER run a built binary from the cache directly (e.g. `./.zig-cache/o/*/<exe>` or any hardcoded/globbed cache path) — always launch through the `zig build <step> -- <args>` command.** The cache holds *multiple stale binaries* from earlier builds; a glob or copied path silently runs an old one that predates your edits, producing bogus results. `zig build` recompiles and runs the *current* source every time. This applies to benchmarks (`embed-bench`, `ggml-bench`, …), `run`, `run-llm`, `run-gui`, and any other exe.
 - `zig build test` is likewise silent when everything passes. Tests must NOT print diagnostics on success — use `errdefer std.debug.print(...)` before the assert so values only print on failure. Any stderr from a *passing* test makes the runner print a misleading red `failed command:` line (see ZIG.md); if `zig build test --summary all` says `test success`, nothing failed — don't investigate that line.
-- **Read `ZIG.md` before doing any work.** It documents Zig 0.16.0 breaking changes relevant to this codebase. When you encounter and resolve a new 0.16.0 change, add it to `ZIG.md`.
+- **Read `ZIG.md` before doing any work.** It documents the Zig 0.17.0 (and still-relevant 0.16.0) breaking changes this codebase met. When you encounter and resolve a new one, add it to `ZIG.md`.
 - The best code is usually the simplest code that still handles every edge case: clear separation of concerns, modular, testable. Getting there takes work; do the work.
 - If there is ambiguity in a request, don't guess or assume; ask for clarification.
 - When adding a new feature or fixing a bug, add unit / integration tests as appropriate.
@@ -35,7 +35,7 @@
 ## Project
 
 TensorPencil is a diffusion inference engine (text-to-image) plus an LLM inference engine
-(`tp-llm`) and a desktop GUI (`tp-gui`), written in Zig, targeting **Zig 0.16.0**
+(`tp-llm`) and a desktop GUI (`tp-gui`), written in Zig, targeting **Zig 0.17.0**
 (`minimum_zig_version` in build.zig.zon). The engine is also exported as a library.
 
 **ComfyUI is the compatibility target.** When an implementation choice is not derivable
@@ -45,7 +45,7 @@ from a checkpoint, match what ComfyUI does.
 
 | file | holds |
 |---|---|
-| `ZIG.md` | Zig 0.16.0 breaking changes and gotchas. Read first; add to it. |
+| `ZIG.md` | Zig 0.17.0 breaking changes and gotchas. Read first; add to it. |
 | `BACKEND.md` | backend × feature × dtype support grid. Update when you add a kernel or format. |
 | `LIBRARY.md` | the layered module split, for external consumers |
 | `VIDEO_PLAN.md` | the video/audio roadmap, MiniMax H3 first. Its "silent wrong answers" list is the reason to read it before touching any of that code |
@@ -60,6 +60,8 @@ from a checkpoint, match what ComfyUI does.
 - `zig build run-llm -- <args>` — `tp-llm`, the LLM CLI
 - `zig build run-gui -- <args>` — `tp-gui`, the desktop GUI; `zig build gui` only compiles it
 - `zig build serve` — `tp-serve`, the engine host daemon tp-gui spawns beside itself
+- `zig build check` — compiles every artifact any step builds (probes, benches, the GUI)
+  and runs none of them. A file only some probe imports is checked nowhere else.
 - `zig build -Doptimize=ReleaseFast` — required for any timing measurement.
 - `zig build test` — fast CPU unit suite (~15s). Integration tests are gated OFF.
 - `zig build test -Dintegration` — everything, including GPU device tests and real-model
@@ -287,12 +289,15 @@ Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the
 - `weights.WeightStore` arms `Overlay` and `Mix` substitute tensors or whole layers from a
   second file without rewriting a checkpoint: the tools for attributing quantization damage.
 
-## Zig 0.16 conventions (differ from older Zig — do not use pre-0.16 patterns)
+## Zig 0.17 conventions (differ from older Zig — do not use older patterns)
 
 - `main` takes `std.process.Init`: `pub fn main(init: std.process.Init) !void`. Get the process-lifetime allocator via `init.arena.allocator()`, args via `init.minimal.args.toSlice(arena)`, and the `Io` instance via `init.io`.
-- I/O goes through `std.Io`: writers are `*Io.Writer`; stdout is set up as `Io.File.Writer.init(.stdout(), io, &buffer)` and must be explicitly `flush()`ed.
+- I/O goes through `std.Io`: writers are `*Io.Writer`; stdout is set up as `Io.File.Writer.initStreaming(.stdout(), io, &buffer)` and must be explicitly `flush()`ed.
 - Container types are unmanaged-style: e.g. `std.ArrayList(T)` is initialized with `.empty` and takes the allocator per call (`list.append(gpa, x)`, `list.deinit(gpa)`).
 - Fuzz tests use `std.testing.fuzz` with a `*std.testing.Smith` input generator.
+- `std.lang` (not `std.builtin`), `allocator.print` (not `std.fmt.allocPrint`), `std.mem.find*`
+  (not `indexOf*`), `@backingInt` / `@fromBackingInt`, and struct-of-arrays `@typeInfo`
+  (`field_names`, `field_types`). ZIG.md lists the rest; nothing deprecated goes in.
 - `.arena = arena` in a struct literal copies the arena's state before later fields
   allocate into it. Build every field into a local first, then construct.
 

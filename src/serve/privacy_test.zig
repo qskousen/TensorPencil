@@ -15,6 +15,7 @@
 //! binary's root module is its test runner, so `std_options` declared here
 //! would never bind).
 const std = @import("std");
+const repeat = @import("tp_core").strings.repeat;
 const Io = std.Io;
 const server = @import("server.zig");
 const link_mod = @import("link.zig");
@@ -42,7 +43,7 @@ fn treeHolds(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, needle: []const u8) !?
         files += 1;
         const bytes = ent.dir.readFileAlloc(io, ent.basename, gpa, .limited(8 << 20)) catch continue;
         defer gpa.free(bytes);
-        if (std.mem.indexOf(u8, bytes, needle) != null) return try gpa.dupe(u8, ent.path);
+        if (std.mem.find(u8, bytes, needle) != null) return try gpa.dupe(u8, ent.path);
     }
     return null;
 }
@@ -137,7 +138,7 @@ const Acceptor = struct {
     gpa: std.mem.Allocator,
     be: server.Backend,
     stop: *std.atomic.Value(bool),
-    threads: [4]?std.Thread = .{null} ** 4,
+    threads: [4]?std.Thread = @splat(null),
     main: ?std.Thread = null,
 
     fn start(self: *Acceptor) !void {
@@ -183,7 +184,7 @@ test "a whole job's text reaches no file the host wrote and no line it logged" {
 
     // Everything this host may write lives under the temp tree: its incoming
     // model store, and whatever else a handler might decide to open.
-    const store_dir = try std.fs.path.join(gpa, &.{ root, "models" });
+    const store_dir = try std.Io.Dir.path.join(gpa, &.{ root, "models" });
     defer gpa.free(store_dir);
     var store = try blob.Store.init(gpa, io, store_dir);
     defer store.deinit();
@@ -232,7 +233,7 @@ test "a whole job's text reaches no file the host wrote and no line it logged" {
     // the name it refused either.
     {
         const manifest = "{\"name\":\"" ++ canary ++ ".safetensors\",\"size\":1,\"chunk_bytes\":1,\"digest\":\"\",\"chunks\":[]}";
-        const r = try httpc.request(gpa, control, "POST", "/v1/blob/" ++ ("ab" ** 32) ++ "/manifest", "application/json", manifest, 1 << 16);
+        const r = try httpc.request(gpa, control, "POST", "/v1/blob/" ++ repeat("ab", 32) ++ "/manifest", "application/json", manifest, 1 << 16);
         defer gpa.free(r.body);
         try testing.expectEqual(@as(u16, 400), r.status);
     }
@@ -252,7 +253,7 @@ test "a whole job's text reaches no file the host wrote and no line it logged" {
         var got: Io.Writer.Allocating = .init(gpa);
         defer got.deinit();
         try ws.streamPayload(events.reader(), h, &got.writer);
-        try testing.expect(std.mem.indexOf(u8, got.written(), reply_canary) != null);
+        try testing.expect(std.mem.find(u8, got.written(), reply_canary) != null);
     }
 
     stop.store(true, .release);
@@ -305,7 +306,7 @@ test "the request's own bytes are the only copy the protocol layer keeps" {
     try testing.expectEqual(@as(u16, 202), r.status);
     // The 202 is written before the handler runs, so wait for the echo.
     while (stub.out_gen.load(.acquire) == 0) std.Thread.yield() catch {};
-    try testing.expect(std.mem.indexOf(u8, stub.held.items, canary) != null);
+    try testing.expect(std.mem.find(u8, stub.held.items, canary) != null);
 
     stop.store(true, .release);
     stub.wakeAll();

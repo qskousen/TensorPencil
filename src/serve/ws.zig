@@ -63,7 +63,7 @@ pub fn readUpgrade(r: *Io.Reader, k: *const Key, status: *u16) UpgradeError!void
     while (true) {
         const line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
         if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.HttpHeadersInvalid;
+        const colon = std.mem.findScalar(u8, line, ':') orelse return error.HttpHeadersInvalid;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(line[0..colon], "sec-websocket-accept")) accept_ok = std.mem.eql(u8, value, &want);
     }
@@ -85,7 +85,7 @@ pub fn readHeader(r: *Io.Reader) Io.Reader.Error!Header {
     const len: u64 = switch (h1.payload_len) {
         .len16 => try r.takeInt(u16, .big),
         .len64 => try r.takeInt(u64, .big),
-        else => @intFromEnum(h1.payload_len),
+        else => @backingInt(h1.payload_len),
     };
     const mask: ?[4]u8 = if (h1.mask) (try r.takeArray(4)).* else null;
     return .{ .opcode = h0.opcode, .fin = h0.fin, .len = len, .mask = mask };
@@ -140,7 +140,7 @@ pub fn writeControl(w: *Io.Writer, opcode: Opcode, payload: []const u8) Io.Write
 fn writeHeader(w: *Io.Writer, opcode: Opcode, len: usize, masked: bool) Io.Writer.Error!void {
     try w.writeByte(@bitCast(Header0{ .opcode = opcode, .fin = true }));
     switch (len) {
-        0...125 => try w.writeByte(@bitCast(Header1{ .payload_len = @enumFromInt(@as(u7, @intCast(len))), .mask = masked })),
+        0...125 => try w.writeByte(@bitCast(Header1{ .payload_len = @fromBackingInt(@intCast(@as(u7, @intCast(len)))), .mask = masked })),
         126...0xffff => {
             try w.writeByte(@bitCast(Header1{ .payload_len = .len16, .mask = masked }));
             try w.writeInt(u16, @intCast(len), .big);
@@ -162,7 +162,7 @@ test "accept matches the RFC 6455 worked example" {
 }
 
 test "client frames are read by std's server-side reader" {
-    const payload_big = [_]u8{0x5A} ** 70000;
+    const payload_big: [70000]u8 = @splat(0x5A);
     for ([_][]const u8{ "", "hello", payload_big[0..200], &payload_big }) |payload| {
         var buf: [70100]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
@@ -176,7 +176,7 @@ test "client frames are read by std's server-side reader" {
 }
 
 test "std's server frames stream through the client reader" {
-    const payload = [_]u8{0xC3} ** 65537;
+    const payload: [65537]u8 = @splat(0xC3);
     var buf: [65600]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     var ws: Ws = .{ .key = "", .input = undefined, .output = &w };
@@ -260,7 +260,7 @@ test "upgrade response is checked for status and accept" {
 test "upgrade request carries the key and is parsed by std's head parser" {
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const k = key([_]u8{7} ** 16);
+    const k = key(@as([16]u8, @splat(7)));
     try writeUpgrade(&w, "/v1/events", "gpu-box", &k, &.{.{ .name = "authorization", .value = "Bearer x" }});
     const head = try std.http.Server.Request.Head.parse(w.buffered());
     try testing.expectEqual(std.http.Method.GET, head.method);

@@ -59,12 +59,12 @@ pub const Viewer = struct {
         self.gpa = gpa;
         self.back = try SDLBackend.initWindow(.{
             .io = io,
-            .allocator = gpa,
             .size = .{ .w = 1000, .h = 760 },
             .min_size = .{ .w = 400, .h = 300 },
             .vsync = true,
             .title = "tp-gui - image",
             .hidden = true, // shown after the first frame is presented
+            .persist_window_geometry = false,
         });
         errdefer self.back.deinit();
         self.win = try dvui.Window.init(@src(), gpa, self.back.backend(), .{ .id_extra = 1 });
@@ -180,8 +180,8 @@ pub const Viewer = struct {
             const host = self.src.hostOf(self.src.ctx, self.cur);
             if (host.len > 0) {
                 var hbuf: [96]u8 = undefined;
-                fonts.richLine(@src(), std.fmt.bufPrint(&hbuf, " · {s}", .{host}) catch "", .{
-                    .color_text = C.text_dim,
+                fonts.richLine(@src(), std.mem.print(&hbuf, " · {s}", .{host}) catch "", .{
+                    .color_text = .{ .color = C.text_dim },
                     .gravity_y = 0.5,
                 });
             }
@@ -196,9 +196,9 @@ pub const Viewer = struct {
             const clicked = dvui.button(@src(), "Copy", .{}, .{
                 .gravity_y = 0.5,
                 .data_out = &wd,
-                .color_text = if (have_px) null else C.text_ghost,
-                .color_text_hover = if (have_px) null else C.text_ghost,
-                .color_text_press = if (have_px) null else C.text_ghost,
+                .color_text = if (have_px) null else .{ .color = C.text_ghost },
+                .color_text_hover = if (have_px) null else .{ .color = C.text_ghost },
+                .color_text_press = if (have_px) null else .{ .color = C.text_ghost },
             });
             if (clicked and have_px) copy(cur);
             hint.hover(@src(), &wd, if (have_px) "Copy image to clipboard" else "Waiting for the image to arrive");
@@ -271,7 +271,7 @@ pub const Viewer = struct {
         var area = dvui.box(@src(), .{}, .{
             .expand = .both,
             .background = true,
-            .color_fill = .{ .r = 18, .g = 18, .b = 18, .a = 255 },
+            .color_fill = .{ .color = .{ .r = 18, .g = 18, .b = 18, .a = 255 } },
         });
         defer area.deinit();
 
@@ -279,7 +279,7 @@ pub const Viewer = struct {
         // crossing the socket.
         const rgba = im.pixels orelse {
             fonts.richLine(@src(), "Receiving image…", .{
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .gravity_x = 0.5,
                 .gravity_y = 0.5,
             });
@@ -348,11 +348,11 @@ pub const Viewer = struct {
                     if (me.button.pointer() and dvui.eventMatchSimple(e, wd)) {
                         e.handled = true;
                         dvui.captureMouse(wd, e.num);
-                        dvui.dragPreStart(me.p, .{});
+                        dvui.dragPreStart(me.button, me.p, .{});
                     }
                 },
                 .motion => |delta| {
-                    if (dvui.captured(id) and dvui.dragging(me.p, null) != null) {
+                    if (dvui.captured(id) and dvui.dragging(me, null) != null) {
                         e.handled = true;
                         const s = crs.s;
                         self.pan_x += delta.x / (self.zoom * s);

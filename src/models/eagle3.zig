@@ -667,9 +667,6 @@ pub const Eagle3Drafter = struct {
 // must equal vanilla greedy (the lossless-verification contract holds no
 // matter what the head proposes). Kept tiny, Debug forwards are slow.
 test "eagle drafter matches vanilla greedy on the real models" {
-    // The failure this has actually shown is an ERROR out of the drafter, not a
-    // mismatch, and an error with no message says nothing about which stage.
-    errdefer |e| if (e != error.SkipZigTest) std.debug.print("eagle chain: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
@@ -735,9 +732,6 @@ test "eagle drafter matches vanilla greedy on the real models" {
 // the target's tree-verify forward) stays byte-identical to vanilla greedy,
 // the lossless contract holds no matter what tree the head proposes.
 test "eagle tree drafter matches vanilla greedy on the real models" {
-    // The failure this has actually shown is an ERROR out of the drafter, not a
-    // mismatch, and an error with no message says nothing about which stage.
-    errdefer |e| if (e != error.SkipZigTest) std.debug.print("eagle tree: {t}\n", .{e});
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");

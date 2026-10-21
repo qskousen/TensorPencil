@@ -142,7 +142,7 @@ const q2_shifts: @Vector(q2_vl, u5) = blk: {
 /// The integer holding one vector's worth of codes (u8 / u16 / u32). Read exactly
 /// this wide, a u32 load at every step would run past the 34-byte block on the
 /// last block of a row.
-const Q2Word = std.meta.Int(.unsigned, q2_vl * 2);
+const Q2Word = @Int(.unsigned, q2_vl * 2);
 
 /// Fused q2_0 g128 dot: `Σ (code - 1) * d * x`, reading each weight byte ONCE and
 /// never materializing the dequantized row.

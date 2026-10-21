@@ -87,7 +87,7 @@ pub const TextModel = struct {
         const w = cfg.width;
 
         var pbuf: [1024]u8 = undefined;
-        var st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/open_clip_model.safetensors", .{dir}));
+        var st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/open_clip_model.safetensors", .{dir}));
         errdefer st.deinit();
         const store: WeightStore = .{ .safetensors = &st };
 
@@ -366,7 +366,7 @@ pub const VisualModel = struct {
         const w = cfg.width;
 
         var pbuf: [1024]u8 = undefined;
-        var st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/open_clip_model.safetensors", .{dir}));
+        var st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/open_clip_model.safetensors", .{dir}));
         errdefer st.deinit();
         const store: WeightStore = .{ .safetensors = &st };
 

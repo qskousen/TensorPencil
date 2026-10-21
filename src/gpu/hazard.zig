@@ -539,7 +539,7 @@ test "device-address pointers make a module untracked" {
 }
 
 test "bytes that are not SPIR-V are untracked" {
-    const junk = [_]u8{0} ** 32;
+    const junk: [32]u8 = @splat(0);
     const aligned: [32]u8 align(4) = junk;
     try testing.expect((try bindingAccess(testing.allocator, &aligned)).untracked);
 }

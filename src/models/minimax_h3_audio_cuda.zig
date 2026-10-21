@@ -246,8 +246,8 @@ test "the anti-aliased activation's constants keep the round trip length-preserv
     // upsample's slice has to leave exactly `2 * len`, and the downsample's
     // ASYMMETRIC pad has to bring it back to `len`. A symmetric guess shifts the
     // signal by a sample, which is inaudible in a spectrum and wrong everywhere.
-    const filt = [_]f32{0} ** 12;
-    const snake = [_]f32{0} ** 4;
+    const filt: [12]f32 = @splat(0);
+    const snake: [4]f32 = @splat(0);
     const act: DevAct = .{
         .up_filter = &filt,
         .down_filter = &filt,
@@ -338,7 +338,7 @@ test "snake parameters are exponentiated once, on the host" {
     // multiply.
     const la = [_]f32{ 0.0, 1.0 };
     const lb = [_]f32{ 0.0, -1.0 };
-    const filt = [_]f32{0} ** 12;
+    const filt: [12]f32 = @splat(0);
     const act: Activation = .{
         .log_alpha = @constCast(&la),
         .log_beta = @constCast(&lb),

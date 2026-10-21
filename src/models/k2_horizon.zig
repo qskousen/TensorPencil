@@ -152,7 +152,7 @@ pub const Model = struct {
         const T = struct {
             fn add(list: *std.ArrayList(Weight), a: std.mem.Allocator, w: ?Weight, comptime fmt: []const u8, args: anytype) !void {
                 var t = w orelse return;
-                t.tag = try std.fmt.allocPrint(a, fmt, args);
+                t.tag = try a.print(fmt, args);
                 try list.append(a, t);
             }
         };
@@ -233,7 +233,7 @@ fn loadLayer(a: std.mem.Allocator, g: *const Gguf, cfg: Config, l: usize) !Layer
     var buf: [96]u8 = undefined;
     const name = struct {
         fn f(b: []u8, layer: usize, suffix: []const u8) ![]const u8 {
-            return std.fmt.bufPrint(b, "layers.{d}.{s}", .{ layer, suffix });
+            return std.mem.print(b, "layers.{d}.{s}", .{ layer, suffix });
         }
     }.f;
     const sparse = cfg.n_experts > 0 and l >= cfg.dense_layers;

@@ -417,8 +417,8 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, ctx: *Context) void {
-        inline for (@typeInfo(Workspace).@"struct".fields) |f| {
-            if (f.type == DeviceBuffer) ctx.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Workspace).@"struct".field_names, @typeInfo(Workspace).@"struct".field_types) |name, FieldType| {
+            if (FieldType == DeviceBuffer) ctx.tensorDestroy(&@field(self, name));
         }
         for (self.skips) |*s| ctx.tensorDestroy(s);
         self.gpa.free(self.skips);

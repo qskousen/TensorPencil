@@ -18,8 +18,9 @@ pub fn of(comptime T: type) T {
 /// Apply `T`'s declared field defaults in place, leaving the rest undefined.
 pub fn applyTo(v: anytype) void {
     const T = @typeInfo(@TypeOf(v)).pointer.child;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (f.defaultValue()) |d| @field(v, f.name) = d;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, FieldType, attrs| {
+        if (attrs.defaultValue(FieldType)) |d| @field(v, name) = d;
     }
 }
 

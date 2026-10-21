@@ -111,7 +111,7 @@ pub fn conv2d(
         .extent_h = if (mode == .upsample2x) oh else h,
         .out_w = ow,
         .first = 0,
-        .mode = @intFromEnum(mode),
+        .mode = @backingInt(mode),
     };
     // The patch gathered straight into the GEMM's 16-bit operand, unless an activation
     // capture needs the f32 patch the GEMM is equivalent to.
@@ -140,7 +140,7 @@ pub fn conv2d(
             .u4 = @intCast(if (mode == .upsample2x) oh else h),
             .u5 = @intCast(p0),
             .u6 = @intCast(ow),
-            .f0 = @floatFromInt(@intFromEnum(mode)),
+            .f0 = @floatFromInt(@backingInt(mode)),
         }, bn * patch_len, 1, 1);
         // Per band; the accumulator sums over rows (see sd_unet_cuda).
         try lin_gpu.probeInput(ctx, patch.*, bn, cv.gemmWeight());

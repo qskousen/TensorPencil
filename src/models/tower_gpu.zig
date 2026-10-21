@@ -139,7 +139,7 @@ pub const Scope = struct {
 /// that runs this after an encode leaves nothing resident under the LLM, and no cache
 /// entry keyed on a host pointer its owner may free.
 pub fn evictModel(ctx: *gpu.Context, model: anytype) void {
-    inline for (@typeInfo(@TypeOf(model.*)).@"struct".fields) |f| evictField(ctx, &@field(model.*, f.name));
+    inline for (@typeInfo(@TypeOf(model.*)).@"struct".field_names) |name| evictField(ctx, &@field(model.*, name));
 }
 
 fn evictField(ctx: *gpu.Context, p: anytype) void {

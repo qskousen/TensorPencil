@@ -49,15 +49,18 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    // Flush on the ERROR path too. The `flush` at the bottom of this function is
-    // never reached when a subcommand returns, so every "print a diagnostic then
-    // return the error" site printed into a buffer that was thrown away, and the
-    // user saw a bare stack trace instead of the sentence explaining it.
+    // Flush on the error path too, or a diagnostic printed before returning an
+    // error is lost and the user sees only a stack trace.
     defer stdout.flush() catch {};
-    // A forward that checks its own output aborts the device check it runs in.
-    errdefer |err| if (err == error.NonFiniteActivation) if (test_act) |a|
-        stdout.print("FAILED: a device forward went non-finite at --act {t}\n", .{a}) catch {};
+    runCommand(arena, io, args, gpa, stdout) catch |err| {
+        // A forward that checks its own output aborts the device check it runs in.
+        if (err == error.NonFiniteActivation) if (test_act) |a|
+            stdout.print("FAILED: a device forward went non-finite at --act {t}\n", .{a}) catch {};
+        return err;
+    };
+}
 
+fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa: std.mem.Allocator, stdout: *Io.Writer) !void {
     // In a device check the CPU side is the reference. Below `small_m_max` rows the
     // CPU block-quant GEMM also quantizes the activation (ggml's vec_dot), which on an
     // outlier-heavy model made the reference itself several percent off.
@@ -2032,7 +2035,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 ops.norm.groupNorm(want, x, ch, groups, cat[0..ch], cat[ch..], 1e-5);
                 if (silu) ops.act.silu(want);
                 var name_buf: [64]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buf, "group_norm mean={d:.0} silu={}", .{ mean, silu });
+                const name = try std.mem.print(&name_buf, "group_norm mean={d:.0} silu={}", .{ mean, silu });
                 try rep.check(name, want, got, if (mean == 0) 2e-6 else 2e-4);
             }
         }
@@ -2262,11 +2265,11 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
 
             try be.opAttnCrossNaive(a_d, b_d, c_d, d_d, s.n, ctx_seq, s.heads, s.hd, scale);
             try be.tensorDownload(d_d, std.mem.sliceAsBytes(got));
-            try rep.check(try std.fmt.bufPrint(&name_buf, "attn_cross naive (q={d}, kv=77, hd={d})", .{ s.n, s.hd }), want, got, 1e-5);
+            try rep.check(try std.mem.print(&name_buf, "attn_cross naive (q={d}, kv=77, hd={d})", .{ s.n, s.hd }), want, got, 1e-5);
 
             try be.opAttnCross(a_d, b_d, c_d, d_d, s.n, ctx_seq, s.heads, s.hd, scale);
             try be.tensorDownload(d_d, std.mem.sliceAsBytes(got));
-            try rep.check(try std.fmt.bufPrint(&name_buf, "attn_cross tensor-core (q={d}, kv=77, hd={d})", .{ s.n, s.hd }), want, got, 3e-3);
+            try rep.check(try std.mem.print(&name_buf, "attn_cross tensor-core (q={d}, kv=77, hd={d})", .{ s.n, s.hd }), want, got, 3e-3);
         }
     }
 
@@ -2409,7 +2412,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 .head_dim = cse.hd,
             });
             var name_buf: [64]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "self attention hd={d} heads={d} (runs at {d})", .{ cse.hd, cse.heads, hp });
+            const name = try std.mem.print(&name_buf, "self attention hd={d} heads={d} (runs at {d})", .{ cse.hd, cse.heads, hp });
             // f16 tensor cores on a seq-length reduction.
             try rep.check(name, want, got, 5e-3);
         }
@@ -2464,7 +2467,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                     .head_dim = ch,
                 });
                 var name_buf: [72]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buf, "vae mid attention seq={d} hd=512 (x{d:.0})", .{ n, mag });
+                const name = try std.mem.print(&name_buf, "vae mid attention seq={d} hd=512 (x{d:.0})", .{ n, mag });
                 // The x8 arm is looser BY MEASUREMENT, not to make it pass: scores
                 // grow with |q|*|k|, so an f16 GEMM feeding a softmax lands at ~6e-3
                 // relative at every seq length tested (1.0 holds 6e-4). What this arm
@@ -2530,7 +2533,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 try ops.conv.conv2d(io, arena, want, in, h, w, cv);
             }
             var name_buf: [80]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "conv 3x3 {t} (im2col_sd + f16 GEMM)", .{mode});
+            const name = try std.mem.print(&name_buf, "conv 3x3 {t} (im2col_sd + f16 GEMM)", .{mode});
             try rep.check(name, want, got, 2e-3);
 
             // The same convolution with 16-bit activation STORAGE on both sides, which
@@ -2560,7 +2563,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 try be.tensorDownload(d_d, std.mem.sliceAsBytes(oh16));
                 const goth = try arena.alloc(f32, oh * ow * co);
                 for (oh16, goth) |v, *o| o.* = bits.from(v);
-                const nameh = try std.fmt.bufPrint(&name_buf, "conv 3x3 {t} {t} storage", .{ mode, dt });
+                const nameh = try std.mem.print(&name_buf, "conv 3x3 {t} {t} storage", .{ mode, dt });
                 try rep.check(nameh, want, goth, tol);
             }
         }
@@ -2696,7 +2699,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 try clip_text_cuda.encodePrompt(&enc, be, io, arena, got, &p, dev_run, act);
 
                 var name_buf: [96]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buf, "clip_text_cuda {s} {t} {t} (2 chunks, weighted)", .{ tw.name, act, mode });
+                const name = try std.mem.print(&name_buf, "clip_text_cuda {s} {t} {t} (2 chunks, weighted)", .{ tw.name, act, mode });
                 // f16 tensor-core GEMMs against an f32 CPU forward over 12/32 layers,
                 // the same regime as the whole-UNet check below, and the per-kernel
                 // checks above are what pin the arithmetic.
@@ -2747,7 +2750,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             // arithmetic, this pins the wiring.
             var name: [64]u8 = undefined;
             try rep.check(
-                try std.fmt.bufPrint(&name, "sd_unet_cuda.forward (SD1.5, {d}x{d} latent)", .{ lat_h, lat_w }),
+                try std.mem.print(&name, "sd_unet_cuda.forward (SD1.5, {d}x{d} latent)", .{ lat_h, lat_w }),
                 want,
                 got,
                 checkTol(2e-2),
@@ -2798,7 +2801,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 const got = try sd_vae_cuda.decode(&dec, be, ref_gpa, z, lat_h, lat_w, null, test_act);
                 defer ref_gpa.free(got);
                 var name_buf: [80]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buf, "sd_vae_cuda.decode ({d}x{d} latent, z x{d:.1})", .{ lat_h, lat_w, mag });
+                const name = try std.mem.print(&name_buf, "sd_vae_cuda.decode ({d}x{d} latent, z x{d:.1})", .{ lat_h, lat_w, mag });
                 try rep.check(name, want, got, checkTol(5e-3));
             }
         }
@@ -3059,7 +3062,7 @@ fn teArm(stdout: *Io.Writer, comptime R: type, name: []const u8, act: TensorPenc
 /// `<prefix>.<arm>.f32`, raw little-endian f32, or nothing when `prefix` is empty.
 fn dumpF32(io: Io, arena: std.mem.Allocator, prefix: []const u8, arm: []const u8, data: []const f32) !void {
     if (prefix.len == 0) return;
-    const path = try std.fmt.allocPrint(arena, "{s}.{s}.f32", .{ prefix, arm });
+    const path = try arena.print("{s}.{s}.f32", .{ prefix, arm });
     var f = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
     var buf: [1 << 16]u8 = undefined;
@@ -3441,7 +3444,7 @@ fn sensenovaArmTest(
             const got = try arena.alloc(f32, x.len);
             try arm.forward(model, dev, &sess, &ws, io, arena, got, x, t, null);
             if (quantized) {
-                const label = try std.fmt.allocPrint(arena, "forward {d}x{d} ({s})", .{ h, w, if (naive) "naive attn" else "tc attn" });
+                const label = try arena.print("forward {d}x{d} ({s})", .{ h, w, if (naive) "naive attn" else "tc attn" });
                 try checkQuantNoise(stdout, &failures, label, exact, emulated, weight_only, got);
                 continue;
             }
@@ -3585,7 +3588,7 @@ fn renderParams(
         opts.seed,
         w,
         h,
-        std.fs.path.stem(opts.dit_path),
+        std.Io.Dir.path.stem(opts.dit_path),
         img.family,
         opts.sampler,
         opts.scheduler,
@@ -3599,7 +3602,7 @@ fn renderParams(
     var loras: std.ArrayList(TensorPencil.pipeline.LoraRecord) = .empty;
     defer loras.deinit(arena);
     for (opts.loras) |l| try loras.append(arena, .{
-        .name = std.fs.path.stem(l.path),
+        .name = std.Io.Dir.path.stem(l.path),
         .hash = hashes.autoV2(arena, io, l.path),
         .strength = l.strength,
     });
@@ -3607,14 +3610,14 @@ fn renderParams(
     // A VAE baked into the checkpoint gets no field, as in A1111.
     const vae_path = if (img.sources.get(.decoder) == .side) opts.vae_path else "";
     return TensorPencil.pipeline.appendExtraParams(arena, base, .{
-        .clip1 = std.fs.path.stem(used(img.sources, .conditioner, opts.dit_path, opts.text_encoder_path)),
-        .clip2 = std.fs.path.stem(used(img.sources, .conditioner2, opts.dit_path, opts.text_encoder_2_path)),
-        .vae = std.fs.path.stem(vae_path),
+        .clip1 = std.Io.Dir.path.stem(used(img.sources, .conditioner, opts.dit_path, opts.text_encoder_path)),
+        .clip2 = std.Io.Dir.path.stem(used(img.sources, .conditioner2, opts.dit_path, opts.text_encoder_2_path)),
+        .vae = std.Io.Dir.path.stem(vae_path),
         .model_hash = hashes.autoV2(arena, io, opts.dit_path),
         .vae_hash = hashes.autoV2(arena, io, vae_path),
         .shift = img.shift,
         .weight_dtype = img.weight_dtype,
-        .act_dtype = if (img.acts) |a| try std.fmt.allocPrint(arena, "{f}", .{a}) else "",
+        .act_dtype = if (img.acts) |a| try arena.print("{f}", .{a}) else "",
         // Only when moved off ComfyUI's defaults, so an ordinary block is
         // unchanged and an overridden one re-renders.
         .eta = if (opts.eta != 1.0) opts.eta else null,
@@ -3862,9 +3865,9 @@ fn mageflowBench(
     try arm.forward(&model, be, &sess, &ws, io, arena, out, x_lat, sigma, null);
     be.profile = false;
     var tot: f64 = 0;
-    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@intFromEnum(cat)];
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@backingInt(cat)];
     inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
-        const i = @intFromEnum(cat);
+        const i = @backingInt(cat);
         const ms = be.prof.ms[i];
         try stdout.print("  {s:<7} {d:>8.1} ms  {d:>5.1}%  ({d} launches)\n", .{
             @tagName(cat), ms, if (tot == 0) 0 else 100 * ms / tot, be.prof.n[i],
@@ -4072,9 +4075,9 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     try den.predict(gpa, v, x, sigmas[1], null);
     be.profile = false;
     var tot: f64 = 0;
-    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@intFromEnum(cat)];
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@backingInt(cat)];
     inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
-        const ci = @intFromEnum(cat);
+        const ci = @backingInt(cat);
         const ms = be.prof.ms[ci];
         if (be.prof.n[ci] != 0) try stdout.print("  {s:<12} {d:>8.1} ms  {d:>5.1}%  ({d} launches)\n", .{ @tagName(cat), ms, if (tot == 0) 0 else 100 * ms / tot, be.prof.n[ci] });
     }
@@ -4178,9 +4181,9 @@ fn mageVaeArmTest(
     for ([_]Dt{ .f32, .f16, .bf16 }) |act| {
         const tol: f64 = if (act == .f32) 1e-3 else std.math.inf(f64);
         const got_cod = try arm.codForward(model, dev, arena, z, lat_h, lat_w, act);
-        try checkRel(stdout, &failures, try std.fmt.allocPrint(arena, "cod conditioning {t}", .{act}), want_cod, got_cod, tol);
+        try checkRel(stdout, &failures, try arena.print("cod conditioning {t}", .{act}), want_cod, got_cod, tol);
         const got = try arm.decode(model, dev, io, arena, z, lat_h, lat_w, act, null);
-        try checkRel(stdout, &failures, try std.fmt.allocPrint(arena, "decode (whole) {t}", .{act}), want, got, tol);
+        try checkRel(stdout, &failures, try arena.print("decode (whole) {t}", .{act}), want, got, tol);
     }
     try summarize(stdout, failures);
 }
@@ -4729,7 +4732,7 @@ fn qwenImage21Checks(comptime arm: type, device: anytype, emu: anytype, stdout: 
         defer arm.force_attn_f32 = false;
         defer arm.force_weight_only = false;
         const ex = try run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
-        for (names, in.exact, ex) |n, e, g| try checkRel(stdout, failures, try std.fmt.allocPrint(arena, "{s} (f32 attention)", .{n}), e, g, checkTol(1e-4));
+        for (names, in.exact, ex) |n, e, g| try checkRel(stdout, failures, try arena.print("{s} (f32 attention)", .{n}), e, g, checkTol(1e-4));
     }
     if (!emu.quantizes()) {
         const got = try run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
@@ -4740,7 +4743,7 @@ fn qwenImage21Checks(comptime arm: type, device: anytype, emu: anytype, stdout: 
     const wo = run(in.model, device, io, arena, in.lat, in.ctxv, in.seq_txt, in.sigmas, in.x_lat);
     arm.force_weight_only = false;
     const wog = try wo;
-    for (names, in.exact, wog) |n, e, g| try checkRel(stdout, failures, try std.fmt.allocPrint(arena, "{s} (weight-only)", .{n}), e, g, in.tol);
+    for (names, in.exact, wog) |n, e, g| try checkRel(stdout, failures, try arena.print("{s} (weight-only)", .{n}), e, g, in.tol);
     const q = try arena.alloc(f32, in.x_lat.len);
     {
         emu.install();
@@ -4811,11 +4814,11 @@ fn mossImageTeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, te: []c
     var failures: usize = 0;
     for (0..2) |p| {
         var kb: [16]u8 = undefined;
-        const tv = try ref.require(try std.fmt.bufPrint(&kb, "tokens.{d}", .{p}));
+        const tv = try ref.require(try std.mem.print(&kb, "tokens.{d}", .{p}));
         const raw = std.mem.bytesAsSlice(i32, tv.bytes);
         const ids = try arena.alloc(u32, raw.len);
         for (ids, raw) |*d, s| d.* = @intCast(s);
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "cond.{d}", .{p}))).toF32Alloc(arena);
+        const want = try (try ref.require(try std.mem.print(&kb, "cond.{d}", .{p}))).toF32Alloc(arena);
         std.debug.assert(want.len == ids.len * hidden);
         try stdout.print("prompt {d}: {d} tokens\n", .{ p, ids.len });
 
@@ -4883,9 +4886,9 @@ fn mossImageCudaProf(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt:
     try arm.forward(&model, be, &sess, &ws, io, arena, out, x, sigma, null);
     be.profile = false;
     var tot: f64 = 0;
-    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@intFromEnum(cat)];
+    inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@backingInt(cat)];
     inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
-        const i = @intFromEnum(cat);
+        const i = @backingInt(cat);
         try stdout.print("  {s:<7} {d:>8.1} ms  {d:>5.1}%  ({d} launches)\n", .{ @tagName(cat), be.prof.ms[i], if (tot == 0) 0 else 100 * be.prof.ms[i] / tot, be.prof.n[i] });
     }
 }
@@ -5687,7 +5690,7 @@ fn dualGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         }
         const mb: f64 = @floatFromInt(w.len);
         var shape_buf: [32]u8 = undefined;
-        try stdout.print("{t:<6} {s:>14} {d:8.0} {d:8.0} {d:8.0} {d:8.0}\n", .{ dt, try std.fmt.bufPrint(&shape_buf, "{d}x{d}", .{ sh.rows, sh.cols }), mb / us[0] / 1e3, mb / us[1] / 1e3, mb / us[2] / 1e3, mb / us[3] / 1e3 });
+        try stdout.print("{t:<6} {s:>14} {d:8.0} {d:8.0} {d:8.0} {d:8.0}\n", .{ dt, try std.mem.print(&shape_buf, "{d}x{d}", .{ sh.rows, sh.cols }), mb / us[0] / 1e3, mb / us[1] / 1e3, mb / us[2] / 1e3, mb / us[3] / 1e3 });
     };
     try stdout.flush();
 }
@@ -5822,8 +5825,8 @@ fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         for (xh) |*v| v.* = rnd.floatNorm(f32);
         try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(xh));
 
-        try stdout.print("\n=== {s} ===\n{s:<11} {s:>10} {s:>10} {s:>10} {s:>11} {s:>8}\n", .{
-            sh.who, "dtype", "1-per-submit", "batched", "GB/s", "Gelem/s", "MiB",
+        try stdout.print("\n=== {s} ===\n{s:<11} {s:>10} {s:>10} {s:>10} {s:>11} {s:>8} {s:>10}\n", .{
+            sh.who, "dtype", "1-per-submit", "batched", "GB/s", "Gelem/s", "MiB", "q8 batched",
         });
         for (dts) |dt| {
             // Random block bytes with the scales pinned, not a real quantization:
@@ -5850,13 +5853,20 @@ fn vkGemvBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
             const args = .{ ctx, dt, y_d, @as(usize, 0), x_d, @as([]const u8, q), @as(f32, 1.0), sh.rows, sh.cols };
             const ms = try T.run(false, gpu.Context.opGemvQuantDual, args);
             const bms = try T.run(true, gpu.Context.opGemvQuantDual, args);
-            try stdout.print("{s:<11} {d:7.3} ms {d:7.3} ms {d:9.1} {d:11.1} {d:8.0}\n", .{
+            // The decode path: the activation quantized to q8_1 once, the `_sdot` GEMV
+            // on it (where the device has OpSDot).
+            const q8ms: f64 = if (ctx.has_int_dot) q8: {
+                try ctx.opGemvQuantizeX(x_d, sh.cols);
+                break :q8 try T.run(true, gpu.Context.opGemvQuantDualQ8, .{ ctx, dt, y_d, @as(usize, 0), @as([]const u8, q), @as(f32, 1.0), sh.rows, sh.cols });
+            } else std.math.nan(f64);
+            try stdout.print("{s:<11} {d:7.3} ms {d:7.3} ms {d:9.1} {d:11.1} {d:8.0} {d:7.3} ms\n", .{
                 @tagName(dt),
                 ms,
                 bms,
                 @as(f64, @floatFromInt(q.len)) / (bms * 1e-3) / 1e9,
                 @as(f64, @floatFromInt(sh.rows * sh.cols)) / (bms * 1e-3) / 1e9,
                 @as(f64, @floatFromInt(q.len)) / (1 << 20),
+                q8ms,
             });
         }
     }
@@ -7225,7 +7235,7 @@ fn wanVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize, v
         fn convAb(out: *Io.Writer, io_: Io, a: std.mem.Allocator, name: []const u8, ctx: anytype) !void {
             const patch = &TensorPencil.gpu.dual_table.force_conv_patch;
             defer patch.* = false;
-            var best = [_][2]f64{.{ std.math.inf(f64), std.math.inf(f64) }} ** 2;
+            var best: [2][2]f64 = @splat(@splat(std.math.inf(f64)));
             for (0..4) |_| for ([_]Dt{ .f32, .f16 }, 0..) |act, ai| for (0..2) |pi| {
                 patch.* = pi == 1;
                 const t0 = std.Io.Clock.real.now(io_);
@@ -7664,7 +7674,7 @@ fn dumpCoopSpv(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, dir: []cons
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer d.close(io);
     for (shaders) |s| {
-        const name = try std.fmt.allocPrint(arena, "{s}.spv", .{s.name});
+        const name = try arena.print("{s}.spv", .{s.name});
         try d.writeFile(io, .{ .sub_path = name, .data = s.code });
         try stdout.print("wrote {s} ({d} bytes)\n", .{ name, s.code.len });
     }
@@ -7832,7 +7842,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     // never printed at all.
     var sync_total: f64 = 0;
     inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| {
-        const i = @intFromEnum(cat);
+        const i = @backingInt(cat);
         const name = switch (cat) {
             .attn => "attn(g/s)",
             .attn_scores => "  scores",
@@ -8154,7 +8164,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             if (std.mem.eql(u8, flag, "--te-act")) opts.te_act = a else if (std.mem.eql(u8, flag, "--vae-act")) opts.vae_act = a else opts.dit_act = a;
         } else if (std.mem.eql(u8, flag, "--inject-nonfinite")) {
             // DIAGNOSTIC: <component>:<dtype>, exercises the precision fallback.
-            const colon = std.mem.indexOfScalar(u8, val, ':') orelse return error.InvalidArgs;
+            const colon = std.mem.findScalar(u8, val, ':') orelse return error.InvalidArgs;
             TensorPencil.precision.inject = .{
                 .component = std.meta.stringToEnum(TensorPencil.precision.Component, val[0..colon]) orelse return error.InvalidArgs,
                 .act = std.meta.stringToEnum(TensorPencil.pipeline.Act, val[colon + 1 ..]) orelse return error.InvalidArgs,
@@ -8318,7 +8328,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             var png: std.ArrayList(u8) = .empty;
             defer png.deinit(arena);
             try TensorPencil.image.encodePngRgb(arena, &png, im.rgb, im.width, im.height);
-            const p = try std.fmt.allocPrint(arena, "{s}.{d}.png", .{ out_path, n });
+            const p = try arena.print("{s}.{d}.png", .{ out_path, n });
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = png.items });
             try stdout.print("[repeat] image {d}/{d} in {d:.1}s -> {s}\n", .{ n + 1, repeat, dt, p });
         }
@@ -8344,7 +8354,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         var ppng: std.ArrayList(u8) = .empty;
         defer ppng.deinit(arena);
         try TensorPencil.image.encodePngRgb(arena, &ppng, rgb, cap.w, cap.h);
-        const ppath = try std.fmt.allocPrint(arena, "{s}.preview.png", .{out_path});
+        const ppath = try arena.print("{s}.preview.png", .{out_path});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = ppng.items });
         try stdout.print("wrote {s} ({d}x{d}) [taew preview]\n", .{ ppath, cap.w, cap.h });
     }
@@ -8489,7 +8499,7 @@ test "the clip muxer writes an MP4 through the linked FFmpeg" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir);
-    const path = try std.fmt.allocPrintSentinel(gpa, "{s}{c}clip.mp4", .{ dir, std.fs.path.sep }, 0);
+    const path = try gpa.printSentinel("{s}{c}clip.mp4", .{ dir, std.Io.Dir.path.sep }, 0);
     defer gpa.free(path);
 
     const w = 64;
@@ -8531,7 +8541,7 @@ test "the clip muxer writes an MP4 through the linked FFmpeg" {
 /// The strength is split from the RIGHT and only taken as one if it parses as a
 /// float, so a path that happens to contain a colon still resolves as a path.
 fn parseLoraSpec(arg: []const u8) TensorPencil.pipeline.LoraSpec {
-    if (std.mem.lastIndexOfScalar(u8, arg, ':')) |c| {
+    if (std.mem.findScalarLast(u8, arg, ':')) |c| {
         if (std.fmt.parseFloat(f32, arg[c + 1 ..])) |v| {
             return .{ .path = arg[0..c], .strength = v };
         } else |_| {}
@@ -8822,7 +8832,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         var fi: usize = 0;
         while (true) : (fi += 1) {
             var nb: [512]u8 = undefined;
-            const fp = try std.fmt.bufPrint(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
+            const fp = try std.mem.print(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
             const img = loadPng(gpa, io, fp) catch break;
             try frames.append(gpa, img);
         }
@@ -8888,7 +8898,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         var fi: usize = 0;
         while (true) : (fi += 1) {
             var nb: [512]u8 = undefined;
-            const fp = try std.fmt.bufPrint(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
+            const fp = try std.mem.print(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
             const img = loadPng(gpa, io, fp) catch break;
             try cont_frames.append(gpa, img);
         }
@@ -8897,7 +8907,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
             return error.BadArgs;
         }
         var ab: [512]u8 = undefined;
-        const ap = try std.fmt.bufPrint(&ab, "{s}/audio.wav", .{dir_path});
+        const ap = try std.mem.print(&ab, "{s}/audio.wav", .{dir_path});
         cont_wave = loadWav(gpa, io, ap) catch null;
         try stdout.print("continue from: {s} ({d} frames, {d}x{d}{s}), preserving {d}\n", .{
             dir_path,                    cont_frames.items.len,                                       cont_frames.items[0].width,
@@ -8935,7 +8945,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
     // with `MuxOpenFailed`, having done all the work.
     if (frames_only) {
         try dir.createDirPath(io, out_stem);
-    } else if (std.fs.path.dirname(out_stem)) |parent| {
+    } else if (std.Io.Dir.path.dirname(out_stem)) |parent| {
         try dir.createDirPath(io, parent);
     }
     var buf: [512]u8 = undefined;
@@ -8943,7 +8953,7 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
     // The AUTOMATIC1111 `parameters` block, in the container's own metadata. The
     // same builder the GUI writes into a PNG text chunk, because a reader
     // re-renders from it and two copies of the format would drift.
-    const model_name = std.fs.path.stem(opts.dit_path);
+    const model_name = std.Io.Dir.path.stem(opts.dit_path);
     const params_base = try pipeline.buildA1111Params(
         gpa,
         clip_opts.prompt,
@@ -8964,11 +8974,11 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
     );
     const params = try pipeline.appendClipParams(gpa, params_base, sess.clipShifts(clip_opts));
     defer gpa.free(params);
-    const params_z = try gpa.dupeZ(u8, params);
+    const params_z = try gpa.dupeSentinel(u8, params, 0);
     defer gpa.free(params_z);
 
     if (!frames_only) {
-        const mp4 = try std.fmt.bufPrintZ(&buf, "{s}.mp4", .{out_stem});
+        const mp4 = try std.mem.printSentinel(&buf, "{s}.mp4", .{out_stem}, 0);
         var mux = av.Muxer.open(mp4, .{
             .width = clip.width,
             .height = clip.height,
@@ -8997,13 +9007,13 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         try TensorPencil.image.encodePngRgbText(gpa, &png, clip.frame(f), clip.width, clip.height, &.{
             .{ .keyword = "parameters", .text = params },
         });
-        const path = try std.fmt.bufPrint(&buf, "{s}/frame_{d:0>5}.png", .{ out_stem, f });
+        const path = try std.mem.print(&buf, "{s}/frame_{d:0>5}.png", .{ out_stem, f });
         try dir.writeFile(io, .{ .sub_path = path, .data = png.items });
     }
     if (clip.hasAudio()) {
         const wav = try TensorPencil.audio.encodeWavPcm16(gpa, clip.audio, clip.audio_channels, clip.audio_sample_rate);
         defer gpa.free(wav);
-        const path = try std.fmt.bufPrint(&buf, "{s}/audio.wav", .{out_stem});
+        const path = try std.mem.print(&buf, "{s}/audio.wav", .{out_stem});
         try dir.writeFile(io, .{ .sub_path = path, .data = wav });
     }
     try stdout.print("wrote {s}/\n", .{out_stem});
@@ -9709,7 +9719,7 @@ fn loraMergeCheck(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []
         // must be handed back before the next one is made.
         const gpa = std.heap.smp_allocator;
         var chk = pipeline.SdMergeCheck.init(gpa, io, &ck, &files) catch |err| {
-            try stdout.print("{s}: FAILED ({t})\n", .{ std.fs.path.basename(path), err });
+            try stdout.print("{s}: FAILED ({t})\n", .{ std.Io.Dir.path.basename(path), err });
             failures += 1;
             continue;
         };
@@ -9721,7 +9731,7 @@ fn loraMergeCheck(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []
             per[ci] = ov.patch.count();
         };
         try stdout.print("{s}: {t}, {d} keys -> {d} tensors (unet {d}, clip_l {d}, clip_g {d}), {d} MB, {d} file keys, {d:.2}s\n", .{
-            std.fs.path.basename(path), chk.family, mg.applied[0], mg.tensors, per[0], per[1], per[2], mg.bytes >> 20, lc.store().names().len, dt,
+            std.Io.Dir.path.basename(path), chk.family, mg.applied[0], mg.tensors, per[0], per[1], per[2], mg.bytes >> 20, lc.store().names().len, dt,
         });
         if (dump_path) |dp| try dumpMerged(arena, io, dp, mg, dump_names.items);
         try stdout.flush();
@@ -10447,7 +10457,7 @@ fn velocityDiff(io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
     for ([2][]const f32{ want, got }, 0..) |side, si| for (side) |v| {
         if (!std.math.isFinite(v)) bad[si] += 1 else mag[si] = @max(mag[si], @abs(v));
     };
-    try stdout.print("{s}: {t} at {t} vs cpu denoiser at sigma {d:.3}, {d}x{d}: rel L2 {e:.4}\n", .{ std.fs.path.stem(args[0]), device, dev_act, sigma, size, size, relL2f(want, got) });
+    try stdout.print("{s}: {t} at {t} vs cpu denoiser at sigma {d:.3}, {d}x{d}: rel L2 {e:.4}\n", .{ std.Io.Dir.path.stem(args[0]), device, dev_act, sigma, size, size, relL2f(want, got) });
     if (bad[0] + bad[1] != 0) try stdout.print("  non-finite: cpu {d}/{d} (max |v| {d:.3}), {t} {d}/{d} (max |v| {d:.3})\n", .{ bad[0], n, mag[0], device, bad[1], n, mag[1] });
     try stdout.flush();
 }
@@ -10806,7 +10816,7 @@ fn linVkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, shape: [3]usi
             if (arm.llm_m == 0) p.dense = arm.dense;
             const r = l.routeAt(p, c.w, mm) orelse continue;
             if (arm.staged and l.stageScale(p, &.{c.w}, mm) == null) continue;
-            const key = @as(u64, @intFromEnum(arm.input)) << 44 | @as(u64, @intFromBool(arm.staged)) << 42 | @as(u64, @intFromEnum(arm.store)) << 40 | @as(u64, @intFromEnum(r)) << 16 | @as(u64, @intFromBool(n != rows)) << 15 | @as(u64, @intFromBool(c.w.convrot != 0)) << 14 | @as(u64, @intFromBool(mm > 4)) << 13 | @as(u64, @intFromEnum(c.w.dtype)) << 2 | @as(u64, wi) << 48;
+            const key = @as(u64, @backingInt(arm.input)) << 44 | @as(u64, @intFromBool(arm.staged)) << 42 | @as(u64, @backingInt(arm.store)) << 40 | @as(u64, @backingInt(r)) << 16 | @as(u64, @intFromBool(n != rows)) << 15 | @as(u64, @intFromBool(c.w.convrot != 0)) << 14 | @as(u64, @intFromBool(mm > 4)) << 13 | @as(u64, @backingInt(c.w.dtype)) << 2 | @as(u64, wi) << 48;
             if ((try seen.getOrPut(arena, key)).found_existing) continue;
             try lin_gpu.presize(ctx, p, &.{c.w});
             for ([2]?[]const f32{ null, bias }, [2][]f32{ y0, y1 }) |b, dst| {
@@ -11270,7 +11280,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             }
             const r = lin_cuda.routeAt(p, c.w, mm) orelse continue;
             // One row per distinct route, shape and arm of the f16 dense dispatch.
-            const key = @as(u64, @intFromEnum(arm.input)) << 42 | @as(u64, @intFromEnum(arm.store)) << 40 | @as(u64, @intFromEnum(r)) << 16 | @as(u64, @intFromBool(n != rows)) << 15 | @as(u64, @intFromBool(c.w.convrot != 0)) << 14 | @as(u64, @intFromEnum(c.w.dtype)) << 2 | @as(u64, @intFromBool(arm.act16 == .bf16)) << 1 | @intFromBool(arm.dense == .f16) | @as(u64, wi) << 48;
+            const key = @as(u64, @backingInt(arm.input)) << 42 | @as(u64, @backingInt(arm.store)) << 40 | @as(u64, @backingInt(r)) << 16 | @as(u64, @intFromBool(n != rows)) << 15 | @as(u64, @intFromBool(c.w.convrot != 0)) << 14 | @as(u64, @backingInt(c.w.dtype)) << 2 | @as(u64, @intFromBool(arm.act16 == .bf16)) << 1 | @intFromBool(arm.dense == .f16) | @as(u64, wi) << 48;
             if ((try seen.getOrPut(arena, key)).found_existing) continue;
 
             try lin_cuda.presize(be, p, &.{c.w});
@@ -11541,7 +11551,7 @@ fn loraCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: boo
         }
         // Pointers into `per` only once it has stopped moving.
         for (per[0..ranks.len]) |*pr| {
-            var hit_list: std.ArrayListUnmanaged(lora.Stack.Hit) = .empty;
+            var hit_list: std.ArrayList(lora.Stack.Hit) = .empty;
             try hit_list.append(a, .{ .target = &pr.t, .file = 0 });
             try hit_list.append(a, .{ .target = &pr.t2, .file = 1 });
             try pr.stack.index.put(a, "bench.weight", hit_list);
@@ -11891,7 +11901,7 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
         var png: std.ArrayList(u8) = .empty;
         try TensorPencil.image.encodePngRgb(arena, &png, img.rgb, img.width, img.height);
         var name_buf: [96]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "scratch_out/lora_e2e_{d}_{s}.png", .{ size, vr.name });
+        const name = try std.mem.print(&name_buf, "scratch_out/lora_e2e_{d}_{s}.png", .{ size, vr.name });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = png.items });
         try stdout.print("  wrote {s}\n", .{name});
     }

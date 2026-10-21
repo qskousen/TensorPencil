@@ -1536,8 +1536,8 @@ const Bufs = struct {
         const hd_max = @max(cfg.head_dim_global, cfg.head_dim_local);
         var self: Bufs = undefined;
         var created: usize = 0;
-        errdefer inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-            if (i < created) be.tensorDestroy(&@field(self, f.name));
+        errdefer inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+            if (i < created) be.tensorDestroy(&@field(self, name));
         };
         const sizes = [_]usize{
             pc * cfg.hidden, // x
@@ -1557,16 +1557,16 @@ const Bufs = struct {
             cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_v
             cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
-        inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-            be.noteBuf(f.name, sizes[i] * 4);
-            @field(self, f.name) = try be.tensorCreate(sizes[i] * 4);
+        inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+            be.noteBuf(name, sizes[i] * 4);
+            @field(self, name) = try be.tensorCreate(sizes[i] * 4);
             created = i + 1;
         }
         return self;
     }
 
     fn deinit(self: *Bufs, be: *Backend) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| be.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| be.tensorDestroy(&@field(self, name));
         self.* = undefined;
     }
 };

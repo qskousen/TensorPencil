@@ -17,7 +17,7 @@ const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
+    return .{ .buf = @fromBackingInt(@intCast(@backingInt(b.buf) + off_bytes)), .mem = b.mem, .size = size };
 }
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {

@@ -1,6 +1,5 @@
 //! Shared definitions for the GPU matmul kernels, compiled to SPIR-V by the
-//! Zig self-hosted backend (build.zig: -target spirv64-vulkan -fno-llvm,
-//! SPIR-V 1.5).
+//! Zig self-hosted backend (build.zig: spirv64-vulkan, SPIR-V 1.4).
 //!
 //! y[m, rows] = x[m, cols] @ W^T (+ bias). The weight buffer holds W
 //! TRANSPOSED to k-major with the output dimension padded to a multiple of 4
@@ -15,7 +14,8 @@
 //!
 //! Array bounds below are type-level maxima, not allocations.
 
-pub const gpu = @import("std").gpu;
+const abi = @import("abi.zig");
+pub const gpu = @import("std").spirv;
 
 /// Outputs per thread: tm tokens x tn columns (tn a multiple of 4: each
 /// aligned u32 of the fp8 layout covers 4 columns). Must match Context in
@@ -36,46 +36,11 @@ pub const Push = extern struct {
     scale: f32,
 };
 
-pub extern var wbuf: WBuf addrspace(.storage_buffer);
-pub extern var xbuf: FBuf addrspace(.storage_buffer);
-pub extern var ybuf: FBuf addrspace(.storage_buffer);
-pub extern var bbuf: BBuf addrspace(.storage_buffer);
-pub extern var pc: Push addrspace(.push_constant);
-
-pub inline fn decorate() void {
-    asm volatile (
-        \\OpDecorate %wt Block
-        \\OpMemberDecorate %wt 0 Offset 0
-        \\OpDecorate %ft Block
-        \\OpMemberDecorate %ft 0 Offset 0
-        \\OpDecorate %bt Block
-        \\OpMemberDecorate %bt 0 Offset 0
-        \\OpDecorate %pt Block
-        \\OpMemberDecorate %pt 0 Offset 0
-        \\OpMemberDecorate %pt 1 Offset 4
-        \\OpMemberDecorate %pt 2 Offset 8
-        \\OpMemberDecorate %pt 3 Offset 12
-        \\OpMemberDecorate %pt 4 Offset 16
-        \\OpMemberDecorate %pt 5 Offset 20
-        \\OpDecorate %w DescriptorSet 0
-        \\OpDecorate %w Binding 0
-        \\OpDecorate %x DescriptorSet 0
-        \\OpDecorate %x Binding 1
-        \\OpDecorate %y DescriptorSet 0
-        \\OpDecorate %y Binding 2
-        \\OpDecorate %b DescriptorSet 0
-        \\OpDecorate %b Binding 3
-        :
-        : [wt] "t" (WBuf),
-          [ft] "t" (FBuf),
-          [bt] "t" (BBuf),
-          [pt] "t" (Push),
-          [w] "" (&wbuf),
-          [x] "" (&xbuf),
-          [y] "" (&ybuf),
-          [b] "" (&bbuf),
-    );
-}
+pub const wbuf = abi.buffer(WBuf, "wbuf", 0);
+pub const xbuf = abi.buffer(FBuf, "xbuf", 1);
+pub const ybuf = abi.buffer(FBuf, "ybuf", 2);
+pub const bbuf = abi.buffer(BBuf, "bbuf", 3);
+pub const pc = abi.pushConstants(Push, "pc");
 
 pub inline fn e4m3ToF32(byte: u32) f32 {
     const man = byte & 0x7;
@@ -96,7 +61,6 @@ pub inline fn e4m3ToF32(byte: u32) f32 {
 /// whole tile is out of range exit early; partial tiles read x with a
 /// clamped token index (always in bounds) and mask at the store.
 pub inline fn tiledMatmul(comptime f8: bool) void {
-    decorate();
     const col_base = gpu.global_invocation_id[0] * tn;
     const t_base = gpu.global_invocation_id[1] * tm;
     if (col_base >= pc.rows or t_base >= pc.m) return;

@@ -57,8 +57,8 @@ pub fn encodeVision(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io
         for ([_]usize{ 0, enc.layers.len - 1 }) |li| {
             const l = enc.layers[li];
             std.log.warn("layer {d}: q#{d} k#{d} v#{d} o#{d} gate#{d} up#{d} down#{d}", .{
-                li,                      @intFromEnum(l.q.dtype),    @intFromEnum(l.k.dtype),  @intFromEnum(l.v.dtype),
-                @intFromEnum(l.o.dtype), @intFromEnum(l.gate.dtype), @intFromEnum(l.up.dtype), @intFromEnum(l.down.dtype),
+                li,                     @backingInt(l.q.dtype),    @backingInt(l.k.dtype),  @backingInt(l.v.dtype),
+                @backingInt(l.o.dtype), @backingInt(l.gate.dtype), @backingInt(l.up.dtype), @backingInt(l.down.dtype),
             });
         }
     }
@@ -562,7 +562,7 @@ pub const VulkanLM = struct {
     pub fn warmWeights(self: *VulkanLM) void {
         if (self.len != 0) return;
         const n = @min(gemv_batch_max + 1, self.capacity);
-        const zeros = [_]u32{0} ** (gemv_batch_max + 1);
+        const zeros: [(gemv_batch_max + 1)]u32 = @splat(0);
         defer self.truncate(0);
         self.prefill(zeros[0..1]) catch |err| std.log.warn("qwen3 vulkan warm-up: {t}", .{err});
         self.truncate(0);

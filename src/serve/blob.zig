@@ -16,6 +16,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tp = @import("TensorPencil");
+const repeat = tp.strings.repeat;
 const link_mod = @import("link.zig");
 const httpc = @import("httpc.zig");
 const Blake3 = std.crypto.hash.Blake3;
@@ -84,9 +85,9 @@ pub const Manifest = struct {
 /// A file name and nothing else, of a kind the catalog would scan.
 pub fn nameOk(name: []const u8) bool {
     if (name.len == 0 or name.len > 255) return false;
-    if (!std.mem.eql(u8, std.fs.path.basename(name), name)) return false;
-    if (std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.eql(u8, name, "..") or std.mem.eql(u8, name, ".")) return false;
-    const ext = std.fs.path.extension(name);
+    if (!std.mem.eql(u8, std.Io.Dir.path.basename(name), name)) return false;
+    if (std.mem.findAny(u8, name, "/\\") != null or std.mem.eql(u8, name, "..") or std.mem.eql(u8, name, ".")) return false;
+    const ext = std.Io.Dir.path.extension(name);
     return std.ascii.eqlIgnoreCase(ext, ".safetensors") or std.ascii.eqlIgnoreCase(ext, ".gguf");
 }
 
@@ -170,7 +171,7 @@ pub const Store = struct {
     dir: []u8,
     partial_dir: []u8,
     mu: Io.Mutex = Io.Mutex.init,
-    transfers: [max_transfers]?*Transfer = .{null} ** max_transfers,
+    transfers: [max_transfers]?*Transfer = @splat(null),
 
     const Transfer = struct {
         arena: std.heap.ArenaAllocator,
@@ -196,7 +197,7 @@ pub const Store = struct {
     pub fn init(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Store {
         const d = try gpa.dupe(u8, dir);
         errdefer gpa.free(d);
-        const p = try std.fs.path.join(gpa, &.{ dir, "partial" });
+        const p = try std.Io.Dir.path.join(gpa, &.{ dir, "partial" });
         errdefer gpa.free(p);
         Io.Dir.cwd().createDirPath(io, p) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -267,7 +268,7 @@ pub const Store = struct {
         }
         const slot = self.freeSlot(t_now) orelse return error.TooManyTransfers;
 
-        const partial_path = std.fs.path.join(a, &.{ self.partial_dir, man.digest }) catch return error.OutOfMemory;
+        const partial_path = std.Io.Dir.path.join(a, &.{ self.partial_dir, man.digest }) catch return error.OutOfMemory;
         const existing = Io.Dir.cwd().statFile(self.io, partial_path, .{}) catch null;
         if (existing == null) {
             if (tp.diskspace.freeBytes(self.gpa, self.dir)) |free| {
@@ -336,7 +337,7 @@ pub const Store = struct {
     /// Reserve the space up front so ENOSPC lands now, not at chunk 1800.
     /// Linux only; elsewhere the file grows as chunks land.
     fn preallocate(io: Io, file: Io.File, size: u64, name: []const u8) void {
-        if (@import("builtin").os.tag == .linux) {
+        if (@import("builtin").target.os.tag == .linux) {
             const rc = std.os.linux.fallocate(file.handle, 0, 0, @intCast(size));
             if (std.posix.errno(rc) != .SUCCESS) log.warn("could not reserve {d} bytes for {s} ({t}); the file grows as chunks land", .{ size, name, std.posix.errno(rc) });
         } else {
@@ -499,7 +500,7 @@ pub const Store = struct {
         c.deinit();
         t.file.sync(self.io) catch return error.WriteFailed;
 
-        const final = std.fs.path.join(self.gpa, &.{ self.dir, t.man.name }) catch return error.OutOfMemory;
+        const final = std.Io.Dir.path.join(self.gpa, &.{ self.dir, t.man.name }) catch return error.OutOfMemory;
         errdefer self.gpa.free(final);
         // Claim the name with an exclusive create: two commits under one name
         // would otherwise both pass a stat and the second rename would replace
@@ -667,7 +668,7 @@ pub const Sender = struct {
         errdefer file.close(io);
         const size = (try file.stat(io)).size;
         if (size == 0) return error.EmptyFile;
-        const name = std.fs.path.basename(path);
+        const name = std.Io.Dir.path.basename(path);
         const built = try buildManifest(gpa, io, file, name, size, opts.chunk_bytes, opts.cancel, opts.progress);
         errdefer gpa.free(built.json);
         errdefer gpa.free(built.chunks);
@@ -749,7 +750,7 @@ pub const Sender = struct {
         var fba = std.heap.FixedBufferAllocator.init(self.scratch);
         var target_buf: [128]u8 = undefined;
         const have = blk: {
-            const target = try std.fmt.bufPrint(&target_buf, "/v1/blob/{s}/manifest", .{&self.hex});
+            const target = try std.mem.print(&target_buf, "/v1/blob/{s}/manifest", .{&self.hex});
             const resp = try httpc.requestInto(l, "POST", target, "application/json", self.man_json, fba.allocator(), 1 << 20);
             if (resp.status == 507) return error.InsufficientSpaceOnHost;
             if (resp.status == 503) return error.HostBusy;
@@ -769,7 +770,7 @@ pub const Sender = struct {
             const off = @as(u64, i) * self.opts.chunk_bytes;
             const len = self.chunkLen(i);
             try fr.seekTo(off);
-            const target = try std.fmt.bufPrint(&target_buf, "/v1/blob/{s}/chunk/{d}", .{ &self.hex, i });
+            const target = try std.mem.print(&target_buf, "/v1/blob/{s}/chunk/{d}", .{ &self.hex, i });
             _ = prog.puts.fetchAdd(1, .monotonic);
             if (cut.*) |at| if (done_bytes + len > at) {
                 // Half the chunk, then the wire goes away under us.
@@ -787,7 +788,7 @@ pub const Sender = struct {
             _ = prog.bytes_moved.fetchAdd(len, .monotonic);
         }
         prog.phase.store(.committing, .release);
-        const target = try std.fmt.bufPrint(&target_buf, "/v1/blob/{s}/commit", .{&self.hex});
+        const target = try std.mem.print(&target_buf, "/v1/blob/{s}/commit", .{&self.hex});
         const resp = try httpc.requestInto(l, "POST", target, "", "", fba.allocator(), 4096);
         return switch (resp.status) {
             200 => true,
@@ -832,7 +833,7 @@ pub const Offer = struct {
         const file = try Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
         const st = try file.stat(io);
-        const built = try buildManifest(gpa, io, file, std.fs.path.basename(path), st.size, chunk_bytes, null, null);
+        const built = try buildManifest(gpa, io, file, std.Io.Dir.path.basename(path), st.size, chunk_bytes, null, null);
         gpa.free(built.chunks); // the JSON carries them; a read needs neither
         errdefer gpa.free(built.json);
         const owned = try gpa.dupe(u8, path);
@@ -887,7 +888,7 @@ pub const Offers = struct {
     io: Io,
     chunk_bytes: u64 = default_chunk_bytes,
     mu: Io.Mutex = Io.Mutex.init,
-    slots: [max_transfers]?*Offer = .{null} ** max_transfers,
+    slots: [max_transfers]?*Offer = @splat(null),
 
     pub fn init(gpa: std.mem.Allocator, io: Io) Offers {
         return .{ .gpa = gpa, .io = io };
@@ -1047,7 +1048,7 @@ pub const Fetcher = struct {
         var fba = std.heap.FixedBufferAllocator.init(self.scratch);
         var target_buf: [320]u8 = undefined;
 
-        const target = try std.fmt.bufPrint(&target_buf, "/v1/pull/{s}/manifest", .{self.id});
+        const target = try std.mem.print(&target_buf, "/v1/pull/{s}/manifest", .{self.id});
         const resp = try httpc.requestInto(l, "GET", target, "", "", fba.allocator(), max_manifest_bytes);
         if (resp.status == 404) return error.HostDoesNotHaveIt;
         if (resp.status == 503) return error.HostBusy;
@@ -1075,7 +1076,7 @@ pub const Fetcher = struct {
         for (0..chunks) |i| {
             if (have.has(i)) continue;
             if (self.stopped()) return error.Cancelled;
-            const ct = try std.fmt.bufPrint(&target_buf, "/v1/pull/{s}/chunk/{d}", .{ self.id, i });
+            const ct = try std.mem.print(&target_buf, "/v1/pull/{s}/chunk/{d}", .{ self.id, i });
             _ = prog.puts.fetchAdd(1, .monotonic);
             try httpc.writeHead(l, "GET", ct, "", 0);
             try l.writer().flush();
@@ -1111,7 +1112,7 @@ pub fn writeTestModel(io: Io, dir: Io.Dir, name: []const u8, payload: usize, see
     std.debug.assert(payload % 4 == 0);
     const header = "{{\"w\":{{\"dtype\":\"F32\",\"shape\":[{d}],\"data_offsets\":[0,{d}]}}}}";
     var hbuf: [128]u8 = undefined;
-    const h = try std.fmt.bufPrint(&hbuf, header, .{ payload / 4, payload });
+    const h = try std.mem.print(&hbuf, header, .{ payload / 4, payload });
     const hlen = (h.len + 7) & ~@as(usize, 7);
     const f = try dir.createFile(io, name, .{});
     defer f.close(io);
@@ -1136,7 +1137,7 @@ pub fn writeTestModel(io: Io, dir: Io.Dir, name: []const u8, payload: usize, see
 }
 
 test "a manifest is checked before a byte moves" {
-    var m: Manifest = .{ .name = "a.safetensors", .size = 100, .chunk_bytes = min_chunk_bytes, .digest = "0" ** 64, .chunks = &.{"1" ** 64} };
+    var m: Manifest = .{ .name = "a.safetensors", .size = 100, .chunk_bytes = min_chunk_bytes, .digest = repeat("0", 64), .chunks = &.{repeat("1", 64)} };
     try m.validate();
     try testing.expectEqual(@as(usize, 1), m.chunkCount());
     try testing.expectEqual(@as(u64, 100), m.chunkLen(0));
@@ -1154,7 +1155,7 @@ test "a manifest is checked before a byte moves" {
     try testing.expectError(error.BadManifest, m.validate());
     // Both sizes come off the wire: the round-up must not overflow, and each
     // must be refused on its own.
-    m.chunks = &.{"1" ** 64};
+    m.chunks = &.{repeat("1", 64)};
     m.size = std.math.maxInt(u64);
     m.chunk_bytes = std.math.maxInt(u64);
     try testing.expectEqual(@as(usize, 1), m.chunkCount());
@@ -1177,7 +1178,7 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const store_dir = try std.fs.path.join(gpa, &.{ root, "models" });
+    const store_dir = try std.Io.Dir.path.join(gpa, &.{ root, "models" });
     defer gpa.free(store_dir);
     var store = try Store.init(gpa, io, store_dir);
     defer store.deinit();
@@ -1185,7 +1186,7 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     // A 3-chunk model file, hashed as a sender would.
     const cb: u64 = min_chunk_bytes;
     const total = try writeTestModel(io, tmp.dir, "m.safetensors", 2 * @as(usize, @intCast(cb)) + 1000, 7);
-    const src_path = try std.fs.path.join(gpa, &.{ root, "m.safetensors" });
+    const src_path = try std.Io.Dir.path.join(gpa, &.{ root, "m.safetensors" });
     defer gpa.free(src_path);
     var hashed: Progress = .{};
     var s = try Sender.init(gpa, io, src_path, .{ .chunk_bytes = cb, .progress = &hashed });
@@ -1199,7 +1200,7 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
 
     const have0 = try store.begin(s.man_json);
     defer gpa.free(have0);
-    try testing.expect(std.mem.indexOf(u8, have0, "\"ranges\":[]") != null);
+    try testing.expect(std.mem.find(u8, have0, "\"ranges\":[]") != null);
     try testing.expectError(error.Incomplete, store.commit(&s.hex));
 
     // Chunk 1 lands; chunk 0 with chunk 1's bytes is refused and not counted.
@@ -1214,7 +1215,7 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     try testing.expectError(error.BadChunk, store.writeChunk(&s.hex, 0, &short, 10, null));
     const have1 = try store.have(&s.hex);
     defer gpa.free(have1);
-    try testing.expect(std.mem.indexOf(u8, have1, "\"ranges\":[[1,2]]") != null);
+    try testing.expect(std.mem.find(u8, have1, "\"ranges\":[[1,2]]") != null);
 
     // The daemon restarts: a fresh store over the same directory learns chunk
     // 1 from the partial file alone (chunk 0 holds the wrong bytes).
@@ -1222,7 +1223,7 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     store = try Store.init(gpa, io, store_dir);
     const have2 = try store.begin(s.man_json);
     defer gpa.free(have2);
-    try testing.expect(std.mem.indexOf(u8, have2, "\"ranges\":[[1,2]]") != null);
+    try testing.expect(std.mem.find(u8, have2, "\"ranges\":[[1,2]]") != null);
 
     // The bulk path takes no allocator: with one that refuses everything, the
     // remaining chunks still land. This is what bounds a 15 GB transfer.
@@ -1252,8 +1253,8 @@ test "the store re-hashes a partial on resume and refuses a bad chunk, a short c
     try testing.expectError(error.NameTaken, store.commit(&s.hex));
 
     // Bytes that hash right but are not a container are refused at commit.
-    try tmp.dir.writeFile(io, .{ .sub_path = "junk.gguf", .data = "not a gguf at all, just bytes" ** 3000 });
-    const junk_path = try std.fs.path.join(gpa, &.{ root, "junk.gguf" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk.gguf", .data = repeat("not a gguf at all, just bytes", 3000) });
+    const junk_path = try std.Io.Dir.path.join(gpa, &.{ root, "junk.gguf" });
     defer gpa.free(junk_path);
     var js = try Sender.init(gpa, io, junk_path, .{ .chunk_bytes = cb });
     defer js.deinit();
@@ -1276,14 +1277,14 @@ test "a longer partial is cut to the manifest's size, and an abort during a chun
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const store_dir = try std.fs.path.join(gpa, &.{ root, "models" });
+    const store_dir = try std.Io.Dir.path.join(gpa, &.{ root, "models" });
     defer gpa.free(store_dir);
     var store = try Store.init(gpa, io, store_dir);
     defer store.deinit();
 
     const cb: u64 = min_chunk_bytes;
     const total = try writeTestModel(io, tmp.dir, "m.safetensors", 2 * @as(usize, @intCast(cb)) + 1000, 3);
-    const src_path = try std.fs.path.join(gpa, &.{ root, "m.safetensors" });
+    const src_path = try std.Io.Dir.path.join(gpa, &.{ root, "m.safetensors" });
     defer gpa.free(src_path);
     var s = try Sender.init(gpa, io, src_path, .{ .chunk_bytes = cb });
     defer s.deinit();
@@ -1292,7 +1293,7 @@ test "a longer partial is cut to the manifest's size, and an abort during a chun
 
     // A partial holding the whole file plus a tail: every chunk hashes right,
     // the tail is dropped, and the committed file is the sender's size.
-    const partial = try std.fs.path.join(gpa, &.{ store.partial_dir, &s.hex });
+    const partial = try std.Io.Dir.path.join(gpa, &.{ store.partial_dir, &s.hex });
     defer gpa.free(partial);
     {
         const f = try Io.Dir.cwd().createFile(io, partial, .{});
@@ -1305,7 +1306,7 @@ test "a longer partial is cut to the manifest's size, and an abort during a chun
     }
     const have0 = try store.begin(s.man_json);
     defer gpa.free(have0);
-    try testing.expect(std.mem.indexOf(u8, have0, "\"ranges\":[[0,3]]") != null);
+    try testing.expect(std.mem.find(u8, have0, "\"ranges\":[[0,3]]") != null);
     try testing.expectEqual(@as(u64, total), (try Io.Dir.cwd().statFile(io, partial, .{})).size);
     const final = try store.commit(&s.hex);
     defer gpa.free(final);
@@ -1329,7 +1330,7 @@ test "a longer partial is cut to the manifest's size, and an abort during a chun
     // Gone means gone: a fresh manifest opens a new, empty transfer.
     const have2 = try store.begin(s.man_json);
     defer gpa.free(have2);
-    try testing.expect(std.mem.indexOf(u8, have2, "\"ranges\":[]") != null);
+    try testing.expect(std.mem.find(u8, have2, "\"ranges\":[]") != null);
 }
 
 test "a full table evicts its idlest transfer, keeping the partial, and old partials are swept at init" {
@@ -1339,16 +1340,16 @@ test "a full table evicts its idlest transfer, keeping the partial, and old part
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const store_dir = try std.fs.path.join(gpa, &.{ root, "models" });
+    const store_dir = try std.Io.Dir.path.join(gpa, &.{ root, "models" });
     defer gpa.free(store_dir);
-    const partial_dir = try std.fs.path.join(gpa, &.{ store_dir, "partial" });
+    const partial_dir = try std.Io.Dir.path.join(gpa, &.{ store_dir, "partial" });
     defer gpa.free(partial_dir);
 
     // Two partials from before: one a week and a day old, one fresh.
     try Io.Dir.cwd().createDirPath(io, partial_dir);
-    const old_path = try std.fs.path.join(gpa, &.{ partial_dir, "0" ** 64 });
+    const old_path = try std.Io.Dir.path.join(gpa, &.{ partial_dir, repeat("0", 64) });
     defer gpa.free(old_path);
-    const new_path = try std.fs.path.join(gpa, &.{ partial_dir, "1" ** 64 });
+    const new_path = try std.Io.Dir.path.join(gpa, &.{ partial_dir, repeat("1", 64) });
     defer gpa.free(new_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = old_path, .data = "old" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = "new" });
@@ -1374,9 +1375,9 @@ test "a full table evicts its idlest transfer, keeping the partial, and old part
     };
     for (&senders, &paths, 0..) |*x, *p, i| {
         var name: [16]u8 = undefined;
-        const n = try std.fmt.bufPrint(&name, "m{d}.safetensors", .{i});
+        const n = try std.mem.print(&name, "m{d}.safetensors", .{i});
         _ = try writeTestModel(io, tmp.dir, n, @intCast(cb), 100 + i);
-        p.* = try std.fs.path.join(gpa, &.{ root, n });
+        p.* = try std.Io.Dir.path.join(gpa, &.{ root, n });
         errdefer gpa.free(p.*);
         x.* = try Sender.init(gpa, io, p.*, .{ .chunk_bytes = cb });
         opened += 1;
@@ -1400,5 +1401,5 @@ test "a full table evicts its idlest transfer, keeping the partial, and old part
     // The evicted partial is still there: sender 0 resumes with its chunk known.
     const back = try store.begin(senders[0].man_json);
     defer gpa.free(back);
-    try testing.expect(std.mem.indexOf(u8, back, "\"ranges\":[[0,1]]") != null);
+    try testing.expect(std.mem.find(u8, back, "\"ranges\":[[0,1]]") != null);
 }

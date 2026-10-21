@@ -42,7 +42,7 @@ pub fn readHead(r: *Io.Reader) Error!Head {
     while (true) {
         const line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
         if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.HttpHeadersInvalid;
+        const colon = std.mem.findScalar(u8, line, ':') orelse return error.HttpHeadersInvalid;
         const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
@@ -135,7 +135,7 @@ pub fn upgradeEvents(link: *Link, target: []const u8, extra: []const std.http.He
     var n = extra.len;
     var bearer: [7 + 64]u8 = undefined;
     if (link.auth) |c| {
-        _ = std.fmt.bufPrint(&bearer, "Bearer {s}", .{&link_mod.secretHex(c)}) catch unreachable;
+        _ = std.mem.print(&bearer, "Bearer {s}", .{&link_mod.secretHex(c)}) catch unreachable;
         hdrs[n] = .{ .name = "authorization", .value = &bearer };
         n += 1;
     }

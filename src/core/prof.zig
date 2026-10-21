@@ -8,23 +8,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Cat = enum { matmul, deltanet, conv, attention, rope, norm, act, embed, other };
-const n_cat = @typeInfo(Cat).@"enum".fields.len;
+const n_cat = @typeInfo(Cat).@"enum".field_names.len;
 
 pub var enabled: bool = false;
-var acc: [n_cat]u64 = [_]u64{0} ** n_cat;
-var calls: [n_cat]u64 = [_]u64{0} ** n_cat;
+var acc: [n_cat]u64 = @splat(0);
+var calls: [n_cat]u64 = @splat(0);
 
 pub inline fn tic() u64 {
     return if (enabled) nowNs() else 0;
 }
 pub inline fn toc(cat: Cat, t0: u64) void {
     if (!enabled) return;
-    acc[@intFromEnum(cat)] += nowNs() -| t0;
-    calls[@intFromEnum(cat)] += 1;
+    acc[@backingInt(cat)] += nowNs() -| t0;
+    calls[@backingInt(cat)] += 1;
 }
 pub fn reset() void {
-    acc = [_]u64{0} ** n_cat;
-    calls = [_]u64{0} ** n_cat;
+    acc = @splat(0);
+    calls = @splat(0);
 }
 pub fn report(w: *std.Io.Writer) !void {
     var total: u64 = 0;
@@ -32,9 +32,9 @@ pub fn report(w: *std.Io.Writer) !void {
     if (total == 0) return;
     const tf: f64 = @floatFromInt(total);
     try w.print("\n[cpu profile — non-overlapping buckets]\n", .{});
-    inline for (@typeInfo(Cat).@"enum".fields, 0..) |f, i| {
+    inline for (@typeInfo(Cat).@"enum".field_names, 0..) |name, i| {
         if (acc[i] > 0) try w.print("  {s:<10} {d:>8.1} ms  {d:>5.1}%  ({d} calls)\n", .{
-            f.name,
+            name,
             @as(f64, @floatFromInt(acc[i])) / 1e6,
             100.0 * @as(f64, @floatFromInt(acc[i])) / tf,
             calls[i],
@@ -43,11 +43,11 @@ pub fn report(w: *std.Io.Writer) !void {
     try w.print("  {s:<10} {d:>8.1} ms\n", .{ "TOTAL", tf / 1e6 });
 }
 
-/// Monotonic nanoseconds, io-free (`std.time.Timer` is gone in 0.16 and
+/// Monotonic nanoseconds, io-free (`std.time.Timer` is gone and
 /// `std.Io.Clock` needs an `Io` the callers here do not have). Shared with the
 /// CUDA backend and the benchmarks, which all time regions the same way.
 pub fn monoNs() u64 {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         var freq: u64 = undefined;
         var counter: u64 = undefined;
         _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(@ptrCast(&freq));

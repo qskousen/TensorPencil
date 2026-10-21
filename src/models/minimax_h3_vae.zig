@@ -115,7 +115,7 @@ pub const Config = struct {
         var n_layers: usize = 0;
         while (true) : (n_layers += 1) {
             var buf: [96]u8 = undefined;
-            const nm = std.fmt.bufPrint(&buf, "decoder.transformer_blocks.{d}.norm1.weight", .{n_layers}) catch break;
+            const nm = std.mem.print(&buf, "decoder.transformer_blocks.{d}.norm1.weight", .{n_layers}) catch break;
             if (store.get(nm) == null) break;
         }
 
@@ -251,7 +251,7 @@ const L = struct {
 
     fn mat(l: L, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [128]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         const view = l.store.get(nm) orelse {
             std.log.err("minimax_h3_vae: missing tensor {s}", .{nm});
             return error.MissingTensor;
@@ -269,7 +269,7 @@ const L = struct {
 
     fn vec(l: L, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
         var buf: [128]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         const view = l.store.get(nm) orelse {
             std.log.err("minimax_h3_vae: missing tensor {s}", .{nm});
             return error.MissingTensor;

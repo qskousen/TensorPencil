@@ -25,6 +25,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const tp_core = @import("tp_core");
+const repeat = tp_core.strings.repeat;
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
@@ -168,7 +169,7 @@ pub const TextEncoder = struct {
 
         const l: Loader = .{ .store = store, .alloc = alloc, .pfx = prefix, .cfg = cfg };
 
-        const emb_name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, switch (cfg.naming) {
+        const emb_name = try alloc.print("{s}{s}", .{ prefix, switch (cfg.naming) {
             .hf => "embeddings.token_embedding.weight",
             .open_clip => "token_embedding.weight",
         } });
@@ -940,7 +941,7 @@ pub const TinyCheckpoint = struct {
 
         const add = struct {
             fn f(g: std.mem.Allocator, ns: *std.ArrayList([]const u8), ss: *std.ArrayList([2]usize), comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !void {
-                try ns.append(g, try std.fmt.allocPrint(g, fmt, args));
+                try ns.append(g, try g.print(fmt, args));
                 try ss.append(g, .{ rows, cols });
             }
         }.f;
@@ -1040,7 +1041,7 @@ const cond_prompts = [_][]const u8{
     "",
     "a (red:0) cat",
     "a (red:2.0) cat",
-    "masterpiece, " ++ ("very detailed cat portrait, " ** 25) ++ "(sunset:1.4)",
+    "masterpiece, " ++ repeat("very detailed cat portrait, ", 25) ++ "(sunset:1.4)",
 };
 
 /// Relative L2 of `got` against `want`, which is the figure these tolerances are in:
@@ -1088,7 +1089,7 @@ test "SD1.5 weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" 
 
     for (cond_cases, cond_prompts) |name, text| {
         var buf: [64]u8 = undefined;
-        const want = try ref.get(try std.fmt.bufPrint(&buf, "sd15.{s}.cond", .{name})).?.toF32Alloc(gpa);
+        const want = try ref.get(try std.mem.print(&buf, "sd15.{s}.cond", .{name})).?.toF32Alloc(gpa);
         defer gpa.free(want);
 
         var p = try tok.encodeWeighted(gpa, text, tp_core.clip_tokenizer.eos_id);
@@ -1145,9 +1146,9 @@ test "SDXL weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" {
 
     for (cond_cases, cond_prompts) |name, text| {
         var buf: [64]u8 = undefined;
-        const want = try ref.get(try std.fmt.bufPrint(&buf, "sdxl.{s}.cond", .{name})).?.toF32Alloc(gpa);
+        const want = try ref.get(try std.mem.print(&buf, "sdxl.{s}.cond", .{name})).?.toF32Alloc(gpa);
         defer gpa.free(want);
-        const want_pooled = try ref.get(try std.fmt.bufPrint(&buf, "sdxl.{s}.pooled", .{name})).?.toF32Alloc(gpa);
+        const want_pooled = try ref.get(try std.mem.print(&buf, "sdxl.{s}.pooled", .{name})).?.toF32Alloc(gpa);
         defer gpa.free(want_pooled);
 
         var pl = try tok.encodeWeighted(gpa, text, tp_core.clip_tokenizer.eos_id);

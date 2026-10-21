@@ -324,7 +324,7 @@ pub const ChatTemplate = struct {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
         self.renderString(gpa, opts.*, &out) catch return false;
-        return std.mem.indexOf(u8, out.items, needle) != null;
+        return std.mem.find(u8, out.items, needle) != null;
     }
 };
 
@@ -859,9 +859,9 @@ test "chat_template: prior-turn thoughts are stripped, current turn primed" {
 
     errdefer std.debug.print("rendered:\n{s}\n", .{out.items});
     // The past assistant turn keeps only its answer; the thought is gone.
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "long private reasoning") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<|channel>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Hello!") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "long private reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "<|channel>") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "Hello!") != null);
     // Ends primed for the model to answer the latest user turn.
     try std.testing.expect(std.mem.endsWith(u8, out.items, "<|turn>model\n"));
 }
@@ -904,15 +904,15 @@ test "chat_template: K2 Horizon's template renders a tool declaration" {
     defer out.deinit(gpa);
     try ct.renderString(gpa, .{ .messages = &msgs, .tools = &decls, .bos_token = "<|ifm|begin_of_text|>", .enable_thinking = false, .reasoning_effort = "high" }, &out);
     errdefer std.debug.print("rendered:\n{s}\n", .{out.items});
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tools>\n## generate_image\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "- `prompt` *(string, required)* - What to draw") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tool_call>$FUNCTION_NAME\n<ifm|arg_key>$PARAMETER_NAME</ifm|arg_key>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "<ifm|tools>\n## generate_image\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "- `prompt` *(string, required)* - What to draw") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "<ifm|tool_call>$FUNCTION_NAME\n<ifm|arg_key>$PARAMETER_NAME</ifm|arg_key>") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>") != null);
     // Thinking on at medium effort primes the fast marker, like chat.openAssistant.
     out.clearRetainingCapacity();
     try ct.renderString(gpa, .{ .messages = &msgs, .bos_token = "<|ifm|begin_of_text|>", .enable_thinking = true, .reasoning_effort = "medium" }, &out);
     try std.testing.expect(std.mem.endsWith(u8, out.items, "<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<ifm|tools>") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "<ifm|tools>") == null);
 }
 
 // Real GGUF: the actual gemma4 embedded template + tokenizer. Proves the fix
@@ -948,8 +948,8 @@ test "chat_template: real gemma4 GGUF strips prior thoughts from the token strea
     const text = try tok.decodeAlloc(gpa, ids.items);
     defer gpa.free(text);
     errdefer std.debug.print("decoded prompt:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.indexOf(u8, text, "SECRETPRIORREASONING") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Hello there!") != null);
+    try std.testing.expect(std.mem.find(u8, text, "SECRETPRIORREASONING") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Hello there!") != null);
 }
 
 // Gemma 4 gates thinking on a `<|think|>` cue that lives in the SYSTEM turn, so
@@ -985,7 +985,7 @@ test "chat_template: gemma4 thinking cue survives an absent system message" {
         defer gpa.free(text);
         errdefer std.debug.print("enable_thinking={} rendered:\n{s}\n", .{ think, text });
 
-        const has_cue = std.mem.indexOf(u8, text, "<|think|>") != null;
+        const has_cue = std.mem.find(u8, text, "<|think|>") != null;
         const primed_closed = std.mem.endsWith(u8, text, "<|channel>thought\n<channel|>");
         try std.testing.expectEqual(think, has_cue);
         try std.testing.expectEqual(!think, primed_closed);
@@ -1030,7 +1030,7 @@ test "chat_template: gemma4 canonical template honors enable_thinking" {
         defer gpa.free(text);
         errdefer std.debug.print("enable_thinking={} rendered:\n{s}\n", .{ think, text });
 
-        const has_cue = std.mem.indexOf(u8, text, "<|think|>") != null;
+        const has_cue = std.mem.find(u8, text, "<|think|>") != null;
         const primed_closed = std.mem.endsWith(u8, text, "<|channel>thought\n<channel|>");
         try std.testing.expectEqual(think, has_cue);
         try std.testing.expectEqual(!think, primed_closed);
@@ -1117,7 +1117,7 @@ test "chat_template: gemma4 image placeholder expands to the real block at the r
     for (got.items[r .. r + n_rows]) |t| try std.testing.expectEqual(exp.pad, t);
     try std.testing.expectEqual(close, got.items[r + n_rows]);
     // No bare placeholder token survives the expansion.
-    try std.testing.expect(std.mem.indexOfScalar(u32, got.items, exp.placeholder) == null);
+    try std.testing.expect(std.mem.findScalar(u32, got.items, exp.placeholder) == null);
 }
 
 // Task #4 (gemma3): the gemma3 template's image branch emits a single

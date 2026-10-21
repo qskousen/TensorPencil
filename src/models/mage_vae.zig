@@ -315,7 +315,7 @@ pub const MageVae = struct {
     /// Whether this store holds a Mage-VAE at all.
     pub fn fits(store: WeightStore, prefix: []const u8) bool {
         var buf: [200]u8 = undefined;
-        const nm = std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, probe }) catch return false;
+        const nm = std.mem.print(&buf, "{s}{s}", .{ prefix, probe }) catch return false;
         return store.get(nm) != null;
     }
 
@@ -922,7 +922,7 @@ const Loader = struct {
 
     fn has(l: Loader, rel: []const u8) bool {
         var buf: [200]u8 = undefined;
-        const nm = std.fmt.bufPrint(&buf, "{s}{s}", .{ l.pfx, rel }) catch return false;
+        const nm = std.mem.print(&buf, "{s}{s}", .{ l.pfx, rel }) catch return false;
         return l.store.get(nm) != null;
     }
 
@@ -1021,7 +1021,7 @@ const Loader = struct {
 
     fn dico(l: Loader, comptime fmt: []const u8, args: anytype, ch: usize, modulated: bool) !DiCo {
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         const inner = 4 * ch;
         return .{
             .adaln = if (modulated) try l.linear("{s}.adaLN_modulation.1", .{base}, 6 * ch, ch) else null,
@@ -1040,7 +1040,7 @@ const Loader = struct {
 
     fn resnet(l: Loader, comptime fmt: []const u8, args: anytype) !Resnet {
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         return .{
             .norm1 = try l.norm("{s}.norm1", .{base}, hidden),
             .conv1 = try l.conv("{s}.conv1", .{base}, hidden, hidden, 3, 1, 1),
@@ -1051,7 +1051,7 @@ const Loader = struct {
 
     fn winAttn(l: Loader, comptime fmt: []const u8, args: anytype) !WinAttn {
         var buf: [200]u8 = undefined;
-        const base = try std.fmt.bufPrint(&buf, fmt, args);
+        const base = try std.mem.print(&buf, fmt, args);
         return .{
             .norm = try l.norm("{s}.norm", .{base}, hidden),
             .q = try l.conv("{s}.q", .{base}, hidden, hidden, 1, 1, 0),
@@ -1155,7 +1155,7 @@ test "Mage-VAE matches ComfyUI on the real codec" {
     var kb: [64]u8 = undefined;
     const key = struct {
         fn f(buf: []u8, c: []const u8, suffix: []const u8) []const u8 {
-            return std.fmt.bufPrint(buf, "{s}.{s}", .{ c, suffix }) catch unreachable;
+            return std.mem.print(buf, "{s}.{s}", .{ c, suffix }) catch unreachable;
         }
     }.f;
 

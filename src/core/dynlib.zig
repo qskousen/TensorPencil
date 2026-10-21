@@ -1,6 +1,6 @@
 //! Runtime library loading for the GPU backends and NVML.
 //!
-//! `std.DynLib` has no Windows arm in 0.16, so this wraps it and supplies one.
+//! `std.DynLib` has no Windows arm, so this wraps it and supplies one.
 //! The surface is deliberately the same three calls the backends already used
 //! (`open` / `lookup` / `close`), plus `openFirst`, because every caller has a
 //! list of names to try: a soname, an unversioned fallback, sometimes an
@@ -19,10 +19,10 @@ const max_name = 512;
 pub const Lib = struct {
     inner: Inner,
 
-    const Inner = if (builtin.os.tag == .windows) windows.HMODULE else std.DynLib;
+    const Inner = if (builtin.target.os.tag == .windows) windows.HMODULE else std.DynLib;
 
     pub fn open(name: []const u8) Error!Lib {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             var buf: [max_name]u16 = undefined;
             const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], name) catch
                 return error.LibraryNotFound;
@@ -42,7 +42,7 @@ pub const Lib = struct {
     }
 
     pub fn lookup(self: *Lib, comptime T: type, name: [:0]const u8) ?T {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             const p = GetProcAddress(self.inner, name.ptr) orelse return null;
             return @constCast(@ptrCast(@alignCast(p)));
         }
@@ -50,7 +50,7 @@ pub const Lib = struct {
     }
 
     pub fn close(self: *Lib) void {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             _ = FreeLibrary(self.inner);
             return;
         }

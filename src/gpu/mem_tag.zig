@@ -58,16 +58,16 @@ test "count covers every tag" {
     // `mem_tag_used` is `[count]usize` indexed by `@intFromEnum`, so a tag added
     // without bumping `count` indexes past the end of that array on its first
     // allocation. Cheaper to catch here than as memory corruption on a GPU box.
-    try std.testing.expectEqual(@typeInfo(MemTag).@"enum".fields.len, MemTag.count);
+    try std.testing.expectEqual(@typeInfo(MemTag).@"enum".field_names.len, MemTag.count);
     // And the values must stay dense from 0, since that indexing assumes it.
-    inline for (@typeInfo(MemTag).@"enum".fields, 0..) |f, i| {
-        try std.testing.expectEqual(i, f.value);
+    inline for (@typeInfo(MemTag).@"enum".field_values, 0..) |value, i| {
+        try std.testing.expectEqual(i, value);
     }
 }
 
 test "every tag has a label" {
-    inline for (@typeInfo(MemTag).@"enum".fields) |f| {
-        const t: MemTag = @enumFromInt(f.value);
+    inline for (@typeInfo(MemTag).@"enum".field_values) |value| {
+        const t: MemTag = @fromBackingInt(value);
         try std.testing.expect(t.name().len > 0);
     }
 }

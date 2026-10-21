@@ -15,7 +15,7 @@
 
 Working list for reworking Vulkan compute kernels that were built around the
 assumption that shared/workgroup memory is unusable. That assumption is a
-**Zig-0.16-SPIR-V-codegen** limitation, not a hardware/driver one — see below —
+**Zig-SPIR-V-codegen** limitation (found on 0.16), not a hardware/driver one — see below —
 and there's a **verified escape hatch: subgroup ops** (no workgroup storage
 class needed).
 

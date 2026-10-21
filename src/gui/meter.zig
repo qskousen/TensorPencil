@@ -204,8 +204,8 @@ pub fn render(m: *Model, a: Actions) void {
         .min_size_content = .{ .h = track_h },
         .max_size_content = .height(track_h),
         .background = true,
-        .color_fill = P.sunken,
-        .corner_radius = style.R.track,
+        .color_fill = .{ .color = P.sunken },
+        .corners = style.R.track,
         .margin = .{ .h = 5 },
     });
     const wd = track.data();
@@ -228,7 +228,7 @@ pub fn render(m: *Model, a: Actions) void {
 
 fn seg(r: dvui.Rect.Physical, x: f32, w: f32, c: C) void {
     if (w <= 0) return;
-    (dvui.Rect.Physical{ .x = x, .y = r.y, .w = w, .h = r.h }).fill(.{}, .{ .color = c });
+    (dvui.Rect.Physical{ .x = x, .y = r.y, .w = w, .h = r.h }).fill(.{}, .{ .color = .{ .color = c } });
 }
 
 /// The rail says only "sys | LLM | free | diffusion", derived by summing the
@@ -281,9 +281,9 @@ fn drawTrack(m: *Model, g: Geom, r: dvui.Rect.Physical, scale: f32) void {
 /// A handle is a 2px stem with a grip. Amber for the reserve (a machine limit),
 /// blue for the split (a value the user sets).
 fn handle(r: dvui.Rect.Physical, hx: f32, c: C) void {
-    (dvui.Rect.Physical{ .x = hx - 1, .y = r.y - 3, .w = 2, .h = r.h + 6 }).fill(.{}, .{ .color = c });
+    (dvui.Rect.Physical{ .x = hx - 1, .y = r.y - 3, .w = 2, .h = r.h + 6 }).fill(.{}, .{ .color = .{ .color = c } });
     (dvui.Rect.Physical{ .x = hx - 3.5, .y = r.y + r.h / 2 - 6, .w = 7, .h = 12 })
-        .fill(dvui.Rect.Physical.all(2), .{ .color = c });
+        .fill(.round(2), .{ .color = .{ .color = c } });
 }
 
 // ------------------------------------------------------------------- legend
@@ -303,7 +303,7 @@ const Item = struct {
     w: f32 = 0,
 };
 
-fn legend(src: std.builtin.SourceLocation, m: *Model, a: Actions) void {
+fn legend(src: std.lang.SourceLocation, m: *Model, a: Actions) void {
     var row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal });
     defer row.deinit();
 
@@ -335,7 +335,7 @@ fn legend(src: std.builtin.SourceLocation, m: *Model, a: Actions) void {
     const llm_total = vram_split.totalText(&tbuf, "LLM", m.llmTotal(), m.llm_host, "cpu", .{ m.llm_host_layers, m.llm_layers });
     const dif_total = vram_split.totalText(&dbuf, "DIFFUSION", m.difTotal(), m.diff_off, "stream", null);
     const free_b = m.freeBytes();
-    const free_txt = std.fmt.bufPrint(&fbuf, "{d:.1}G free", .{gib(free_b)}) catch "";
+    const free_txt = std.mem.print(&fbuf, "{d:.1}G free", .{gib(free_b)}) catch "";
 
     // Fixed cost: the two totals with their arrows, the free readout, the four
     // control buttons, and the gaps around them.
@@ -383,7 +383,7 @@ fn legend(src: std.builtin.SourceLocation, m: *Model, a: Actions) void {
         dvui.labelNoFmt(@src(), free_txt, .{}, .{
             .font = F.mono_legend,
             // The one place the bar shouts: nearly out of card.
-            .color_text = if (free_b < (2 << 30)) P.amber else P.text_ghost,
+            .color_text = .{ .color = if (free_b < (2 << 30)) P.amber else P.text_ghost },
             .gravity_x = 0.5,
             .gravity_y = 0.5,
             .padding = .{},
@@ -407,45 +407,45 @@ fn legend(src: std.builtin.SourceLocation, m: *Model, a: Actions) void {
 fn entry(buf: []u8, c: C, name: []const u8, bytes: u64, loaded: bool, suffix: ?[]const u8, importance: u8) Item {
     const present = loaded and bytes >= (1 << 20);
     const text = if (!present)
-        std.fmt.bufPrint(buf, "{s} —", .{name}) catch name
+        std.mem.print(buf, "{s} —", .{name}) catch name
     else if (suffix) |sfx|
-        std.fmt.bufPrint(buf, "{s} {d:.1}G · {s}", .{ name, gib(bytes), sfx }) catch name
+        std.mem.print(buf, "{s} {d:.1}G · {s}", .{ name, gib(bytes), sfx }) catch name
     else
-        std.fmt.bufPrint(buf, "{s} {d:.1}G", .{ name, gib(bytes) }) catch name;
+        std.mem.print(buf, "{s} {d:.1}G", .{ name, gib(bytes) }) catch name;
     // swatch (6) + its gap (5) + the entry's own trailing margin (8)
     return .{ .color = c, .text = text, .importance = importance, .present = present, .w = F.mono_legend.textSize(text).w + 19 };
 }
 
-fn drawItem(src: std.builtin.SourceLocation, id: usize, it: Item) void {
+fn drawItem(src: std.lang.SourceLocation, id: usize, it: Item) void {
     var b = dvui.box(src, .{ .dir = .horizontal }, .{ .id_extra = id, .gravity_y = 0.5, .margin = .{ .w = 8 } });
     defer b.deinit();
     style.swatch(@src(), if (it.present) it.color else style.over(P.chrome, it.color, 0.28));
     dvui.labelNoFmt(@src(), it.text, .{}, .{
         .font = F.mono_legend,
-        .color_text = if (it.present) P.text_dim else P.text_ghost,
+        .color_text = .{ .color = if (it.present) P.text_dim else P.text_ghost },
         .padding = .{},
         .gravity_y = 0.5,
     });
 }
 
 /// A group total, with the arrow pointing the way its side grows.
-fn total(src: std.builtin.SourceLocation, text: []const u8, c: C, side: enum { left, right }) void {
+fn total(src: std.lang.SourceLocation, text: []const u8, c: C, side: enum { left, right }) void {
     var b = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5, .margin = .{ .x = 6, .w = 10 } });
     defer b.deinit();
     if (side == .right) arrow(@src(), "←", c);
     dvui.labelNoFmt(@src(), text, .{}, .{
         .font = F.mono_val,
-        .color_text = c,
+        .color_text = .{ .color = c },
         .padding = .{},
         .gravity_y = 0.5,
     });
     if (side == .left) arrow(@src(), "→", c);
 }
 
-fn arrow(src: std.builtin.SourceLocation, glyph: []const u8, c: C) void {
+fn arrow(src: std.lang.SourceLocation, glyph: []const u8, c: C) void {
     dvui.labelNoFmt(src, glyph, .{}, .{
         .font = F.mono_val,
-        .color_text = c,
+        .color_text = .{ .color = c },
         .padding = .{},
         .margin = .{ .x = 4, .w = 4 },
         .gravity_y = 0.5,
@@ -454,8 +454,8 @@ fn arrow(src: std.builtin.SourceLocation, glyph: []const u8, c: C) void {
 
 /// "823", "3.2k", "128k".
 fn fmtTokens(buf: []u8, n: usize) []const u8 {
-    if (n >= 1000) return std.fmt.bufPrint(buf, "{d:.1}k", .{@as(f64, @floatFromInt(n)) / 1000.0}) catch "?";
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "?";
+    if (n >= 1000) return std.mem.print(buf, "{d:.1}k", .{@as(f64, @floatFromInt(n)) / 1000.0}) catch "?";
+    return std.mem.print(buf, "{d}", .{n}) catch "?";
 }
 
 // ------------------------------------------------------------------ controls
@@ -468,12 +468,12 @@ fn eject(id: usize, loaded: bool, armed: bool, hint_text: []const u8) bool {
         .min_size_content = .{ .w = 13, .h = 13 },
         .margin = .{ .x = 2, .w = 2 },
         .padding = dvui.Rect.all(3),
-        .corner_radius = style.R.chip,
+        .corners = style.R.chip,
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .color_text = if (armed) P.amber else if (loaded) P.text_faint else P.text_ghost,
-        .color_border = if (armed) P.amber else null,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .color_text = .{ .color = if (armed) P.amber else if (loaded) P.text_faint else P.text_ghost },
+        .color_border = if (armed) .{ .color = P.amber } else null,
         .border = if (armed) dvui.Rect.all(1) else .{},
         .data_out = &wd,
     });
@@ -498,12 +498,12 @@ fn pauseBtn(id: usize, paused: bool, hint_text: []const u8) bool {
         .min_size_content = .{ .w = 13, .h = 13 },
         .margin = .{ .x = 2, .w = 2 },
         .padding = dvui.Rect.all(3),
-        .corner_radius = style.R.chip,
+        .corners = style.R.chip,
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .color_text = if (paused) (if (lit) P.amber else style.over(P.chrome, P.amber, 0.35)) else P.text_faint,
-        .color_border = if (paused) P.amber else null,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .color_text = .{ .color = if (paused) (if (lit) P.amber else style.over(P.chrome, P.amber, 0.35)) else P.text_faint },
+        .color_border = if (paused) .{ .color = P.amber } else null,
         .border = if (paused) dvui.Rect.all(1) else .{},
         .data_out = &wd,
     });
@@ -538,14 +538,14 @@ fn handleDrag(m: *Model, a: Actions, wd: *dvui.WidgetData, crs: dvui.RectScale) 
                 if (dragging != null) {
                     e.handled = true;
                     dvui.captureMouse(wd, e.num);
-                    dvui.dragPreStart(me.p, .{});
+                    dvui.dragPreStart(me.button, me.p, .{});
                 }
             },
             // Move by the per-event DELTA, never by absolute cursor position, so
             // the handle tracks from where the drag started and cannot jump.
             .motion => |delta| {
                 if (!dvui.captured(wd.id) or dragging == null) continue;
-                if (dvui.dragging(me.p, null) == null) continue; // past the click threshold
+                if (dvui.dragging(me, null) == null) continue; // past the click threshold
                 e.handled = true;
                 dragBy(m, delta.x / r.w);
                 a.on_change();

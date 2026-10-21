@@ -551,7 +551,7 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
     return b.build(
         "igemm_smem",
@@ -983,7 +983,7 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
     const params = if (fuse)
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias"
@@ -2227,9 +2227,9 @@ fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const p_lo = if (experts) try b.reg(.pred) else "";
     const p_hi = if (experts) try b.reg(.pred) else "";
     const r_loc = if (experts) try b.reg(.b32) else "";
-    const g_lo = if (experts) try std.fmt.allocPrint(alloc, "@{s} ", .{p_lo}) else "";
+    const g_lo = if (experts) try alloc.print("@{s} ", .{p_lo}) else "";
     defer if (experts) alloc.free(g_lo);
-    const g_hi = if (experts) try std.fmt.allocPrint(alloc, "@{s} ", .{p_hi}) else "";
+    const g_hi = if (experts) try alloc.print("@{s} ", .{p_hi}) else "";
     defer if (experts) alloc.free(g_hi);
     var mi2: usize = 0;
     while (mi2 < MT) : (mi2 += 1) {
@@ -2272,7 +2272,7 @@ fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
     const name = if (experts) "hgemm_experts" else if (attnout and a_f32) "hgemm_attnout_a32" else if (attnout) "hgemm_attnout" else if (batched and c_f16) "hgemm_batched_c16" else if (batched) "hgemm_batched" else "hgemm";
     const batched_params = "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u32 p_sa,\n    .param .u32 p_sb,\n    .param .u32 p_sc,\n    .param .f32 p_scale";
@@ -2687,8 +2687,8 @@ pub const softmax_md_f16_ptx: [:0]const u8 = ptx.preamble ++
 /// absent OR appears twice, so a kernel derived this way cannot silently drift from
 /// its source when the source is edited.
 fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
-    if (std.mem.indexOf(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
+    const i = std.mem.find(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
+    if (std.mem.find(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
     return src[0..i] ++ to ++ src[i + from.len ..];
 }
 
@@ -4169,7 +4169,7 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
         try b.label(l_skip1);
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{sh_bytes});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{sh_bytes});
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_q4_k",
@@ -4358,7 +4358,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
     defer b.deinit();
     var tuning_buf: [64]u8 = undefined;
     if (ctas_per_sm != 0)
-        b.tuning = std.fmt.bufPrint(&tuning_buf, ".maxntid 128, 1, 1\n.minnctapersm {d}", .{ctas_per_sm}) catch unreachable;
+        b.tuning = std.mem.print(&tuning_buf, ".maxntid 128, 1, 1\n.minnctapersm {d}", .{ctas_per_sm}) catch unreachable;
 
     const acc = try b.regs(.f32, MT * NT * 4);
     const af = try b.regs(.b32, MT * 4);
@@ -4948,7 +4948,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
         kq.entry(),
@@ -5278,7 +5278,7 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q8_0",
@@ -5682,7 +5682,7 @@ fn buildMmqPipeQ6KMode(alloc: std.mem.Allocator, comptime experts: bool) ![:0]u8
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
         if (experts) "mmq_pipe_q6_k_experts" else "mmq_pipe_q6_k",
@@ -6078,7 +6078,7 @@ pub fn buildGdnDeltaChunk(alloc: std.mem.Allocator, d: usize) ![:0]u8 {
     try b.comment("state column -> memory (once per chunk)", .{});
     for (0..d) |i| try b.linef("st.global.f32 [{s}+{d}], {s};", .{ rd_scol, i * d * 4, s[i] });
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 4 .b8 sk[{d}];\n    .shared .align 4 .b8 sq[{d}];", .{ d * 4, d * 4 });
+    const shared_decl = try alloc.print(".shared .align 4 .b8 sk[{d}];\n    .shared .align 4 .b8 sq[{d}];", .{ d * 4, d * 4 });
     defer alloc.free(shared_decl);
     return b.build(
         "gdn_delta_chunk",
@@ -6629,9 +6629,9 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
         }
     }
 
-    const entry_name = try std.fmt.allocPrint(alloc, "mmq_pipe_q2_0_{s}", .{g.tag});
+    const entry_name = try alloc.print("mmq_pipe_q2_0_{s}", .{g.tag});
     defer alloc.free(entry_name);
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
         entry_name,
@@ -7069,7 +7069,7 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
         }
     }
 
-    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q1_0",
@@ -7265,8 +7265,8 @@ test "the prep's global row staging is a drop-in for the shared one" {
         defer ta.free(global);
 
         // The extra parameter exists on one and not the other.
-        try std.testing.expect(std.mem.indexOf(u8, global, "p_rot") != null);
-        try std.testing.expect(std.mem.indexOf(u8, shared, "p_rot") == null);
+        try std.testing.expect(std.mem.find(u8, global, "p_rot") != null);
+        try std.testing.expect(std.mem.find(u8, shared, "p_rot") == null);
 
         // The claim that matters: the global variant's SHARED traffic does not grow
         // with the width, because the only thing left there is the fixed 256-float

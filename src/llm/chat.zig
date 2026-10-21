@@ -109,7 +109,7 @@ const known_reasoning = [_]Reasoning{
 /// the answer.
 pub fn reasoningFromTemplate(src: []const u8) ?Reasoning {
     for (known_reasoning) |r| {
-        if (std.mem.indexOf(u8, src, r.open) != null and std.mem.indexOf(u8, src, r.close) != null) return r;
+        if (std.mem.find(u8, src, r.open) != null and std.mem.find(u8, src, r.close) != null) return r;
     }
     return null;
 }
@@ -478,14 +478,14 @@ pub fn parseImageMentions(gpa: std.mem.Allocator, line: []const u8, parts: *std.
         var next: usize = undefined;
         if (pstart < line.len and line[pstart] == '"') {
             pstart += 1;
-            pend = std.mem.indexOfScalarPos(u8, line, pstart, '"') orelse {
+            pend = std.mem.findScalarPos(u8, line, pstart, '"') orelse {
                 i += 1; // unterminated quote: not a mention
                 continue;
             };
             next = pend + 1;
         } else {
-            pend = std.mem.indexOfAnyPos(u8, line, pstart, " \t\n") orelse line.len;
-            while (pend > pstart and std.mem.indexOfScalar(u8, ",.;:!?)", line[pend - 1]) != null) pend -= 1;
+            pend = std.mem.findAnyPos(u8, line, pstart, " \t\n") orelse line.len;
+            while (pend > pstart and std.mem.findScalar(u8, ",.;:!?)", line[pend - 1]) != null) pend -= 1;
             next = pend;
         }
         const path = line[pstart..pend];
@@ -735,7 +735,7 @@ test "appendSystem emits gemma4's thinking cue with no system message" {
     const on_txt = try tok.decodeAlloc(gpa, on.items);
     defer gpa.free(on_txt);
     errdefer std.debug.print("thinking-on render: {s}\n", .{on_txt});
-    try std.testing.expect(std.mem.indexOf(u8, on_txt, "<|think|>") != null);
+    try std.testing.expect(std.mem.find(u8, on_txt, "<|think|>") != null);
 
     // Thinking off, no system message: nothing at all (the assistant open
     // primes the closed thought channel instead).

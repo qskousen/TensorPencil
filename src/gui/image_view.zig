@@ -245,7 +245,7 @@ fn currentFamily(cfg: *const config.Config) ?model_spec.Family {
 }
 
 fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
-    _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
+    _ = std.mem.printSentinel(&steps_buf, "{d}", .{cfg.steps}, 0) catch {};
     // CFG 0 in the config means "this architecture's own value", which is the
     // only honest default for a number that cannot be shared: krea2 renders at
     // 1.0, which DISABLES guidance, and SD1.5 at 1.0 ignores the negative
@@ -253,7 +253,7 @@ fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
     const guidance = if (cfg.cfg_scale > 0)
         cfg.cfg_scale
     else if (fam) |f| model_spec.traits(f).cfg else 1.0;
-    _ = std.fmt.bufPrintZ(&cfg_buf, "{d:.1}", .{guidance}) catch {};
+    _ = std.mem.printSentinel(&cfg_buf, "{d:.1}", .{guidance}, 0) catch {};
 
     // Size comes from the framing pair, which is what the chat composer sets
     // too; the exact fields are the same value spelled in pixels.
@@ -332,7 +332,7 @@ fn parseFloat(buf: []const u8, fallback: f32) f32 {
 
 fn setNum(buf: []u8, v: f32) void {
     @memset(buf, 0);
-    _ = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{d}", .{v}) catch {};
+    _ = std.mem.print(buf[0 .. buf.len - 1], "{d}", .{v}) catch {};
 }
 
 /// Clamped at the pipeline's own ceiling so a typo cannot ask for something the
@@ -512,7 +512,7 @@ fn renderNoModel(cb: Callbacks) void {
     fonts.addStyled(tl, "No diffusion model is set.\n\nOpen Settings and choose a diffusion model to generate images here. " ++
         "Most checkpoints bundle everything they need; the text encoder and VAE fields are only for supplying or replacing a piece.", .{}, .{
         .font = F.prose,
-        .color_text = C.text,
+        .color_text = .{ .color = C.text },
     });
     tl.deinit();
     var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 14 } });
@@ -532,7 +532,7 @@ fn renderNoModel(cb: Callbacks) void {
 fn renderModelNotice(cfg: *const config.Config, fam: ?model_spec.Family) void {
     var buf: [320]u8 = undefined;
     const text: []const u8 = blk: {
-        if (g_m.state.diff_load_err.len > 0) break :blk std.fmt.bufPrint(
+        if (g_m.state.diff_load_err.len > 0) break :blk std.mem.print(
             &buf,
             "The diffusion model failed to load: {s}. Check the model paths and backend in Settings.",
             .{g_m.state.diff_load_err},
@@ -540,7 +540,7 @@ fn renderModelNotice(cfg: *const config.Config, fam: ?model_spec.Family) void {
         const f = fam orelse return; // unreadable/unknown: Settings says why
         const t = model_spec.traits(f);
         const want = pipeline_map.explicitBackend(cfg.diff_backend) orelse return;
-        if (!t.supports(want)) break :blk std.fmt.bufPrint(
+        if (!t.supports(want)) break :blk std.mem.print(
             &buf,
             "{s} has no kernels for the {t} backend. Generation will fail to load — change it in Settings.",
             .{ t.label, cfg.diff_backend },
@@ -552,10 +552,10 @@ fn renderModelNotice(cfg: *const config.Config, fam: ?model_spec.Family) void {
         .expand = .horizontal,
         .background = false,
         .padding = .{ .x = 18, .y = 6, .w = 18, .h = 2 },
-        .color_text = C.danger,
+        .color_text = .{ .color = C.danger },
     });
     defer tl.deinit();
-    fonts.addStyled(tl, text, .{}, .{ .font = F.ui, .color_text = C.danger });
+    fonts.addStyled(tl, text, .{}, .{ .font = F.ui, .color_text = .{ .color = C.danger } });
 }
 
 // ------------------------------------------------------------------- canvas
@@ -727,7 +727,7 @@ fn renderPinned(im: *const Image, n_live: usize, avail_w: f32) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 2 } });
     defer row.deinit();
     var buf: [48]u8 = undefined;
-    const label = std.fmt.bufPrint(&buf, "Show all {d} rendering", .{n_live}) catch "Show all";
+    const label = std.mem.print(&buf, "Show all {d} rendering", .{n_live}) catch "Show all";
     if (style.chip(@src(), label, .{ .font = F.mono_row })) g_selected = null;
 }
 
@@ -772,7 +772,7 @@ fn renderGrid(live: []const *const Image, avail_w: f32) void {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 4 } });
         defer row.deinit();
         var buf: [72]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "+{d} more rendering", .{live.len - g.shown}) catch "+ more";
+        const text = std.mem.print(&buf, "+{d} more rendering", .{live.len - g.shown}) catch "+ more";
         if (style.chip(@src(), text, .{ .font = F.mono_row })) g_selected = live[g.shown].info.id;
     }
 }
@@ -788,15 +788,15 @@ fn renderIdle() void {
             .expand = .horizontal,
             .min_size_content = .{ .h = 220 },
             .background = true,
-            .color_fill = C.sunken,
+            .color_fill = .{ .color = C.sunken },
             .border = style.Edge.all,
-            .color_border = style.hairline,
-            .corner_radius = R.card,
+            .color_border = .{ .color = style.hairline },
+            .corners = R.card,
         });
         defer well.deinit();
         dvui.labelNoFmt(@src(), "Your renders appear here.", .{}, .{
             .font = F.ui,
-            .color_text = C.text_ghost,
+            .color_text = .{ .color = C.text_ghost },
             .gravity_x = 0.5,
             .gravity_y = 0.5,
         });
@@ -815,7 +815,7 @@ fn renderReceiving(im: *const Image) void {
         _ = dvui.image(@src(), .{
             .source = .{ .pixels = .{ .rgba = t.px, .width = t.w, .height = t.h } },
             .shrink = .ratio,
-        }, .{ .gravity_x = 0.5, .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = R.card });
+        }, .{ .gravity_x = 0.5, .min_size_content = sz, .max_size_content = .size(sz), .corners = R.card });
     }
     metaLine(metaText(im, "receiving the full picture…"), null, g_canvas_max);
 }
@@ -824,7 +824,7 @@ fn renderReceiving(im: *const Image) void {
 fn metaText(im: *const Image, what: []const u8) []const u8 {
     const host = g_images.hostOf(g_images.ctx, im.info.id);
     if (host.len == 0) return what;
-    return std.fmt.bufPrint(&meta_buf, "{s} · on {s}", .{ what, host }) catch what;
+    return std.mem.print(&meta_buf, "{s} · on {s}", .{ what, host }) catch what;
 }
 
 var meta_buf: [200]u8 = undefined;
@@ -849,8 +849,8 @@ fn renderLive(im: *const Image, bw: f32, bh: f32, big: bool) void {
         // Filled only while there is nothing to put in it: a render whose first
         // preview has not arrived still holds its place in the row.
         .background = !big and blank,
-        .color_fill = C.sunken,
-        .corner_radius = R.card,
+        .color_fill = .{ .color = C.sunken },
+        .corners = R.card,
     });
     // A fetched preview is a new buffer each time, so dvui's pointer-keyed
     // texture cache re-uploads exactly once per fetched frame.
@@ -867,7 +867,7 @@ fn renderLive(im: *const Image, bw: f32, bh: f32, big: bool) void {
                 .gravity_y = 0.5,
                 .min_size_content = sz,
                 .max_size_content = .size(sz),
-                .corner_radius = R.card,
+                .corners = R.card,
             });
         }
     }
@@ -888,9 +888,9 @@ fn renderLive(im: *const Image, bw: f32, bh: f32, big: bool) void {
 
     var buf: [64]u8 = undefined;
     const status = switch (im.status()) {
-        .suspended => std.fmt.bufPrint(&buf, "paused · step {d}/{d}", .{ done, total }) catch "paused",
+        .suspended => std.mem.print(&buf, "paused · step {d}/{d}", .{ done, total }) catch "paused",
         .pending => "queued",
-        else => std.fmt.bufPrint(&buf, "step {d} / {d}", .{ done, total }) catch "…",
+        else => std.mem.print(&buf, "step {d} / {d}", .{ done, total }) catch "…",
     };
     liveCaption(im, metaText(im, status), bw);
 }
@@ -910,7 +910,7 @@ fn liveCaption(im: *const Image, text: []const u8, edge: f32) void {
     var tbuf: [200]u8 = undefined;
     fonts.richLine(@src(), style.ellipsize(&tbuf, text, F.mono, @max(40, edge - 28)), .{
         .font = F.mono,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
         .margin = .{},
         .gravity_y = 0.5,
@@ -923,9 +923,9 @@ fn liveCaption(im: *const Image, text: []const u8, edge: f32) void {
     if (dvui.buttonIcon(@src(), "cancel", dvui.entypo.cross, .{}, .{}, .{
         .min_size_content = .{ .w = 14, .h = 14 },
         .gravity_y = 0.5,
-        .color_text = C.text_ghost,
+        .color_text = .{ .color = C.text_ghost },
         .background = false,
-        .corner_radius = R.chip,
+        .corners = R.chip,
         .padding = dvui.Rect.all(2),
         .data_out = &wd,
     })) g_cb.cancel(im.info.id);
@@ -941,13 +941,13 @@ fn renderDone(im: *const Image) void {
     _ = dvui.image(@src(), .{
         .source = .{ .pixels = .{ .rgba = rgba, .width = @intCast(w), .height = @intCast(h) } },
         .shrink = .ratio,
-    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = R.card });
+    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corners = R.card });
     const clicked = dvui.clicked(ib.data(), .{});
     ib.deinit();
     if (clicked) viewer_request = im.info.id;
 
     var buf: [96]u8 = undefined;
-    const what = std.fmt.bufPrint(&buf, "{d}×{d} · seed {d}", .{ w, h, im.info.req_seed }) catch "";
+    const what = std.mem.print(&buf, "{d}×{d} · seed {d}", .{ w, h, im.info.req_seed }) catch "";
     metaLine(metaText(im, what), im, g_canvas_max);
 }
 
@@ -962,7 +962,7 @@ fn metaLine(text: []const u8, im: ?*const Image, edge: f32) void {
     defer row.deinit();
     fonts.richLine(@src(), text, .{
         .font = F.mono,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
         .margin = .{},
         .gravity_y = 0.5,
@@ -985,11 +985,11 @@ fn metaLine(text: []const u8, im: ?*const Image, edge: f32) void {
 // ----------------------------------------------------------------- sections
 
 /// A labelled form row: a fixed-width label and whatever control follows.
-fn rowBegin(src: std.builtin.SourceLocation, id: usize, label: []const u8) *dvui.BoxWidget {
+fn rowBegin(src: std.lang.SourceLocation, id: usize, label: []const u8) *dvui.BoxWidget {
     const row = dvui.box(src, .{ .dir = .horizontal }, .{ .id_extra = id, .expand = .horizontal, .margin = .{ .h = 5 } });
     dvui.labelNoFmt(@src(), label, .{}, .{
         .font = F.ui,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 118 },
@@ -1000,22 +1000,22 @@ fn rowBegin(src: std.builtin.SourceLocation, id: usize, label: []const u8) *dvui
 
 /// A dropdown over an enum whose members carry a `label()`. Returns true when
 /// the pick changed.
-fn enumChip(src: std.builtin.SourceLocation, comptime T: type, cur: *T, id: usize) bool {
-    const fields = @typeInfo(T).@"enum".fields;
-    var labels: [fields.len][]const u8 = undefined;
-    inline for (fields, 0..) |f, i| labels[i] = (@as(T, @enumFromInt(f.value))).label();
+fn enumChip(src: std.lang.SourceLocation, comptime T: type, cur: *T, id: usize) bool {
+    const values = @typeInfo(T).@"enum".field_values;
+    var labels: [values.len][]const u8 = undefined;
+    inline for (values, 0..) |value, i| labels[i] = (@as(T, @fromBackingInt(value))).label();
     var sel: usize = blk: {
-        inline for (fields, 0..) |f, i| if (@intFromEnum(cur.*) == f.value) break :blk i;
+        inline for (values, 0..) |value, i| if (@backingInt(cur.*) == value) break :blk i;
         break :blk 0;
     };
     if (!style.chipDropdown(src, &labels, &sel, .{ .id_extra = id })) return false;
-    inline for (fields, 0..) |f, i| if (i == sel) {
-        cur.* = @enumFromInt(f.value);
+    inline for (values, 0..) |value, i| if (i == sel) {
+        cur.* = @fromBackingInt(value);
     };
     return true;
 }
 
-fn numChip(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8, width: f32, id: usize) void {
+fn numChip(src: std.lang.SourceLocation, buf: []u8, suffix: []const u8, width: f32, id: usize) void {
     _ = style.chipInput(src, buf, suffix, width, .{ .id_extra = id });
 }
 
@@ -1023,7 +1023,7 @@ fn renderSizeSection(cfg: *config.Config) void {
     var sum_buf: [64]u8 = undefined;
     const d = formDims(cfg);
     var sec = style.collapsibleBegin(@src(), "SIZE & SEED", &cfg.studio_open_size, .{
-        .summary = std.fmt.bufPrint(&sum_buf, "{d}×{d} · {s}", .{
+        .summary = std.mem.print(&sum_buf, "{d}×{d} · {s}", .{
             d.w, d.h, if (random_seed) "random seed" else "fixed seed",
         }) catch "",
     });
@@ -1036,8 +1036,8 @@ fn renderSizeSection(cfg: *config.Config) void {
     {
         var row = rowBegin(@src(), 0, "Size as");
         defer row.deinit();
-        if (style.segmented(@src(), &.{ "ratio + MP", "width × height" }, @intFromEnum(cfg.studio_size_mode))) |i| {
-            const want: config.StudioSizeMode = @enumFromInt(i);
+        if (style.segmented(@src(), &.{ "ratio + MP", "width × height" }, @backingInt(cfg.studio_size_mode))) |i| {
+            const want: config.StudioSizeMode = @fromBackingInt(@intCast(i));
             if (want != cfg.studio_size_mode) {
                 switch (want) {
                     .exact => {
@@ -1061,9 +1061,9 @@ fn renderSizeSection(cfg: *config.Config) void {
             _ = enumChip(@src(), framing.Ratio, &ratio, 0);
             numChip(@src(), &mp_buf, "MP", 42, 1);
             var px: [32]u8 = undefined;
-            dvui.labelNoFmt(@src(), std.fmt.bufPrint(&px, "{d} × {d}", .{ d.w, d.h }) catch "", .{}, .{
+            dvui.labelNoFmt(@src(), std.mem.print(&px, "{d} × {d}", .{ d.w, d.h }) catch "", .{}, .{
                 .font = F.mono,
-                .color_text = C.text_faint,
+                .color_text = .{ .color = C.text_faint },
                 .padding = .{},
                 .margin = .{ .x = 10 },
                 .gravity_y = 0.5,
@@ -1101,7 +1101,7 @@ fn renderSizeSection(cfg: *config.Config) void {
 fn renderSamplingSection(cfg: *config.Config) void {
     var sum_buf: [96]u8 = undefined;
     var sec = style.collapsibleBegin(@src(), "SAMPLING", &cfg.studio_open_sampling, .{
-        .summary = std.fmt.bufPrint(&sum_buf, "{s} · {s} · {s} steps · cfg {s}", .{
+        .summary = std.mem.print(&sum_buf, "{s} · {s} · {s} steps · cfg {s}", .{
             f_sampler.label(),
             f_scheduler.label(),
             std.mem.sliceTo(&steps_buf, 0),
@@ -1156,7 +1156,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
         .summary = if (active == 0)
             "none"
         else
-            std.fmt.bufPrint(&sum_buf, "{d} active", .{active}) catch "",
+            std.mem.print(&sum_buf, "{d} active", .{active}) catch "",
     });
     defer style.collapsibleEnd(&sec);
     if (!sec.open()) return;
@@ -1179,7 +1179,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
         var nb: [96]u8 = undefined;
         dvui.labelNoFmt(@src(), style.ellipsize(&nb, cat.refName(path), F.ui, 200), .{}, .{
             .font = F.ui,
-            .color_text = if (known) C.text else C.amber,
+            .color_text = .{ .color = if (known) C.text else C.amber },
             .padding = .{},
             .margin = .{ .x = 4, .w = 8 },
             .gravity_y = 0.5,
@@ -1217,7 +1217,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
         const e = &cat.entries[ci];
         if (hasLora(e.path)) continue;
         const info = e.lora.?.info;
-        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        labels.append(arena, arena.print("{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
         paths.append(arena, e.path) catch return;
     }
     if (labels.items.len == 0) return;
@@ -1251,11 +1251,11 @@ fn renderAdvancedSection(cfg: *config.Config, cb: Callbacks) void {
     // Conditioning noise named in the FOLDED summary: it changes every render and
     // is otherwise invisible the moment the section is collapsed.
     const summary = if (f_cond_on and f_cond_curve.slice().len > 0)
-        std.fmt.bufPrint(&sum_buf, "{s} · noise {s} {d}", .{
+        std.mem.print(&sum_buf, "{s} · noise {s} {d}", .{
             f_syntax.label(), condShapeName(), condAmount(),
         }) catch ""
     else
-        std.fmt.bufPrint(&sum_buf, "{s} · {s}", .{ f_syntax.label(), f_compat.label() }) catch "";
+        std.mem.print(&sum_buf, "{s} · {s}", .{ f_syntax.label(), f_compat.label() }) catch "";
     var sec = style.collapsibleBegin(@src(), "ADVANCED", &cfg.studio_open_advanced, .{
         .summary = summary,
     });
@@ -1400,7 +1400,7 @@ fn renderCondSteer() void {
         if (f_steer_n == 0) {
             dvui.labelNoFmt(@src(), "none", .{}, .{
                 .font = F.ui,
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .padding = .{},
                 .margin = .{ .x = 8 },
                 .gravity_y = 0.5,
@@ -1566,7 +1566,7 @@ fn renderActModal() void {
         "lands in your first model folder as <name>.actd.");
 
     for ([_][]const u8{ "With the thing (A)", "Without it (B)" }, [_][]u8{ &g_act_set_a, &g_act_set_b }, 0..) |label, buf, i| {
-        dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = i, .font = F.ui, .color_text = C.text_dim, .padding = .{ .y = 6 } });
+        dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = i, .font = F.ui, .color_text = .{ .color = C.text_dim }, .padding = .{ .y = 6 } });
         var te = dvui.textEntry(@src(), .{
             .text = .{ .buffer = buf },
             .multiline = true,
@@ -1590,7 +1590,7 @@ fn renderActModal() void {
     } else if (g_act_sent) {
         if (g_m.act_err.slice().len > 0) {
             var buf: [160]u8 = undefined;
-            help(9, std.fmt.bufPrint(&buf, "That did not work: {s}", .{g_m.act_err.slice()}) catch "That did not work.");
+            help(9, std.mem.print(&buf, "That did not work: {s}", .{g_m.act_err.slice()}) catch "That did not work.");
         } else if (g_m.act_path.slice().len > 0) {
             help(9, "Done. The path is filled in above; Generate uses it now.");
         }
@@ -1638,7 +1638,7 @@ fn help(id: usize, text: []const u8) void {
         .padding = .{ .y = 2, .h = 8 },
     });
     defer tl.deinit();
-    fonts.addStyled(tl, text, .{}, .{ .font = F.row, .color_text = C.text_ghost });
+    fonts.addStyled(tl, text, .{}, .{ .font = F.row, .color_text = .{ .color = C.text_ghost } });
 }
 
 // ----------------------------------------------------------------- composer
@@ -1647,9 +1647,9 @@ fn renderComposer(cfg: *const config.Config, ready: bool) void {
     var block = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .background = true,
-        .color_fill = C.canvas,
+        .color_fill = .{ .color = C.canvas },
         .border = style.Edge.top,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .x = 18, .y = 10, .w = 18, .h = 12 },
     });
     defer block.deinit();
@@ -1657,10 +1657,10 @@ fn renderComposer(cfg: *const config.Config, ready: bool) void {
     var frame = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .background = true,
-        .color_fill = C.sunken,
+        .color_fill = .{ .color = C.sunken },
         .border = style.Edge.all,
-        .color_border = style.hairline_hi,
-        .corner_radius = R.input,
+        .color_border = .{ .color = style.hairline_hi },
+        .corners = R.input,
         .padding = .{ .x = 12, .y = 8, .w = 12, .h = 8 },
     });
     defer frame.deinit();
@@ -1702,7 +1702,7 @@ fn renderComposer(cfg: *const config.Config, ready: bool) void {
             .min_size_content = .{ .h = 20 },
             .max_size_content = .height(56),
             .font = F.ui,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
             .theme = style.noFocusTheme(),
         });
         negative_h = te.data().rect.h;
@@ -1724,15 +1724,15 @@ fn renderComposer(cfg: *const config.Config, ready: bool) void {
     if (!ready) {
         dvui.labelNoFmt(@src(), "Loading model…", .{}, .{
             .font = F.ui,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
             .padding = .{},
             .gravity_y = 0.5,
         });
     } else if (generating) {
         var n: [40]u8 = undefined;
-        dvui.labelNoFmt(@src(), std.fmt.bufPrint(&n, "{d} in the queue", .{st.pending_images + 1}) catch "", .{}, .{
+        dvui.labelNoFmt(@src(), std.mem.print(&n, "{d} in the queue", .{st.pending_images + 1}) catch "", .{}, .{
             .font = F.mono,
-            .color_text = C.text_faint,
+            .color_text = .{ .color = C.text_faint },
             .padding = .{},
             .gravity_y = 0.5,
         });
@@ -2023,7 +2023,7 @@ pub fn loadFrom(im: *const Image) void {
 /// file is gone or carries no metadata (an image saved by something that did
 /// not write one), so the caller can fall back to whatever it has in memory.
 fn loadFromFile(path: []const u8) bool {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(g_io, path, g_gpa, @enumFromInt(64 << 20)) catch return false;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(g_io, path, g_gpa, @fromBackingInt(@intCast(64 << 20))) catch return false;
     defer g_gpa.free(bytes);
     const text = tp.image.pngText(bytes, "parameters") orelse return false;
     const p = save_image.parseA1111Params(text);
@@ -2059,5 +2059,5 @@ fn setBuf(buf: []u8, text: []const u8) void {
 
 fn setFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
     @memset(buf, 0);
-    _ = std.fmt.bufPrint(buf, fmt, args) catch {};
+    _ = std.mem.print(buf, fmt, args) catch {};
 }

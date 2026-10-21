@@ -6,8 +6,8 @@ vectors — the text space (Snowflake / EmbeddingGemma) **and** the SigLIP2
 cross-modal image/text space — fully replacing the `onnxruntime` path
 (`src/onnx_embedder.zig` + `src/onnx_tokenizers.zig`).
 
-TP and DiffKeep are sibling checkouts (`../TensorPencil`, `../DiffKeep`), both on
-**Zig 0.16.0**.
+TP and DiffKeep are sibling checkouts (`../TensorPencil`, `../DiffKeep`). TP requires
+**Zig 0.17.0**, so DiffKeep must build with it too.
 
 ---
 

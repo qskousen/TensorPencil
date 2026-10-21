@@ -180,7 +180,7 @@ pub const Config = struct {
         };
         var layers: usize = 0;
         while (layers < max_blocks) : (layers += 1) {
-            const nm = std.fmt.bufPrint(&buf, "{s}transformer_blocks.{d}.attn.norm_q.weight", .{ pfx, layers }) catch break;
+            const nm = std.mem.print(&buf, "{s}transformer_blocks.{d}.attn.norm_q.weight", .{ pfx, layers }) catch break;
             if (store.get(nm) == null) break;
         }
         if (hd == 0 or dim % hd != 0) return error.UnknownModelConfig;
@@ -197,7 +197,7 @@ pub const Config = struct {
     }
 
     fn name(buf: []u8, pfx: []const u8, n: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}{s}", .{ pfx, n });
+        return std.mem.print(buf, "{s}{s}", .{ pfx, n });
     }
 };
 
@@ -749,24 +749,24 @@ fn checkToy(prefix: []const u8, want_fused: bool) !void {
 
     for ([_][]const u8{ "even", "odd", "ref" }) |case| {
         var kb: [32]u8 = undefined;
-        const xv = try ref.require(try std.fmt.bufPrint(&kb, "{s}.x", .{case}));
+        const xv = try ref.require(try std.mem.print(&kb, "{s}.x", .{case}));
         const x = try xv.toF32Alloc(gpa);
         defer gpa.free(x);
-        const ctx = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.ctx", .{case}))).toF32Alloc(gpa);
+        const ctx = try (try ref.require(try std.mem.print(&kb, "{s}.ctx", .{case}))).toF32Alloc(gpa);
         defer gpa.free(ctx);
-        const sig = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.sigma", .{case}))).toF32Alloc(gpa);
+        const sig = try (try ref.require(try std.mem.print(&kb, "{s}.sigma", .{case}))).toF32Alloc(gpa);
         defer gpa.free(sig);
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.out", .{case}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "{s}.out", .{case}))).toF32Alloc(gpa);
         defer gpa.free(want);
 
         var refs: [1]Ref = undefined;
         var n_refs: usize = 0;
         var ref_lat: ?[]f32 = null;
         defer if (ref_lat) |r| gpa.free(r);
-        if (ref.get(try std.fmt.bufPrint(&kb, "{s}.ref0", .{case}))) |rv| {
+        if (ref.get(try std.mem.print(&kb, "{s}.ref0", .{case}))) |rv| {
             const rs = rv.info.shape.slice();
             ref_lat = try rv.toF32Alloc(gpa);
-            const slot = std.mem.bytesAsSlice(i32, (try ref.require(try std.fmt.bufPrint(&kb, "{s}.slot0", .{case}))).bytes)[0];
+            const slot = std.mem.bytesAsSlice(i32, (try ref.require(try std.mem.print(&kb, "{s}.slot0", .{case}))).bytes)[0];
             refs[0] = .{ .lat = ref_lat.?, .h = rs[1], .w = rs[2], .slot = @intCast(slot) };
             n_refs = 1;
         }

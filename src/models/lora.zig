@@ -452,7 +452,7 @@ pub const Sidecar = struct {
         var index: std.StringHashMapUnmanaged(Target) = .empty;
         // Renamed keys wait here so a collision with a native spelling of the
         // same tensor is caught whatever order the file lists them in.
-        var renamed: std.StringArrayHashMapUnmanaged([max_slots]?Target) = .empty;
+        var renamed: std.array_hash_map.String([max_slots]?Target) = .empty;
         var slots_of: std.StringHashMapUnmanaged(u8) = .empty;
 
         var unclaimed: usize = 0;
@@ -490,12 +490,12 @@ pub const Sidecar = struct {
                 // A pair with a Tucker core or a DoRA magnitude is not a plain pair.
                 var kb: [512]u8 = undefined;
                 const odd = for ([_][]const u8{ ".lora_mid.weight", ".dora_scale" }) |sib| {
-                    if (store.get(std.fmt.bufPrint(&kb, "{s}{s}", .{ full_stem, sib }) catch break false) != null) break true;
+                    if (store.get(std.mem.print(&kb, "{s}{s}", .{ full_stem, sib }) catch break false) != null) break true;
                 } else false;
                 t = if (odd) try adapterTarget(gpa, alloc, store, full_stem, stem) else try loadTarget(alloc, store, full_stem, stem, d, &pad_bytes);
             }
             if (renameFor(renames, stem)) |r| {
-                const base = try std.fmt.allocPrint(alloc, "{s}{s}.weight", .{ stem[0 .. stem.len - r.from.len], r.to });
+                const base = try alloc.print("{s}{s}.weight", .{ stem[0 .. stem.len - r.from.len], r.to });
                 const gop = try renamed.getOrPut(alloc, base);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = @splat(null);
@@ -504,7 +504,7 @@ pub const Sidecar = struct {
                 if (gop.value_ptr[r.slot] != null) return dupTarget(base);
                 gop.value_ptr[r.slot] = t;
             } else {
-                const base = try std.fmt.allocPrint(alloc, "{s}.weight", .{stem});
+                const base = try alloc.print("{s}.weight", .{stem});
                 try index.put(alloc, base, t);
             }
         }
@@ -616,12 +616,12 @@ pub const Stack = struct {
     files: std.ArrayList(File) = .empty,
     /// Base tensor name -> every file's target for it. Keys are borrowed from
     /// the sidecars' own indexes, so every file outlives this map.
-    index: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Hit)) = .empty,
+    index: std.StringHashMapUnmanaged(std.ArrayList(Hit)) = .empty,
     /// Per-file hit counts for the attach walk in progress. Only `beginAttach`
     /// / `resolve` / `finishAttach` touch these.
     hits: [max_files]usize = @splat(0),
     /// Storage behind every `Hit.a_i8`.
-    quant: std.ArrayListUnmanaged(QuantA) = .empty,
+    quant: std.ArrayList(QuantA) = .empty,
 
     pub const File = struct {
         side: Sidecar,
@@ -1302,8 +1302,8 @@ fn loadTarget(
 ) !Target {
     var buf: [512]u8 = undefined;
 
-    const a_view = store.get(try std.fmt.bufPrint(&buf, "{s}{s}", .{ full_stem, d.a })) orelse return error.MissingTensor;
-    const b_view = store.get(try std.fmt.bufPrint(&buf, "{s}{s}", .{ full_stem, d.b })) orelse {
+    const a_view = store.get(try std.mem.print(&buf, "{s}{s}", .{ full_stem, d.a })) orelse return error.MissingTensor;
+    const b_view = store.get(try std.mem.print(&buf, "{s}{s}", .{ full_stem, d.b })) orelse {
         std.log.err("lora: {s} has a {s} but no {s}", .{ stem, d.a[1..], d.b[1..] });
         return error.MissingTensor;
     };
@@ -1327,7 +1327,7 @@ fn loadTarget(
     // factor's alpha is pre-multiplied to match its concatenated rank, so this
     // is the one reading that is right for both.
     var alpha: f32 = @floatFromInt(rank);
-    if (store.get(try std.fmt.bufPrint(&buf, "{s}.alpha", .{full_stem}))) |av| {
+    if (store.get(try std.mem.print(&buf, "{s}.alpha", .{full_stem}))) |av| {
         // Rank 0 (`shape: []`) is how the turbo LoRAs ship it, and `Shape.count`
         // reads that as one element.
         alpha = av.asScalarF32() catch {
@@ -1501,7 +1501,7 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
 
         for (targets) |spec| {
             var buf: [128]u8 = undefined;
-            const base_name = try std.fmt.bufPrint(&buf, "base.{s}.weight", .{spec.name});
+            const base_name = try std.mem.print(&buf, "base.{s}.weight", .{spec.name});
             const bv = store.get(base_name) orelse return error.MissingTensor;
             const bs = bv.info.shape.slice();
             const out_dim = bs[0];
@@ -1510,7 +1510,7 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
             var w = Weight.init(bv.bytes, bv.info.dtype, out_dim, in_dim);
             // `forWeight` keys on the checkpoint name, so the fixture's base
             // tensors are looked up under the name a loader would have set.
-            const tag = try std.fmt.allocPrint(gpa, "{s}.weight", .{spec.name});
+            const tag = try gpa.print("{s}.weight", .{spec.name});
             defer gpa.free(tag);
             w.tag = tag;
 
@@ -1525,13 +1525,13 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
             // is what proves the detector fires on a real fused factor.
             try testing.expectEqual(spec.groups, t.factors.len);
 
-            const in_name = try std.fmt.bufPrint(&buf, "in.{s}", .{spec.name});
+            const in_name = try std.mem.print(&buf, "in.{s}", .{spec.name});
             const x = try (store.get(in_name) orelse return error.MissingTensor).toF32Alloc(gpa);
             defer gpa.free(x);
             const m = x.len / in_dim;
 
             const want_prefix: []const u8 = if (strength == 1.0) "out" else "out_half";
-            const want_name = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ want_prefix, spec.name });
+            const want_name = try std.mem.print(&buf, "{s}.{s}", .{ want_prefix, spec.name });
             const want = try (store.get(want_name) orelse return error.MissingTensor).toF32Alloc(gpa);
             defer gpa.free(want);
 
@@ -1547,7 +1547,7 @@ test "the sidecar reproduces ComfyUI's merged LoRA" {
 
             // ...and the sidecar is what moved it. Without this the test passes
             // on a base weight that already happened to match.
-            const bare_name = try std.fmt.bufPrint(&buf, "out_base.{s}", .{spec.name});
+            const bare_name = try std.mem.print(&buf, "out_base.{s}", .{spec.name});
             const bare = try (store.get(bare_name) orelse return error.MissingTensor).toF32Alloc(gpa);
             defer gpa.free(bare);
             try testing.expect(relL2(want, bare) > 0.05);
@@ -1567,7 +1567,7 @@ test "a shape disagreement is distinguished from no entry at all" {
     var side = try Sidecar.load(gpa, store, .{});
     defer side.deinit();
 
-    const bytes = [_]u8{0} ** (16 * 9 * 4);
+    const bytes: [(16 * 9 * 4)]u8 = @splat(0);
     var w = Weight.init(&bytes, .f32, 16, 9); // fc2 is 6x8 in the fixture
     w.tag = "blocks.0.mlp.fc2.weight";
     try testing.expect(side.forWeight(w) == .mismatch);
@@ -1612,12 +1612,12 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
 
     for ([_][]const u8{ "blocks.0.mlp.fc2", "blocks.0.attn.qkv_proj", "blocks.0.attn.out_proj" }) |name| {
         var buf: [128]u8 = undefined;
-        const bv = store.get(try std.fmt.bufPrint(&buf, "base.{s}.weight", .{name})) orelse return error.MissingTensor;
+        const bv = store.get(try std.mem.print(&buf, "base.{s}.weight", .{name})) orelse return error.MissingTensor;
         const out_dim = bv.info.shape.slice()[0];
         const in_dim = bv.info.shape.slice()[1];
 
         var w = Weight.init(bv.bytes, bv.info.dtype, out_dim, in_dim);
-        const tag = try std.fmt.allocPrint(gpa, "{s}.weight", .{name});
+        const tag = try gpa.print("{s}.weight", .{name});
         defer gpa.free(tag);
         w.tag = tag;
 
@@ -1625,12 +1625,12 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
         stack.beginAttach();
         try testing.expectEqual(@as(usize, 2), (try stack.resolve(w)).len);
 
-        const x = try (store.get(try std.fmt.bufPrint(&buf, "in.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        const x = try (store.get(try std.mem.print(&buf, "in.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(x);
         const m = x.len / in_dim;
-        const want = try (store.get(try std.fmt.bufPrint(&buf, "out_stack.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        const want = try (store.get(try std.mem.print(&buf, "out_stack.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(want);
-        const bare = try (store.get(try std.fmt.bufPrint(&buf, "out_base.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        const bare = try (store.get(try std.mem.print(&buf, "out_base.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(bare);
 
         const got = try gpa.alloc(f32, m * out_dim);
@@ -1646,7 +1646,7 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
 
         // The dial is live: zeroing file 2 leaves file 1's delta alone, with no
         // reload anywhere. `out` is file 1 at strength 1, so its delta scales.
-        const only1 = try (store.get(try std.fmt.bufPrint(&buf, "out.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
+        const only1 = try (store.get(try std.mem.print(&buf, "out.{s}", .{name})) orelse return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(only1);
         const want1 = try gpa.alloc(f32, m * out_dim);
         defer gpa.free(want1);
@@ -1678,7 +1678,7 @@ test "a file that patches nothing is refused rather than ignored" {
     defer stack.deinit(gpa);
     _ = try stack.add(gpa, store, 1.0, "file1", .{});
 
-    const bytes = [_]u8{0} ** 16;
+    const bytes: [16]u8 = @splat(0);
     var other = Weight.init(&bytes, .f32, 2, 2);
     other.tag = "some.other.arch.weight";
 
@@ -1712,7 +1712,7 @@ test "the generic loader reproduces ComfyUI's merge for every adapter on a linea
     const rnd = prng.random();
     for ([_][]const u8{ "lora", "peft", "loha", "lokr_full", "lokr_dec", "diff", "dora_out", "dora_in", "dora_in_s" }) |name| {
         var buf: [64]u8 = undefined;
-        const stem = try std.fmt.bufPrint(&buf, "{s}.0", .{name});
+        const stem = try std.mem.print(&buf, "{s}.0", .{name});
         // The case's own keys, renamed under the denoiser prefix onto `l.0.weight`.
         var entries: std.ArrayList(struct { []const u8, []const u8, []const usize, []const u8 }) = .empty;
         defer {
@@ -1733,20 +1733,20 @@ test "the generic loader reproduces ComfyUI's merge for every adapter on a linea
                 else => return error.TestUnexpectedResult,
             };
             // The shape is copied out: `v` is this iteration's own copy of the view.
-            try entries.append(gpa, .{ try std.fmt.allocPrint(gpa, "diffusion_model.l.0{s}", .{n[stem.len..]}), dt, try gpa.dupe(usize, v.info.shape.slice()), v.bytes });
+            try entries.append(gpa, .{ try gpa.print("diffusion_model.l.0{s}", .{n[stem.len..]}), dt, try gpa.dupe(usize, v.info.shape.slice()), v.bytes });
         }
         const blob = try safetensorsBlob(gpa, entries.items);
         defer gpa.free(blob);
         var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, blob);
         defer st.deinit();
-        const strength = try (fstore.get(try std.fmt.bufPrint(&buf, "{s}.0.strength", .{name})).?).asScalarF32();
+        const strength = try (fstore.get(try std.mem.print(&buf, "{s}.0.strength", .{name})).?).asScalarF32();
 
         var stack: Stack = .{};
         defer stack.deinit(gpa);
         _ = try stack.add(gpa, .{ .safetensors = &st }, strength, name, .{});
 
-        const base_v = fstore.get(try std.fmt.bufPrint(&buf, "{s}.base", .{name})).?;
-        const want_v = fstore.get(try std.fmt.bufPrint(&buf, "{s}.want", .{name})).?;
+        const base_v = fstore.get(try std.mem.print(&buf, "{s}.base", .{name})).?;
+        const want_v = fstore.get(try std.mem.print(&buf, "{s}.want", .{name})).?;
         const out = base_v.info.shape.slice()[0];
         const cols = base_v.info.elemCount() / out;
         var base_w = Weight.init(base_v.bytes, base_v.info.dtype, out, cols);
@@ -1989,7 +1989,7 @@ test "quantizeHits leaves the file's scale out, follows the rotation, and skips 
     var stack: Stack = .{};
     defer stack.deinit(gpa);
     for ([_]struct { []const u8, *const Target }{ .{ "one.weight", &t }, .{ "two.weight", &fused } }) |e| {
-        var list: std.ArrayListUnmanaged(Stack.Hit) = .empty;
+        var list: std.ArrayList(Stack.Hit) = .empty;
         try list.append(gpa, .{ .target = e[1], .file = 0 });
         try stack.index.put(gpa, e[0], list);
     }
@@ -2123,7 +2123,7 @@ test "a rank-8 factor pads to the slab, keeps the file's scale, and applies unch
     const y = try gpa.alloc(f32, m * out_dim);
     defer gpa.free(y);
     @memset(y, 0);
-    const base = [_]u8{0} ** (out_dim * in_dim * 2);
+    const base: [(out_dim * in_dim * 2)]u8 = @splat(0);
     var w = Weight.init(&base, .bf16, out_dim, in_dim);
     w.tag = "blk.fc.weight";
     try stack.applyHost(io, gpa, y, out_dim, x, m, w, null);
@@ -2279,7 +2279,7 @@ test "a target no linear matches is counted and named, and a bundled tag still m
     defer stack.deinit(gpa);
     try testing.expectEqual(@as(usize, 3), try stack.add(gpa, .{ .safetensors = &st }, 1.0, "f", .{}));
 
-    const base = [_]u8{0} ** (out_dim * in_dim * 2);
+    const base: [(out_dim * in_dim * 2)]u8 = @splat(0);
     var wa = Weight.init(&base, .bf16, out_dim, in_dim);
     // The bundled checkpoint prefix is not part of the name a LoRA patches.
     wa.tag = "model.diffusion_model.blk.a.weight";
@@ -2355,7 +2355,7 @@ test "split q/k/v keys merge onto row blocks of the fused tensor, each with its 
     const y = try gpa.alloc(f32, m * 3 * h);
     defer gpa.free(y);
     @memset(y, 0);
-    const base = [_]u8{0} ** (3 * h * in_dim * 2);
+    const base: [(3 * h * in_dim * 2)]u8 = @splat(0);
     var w = Weight.init(&base, .bf16, 3 * h, in_dim);
     w.tag = "l.0.attention.qkv.weight";
     try stack.applyHost(io, gpa, y, 3 * h, x, m, w, null);

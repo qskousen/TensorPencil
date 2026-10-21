@@ -71,7 +71,7 @@ pub fn postText(tone: Tone, text: []const u8) void {
     // Past the ring the oldest waiting notice goes: a burst is a burst, and
     // the newest is the one still worth reading.
     if (n_queued == queued.len) {
-        std.mem.copyForwards(Pending, queued[0 .. queued.len - 1], queued[1..]);
+        @memmove(queued[0 .. queued.len - 1], queued[1..]);
         n_queued -= 1;
     }
     const n = @min(text.len, max_text);
@@ -88,7 +88,7 @@ pub fn pump() void {
         next_slot +%= 1;
         const im = dvui.toastAdd(null, @src(), next_slot, null, display, dwell_us);
         dvui.dataSetSlice(null, im.id, "_message", p.buf[0..p.len]);
-        dvui.dataSet(null, im.id, "_tone", @intFromEnum(p.tone));
+        dvui.dataSet(null, im.id, "_tone", @backingInt(p.tone));
         im.mutex.unlock(dvui.io);
     }
     n_queued = 0;
@@ -99,7 +99,7 @@ fn display(id: dvui.Id) !void {
         dvui.toastRemove(id);
         return;
     };
-    const tone: Tone = @enumFromInt(dvui.dataGet(null, id, "_tone", u8) orelse 0);
+    const tone: Tone = @fromBackingInt(@intCast(dvui.dataGet(null, id, "_tone", u8) orelse 0));
 
     var animator = dvui.animate(@src(), .{ .kind = .alpha, .duration = 300_000 }, .{
         .id_extra = id.asUsize(),
@@ -109,10 +109,10 @@ fn display(id: dvui.Id) !void {
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .background = true,
-        .color_fill = C.raised,
-        .corner_radius = style.R.card,
+        .color_fill = .{ .color = C.raised },
+        .corners = style.R.card,
         .border = dvui.Rect.all(1),
-        .color_border = tone.color(),
+        .color_border = .{ .color = tone.color() },
         .padding = .{ .x = 12, .y = 8, .w = 8, .h = 8 },
         .margin = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
     });
@@ -124,7 +124,7 @@ fn display(id: dvui.Id) !void {
     // screen: a text layout given no ceiling expands to whatever it is offered.
     fonts.richLabel(@src(), msg, .{
         .gravity_y = 0.5,
-        .color_text = C.text_hi,
+        .color_text = .{ .color = C.text_hi },
         .max_size_content = .width(480),
     });
 
@@ -133,7 +133,7 @@ fn display(id: dvui.Id) !void {
     var x: dvui.ButtonWidget = undefined;
     x.init(@src(), .{}, .{
         .gravity_y = 0.5,
-        .corner_radius = style.R.chip,
+        .corners = style.R.chip,
         .padding = dvui.Rect.all(3),
         .margin = .{ .x = 8 },
     });

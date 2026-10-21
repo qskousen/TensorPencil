@@ -66,7 +66,7 @@ pub const buf_len = 192;
 /// against a 5,310-token context is unreadable ungrouped).
 pub fn grouped(buf: []u8, n: usize) []const u8 {
     var digits: [24]u8 = undefined;
-    const s = std.fmt.bufPrint(&digits, "{d}", .{n}) catch return "?";
+    const s = std.mem.print(&digits, "{d}", .{n}) catch return "?";
     var out: usize = 0;
     for (s, 0..) |c, i| {
         const left = s.len - i; // digits still to write, including this one

@@ -64,7 +64,7 @@ pub const adapter_suffixes = [_][]const u8{
 pub const stem_suffixes = [_][]const u8{ ".lokr_w1", ".lokr_w1_a", ".hada_w1_a", ".diff" };
 
 fn probe(store: WeightStore, buf: []u8, stem: []const u8, suffix: []const u8, consumed: *Consumed, gpa: std.mem.Allocator) !?TensorView {
-    const key = std.fmt.bufPrint(buf, "{s}{s}", .{ stem, suffix }) catch return null;
+    const key = std.mem.print(buf, "{s}{s}", .{ stem, suffix }) catch return null;
     const v = store.get(key) orelse return null;
     // The store's own name string, which outlives this walk.
     try consumed.put(gpa, v.info.name, {});
@@ -729,8 +729,8 @@ test "every adapter merges as ComfyUI merges it" {
     const cases = [_][]const u8{ "lora", "noalpha", "f32", "locon", "tucker", "peft", "loha", "loha_cp", "lokr_full", "lokr_dec", "dora_out", "dora_in", "diff", "stack", "lokr_conv", "lokr_conv_dec", "diff_conv", "dora_in_s", "dora_in_conv" };
     for (cases) |name| {
         var buf: [64]u8 = undefined;
-        const base_v = try store.require(try std.fmt.bufPrint(&buf, "{s}.base", .{name}));
-        const want_v = try store.require(try std.fmt.bufPrint(&buf, "{s}.want", .{name}));
+        const base_v = try store.require(try std.mem.print(&buf, "{s}.base", .{name}));
+        const want_v = try store.require(try std.mem.print(&buf, "{s}.want", .{name}));
         const mode: Mode = if (base_v.info.dtype == .f32) .f32 else .f16;
         const w = try base_v.toF32Alloc(gpa);
         defer gpa.free(w);
@@ -740,8 +740,8 @@ test "every adapter merges as ComfyUI merges it" {
         var fi: usize = 0;
         while (true) : (fi += 1) {
             var sb: [64]u8 = undefined;
-            const stem = try std.fmt.bufPrint(&sb, "{s}.{d}", .{ name, fi });
-            const sv = store.get(try std.fmt.bufPrint(&buf, "{s}.strength", .{stem})) orelse break;
+            const stem = try std.mem.print(&sb, "{s}.{d}", .{ name, fi });
+            const sv = store.get(try std.mem.print(&buf, "{s}.strength", .{stem})) orelse break;
             var consumed: Consumed = .empty;
             defer consumed.deinit(gpa);
             const p = (try parse(gpa, store, stem, &consumed)).?;
@@ -768,16 +768,16 @@ test "a sidecar reproduces the merge's product for every adapter, linear and con
     const rnd_g = prng.random();
     for (cases) |name| {
         var buf: [64]u8 = undefined;
-        const base_v = try store.require(try std.fmt.bufPrint(&buf, "{s}.base", .{name}));
-        const want_v = try store.require(try std.fmt.bufPrint(&buf, "{s}.want", .{name}));
-        const strength = try (try store.require(try std.fmt.bufPrint(&buf, "{s}.0.strength", .{name}))).asScalarF32();
+        const base_v = try store.require(try std.mem.print(&buf, "{s}.base", .{name}));
+        const want_v = try store.require(try std.mem.print(&buf, "{s}.want", .{name}));
+        const strength = try (try store.require(try std.mem.print(&buf, "{s}.0.strength", .{name}))).asScalarF32();
         const shape = base_v.info.shape.slice();
         const out = shape[0];
         const cols = base_v.info.elemCount() / out;
         var sb: [64]u8 = undefined;
         var consumed: Consumed = .empty;
         defer consumed.deinit(gpa);
-        const p = (try parse(gpa, store, try std.fmt.bufPrint(&sb, "{s}.0", .{name}), &consumed)).?;
+        const p = (try parse(gpa, store, try std.mem.print(&sb, "{s}.0", .{name}), &consumed)).?;
 
         var arena = std.heap.ArenaAllocator.init(gpa);
         const alloc = arena.allocator();

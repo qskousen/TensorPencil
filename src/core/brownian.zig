@@ -91,7 +91,7 @@ pub fn round6(x: f64) f64 {
     // Parse back the decimal N / 10^6, exactly as CPython hands the dtoa string to
     // strtod. Doing the division in floating point instead would round twice.
     var buf: [48]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{s}{d}.{d:0>6}", .{
+    const s = std.mem.print(&buf, "{s}{d}.{d:0>6}", .{
         if (negative) "-" else "",
         q / round_scale,
         @as(u64, @intCast(q % round_scale)),

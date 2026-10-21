@@ -100,9 +100,9 @@ pub fn render(m: Model, cb: Actions) void {
         .min_size_content = .{ .w = L.rail_w - 1 },
         .max_size_content = .width(L.rail_w - 1),
         .background = true,
-        .color_fill = C.rail,
+        .color_fill = .{ .color = C.rail },
         .border = style.Edge.left,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
     });
     defer col.deinit();
 
@@ -131,7 +131,7 @@ pub fn render(m: Model, cb: Actions) void {
             if (m.jobs.len == 0) {
                 dvui.labelNoFmt(@src(), "Nothing queued.", .{}, .{
                     .font = F.row,
-                    .color_text = C.text_ghost,
+                    .color_text = .{ .color = C.text_ghost },
                     .padding = .{ .x = 2, .y = 6 },
                 });
             } else {
@@ -143,7 +143,7 @@ pub fn render(m: Model, cb: Actions) void {
             if (m.library.len == 0) {
                 dvui.labelNoFmt(@src(), "No images yet.", .{}, .{
                     .font = F.row,
-                    .color_text = C.text_ghost,
+                    .color_text = .{ .color = C.text_ghost },
                     .padding = .{ .x = 2, .y = 6 },
                 });
             } else thumbGrid(@src(), m.library, 3, cb);
@@ -151,38 +151,38 @@ pub fn render(m: Model, cb: Actions) void {
     }
 }
 
-fn tabStrip(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
+fn tabStrip(src: std.lang.SourceLocation, m: Model, cb: Actions) void {
     var strip = dvui.box(src, .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         // The rail's surface, not the theme's: a forced background here painted
         // a canvas-coloured block over the rail behind the tabs.
         .background = true,
-        .color_fill = C.rail,
+        .color_fill = .{ .color = C.rail },
         .border = style.Edge.bottom,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 },
     });
     defer strip.deinit();
 
     var buf: [24]u8 = undefined;
     const q_label = if (m.jobs.len > 0)
-        std.fmt.bufPrint(&buf, "Queue · {d}", .{m.jobs.len}) catch "Queue"
+        std.mem.print(&buf, "Queue · {d}", .{m.jobs.len}) catch "Queue"
     else
         "Queue";
     if (tab(@src(), 0, q_label, m.tab == .queue)) cb.on_tab(.queue);
     if (tab(@src(), 1, "Library", m.tab == .library)) cb.on_tab(.library);
 }
 
-fn tab(src: std.builtin.SourceLocation, id: usize, label: []const u8, on: bool) bool {
+fn tab(src: std.lang.SourceLocation, id: usize, label: []const u8, on: bool) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .id_extra = id,
         .expand = .horizontal,
         .background = on,
-        .color_fill = C.text_hi,
-        .color_fill_hover = if (on) C.text_hi else style.hover_wash,
-        .color_fill_press = if (on) C.text_hi else style.hover_wash,
-        .corner_radius = R.chip,
+        .color_fill = .{ .color = C.text_hi },
+        .color_fill_hover = .{ .color = if (on) C.text_hi else style.hover_wash },
+        .color_fill_press = .{ .color = if (on) C.text_hi else style.hover_wash },
+        .corners = R.chip,
         .padding = dvui.Rect.all(7),
         .margin = .{ .x = if (id == 0) 0 else 2 },
     });
@@ -190,7 +190,7 @@ fn tab(src: std.builtin.SourceLocation, id: usize, label: []const u8, on: bool) 
     bw.drawBackground();
     dvui.labelNoFmt(@src(), label, .{}, .{
         .font = F.ui,
-        .color_text = if (on) C.text_ink else C.text_dim,
+        .color_text = .{ .color = if (on) C.text_ink else C.text_dim },
         .padding = .{},
         .gravity_x = 0.5,
         .gravity_y = 0.5,
@@ -201,7 +201,7 @@ fn tab(src: std.builtin.SourceLocation, id: usize, label: []const u8, on: bool) 
     return clicked;
 }
 
-fn jobList(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
+fn jobList(src: std.lang.SourceLocation, m: Model, cb: Actions) void {
     if (m.jobs.len == 0) return;
 
     // The reorder widget must wrap the whole list; it reports the drag as a
@@ -233,16 +233,16 @@ fn jobList(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
         cb.on_reorder(m.jobs[from].id, if (to < m.jobs.len) m.jobs[to].id else null);
 }
 
-fn jobRow(src: std.builtin.SourceLocation, j: Job, r: *dvui.Reorderable, cb: Actions) void {
+fn jobRow(src: std.lang.SourceLocation, j: Job, r: *dvui.Reorderable, cb: Actions) void {
     const failed = j.state == .failed;
     var row = dvui.box(src, .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .background = true,
-        .color_fill = C.queue_idle,
+        .color_fill = .{ .color = C.queue_idle },
         .border = style.Edge.all,
         // A failed job is the only thing in this rail allowed to be red.
-        .color_border = if (failed) style.tint(C.danger, 56) else style.hairline_soft,
-        .corner_radius = R.panel,
+        .color_border = .{ .color = if (failed) style.tint(C.danger, 56) else style.hairline_soft },
+        .corners = R.panel,
         .padding = dvui.Rect.all(9),
         .margin = .{ .h = 9 },
     });
@@ -265,34 +265,34 @@ fn jobRow(src: std.builtin.SourceLocation, j: Job, r: *dvui.Reorderable, cb: Act
     var tbuf: [160]u8 = undefined;
     fonts.richLine(@src(), style.ellipsize(&tbuf, j.title, F.row_hi, text_w), .{
         .font = F.row_hi,
-        .color_text = C.text,
+        .color_text = .{ .color = C.text },
         .padding = .{},
         .margin = .{},
     });
 
     var buf: [96]u8 = undefined;
     var host_buf: [48]u8 = undefined;
-    const on_host = if (j.host.len > 0) std.fmt.bufPrint(&host_buf, " · on {s}", .{j.host}) catch "" else "";
+    const on_host = if (j.host.len > 0) std.mem.print(&host_buf, " · on {s}", .{j.host}) catch "" else "";
     switch (j.state) {
         .queued => |s| {
             const line = if (s.note.len > 0)
-                std.fmt.bufPrint(&buf, "queued · {s}", .{s.note}) catch "queued"
+                std.mem.print(&buf, "queued · {s}", .{s.note}) catch "queued"
             else if (s.eta_s) |e|
-                std.fmt.bufPrint(&buf, "queued · ~{d:.0} s{s}{s}", .{ e, if (j.from_studio) " · from Studio" else "", on_host }) catch "queued"
+                std.mem.print(&buf, "queued · ~{d:.0} s{s}{s}", .{ e, if (j.from_studio) " · from Studio" else "", on_host }) catch "queued"
             else
-                std.fmt.bufPrint(&buf, "queued{s}{s}", .{ if (j.from_studio) " · from Studio" else "", on_host }) catch "queued";
+                std.mem.print(&buf, "queued{s}{s}", .{ if (j.from_studio) " · from Studio" else "", on_host }) catch "queued";
             fonts.richLine(@src(), style.ellipsize(&tbuf, line, F.mono_row, text_w), .{
                 .font = F.mono_row,
-                .color_text = if (s.note.len > 0) C.amber else C.text_ghost,
+                .color_text = .{ .color = if (s.note.len > 0) C.amber else C.text_ghost },
                 .padding = .{ .y = 2 },
                 .margin = .{},
             });
         },
         .failed => |s| {
-            const line = std.fmt.bufPrint(&buf, "{s}{s}", .{ s.why, on_host }) catch "failed";
+            const line = std.mem.print(&buf, "{s}{s}", .{ s.why, on_host }) catch "failed";
             fonts.richLine(@src(), style.ellipsize(&tbuf, line, F.mono_row, text_w), .{
                 .font = F.mono_row,
-                .color_text = C.danger,
+                .color_text = .{ .color = C.danger },
                 .padding = .{ .y = 2 },
                 .margin = .{},
             });
@@ -323,9 +323,9 @@ fn jobRow(src: std.builtin.SourceLocation, j: Job, r: *dvui.Reorderable, cb: Act
     if (dvui.buttonIcon(@src(), "cancel", dvui.entypo.cross, .{}, .{}, .{
         .gravity_x = 0.5,
         .min_size_content = .{ .w = 12, .h = 12 },
-        .color_text = if (j.state == .failed) style.tint(C.danger, 150) else C.text_ghost,
+        .color_text = .{ .color = if (j.state == .failed) style.tint(C.danger, 150) else C.text_ghost },
         .background = false,
-        .corner_radius = R.chip,
+        .corners = R.chip,
         .padding = dvui.Rect.all(2),
         .margin = .{},
     })) cb.on_cancel(j.id);
@@ -336,11 +336,11 @@ fn jobRow(src: std.builtin.SourceLocation, j: Job, r: *dvui.Reorderable, cb: Act
         .gravity_x = 0.5,
         .min_size_content = .{ .w = 12, .h = 12 },
         .margin = .{ .y = 4 },
-        .color_text = C.text_ghost,
+        .color_text = .{ .color = C.text_ghost },
     });
 }
 
-fn hintRow(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
+fn hintRow(src: std.lang.SourceLocation, m: Model, cb: Actions) void {
     var row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 2 } });
     defer row.deinit();
     var any_drag = false;
@@ -352,7 +352,7 @@ fn hintRow(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
     }
     if (any_drag) dvui.labelNoFmt(@src(), "drag to reorder", .{}, .{
         .font = F.mono,
-        .color_text = C.text_ghost,
+        .color_text = .{ .color = C.text_ghost },
         .padding = .{ .x = 2 },
         .gravity_y = 0.5,
     });
@@ -360,9 +360,9 @@ fn hintRow(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
     bw.init(@src(), .{}, .{
         .gravity_x = 1.0,
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .corner_radius = R.chip,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .corners = R.chip,
         .padding = .{ .x = 5, .y = 3, .w = 5, .h = 3 },
         .margin = .{},
     });
@@ -370,7 +370,7 @@ fn hintRow(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
     bw.drawBackground();
     dvui.labelNoFmt(@src(), if (m.paused) "Resume all" else "Pause all", .{}, .{
         .font = F.mono,
-        .color_text = if (m.paused) C.amber else C.text_ghost,
+        .color_text = .{ .color = if (m.paused) C.amber else C.text_ghost },
         .padding = .{},
         .gravity_y = 0.5,
     });
@@ -379,7 +379,7 @@ fn hintRow(src: std.builtin.SourceLocation, m: Model, cb: Actions) void {
     if (clicked) cb.on_pause_all();
 }
 
-fn thumbGrid(src: std.builtin.SourceLocation, items: []const LibraryItem, cols: usize, cb: Actions) void {
+fn thumbGrid(src: std.lang.SourceLocation, items: []const LibraryItem, cols: usize, cb: Actions) void {
     var grid = dvui.box(src, .{ .dir = .vertical }, .{ .expand = .horizontal });
     defer grid.deinit();
 
@@ -404,7 +404,7 @@ fn thumbGrid(src: std.builtin.SourceLocation, items: []const LibraryItem, cols: 
                 .min_size_content = .{ .w = cell, .h = cell },
                 .max_size_content = .size(.{ .w = cell, .h = cell }),
                 .margin = .{ .w = if (c + 1 < cols) gap else 0 },
-                .corner_radius = R.button,
+                .corners = R.button,
             });
             const crs = cellbox.data().contentRectScale();
             switch (items[i + c].thumb) {
@@ -414,7 +414,7 @@ fn thumbGrid(src: std.builtin.SourceLocation, items: []const LibraryItem, cols: 
                 }, .{
                     .min_size_content = .{ .w = cell, .h = cell },
                     .max_size_content = .size(.{ .w = cell, .h = cell }),
-                    .corner_radius = R.button,
+                    .corners = R.button,
                 }),
                 .loading => style.hatch(crs.r, C.raised, dvui.Color.fromHex("#161a1e"), 6 * @max(1, crs.s)),
             }
@@ -428,13 +428,13 @@ fn thumbGrid(src: std.builtin.SourceLocation, items: []const LibraryItem, cols: 
 
 /// Who made this picture, in its bottom-left corner. The wash under it is what
 /// keeps the name readable over a bright image.
-fn hostTag(src: std.builtin.SourceLocation, host: []const u8, cell: f32) void {
+fn hostTag(src: std.lang.SourceLocation, host: []const u8, cell: f32) void {
     var pill = dvui.box(src, .{ .dir = .horizontal }, .{
         .gravity_x = 0,
         .gravity_y = 1.0,
         .background = true,
-        .color_fill = style.tint(C.canvas, 200),
-        .corner_radius = R.chip,
+        .color_fill = .{ .color = style.tint(C.canvas, 200) },
+        .corners = R.chip,
         .padding = .{ .x = 4, .y = 1, .w = 4, .h = 1 },
         .margin = dvui.Rect.all(3),
     });
@@ -443,7 +443,7 @@ fn hostTag(src: std.builtin.SourceLocation, host: []const u8, cell: f32) void {
     var buf: [64]u8 = undefined;
     fonts.richLine(@src(), style.ellipsize(&buf, host, F.mono_row, @max(8, cell - 14)), .{
         .font = F.mono_row,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
         .margin = .{},
     });

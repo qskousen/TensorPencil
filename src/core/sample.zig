@@ -647,8 +647,8 @@ test "greedy dist is a point mass and draws no rng" {
 test "accept + sampleExcluding preserves the target distribution" {
     const logits_base = [_]f32{ 1.5, 1.0, 0.5, 0.0 };
     const draft: u32 = 1; // a mid-probability candidate
-    var counts_spec = [_]usize{0} ** 4;
-    var counts_direct = [_]usize{0} ** 4;
+    var counts_spec: [4]usize = @splat(0);
+    var counts_direct: [4]usize = @splat(0);
     const trials = 20000;
 
     var s = Sampler.init(.{ .temperature = 1.0, .top_k = 0, .top_p = 1.0 }, 424242);

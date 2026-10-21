@@ -93,7 +93,7 @@ const Dev = struct {
     pub fn teardown(d: *Dev) void {
         d.be.freeAttnScratch();
         d.be.freeConvScratch();
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| d.be.tensorDestroy(&@field(d.b, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| d.be.tensorDestroy(&@field(d.b, name));
     }
 
     pub fn upload(d: *Dev, b: Buf, data: []const f32) !void {

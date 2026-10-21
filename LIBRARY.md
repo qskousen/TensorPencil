@@ -19,7 +19,7 @@ kernels, the GPU backends, the offload logic, or the whole thing:
 
 ### Side effects a `tp_gpu` consumer should know about
 
-`gpu.Context.init(gpa, io)` takes an `Io` because 0.16 puts file access and clocks behind
+`gpu.Context.init(gpa, io)` takes an `Io` because std puts file access and clocks behind
 one, and it uses both: on a GPU it has no measurement for, it **screens the cooperative-matrix
 warp tiles once and saves the result** under the user's cache dir, keyed by
 `vendor:device:driver`. Later runs on the same device+driver just load it; a cache written by a
@@ -43,7 +43,7 @@ just want it all.
 
 ## Requirements
 
-- Zig **0.16.0** (`minimum_zig_version`).
+- Zig **0.17.0** (`minimum_zig_version`).
 - A C/C++ toolchain reachable by Zig (for the optional ggml dependency; see below).
 - Nothing else at build time. GPU backends (`libcuda`, `libvulkan`, cuBLASLt,
   cuDNN) and image decode (`libvips`) are `dlopen`'d / linked only by the

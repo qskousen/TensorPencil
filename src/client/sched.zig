@@ -153,7 +153,7 @@ pub const Table = struct {
     n: usize = 0,
 
     pub const Row = struct {
-        tag: [max_family_tag]u8 = .{0} ** max_family_tag,
+        tag: [max_family_tag]u8 = @splat(0),
         tag_len: u8 = 0,
         /// Seconds per step per megapixel: a step is taken to scale with area,
         /// which is first-order right for every family here.
@@ -394,7 +394,7 @@ test "the measured table fills up without overwriting what it has" {
     var t: Table = .{};
     var buf: [8]u8 = undefined;
     for (0..max_families + 3) |i| {
-        const fam = std.fmt.bufPrint(&buf, "fam{d}", .{i}) catch unreachable;
+        const fam = std.mem.print(&buf, "fam{d}", .{i}) catch unreachable;
         _ = t.note(.{ .family = fam, .mpx = 1, .steps = 3, .first_step_ns = 1, .last_step_ns = 1 + 2 * std.time.ns_per_s });
     }
     try testing.expectEqual(max_families, t.n);

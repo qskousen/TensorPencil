@@ -187,12 +187,12 @@ test "auto names no backend a client could check, and resolves to one where it r
 }
 
 test "the sampler and scheduler maps invert each other" {
-    inline for (std.meta.fields(config.Sampler)) |f| {
-        const s: config.Sampler = @enumFromInt(f.value);
+    inline for (@typeInfo(config.Sampler).@"enum".field_values) |value| {
+        const s: config.Sampler = @fromBackingInt(value);
         try std.testing.expectEqual(s, fromPipelineSampler(toPipelineSampler(s)));
     }
-    inline for (std.meta.fields(config.Scheduler)) |f| {
-        const s: config.Scheduler = @enumFromInt(f.value);
+    inline for (@typeInfo(config.Scheduler).@"enum".field_values) |value| {
+        const s: config.Scheduler = @fromBackingInt(value);
         try std.testing.expectEqual(s, fromPipelineScheduler(toPipelineScheduler(s)));
     }
 }

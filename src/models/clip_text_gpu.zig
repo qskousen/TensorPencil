@@ -92,7 +92,7 @@ const Dev = struct {
     }
 
     pub fn teardown(d: *Dev) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| d.ctx.tensorDestroy(&@field(d.b, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| d.ctx.tensorDestroy(&@field(d.b, name));
         if (d.lin) |*l| l.deinit();
         d.lin = null;
     }

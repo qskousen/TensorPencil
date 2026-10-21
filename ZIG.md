@@ -1,7 +1,8 @@
-# ZIG.md — Zig 0.16.0 Notes
+# ZIG.md — Zig 0.17.0 Notes
 
-Breaking changes and gotchas encountered in this codebase when working with Zig 0.16.0.
-Update this file whenever a new 0.16.0 change is found or an existing workaround is resolved.
+Breaking changes and gotchas met in this codebase, on Zig 0.17.0 and the 0.16.0 changes
+that still apply. Add a change here when you meet a new one, and delete a workaround
+when it is resolved.
 
 ---
 
@@ -33,6 +34,69 @@ writes `@import("shared").config`. A file may belong to ONE module: a relative
 import of a file that another module also owns compiles it twice, and the two
 copies of every type in it are distinct.
 
+## Zig 0.17.0: what changed here
+
+Each of these broke this tree or is deprecated for removal in 0.18. The release notes
+miss several of them (the std renames especially); ggufy's 0.17 commit is a second
+reference.
+
+Language:
+- `a ** n` is gone. One element: `const x: [n]T = @splat(v)` (or `@as([n]T, @splat(v))`
+  where nothing gives the type). A string: `strings.repeat("ab", 32)` (`tp_core`).
+- `errdefer |err|` is gone: move the body into an inner function and `catch` at the call.
+- `@cImport` is gone: build.zig translates the header with the `translate_c` package
+  (`Translator`) and the module imports the result by name. The `zig-0.17.x` branch tip
+  needs a newer std than 0.17.0 (`avx512bmm`); the pinned commit is the one that builds.
+- `@typeInfo` is struct-of-arrays: `field_names`, `field_types`, `field_attrs` (struct,
+  union), `field_values` (enum), `decl_names`. Iterate them zipped:
+  `inline for (info.field_names, info.field_types) |name, T|`. A default is
+  `info.field_attrs[i].defaultValue(info.field_types[i])`.
+- `@bitCast` of an extern struct is an error; `std.mem.toBytes` / `bytesToValue` keep
+  the old memory reinterpretation. On arrays and vectors it now concatenates LOGICAL
+  bits, which differs from 0.16 only for elements with padding bits (`u4`, `bool`,
+  `u24`); none are bitcast here.
+- `@hasDecl` is false for a non-`pub` decl even in the same file. Cross-file it already
+  was, so a capability check on another file's type keeps working only if the decl is
+  `pub`.
+- `@intFromEnum` / `@enumFromInt` are deprecated: `@backingInt(e)` and
+  `@fromBackingInt(@intCast(i))` (the argument must be the exact backing type).
+- `std.builtin` is `std.lang`; `OptimizeMode` is `Optimize` with tags `.debug`, `.safe`,
+  `.fast`, `.small`, and `builtin.mode.runtimeSafety()` replaces
+  `std.debug.runtime_safety`. `@import("builtin").cpu/os/abi` move under `.target`.
+
+std (renames unless noted):
+- `fmt.allocPrint(a, ...)` -> `a.print(...)`; `fmt.bufPrint` -> `mem.print`;
+  `fmt.bufPrintZ(b, f, x)` -> `mem.printSentinel(b, f, x, 0)`;
+  `a.dupeZ(u8, s)` -> `a.dupeSentinel(u8, s, 0)`.
+- `mem.indexOf*` -> `mem.find*` (`lastIndexOfScalar` -> `findScalarLast`).
+- `std.fs.path` -> `std.Io.Dir.path`; `std.fs.max_path_bytes` -> `std.Io.Dir.max_path_bytes`.
+- `mem.copyForwards(T, d, s)` -> `@memmove(d, s)`, which needs EQUAL lengths: slice the
+  destination to the source's length (a longer one panics, it did in `serve/queue.zig`).
+- `meta.Int` -> `@Int`; `meta.fieldNames` -> `@typeInfo(T).@"enum".field_names`.
+- `StaticBitSet` -> `bit_set.Static` and friends; `.initEmpty()` -> `.empty`.
+- `ArrayList.getLast()` -> `last().?`; `*Unmanaged` container aliases -> the plain
+  names (`array_hash_map.String`); an unmanaged hash map initializes as `.empty`, never `.{}`.
+- `unicode.utf8Decode` is deprecated with no direct successor: `strings.utf8DecodeSequence`
+  keeps its behaviour (a lone byte decodes to itself), or use `Utf8View`.
+- `testing.allocator` is a `SafeAllocator`: it never reuses memory.
+
+Build system:
+- `build` may return `!void`; `try b.dependencyLazy(...)` replaces the
+  `if (b.lazyDependency(...)) |d|` dance (the build fetches and reruns).
+- `b.args` is gone: `run.addPassthruArgs()`.
+- `b.build_root` -> `b.root` (a `Cache.Path`); `b.libc_file`, `b.sysroot`,
+  `b.pathFromRoot`, `b.getInstallPath`, `Run.addPathDir` and custom steps are gone. An
+  installed binary is run with `b.addRunFile(b.graph.path(.install_bin, name))`.
+- `Run.add*Arg` -> `add*Arg2(..., .{ .prefix = ... })`.
+- build.zig runs in a separate configure process whose result is cached: anything it
+  reads from the filesystem must be declared with `b.dependOnFileContents` /
+  `dependOnDirectoryContents`, or a change to it is missed.
+- A test binary for a foreign target is no longer skipped: its Run fails unless
+  `skip_foreign_checks` is set (`testRun` in build.zig).
+- `zig build -k` is gone; a failed step no longer stops the others.
+- The ELF linker now handles the `R_X86_64_PC64` relocations in recent glibc's crt
+  `.sframe`, which needed a patched crt under 0.16.
+
 ## `std.Io` futex (cross-platform, replaces `std.Thread.Futex`)
 
 `std.Thread.Futex` is gone; use `std.Io`'s futex, which is cross-platform
@@ -48,32 +112,6 @@ io.futexWaitUncancelable(u32, &wake.raw, expect);   // wake: std.atomic.Value(u3
 _ = wake.fetchAdd(1, .release);
 io.futexWake(u32, &wake.raw, 1);
 ```
-
----
-
-## Self-hosted linker chokes on glibc CRT `.sframe` (recent toolchains)
-
-On hosts with a recent glibc/binutils (e.g. Arch/CachyOS, gcc 16+), the C
-runtime startup objects `Scrt1.o`/`crt1.o` carry an SFrame unwind section
-(`.sframe` + `.rela.sframe`) that uses `R_X86_64_PC64` relocations. Zig 0.16's
-self-hosted ELF linker (the default for native Debug builds) cannot process
-that relocation type, so **every libc-linked build fails**:
-
-```
-fatal linker error: unhandled relocation type R_X86_64_PC64 at offset 0x1c
-    note: in .../crt1.o:.sframe
-```
-
-The exit-1 build even writes a corrupt binary ("exec format error"). Forcing
-`-flld` is not a fallback here — the bundled LLD segfaults on this system.
-
-`.sframe` is only stack-unwind metadata for the tiny `_start` stub, so stripping
-it is harmless. `tools/patch-crt.sh` builds `.zig-crt/` — a mirror of the system
-crt dir with those objects sframe-stripped (via `objcopy --remove-section`) — plus
-`.zig-crt/libc.txt`. `build.zig` auto-detects that file and sets `b.libc_file`
-(the global libc-file fallback for all compiles), so a plain `zig build` links
-cleanly. The dir is host-specific, `.gitignore`d, and a no-op on hosts with an
-older toolchain (e.g. the CUDA desktop). Re-run the script after a glibc upgrade.
 
 ---
 
@@ -245,28 +283,34 @@ Use `std.Io.sleep(io, duration, clock)` instead. `duration` is `std.Io.Duration{
 std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .real) catch {};  // 1ms
 ```
 
-## SPIR-V kernels (0.16 self-hosted backend)
+## SPIR-V kernels (self-hosted backend)
 
-- Compile with `-target spirv64-vulkan -fno-llvm`. Release modes without
-  `-fno-llvm` silently pick the LLVM backend, which does not support
-  `callconv(.spirv_kernel)` (and can segfault or emit empty output).
-- `std.gpu.executionMode(...)` does not work ("cannot set execution mode in
-  assembly"); the module comes out without `OpExecutionMode LocalSize`.
-  `src/gpu/spv.zig` patches it into the binary at load time instead.
-- Storage buffers: declare `extern var buf: T addrspace(.storage_buffer)` where
-  `T` is an `extern struct` wrapping the array, then add the Vulkan-required
-  decorations via inline asm inside the kernel. Types are passed to asm with
-  the `"t"` constraint, variables with `""`:
+The bullets from "Workgroup (shared) memory" on were found on 0.16; 0.17 fixed 22 SPIR-V
+backend bugs and lists new regressions (#37050), so treat each as unverified until it bites
+again.
 
-```zig
-asm volatile (
-    \\OpDecorate %t Block
-    \\OpMemberDecorate %t 0 Offset 0
-    \\OpDecorate %v DescriptorSet 0
-    \\OpDecorate %v Binding 0
-    : : [t] "t" (Buf), [v] "" (&buf));
-```
-
+- Compile with `.use_llvm = false` (`-fno-llvm`). Release modes without it silently pick
+  the LLVM backend, which does not support `spirv_kernel` (and can segfault or emit
+  empty output).
+- The calling convention carries the workgroup size,
+  `callconv(.{ .spirv_kernel = .{ .x, .y, .z } })`, and the compiler emits
+  `OpExecutionMode LocalSize` from it. Ours is a placeholder (`kernels/abi.zig`):
+  `spv.withLocalSize` overwrites it with the size the device gets at load.
+- **Inline-asm `OpDecorate` on a VARIABLE is silently dropped** (on a type it still
+  lands), so a buffer decorated that way has no binding and every buffer aliases
+  binding 0. Declare it with
+  `@extern(*addrspace(.storage_buffer) T, .{ .name, .decoration = .{ .descriptor = .{ .set, .binding } } })`
+  (`abi.buffer`); the compiler emits Block, Offset and ArrayStride itself. The
+  `gpu/context.zig` test that every kernel's bindings are tracked is what caught it.
+- 0.17 inlines a kernel's whole body into its entry point, and the NVIDIA driver (580)
+  builds slower code from that than from an entry that calls one function: 4-9% on
+  several dual GEMVs, from SPIR-V otherwise identical in instructions and order.
+  `dual.zig`'s `Entry` keeps the body behind `@call(.never_inline, ...)`. The other
+  kernel modules showed no difference (`vk-prep-bench`, `anima-vk-bench`).
+- A built-in input is decorated by its extern NAME: `global_invocation_id` (std.spirv),
+  and `subgroup_size`, `subgroup_local_invocation_id`, `subgroup_id`, `num_subgroups`.
+- Capabilities cannot be declared in inline asm; they follow the target's cpu
+  features. Ours are added to the module at load (`spv.withCapabilities`), per device.
 - Kernel entry points must not take parameters (that emits a Linkage module,
   not executable by Vulkan); use decorated globals + push constants.
 - Embedding the .spv: `b.addObject` with the spirv target + `.use_llvm = false`,
@@ -316,35 +360,23 @@ asm volatile (
   the quickest bring-up probe: the crash is a SEGV inside `libnvidia-glvkspirv`
   before any kernel runs.
 
-## NVPTX kernels: `export` + `callconv(.nvptx_kernel)` dies in LLVM (0.16.0)
+## NVPTX kernels (LLVM backend)
 
-- `zig build-obj -target nvptx64-cuda -mcpu=sm_86 -femit-asm=k.ptx -fno-emit-bin`
-  aborts with `LLVM ERROR: NVPTX aliasee must be a non-kernel function definition`
-  for ANY exported kernel, every optimize mode, `@export` included. The LLVM
-  backend emits the function as `define private ptx_kernel @mod.name` plus
-  `@name = alias ... @mod.name`, and NVPTX refuses an alias to a kernel. Open
-  upstream issue; no in-language workaround.
-- Working route with no extra tools: `-femit-llvm-ir=k.ll -fno-emit-bin
-  -fno-emit-asm` succeeds; drop the alias line and rename the private function
-  to the exported name (make it non-private); then Zig's bundled clang lowers
-  it: `zig cc -target nvptx64-cuda -O3 k.ll -S -o k.ptx` (`.ll` is picked by
-  extension; `-x ir` is rejected by the wrapper). `ptxas -arch=sm_86` accepts
-  the result. The box's `llc-18` does not: 0.16 emits LLVM 21 syntax
-  (`captures(none)`).
+- build.zig emits `dual.ptx` as the object's assembly (`addObject` for `nvptx64-cuda`,
+  `getEmittedAsm`), with the PTX ISA version the hand kernels use as a cpu feature
+  (`-mcpu=sm_86+ptx80`): the cpu model alone gives an older ISA (7.1 for sm_86), and
+  this box's ptxas (12.x) rejects the 8.7 `zig cc -march=sm_86` would emit.
+- 0.16's LLVM backend aliased every exported kernel to a private function, which NVPTX
+  refuses (`LLVM ERROR: NVPTX aliasee must be a non-kernel function definition`), so
+  the PTX came from IR through a rename tool and `zig cc`. 0.17 emits no alias; the
+  direct PTX is bit-identical in results and equal in speed (`tp-llm --bench` hashes).
 - `@exp` has no libcall on nvptx ("no libcall available for fexp"); use
   `@exp2(x * log2e)`, which lowers to `ex2.approx` like the hand PTX does.
 - A kernel `[*]addrspace(.global) f32` parameter comes out as
   `.param .u64 .ptr .global`, and scalar params in order, so a Zig kernel taking
   `(a, b, c, d, u0..u5, f0, f1)` matches `cuda/elt.zig`'s launcher ABI as is.
 - Thread index: `@workGroupId(0) * @workGroupSize(0) + @workItemId(0)`
-  (`std.gpu.global_invocation_id` is SPIR-V only).
-- In build.zig this is `b.addObject` for `nvptx64-cuda` (only `getEmittedLlvmIr()`
-  requested, so the step passes `-fno-emit-bin` itself), a run of
-  `tools/ptx_unalias.zig`, then `b.addSystemCommand` with `zig cc`. Under `zig cc`
-  the PTX ISA version follows Zig's CPU model (7.1 for sm_86); add
-  `-Xclang -target-feature -Xclang +ptx80` to get the 8.0 the hand kernels use.
-  The box's `ptxas` (12.x) rejects the 8.7 that `zig clang -march=sm_86` emits;
-  the driver JIT would take it.
+  (`std.spirv.global_invocation_id` is SPIR-V only).
 
 ## `@min`/`@max` with a comptime bound narrows the result type
 
@@ -393,7 +425,7 @@ return w.buffered();           // exactly the bytes written
 an absolute path, pass the directory itself and open relative to it
 (e.g. `SafeTensors.openIn(gpa, io, dir, sub_path)`).
 
-## `std.process.Child.Term` tags are lowercase in 0.16.0
+## `std.process.Child.Term` tags are lowercase
 
 ```zig
 // Old
@@ -523,13 +555,10 @@ succeeded and the summary says `N passed; 0 failed`. Don't burn time
 debugging it: check `zig build test --summary all`; if it says
 `test success`, nothing failed.
 
-Mechanism (Zig 0.16 cosmetic bug): `Step/Run.zig` sets
-`step.result_failed_command` before spawning every test binary and never
-clears it on the `zig_test` success path; `build_runner.zig`'s `makeStep`
-routes ANY step with non-empty `result_stderr` through
-`printErrorMessages` ("no matter the result"), which unconditionally
-appends the `failed command:` line when `result_failed_command` is set
-(default `verbose` error style).
+Mechanism (a cosmetic bug, still in 0.17's maker): the Run step records its
+command line as the failed command before spawning every test binary and never
+clears it on success, and any step with stderr is printed through the error
+path, which appends that line.
 
 Rule: tests print diagnostics **only on failure**, via `errdefer`:
 
@@ -640,9 +669,9 @@ waiting; `client/remote.zig`'s `deinit` is the case.
 
 `@Struct(.auto, null, &names, &types, &attrs)` builds a struct type from
 parallel arrays: the field names, their types, and one
-`std.builtin.Type.StructField.Attributes` each (`default_value_ptr`,
+`std.lang.Type.Struct.FieldAttributes` each (`default_value_ptr`,
 `@"align"`, `@"comptime"`). A field copied from an existing struct carries its
-default by passing `f.default_value_ptr` through. Integers are `@Int(.unsigned,
+default by passing its `field_attrs[i]` through. Integers are `@Int(.unsigned,
 bits)`, enums `@Enum`. The name lookup over a 60-field struct needs
 `@setEvalBranchQuota` in the builder. `shared/config.zig`'s `Subset` is the
 in-tree example.
@@ -711,7 +740,7 @@ use-after-close. Ask for `testing.tmpDir(.{ .iterate = true })`.
 
 ## std has no free-space call, and a file writer's `pos` is the seek
 
-`statvfs`/`fstatfs` are wrapped nowhere in 0.16, not even in `std.c`, and there is no
+`statvfs`/`fstatfs` are wrapped nowhere in std, not even in `std.c`, and there is no
 `GetDiskFreeSpaceEx` binding: a free-space check is a raw `syscall2(.statfs, ...)` with
 its own `extern struct` on Linux and a `kernel32` extern on Windows, which is why it
 lives in `core/diskspace.zig` beside the other per-platform shims. A raw syscall's
@@ -922,21 +951,15 @@ A comptime generator returning `struct { inline fn run(...) void {...} }.run` as
 parameter that takes a function accepts an inline one that way (the dual kernel table's
 `quant.GemvN(.q4_k).run`).
 
-## A Windows host: seven things that only break there
+## A Windows host: things that only break there
 
-- **`zig build` cannot emit a SPIR-V object on a Windows host** (`failed to write:
-  NotOpenForWriting`). Before moving a finished compile out of its temporary cache dir,
-  `Compilation.zig` closes the linker's output file, since Windows refuses to rename a dir
-  holding an open handle, and asks the linker to reopen it; the SPIR-V arm of
-  `link.File.makeWritable` is a no-op, so the module is written to a closed file. A direct
-  `zig build-obj` takes no such path, which is why `build.zig` compiles each kernel as a
-  Run of `zig build-obj` with every file under `src/gpu/kernels` as an input. Fixed in
-  0.17 (`.c, .spirv => ... openFile`); that is when the Run goes back to a Compile step.
+- **0.16 could not emit a SPIR-V object from a Compile step on a Windows host**
+  (`failed to write: NotOpenForWriting`: the SPIR-V arm of `link.File.makeWritable` was a
+  no-op), so build.zig ran `zig build-obj` instead. 0.17 fixes it and build.zig is back
+  on `addObject`; a native Windows build is what confirms it.
 - **`Io.Dir.setTimestamps` is `@panic("TODO ...")` on Windows.** `File.setTimestamps`
   works; open the file `.read_write`, and close it before anything tries to delete it,
   since Windows will not delete an open file.
-- **LLVM writes IR text with CRLF on Windows** (`-femit-llvm-ir`), so a tool that parses
-  it line by line must strip `\r` (`tools/ptx_unalias.zig`).
 - **A socket read or write after the peer closes returns `error.Unexpected`**, unix or
   TCP, and in Debug prints a stack trace first: `netReadWindows` / `netWriteWindows` map
   neither `PIPE_DISCONNECTED` nor `LOCAL_DISCONNECT` (0.17 adds only `CONNECTION_RESET`
@@ -946,7 +969,7 @@ parameter that takes a function accepts an inline one that way (the dual kernel 
 - **A unix socket's path must use `\` on Windows.** std binds it through AFD ioctls, which
   pass the path to the socket driver untranslated, so `C:\...\Temp/x/local.sock` fails
   as `OBJECT_PATH_NOT_FOUND` (`error.Unexpected`) though Win32 file calls accept the `/`.
-  Build socket paths with `std.fs.path.sep_str` (`link.localPath`), and never `/tmp`.
+  Build socket paths with `std.Io.Dir.path.sep_str` (`link.localPath`), and never `/tmp`.
 - **An AF_UNIX connect that fails returns `error.Unexpected`**, a stack trace first in
   Debug: `netConnectUnixWindows` maps no AFD connect status but `INSUFFICIENT_RESOURCES`,
   so a socket path with nothing there (`CONNECTION_REFUSED`, 0xc0000236) reads as a

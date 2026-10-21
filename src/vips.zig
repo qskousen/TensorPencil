@@ -11,9 +11,7 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("vips_helper.h");
-});
+const c = @import("c");
 
 var initialized = false;
 
@@ -36,7 +34,7 @@ pub const Decoded = struct {
 /// (EXIF-autorotated, alpha flattened over white).
 pub fn loadRgb(gpa: std.mem.Allocator, path: []const u8) !Decoded {
     try ensureInit();
-    const pathz = try gpa.dupeZ(u8, path);
+    const pathz = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(pathz);
 
     var buf: ?*anyopaque = null;

@@ -42,7 +42,7 @@ pub const Event = enum {
 };
 
 pub const Editor = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
+    buf: std.ArrayList(u8) = .empty,
     state: State = .normal,
     /// CSI parameter bytes ("13;2" of CSI 13;2u); overflow abandons the seq.
     csi: [15]u8 = undefined,

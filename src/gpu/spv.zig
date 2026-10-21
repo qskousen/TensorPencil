@@ -1,8 +1,6 @@
-//! SPIR-V binary post-processing.
-//!
-//! Zig 0.16's SPIR-V backend cannot emit `OpExecutionMode LocalSize` (the
-//! std.gpu.executionMode helper is rejected by its assembler), so the
-//! workgroup size is spliced into the module here at load time.
+//! SPIR-V binary post-processing: the Zig backend's output patched into the
+//! shape a strict Vulkan driver accepts, and the workgroup size the device picks
+//! set at load time.
 
 const std = @import("std");
 
@@ -113,11 +111,12 @@ pub fn forEntry(gpa: std.mem.Allocator, spv: []align(4) const u8, entry_name: []
 /// A literal string operand: bytes up to the first NUL.
 fn wordString(ws: []const u32) []const u8 {
     const bytes = std.mem.sliceAsBytes(ws);
-    return bytes[0 .. std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len];
+    return bytes[0 .. std.mem.findScalar(u8, bytes, 0) orelse bytes.len];
 }
 
-/// Return a copy of `spv` with `OpExecutionMode <entry> LocalSize x y z`
-/// inserted after the OpEntryPoint whose name matches `entry_name`.
+/// Return a copy of `spv` whose entry point `entry_name` has workgroup size
+/// x y z: its `OpExecutionMode LocalSize` overwritten (the Zig backend emits one
+/// from the calling convention), or inserted after the OpEntryPoint if it has none.
 pub fn withLocalSize(gpa: std.mem.Allocator, spv: []const u8, entry_name: []const u8, x: u32, y: u32, z: u32) Error![]align(4) u8 {
     if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
     const n_words = spv.len / 4;
@@ -141,7 +140,7 @@ pub fn withLocalSize(gpa: std.mem.Allocator, spv: []const u8, entry_name: []cons
         if (opcode == op_entry_point and wc >= 4) {
             // words: [op] execution_model entry_id name... interface_ids...
             const name_bytes = spv[(i + 3) * 4 .. (i + wc) * 4];
-            const name_end = std.mem.indexOfScalar(u8, name_bytes, 0) orelse name_bytes.len;
+            const name_end = std.mem.findScalar(u8, name_bytes, 0) orelse name_bytes.len;
             if (std.mem.eql(u8, name_bytes[0..name_end], entry_name)) {
                 entry_id = word_at(spv, i + 2);
                 insert_at = i + wc;
@@ -151,6 +150,23 @@ pub fn withLocalSize(gpa: std.mem.Allocator, spv: []const u8, entry_name: []cons
         i += wc;
     }
     const id = entry_id orelse return error.EntryPointNotFound;
+
+    // OpExecutionMode follows every OpEntryPoint in the layout the spec requires.
+    while (i < n_words) {
+        const first = word_at(spv, i);
+        const opcode: u16 = @truncate(first & 0xFFFF);
+        const wc: usize = first >> 16;
+        if (wc == 0 or i + wc > n_words) return error.InvalidSpirv;
+        if (opcode != op_entry_point and opcode != op_execution_mode and opcode != op_execution_mode_id) break;
+        if (opcode == op_execution_mode and wc == 6 and word_at(spv, i + 1) == id and word_at(spv, i + 2) == mode_local_size) {
+            const out = try gpa.alignedAlloc(u8, .of(u32), spv.len);
+            @memcpy(out, spv);
+            const size = [3]u32{ x, y, z };
+            @memcpy(out[(i + 3) * 4 ..][0..12], std.mem.sliceAsBytes(&size));
+            return out;
+        }
+        i += wc;
+    }
 
     // OpExecutionMode has 6 words: header, entry, LocalSize, x, y, z.
     const out = try gpa.alignedAlloc(u8, .of(u32), spv.len + 6 * 4);
@@ -255,54 +271,206 @@ pub fn stripWorkgroupStrides(gpa: std.mem.Allocator, spv: []const u8) Error![]al
     return bytes;
 }
 
-const op_member_decorate: u16 = 72;
+const op_type_matrix: u16 = 24;
+const op_type_runtime_array: u16 = 29;
+const op_function_parameter: u16 = 55;
+const op_load: u16 = 61;
+const op_access_chain: u16 = 65;
+const op_in_bounds_access_chain: u16 = 66;
+const op_ptr_access_chain: u16 = 67;
+const op_in_bounds_ptr_access_chain: u16 = 70;
+const op_copy_object: u16 = 83;
+const op_select: u16 = 169;
+const op_phi: u16 = 245;
 
-/// Drop exact-duplicate OpDecorate/OpMemberDecorate instructions. The Zig
-/// backend emits automatic layout decorations for storage structs and our
-/// kernels add the Vulkan-required ones via inline asm, so members end up
-/// decorated twice, invalid SPIR-V that NVIDIA rejects at runtime.
-pub fn dedupeDecorations(gpa: std.mem.Allocator, spv: []const u8) Error![]align(4) u8 {
-    if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
-    const n_words = spv.len / 4;
-    const in_words: []align(1) const u32 = std.mem.bytesAsSlice(u32, spv);
-    if (in_words[0] != magic) return error.InvalidSpirv;
+/// What an access-chain walk needs: every type's operands, the 32-bit constants a
+/// struct index names, the type of every pointer-valued id, and the pointer type
+/// for each (storage class, pointee).
+const TypeTable = struct {
+    /// Word offset of each type instruction, by result id; 0 for a non-type.
+    type_at: []u32,
+    /// The low word of each OpConstant, by result id.
+    constant: []?u32,
+    /// The result type of each id that can be an access chain's base.
+    value_type: []u32,
+    /// Pointer type id by (storage class, pointee), and back.
+    pointers: std.AutoHashMapUnmanaged([2]u32, u32) = .empty,
+    pointee: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        seen.deinit(gpa);
+    fn deinit(t: *TypeTable, gpa: std.mem.Allocator) void {
+        gpa.free(t.type_at);
+        gpa.free(t.constant);
+        gpa.free(t.value_type);
+        t.pointers.deinit(gpa);
+        t.pointee.deinit(gpa);
     }
 
-    var out: std.ArrayList(u32) = .empty;
-    defer out.deinit(gpa);
-    try out.ensureTotalCapacity(gpa, n_words);
-    for (in_words[0..5]) |w| try out.append(gpa, w);
+    fn addPointer(t: *TypeTable, gpa: std.mem.Allocator, key: [2]u32, id: u32) Error!void {
+        try t.pointers.put(gpa, key, id);
+        try t.pointee.put(gpa, id, key);
+    }
 
-    var i: usize = 5;
-    while (i < n_words) {
-        const first = in_words[i];
-        const opcode: u16 = @truncate(first & 0xFFFF);
-        const wc: usize = first >> 16;
-        if (wc == 0 or i + wc > n_words) return error.InvalidSpirv;
-        var drop = false;
-        if (opcode == op_decorate or opcode == op_member_decorate) {
-            const key_src = std.mem.sliceAsBytes(in_words[i .. i + wc]);
-            const entry = try seen.getOrPut(gpa, key_src);
-            if (entry.found_existing) {
-                drop = true;
-            } else {
-                entry.key_ptr.* = try gpa.dupe(u8, key_src);
+    /// The type `chain`'s indices reach from its base pointer, as (storage class,
+    /// pointee), or null when it cannot tell (a struct indexed by a non-constant).
+    fn reached(t: *const TypeTable, w: []align(1) const u32, chain: []align(1) const u32) ?[2]u32 {
+        const op: u16 = @truncate(chain[0] & 0xffff);
+        if (chain[3] >= t.value_type.len) return null;
+        const base = t.pointee.get(t.value_type[chain[3]]) orelse return null;
+        var cur = base[1];
+        // A Ptr chain's first index steps over elements of the base pointer itself.
+        const first: usize = if (op == op_ptr_access_chain or op == op_in_bounds_ptr_access_chain) 5 else 4;
+        for (chain[first..]) |index| {
+            if (cur >= t.type_at.len or index >= t.constant.len) return null;
+            const ti = w[t.type_at[cur]..];
+            switch (@as(u16, @truncate(ti[0] & 0xffff))) {
+                op_type_array, op_type_runtime_array, op_type_vector, op_type_matrix => cur = ti[2],
+                op_type_struct => {
+                    const member = t.constant[index] orelse return null;
+                    if (member + 2 >= ti[0] >> 16) return null;
+                    cur = ti[2 + member];
+                },
+                else => return null,
             }
         }
-        if (!drop) {
-            for (in_words[i .. i + wc]) |w| try out.append(gpa, w);
+        return .{ base[0], cur };
+    }
+};
+
+fn typeTable(gpa: std.mem.Allocator, w: []align(1) const u32) Error!TypeTable {
+    const bound = w[3];
+    var t: TypeTable = .{
+        .type_at = try gpa.alloc(u32, bound),
+        .constant = try gpa.alloc(?u32, bound),
+        .value_type = try gpa.alloc(u32, bound),
+    };
+    errdefer t.deinit(gpa);
+    @memset(t.type_at, 0);
+    @memset(t.constant, null);
+    @memset(t.value_type, 0);
+    var i: usize = 5;
+    while (i < w.len) {
+        const op: u16 = @truncate(w[i] & 0xffff);
+        const wc: usize = w[i] >> 16;
+        if (wc == 0 or i + wc > w.len) return error.InvalidSpirv;
+        switch (op) {
+            op_type_int, op_type_float, op_type_vector, op_type_matrix, op_type_array, op_type_runtime_array, op_type_struct, op_type_pointer => {
+                if (w[i + 1] >= bound) return error.InvalidSpirv;
+                t.type_at[w[i + 1]] = @intCast(i);
+                if (op == op_type_pointer) try t.addPointer(gpa, .{ w[i + 2], w[i + 3] }, w[i + 1]);
+            },
+            op_constant => if (wc >= 4 and w[i + 2] < bound) {
+                t.constant[w[i + 2]] = w[i + 3];
+            },
+            op_variable, op_function_parameter, op_load, op_copy_object, op_select, op_phi, op_access_chain, op_in_bounds_access_chain, op_ptr_access_chain, op_in_bounds_ptr_access_chain => if (wc >= 3 and w[i + 2] < bound) {
+                t.value_type[w[i + 2]] = w[i + 1];
+            },
+            else => {},
         }
         i += wc;
     }
-    const bytes = try gpa.alignedAlloc(u8, .of(u32), out.items.len * 4);
-    @memcpy(bytes, std.mem.sliceAsBytes(out.items));
-    return bytes;
+    return t;
+}
+
+fn isAccessChain(op: u16) bool {
+    return op == op_access_chain or op == op_in_bounds_access_chain or op == op_ptr_access_chain or op == op_in_bounds_ptr_access_chain;
+}
+
+/// Give every access chain the pointer type its indices reach. Zig 0.17's backend
+/// types a chain that indexes an array by a comptime-known value as a pointer to
+/// the ARRAY, which a driver rejects (NVIDIA: "NVVM compilation failed"). A
+/// missing pointer type is declared before the first function.
+pub fn fixAccessChainTypes(gpa: std.mem.Allocator, spv: []const u8) Error![]align(4) u8 {
+    if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
+    const out = try gpa.alignedAlloc(u8, .of(u32), spv.len);
+    defer gpa.free(out);
+    @memcpy(out, spv);
+    const w: []u32 = std.mem.bytesAsSlice(u32, out);
+    if (w[0] != magic) return error.InvalidSpirv;
+    var t = try typeTable(gpa, w);
+    defer t.deinit(gpa);
+
+    var added: std.ArrayList(u32) = .empty;
+    defer added.deinit(gpa);
+    var bound = w[3];
+    var first_fn: ?usize = null;
+    var i: usize = 5;
+    while (i < w.len) {
+        const op: u16 = @truncate(w[i] & 0xffff);
+        const wc: usize = w[i] >> 16;
+        if (op == op_function and first_fn == null) first_fn = i;
+        if (isAccessChain(op) and wc >= 4) if (t.reached(w, w[i .. i + wc])) |want| {
+            const ptr = t.pointers.get(want) orelse ptr: {
+                const id = bound;
+                bound += 1;
+                try added.appendSlice(gpa, &.{ (4 << 16) | @as(u32, op_type_pointer), id, want[0], want[1] });
+                try t.addPointer(gpa, want, id);
+                break :ptr id;
+            };
+            w[i + 1] = ptr;
+            // A later chain based on this one walks from the corrected type.
+            t.value_type[w[i + 2]] = ptr;
+        };
+        i += wc;
+    }
+    if (added.items.len == 0) {
+        const same = try gpa.alignedAlloc(u8, .of(u32), out.len);
+        @memcpy(same, out);
+        return same;
+    }
+    const at = first_fn orelse return error.InvalidSpirv;
+    w[3] = bound;
+    const result = try gpa.alignedAlloc(u8, .of(u32), out.len + added.items.len * 4);
+    @memcpy(result[0 .. at * 4], out[0 .. at * 4]);
+    @memcpy(result[at * 4 ..][0 .. added.items.len * 4], std.mem.sliceAsBytes(added.items));
+    @memcpy(result[(at + added.items.len) * 4 ..], out[at * 4 ..]);
+    return result;
+}
+
+/// Access chains whose result type is not the pointer their indices reach, and
+/// integer divisions whose operands are not of the result type (signedness
+/// included, which SPIR-V requires of these and of no add or multiply).
+pub const TypeErrors = struct { access_chains: usize = 0, divisions: usize = 0 };
+
+pub fn typeErrors(gpa: std.mem.Allocator, spv: []align(4) const u8) Error!TypeErrors {
+    const w: []const u32 = std.mem.bytesAsSlice(u32, spv);
+    if (w.len < 5 or w[0] != magic) return error.InvalidSpirv;
+    var t = try typeTable(gpa, w);
+    defer t.deinit(gpa);
+    // Every id's result type, for the division operands.
+    const ty = try gpa.alloc(u32, w[3]);
+    defer gpa.free(ty);
+    @memset(ty, 0);
+    var errs: TypeErrors = .{};
+    var i: usize = 5;
+    while (i < w.len) {
+        const op: u16 = @truncate(w[i] & 0xffff);
+        const wc: usize = w[i] >> 16;
+        if (wc == 0 or i + wc > w.len) return error.InvalidSpirv;
+        // Ops with a result type put it first and the result id second; these
+        // are the ones an integer operand can come from.
+        switch (op) {
+            op_constant, op_load, 81, 83, 109...124, 126...200, op_phi, 333...366 => if (wc >= 3 and w[i + 2] < ty.len) {
+                ty[w[i + 2]] = w[i + 1];
+            },
+            else => {},
+        }
+        if (isAccessChain(op) and wc >= 4) if (t.reached(w, w[i .. i + wc])) |want| {
+            if (t.pointers.get(want) != w[i + 1]) errs.access_chains += 1;
+        };
+        switch (op) {
+            134, 135, 137, 138, 139 => if (wc == 5) { // UDiv, SDiv, UMod, SRem, SMod
+                for (w[i + 3 .. i + 5]) |operand| {
+                    if (operand < ty.len and ty[operand] != 0 and ty[operand] != w[i + 1]) {
+                        errs.divisions += 1;
+                        break;
+                    }
+                }
+            },
+            else => {},
+        }
+        i += wc;
+    }
+    return errs;
 }
 
 const decoration_no_contraction: u32 = 42;
@@ -604,7 +772,7 @@ pub fn workgroupBytes(gpa: std.mem.Allocator, spv: []const u8) Error!u64 {
         switch (op) {
             op_entry_point => if (wc >= 4) {
                 var n: usize = 3;
-                while (n < wc) : (n += 1) if (std.mem.indexOfScalar(u8, std.mem.asBytes(&a[n]), 0) != null) break;
+                while (n < wc) : (n += 1) if (std.mem.findScalar(u8, std.mem.asBytes(&a[n]), 0) != null) break;
                 try interfaces.append(gpa, a[@min(n + 1, wc)..]);
             },
             op_type_pointer => if (wc >= 4 and a[2] == storage_class_workgroup) try pointee.put(gpa, a[1], a[3]),
@@ -651,6 +819,64 @@ test "patches local size after entry point" {
     try std.testing.expectEqual(@as(u32, 2), words[13]);
 
     try std.testing.expectError(error.EntryPointNotFound, withLocalSize(gpa, module.items, "other", 1, 1, 1));
+
+    // A module that already declares a size has it overwritten, not duplicated.
+    const resized = try withLocalSize(gpa, patched, "k", 32, 4, 1);
+    defer gpa.free(resized);
+    try std.testing.expectEqual(patched.len, resized.len);
+    const rw = std.mem.bytesAsSlice(u32, resized);
+    try std.testing.expectEqualSlices(u32, &.{ 32, 4, 1 }, rw[12..15]);
+}
+
+test "fixAccessChainTypes retypes a chain into an array element, adding the pointer type" {
+    const gpa = std.testing.allocator;
+    const sb: u32 = 12; // StorageBuffer
+    const words = [_]u32{
+        magic,                               0x10400,                               0,                                     20,                                0,
+        (3 << 16) | @as(u32, op_type_float), 1,                                     32,                                    (4 << 16) | @as(u32, op_type_int), 2,
+        32,                                  0,                                     (4 << 16) | @as(u32, op_constant),     2,                                 3,
+        4,                                   (4 << 16) | @as(u32, op_constant),     2,                                     4,                                 0,
+        (4 << 16) | @as(u32, op_type_array), 5,                                     1,                                     3,                                 (3 << 16) | @as(u32, op_type_struct),
+        6,                                   5,                                     (4 << 16) | @as(u32, op_type_pointer), 7,                                 sb,
+        6,                                   (4 << 16) | @as(u32, op_type_pointer), 8,                                     sb,                                5,
+        (4 << 16) | @as(u32, op_variable),   7,                                     9,                                     sb,
+        (2 << 16) | 19, // OpTypeVoid
+        10,
+        (3 << 16) | 33, // OpTypeFunction
+        11,
+        10,
+        (5 << 16) | @as(u32, op_function),
+        10,
+        12,
+        0,
+        11,
+        (2 << 16) | 248, // OpLabel
+        13,
+        // The struct's array: right.
+        (5 << 16) | @as(u32, op_in_bounds_access_chain),
+        8,
+        14,
+        9,
+        4,
+        // Element 0 of it, typed as the array again: wrong.
+        (5 << 16) | @as(u32, op_in_bounds_access_chain),
+        8,
+        15,
+        14,
+        4,
+        (1 << 16) | 253, // OpReturn
+        (1 << 16) | @as(u32, op_function_end),
+    };
+    const bytes = std.mem.sliceAsBytes(&words);
+    const before = try typeErrors(gpa, @alignCast(bytes));
+    try std.testing.expectEqual(@as(usize, 1), before.access_chains);
+
+    const fixed = try fixAccessChainTypes(gpa, bytes);
+    defer gpa.free(fixed);
+    try std.testing.expectEqual(TypeErrors{}, try typeErrors(gpa, fixed));
+    const fw = std.mem.bytesAsSlice(u32, fixed);
+    try std.testing.expectEqual(@as(u32, 21), fw[3]); // one id added
+    try std.testing.expectEqual(bytes.len + 16, fixed.len);
 }
 
 test "forEntry cuts each dual entry point to a module that resolves" {

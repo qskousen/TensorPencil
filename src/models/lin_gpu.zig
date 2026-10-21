@@ -1040,14 +1040,14 @@ test "a diffusion plan takes every format the device has a kernel for" {
 
 test "check refuses an int8 shape the GEMM cannot store and an unrotated int4" {
     var q = fake(.i8, 96, 512);
-    q.row_scale = &([_]f32{1} ** 96);
+    q.row_scale = &@as([96]f32, @splat(1));
     q.tag = "blk.0.q";
     try std.testing.expectEqual(Why.int_shape, dual_lin.check(Caps, full, &.{q}, .{ .blockq = .auto }).refused.why);
     q = fake(.i8, 128, 512);
-    q.row_scale = &([_]f32{1} ** 128);
+    q.row_scale = &@as([128]f32, @splat(1));
     try std.testing.expect(dual_lin.check(Caps, full, &.{q}, .{ .blockq = .auto }) == .ok);
     var q4 = fake(.i4, 128, 512);
-    q4.row_scale = &([_]f32{1} ** 128);
+    q4.row_scale = &@as([128]f32, @splat(1));
     try std.testing.expectEqual(Why.int4_unrotated, dual_lin.check(Caps, full, &.{q4}, .{ .blockq = .auto }).refused.why);
 }
 

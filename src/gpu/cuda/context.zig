@@ -3,6 +3,7 @@
 //! diagnostic-friendly (the Phase-1 experiment lives on top of this).
 
 const std = @import("std");
+const repeat = @import("tp_core").strings.repeat;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const cu = @import("cu.zig");
@@ -11,7 +12,7 @@ pub const MemTag = mem_tag.MemTag;
 
 pub const Error = error{ CudaError, OutOfMemory, DeviceOutOfMemory };
 
-/// Monotonic wall-clock nanoseconds (io-free; std.time.Timer is gone in 0.16).
+/// Monotonic wall-clock nanoseconds (io-free; std.time.Timer is gone).
 pub const monoNs = @import("tp_core").prof.monoNs;
 
 /// Pinned staging-ring depth (slots in flight for async weight uploads).
@@ -162,7 +163,7 @@ pub const Context = struct {
         // Device name.
         var nb: [256]u8 = undefined;
         if (self.api.cuDeviceGetName(&nb, nb.len, self.dev) == cu.CUDA_SUCCESS) {
-            const n = std.mem.indexOfScalar(u8, &nb, 0) orelse nb.len;
+            const n = std.mem.findScalar(u8, &nb, 0) orelse nb.len;
             @memcpy(self.name_buf[0..n], nb[0..n]);
             self.name_len = n;
         }
@@ -624,7 +625,7 @@ const FillPool = struct {
         if (r == cu.CUDA_ERROR_OUT_OF_MEMORY) return error.DeviceOutOfMemory;
         try self.check(r, "cuMemAlloc");
         self.device_used += bytes;
-        if (self.track_tags) self.mem_tag_used[@intFromEnum(self.mem_tag)] += bytes;
+        if (self.track_tags) self.mem_tag_used[@backingInt(self.mem_tag)] += bytes;
         return .{ .ptr = ptr, .bytes = bytes, .tag = self.mem_tag };
     }
 
@@ -632,7 +633,7 @@ const FillPool = struct {
         if (buf.ptr != 0) {
             _ = self.api.cuMemFree(buf.ptr);
             self.device_used -|= buf.bytes;
-            if (self.track_tags) self.mem_tag_used[@intFromEnum(buf.tag)] -|= buf.bytes;
+            if (self.track_tags) self.mem_tag_used[@backingInt(buf.tag)] -|= buf.bytes;
         }
         buf.* = .{};
     }
@@ -645,7 +646,7 @@ const FillPool = struct {
 
     /// Live device bytes attributed to `tag` (0 unless tagging is active).
     pub fn memTagUsed(self: *const Context, tag: MemTag) u64 {
-        return self.mem_tag_used[@intFromEnum(tag)];
+        return self.mem_tag_used[@backingInt(tag)];
     }
 
     /// Live device free/total bytes (cuMemGetInfo), sees OTHER processes'
@@ -733,7 +734,7 @@ const FillPool = struct {
         // Without this the KV cache is the one big allocation NOT in the tag
         // breakdown: it bypasses `alloc`, so its bytes would sit inside
         // `device_used` under no tag at all and read as unattributed overhead.
-        if (self.track_tags) self.mem_tag_used[@intFromEnum(tag)] += size;
+        if (self.track_tags) self.mem_tag_used[@backingInt(tag)] += size;
         return h;
     }
 
@@ -745,7 +746,7 @@ const FillPool = struct {
         for (handles) |h| _ = self.api.cuMemRelease.?(h);
         _ = self.api.cuMemAddressFree.?(base, va_size);
         self.device_used -|= committed;
-        if (self.track_tags) self.mem_tag_used[@intFromEnum(tag)] -|= committed;
+        if (self.track_tags) self.mem_tag_used[@backingInt(tag)] -|= committed;
     }
 
     pub fn upload(self: *Context, buf: Buffer, data: []const u8) Error!void {
@@ -898,7 +899,7 @@ test "kernel names survive a caller's stack buffer, and an unknown one is labell
     var c = testContext();
     {
         var buf: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "mmq_pipe_q2_0_{s}", .{"g64"}) catch unreachable;
+        const name = std.mem.print(&buf, "mmq_pipe_q2_0_{s}", .{"g64"}) catch unreachable;
         c.noteFunction(fakeFn(0), name);
         @memset(&buf, 0xaa); // the caller's buffer is gone by the time we print
     }
@@ -909,7 +910,7 @@ test "kernel names survive a caller's stack buffer, and an unknown one is labell
 
 test "a name longer than the table's slot is truncated, not written past" {
     var c = testContext();
-    const long = "k" ** 200;
+    const long = repeat("k", 200);
     c.noteFunction(fakeFn(0), long);
     try std.testing.expectEqual(c.fn_names[0].buf.len, c.functionName(fakeFn(0)).len);
 }

@@ -6,8 +6,4 @@
 //! CPU quant kernels; with `-Dggml=false` this module is not imported and the
 //! GGUF block-quant paths return error.QuantBackendUnavailable (see quants.zig).
 
-pub const c = @cImport({
-    @cDefine("NDEBUG", "1");
-    @cInclude("ggml.h");
-    @cInclude("ggml-cpu.h");
-});
+pub const c = @import("ggml_c");

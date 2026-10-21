@@ -520,8 +520,8 @@ pub const Scratch = struct {
     pub fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
         var done: usize = 0;
-        errdefer inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            if (i < done) gpa.free(@field(s, f.name));
+        errdefer inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            if (i < done) gpa.free(@field(s, name));
         };
         const sizes = [_]usize{
             seq * cfg.hidden, // normed
@@ -533,15 +533,15 @@ pub const Scratch = struct {
             seq * cfg.intermediate, // gate
             seq * cfg.intermediate, // up
         };
-        inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            @field(s, f.name) = try gpa.alloc(f32, sizes[i]);
+        inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            @field(s, name) = try gpa.alloc(f32, sizes[i]);
             done = i + 1;
         }
         return s;
     }
 
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Scratch).@"struct".fields) |f| gpa.free(@field(self, f.name));
+        inline for (@typeInfo(Scratch).@"struct".field_names) |name| gpa.free(@field(self, name));
         self.* = undefined;
     }
 };

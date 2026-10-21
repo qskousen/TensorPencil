@@ -104,7 +104,7 @@ pub const Model = struct {
         const cfg = config_m_v2;
 
         var pbuf: [1024]u8 = undefined;
-        var st = try SafeTensors.open(gpa, io, try std.fmt.bufPrint(&pbuf, "{s}/model.safetensors", .{dir}));
+        var st = try SafeTensors.open(gpa, io, try std.mem.print(&pbuf, "{s}/model.safetensors", .{dir}));
         errdefer st.deinit();
         const store: WeightStore = .{ .safetensors = &st };
 

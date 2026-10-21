@@ -504,7 +504,7 @@ pub const CudaLM = struct {
         return null;
     }
 
-    fn hostLayers(self: *const CudaLM) usize {
+    pub fn hostLayers(self: *const CudaLM) usize {
         var n: usize = 0;
         for (self.host_experts) |h| n += @intFromBool(h);
         return n;

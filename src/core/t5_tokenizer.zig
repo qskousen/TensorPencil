@@ -56,6 +56,7 @@
 
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
+const strings = @import("strings.zig");
 const prompt_weights = @import("prompt_weights.zig");
 
 const vocab_bin = @embedFile("assets/t5_tokenizer/vocab.bin");
@@ -111,7 +112,7 @@ fn cpLen(b: u8) usize {
 
 fn cpAt(s: []const u8, i: usize) struct { cp: u21, len: usize } {
     const n = @min(cpLen(s[i]), s.len - i);
-    const cp = std.unicode.utf8Decode(s[i .. i + n]) catch {
+    const cp = strings.utf8DecodeSequence(s[i .. i + n]) catch {
         // Invalid UTF-8 cannot reach here from a Zig string literal or a validated
         // prompt, but a prompt is caller data. Treat the byte as its own scalar so
         // the tokenizer degrades to <unk> rather than failing the render.
@@ -213,7 +214,7 @@ pub const Tokenizer = struct {
                 return a < b;
             }
         }.lt);
-        var added_first = [_]bool{false} ** 256;
+        var added_first: [256]bool = @splat(false);
         for (added) |id| if (pieces[id].len > 0) {
             added_first[pieces[id][0]] = true;
         };
@@ -469,7 +470,7 @@ pub const Tokenizer = struct {
         const at = best orelse return null;
         if (at >= self.blob.len) return null;
         const rest = self.blob[at..];
-        const end = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+        const end = std.mem.findScalar(u8, rest, 0) orelse rest.len;
         return rest[0..end];
     }
 
@@ -720,7 +721,7 @@ test "the metaspace prefix keys off byte offset zero, not the first span" {
         for (got) |id| std.debug.print(" {d}({s})", .{ id, tok.pieces[id] });
         std.debug.print("\n", .{});
     }
-    const at = std.mem.indexOfScalar(u32, got, 32099) orelse return error.AddedTokenMissing;
+    const at = std.mem.findScalar(u32, got, 32099) orelse return error.AddedTokenMissing;
     try testing.expect(!std.mem.startsWith(u8, tok.pieces[got[at + 1]], meta));
     // ...while the span that DOES start at offset 0 gets one.
     try testing.expect(std.mem.startsWith(u8, tok.pieces[got[0]], meta));

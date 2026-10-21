@@ -7,7 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const RawTty = switch (builtin.os.tag) {
+pub const RawTty = switch (builtin.target.os.tag) {
     .windows => Windows,
     else => Posix,
 };
@@ -24,8 +24,8 @@ const Posix = struct {
         raw.lflag.ISIG = false;
         raw.iflag.ICRNL = false;
         raw.iflag.IXON = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(fd, .NOW, raw);
         return .{ .fd = fd, .saved = saved };
     }

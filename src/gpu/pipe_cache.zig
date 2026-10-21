@@ -23,12 +23,12 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// `<XDG_CACHE_HOME, HOME/.cache or LOCALAPPDATA>/tensorpencil/<leaf>`, or null when none
 /// of them is set.
 pub fn path(buf: []u8, leaf: []const u8) ?[]const u8 {
-    const sep = std.fs.path.sep_str;
-    if (getenv("XDG_CACHE_HOME")) |p| return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
-    if (builtin.os.tag == .windows) {
-        if (getenv("LOCALAPPDATA")) |p| return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
+    const sep = std.Io.Dir.path.sep_str;
+    if (getenv("XDG_CACHE_HOME")) |p| return std.mem.print(buf, "{s}" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
+    if (builtin.target.os.tag == .windows) {
+        if (getenv("LOCALAPPDATA")) |p| return std.mem.print(buf, "{s}" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
     }
-    if (getenv("HOME")) |p| return std.fmt.bufPrint(buf, "{s}" ++ sep ++ ".cache" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
+    if (getenv("HOME")) |p| return std.mem.print(buf, "{s}" ++ sep ++ ".cache" ++ sep ++ "tensorpencil" ++ sep ++ "{s}", .{ std.mem.sliceTo(p, 0), leaf }) catch null;
     return null;
 }
 
@@ -37,12 +37,12 @@ pub const pipe_prefix = "vk-pipe-";
 
 /// The cache file's name for a device's `pipelineCacheUUID` and this build's modules.
 pub fn fileName(buf: []u8, uuid: [16]u8, build: u64) []const u8 {
-    return std.fmt.bufPrint(buf, build_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, build }) catch unreachable;
+    return std.mem.print(buf, build_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, build }) catch unreachable;
 }
 
 /// One pipeline's own cache file, for the device and the pipeline's content hash.
 pub fn pipeFileName(buf: []u8, uuid: [16]u8, key: u64) []const u8 {
-    return std.fmt.bufPrint(buf, pipe_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, key }) catch unreachable;
+    return std.mem.print(buf, pipe_prefix ++ "{x}-{x:0>16}.bin", .{ uuid, key }) catch unreachable;
 }
 
 /// Delete every `prefix` cache in `dir` but the `keep` most recently written. Best
@@ -100,9 +100,9 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, p: []const u8) ?[]u8 {
 /// process starting up) never sees a partial file.
 pub fn write(io: std.Io, p: []const u8, data: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.dirname(p)) |d| try cwd.createDirPath(io, d);
+    if (std.Io.Dir.path.dirname(p)) |d| try cwd.createDirPath(io, d);
     var tmp_buf: [1024]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.{d}.tmp", .{ p, std.Thread.getCurrentId() });
+    const tmp = try std.mem.print(&tmp_buf, "{s}.{d}.tmp", .{ p, std.Thread.getCurrentId() });
     try cwd.writeFile(io, .{ .sub_path = tmp, .data = data });
     errdefer cwd.deleteFile(io, tmp) catch {};
     try std.Io.Dir.rename(cwd, tmp, cwd, p, io);
@@ -111,7 +111,7 @@ pub fn write(io: std.Io, p: []const u8, data: []const u8) !void {
 test "path names the tensorpencil cache directory" {
     var buf: [512]u8 = undefined;
     const p = path(&buf, used_list) orelse return error.SkipZigTest;
-    try std.testing.expect(std.mem.endsWith(u8, p, "tensorpencil" ++ std.fs.path.sep_str ++ used_list));
+    try std.testing.expect(std.mem.endsWith(u8, p, "tensorpencil" ++ std.Io.Dir.path.sep_str ++ used_list));
     var nb: [96]u8 = undefined;
     try std.testing.expectEqualStrings("vk-pipelines-000102030405060708090a0b0c0d0e0f-00000000000000ab.bin", fileName(&nb, .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, 0xab));
     try std.testing.expectEqualStrings("vk-pipe-000102030405060708090a0b0c0d0e0f-00000000000000ab.bin", pipeFileName(&nb, .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, 0xab));
@@ -127,7 +127,7 @@ test "prune keeps the newest caches of its kind and nothing else is touched" {
         try tmp.dir.writeFile(io, .{ .sub_path = n, .data = "x" });
         // Distinct mtimes, oldest first.
         const t: std.Io.Timestamp = .{ .nanoseconds = @as(i96, @intCast(i + 1)) * std.time.ns_per_s };
-        // Through a handle: 0.16's `Dir.setTimestamps` panics on Windows.
+        // Through a handle: `Dir.setTimestamps` panics on Windows.
         const f = try tmp.dir.openFile(io, n, .{ .mode = .read_write });
         defer f.close(io);
         try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = t } });

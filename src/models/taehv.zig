@@ -76,12 +76,12 @@ pub const Decoder = struct {
             }
             // TGrow 1x1 conv (decoder.<tg>.conv). Load full output channels,
             // then keep only the first `n` (the first-frame slice).
-            const tg_name = try std.fmt.allocPrint(a, "decoder.{d}.conv", .{s.tg});
+            const tg_name = try a.print("decoder.{d}.conv", .{s.tg});
             const tg_full = try wan_vae.loadConv(a, store, tg_name, s.n, s.tg_co, 1);
             // first-frame: keep only the first n output channels (the second
             // half of a stride-2 tgrow is the dropped second frame).
             const tg = firstNOutput(tg_full, s.n);
-            const sc_name = try std.fmt.allocPrint(a, "decoder.{d}", .{s.sc});
+            const sc_name = try a.print("decoder.{d}", .{s.sc});
             stage.* = .{
                 .mb = mb,
                 .tgrow = tg,
@@ -176,7 +176,7 @@ fn firstNOutput(cv: Conv2d, n: usize) Conv2d {
 }
 
 fn loadSub(a: std.mem.Allocator, st: @import("tp_core").weights.WeightStore, base: usize, sub: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
-    const name = try std.fmt.allocPrint(a, "decoder.{d}.{s}", .{ base, sub });
+    const name = try a.print("decoder.{d}.{s}", .{ base, sub });
     return wan_vae.loadConv(a, st, name, ci, co, k);
 }
 
@@ -185,8 +185,8 @@ test "firstNOutput keeps the Weight length rule for the TGrow slice" {
     const Weight = ops.matmul.Weight;
     // A 1x1 conv with 2n output channels (stride-2 tgrow), ci = n = 3.
     const n = 3;
-    const w = [_]f32{0} ** (2 * n * n); // [2n][1][1][n]
-    const b = [_]f32{0} ** (2 * n);
+    const w: [(2 * n * n)]f32 = @splat(0); // [2n][1][1][n]
+    const b: [(2 * n)]f32 = @splat(0);
     const full: Conv2d = .{ .w = .{ .krsc = &w }, .b = &b, .co = 2 * n, .ci = n, .k = 1 };
 
     const sliced = firstNOutput(full, n);

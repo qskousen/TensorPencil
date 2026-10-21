@@ -1,6 +1,6 @@
 //! Standalone SPIR-V module for block-diagonal BATCHED attention. It lives in
-//! its own module (not `eltwise.zig`) because the Zig 0.16 SPIR-V backend
-//! segfaults once `eltwise`, already ~80 entry points, gains one more; a fresh
+//! its own module (not `eltwise.zig`) because the Zig SPIR-V backend
+//! segfaulted (0.16) once `eltwise`, already ~80 entry points, gains one more; a fresh
 //! small module compiles fine and also lets this kernel use a 5th storage buffer
 //! (the per-item bounds table) that the shared 4-buffer eltwise layout can't.
 //!
@@ -8,7 +8,8 @@
 //! [total, heads*hd] / [total, kv*hd] batch activation), e=bounds (u32[2*total]).
 //! Push: u0=total, u1=n_heads, u2=n_kv, u3=hd, f0=scale.
 
-const gpu = @import("std").gpu;
+const abi = @import("abi.zig");
+const gpu = @import("std").spirv;
 
 const FBuf = extern struct { data: [1 << 28]f32 };
 const UBuf = extern struct { data: [1 << 24]u32 };
@@ -21,51 +22,16 @@ const Push = extern struct {
     f0: f32,
 };
 
-extern var a: FBuf addrspace(.storage_buffer);
-extern var b: FBuf addrspace(.storage_buffer);
-extern var c: FBuf addrspace(.storage_buffer);
-extern var d: FBuf addrspace(.storage_buffer);
-extern var e: UBuf addrspace(.storage_buffer);
-extern var pc: Push addrspace(.push_constant);
-
-inline fn decorate() void {
-    asm volatile (
-        \\OpDecorate %ft Block
-        \\OpMemberDecorate %ft 0 Offset 0
-        \\OpDecorate %ut Block
-        \\OpMemberDecorate %ut 0 Offset 0
-        \\OpDecorate %pt Block
-        \\OpMemberDecorate %pt 0 Offset 0
-        \\OpMemberDecorate %pt 1 Offset 4
-        \\OpMemberDecorate %pt 2 Offset 8
-        \\OpMemberDecorate %pt 3 Offset 12
-        \\OpMemberDecorate %pt 4 Offset 16
-        \\OpDecorate %ba DescriptorSet 0
-        \\OpDecorate %ba Binding 0
-        \\OpDecorate %bb DescriptorSet 0
-        \\OpDecorate %bb Binding 1
-        \\OpDecorate %bc DescriptorSet 0
-        \\OpDecorate %bc Binding 2
-        \\OpDecorate %bd DescriptorSet 0
-        \\OpDecorate %bd Binding 3
-        \\OpDecorate %be DescriptorSet 0
-        \\OpDecorate %be Binding 4
-        :
-        : [ft] "t" (FBuf),
-          [ut] "t" (UBuf),
-          [pt] "t" (Push),
-          [ba] "" (&a),
-          [bb] "" (&b),
-          [bc] "" (&c),
-          [bd] "" (&d),
-          [be] "" (&e),
-    );
-}
+const a = abi.buffer(FBuf, "a", 0);
+const b = abi.buffer(FBuf, "b", 1);
+const c = abi.buffer(FBuf, "c", 2);
+const d = abi.buffer(FBuf, "d", 3);
+const e = abi.buffer(UBuf, "e", 4);
+const pc = abi.pushConstants(Push, "pc");
 
 // Ragged block-diagonal non-causal attention. Query row q attends only keys
 // [e[q], e[total+q]); one thread per (query,head). Online softmax, f32.
-export fn attn_batched() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_batched() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const total = pc.u0;
     const n_heads = pc.u1;

@@ -5,7 +5,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 
-pub fn hover(src: std.builtin.SourceLocation, wd: *const dvui.WidgetData, text: []const u8) void {
+pub fn hover(src: std.lang.SourceLocation, wd: *const dvui.WidgetData, text: []const u8) void {
     // FloatingTooltipWidget derives its id from src alone (it drops the
     // caller's id_extra, dvui bug), so hints on widgets created from a shared
     // source location (helper fns, loops) would collide and share "_showing"

@@ -193,26 +193,26 @@ var seeded: bool = false;
 pub fn reseed() void {
     seeded = false;
 }
-var steps_buf: [16]u8 = [_]u8{0} ** 16;
-var regen_buf: [16]u8 = [_]u8{0} ** 16;
-var noise_amt_buf: [16]u8 = [_]u8{0} ** 16;
+var steps_buf: [16]u8 = @splat(0);
+var regen_buf: [16]u8 = @splat(0);
+var noise_amt_buf: [16]u8 = @splat(0);
 // Per-reply token cap. Sits in the sampling SECTION but is committed with the
 // other plain integers (commitNumbers), not with commitSampling: it is not part
 // of a preset, see config.Config.max_new_tokens.
-var maxnew_buf: [16]u8 = [_]u8{0} ** 16;
+var maxnew_buf: [16]u8 = @splat(0);
 // LLM sampling controls (same text-buffer pattern; floats parse on commit).
-var temp_buf: [16]u8 = [_]u8{0} ** 16;
-var topk_buf: [16]u8 = [_]u8{0} ** 16;
-var topp_buf: [16]u8 = [_]u8{0} ** 16;
-var minp_buf: [16]u8 = [_]u8{0} ** 16;
-var rpen_buf: [16]u8 = [_]u8{0} ** 16;
-var rlast_buf: [16]u8 = [_]u8{0} ** 16;
-var ppen_buf: [16]u8 = [_]u8{0} ** 16;
-var fpen_buf: [16]u8 = [_]u8{0} ** 16;
+var temp_buf: [16]u8 = @splat(0);
+var topk_buf: [16]u8 = @splat(0);
+var topp_buf: [16]u8 = @splat(0);
+var minp_buf: [16]u8 = @splat(0);
+var rpen_buf: [16]u8 = @splat(0);
+var rlast_buf: [16]u8 = @splat(0);
+var ppen_buf: [16]u8 = @splat(0);
+var fpen_buf: [16]u8 = @splat(0);
 // Preset name entry (save/load/delete target in the sampling section).
-var preset_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
+var preset_name_buf: [config.max_preset_name]u8 = @splat(0);
 // System-prompt name entry (save/load/delete target in the system-prompt section).
-var sys_prompt_name_buf: [config.max_sys_prompt_name]u8 = [_]u8{0} ** config.max_sys_prompt_name;
+var sys_prompt_name_buf: [config.max_sys_prompt_name]u8 = @splat(0);
 
 
 /// Call when the view is (re)entered so numeric buffers reseed from the config.
@@ -230,10 +230,10 @@ pub fn open() void {
 }
 
 fn seed(cfg: *const config.Config) void {
-    _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
-    _ = std.fmt.bufPrintZ(&regen_buf, "{d}", .{cfg.regen_cache_mb}) catch {};
-    _ = std.fmt.bufPrintZ(&noise_amt_buf, "{d}", .{cfg.weight_noise_amount}) catch {};
-    _ = std.fmt.bufPrintZ(&maxnew_buf, "{d}", .{cfg.max_new_tokens}) catch {};
+    _ = std.mem.printSentinel(&steps_buf, "{d}", .{cfg.steps}, 0) catch {};
+    _ = std.mem.printSentinel(&regen_buf, "{d}", .{cfg.regen_cache_mb}, 0) catch {};
+    _ = std.mem.printSentinel(&noise_amt_buf, "{d}", .{cfg.weight_noise_amount}, 0) catch {};
+    _ = std.mem.printSentinel(&maxnew_buf, "{d}", .{cfg.max_new_tokens}, 0) catch {};
     seedSampling(cfg);
     seeded = true;
 }
@@ -242,14 +242,14 @@ fn seed(cfg: *const config.Config) void {
 /// is loaded (the studio numeric buffers keep their in-progress edits).
 fn seedSampling(cfg: *const config.Config) void {
     const s = &cfg.sampling;
-    _ = std.fmt.bufPrintZ(&temp_buf, "{d}", .{s.temperature}) catch {};
-    _ = std.fmt.bufPrintZ(&topk_buf, "{d}", .{s.top_k}) catch {};
-    _ = std.fmt.bufPrintZ(&topp_buf, "{d}", .{s.top_p}) catch {};
-    _ = std.fmt.bufPrintZ(&minp_buf, "{d}", .{s.min_p}) catch {};
-    _ = std.fmt.bufPrintZ(&rpen_buf, "{d}", .{s.repeat_penalty}) catch {};
-    _ = std.fmt.bufPrintZ(&rlast_buf, "{d}", .{s.repeat_last_n}) catch {};
-    _ = std.fmt.bufPrintZ(&ppen_buf, "{d}", .{s.presence_penalty}) catch {};
-    _ = std.fmt.bufPrintZ(&fpen_buf, "{d}", .{s.frequency_penalty}) catch {};
+    _ = std.mem.printSentinel(&temp_buf, "{d}", .{s.temperature}, 0) catch {};
+    _ = std.mem.printSentinel(&topk_buf, "{d}", .{s.top_k}, 0) catch {};
+    _ = std.mem.printSentinel(&topp_buf, "{d}", .{s.top_p}, 0) catch {};
+    _ = std.mem.printSentinel(&minp_buf, "{d}", .{s.min_p}, 0) catch {};
+    _ = std.mem.printSentinel(&rpen_buf, "{d}", .{s.repeat_penalty}, 0) catch {};
+    _ = std.mem.printSentinel(&rlast_buf, "{d}", .{s.repeat_last_n}, 0) catch {};
+    _ = std.mem.printSentinel(&ppen_buf, "{d}", .{s.presence_penalty}, 0) catch {};
+    _ = std.mem.printSentinel(&fpen_buf, "{d}", .{s.frequency_penalty}, 0) catch {};
 }
 
 fn parseNum(buf: []const u8, fallback: usize) usize {
@@ -314,15 +314,15 @@ pub fn render(cfg: *config.Config, m: *const mirror.Mirror, u: *const models.Uni
             .min_size_content = .{ .h = style.Layout.title_h },
             .max_size_content = .height(style.Layout.title_h),
             .background = true,
-            .color_fill = style.C.chrome,
+            .color_fill = .{ .color = style.C.chrome },
             .border = style.Edge.bottom,
-            .color_border = style.hairline,
+            .color_border = .{ .color = style.hairline },
             .padding = .{ .x = 14, .w = 14 },
         });
         defer header.deinit();
         dvui.labelNoFmt(@src(), "Settings", .{}, .{
             .font = style.F.app,
-            .color_text = style.C.text_hi,
+            .color_text = .{ .color = style.C.text_hi },
             .gravity_y = 0.5,
             .padding = .{},
         });
@@ -623,7 +623,7 @@ fn sysPromptRow(cfg: *config.Config) void {
             for (cfg.sys_prompts.slice()) |*sp| {
                 if (dd.addChoiceLabel(sp.name.slice())) {
                     cfg.system_prompt.set(sp.text.slice());
-                    _ = std.fmt.bufPrintZ(&sys_prompt_name_buf, "{s}", .{sp.name.slice()}) catch {};
+                    _ = std.mem.printSentinel(&sys_prompt_name_buf, "{s}", .{sp.name.slice()}, 0) catch {};
                 }
             }
         }
@@ -663,7 +663,7 @@ fn presetRow(cfg: *config.Config) void {
             for (cfg.presets.slice()) |*pr| {
                 if (dd.addChoiceLabel(pr.name.slice())) {
                     cfg.sampling = pr.sampling;
-                    _ = std.fmt.bufPrintZ(&preset_name_buf, "{s}", .{pr.name.slice()}) catch {};
+                    _ = std.mem.printSentinel(&preset_name_buf, "{s}", .{pr.name.slice()}, 0) catch {};
                     seedSampling(cfg);
                 }
             }
@@ -718,7 +718,7 @@ fn noiseSection(cfg: *config.Config) void {
     curvePreview(cfg);
 }
 
-var curve_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
+var curve_name_buf: [config.max_preset_name]u8 = @splat(0);
 
 /// The noise-curve library row: load a saved curve into the active one, and
 /// save/delete under a name. Mirrors `presetRow`.
@@ -735,7 +735,7 @@ fn noiseCurveRow(cfg: *config.Config) void {
             for (cfg.noise_curves.slice()) |*c| {
                 if (dd.addChoiceLabel(c.name.slice())) {
                     cfg.weight_noise_curve = c.curve;
-                    _ = std.fmt.bufPrintZ(&curve_name_buf, "{s}", .{c.name.slice()}) catch {};
+                    _ = std.mem.printSentinel(&curve_name_buf, "{s}", .{c.name.slice()}, 0) catch {};
                 }
             }
         }
@@ -770,7 +770,7 @@ fn curveField(cfg: *config.Config) void {
         .font = style.F.mono,
         // Amber while it does not parse: an unparseable curve is noise OFF, and
         // nothing else on screen would say so.
-        .color_text = if (noise_curve.validate(cfg.weight_noise_curve.slice())) style.C.text_hi else |_| style.C.amber,
+        .color_text = .{ .color = if (noise_curve.validate(cfg.weight_noise_curve.slice())) style.C.text_hi else |_| style.C.amber },
     });
     te.deinit();
 }
@@ -829,9 +829,9 @@ fn curvePreview(cfg: *config.Config) void {
             .max_size_content = .width(480),
         });
         defer axis.deinit();
-        dvui.labelNoFmt(@src(), "layer 0", .{}, .{ .font = style.F.mono_legend, .color_text = style.C.text_faint, .padding = .{} });
+        dvui.labelNoFmt(@src(), "layer 0", .{}, .{ .font = style.F.mono_legend, .color_text = .{ .color = style.C.text_faint }, .padding = .{} });
         _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-        dvui.labelNoFmt(@src(), "LM head", .{}, .{ .font = style.F.mono_legend, .color_text = style.C.text_faint, .padding = .{} });
+        dvui.labelNoFmt(@src(), "LM head", .{}, .{ .font = style.F.mono_legend, .color_text = .{ .color = style.C.text_faint }, .padding = .{} });
     }
 
     var buf: [192]u8 = undefined;
@@ -840,16 +840,16 @@ fn curvePreview(cfg: *config.Config) void {
         "does not parse, so noise is off"
     else if (peak == 0)
         "zero everywhere, so noise is off"
-    else if (zero_from) |z| std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, zero past {d}%, {d:.3} at the LM head", .{
+    else if (zero_from) |z| std.mem.print(&buf, "peak {d:.3} at {d}% of the stack, zero past {d}%, {d:.3} at the LM head", .{
         peak, pct, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(z)) / @as(f32, n - 1) * 100))), vals[n - 1],
     }) catch ""
     else if (!noise_curve.respondsToAmount(expr))
-        std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head (fixed: this shape ignores Amount)", .{ peak, pct, vals[n - 1] }) catch ""
+        std.mem.print(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head (fixed: this shape ignores Amount)", .{ peak, pct, vals[n - 1] }) catch ""
     else
-        std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head", .{ peak, pct, vals[n - 1] }) catch "";
+        std.mem.print(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head", .{ peak, pct, vals[n - 1] }) catch "";
     dvui.labelNoFmt(@src(), txt, .{}, .{
         .font = style.F.mono_legend,
-        .color_text = if (!ok) style.C.amber else style.C.text_faint,
+        .color_text = .{ .color = if (!ok) style.C.amber else style.C.text_faint },
         .padding = .{ .y = 4 },
     });
 }
@@ -863,13 +863,13 @@ fn curvePreview(cfg: *config.Config) void {
 fn promptSyntaxDropdown(choice: *config.PromptSyntax) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     defer dd.deinit();
     if (dd.dropped()) {
-        inline for (@typeInfo(config.PromptSyntax).@"enum".fields) |e| {
-            const opt: config.PromptSyntax = @field(config.PromptSyntax, e.name);
+        inline for (@typeInfo(config.PromptSyntax).@"enum".field_names) |name| {
+            const opt: config.PromptSyntax = @field(config.PromptSyntax, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -878,13 +878,13 @@ fn promptSyntaxDropdown(choice: *config.PromptSyntax) void {
 fn compatDropdown(choice: *config.Compat) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
     defer dd.deinit();
     if (dd.dropped()) {
-        inline for (@typeInfo(config.Compat).@"enum".fields) |e| {
-            const opt: config.Compat = @field(config.Compat, e.name);
+        inline for (@typeInfo(config.Compat).@"enum".field_names) |name| {
+            const opt: config.Compat = @field(config.Compat, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -893,13 +893,13 @@ fn compatDropdown(choice: *config.Compat) void {
 fn emphasisDropdown(choice: *config.Emphasis) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
     defer dd.deinit();
     if (dd.dropped()) {
-        inline for (@typeInfo(config.Emphasis).@"enum".fields) |e| {
-            const opt: config.Emphasis = @field(config.Emphasis, e.name);
+        inline for (@typeInfo(config.Emphasis).@"enum".field_names) |name| {
+            const opt: config.Emphasis = @field(config.Emphasis, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -908,14 +908,14 @@ fn emphasisDropdown(choice: *config.Emphasis) void {
 fn samplerDropdown(choice: *config.Sampler) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     defer dd.deinit();
 
     if (dd.dropped()) {
-        inline for (@typeInfo(config.Sampler).@"enum".fields) |e| {
-            const opt: config.Sampler = @field(config.Sampler, e.name);
+        inline for (@typeInfo(config.Sampler).@"enum".field_names) |name| {
+            const opt: config.Sampler = @field(config.Sampler, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -927,14 +927,14 @@ fn samplerDropdown(choice: *config.Sampler) void {
 fn schedulerDropdown(choice: *config.Scheduler) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
     defer dd.deinit();
 
     if (dd.dropped()) {
-        inline for (@typeInfo(config.Scheduler).@"enum".fields) |e| {
-            const opt: config.Scheduler = @field(config.Scheduler, e.name);
+        inline for (@typeInfo(config.Scheduler).@"enum".field_names) |name| {
+            const opt: config.Scheduler = @field(config.Scheduler, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -943,14 +943,14 @@ fn schedulerDropdown(choice: *config.Scheduler) void {
 fn taesdSizeDropdown(choice: *config.TaesdSize) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
-        .selected_index = @intFromEnum(choice.*),
+        .selected_index = @backingInt(choice.*),
         .label = choice.label(),
     }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     defer dd.deinit();
 
     if (dd.dropped()) {
-        inline for (@typeInfo(config.TaesdSize).@"enum".fields) |e| {
-            const opt: config.TaesdSize = @field(config.TaesdSize, e.name);
+        inline for (@typeInfo(config.TaesdSize).@"enum".field_names) |name| {
+            const opt: config.TaesdSize = @field(config.TaesdSize, name);
             if (dd.addChoiceLabel(opt.label())) choice.* = opt;
         }
     }
@@ -993,7 +993,7 @@ fn isDir(path: []const u8) bool {
 fn startDir(buf: []u8, pb: *const config.PathBuf) ?[*:0]const u8 {
     const p = pb.slice();
     if (p.len == 0) return null;
-    const dir = if (isDir(p)) p else (std.fs.path.dirname(p) orelse return null);
+    const dir = if (isDir(p)) p else (std.Io.Dir.path.dirname(p) orelse return null);
     if (dir.len == 0 or dir.len >= buf.len) return null;
     if (!isDir(dir)) return null;
     @memcpy(buf[0..dir.len], dir);
@@ -1064,7 +1064,7 @@ fn folderRows(cfg: *config.Config) void {
     }
     if (dvui.button(@src(), "Rescan", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) g_cb.rescan();
     var buf: [128]u8 = undefined;
-    dvui.labelNoFmt(@src(), model_lib.statusLine(g_m, g_u, &buf), .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 10 }, .color_text = style.C.text_dim });
+    dvui.labelNoFmt(@src(), model_lib.statusLine(g_m, g_u, &buf), .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 10 }, .color_text = .{ .color = style.C.text_dim } });
 }
 
 // ── Model library ────────────────────────────────────────────────────────────
@@ -1118,16 +1118,16 @@ const LibClass = enum {
 };
 
 fn sideAny(e: *const catalog.Entry, comp: catalog.Component) bool {
-    inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
-        if (e.side.has(@enumFromInt(ff.value), comp)) return true;
+    inline for (@typeInfo(catalog.Family).@"enum".field_values) |value| {
+        if (e.side.has(@fromBackingInt(value), comp)) return true;
     }
     return false;
 }
 
 /// The class a file belongs to: the first that claims it.
 fn classOf(e: *const catalog.Entry) LibClass {
-    inline for (@typeInfo(LibClass).@"enum".fields) |cf| {
-        const c: LibClass = @enumFromInt(cf.value);
+    inline for (@typeInfo(LibClass).@"enum".field_values) |value| {
+        const c: LibClass = @fromBackingInt(value);
         if (c != .unusable and c.holds(e)) return c;
     }
     return .unusable;
@@ -1136,7 +1136,7 @@ fn classOf(e: *const catalog.Entry) LibClass {
 /// Sections start closed: the library is long, and it is a reference, not
 /// something to read on the way past. Public so `ui-probe` can draw an open one
 /// beside the closed ones, which are two different pictures.
-pub var g_lib_open: [@typeInfo(LibClass).@"enum".fields.len]bool = @splat(false);
+pub var g_lib_open: [@typeInfo(LibClass).@"enum".field_names.len]bool = @splat(false);
 
 /// A cell's dot. Green and filled means that host could RUN the file; a smaller,
 /// fainter green that it holds the file but is short something the file needs,
@@ -1147,8 +1147,8 @@ fn presenceDot(size: f32, color: style.Color, id_extra: usize) void {
         .min_size_content = .{ .w = size, .h = size },
         .max_size_content = .{ .w = size, .h = size },
         .background = true,
-        .color_fill = color,
-        .corner_radius = dvui.Rect.all(size / 2),
+        .color_fill = .{ .color = color },
+        .corners = style.R.pill(size),
         .gravity_x = 0.5,
         .gravity_y = 0.5,
     });
@@ -1168,8 +1168,8 @@ fn modelLibraryRows() void {
         "everything the file needs, which for a checkpoint means a render that loads " ++
         "nothing. Get brings a file here; Send puts one there.");
 
-    inline for (@typeInfo(LibClass).@"enum".fields) |cf| {
-        const class: LibClass = @enumFromInt(cf.value);
+    inline for (@typeInfo(LibClass).@"enum".field_values) |value| {
+        const class: LibClass = @fromBackingInt(value);
         var count: usize = 0;
         for (u.cat.entries) |*e| count += @intFromBool(classOf(e) == class);
         if (count > 0) librarySection(class, count, n);
@@ -1177,7 +1177,7 @@ fn modelLibraryRows() void {
 }
 
 fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
-    const idx = @intFromEnum(class);
+    const idx = @backingInt(class);
     const expanded = g_lib_open[idx];
     {
         var b: dvui.ButtonWidget = undefined;
@@ -1185,9 +1185,9 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
             .id_extra = idx,
             .expand = .horizontal,
             .background = false,
-            .color_fill_hover = style.hover_wash,
-            .color_fill_press = style.hover_wash,
-            .corner_radius = style.R.chip,
+            .color_fill_hover = .{ .color = style.hover_wash },
+            .color_fill_press = .{ .color = style.hover_wash },
+            .corners = style.R.chip,
             .padding = .{ .x = 4, .y = 5, .w = 4, .h = 5 },
             .margin = .{ .y = 4 },
         });
@@ -1199,13 +1199,13 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
             style.mark(@src(), if (expanded) .disclosure_open else .disclosure, 9, style.C.text_dim, .{ .margin = .{ .w = 6 } });
             dvui.labelNoFmt(@src(), class.title(), .{}, .{
                 .font = style.F.ui,
-                .color_text = style.C.text,
+                .color_text = .{ .color = style.C.text },
                 .padding = .{},
                 .gravity_y = 0.5,
             });
             dvui.label(@src(), "{d}", .{count}, .{
                 .font = style.F.ui_sm,
-                .color_text = style.C.text_faint,
+                .color_text = .{ .color = style.C.text_faint },
                 .padding = .{},
                 .margin = .{ .x = 8 },
                 .gravity_y = 0.5,
@@ -1238,7 +1238,7 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
                 .gravity_x = 0.5,
                 .gravity_y = 0.5,
                 .font = style.F.ui_sm,
-                .color_text = if (models.has(u.up, i)) style.C.text_dim else style.C.text_ghost,
+                .color_text = .{ .color = if (models.has(u.up, i)) style.C.text_dim else style.C.text_ghost },
             });
         }
     }
@@ -1261,7 +1261,7 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
             .min_size_content = .{ .w = model_col_w },
             .max_size_content = .width(model_col_w),
             .font = style.F.mono,
-            .color_text = if (models.count(r.render & u.up) > 0) style.C.text else style.C.text_dim,
+            .color_text = .{ .color = if (models.count(r.render & u.up) > 0) style.C.text else style.C.text_dim },
         });
         for (0..n_hosts) |i| {
             var cell = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -1273,13 +1273,13 @@ fn librarySection(class: LibClass, count: usize, n_hosts: usize) void {
             defer cell.deinit();
             if (cellTransfer(e.stem(), i, n_hosts)) |t| {
                 var pbuf: [8]u8 = undefined;
-                const text = if (t.queued) "queued" else std.fmt.bufPrint(&pbuf, "{d}%", .{@as(u32, @intFromFloat(t.fraction * 100))}) catch "";
+                const text = if (t.queued) "queued" else std.mem.print(&pbuf, "{d}%", .{@as(u32, @intFromFloat(t.fraction * 100))}) catch "";
                 dvui.labelNoFmt(@src(), text, .{}, .{
                     .id_extra = i,
                     .gravity_x = 0.5,
                     .gravity_y = 0.5,
                     .font = style.F.ui_sm,
-                    .color_text = style.C.text_dim,
+                    .color_text = .{ .color = style.C.text_dim },
                 });
                 if (!t.queued) dvui.timer(cell.data().id, 250_000);
             } else if (models.has(r.render, i)) {
@@ -1337,20 +1337,20 @@ fn hostRows(cfg: *config.Config) void {
         fonts.richLabel(@src(), h.name.slice(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 } });
         fonts.richLabel(@src(), h.socket.slice(), .{ .gravity_y = 0.5, .expand = .horizontal, .font = style.F.mono });
         const kind = if (h.remote()) "remote" else if (h.spawn) "started here" else "external";
-        dvui.labelNoFmt(@src(), kind, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = style.C.text_dim });
+        dvui.labelNoFmt(@src(), kind, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = .{ .color = style.C.text_dim } });
         // The short name of the token this row holds, which is what the daemon
         // logs for the one it wants: a refusal is then two numbers to compare
         // instead of a word.
         if (h.tokenFingerprint()) |fp| {
-            dvui.labelNoFmt(@src(), &fp, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono, .color_text = style.C.text_ghost });
+            dvui.labelNoFmt(@src(), &fp, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono, .color_text = .{ .color = style.C.text_ghost } });
         }
         const status = g_cb.hostStatus(h.name.slice(), h);
         if (status.text.len > 0) {
-            dvui.labelNoFmt(@src(), status.text, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = switch (status.tone) {
+            dvui.labelNoFmt(@src(), status.text, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = .{ .color = switch (status.tone) {
                 .ok => style.C.text_dim,
                 .pending => style.C.blue,
                 .bad => style.C.amber,
-            } });
+            } }});
         }
         if (status.offer_reconnect and dvui.button(@src(), "Reconnect", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
             g_cb.reconnectHost(h.name.slice());
@@ -1384,7 +1384,7 @@ fn hostRows(cfg: *config.Config) void {
         }
     }
     if (g_add_host.why().len > 0) {
-        fonts.richLabel(@src(), g_add_host.why(), .{ .padding = .{ .x = 8, .y = 2 }, .color_text = style.C.danger });
+        fonts.richLabel(@src(), g_add_host.why(), .{ .padding = .{ .x = 8, .y = 2 }, .color_text = .{ .color = style.C.danger } });
     }
     // The chat pin: local, or any listed host.
     var names: [config.max_hosts + 1][]const u8 = undefined;
@@ -1417,19 +1417,19 @@ fn hostSyncRows(cfg: *config.Config) void {
         if (s.sending.len > 0) {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
             defer row.deinit();
-            const line = std.fmt.bufPrint(&buf, "{s} {s} {s} {s}", .{
+            const line = std.mem.print(&buf, "{s} {s} {s} {s}", .{
                 if (s.pull) "fetching" else "sending",
                 s.sending,
                 if (s.pull) "from" else "to",
                 h.name.slice(),
             }) catch "moving a model";
-            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = style.C.text_dim });
+            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = .{ .color = style.C.text_dim } });
             if (s.running) {
                 dvui.progress(@src(), .{ .percent = s.fraction }, .{
                     .gravity_y = 0.5,
                     .margin = .{ .x = 8 },
                     .min_size_content = .{ .w = 120, .h = 6 },
-                    .corner_radius = dvui.Rect.all(3),
+                    .corners = .round(3),
                 });
                 // Nothing else wakes the UI for a transfer, and the rate is
                 // sampled on the frames this draws.
@@ -1438,8 +1438,8 @@ fn hostSyncRows(cfg: *config.Config) void {
             dvui.labelNoFmt(@src(), s.status, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .font = style.F.mono });
             if (s.queued > 0) {
                 var qbuf: [32]u8 = undefined;
-                const q = std.fmt.bufPrint(&qbuf, "· {d} more queued", .{s.queued}) catch "";
-                dvui.labelNoFmt(@src(), q, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = style.C.text_dim });
+                const q = std.mem.print(&qbuf, "· {d} more queued", .{s.queued}) catch "";
+                dvui.labelNoFmt(@src(), q, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 }, .color_text = .{ .color = style.C.text_dim } });
             }
         }
         if (s.missing.len > 0) {
@@ -1447,15 +1447,15 @@ fn hostSyncRows(cfg: *config.Config) void {
             defer row.deinit();
             // Already leaves out whatever is queued or moving there.
             const line = if (s.missing_count > 1)
-                std.fmt.bufPrint(&buf, "{s} and {d} more are not on {s}", .{ s.missing, s.missing_count - 1, h.name.slice() }) catch "models are missing there"
+                std.mem.print(&buf, "{s} and {d} more are not on {s}", .{ s.missing, s.missing_count - 1, h.name.slice() }) catch "models are missing there"
             else
-                std.fmt.bufPrint(&buf, "{s} is not on {s}", .{ s.missing, h.name.slice() }) catch "a model is missing there";
-            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = style.C.text_dim });
+                std.mem.print(&buf, "{s} is not on {s}", .{ s.missing, h.name.slice() }) catch "a model is missing there";
+            fonts.richLabel(@src(), line, .{ .gravity_y = 0.5, .color_text = .{ .color = style.C.text_dim } });
             const busy = s.running or s.queued > 0;
             if (dvui.button(@src(), if (busy) "Queue it" else "Send it", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 8 } })) g_cb.sendModel(h.name.slice(), false);
             if (s.missing_count > 1) {
                 var abuf: [24]u8 = undefined;
-                const label = std.fmt.bufPrint(&abuf, "{s} all {d}", .{ if (busy) "Queue" else "Send", s.missing_count }) catch "Send all";
+                const label = std.mem.print(&abuf, "{s} all {d}", .{ if (busy) "Queue" else "Send", s.missing_count }) catch "Send all";
                 if (dvui.button(@src(), label, .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) g_cb.sendModel(h.name.slice(), true);
             }
         }
@@ -1480,7 +1480,7 @@ fn notedRow(key: []const u8, label: []const u8, current: []const u8, entries: []
     dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
     var dd: dvui.DropdownWidget = undefined;
     var opts: dvui.Options = .{ .gravity_y = 0.5, .min_size_content = .{ .w = 420 }, .max_size_content = .width(640) };
-    if (warn) opts.color_text = style.C.amber;
+    if (warn) opts.color_text = .{ .color = style.C.amber };
     dd.init(@src(), .{ .label = current }, opts);
     defer dd.deinit();
     var picked: ?usize = null;
@@ -1511,7 +1511,7 @@ const other_file = "Other file…";
 fn withWhere(arena: std.mem.Allocator, e: *const catalog.Entry) []const u8 {
     const note = whereNote(arena, e);
     if (note.len == 0) return e.stem();
-    return std.fmt.allocPrint(arena, "{s}  ·  {s}", .{ e.stem(), note }) catch e.stem();
+    return arena.print("{s}  ·  {s}", .{ e.stem(), note }) catch e.stem();
 }
 
 /// Just the note: which machines have the file, "" when there is nothing to
@@ -1532,14 +1532,14 @@ fn llmRows(cfg: *config.Config) void {
     var labels = arena.alloc([]const u8, classes.len + 1) catch return;
     var cur_label: []const u8 = "none";
     for (classes, 0..) |c, i| {
-        labels[i] = if (c.supported) c.label else std.fmt.allocPrint(arena, "{s} (unsupported)", .{c.label}) catch c.label;
+        labels[i] = if (c.supported) c.label else arena.print("{s} (unsupported)", .{c.label}) catch c.label;
         if (cur) |e| if (std.mem.eql(u8, e.llm.?.class, c.label)) {
             cur_label = labels[i];
         };
     }
     labels[classes.len] = "none";
     if (cur == null) if (cfg.llm_model.opt()) |p| {
-        cur_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
+        cur_label = arena.print("{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
     };
     if (choiceRow("llm/arch", "Architecture", cur_label, labels, false)) |i| {
         if (i == classes.len) selection.clearLlm(cfg) else selection.selectLlm(cfg, cat, cat.entries[classes[i].members[0]].path);
@@ -1586,7 +1586,7 @@ fn llmRows(cfg: *config.Config) void {
     var tower_label: []const u8 = "none";
     var tower_warn = false;
     if (cfg.vision_tower.opt()) |p| {
-        tower_label = if (in_list) cat.refName(p) else std.fmt.allocPrint(arena, "{s} (does not match this model)", .{cat.refName(p)}) catch cat.refName(p);
+        tower_label = if (in_list) cat.refName(p) else arena.print("{s} (does not match this model)", .{cat.refName(p)}) catch cat.refName(p);
         tower_warn = !in_list;
     }
     if (notedRow("llm/tower", "Vision tower", tower_label, tl.items, tn.items, tower_warn)) |i| {
@@ -1608,8 +1608,8 @@ fn imageRows(cfg: *config.Config) void {
     var fam_list: std.ArrayList(catalog.Family) = .empty;
     var fam_labels: std.ArrayList([]const u8) = .empty;
     var fam_label: []const u8 = "none";
-    inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
-        const fam: catalog.Family = @enumFromInt(ff.value);
+    inline for (@typeInfo(catalog.Family).@"enum".field_values) |value| {
+        const fam: catalog.Family = @fromBackingInt(value);
         if (fams.contains(fam)) {
             fam_list.append(arena, fam) catch return;
             fam_labels.append(arena, model_spec.traits(fam).short) catch return;
@@ -1617,7 +1617,7 @@ fn imageRows(cfg: *config.Config) void {
     }
     if (cur) |e| fam_label = model_spec.traits(e.ckpt.?.family).short;
     if (cur == null) if (cfg.diffusion_model.opt()) |p| {
-        fam_label = std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
+        fam_label = arena.print("{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
     };
     fam_labels.append(arena, "none") catch return;
     if (choiceRow("image/arch", "Architecture", fam_label, fam_labels.items, false)) |i| {
@@ -1680,7 +1680,7 @@ fn imageRows(cfg: *config.Config) void {
             .bundled => label = "bundled (in the checkpoint)",
             .none => warn = slot.component() != null, // a required piece with nothing supplying it
             .file => |p| {
-                label = if (in_list) cat.refName(p) else std.fmt.allocPrint(arena, "{s} (not in a model folder)", .{cat.refName(p)}) catch cat.refName(p);
+                label = if (in_list) cat.refName(p) else arena.print("{s} (not in a model folder)", .{cat.refName(p)}) catch cat.refName(p);
             },
         }
         const target: PickTarget = switch (slot) {
@@ -1743,7 +1743,7 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 240 },
             .max_size_content = .width(240),
-            .color_text = if (known) null else style.C.amber,
+            .color_text = if (known) null else .{ .color = style.C.amber },
         });
 
         var strength = l.strength;
@@ -1766,7 +1766,7 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
         const e = &cat.entries[ci];
         if (selection.loraListed(cfg, cat, fam, e.path)) continue;
         const info = e.lora.?.info;
-        labels.append(arena, std.fmt.allocPrint(arena, "{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
+        labels.append(arena, arena.print("{s}  ({d} weights, rank {d})", .{ e.stem(), info.targets, info.rank }) catch e.stem()) catch return;
         lora_notes.append(arena, whereNote(arena, e)) catch return;
         paths.append(arena, e.path) catch return;
     }
@@ -1829,7 +1829,7 @@ fn statusLine(text: []const u8, err: bool) void {
         .id_extra = idFor(text),
         .expand = .horizontal,
         .padding = .{ .x = 12, .h = 2 },
-        .color_text = color,
+        .color_text = .{ .color = color },
     });
     defer tl.deinit();
     tl.addText(text, .{});
@@ -1837,7 +1837,7 @@ fn statusLine(text: []const u8, err: bool) void {
 
 /// Same, for a line that needs formatting. `buf` is the caller's scratch.
 fn statusFmt(buf: []u8, comptime fmt: []const u8, args: anytype, err: bool) void {
-    statusLine(std.fmt.bufPrint(buf, fmt, args) catch fmt, err);
+    statusLine(std.mem.print(buf, fmt, args) catch fmt, err);
 }
 
 fn checkpointPanel(cfg: *config.Config) void {

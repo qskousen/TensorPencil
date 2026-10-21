@@ -46,7 +46,7 @@ const Bufs = struct {
     ao: Buf = .{},
 
     fn deinit(self: *Bufs, be: *Backend) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| be.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| be.tensorDestroy(&@field(self, name));
     }
 };
 

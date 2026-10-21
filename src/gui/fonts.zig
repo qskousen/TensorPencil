@@ -14,9 +14,8 @@
 //!      math, box drawing, the long tail. Also the mono fallback: ideographs
 //!      are full-width in every Noto CJK cut and Plex Mono holds the Latin, so
 //!      a Mono CJK face would add 16 MB and change no pixel. And the bold
-//!      fallback: a bold face is another 10 MB for a weight change, so bold
-//!      CJK runs render regular. FreeType can synthesize a bold from the
-//!      regular outlines, but that is a dvui change, not a font.
+//!      fallback: a bold face would be another 10 MB, so dvui synthesizes
+//!      bold CJK from the regular outlines.
 //!   3. Noto Emoji — monochrome outlines, since dvui's rasterizer is monochrome
 //!      and cannot use a color emoji font.
 //!
@@ -273,10 +272,8 @@ fn fontFor(cp: u21, style: Style, base: dvui.Font) dvui.Font {
         return if (style.italic) r.withStyle(.italic) else r;
     }
     // Tier 2. Italic is dropped rather than faked: Noto CJK ships no italic,
-    // and CJK is conventionally emphasized without one. Weight too: regular is
-    // the one Noto weight bundled, and asking dvui for a bold it has no source
-    // for logs an error per size rather than falling back quietly.
-    return f.withFamily(c.fallback).withWeight(.normal);
+    // and CJK is conventionally emphasized without one. Bold is synthesized.
+    return f.withFamily(c.fallback).withWeight(if (bold) .bold else .normal);
 }
 
 /// Add `text` to a text layout, split into same-face runs. `opts` applies to
@@ -290,10 +287,11 @@ pub fn addStyled(tl: *dvui.TextLayoutWidget, text: []const u8, style: Style, opt
     var have = false;
     while (i < text.len) {
         const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const cp: u21 = if (n > 1 and i + n <= text.len)
-            (std.unicode.utf8Decode(text[i..][0..n]) catch 0xFFFD)
-        else
-            text[i];
+        const cp: u21 = if (n > 1 and i + n <= text.len) cp: {
+            const view = std.unicode.Utf8View.init(text[i..][0..n]) catch break :cp 0xFFFD;
+            var it = view.iterator();
+            break :cp it.nextCodepoint().?;
+        } else text[i];
         const f = fontFor(cp, style, base);
         if (!have) {
             cur = f;
@@ -323,7 +321,7 @@ pub fn addRich(tl: *dvui.TextLayoutWidget, text: []const u8) void {
 /// A short label that may leave tier 1, rendered through a text layout so the
 /// per-run fallback applies. Drop-in for `dvui.label` at such sites (a plain
 /// label cannot mix faces within a run).
-pub fn richLabel(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Options) void {
+pub fn richLabel(src: std.lang.SourceLocation, text: []const u8, opts: dvui.Options) void {
     var tl = dvui.textLayout(src, .{}, noBackground(opts));
     defer tl.deinit();
     addRich(tl, text);
@@ -344,7 +342,7 @@ fn noBackground(opts: dvui.Options) dvui.Options {
 /// `richLabel` that never wraps: for row titles and other single-line slots in
 /// a fixed-width rail, where wrapping would reflow the whole list. Pair it with
 /// `style.ellipsize` so the overflow is cut deliberately rather than clipped.
-pub fn richLine(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Options) void {
+pub fn richLine(src: std.lang.SourceLocation, text: []const u8, opts: dvui.Options) void {
     // Built by hand rather than via `dvui.textLayout`, purely to SKIP
     // `processEvents`. A text layout claims the mouse to support text
     // selection, so a row title drawn with one swallowed every click that
@@ -364,14 +362,14 @@ pub fn richLine(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Op
 /// a row built from two of them stops activating inside a nested submenu (see
 /// `model_menu.pickRow`). This is one inert widget, like `richLine`, so the row
 /// under it still gets the click.
-pub fn richLineNote(src: std.builtin.SourceLocation, name: []const u8, note: []const u8, note_color: dvui.Color, opts: dvui.Options) void {
+pub fn richLineNote(src: std.lang.SourceLocation, name: []const u8, note: []const u8, note_color: dvui.Color, opts: dvui.Options) void {
     var tl: dvui.TextLayoutWidget = undefined;
     tl.init(src, .{ .break_lines = false }, noBackground(opts));
     defer tl.deinit();
     addStyled(&tl, name, .{}, .{ .font = opts.font, .color_text = opts.color_text });
     if (note.len > 0) {
-        addStyled(&tl, "   ", .{}, .{ .font = opts.font, .color_text = note_color });
-        addStyled(&tl, note, .{}, .{ .font = opts.font, .color_text = note_color });
+        addStyled(&tl, "   ", .{}, .{ .font = opts.font, .color_text = .{ .color = note_color } });
+        addStyled(&tl, note, .{}, .{ .font = opts.font, .color_text = .{ .color = note_color } });
     }
 }
 
@@ -454,14 +452,15 @@ test "medium weight keeps its own family but borrows real bold and italic faces"
     try std.testing.expectEqual(dvui.Font.Style.italic, i.style);
 }
 
-test "a bold CJK run asks for the one Noto weight bundled" {
+test "a bold CJK run asks for bold from the regular Noto face" {
     testCoverage();
     const base = dvui.Font{ .family = dvui.Font.array(sans), .size = 12 };
     const heading = base.withWeight(.bold);
     for ([_]dvui.Font{ fontFor('日', .{ .bold = true }, base), fontFor('日', .{}, heading) }) |f| {
         try std.testing.expectEqualStrings(cjk, f.familyName());
-        try std.testing.expectEqual(dvui.Font.Weight.normal, f.weight);
+        try std.testing.expectEqual(dvui.Font.Weight.bold, f.weight);
     }
+    try std.testing.expectEqual(dvui.Font.Weight.normal, fontFor('日', .{}, base).weight);
     // ...while a bold Latin run keeps its real SemiBold.
     try std.testing.expectEqual(dvui.Font.Weight.bold, fontFor('A', .{ .bold = true }, base).weight);
 }

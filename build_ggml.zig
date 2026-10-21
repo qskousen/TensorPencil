@@ -116,24 +116,12 @@ const cpu_arm_cpp_sources = [_][]const u8{
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Build a static GGML library and link it into `exe`.
-pub fn link(
-    b: *std.Build,
-    exe: *std.Build.Step.Compile,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    ggml_dep: *std.Build.Dependency,
-) void {
-    const lib = buildLib(b, target, optimize, ggml_dep);
-    exe.root_module.linkLibrary(lib);
-}
-
 /// Build and return the static GGML library from the fetched `ggml_dep`.
 /// Use this if you need to inspect or further configure the library step.
 pub fn buildLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     ggml_dep: *std.Build.Dependency,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{

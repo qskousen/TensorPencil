@@ -137,7 +137,7 @@ fn tokenWeights(
         }
         var x = item[1 .. item.len - 1];
         var weight = current_weight * 1.1;
-        if (std.mem.lastIndexOfScalar(u8, x, ':')) |at| {
+        if (std.mem.findScalarLast(u8, x, ':')) |at| {
             // `at > 0`: a leading colon is text, not a weight separator. This is why
             // `(:1.5)` is a bare-paren group over the literal ":1.5" rather than an
             // empty segment at weight 1.5.

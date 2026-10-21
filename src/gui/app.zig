@@ -153,7 +153,7 @@ fn hostStatus(name: []const u8, e: *const config.HostEntry) config_view.HostStat
     if (hosts.Hosts.troubleOf(s.?)) |t| return .{ .text = t, .tone = .bad, .offer_reconnect = true };
     // A host that is up but never gets a render looks broken; say which.
     const why = g_hosts.whyNotRender(s.?, &g_config) orelse return .{ .text = "up", .tone = .ok };
-    const text = std.fmt.bufPrint(&g_host_status, "up · {s}", .{why.long}) catch "up";
+    const text = std.mem.print(&g_host_status, "up · {s}", .{why.long}) catch "up";
     return .{ .text = text, .tone = .pending };
 }
 
@@ -721,12 +721,13 @@ pub fn run(init: std.process.Init) !void {
 
     var back = try SDLBackend.initWindow(.{
         .io = init.io,
-        .allocator = gpa,
         .size = .{ .w = @floatFromInt(g_config.win_w), .h = @floatFromInt(g_config.win_h) },
         .min_size = .{ .w = 640, .h = 480 },
         .vsync = true,
         .title = "TensorPencil",
         .environ_map = init.environ_map,
+        // The config holds the window geometry (applyWindowGeom below).
+        .persist_window_geometry = false,
     });
     defer back.deinit();
     // Restore the saved position / maximized state (size is already set above).
@@ -843,9 +844,9 @@ pub fn run(init: std.process.Init) !void {
             if (e.evt == .app and e.evt.app.action == .quit) res = .close;
         }
         var end_micros = try win.end(.{});
-        try back.setCursor(win.cursorRequested());
-        try back.textInputRect(win.textInputRequested());
-        try back.renderPresent();
+        back.setCursor(win.cursorRequested());
+        back.textInputRect(win.textInputRequested());
+        back.renderPresent();
         if (res != .ok) break :main_loop;
 
         // A clicked image (chat transcript or studio gallery) opens/refocuses
@@ -890,9 +891,9 @@ pub fn run(init: std.process.Init) !void {
                 if (!e.handled and e.evt == .window and e.evt.window.action == .close) v.open = false;
             }
             const v_end = try v.win.end(.{});
-            try v.back.setCursor(v.win.cursorRequested());
-            try v.back.textInputRect(v.win.textInputRequested());
-            try v.back.renderPresent();
+            v.back.setCursor(v.win.cursorRequested());
+            v.back.textInputRect(v.win.textInputRequested());
+            v.back.renderPresent();
             if (!v.shown) {
                 v.shown = true;
                 _ = SDLBackend.c.SDL_ShowWindow(v.back.window);
@@ -1120,7 +1121,7 @@ fn frame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
         .background = true,
-        .color_fill = style.C.canvas,
+        .color_fill = .{ .color = style.C.canvas },
     });
     defer root.deinit();
 
@@ -1382,7 +1383,7 @@ fn renderQueueRail() void {
 /// user recognizes. Truncation is left to the rail, which knows its own width.
 fn railTitle(buf: []u8, im: *const mirror.Image) []const u8 {
     const p = std.mem.trim(u8, im.info.prompt, " \t\r\n");
-    const line = p[0 .. std.mem.indexOfScalar(u8, p, '\n') orelse p.len];
+    const line = p[0 .. std.mem.findScalar(u8, p, '\n') orelse p.len];
     if (line.len == 0) return "untitled";
     const n = @min(line.len, buf.len);
     @memcpy(buf[0..n], line[0..n]);
@@ -1393,7 +1394,7 @@ fn railTitle(buf: []u8, im: *const mirror.Image) []const u8 {
 fn waitNote(buf: []u8, a: *const hosts.Hosts.Asked) []const u8 {
     return switch (g_hosts.waitReason(&g_config, a)) {
         .ready => "",
-        .behind => |host| if (host.len == 0) "" else std.fmt.bufPrint(buf, "waiting for {s}", .{host}) catch "",
+        .behind => |host| if (host.len == 0) "" else std.mem.print(buf, "waiting for {s}", .{host}) catch "",
         .nowhere => "no host can run this yet",
     };
 }
@@ -1489,8 +1490,8 @@ fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usiz
 
     var meta_buf: [80]u8 = undefined;
     var cbuf: [8]u8 = undefined;
-    const meta = if (first) |f| std.fmt.bufPrint(&meta_buf, "{s}{d}×{d} · seed {d}", .{
-        if (n > 1) (std.fmt.bufPrint(&cbuf, "×{d} · ", .{n}) catch "") else "",
+    const meta = if (first) |f| std.mem.print(&meta_buf, "{s}{d}×{d} · seed {d}", .{
+        if (n > 1) (std.mem.print(&cbuf, "×{d} · ", .{n}) catch "") else "",
         f.info.req_width,
         f.info.req_height,
         f.info.req_seed,
@@ -1498,7 +1499,7 @@ fn renderToolCard(imgs: []const wire.ImageId, slots: usize, key: usize, id: usiz
 
     var status_buf: [40]u8 = undefined;
     const status = if (busy)
-        (std.fmt.bufPrint(&status_buf, "rendering {d} of {d}", .{ @min(n_done + 1, n), n }) catch "rendering")
+        (std.mem.print(&status_buf, "rendering {d} of {d}", .{ @min(n_done + 1, n), n }) catch "rendering")
     else
         "";
 
@@ -1564,11 +1565,11 @@ fn cardCancel(_: *anyopaque, i: usize) void {
 fn liveTile(im: *const mirror.Image, buf: []u8) bubbles.Rendering {
     const host = g_hosts.hostOf(im.info.id);
     const label = switch (im.status()) {
-        .suspended => std.fmt.bufPrint(buf, "paused · {d}/{d}", .{ im.info.step, im.info.total }) catch "paused",
+        .suspended => std.mem.print(buf, "paused · {d}/{d}", .{ im.info.step, im.info.total }) catch "paused",
         else => if (host.len > 0)
-            std.fmt.bufPrint(buf, "{d} / {d} · {s}", .{ im.info.step, im.info.total, host }) catch ""
+            std.mem.print(buf, "{d} / {d} · {s}", .{ im.info.step, im.info.total, host }) catch ""
         else
-            std.fmt.bufPrint(buf, "step {d} / {d}", .{ im.info.step, im.info.total }) catch "",
+            std.mem.print(buf, "step {d} / {d}", .{ im.info.step, im.info.total }) catch "",
     };
     return .{
         .px = if (im.preview) |pv|
@@ -1635,7 +1636,7 @@ fn renderSidebar() void {
             rows[n] = .{
                 .id = e.id,
                 .title = e.title,
-                .sub = std.fmt.bufPrint(&subs[n], "{d} messages", .{e.turns}) catch null,
+                .sub = std.mem.print(&subs[n], "{d} messages", .{e.turns}) catch null,
             };
             n += 1;
         }
@@ -1726,12 +1727,12 @@ fn openHistory() void {
     const dir: ?[]u8 = blk: {
         if (g_config_path) |p| {
             // An explicit --config: keep the history beside that file.
-            const parent = std.fs.path.dirname(p) orelse ".";
-            break :blk std.fs.path.join(g_gpa, &.{ parent, "conversations" }) catch null;
+            const parent = std.Io.Dir.path.dirname(p) orelse ".";
+            break :blk std.Io.Dir.path.join(g_gpa, &.{ parent, "conversations" }) catch null;
         }
         const base = (config.Config.dirPath(g_io, g_gpa, g_environ) catch null) orelse break :blk null;
         defer g_gpa.free(base);
-        break :blk std.fs.path.join(g_gpa, &.{ base, "conversations" }) catch null;
+        break :blk std.Io.Dir.path.join(g_gpa, &.{ base, "conversations" }) catch null;
     };
     const d = dir orelse {
         std.log.warn("history: no config directory — conversations will not be saved", .{});
@@ -1741,7 +1742,7 @@ fn openHistory() void {
     g_history.open(g_gpa, g_io, d);
     // The prompt library lives beside the transcripts, in the same directory an
     // explicit --config redirects, so a throwaway config leaves nothing behind.
-    const parent = std.fs.path.dirname(d) orelse ".";
+    const parent = std.Io.Dir.path.dirname(d) orelse ".";
     g_prompts.open(g_gpa, g_io, parent);
 }
 
@@ -2026,7 +2027,7 @@ fn onImagePick(p: model_menu.Pick) void {
 var g_composer_ctx: u8 = 0;
 /// The megapixel field's text, held across frames because the user types into
 /// it. Synced from `g_config.framing_mp` whenever it is not focused.
-var g_mp_buf: [16]u8 = [_]u8{0} ** 16;
+var g_mp_buf: [16]u8 = @splat(0);
 
 /// Recompute the image dimensions from the framing choice, push them to the
 /// engine, and persist.
@@ -2127,7 +2128,7 @@ fn noiseNames() []const []const u8 {
 }
 
 /// The amount field's text, held across frames like `g_mp_buf`.
-var g_noise_amt_buf: [16]u8 = [_]u8{0} ** 16;
+var g_noise_amt_buf: [16]u8 = @splat(0);
 
 /// The amount was committed. Clamped generously: past ~0.8 a front-loaded curve
 /// only produces fluent nonsense, but watching that happen is the point of the
@@ -2223,7 +2224,7 @@ fn loadingAssistantBubble() void {
     });
     defer bubble.deinit();
     dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 14, .h = 14 }, .margin = .{ .w = 8 } });
-    dvui.labelNoFmt(@src(), "Loading…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
+    dvui.labelNoFmt(@src(), "Loading…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = .{ .color = style.C.text_dim } });
 }
 
 /// Assistant slot for a message sent while the LLM is paused with nothing
@@ -2237,7 +2238,7 @@ fn queuedAssistantBubble() void {
     defer bubble.deinit();
     // richLabel (not dvui.label) so the ⏸ routes to the emoji face; no text
     // face we bundle has the media-control glyphs. See fonts.isEmoji.
-    fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
+    fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = .{ .color = style.C.text_dim } });
 }
 
 /// Chat view when no LLM is configured (or the last load failed): explain and
@@ -2255,12 +2256,12 @@ fn renderNoModel() void {
             const text = if (std.mem.eql(u8, err, "MmprojNotVisionTower"))
                 "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
             else
-                (std.fmt.bufPrint(&msg, "Failed to load the model: {s}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
-            fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = style.C.text });
+                (std.mem.print(&msg, "Failed to load the model: {s}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
+            fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = .{ .color = style.C.text } });
         } else {
             fonts.addStyled(tl, "No LLM model is set.\n\nOpen Settings to choose a model file and get started.", .{}, .{
                 .font = style.F.prose,
-                .color_text = style.C.text,
+                .color_text = .{ .color = style.C.text },
             });
         }
     }
@@ -2436,7 +2437,7 @@ fn renderMessages(list_h: f32) void {
             else
                 "Say something to start the conversation.", .{}, .{
                 .font = style.F.prose,
-                .color_text = style.C.text_ghost,
+                .color_text = .{ .color = style.C.text_ghost },
             });
         } else {
             for (msgs, 0..) |*m, idx| renderMessage(msgs, m, idx);
@@ -2489,10 +2490,10 @@ fn pendingUserBubble(text: []const u8) void {
         .gravity_x = 1.0,
         .max_size_content = .width(style.Layout.bubble_max),
         .background = true,
-        .color_fill = style.C.bubble_user,
+        .color_fill = .{ .color = style.C.bubble_user },
         .border = style.Edge.all,
-        .color_border = style.hairline,
-        .corner_radius = .{ .x = 10, .y = 10, .w = 3, .h = 10 },
+        .color_border = .{ .color = style.hairline },
+        .corners = style.R.bubble_user,
         .padding = .{ .x = 14, .y = 11, .w = 14, .h = 11 },
         .margin = .{ .y = 9, .h = 9 },
     });
@@ -2501,7 +2502,7 @@ fn pendingUserBubble(text: []const u8) void {
         .background = false,
         .padding = .{},
         .font = style.F.prose,
-        .color_text = style.C.text_hi,
+        .color_text = .{ .color = style.C.text_hi },
     } });
 }
 
@@ -2512,7 +2513,7 @@ fn processingRow() void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
     defer row.deinit();
     dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
-    dvui.labelNoFmt(@src(), "Processing…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
+    dvui.labelNoFmt(@src(), "Processing…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = .{ .color = style.C.text_dim } });
 }
 
 /// The assistant bubble's body when there is nothing to show and nothing is
@@ -2530,13 +2531,13 @@ fn renderEmptyAssistant(idx: usize) void {
             fonts.addRich(tl, "the GPU context was lost (a kernel faulted). Restart TensorPencil to use the GPU again; the terminal log names the kernels it was running.");
         } else {
             var msg: [128]u8 = undefined;
-            fonts.addRich(tl, std.fmt.bufPrint(&msg, "generation error: {s}", .{st.gen_err}) catch "generation error");
+            fonts.addRich(tl, std.mem.print(&msg, "generation error: {s}", .{st.gen_err}) catch "generation error");
         }
     } else if (st.llm_resident and idx + 1 == g_m.messages.items.len and st.llm_paused) {
         // A turn queued while the LLM is paused, it runs on resume (Tier 2).
         // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
         // lacks media-control glyphs, see fonts.isEmoji).
-        fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .font = style.F.prose, .color_text = style.C.text_dim });
+        fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .font = style.F.prose, .color_text = .{ .color = style.C.text_dim } });
     }
 }
 
@@ -2548,7 +2549,7 @@ fn renderMessage(msgs: []mirror.Message, m: *mirror.Message, idx: usize) void {
         dvui.labelNoFmt(@src(), m.active().text.items, .{}, .{
             .id_extra = idx,
             .font = style.F.mono_sm,
-            .color_text = style.C.text_ghost,
+            .color_text = .{ .color = style.C.text_ghost },
             .gravity_x = 0.5,
             .padding = .{},
             .margin = .{ .y = 8, .h = 8 },
@@ -2574,11 +2575,11 @@ fn renderMessage(msgs: []mirror.Message, m: *mirror.Message, idx: usize) void {
         .gravity_x = if (is_user) 1.0 else 0.0,
         .max_size_content = .width(if (is_user) style.Layout.bubble_max else style.Layout.prose_max),
         .background = is_user,
-        .color_fill = style.C.bubble_user,
+        .color_fill = .{ .color = style.C.bubble_user },
         .border = if (is_user) style.Edge.all else .{},
-        .color_border = style.hairline,
+        .color_border = .{ .color = style.hairline },
         // tl, tr, br, bl — the small one is the tail.
-        .corner_radius = if (is_user) .{ .x = 10, .y = 10, .w = 3, .h = 10 } else style.R.none,
+        .corners = if (is_user) style.R.bubble_user else style.R.none,
         .padding = if (is_user) .{ .x = 14, .y = 11, .w = 14, .h = 11 } else .{},
     });
     defer bubble.deinit();
@@ -2632,11 +2633,11 @@ fn renderMessage(msgs: []mirror.Message, m: *mirror.Message, idx: usize) void {
                 markdown_view.render(@src(), think, .{ .prose = .{
                     .expand = .horizontal,
                     .background = true,
-                    .color_fill = style.C.sunken,
-                    .color_text = style.C.text_dim,
-                    .color_border = style.tint(style.C.blue, 120),
+                    .color_fill = .{ .color = style.C.sunken },
+                    .color_text = .{ .color = style.C.text_dim },
+                    .color_border = .{ .color = style.tint(style.C.blue, 120) },
                     .border = .{ .x = 2 },
-                    .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
+                    .corners = style.R.tab_right,
                     .margin = .{ .y = 4, .h = 6 },
                     .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
                     .font = style.F.prose,
@@ -2655,7 +2656,7 @@ fn renderMessage(msgs: []mirror.Message, m: *mirror.Message, idx: usize) void {
             if (dvui.buttonIcon(@src(), "copy markdown", dvui.entypo.clipboard, .{}, .{}, .{
                 .gravity_x = 1.0,
                 .min_size_content = .{ .h = 12 },
-                .color_text = style.C.text_ghost,
+                .color_text = .{ .color = style.C.text_ghost },
                 .padding = dvui.Rect.all(2),
                 .margin = .{ .y = 2 },
                 .data_out = &wd,
@@ -2707,7 +2708,7 @@ fn renderStatsFooter(st: wire.TurnStats, is_user: bool, gen_model: []const u8) v
         dvui.labelNoFmt(@src(), gen_model, .{}, .{
             .gravity_x = if (is_user) 1.0 else 0.0,
             .font = style.F.mono_sm,
-            .color_text = style.C.text_faint,
+            .color_text = .{ .color = style.C.text_faint },
             .padding = .{},
             .margin = .{ .y = 5 },
         });
@@ -2718,7 +2719,7 @@ fn renderStatsFooter(st: wire.TurnStats, is_user: bool, gen_model: []const u8) v
     if (stats.len == 0 and !show_model) return;
     var joined: [turn_stats.buf_len + 96]u8 = undefined;
     const text = if (show_model)
-        (std.fmt.bufPrint(&joined, "{s}{s}{s}", .{
+        (std.mem.print(&joined, "{s}{s}{s}", .{
             stats,
             if (stats.len > 0) " · " else "",
             gen_model,
@@ -2733,7 +2734,7 @@ fn renderStatsFooter(st: wire.TurnStats, is_user: bool, gen_model: []const u8) v
         // Telemetry, not prose: mono and small, so a turn's numbers sit under
         // the message without competing with it.
         .font = style.F.mono_sm,
-        .color_text = style.C.text_faint,
+        .color_text = .{ .color = style.C.text_faint },
         .padding = .{},
         .margin = .{ .y = 5 },
     });
@@ -2757,7 +2758,7 @@ fn renderVariantNav(m: *mirror.Message, idx: usize) void {
     var bwd: dvui.WidgetData = undefined;
     var opts = icon_opts;
     opts.data_out = &bwd;
-    if (!can_back) opts.color_text = style.C.text_ghost;
+    if (!can_back) opts.color_text = .{ .color = style.C.text_ghost };
     if (dvui.buttonIcon(@src(), "prev-variant", dvui.entypo.chevron_small_left, .{}, .{}, opts) and can_back) {
         switch (mirror.navTarget(m.cur, n, .back)) {
             // The host re-syncs the KV for the next turn (or just switches the
@@ -2770,7 +2771,7 @@ fn renderVariantNav(m: *mirror.Message, idx: usize) void {
 
     if (n > 1) dvui.label(@src(), "{d}/{d}", .{ m.cur + 1, n }, .{
         .gravity_y = 0.5,
-        .color_text = style.C.text_dim,
+        .color_text = .{ .color = style.C.text_dim },
         .padding = .{ .x = 2, .w = 2 },
     });
 
@@ -2838,7 +2839,7 @@ fn renderProse(id: usize, text: []const u8, color: dvui.Color) void {
             .background = false,
             .padding = .{},
             .font = style.F.prose,
-            .color_text = color,
+            .color_text = .{ .color = color },
         },
     });
 }
@@ -2866,17 +2867,17 @@ fn renderCallRun(imgs: []const wire.ImageId, n_calls: usize, slots: usize, raw: 
             .id_extra = id * 64 + 2,
             .expand = .horizontal,
             .background = true,
-            .color_fill = style.C.sunken,
-            .color_border = style.tint(style.C.blue, 120),
+            .color_fill = .{ .color = style.C.sunken },
+            .color_border = .{ .color = style.tint(style.C.blue, 120) },
             .border = .{ .x = 2 },
-            .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
+            .corners = style.R.tab_right,
             .margin = .{ .h = 6 },
             .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
             .font = style.F.code,
-            .color_text = style.C.text_dim,
+            .color_text = .{ .color = style.C.text_dim },
         });
         defer tl.deinit();
-        fonts.addStyled(tl, raw, .{}, .{ .font = style.F.code, .color_text = style.C.text_dim });
+        fonts.addStyled(tl, raw, .{}, .{ .font = style.F.code, .color_text = .{ .color = style.C.text_dim } });
     }
 
     if (slots > 0) {
@@ -2889,14 +2890,14 @@ fn renderCallRun(imgs: []const wire.ImageId, n_calls: usize, slots: usize, raw: 
     // failed, and neither should look like a bug.
     var buf: [96]u8 = undefined;
     const why = if (g_config.output_dir.opt() == null)
-        (std.fmt.bufPrint(&buf, "{d} image{s} generated · not kept (image saving is off)", .{
+        (std.mem.print(&buf, "{d} image{s} generated · not kept (image saving is off)", .{
             n_calls,
             if (n_calls == 1) "" else "s",
         }) catch "generated, not kept")
     else if (!g_m.state.diff_present)
         "generated earlier · no image model loaded to show them"
     else
-        (std.fmt.bufPrint(&buf, "{d} image{s} generated · the saved file{s} could not be found", .{
+        (std.mem.print(&buf, "{d} image{s} generated · the saved file{s} could not be found", .{
             n_calls,
             if (n_calls == 1) "" else "s",
             if (n_calls == 1) "" else "s",
@@ -2905,7 +2906,7 @@ fn renderCallRun(imgs: []const wire.ImageId, n_calls: usize, slots: usize, raw: 
     dvui.labelNoFmt(@src(), why, .{}, .{
         .id_extra = id * 64 + 4,
         .font = style.F.mono,
-        .color_text = style.C.text_ghost,
+        .color_text = .{ .color = style.C.text_ghost },
         .padding = .{},
         .margin = .{ .h = 8 },
     });
@@ -2942,7 +2943,7 @@ fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
                     _ = dvui.image(@src(), .{
                         .source = .{ .pixels = .{ .rgba = pv, .width = pw, .height = ph } },
                         .shrink = .ratio,
-                    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(6) });
+                    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corners = .round(6) });
                 }
             }
             // Live timing: elapsed since dispatch, average s/step over completed
@@ -2963,23 +2964,23 @@ fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
             var buf: [112]u8 = undefined;
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
             const status = switch (st_now) {
-                .suspended => std.fmt.bufPrint(&buf, "⏸  Suspended at step {d}/{d} — resume to continue", .{ done, total }) catch "⏸ Suspended",
+                .suspended => std.mem.print(&buf, "⏸  Suspended at step {d}/{d} — resume to continue", .{ done, total }) catch "⏸ Suspended",
                 .pending => "🖼  Queued…",
                 else => if (sps > 0)
-                    std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}  ·  {d:.2} s/step", .{ done, total, sps }) catch "Generating…"
+                    std.mem.print(&buf, "🖼  Generating…  step {d}/{d}  ·  {d:.2} s/step", .{ done, total, sps }) catch "Generating…"
                 else
-                    std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}", .{ done, total }) catch "Generating…",
+                    std.mem.print(&buf, "🖼  Generating…  step {d}/{d}", .{ done, total }) catch "Generating…",
             };
             fonts.addRich(tl, status);
             tl.deinit();
             const pct: f32 = if (total > 0) @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total)) else 0;
-            dvui.progress(@src(), .{ .percent = pct }, .{ .expand = .horizontal, .min_size_content = .{ .h = 6 }, .corner_radius = dvui.Rect.all(3) });
+            dvui.progress(@src(), .{ .percent = pct }, .{ .expand = .horizontal, .min_size_content = .{ .h = 6 }, .corners = .round(3) });
             if (generating and elapsed_s > 0) {
                 var tbuf: [80]u8 = undefined;
                 const timing = if (eta_s > 0)
-                    std.fmt.bufPrint(&tbuf, "{d:.1}s elapsed  ·  ~{d:.1}s left", .{ elapsed_s, eta_s }) catch ""
+                    std.mem.print(&tbuf, "{d:.1}s elapsed  ·  ~{d:.1}s left", .{ elapsed_s, eta_s }) catch ""
                 else
-                    std.fmt.bufPrint(&tbuf, "{d:.1}s elapsed", .{elapsed_s}) catch "";
+                    std.mem.print(&tbuf, "{d:.1}s elapsed", .{elapsed_s}) catch "";
                 dvui.label(@src(), "{s}", .{timing}, .{ .margin = .{ .y = 1 } });
             }
             genInfo(im);
@@ -2999,7 +3000,7 @@ fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
                 _ = dvui.image(@src(), .{
                     .source = .{ .pixels = .{ .rgba = rgba, .width = info.width, .height = info.height } },
                     .shrink = .ratio,
-                }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(6) });
+                }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corners = .round(6) });
                 const clicked = dvui.clicked(ib.data(), .{});
                 ib.deinit();
                 if (clicked) g_viewer_request = info.id;
@@ -3044,7 +3045,7 @@ fn renderGenImage(im: *const mirror.Image, gi_idx: usize) void {
             // (unload the LLM, drop the resolution) and then retry into.
             var fbuf: [160]u8 = undefined;
             const msg = if (info.failure.len > 0)
-                std.fmt.bufPrint(&fbuf, "image generation failed: {s}", .{mirror.failureText(info.failure)}) catch "image generation failed"
+                std.mem.print(&fbuf, "image generation failed: {s}", .{mirror.failureText(info.failure)}) catch "image generation failed"
             else
                 "image generation failed";
             fonts.richLabel(@src(), msg, .{});
@@ -3091,8 +3092,8 @@ fn genInfo(im: *const mirror.Image) void {
             (@as(f64, @floatFromInt(last - first)) / 1e9) / @as(f64, @floatFromInt(info.req_steps - 1))
         else
             0;
-        break :blk std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, info.req_steps, info.req_seed, sps, total_s }) catch "";
-    } else std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, info.req_steps, info.req_seed }) catch "";
+        break :blk std.mem.print(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, info.req_steps, info.req_seed, sps, total_s }) catch "";
+    } else std.mem.print(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, info.req_steps, info.req_seed }) catch "";
     // Rendered through a text layout (not a plain label) so the metadata,
     // seed especially, is mouse-selectable.
     fonts.richLabel(@src(), meta, .{ .margin = .{ .y = 2 } });
@@ -3136,7 +3137,7 @@ fn renderPendingThumb(pi: usize, rgba: []const u8, w: usize, h: usize) bool {
     _ = dvui.image(@src(), .{
         .source = .{ .pixels = .{ .rgba = rgba, .width = @intCast(w), .height = @intCast(h) } },
         .shrink = .ratio,
-    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(4) });
+    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corners = .round(4) });
     // Non-consuming hover test (leaves the click for the X button).
     const hovered = ov.data().rectScale().r.contains(dvui.currentWindow().mouse_pt);
     if (hovered) {
@@ -3145,7 +3146,7 @@ fn renderPendingThumb(pi: usize, rgba: []const u8, w: usize, h: usize) bool {
             .gravity_y = 0.0,
             .min_size_content = .{ .w = 12, .h = 12 },
             .padding = dvui.Rect.all(2),
-            .corner_radius = dvui.Rect.all(3),
+            .corners = .round(3),
         })) return true;
     }
     return false;
@@ -3194,9 +3195,9 @@ fn renderInput() void {
         // border, and the fill it picks is the theme's, which is the wrong
         // surface anywhere but the canvas. Saying so also silences the warning.
         .background = true,
-        .color_fill = style.C.canvas,
+        .color_fill = .{ .color = style.C.canvas },
         .border = style.Edge.top,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .x = 30, .y = 12, .w = 30, .h = 18 },
     });
     defer block.deinit();
@@ -3212,7 +3213,7 @@ fn renderInput() void {
         // Ratio and pixel budget, not raw width/height: those are the two
         // things a person decides, and since Settings no longer has size rows
         // these chips are the single source for it. Both persist.
-        var ratio_i: usize = @intFromEnum(g_config.framing_ratio);
+        var ratio_i: usize = @backingInt(g_config.framing_ratio);
         const ratio_before = ratio_i;
 
         const ratios = comptime blk: {
@@ -3221,7 +3222,7 @@ fn renderInput() void {
             break :blk out;
         };
         if (style.chipDropdown(@src(), &ratios, &ratio_i, .{ .id_extra = 0 }) and ratio_i != ratio_before) {
-            g_config.framing_ratio = @enumFromInt(ratio_i);
+            g_config.framing_ratio = @fromBackingInt(@intCast(ratio_i));
             applyFraming();
         }
 
@@ -3282,9 +3283,9 @@ fn renderInput() void {
             .gravity_x = 1.0,
             .gravity_y = 0.5,
             .background = false,
-            .color_fill_hover = style.hover_wash,
-            .color_fill_press = style.hover_wash,
-            .corner_radius = style.R.chip,
+            .color_fill_hover = .{ .color = style.hover_wash },
+            .color_fill_press = .{ .color = style.hover_wash },
+            .corners = style.R.chip,
             .padding = .{ .x = 5, .y = 3, .w = 5, .h = 3 },
             .margin = .{},
         });
@@ -3295,7 +3296,7 @@ fn renderInput() void {
             defer lr.deinit();
             dvui.labelNoFmt(@src(), "All settings in Studio", .{}, .{
                 .font = style.F.ui_sm,
-                .color_text = style.C.text_ghost,
+                .color_text = .{ .color = style.C.text_ghost },
                 .padding = .{},
                 .gravity_y = 0.5,
             });
@@ -3369,7 +3370,7 @@ fn renderInput() void {
         .border = .{},
         .padding = .{},
         .font = style.F.input,
-        .color_text = style.C.text_hi,
+        .color_text = .{ .color = style.C.text_hi },
         .theme = style.noFocusTheme(), // the frame shows focus, not the entry
         .min_size_content = .{ .h = 20 },
         // Bound BOTH dimensions of the reported min size. dvui's TextLayout

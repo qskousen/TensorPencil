@@ -475,7 +475,7 @@ pub const Model = struct {
         const T = struct {
             fn add(list: *std.ArrayList(Weight), a: std.mem.Allocator, w: Weight, l: usize, name: []const u8) !void {
                 var t = w;
-                t.tag = try std.fmt.allocPrint(a, "layers.{d}.{s}", .{ l, name });
+                t.tag = try a.print("layers.{d}.{s}", .{ l, name });
                 try list.append(a, t);
             }
         };
@@ -837,8 +837,8 @@ pub const Scratch = struct {
         var s: Scratch = undefined;
         var done: usize = 0;
         errdefer { // free the fields allocated before the failing one
-            inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-                if (i < done) gpa.free(@field(s, f.name));
+            inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+                if (i < done) gpa.free(@field(s, name));
             }
         }
         const sizes = [_]usize{
@@ -861,16 +861,16 @@ pub const Scratch = struct {
             seq * cfg.intermediate, // mlp_gate
             seq * cfg.intermediate, // mlp_up
         };
-        inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            @field(s, f.name) = try gpa.alloc(f32, sizes[i]);
+        inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            @field(s, name) = try gpa.alloc(f32, sizes[i]);
             done = i + 1;
         }
         return s;
     }
 
     pub fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Scratch).@"struct".fields) |f| {
-            gpa.free(@field(s, f.name));
+        inline for (@typeInfo(Scratch).@"struct".field_names) |name| {
+            gpa.free(@field(s, name));
         }
         s.* = undefined;
     }
@@ -992,10 +992,10 @@ test "delta rule recurrence matches naive reference" {
     const rand = prng.random();
 
     // Optimized-path state and naive-path state.
-    var S = [_]f32{0} ** (heads * d * d);
-    var S_ref = [_]f64{0} ** (heads * d * d);
-    var o = [_]f32{0} ** (heads * d);
-    var o_ref = [_]f64{0} ** (heads * d);
+    var S: [(heads * d * d)]f32 = @splat(0);
+    var S_ref: [(heads * d * d)]f64 = @splat(0);
+    var o: [(heads * d)]f32 = @splat(0);
+    var o_ref: [(heads * d)]f64 = @splat(0);
     const scale = 1.0 / @sqrt(@as(f32, d));
 
     var m_buf: [d]f32 = undefined;

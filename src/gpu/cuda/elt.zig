@@ -257,8 +257,8 @@ pub const qk_rmsnorm_par_ptx: [:0]const u8 = ptx.preamble ++
 /// time. Local to this file because `kernels.zig` imports it and must not be
 /// imported back (see that file's note on the cycle).
 fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
-    if (std.mem.indexOf(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
+    const i = std.mem.find(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
+    if (std.mem.find(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
     return src[0..i] ++ to ++ src[i + from.len ..];
 }
 
@@ -5749,11 +5749,11 @@ pub const attn_cross_ptx: [:0]const u8 = ptx.preamble ++
 test "every PTX kernel string is ASCII" {
     @setEvalBranchQuota(200_000);
     const self = @This();
-    inline for (@typeInfo(self).@"struct".decls) |d| {
-        if (comptime !std.mem.endsWith(u8, d.name, "_ptx")) continue;
-        const src = @field(self, d.name);
+    inline for (@typeInfo(self).@"struct".decl_names) |d| {
+        if (comptime !std.mem.endsWith(u8, d, "_ptx")) continue;
+        const src = @field(self, d);
         for (src, 0..) |c, i| {
-            errdefer std.debug.print("{s}: non-ASCII 0x{X} at byte {d}\n", .{ d.name, c, i });
+            errdefer std.debug.print("{s}: non-ASCII 0x{X} at byte {d}\n", .{ d, c, i });
             try std.testing.expect(c < 0x80);
         }
     }
@@ -5767,9 +5767,9 @@ test "every PTX kernel string is ASCII" {
 test "every PTX kernel stays inside its register declarations" {
     @setEvalBranchQuota(200_000);
     const self = @This();
-    inline for (@typeInfo(self).@"struct".decls) |d| {
-        if (comptime !std.mem.endsWith(u8, d.name, "_ptx")) continue;
-        try checkRegisterBounds(d.name, @field(self, d.name));
+    inline for (@typeInfo(self).@"struct".decl_names) |d| {
+        if (comptime !std.mem.endsWith(u8, d, "_ptx")) continue;
+        try checkRegisterBounds(d, @field(self, d));
     }
 }
 
@@ -5781,14 +5781,14 @@ fn checkRegisterBounds(name: []const u8, src: []const u8) !void {
     defer decls.deinit(std.testing.allocator);
 
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "%")) |at| {
+    while (std.mem.findPos(u8, src, i, "%")) |at| {
         i = at + 1;
         var j = i;
         while (j < src.len and std.ascii.isAlphabetic(src[j])) j += 1;
         const prefix = src[i..j];
         if (prefix.len == 0 or j == src.len) continue;
         if (src[j] == '<') { // a declaration: %r<64>
-            const close = std.mem.indexOfScalarPos(u8, src, j, '>') orelse continue;
+            const close = std.mem.findScalarPos(u8, src, j, '>') orelse continue;
             const n = std.fmt.parseInt(u32, src[j + 1 .. close], 10) catch continue;
             try decls.put(std.testing.allocator, prefix, n);
             i = close;
@@ -5942,17 +5942,17 @@ pub const im2col3d_ptx: [:0]const u8 = ptx.preamble ++
 // injected statement must start its own line.
 test "every injected weight-noise statement starts its own line" {
     const marks = [_][]const u8{ "[f1];", "[u5];", "0x9E3779B1", "0x85EBCA6B", "0xC2B2AE35" };
-    inline for (@typeInfo(@This()).@"struct".decls) |d| {
-        if (comptime std.mem.endsWith(u8, d.name, "_ptx")) {
-            const text: []const u8 = @field(@This(), d.name);
+    inline for (@typeInfo(@This()).@"struct".decl_names) |d| {
+        if (comptime std.mem.endsWith(u8, d, "_ptx")) {
+            const text: []const u8 = @field(@This(), d);
             for (marks) |mark| {
                 var at: usize = 0;
-                while (std.mem.indexOfPos(u8, text, at, mark)) |i| {
+                while (std.mem.findPos(u8, text, at, mark)) |i| {
                     at = i + mark.len;
-                    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..i], '\n')) |nl| nl + 1 else 0;
+                    const line_start = if (std.mem.findScalarLast(u8, text[0..i], '\n')) |nl| nl + 1 else 0;
                     const before = text[line_start..i];
-                    errdefer std.debug.print("{s}: `{s}` sits behind a comment: {s}\n", .{ d.name, mark, before });
-                    try std.testing.expect(std.mem.indexOf(u8, before, "//") == null);
+                    errdefer std.debug.print("{s}: `{s}` sits behind a comment: {s}\n", .{ d, mark, before });
+                    try std.testing.expect(std.mem.find(u8, before, "//") == null);
                 }
             }
         }

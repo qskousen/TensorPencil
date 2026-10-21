@@ -117,17 +117,17 @@ fn nextNativeImageCall(buf: []const u8) ScanResult {
 fn nextImageTag(buf: []const u8) ScanResult {
     const close = "</image>";
     var from: usize = 0;
-    while (std.mem.indexOfPos(u8, buf, from, "<image")) |a| {
+    while (std.mem.findPos(u8, buf, from, "<image")) |a| {
         if (!atLineStart(buf, a)) {
             // Casual mention, not a tool call: skip past it, keep it as text.
             from = a + "<image".len;
             continue;
         }
         const after_open = buf[a + "<image".len ..];
-        const gt = std.mem.indexOfScalar(u8, after_open, '>') orelse
+        const gt = std.mem.findScalar(u8, after_open, '>') orelse
             return .{ .partial = .{ .text_before = buf[0..a] } };
         const body = after_open[gt + 1 ..];
-        const b = std.mem.indexOf(u8, body, close) orelse
+        const b = std.mem.find(u8, body, close) orelse
             return .{ .partial = .{ .text_before = buf[0..a] } };
         return .{ .call = .{
             .text_before = buf[0..a],
@@ -383,7 +383,7 @@ test "nextImageCall: a native K2 generate_image block is a call, other tools are
     try testing.expectEqualStrings("Here:\n", r.call.text_before);
     try testing.expectEqualStrings("a red fox", r.call.prompt);
     try testing.expectEqualStrings("\nDone.", r.call.after);
-    try testing.expect(std.mem.indexOf(u8, r.call.attrs, "<ifm|arg_key>width</ifm|arg_key>") != null);
+    try testing.expect(std.mem.find(u8, r.call.attrs, "<ifm|arg_key>width</ifm|arg_key>") != null);
     try testing.expectEqual(ScanResult.none, nextImageCall("<ifm|tool_calls>\n<ifm|tool_call>get_weather\n</ifm|tool_call>\n</ifm|tool_calls>"));
     switch (nextImageCall("ok\n<ifm|tool_calls>\n<ifm|tool_call>generate_image\n<ifm|arg_key>pro")) {
         .partial => |p| try testing.expectEqualStrings("ok\n", p.text_before),

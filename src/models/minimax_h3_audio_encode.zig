@@ -226,7 +226,7 @@ pub const AudioEncoder = struct {
         var n_stages: usize = 0;
         while (true) : (n_stages += 1) {
             var buf: [96]u8 = undefined;
-            const nm = std.fmt.bufPrint(&buf, "encoder.block.{d}.block.4.weight", .{n_stages + 1}) catch break;
+            const nm = std.mem.print(&buf, "encoder.block.{d}.block.4.weight", .{n_stages + 1}) catch break;
             if (store.get(nm) == null) break;
         }
         if (n_stages == 0) return error.MissingTensor;
@@ -313,7 +313,7 @@ const L = struct {
 
     fn tensor(l: L, comptime fmt: []const u8, args: anytype) !weights_mod.TensorView {
         var buf: [128]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         return l.store.get(nm) orelse {
             std.log.err("minimax_h3_audio_encode: missing tensor {s}", .{nm});
             return error.MissingTensor;

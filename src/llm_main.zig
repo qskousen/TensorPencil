@@ -14,7 +14,7 @@ const qwen3_cuda = TensorPencil.models.qwen3_cuda;
 const llm = TensorPencil.llm;
 const residency = TensorPencil.residency;
 
-/// libc getenv (std.posix.getenv is gone in 0.16; we link libc). Used for the
+/// libc getenv (std.posix.getenv is gone; we link libc). Used for the
 /// TP_VIT_DUMP debug hook.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -263,7 +263,7 @@ pub fn main(init: std.process.Init) !void {
             llm.chat.setThinking(false);
         } else if (std.mem.eql(u8, a, "--reasoning-markers")) {
             const v = try nextArg(args, &i);
-            const comma = std.mem.indexOfScalar(u8, v, ',') orelse {
+            const comma = std.mem.findScalar(u8, v, ',') orelse {
                 try stdout.print("--reasoning-markers: expected \"<open>,<close>\", got {s}\n", .{v});
                 try stdout.flush();
                 return error.InvalidArgument;
@@ -1194,7 +1194,7 @@ fn renderDrivenChat(
             cur_imgs.deinit(gpa);
         }
         var used_parts = false;
-        if (!is_tool_turn and exp != null and std.mem.indexOfScalar(u8, line, '@') != null) {
+        if (!is_tool_turn and exp != null and std.mem.findScalar(u8, line, '@') != null) {
             var parts: std.ArrayList(llm.chat.Part) = .empty;
             defer parts.deinit(gpa);
             try llm.chat.parseImageMentions(gpa, line, &parts);
@@ -1405,7 +1405,7 @@ fn runSession(
         var parts: std.ArrayList(llm.chat.Part) = .empty;
         defer parts.deinit(gpa);
         var has_image = false;
-        if (std.mem.indexOfScalar(u8, line, '@') != null) {
+        if (std.mem.findScalar(u8, line, '@') != null) {
             try llm.chat.parseImageMentions(gpa, line, &parts);
             for (parts.items) |p| {
                 if (p == .image) has_image = true;
@@ -1567,7 +1567,7 @@ fn benchStepper(model: anytype, io: Io, gpa: std.mem.Allocator, ids: []const u32
         const lh = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(logits));
         var out: [decode]u32 = undefined;
         for (&out) |*o| {
-            o.* = @intCast(std.mem.indexOfMax(f32, logits));
+            o.* = @intCast(std.mem.findMax(f32, logits));
             try model.step(io, o[0..1], logits);
         }
         const t2 = Io.Clock.awake.now(io).nanoseconds;
@@ -2316,7 +2316,7 @@ fn runGemma4(
         defer gpa.free(dec.pixels);
         // Debug: TP_VIT_DUMP=<path.png> writes the EXACT letterboxed image the
         // gemma4v tower ingests (to confirm it sees the whole image, not a crop).
-        // std.posix.getenv is gone in 0.16; we link libc, so use getenv directly.
+        // std.posix.getenv is gone; we link libc, so use getenv directly.
         if (proj_v) if (getenv("TP_VIT_DUMP")) |dp_c| {
             const dp = std.mem.span(dp_c);
             const pp = try vit_v.?.preprocessedRgb(gpa, dec.pixels, dec.width, dec.height);
@@ -2482,7 +2482,13 @@ const ModelFile = union(enum) {
     fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
         // A run names a model, an mmproj and sometimes a draft model, so a bare
         // `error.FileNotFound` does not say which one was wrong.
-        errdefer |err| std.log.err("cannot open {s}: {t}", .{ path, err });
+        return openUnnamed(gpa, io, path) catch |err| {
+            std.log.err("cannot open {s}: {t}", .{ path, err });
+            return err;
+        };
+    }
+
+    fn openUnnamed(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
         if (std.ascii.endsWithIgnoreCase(path, ".gguf"))
             return .{ .gguf = try TensorPencil.Gguf.open(gpa, io, path) };
         return .{ .safetensors = try TensorPencil.SafeTensors.open(gpa, io, path) };

@@ -10,7 +10,8 @@
 //!   rmsnorm     x = row.               a=in, b=out, c=weight.
 //!               u0=n_rows u1=dim f0=eps.
 
-const gpu = @import("std").gpu;
+const abi = @import("abi.zig");
+const gpu = @import("std").spirv;
 
 // Type-level maximum, not an allocation: the VAE decoder's final-stage
 // activations reach ~180M f32 at 5.4 MP, past the old 1 << 27 bound.
@@ -30,42 +31,11 @@ pub const Push = extern struct {
     u6: u32,
 };
 
-extern var a: FBuf addrspace(.storage_buffer);
-extern var b: FBuf addrspace(.storage_buffer);
-extern var c: FBuf addrspace(.storage_buffer);
-extern var d: FBuf addrspace(.storage_buffer);
-extern var pc: Push addrspace(.push_constant);
-
-inline fn decorate() void {
-    asm volatile (
-        \\OpDecorate %ft Block
-        \\OpMemberDecorate %ft 0 Offset 0
-        \\OpDecorate %pt Block
-        \\OpMemberDecorate %pt 0 Offset 0
-        \\OpMemberDecorate %pt 1 Offset 4
-        \\OpMemberDecorate %pt 2 Offset 8
-        \\OpMemberDecorate %pt 3 Offset 12
-        \\OpMemberDecorate %pt 4 Offset 16
-        \\OpMemberDecorate %pt 5 Offset 20
-        \\OpMemberDecorate %pt 6 Offset 24
-        \\OpMemberDecorate %pt 7 Offset 28
-        \\OpDecorate %ba DescriptorSet 0
-        \\OpDecorate %ba Binding 0
-        \\OpDecorate %bb DescriptorSet 0
-        \\OpDecorate %bb Binding 1
-        \\OpDecorate %bc DescriptorSet 0
-        \\OpDecorate %bc Binding 2
-        \\OpDecorate %bd DescriptorSet 0
-        \\OpDecorate %bd Binding 3
-        :
-        : [ft] "t" (FBuf),
-          [pt] "t" (Push),
-          [ba] "" (&a),
-          [bb] "" (&b),
-          [bc] "" (&c),
-          [bd] "" (&d),
-    );
-}
+const a = abi.buffer(FBuf, "a", 0);
+const b = abi.buffer(FBuf, "b", 1);
+const c = abi.buffer(FBuf, "c", 2);
+const d = abi.buffer(FBuf, "d", 3);
+const pc = abi.pushConstants(Push, "pc");
 
 // topk_reduce: L lanes each keep their M highest (value, index) over their
 //   stride-slice, via min-slot tracking (strict `>` keeps the lower index on
@@ -79,8 +49,7 @@ const topk_m = 8; // must match context.zig topk_m
 // head_dim (unlike the 32-slice `attention` kernel). a=q, b=k, c=v, d=out,
 // each [seq][n_heads*hd] (position j at j*n_kv*hd + kvh*hd). u0=seq,
 // u1=n_heads, u2=n_kv_heads, u3=head_dim (<=256), f0=scale. Online softmax.
-export fn attn_full() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_full() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const seq = pc.u0;
     const n_heads = pc.u1;
@@ -139,8 +108,7 @@ export fn attn_full() callconv(.spirv_kernel) void {
 // u0=total rows, u1=n_heads, u2=n_kv, u3=hd, u4=s_rows (per-item length),
 // u5 = where query row 0 sits among the keys (0 for CLIP), u6 != 0 lifts the mask so
 // every query sees keys [item start, u6), f0=scale. a=q, b=k, c=v, d=out.
-export fn attn_causal_batched() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_causal_batched() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const total = pc.u0;
     const n_heads = pc.u1;
@@ -192,8 +160,7 @@ export fn attn_causal_batched() callconv(.spirv_kernel) void {
 //   k*w_stride + col; rows must be a multiple of 4. a = W (raw words through
 //   the f32 view), b = x, d = partials [ch][rows]. u0 = (rows/4)*nchunk,
 //   u1 = cols, u2 = nchunk, u3 = w_stride, u4 = is_f8, u5 = rows.
-export fn gemv_partial() callconv(.spirv_kernel) void {
-    decorate();
+export fn gemv_partial() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
     const groups = pc.u5 / 4;
@@ -307,8 +274,7 @@ const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 //   c = gates [decay(heads) | beta(heads)], d = o [heads*dd]. u0 = heads,
 //   u1 = dd (<=128), u2 = kheads, u3 = v-heads per k-head (0 or 1: tiled),
 //   f0 = readout scale. One thread per head.
-export fn gdn_delta_step() callconv(.spirv_kernel) void {
-    decorate();
+export fn gdn_delta_step() callconv(abi.kernel) void {
     const h = gpu.global_invocation_id[0];
     if (h >= pc.u0) return;
     const heads = pc.u0;
@@ -372,8 +338,7 @@ export fn gdn_delta_step() callconv(.spirv_kernel) void {
 //   [ch][4][rows]. u0 = (rows/8)*nchunk, u1 = cols, u2 = nchunk,
 //   u3 = w_stride, u4 = is_f8, u5 = rows, f1 = x element offset (bitcast u32
 //   the input-group base for seq > 4 verifies).
-export fn gemv_partial4() callconv(.spirv_kernel) void {
-    decorate();
+export fn gemv_partial4() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
     const rows = pc.u5;
@@ -461,8 +426,7 @@ inline fn e4m3ToF32(byte: u32) f32 {
 // idx*17. Per block: d = absmax/127 (f16), q = roundEven(x/d), same
 // round-to-nearest-even as the host packQ80 and the CUDA cvt.rni kernels.
 // u0 = pair count, u2 = dst element offset (pair-aligned), u3 = src elem off.
-export fn kv_store_q8_0() callconv(.spirv_kernel) void {
-    decorate();
+export fn kv_store_q8_0() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
     const src = pc.u3 + idx * 64;
@@ -551,8 +515,7 @@ inline fn packH16(lo: f32, hi: f32) f32 {
 //   z = head-in-batch. a=S, c=V, d=out. u0..u4 as attn_scores.
 const amm_tile = 8;
 
-export fn attn_scores() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_scores() callconv(abi.kernel) void {
     const seq = pc.u0;
     const hd = pc.u3;
     const head = pc.u4 + gpu.global_invocation_id[2];
@@ -606,8 +569,7 @@ export fn attn_scores() callconv(.spirv_kernel) void {
     }
 }
 
-export fn attn_out() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_out() callconv(abi.kernel) void {
     const seq = pc.u0;
     const hd = pc.u3;
     const head = pc.u4 + gpu.global_invocation_id[2];
@@ -696,8 +658,7 @@ export fn attn_out() callconv(.spirv_kernel) void {
 // per-row quant scale becomes a cheap O(groups/row) reduction instead of a
 // latency-bound O(cols) row scan. a = x, b = x_rot, d = partial abs-max per
 // group. u0 = group count (n/256).
-export fn rotate_fwht() callconv(.spirv_kernel) void {
-    decorate();
+export fn rotate_fwht() callconv(abi.kernel) void {
     const g = gpu.global_invocation_id[0];
     if (g >= pc.u0) return;
     const base = g * 256;
@@ -761,8 +722,7 @@ export fn rotate_fwht() callconv(.spirv_kernel) void {
 //
 // u0 = total threads = (cols/2)*(stride/4), u1 = group_size/2 (packed byte-columns per
 // group), u2 = stride/4.
-export fn w4a8_decode_t() callconv(.spirv_kernel) void {
-    decorate();
+export fn w4a8_decode_t() callconv(abi.kernel) void {
     const t = gpu.global_invocation_id[0];
     if (t >= pc.u0) return;
     const rq = pc.u2; // row quads per byte-column plane
@@ -819,8 +779,7 @@ export fn w4a8_decode_t() callconv(.spirv_kernel) void {
 // to int8 0, which is what the GEMM must see for a pad row.
 //
 // u0 = total threads = (cols/2)*(stride/4), u1 = stride/4.
-export fn i4_decode_t() callconv(.spirv_kernel) void {
-    decorate();
+export fn i4_decode_t() callconv(abi.kernel) void {
     const t = gpu.global_invocation_id[0];
     if (t >= pc.u0) return;
     const pw: u32 = @bitCast(a.data[t]);
@@ -874,8 +833,7 @@ export fn i4_decode_t() callconv(.spirv_kernel) void {
 //
 // u0 = total threads = (k_pad/2)*(n_pad/4), u1 = n_pad/4 (output row quads), u2 = n_pad,
 // u3 = rows, u4 = cols, u5 = sin/4 (INPUT row quads).
-export fn nvfp4_decode_t() callconv(.spirv_kernel) void {
-    decorate();
+export fn nvfp4_decode_t() callconv(abi.kernel) void {
     const t = gpu.global_invocation_id[0];
     if (t >= pc.u0) return;
     const rq = pc.u1;
@@ -930,8 +888,7 @@ export fn nvfp4_decode_t() callconv(.spirv_kernel) void {
 // a = q [seq_q][n_heads*hd], b = k, c = v (both [seq_kv][n_heads*hd]),
 // d = out [seq_q][n_heads*hd].
 // u0 = seq_q, u1 = n_heads, u2 = head_dim (<=256), u3 = seq_kv, f0 = scale.
-export fn attn_cross() callconv(.spirv_kernel) void {
-    decorate();
+export fn attn_cross() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     const n_heads = pc.u1;
     if (idx >= pc.u0 * n_heads) return;

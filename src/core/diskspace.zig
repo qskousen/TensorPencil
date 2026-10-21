@@ -8,10 +8,10 @@ const builtin = @import("builtin");
 /// Bytes an unprivileged writer may still use under `path`, null when the
 /// platform has no answer here.
 pub fn freeBytes(gpa: std.mem.Allocator, path: []const u8) ?u64 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             if (@sizeOf(usize) != 8) return null;
-            const z = gpa.dupeZ(u8, path) catch return null;
+            const z = gpa.dupeSentinel(u8, path, 0) catch return null;
             defer gpa.free(z);
             var st: LinuxStatfs = undefined;
             // A raw syscall returns -errno in the top range of usize.
@@ -58,7 +58,7 @@ extern "kernel32" fn GetDiskFreeSpaceExW(
 
 test "the working directory has a known, non-zero amount of free space on Linux" {
     const free = freeBytes(std.testing.allocator, ".");
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         try std.testing.expect(free != null);
         try std.testing.expect(free.? > 0);
     }

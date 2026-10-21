@@ -32,8 +32,8 @@ const selection = @import("client").selection;
 fn noop() void {}
 
 fn stemOf(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+    const base = std.Io.Dir.path.basename(path);
+    return base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len];
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -128,8 +128,8 @@ pub fn main(init: std.process.Init) !void {
     // user is sitting at. B is a listed host: one the client starts itself, or
     // the remote one the pairing string names.
     const stamp = Io.Clock.real.now(io).toSeconds();
-    const sock_a = try link.localPath(arena, io, init.environ_map, try std.fmt.allocPrint(arena, "probe-A-{d}.sock", .{stamp}));
-    const sock_b = try link.localPath(arena, io, init.environ_map, try std.fmt.allocPrint(arena, "probe-B-{d}.sock", .{stamp}));
+    const sock_a = try link.localPath(arena, io, init.environ_map, try arena.print("probe-A-{d}.sock", .{stamp}));
+    const sock_b = try link.localPath(arena, io, init.environ_map, try arena.print("probe-B-{d}.sock", .{stamp}));
     if (!cfg.addHost("B", pairing orelse sock_b, true).ok()) return error.HostListFull;
     const remote_b = pairing != null;
 
@@ -256,14 +256,14 @@ pub fn main(init: std.process.Init) !void {
         if (j.prog.phase.load(.acquire) != .done) return error.PullFailed;
         // What landed has to be the same file: the id this machine computes for
         // it, off its own disk, must be the id it was asked for.
-        const landed = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dest, e.stem() });
+        const landed = try arena.print("{s}/{s}", .{ dest, e.stem() });
         var found: ?[]const u8 = null;
         var d = try Io.Dir.cwd().openDir(io, dest, .{ .iterate = true });
         defer d.close(io);
         var it = d.iterate();
         while (try it.next(io)) |ent| {
             if (ent.kind != .file or !std.mem.startsWith(u8, ent.name, e.stem())) continue;
-            found = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dest, ent.name });
+            found = try arena.print("{s}/{s}", .{ dest, ent.name });
         }
         const got = found orelse {
             try out.print("{{\"probe\":\"nothing at {s}\"}}\n", .{landed});
@@ -309,7 +309,7 @@ pub fn main(init: std.process.Init) !void {
             var ids_only = true;
             var ckpts: usize = 0;
             for (b.mirror.catalog.entries) |*e| {
-                if (catalog.parseId(e.path) == null or e.name.len == 0 or std.mem.indexOfAny(u8, e.path, "/\\") != null) ids_only = false;
+                if (catalog.parseId(e.path) == null or e.name.len == 0 or std.mem.findAny(u8, e.path, "/\\") != null) ids_only = false;
                 if (e.ckpt != null) ckpts += 1;
             }
             try out.print("{{\"probe\":\"catalog\",\"host\":\"B\",\"entries\":{d},\"checkpoints\":{d},\"ids_only\":{}}}\n", .{ b.mirror.catalog.entries.len, ckpts, ids_only });

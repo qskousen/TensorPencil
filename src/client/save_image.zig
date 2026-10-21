@@ -86,7 +86,7 @@ pub fn encodeAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, rgba: []
 
 /// Unique, roughly time-sortable filename: tp_<ns>_<seed>.png.
 pub fn fileName(buf: []u8, info: *const wire.ImageInfo) []const u8 {
-    return std.fmt.bufPrint(buf, "tp_{d}_{d}.png", .{ info.start_ns, info.req_seed }) catch "tp_image.png";
+    return std.mem.print(buf, "tp_{d}_{d}.png", .{ info.start_ns, info.req_seed }) catch "tp_image.png";
 }
 
 /// Write the image into `dir` (created if missing) and return the path, gpa-owned.
@@ -99,7 +99,7 @@ pub fn saveIn(gpa: std.mem.Allocator, io: Io, base: Io.Dir, dir: []const u8, inf
     const png = try encodeAlloc(gpa, info, rgba, w, h);
     defer gpa.free(png);
     var name_buf: [64]u8 = undefined;
-    const path = std.fs.path.join(gpa, &.{ dir, fileName(&name_buf, info) }) catch return error.OutOfMemory;
+    const path = std.Io.Dir.path.join(gpa, &.{ dir, fileName(&name_buf, info) }) catch return error.OutOfMemory;
     errdefer gpa.free(path);
     base.createDirPath(io, dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -196,7 +196,7 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
     }
     const head = std.mem.trimEnd(u8, text[0..head_end], "\n");
 
-    if (std.mem.indexOf(u8, head, neg_tag)) |i| {
+    if (std.mem.find(u8, head, neg_tag)) |i| {
         out.prompt = std.mem.trim(u8, head[0..i], " \t\r\n");
         out.negative = std.mem.trim(u8, head[i + neg_tag.len ..], " \t\r\n");
     } else {
@@ -205,7 +205,7 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
 
     var f: FieldIter = .{ .s = settings };
     while (f.next()) |field| {
-        const colon = std.mem.indexOfScalar(u8, field, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, field, ':') orelse continue;
         const key = std.mem.trim(u8, field[0..colon], " \t");
         const val = std.mem.trim(u8, field[colon + 1 ..], " \t");
         if (std.mem.eql(u8, key, "Steps")) {
@@ -227,7 +227,7 @@ pub fn parseA1111Params(text: []const u8) A1111Params {
         } else if (std.mem.eql(u8, key, "Cond noise negative")) {
             out.cond_noise_negative = std.fmt.parseFloat(f32, val) catch null;
         } else if (std.mem.eql(u8, key, "Size")) {
-            const x = std.mem.indexOfScalar(u8, val, 'x') orelse continue;
+            const x = std.mem.findScalar(u8, val, 'x') orelse continue;
             out.width = std.fmt.parseInt(usize, val[0..x], 10) catch null;
             out.height = std.fmt.parseInt(usize, val[x + 1 ..], 10) catch null;
         }
@@ -249,12 +249,12 @@ test "the parameters block names the request the way the engine's writer did" {
     const p = try paramsAlloc(std.testing.allocator, &info, 1152, 1728);
     defer std.testing.allocator.free(p);
     try std.testing.expect(std.mem.startsWith(u8, p, "a red cube\n"));
-    try std.testing.expect(std.mem.indexOf(u8, p, "Negative prompt: blur") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Steps: 12") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Seed: 1234") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Size: 1152x1728") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Model: cyberChimera_v10Int8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "Karras") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Negative prompt: blur") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Steps: 12") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Seed: 1234") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Size: 1152x1728") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Model: cyberChimera_v10Int8") != null);
+    try std.testing.expect(std.mem.find(u8, p, "Karras") != null);
 }
 
 test "a saved PNG carries the parameters chunk and the pixels" {
@@ -265,11 +265,11 @@ test "a saved PNG carries the parameters chunk and the pixels" {
     const rgba = [_]u8{ 10, 20, 30, 255, 40, 50, 60, 255 };
     const path = try saveIn(std.testing.allocator, io, tmp.dir, "out", &info, &rgba, 2, 1);
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("out" ++ std.fs.path.sep_str ++ "tp_5_9.png", path);
+    try std.testing.expectEqualStrings("out" ++ std.Io.Dir.path.sep_str ++ "tp_5_9.png", path);
     const bytes = try tmp.dir.readFileAlloc(io, path, std.testing.allocator, .limited(1 << 20));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualSlices(u8, "\x89PNG", bytes[0..4]);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "parameters") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "parameters") != null);
 }
 
 test "a saved PNG keeps a render's alpha, and stays RGB when there is none" {
@@ -404,18 +404,18 @@ test "appendExtraParams writes the A1111/Civitai field names" {
         ", Shift: 6.0000",
         ", Lora hashes: \"style: 9999888877\"",
         ", Lora strengths: \"style: 0.80\"",
-    }) |want| try std.testing.expect(std.mem.indexOf(u8, out, want) != null);
+    }) |want| try std.testing.expect(std.mem.find(u8, out, want) != null);
     // The quoted, comma-carrying value does not swallow the fields after it.
     try std.testing.expectEqual(@as(?f32, 6.0), parseA1111Params(out).shift);
     // The Civitai map is built from the same values, so it cannot disagree.
-    try std.testing.expect(std.mem.indexOf(u8, out,
+    try std.testing.expect(std.mem.find(u8, out,
         ", Hashes: {\"model\":\"0123456789\",\"vae\":\"abcdef0123\",\"lora:style\":\"9999888877\"}") != null);
     // Absent fields are absent, not empty: `Clip 2` was never set.
-    try std.testing.expect(std.mem.indexOf(u8, out, "Clip 2") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Denoise") == null);
+    try std.testing.expect(std.mem.find(u8, out, "Clip 2") == null);
+    try std.testing.expect(std.mem.find(u8, out, "Denoise") == null);
     // Conditioning noise was off, so it contributes nothing at all -- not even the
     // amount, which has a non-null default of its own.
-    try std.testing.expect(std.mem.indexOf(u8, out, "Cond noise") == null);
+    try std.testing.expect(std.mem.find(u8, out, "Cond noise") == null);
 }
 
 test "a conditioning-noise curve round-trips with its commas intact" {
@@ -432,7 +432,7 @@ test "a conditioning-noise curve round-trips with its commas intact" {
     });
     defer gpa.free(out);
     errdefer std.debug.print("{s}\n", .{out});
-    try std.testing.expect(std.mem.indexOf(u8, out, ", Cond noise: \"clamp(a*(1-t),0,1)\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, ", Cond noise: \"clamp(a*(1-t),0,1)\"") != null);
 
     const got = parseA1111Params(out);
     try std.testing.expectEqualStrings("clamp(a*(1-t),0,1)", got.cond_noise);
@@ -464,7 +464,7 @@ test "autoV2 is the file's own sha256, sidecar or not" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
-    const file = try std.fmt.allocPrint(gpa, "{s}/f.bin", .{dir_path});
+    const file = try gpa.print("{s}/f.bin", .{dir_path});
     defer gpa.free(file);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
 
@@ -477,7 +477,7 @@ test "autoV2 is the file's own sha256, sidecar or not" {
     }
     // And read from a sidecar, which must agree rather than merely be accepted.
     {
-        const side = try std.fmt.allocPrint(gpa, "{s}/f.sha256", .{dir_path});
+        const side = try gpa.print("{s}/f.sha256", .{dir_path});
         defer gpa.free(side);
         try std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = side,
@@ -502,9 +502,9 @@ test "a computed hash is SAVED, in the sidecar format the other tools read" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
-    const file = try std.fmt.allocPrint(gpa, "{s}/f.bin", .{dir_path});
+    const file = try gpa.print("{s}/f.bin", .{dir_path});
     defer gpa.free(file);
-    const side = try std.fmt.allocPrint(gpa, "{s}/f.sha256", .{dir_path});
+    const side = try gpa.print("{s}/f.sha256", .{dir_path});
     defer gpa.free(side);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
 
@@ -534,7 +534,7 @@ test "compute = false neither hashes nor writes" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
-    const file = try std.fmt.allocPrint(gpa, "{s}/g.bin", .{dir_path});
+    const file = try gpa.print("{s}/g.bin", .{dir_path});
     defer gpa.free(file);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "hello\n" });
 
@@ -542,7 +542,7 @@ test "compute = false neither hashes nor writes" {
     defer h.deinit(gpa);
     try std.testing.expectEqualStrings("", h.autoV2(gpa, io, file));
 
-    const side = try std.fmt.allocPrint(gpa, "{s}/g.sha256", .{dir_path});
+    const side = try gpa.print("{s}/g.sha256", .{dir_path});
     defer gpa.free(side);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, side, .{}));
 }
@@ -581,7 +581,7 @@ test "buildA1111Params records the sampler actually used" {
         const s = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, c.k, null, .comfy, .original, .comfy, .{});
         defer gpa.free(s);
         errdefer std.debug.print("{s}\n", .{s});
-        try std.testing.expect(std.mem.indexOf(u8, s, c.want) != null);
+        try std.testing.expect(std.mem.find(u8, s, c.want) != null);
     }
 }
 
@@ -592,15 +592,15 @@ test "buildA1111Params records the sampling compat, and overrides only when over
     // existed, no new fields, so nothing that parses these PNGs has to change.
     const plain = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .of(.comfy));
     defer gpa.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "Compat") == null);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "RNG") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "Compat") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "RNG") == null);
 
     // A1111's defaults are named once, not spelled out three times.
     const a = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, .of(.a1111));
     defer gpa.free(a);
     errdefer std.debug.print("{s}\n", .{a});
-    try std.testing.expect(std.mem.indexOf(u8, a, "Compat: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "RNG") == null);
+    try std.testing.expect(std.mem.find(u8, a, "Compat: A1111") != null);
+    try std.testing.expect(std.mem.find(u8, a, "RNG") == null);
 
     // An override has to be recorded or the block does not describe the render: with
     // `RNG: CPU` this is a different starting latent from the line above, at the same
@@ -610,10 +610,10 @@ test "buildA1111Params records the sampling compat, and overrides only when over
     const ov = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, cc);
     defer gpa.free(ov);
     errdefer std.debug.print("{s}\n", .{ov});
-    try std.testing.expect(std.mem.indexOf(u8, ov, "Compat: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ov, "RNG: CPU") != null);
+    try std.testing.expect(std.mem.find(u8, ov, "Compat: A1111") != null);
+    try std.testing.expect(std.mem.find(u8, ov, "RNG: CPU") != null);
     // And the two knobs still at A1111's defaults stay out of it.
-    try std.testing.expect(std.mem.indexOf(u8, ov, "SGM") == null);
+    try std.testing.expect(std.mem.find(u8, ov, "SGM") == null);
 
     // The reverse: ComfyUI conventions with A1111's noise, which is the single-variable
     // experiment someone chasing a mismatch would actually run.
@@ -621,8 +621,8 @@ test "buildA1111Params records the sampling compat, and overrides only when over
     cn.noise_src = .nv_philox;
     const nv = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, cn);
     defer gpa.free(nv);
-    try std.testing.expect(std.mem.indexOf(u8, nv, "RNG: NV") != null);
-    try std.testing.expect(std.mem.indexOf(u8, nv, "Compat") == null);
+    try std.testing.expect(std.mem.find(u8, nv, "RNG: NV") != null);
+    try std.testing.expect(std.mem.find(u8, nv, "Compat") == null);
 }
 
 test "buildA1111Params records the prompt dialect, and the emphasis only when it applies" {
@@ -632,13 +632,13 @@ test "buildA1111Params records the prompt dialect, and the emphasis only when it
     const gpa = std.testing.allocator;
     const a = try tp.pipeline.buildA1111Params(gpa, "(a:1.2) [b]", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .a1111, .no_norm, .comfy, .{});
     defer gpa.free(a);
-    try std.testing.expect(std.mem.indexOf(u8, a, "Prompt syntax: A1111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "Emphasis: No norm") != null);
+    try std.testing.expect(std.mem.find(u8, a, "Prompt syntax: A1111") != null);
+    try std.testing.expect(std.mem.find(u8, a, "Emphasis: No norm") != null);
 
     const c = try tp.pipeline.buildA1111Params(gpa, "(a:1.2)", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(c);
-    try std.testing.expect(std.mem.indexOf(u8, c, "Prompt syntax: ComfyUI") != null);
-    try std.testing.expect(std.mem.indexOf(u8, c, "Emphasis") == null);
+    try std.testing.expect(std.mem.find(u8, c, "Prompt syntax: ComfyUI") != null);
+    try std.testing.expect(std.mem.find(u8, c, "Emphasis") == null);
 }
 
 test "buildA1111Params names the family's own schedule, and omits it when unknown" {
@@ -649,27 +649,27 @@ test "buildA1111Params names the family's own schedule, and omits it when unknow
     for ([_]tp.pipeline.Family{ .sd15, .sdxl }) |f| {
         const s = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", f, .euler, null, .comfy, .original, .comfy, .{});
         defer gpa.free(s);
-        try std.testing.expect(std.mem.indexOf(u8, s, "Schedule type: Normal,") != null);
+        try std.testing.expect(std.mem.find(u8, s, "Schedule type: Normal,") != null);
     }
     const k = try tp.pipeline.buildA1111Params(gpa, "p", "", 8, 1.0, 1, 1024, 1024, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(k);
-    try std.testing.expect(std.mem.indexOf(u8, k, "Schedule type: Simple,") != null);
+    try std.testing.expect(std.mem.find(u8, k, "Schedule type: Simple,") != null);
 
     // An EXPLICIT scheduler wins over the family default, and this is what the
     // field is for: with schedulers selectable, deriving it from the architecture
     // stamps a name the image was not rendered with.
     const karras = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sd15, .euler, .karras, .comfy, .original, .comfy, .{});
     defer gpa.free(karras);
-    try std.testing.expect(std.mem.indexOf(u8, karras, "Schedule type: Karras,") != null);
+    try std.testing.expect(std.mem.find(u8, karras, "Schedule type: Karras,") != null);
     const kl = try tp.pipeline.buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .krea2, .euler, .kl_optimal, .comfy, .original, .comfy, .{});
     defer gpa.free(kl);
-    try std.testing.expect(std.mem.indexOf(u8, kl, "Schedule type: KL Optimal,") != null);
+    try std.testing.expect(std.mem.find(u8, kl, "Schedule type: KL Optimal,") != null);
 
     // Unknown architecture: drop the field rather than stamp a guess a reader
     // would reproduce with. Everything around it stays well-formed.
     const unknown = try tp.pipeline.buildA1111Params(gpa, "p", "", 8, 1.0, 1, 512, 512, "m", null, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(unknown);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "Schedule type") == null);
+    try std.testing.expect(std.mem.find(u8, unknown, "Schedule type") == null);
     try std.testing.expectEqualStrings(
         "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 1, Size: 512x512, Model: m, Prompt syntax: ComfyUI",
         unknown,

@@ -143,7 +143,7 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        inline for (@typeInfo(Workspace).@"struct".fields) |f| be.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Workspace).@"struct".field_names) |name| be.tensorDestroy(&@field(self, name));
         self.* = undefined;
     }
 };

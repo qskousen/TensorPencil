@@ -107,7 +107,7 @@ pub const Loaded = struct {
 pub const magic = "tp-conv 1";
 /// A transcript longer than this is refused rather than read into memory. A
 /// real chat is kilobytes; anything at this scale is a wrong file.
-pub const max_file_bytes: std.Io.Limit = @enumFromInt(32 << 20);
+pub const max_file_bytes: std.Io.Limit = @fromBackingInt(@intCast(32 << 20));
 
 // ------------------------------------------------------------- serialization
 
@@ -154,7 +154,7 @@ const Reader = struct {
 
     fn line(self: *Reader) ParseError![]const u8 {
         if (self.i >= self.b.len) return error.Truncated;
-        const nl = std.mem.indexOfScalarPos(u8, self.b, self.i, '\n') orelse return error.Truncated;
+        const nl = std.mem.findScalarPos(u8, self.b, self.i, '\n') orelse return error.Truncated;
         const out = self.b[self.i..nl];
         self.i = nl + 1;
         return out;
@@ -174,7 +174,7 @@ const Reader = struct {
 /// disagree about where the next line starts.
 fn blobLen(line: []const u8) ?usize {
     if (std.mem.startsWith(u8, line, "turn ")) {
-        const sp = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return null;
+        const sp = std.mem.findScalarLast(u8, line, ' ') orelse return null;
         return std.fmt.parseInt(usize, line[sp + 1 ..], 10) catch null;
     }
     // `meta` and `image` end in several lengths whose sum is the blob; a
@@ -249,7 +249,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Loaded {
             // A new turn closes the previous one's image list.
             if (out.items.len > 0) out.items[out.items.len - 1].images = try imgs.toOwnedSlice(a);
             const rest = hl["turn ".len..];
-            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadHeader;
+            const sp = std.mem.findScalar(u8, rest, ' ') orelse return error.BadHeader;
             const tag = rest[0..sp];
             const is_note = std.mem.eql(u8, tag, "note");
             const role: Role = if (is_note or std.mem.eql(u8, tag, "user")) .user else .assistant;
@@ -324,7 +324,7 @@ pub fn groupOf(updated_ms: i64, now_ms: i64, tz_offset_s: i64) Group {
 /// platforms this degrades to UTC-day grouping rather than pulling in a
 /// timezone database.
 pub fn localOffsetSeconds(now_s: i64) i64 {
-    if (@import("builtin").os.tag == .windows) return 0;
+    if (@import("builtin").target.os.tag == .windows) return 0;
     if (!@hasDecl(std.c, "localtime_r")) return 0;
     var t: std.c.time_t = @intCast(now_s);
     var tm: std.c.tm = undefined;
@@ -339,7 +339,7 @@ pub fn titleFrom(buf: []u8, turns: []const Turn) []const u8 {
         if (t.role != .user) continue;
         const s = std.mem.trim(u8, t.text, " \t\r\n");
         if (s.len == 0) continue;
-        const line = s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
+        const line = s[0 .. std.mem.findScalar(u8, s, '\n') orelse s.len];
         const n = @min(line.len, buf.len);
         // Never cut a UTF-8 sequence in half: back up to a boundary.
         var end = n;
@@ -397,7 +397,7 @@ pub const Store = struct {
             if (ent.kind != .file) continue;
             if (!std.mem.endsWith(u8, ent.name, ".tpc")) continue;
             const id = std.fmt.parseInt(u64, ent.name[0 .. ent.name.len - 4], 10) catch continue;
-            const path = std.fmt.bufPrint(&namebuf, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
+            const path = std.mem.print(&namebuf, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
             const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, max_file_bytes) catch continue;
             defer gpa.free(bytes);
             const h = parseHeader(gpa, bytes) catch |err| {
@@ -438,7 +438,7 @@ pub const Store = struct {
         write(&aw.writer, title, now, turns) catch return;
 
         var namebuf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&namebuf, "{s}/{d}.tpc", .{ dir_path, self.current }) catch return;
+        const path = std.mem.print(&namebuf, "{s}/{d}.tpc", .{ dir_path, self.current }) catch return;
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.writer.buffered() }) catch |err| {
             std.log.warn("history: save failed: {t}", .{err});
             return;
@@ -487,7 +487,7 @@ pub const Store = struct {
     pub fn load(self: *Store, gpa: std.mem.Allocator, io: std.Io, id: u64) ?Loaded {
         const dir_path = self.dir orelse return null;
         var namebuf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&namebuf, "{s}/{d}.tpc", .{ dir_path, id }) catch return null;
+        const path = std.mem.print(&namebuf, "{s}/{d}.tpc", .{ dir_path, id }) catch return null;
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, max_file_bytes) catch |err| {
             std.log.warn("history: cannot read conversation {d}: {t}", .{ id, err });
             return null;
@@ -502,7 +502,7 @@ pub const Store = struct {
     pub fn remove(self: *Store, gpa: std.mem.Allocator, io: std.Io, id: u64) void {
         const dir_path = self.dir orelse return;
         var namebuf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&namebuf, "{s}/{d}.tpc", .{ dir_path, id })) |path| {
+        if (std.mem.print(&namebuf, "{s}/{d}.tpc", .{ dir_path, id })) |path| {
             std.Io.Dir.cwd().deleteFile(io, path) catch |err| std.log.warn("history: delete failed: {t}", .{err});
         } else |_| {}
         for (self.entries.items, 0..) |e, i| {

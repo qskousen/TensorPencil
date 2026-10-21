@@ -1808,9 +1808,9 @@ test "matmul q2_0 on both paths, both block sizes" {
 test "quantGemvBatch refuses under exact_activations, so its caller keeps f32" {
     if (!have_ggml) return error.SkipZigTest;
     const dt: DType = .q4_k;
-    var w = [_]u8{0} ** (8 * 144);
-    var x = [_]f32{0} ** 256;
-    var y = [_]f32{0} ** 8;
+    var w: [(8 * 144)]u8 = @splat(0);
+    var x: [256]f32 = @splat(0);
+    var y: [8]f32 = @splat(0);
     const jobs = [_]BatchGemv{.{ .y = &y, .x = &x, .w = &w }};
     const prev = exact_activations;
     defer exact_activations = prev;

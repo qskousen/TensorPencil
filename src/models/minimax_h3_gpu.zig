@@ -150,8 +150,8 @@ pub const Workspace = struct {
 
     pub fn deinit(self: *Workspace, ctx: *Context) void {
         if (self.lin) |*l| l.deinit();
-        inline for (@typeInfo(Workspace).@"struct".fields) |f| {
-            if (f.type == Buf) ctx.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Workspace).@"struct".field_names, @typeInfo(Workspace).@"struct".field_types) |name, FieldType| {
+            if (FieldType == Buf) ctx.tensorDestroy(&@field(self, name));
         }
     }
 };

@@ -298,7 +298,7 @@ pub const ImageMeta = struct {
     }
 
     fn setActs(self: *ImageMeta, a: pipeline.precision.Acts) void {
-        const text = std.fmt.bufPrint(&self.act_buf, "{f}", .{a}) catch return;
+        const text = std.mem.print(&self.act_buf, "{f}", .{a}) catch return;
         self.act_len.store(@intCast(text.len), .release);
     }
 
@@ -319,7 +319,7 @@ pub const GenImage = struct {
     prompt: []u8, // owned (gpa)
     /// See `ImageMeta`. Empty until the worker starts this image.
     meta: ImageMeta = .{},
-    status: std.atomic.Value(u8) = .init(@intFromEnum(GenStatus.pending)),
+    status: std.atomic.Value(u8) = .init(@backingInt(GenStatus.pending)),
     step: std.atomic.Value(u32) = .init(0),
     total: std.atomic.Value(u32) = .init(0),
     rgba: ?[]u8 = null, // interleaved RGBA, [h][w][4]; gpa-owned
@@ -387,7 +387,7 @@ pub const GenImage = struct {
     resume_snapshot: ?pipeline.Snapshot = null,
 
     pub fn get(self: *const GenImage) GenStatus {
-        return @enumFromInt(self.status.load(.acquire));
+        return @fromBackingInt(@intCast(self.status.load(.acquire)));
     }
 
     /// Why this image failed, or null if it did not (or has not yet).
@@ -401,7 +401,7 @@ pub const GenImage = struct {
     /// would let it read a fresh `.failed` beside a stale (zero) reason.
     pub fn fail(self: *GenImage, err: anyerror) void {
         self.gen_error.store(@intFromError(err), .release);
-        self.status.store(@intFromEnum(GenStatus.failed), .release);
+        self.status.store(@backingInt(GenStatus.failed), .release);
     }
 };
 
@@ -518,14 +518,14 @@ pub const VramCoordinator = struct {
 /// `attrs` is either the `<image ...>` tag's `key=value` list or a native K2
 /// tool-call body (see shared/toolcall.zig), whose arg pairs carry the same keys.
 pub fn parseGenAttrs(attrs: []const u8, gi: *GenImage) void {
-    if (std.mem.indexOf(u8, attrs, "<ifm|arg_key>") != null) {
+    if (std.mem.find(u8, attrs, "<ifm|arg_key>") != null) {
         var it = tool_call.k2Args(attrs);
         while (it.next()) |arg| applyGenAttr(arg.key, std.mem.trim(u8, arg.value, " \t\r\n\"'"), gi);
         return;
     }
     var it = std.mem.tokenizeAny(u8, attrs, " \t");
     while (it.next()) |tok| {
-        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, tok, '=') orelse continue;
         applyGenAttr(tok[0..eq], std.mem.trim(u8, tok[eq + 1 ..], "\"'"), gi);
     }
 }
@@ -549,8 +549,8 @@ pub fn nowNs(io: std.Io) i64 {
 
 /// The file stem of a path (basename minus final extension), the a1111 "Model".
 pub fn modelStem(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+    const base = std.Io.Dir.path.basename(path);
+    return if (std.mem.findScalarLast(u8, base, '.')) |dot| base[0..dot] else base;
 }
 
 /// The diffusion engine. Compose one per driver (chat / studio); at most one is
@@ -778,7 +778,7 @@ pub const Diffuser = struct {
     pub fn drop(self: *Diffuser, id: ImageId) bool {
         const gi = self.byId(id) orelse return false;
         if (!terminal(gi.get())) return false;
-        const at = std.mem.indexOfScalar(*GenImage, self.queue.items, gi) orelse return false;
+        const at = std.mem.findScalar(*GenImage, self.queue.items, gi) orelse return false;
         _ = self.queue.orderedRemove(at);
         freeGenImage(self.gpa, gi);
         return true;
@@ -837,10 +837,10 @@ pub const Diffuser = struct {
         const before: ?*GenImage = if (before_id) |b| self.byId(b) orelse return else null;
         if (move.get() != .pending) return;
         if (before) |b| if (b == move or b.get() != .pending) return;
-        const from = std.mem.indexOfScalar(*GenImage, self.queue.items, move) orelse return;
+        const from = std.mem.findScalar(*GenImage, self.queue.items, move) orelse return;
         _ = self.queue.orderedRemove(from);
         const to = if (before) |b|
-            (std.mem.indexOfScalar(*GenImage, self.queue.items, b) orelse self.queue.items.len)
+            (std.mem.findScalar(*GenImage, self.queue.items, b) orelse self.queue.items.len)
         else
             self.queue.items.len;
         self.queue.insert(self.gpa, to, move) catch {
@@ -899,7 +899,7 @@ pub const Diffuser = struct {
             const st = gi.get();
             if (st != .pending and st != .suspended) continue;
             if (gi.cancel.load(.acquire)) {
-                gi.status.store(@intFromEnum(GenStatus.canceled), .release);
+                gi.status.store(@backingInt(GenStatus.canceled), .release);
                 if (gi.resume_snapshot) |*s| { // dropping a suspended image: free its state
                     s.deinit(self.gpa);
                     gi.resume_snapshot = null;
@@ -974,7 +974,7 @@ pub const Diffuser = struct {
     }
 
     fn putNotice(self: *Diffuser, comptime fmt: []const u8, args: anytype) void {
-        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        const text = self.gpa.print(fmt, args) catch return;
         self.notice_mu.lockUncancelable(self.io);
         if (self.notice) |old| self.gpa.free(old);
         self.notice = text;
@@ -1116,7 +1116,7 @@ pub const Diffuser = struct {
     /// Architecture of the resident pipeline; null when nothing is loaded.
     pub fn loadedFamily(self: *const Diffuser) ?pipeline.Family {
         const v = self.loaded_family.load(.acquire);
-        return if (v == 0) null else @enumFromInt(v - 1);
+        return if (v == 0) null else @fromBackingInt(@intCast(v - 1));
     }
 
     pub fn deinit(self: *Diffuser) void {
@@ -1355,7 +1355,7 @@ pub const Diffuser = struct {
         // copied out under the lock and statted outside it. Declining rather
         // than blocking is this engine's rule for a foreign caller, and erring
         // low is the safe direction (see above).
-        var buf: [2][std.fs.max_path_bytes]u8 = undefined;
+        var buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
         var paths: [2][]const u8 = .{ "", "" };
         {
             if (!self.res_mu.tryLock()) return 0;
@@ -1436,7 +1436,7 @@ pub const Diffuser = struct {
         self.preview_method = method;
         // config.Preview values match pipeline's method encoding (0=none,
         // 1=latent2rgb, 2=taesd).
-        self.live_preview.method.store(@intFromEnum(method), .release);
+        self.live_preview.method.store(@backingInt(method), .release);
         self.refreshPreview();
     }
 
@@ -1529,7 +1529,7 @@ pub const Diffuser = struct {
         const t_load = nowNs(self.io);
         const sess = try pipeline.Session.init(self.io, self.gpa, opts, progress);
         self.load_error.store(0, .release);
-        self.loaded_family.store(@as(u8, @intFromEnum(sess.family())) + 1, .release);
+        self.loaded_family.store(@as(u8, @backingInt(sess.family())) + 1, .release);
         std.log.info("[vram] diffusion model loaded in {d:.1}s ({t}): {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
             @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9, sess.family(),
             sess.deviceUsed() >> 20, opts.vram_budget >> 20, sess.freeVram() >> 20,
@@ -1664,7 +1664,7 @@ pub const Diffuser = struct {
         // it is set on this thread, not the evicting one).
         self.res_mu.lockUncancelable(self.io);
         defer self.res_mu.unlock(self.io);
-        gi.status.store(@intFromEnum(GenStatus.generating), .release);
+        gi.status.store(@backingInt(GenStatus.generating), .release);
         self.busy.store(true, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{ self, gi }) catch |err| {
             gi.fail(err);
@@ -1825,13 +1825,13 @@ pub const Diffuser = struct {
             if (err == error.Paused) {
                 if (gi.resume_snapshot) |*old| old.deinit(self.gpa); // replace any prior
                 gi.resume_snapshot = suspend_snap;
-                gi.status.store(@intFromEnum(GenStatus.suspended), .release);
+                gi.status.store(@backingInt(GenStatus.suspended), .release);
                 self.busy.store(false, .release);
                 self.wake();
                 return;
             }
             if (err == error.Canceled) {
-                gi.status.store(@intFromEnum(GenStatus.canceled), .release);
+                gi.status.store(@backingInt(GenStatus.canceled), .release);
             } else {
                 std.log.err("image generation failed: {t}", .{err});
                 if (err == error.NonFiniteActivation) if (sess.?.last_failure) |f| self.putNotice("{f}; the render failed (its precision setting allows no wider dtype)", .{f});
@@ -1873,7 +1873,7 @@ pub const Diffuser = struct {
         gi.rgba = rgba;
         gi.width = img.width;
         gi.height = img.height;
-        gi.status.store(@intFromEnum(GenStatus.done), .release);
+        gi.status.store(@backingInt(GenStatus.done), .release);
         self.busy.store(false, .release);
         self.wake();
     }
@@ -2046,9 +2046,9 @@ test "loadError/loadedFamily round-trip through their atomic encodings" {
     // 0 is reserved for "nothing loaded", so the tag is stored offset by one,
     // without that, family 0 (krea2) would read back as "no model". Every family
     // must survive the round trip, including any added later.
-    inline for (@typeInfo(pipeline.Family).@"enum".fields) |f| {
-        const fam: pipeline.Family = @enumFromInt(f.value);
-        d.loaded_family.store(@as(u8, @intFromEnum(fam)) + 1, .release);
+    inline for (@typeInfo(pipeline.Family).@"enum".field_values) |value| {
+        const fam: pipeline.Family = @fromBackingInt(value);
+        d.loaded_family.store(@as(u8, @backingInt(fam)) + 1, .release);
         try std.testing.expectEqual(@as(?pipeline.Family, fam), d.loadedFamily());
     }
 }
@@ -2116,7 +2116,7 @@ test "only a finished image drops, and its id then names nothing" {
         fn f(dd: *Diffuser, st: GenStatus) !*GenImage {
             const gi = try dd.gpa.create(GenImage);
             gi.* = .{ .prompt = try dd.gpa.dupe(u8, "p"), .wake = nop, .io = std.testing.io };
-            gi.status = .init(@intFromEnum(st));
+            gi.status = .init(@backingInt(st));
             try dd.enqueue(gi);
             return gi;
         }
@@ -2157,7 +2157,7 @@ test "the terminal cap sheds oldest-first and never touches live work" {
     for (0..Diffuser.max_terminal + extra) |i| {
         const gi = try gpa.create(GenImage);
         gi.* = .{ .prompt = try gpa.dupe(u8, "t"), .wake = nop, .io = std.testing.io };
-        gi.status = .init(@intFromEnum(GenStatus.done));
+        gi.status = .init(@backingInt(GenStatus.done));
         try d.enqueue(gi);
         if (i == extra) first_kept = gi.id;
     }
@@ -2244,22 +2244,22 @@ test "every render-recipe field survives the round trip through Options" {
     var steer_scratch: [wire.max_steers]pipeline.CondNoise.Steer = @splat(.{});
     params.applyTo(&dst, &steer_scratch);
 
-    inline for (@typeInfo(RenderParams).@"struct".fields) |f| {
+    inline for (@typeInfo(RenderParams).@"struct".field_names) |name| {
         // The conditioning-noise group lives under `Options.cond_noise` rather
         // than at the top level, so it is walked separately just below.
-        if (comptime std.mem.startsWith(u8, f.name, "cond_noise")) continue;
-        if (comptime std.mem.startsWith(u8, f.name, "steer")) continue;
+        if (comptime std.mem.startsWith(u8, name, "cond_noise")) continue;
+        if (comptime std.mem.startsWith(u8, name, "steer")) continue;
         // `act_*` lives under `Options.act_steer`, and `act_dirs` is a PATH with no
         // counterpart there at all: the worker reads the file and fills in `dirs`.
-        if (comptime std.mem.startsWith(u8, f.name, "act_")) continue;
-        errdefer std.debug.print("field {s} did not survive\n", .{f.name});
-        try std.testing.expectEqual(@field(src, f.name), @field(dst, f.name));
+        if (comptime std.mem.startsWith(u8, name, "act_")) continue;
+        errdefer std.debug.print("field {s} did not survive\n", .{name});
+        try std.testing.expectEqual(@field(src, name), @field(dst, name));
     }
     // Walked off `CondNoise` itself, so a knob added THERE and forgotten in
     // `RenderParams` fails here too, not just one added to `RenderParams`.
-    inline for (@typeInfo(pipeline.CondNoise).@"struct".fields) |f| {
-        errdefer std.debug.print("cond_noise.{s} did not survive\n", .{f.name});
-        try std.testing.expectEqualDeep(@field(src.cond_noise, f.name), @field(dst.cond_noise, f.name));
+    inline for (@typeInfo(pipeline.CondNoise).@"struct".field_names) |name| {
+        errdefer std.debug.print("cond_noise.{s} did not survive\n", .{name});
+        try std.testing.expectEqualDeep(@field(src.cond_noise, name), @field(dst.cond_noise, name));
     }
     // The activation knobs the wire DOES carry. `dirs` and `curve_at` are absent by
     // design: they come from the file the path names, which `applyTo` cannot read.

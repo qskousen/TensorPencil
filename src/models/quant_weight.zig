@@ -67,7 +67,7 @@ pub fn nvfp4(
     cols: usize,
 ) !?Weight {
     var buf: [256]u8 = undefined;
-    const g_name = std.fmt.bufPrint(&buf, "{s}_scale_2", .{name}) catch return null;
+    const g_name = std.mem.print(&buf, "{s}_scale_2", .{name}) catch return null;
     const gv = store.get(g_name) orelse return null;
 
     const view = store.get(name) orelse return error.MissingTensor;
@@ -85,7 +85,7 @@ pub fn nvfp4(
     }
 
     var sbuf: [256]u8 = undefined;
-    const s_name = std.fmt.bufPrint(&sbuf, "{s}_scale", .{name}) catch return error.ShapeMismatch;
+    const s_name = std.mem.print(&sbuf, "{s}_scale", .{name}) catch return error.ShapeMismatch;
     const sv = store.get(s_name) orelse {
         std.log.err("nvfp4: {s} has a per-tensor scale but no {s}", .{ name, s_name });
         return error.MissingTensor;
@@ -127,7 +127,7 @@ pub fn nvfp4(
 /// sidecar whose name is not `<weight><suffix>`.
 fn quantConfName(buf: []u8, name: []const u8) ![]u8 {
     const base = if (std.mem.endsWith(u8, name, ".weight")) name[0 .. name.len - ".weight".len] else name;
-    return std.fmt.bufPrint(buf, "{s}.comfy_quant", .{base});
+    return std.mem.print(buf, "{s}.comfy_quant", .{base});
 }
 
 /// The dequant metadata of a ComfyUI `int8_tensorwise` layer: a scale per output row and
@@ -190,7 +190,7 @@ pub fn int8Scale(
     cols: usize,
 ) !Int8Meta {
     var buf: [256]u8 = undefined;
-    const s_name = try std.fmt.bufPrint(&buf, "{s}_scale", .{name});
+    const s_name = try std.mem.print(&buf, "{s}_scale", .{name});
     const sv = store.get(s_name) orelse {
         std.log.err("int8: {s} is int8 but has no {s}", .{ name, s_name });
         return error.MissingTensor;
@@ -220,7 +220,7 @@ pub fn int8Scale(
 /// different format under the same name, so it is refused rather than guessed at.
 fn fp8Scale(store: WeightStore, name: []const u8, who: []const u8) !f32 {
     var buf: [256]u8 = undefined;
-    const s_name = std.fmt.bufPrint(&buf, "{s}_scale", .{name}) catch return 1.0;
+    const s_name = std.mem.print(&buf, "{s}_scale", .{name}) catch return 1.0;
     const sv = store.get(s_name) orelse return 1.0;
     const n = sv.info.elemCount();
     if (n != 1) {
@@ -347,7 +347,7 @@ pub fn w4a8(
     cols: usize,
 ) !?Weight {
     var nbuf: [288]u8 = undefined;
-    const sr_name = std.fmt.bufPrint(&nbuf, "{s}_s_rel", .{name}) catch return null;
+    const sr_name = std.mem.print(&nbuf, "{s}_s_rel", .{name}) catch return null;
     const sv = store.get(sr_name) orelse return null;
 
     const view = store.get(name) orelse return error.MissingTensor;
@@ -406,7 +406,7 @@ pub fn w4a8(
         return error.UnsupportedCheckpoint;
     }
 
-    const sc_name = try std.fmt.bufPrint(&nbuf, "{s}_s_channel", .{name});
+    const sc_name = try std.mem.print(&nbuf, "{s}_s_channel", .{name});
     const scv = store.get(sc_name) orelse {
         std.log.err("w4a8: {s} has a W4A8 group scale but no {s}", .{ name, sc_name });
         return error.MissingTensor;
@@ -423,7 +423,7 @@ pub fn w4a8(
     // decodes to the uniform `q - 8` levels instead.
     var cb_store: [16]f32 = undefined;
     var codebook: ?*const [16]f32 = null;
-    if (store.get(try std.fmt.bufPrint(&nbuf, "{s}_codebook", .{name}))) |cv| {
+    if (store.get(try std.mem.print(&nbuf, "{s}_codebook", .{name}))) |cv| {
         // The 6-bit levels are uniform by construction; a table there is a writer bug.
         if (six) {
             std.log.err("w4a8: {s} is 6-bit, which has no codebook, yet ships one", .{name});
@@ -617,7 +617,7 @@ test "an NVFP4 layer of each real checkpoint decodes to comfy_kitchen's weight" 
             // is gitignored, so these are a local convenience, a family without one
             // skips rather than failing.
             for ([_][]const u8{ "models/diffusion_model/", "models/anima/", "models/zit/", "models/" }) |root| {
-                const p = std.fmt.bufPrint(&pbuf, "{s}{s}", .{ root, L.checkpoint }) catch continue;
+                const p = std.mem.print(&pbuf, "{s}{s}", .{ root, L.checkpoint }) catch continue;
                 std.Io.Dir.cwd().access(io, p, .{}) catch continue;
                 break :blk p;
             }
@@ -634,8 +634,8 @@ test "an NVFP4 layer of each real checkpoint decodes to comfy_kitchen's weight" 
         // The fixture records the LAYER base; the tensors hang off `<layer>.weight`.
         var nbuf: [256]u8 = undefined;
         var sbuf2: [256]u8 = undefined;
-        const wn = try std.fmt.bufPrint(&nbuf, "{s}.weight", .{L.layer});
-        const sn = try std.fmt.bufPrint(&sbuf2, "{s}_scale", .{wn});
+        const wn = try std.mem.print(&nbuf, "{s}.weight", .{L.layer});
+        const sn = try std.mem.print(&sbuf2, "{s}_scale", .{wn});
         try std.testing.expectEqual(L.packed_fnv1a64, fnv1a64((try store.require(wn)).bytes));
         try std.testing.expectEqual(L.scale_fnv1a64, fnv1a64((try store.require(sn)).bytes));
 
@@ -677,7 +677,7 @@ test "nvfp4 returns null for a layer that is not nvfp4, and errors on a broken o
     ;
     try buf.appendSlice(gpa, &std.mem.toBytes(@as(u64, hdr.len)));
     try buf.appendSlice(gpa, hdr);
-    try buf.appendSlice(gpa, &[_]u8{0} ** 8);
+    try buf.appendSlice(gpa, &@as([8]u8, @splat(0)));
     var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
     defer st.deinit();
     try std.testing.expectEqual(@as(?Weight, null), try nvfp4(gpa, .{ .safetensors = &st }, "w", 2, 2));

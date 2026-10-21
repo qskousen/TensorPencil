@@ -230,7 +230,7 @@ const L = struct {
 
     fn view(s: L, comptime fmt: []const u8, args: anytype) !weights_mod.TensorView {
         var buf: [160]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         return s.store.get(nm) orelse {
             std.log.err("minimax_h3_vit: missing tensor {s}", .{nm});
             return error.MissingTensor;
@@ -995,7 +995,7 @@ test "multimodal rope positions and frequencies match the reference" {
 
     for (cases) |c| {
         var buf: [48]u8 = undefined;
-        const want_pos = try (store.get(try std.fmt.bufPrint(&buf, "pos.{s}", .{c.name})) orelse
+        const want_pos = try (store.get(try std.mem.print(&buf, "pos.{s}", .{c.name})) orelse
             return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(want_pos);
 
@@ -1015,10 +1015,10 @@ test "multimodal rope positions and frequencies match the reference" {
         // ...and the frequency table those positions produce.
         var freqs = try ops.rope.mropeInterleavedFreqs(gpa, pos, c.seq, head_dim, dims, theta);
         defer freqs.deinit(gpa);
-        const want_cos = try (store.get(try std.fmt.bufPrint(&buf, "cos.{s}", .{c.name})) orelse
+        const want_cos = try (store.get(try std.mem.print(&buf, "cos.{s}", .{c.name})) orelse
             return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(want_cos);
-        const want_sin = try (store.get(try std.fmt.bufPrint(&buf, "sin.{s}", .{c.name})) orelse
+        const want_sin = try (store.get(try std.mem.print(&buf, "sin.{s}", .{c.name})) orelse
             return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(want_sin);
         try testing.expectEqual(want_cos.len, freqs.cos.len);
@@ -1230,7 +1230,7 @@ test "the resize samples pixel centres, not corners" {
     //
     // A 2 -> 4 upscale of [0, 1] makes the difference visible: centres give
     // 0, 0.25, 0.75, 1 (the ends CLAMP), corners give 0, 1/3, 2/3, 1.
-    var src = [_]f32{ 0, 1 } ** 3; // three channels of [0, 1]
+    var src = [_]f32{ 0, 1, 0, 1, 0, 1 }; // three channels of [0, 1]
     var dst: [3 * 1 * 4]f32 = undefined;
     resizeBilinear(&dst, &src, 1, 2, 1, 4);
     try testing.expectApproxEqAbs(@as(f32, 0.0), dst[0], 1e-6);
@@ -1303,7 +1303,7 @@ test "the vision tower matches the reference, deepstack included" {
 
     for (0..cfg.n_deepstack) |i| {
         var buf: [32]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, "out.deepstack.{d}", .{i});
+        const nm = try std.mem.print(&buf, "out.deepstack.{d}", .{i});
         const dw = try (store.get(nm) orelse return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(dw);
         const rel = relL2(dw, got.deepstack[i]);

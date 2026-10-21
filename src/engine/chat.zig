@@ -210,7 +210,7 @@ fn imageTools(images_enabled: bool) ?[]const chat_template.Tool {
 /// returned slice.
 fn composeSystemText(gpa: std.mem.Allocator, images_enabled: bool, base: []const u8) ![]u8 {
     if (images_enabled and !nativeImageTool())
-        return std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ base, image_tool_prompt });
+        return gpa.print("{s}\n\n{s}", .{ base, image_tool_prompt });
     return gpa.dupe(u8, base);
 }
 
@@ -827,8 +827,8 @@ pub const Session = struct {
 
         // The file stem, stamped onto every turn this session generates so a
         // mixed-model conversation stays legible after a swap or a reload.
-        const base = std.fs.path.basename(cfg.model_path);
-        self.model_name = try arena.dupe(u8, base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len]);
+        const base = std.Io.Dir.path.basename(cfg.model_path);
+        self.model_name = try arena.dupe(u8, base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len]);
 
         self.gguf = try Gguf.open(arena, io, cfg.model_path);
         errdefer self.gguf.deinit();
@@ -1493,7 +1493,7 @@ pub const Session = struct {
         for (tags, 0..) |v, i| {
             if (v == 0) continue;
             named += v;
-            const t: device.MemTag = @enumFromInt(i);
+            const t: device.MemTag = @fromBackingInt(@intCast(i));
             w.print("{s} {d} + ", .{ t.name(), v >> 20 }) catch break;
         }
         return .{ .text = w.buffered(), .named = named };
@@ -1865,7 +1865,7 @@ pub const Session = struct {
         const gi = try self.gpa.create(GenImage);
         gi.* = .{ .id = diffuser.nextImageId(), .prompt = try self.gpa.dupe(u8, ""), .wake = self.wake, .io = self.io, .width = w, .height = h };
         gi.rgba = try rgbToRgba(self.gpa, rgb, w, h);
-        gi.status = .init(@intFromEnum(GenStatus.done));
+        gi.status = .init(@backingInt(GenStatus.done));
         try self.attach_view.append(self.gpa, gi);
         try self.attach_rgb.append(self.gpa, .{ .rgb = rgb, .width = w, .height = h });
         self.wake();

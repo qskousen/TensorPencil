@@ -84,7 +84,7 @@ pub const Remote = struct {
     pub fn spawn(gpa: std.mem.Allocator, io: Io, socket_path: []const u8, extra: []const []const u8, on_out: *const fn () void) !*Remote {
         const dir = try std.process.executableDirPathAlloc(io, gpa);
         defer gpa.free(dir);
-        const exe = try std.fs.path.join(gpa, &.{ dir, "tp-serve" });
+        const exe = try std.Io.Dir.path.join(gpa, &.{ dir, "tp-serve" });
         defer gpa.free(exe);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);

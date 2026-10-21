@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
+const strings = @import("strings.zig");
 const prompt_a1111 = @import("prompt_a1111.zig");
 const prompt_weights = @import("prompt_weights.zig");
 
@@ -126,8 +127,8 @@ pub const Tokenizer = struct {
             while (lines.next()) |raw| {
                 const line = std.mem.trimEnd(u8, raw, "\r");
                 if (line.len == 0 or line[0] == '#') continue; // "#version: 0.2"
-                const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-                const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ line[0..sp], line[sp + 1 ..] });
+                const sp = std.mem.findScalar(u8, line, ' ') orelse continue;
+                const key = try alloc.print("{s}\x00{s}", .{ line[0..sp], line[sp + 1 ..] });
                 try ranks.put(alloc, key, rank);
                 rank += 1;
             }
@@ -390,7 +391,7 @@ pub const Tokenizer = struct {
                 i = end;
             }
             const last = syms.items[syms.items.len - 1];
-            syms.items[syms.items.len - 1] = try std.fmt.allocPrint(alloc, "{s}</w>", .{last});
+            syms.items[syms.items.len - 1] = try alloc.print("{s}</w>", .{last});
         }
 
         // Repeatedly merge the lowest-ranked adjacent pair. O(len²) in the worst
@@ -412,7 +413,7 @@ pub const Tokenizer = struct {
                 }
             }
             const at = best_at orelse break;
-            const merged = try std.fmt.allocPrint(alloc, "{s}{s}", .{ syms.items[at], syms.items[at + 1] });
+            const merged = try alloc.print("{s}{s}", .{ syms.items[at], syms.items[at + 1] });
             syms.items[at] = merged;
             _ = syms.orderedRemove(at + 1);
         }
@@ -521,7 +522,7 @@ const WordIterator = struct {
                 }
             }
             const one = "stmd";
-            if (rest.len >= 1 and std.mem.indexOfScalar(u8, one, std.ascii.toLower(rest[0])) != null) {
+            if (rest.len >= 1 and std.mem.findScalar(u8, one, std.ascii.toLower(rest[0])) != null) {
                 try self.emit(gpa, &out, self.pos, self.pos + 2);
                 self.pos += 2;
                 return try out.toOwnedSlice(gpa);
@@ -565,7 +566,7 @@ const WordIterator = struct {
     fn decode(self: *const WordIterator, at: usize) !Decoded {
         const len = std.unicode.utf8ByteSequenceLength(self.text[at]) catch return .{ .cp = self.text[at], .len = 1 };
         if (at + len > self.text.len) return .{ .cp = self.text[at], .len = 1 };
-        const cp = std.unicode.utf8Decode(self.text[at..][0..len]) catch return .{ .cp = self.text[at], .len = 1 };
+        const cp = strings.utf8DecodeSequence(self.text[at..][0..len]) catch return .{ .cp = self.text[at], .len = 1 };
         return .{ .cp = cp, .len = len };
     }
 
@@ -748,7 +749,7 @@ test "a long prompt keeps every token instead of truncating at one chunk" {
     defer p.deinit(gpa);
 
     const unicorn = tok.vocab.get("unicorn</w>").?;
-    try testing.expect(std.mem.indexOfScalar(u32, truncated, unicorn) == null);
+    try testing.expect(std.mem.findScalar(u32, truncated, unicorn) == null);
     var found = false;
     for (p.tokens) |t| if (t.id == unicorn) {
         found = true;

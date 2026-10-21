@@ -95,7 +95,7 @@ pub fn familyKey(fam: Family) []const u8 {
 /// "gemma4|5376": what a vision tower has to match, so the memory is per width,
 /// not per file.
 pub fn classKey(buf: []u8, l: catalog.Llm) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}|{d}", .{ l.arch, l.width }) catch buf[0..0];
+    return std.mem.print(buf, "{s}|{d}", .{ l.arch, l.width }) catch buf[0..0];
 }
 
 // ── Diffusion ───────────────────────────────────────────────────────────────
@@ -380,7 +380,7 @@ const testing = std.testing;
 fn loraEntry(path: []const u8, fam: Family) catalog.Entry {
     var e: catalog.Entry = .{ .path = path, .size = 1, .mtime_ns = 1 };
     e.lora = .{ .info = .{ .targets = 294, .rank = 128, .depth = 42 } };
-    e.lora.?.fams[@intFromEnum(fam)] = true;
+    e.lora.?.fams[@backingInt(fam)] = true;
     return e;
 }
 
@@ -477,7 +477,7 @@ fn sideEntry(path: []const u8, fits: []const struct { Family, Component }) catal
 
 fn previewEntry(path: []const u8, fams: []const Family) catalog.Entry {
     var e: catalog.Entry = .{ .path = path, .size = 1, .mtime_ns = 1 };
-    for (fams) |f| e.preview.fams[@intFromEnum(f)] = true;
+    for (fams) |f| e.preview.fams[@backingInt(f)] = true;
     return e;
 }
 

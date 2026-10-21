@@ -41,7 +41,7 @@ pub fn indexedMatrix(
     cols: usize,
 ) !Weight {
     var buf: [128]u8 = undefined;
-    return matrix(store, try std.fmt.bufPrint(&buf, prefix ++ "{d}." ++ suffix, .{i}), rows, cols);
+    return matrix(store, try std.mem.print(&buf, prefix ++ "{d}." ++ suffix, .{i}), rows, cols);
 }
 
 /// A vector under an indexed block prefix (see `indexedMatrix`).
@@ -54,7 +54,7 @@ pub fn indexedVector(
     len: usize,
 ) ![]f32 {
     var buf: [128]u8 = undefined;
-    return vector(alloc, store, try std.fmt.bufPrint(&buf, prefix ++ "{d}." ++ suffix, .{i}), len);
+    return vector(alloc, store, try std.mem.print(&buf, prefix ++ "{d}." ++ suffix, .{i}), len);
 }
 
 // --- tests -----------------------------------------------------------------

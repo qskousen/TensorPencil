@@ -64,9 +64,9 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
         .min_size_content = .{ .h = L.title_h },
         .max_size_content = .height(L.title_h),
         .background = true,
-        .color_fill = C.chrome,
+        .color_fill = .{ .color = C.chrome },
         .border = style.Edge.bottom,
-        .color_border = style.hairline,
+        .color_border = .{ .color = style.hairline },
         .padding = .{ .x = 14, .w = 14 },
     });
     defer bar.deinit();
@@ -74,8 +74,8 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
     // No traffic lights and no app name: the mockup was imitating a macOS
     // window, and the real one has a title bar of its own saying TensorPencil.
     // The bar starts with the only thing here that is a control.
-    if (style.segmented(@src(), &.{ "Chat", "Studio" }, @intFromEnum(m.tab))) |i| {
-        cb.on_tab(@enumFromInt(i));
+    if (style.segmented(@src(), &.{ "Chat", "Studio" }, @backingInt(m.tab))) |i| {
+        cb.on_tab(@fromBackingInt(@intCast(i)));
     }
 
     // Right group. `gravity_x = 1` inside an expanded spacer is dvui's
@@ -100,13 +100,13 @@ pub fn titleBar(m: Title, cb: TitleActions) void {
     }
 }
 
-fn gearButton(src: std.builtin.SourceLocation) bool {
+fn gearButton(src: std.lang.SourceLocation) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .corner_radius = R.button,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .corners = R.button,
         .padding = dvui.Rect.all(6),
         .margin = .{ .x = 8 },
         .gravity_y = 0.5,
@@ -176,9 +176,9 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
         .min_size_content = .{ .w = L.sidebar_w - 2 * L.sidebar_pad - 1 },
         .max_size_content = .width(L.sidebar_w - 2 * L.sidebar_pad - 1),
         .background = true,
-        .color_fill = C.rail,
+        .color_fill = .{ .color = C.rail },
         .border = style.Edge.right,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .x = L.sidebar_pad, .y = 14, .w = L.sidebar_pad, .h = 14 },
     });
     defer col.deinit();
@@ -217,7 +217,7 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
         if (m.groups.len == 0) {
             dvui.labelNoFmt(@src(), m.empty, .{}, .{
                 .font = F.row,
-                .color_text = C.text_ghost,
+                .color_text = .{ .color = C.text_ghost },
                 .padding = .{ .x = 8, .y = 6 },
             });
         }
@@ -226,17 +226,17 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
     if (m.footer) footer(@src(), m.models_pct, cb);
 }
 
-fn newChatButton(src: std.builtin.SourceLocation, label: []const u8) bool {
+fn newChatButton(src: std.lang.SourceLocation, label: []const u8) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .expand = .horizontal,
         .background = true,
-        .color_fill = C.raised,
-        .color_fill_hover = C.raised.lighten(6),
-        .color_fill_press = C.raised.lighten(12),
+        .color_fill = .{ .color = C.raised },
+        .color_fill_hover = .{ .color = C.raised.lighten(6) },
+        .color_fill_press = .{ .color = C.raised.lighten(12) },
         .border = style.Edge.all,
-        .color_border = style.hairline_hi,
-        .corner_radius = R.panel,
+        .color_border = .{ .color = style.hairline_hi },
+        .corners = R.panel,
         .padding = dvui.Rect.all(9),
         .margin = .{},
     });
@@ -248,7 +248,7 @@ fn newChatButton(src: std.builtin.SourceLocation, label: []const u8) bool {
         style.mark(@src(), .plus, 11, C.text_hi, .{ .margin = .{ .w = 5 } });
         dvui.labelNoFmt(@src(), label, .{}, .{
             .font = F.row_hi,
-            .color_text = C.text_hi,
+            .color_text = .{ .color = C.text_hi },
             .padding = .{},
             .gravity_y = 0.5,
         });
@@ -267,7 +267,7 @@ fn newChatButton(src: std.builtin.SourceLocation, label: []const u8) bool {
 /// a row you were only trying to open.
 var arm_delete: ?u64 = null;
 
-fn convRow(src: std.builtin.SourceLocation, id_extra: usize, r: ConvRow, selected: bool, cb: SidebarActions) void {
+fn convRow(src: std.lang.SourceLocation, id_extra: usize, r: ConvRow, selected: bool, cb: SidebarActions) void {
     // A plain box, NOT a ButtonWidget: a button processes its events before its
     // children exist, so it would swallow the click meant for the ✕ inside it.
     // Here the row's own click is tested AFTER the children have had their turn.
@@ -282,8 +282,8 @@ fn convRow(src: std.builtin.SourceLocation, id_extra: usize, r: ConvRow, selecte
         .id_extra = id_extra,
         .expand = .horizontal,
         .background = selected or hovered,
-        .color_fill = if (selected) C.sel_row else style.over(C.rail, C.text_hi, 0.04),
-        .corner_radius = R.button,
+        .color_fill = .{ .color = if (selected) C.sel_row else style.over(C.rail, C.text_hi, 0.04) },
+        .corners = R.button,
         .padding = dvui.Rect.all(8),
         .margin = .{ .h = 3 },
     });
@@ -296,13 +296,13 @@ fn convRow(src: std.builtin.SourceLocation, id_extra: usize, r: ConvRow, selecte
         const avail = col.data().contentRect().w - (if (hovered or armed) @as(f32, 20) else 0);
         fonts.richLine(@src(), style.ellipsize(&tbuf, r.title, F.row, avail), .{
             .font = F.row,
-            .color_text = if (selected) C.text_hi else C.text_dim,
+            .color_text = .{ .color = if (selected) C.text_hi else C.text_dim },
             .padding = .{},
             .margin = .{},
         });
         if (selected) if (r.sub) |sub| dvui.labelNoFmt(@src(), sub, .{}, .{
             .font = F.mono_row,
-            .color_text = C.blue,
+            .color_text = .{ .color = C.blue },
             .padding = .{ .y = 2 },
         });
     }
@@ -316,10 +316,10 @@ fn convRow(src: std.builtin.SourceLocation, id_extra: usize, r: ConvRow, selecte
             .gravity_x = 1.0,
             .gravity_y = 0.5,
             .background = armed,
-            .color_fill = style.tint(C.danger, 60),
-            .color_fill_hover = style.tint(C.danger, 90),
-            .color_fill_press = style.tint(C.danger, 120),
-            .corner_radius = R.chip,
+            .color_fill = .{ .color = style.tint(C.danger, 60) },
+            .color_fill_hover = .{ .color = style.tint(C.danger, 90) },
+            .color_fill_press = .{ .color = style.tint(C.danger, 120) },
+            .corners = R.chip,
             .padding = dvui.Rect.all(3),
             .margin = .{},
         });
@@ -367,15 +367,15 @@ fn convRow(src: std.builtin.SourceLocation, id_extra: usize, r: ConvRow, selecte
     }
 }
 
-fn footer(src: std.builtin.SourceLocation, models_pct: ?f32, cb: SidebarActions) void {
+fn footer(src: std.lang.SourceLocation, models_pct: ?f32, cb: SidebarActions) void {
     var f = dvui.box(src, .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .gravity_y = 1.0,
         // The sidebar's surface; see queue_rail's tab strip for why.
         .background = true,
-        .color_fill = C.rail,
+        .color_fill = .{ .color = C.rail },
         .border = style.Edge.top,
-        .color_border = style.hairline_soft,
+        .color_border = .{ .color = style.hairline_soft },
         .padding = .{ .y = 10 },
     });
     defer f.deinit();
@@ -386,9 +386,9 @@ fn footer(src: std.builtin.SourceLocation, models_pct: ?f32, cb: SidebarActions)
         if (footerLabel(@src(), "Models")) cb.on_models();
         if (models_pct) |p| {
             var buf: [8]u8 = undefined;
-            dvui.labelNoFmt(@src(), std.fmt.bufPrint(&buf, "{d:.0}%", .{p * 100}) catch "", .{}, .{
+            dvui.labelNoFmt(@src(), std.mem.print(&buf, "{d:.0}%", .{p * 100}) catch "", .{}, .{
                 .font = F.mono,
-                .color_text = C.amber, // a download is the machine working
+                .color_text = .{ .color = C.amber }, // a download is the machine working
                 .gravity_x = 1.0,
                 .gravity_y = 0.5,
                 .padding = .{},
@@ -398,13 +398,13 @@ fn footer(src: std.builtin.SourceLocation, models_pct: ?f32, cb: SidebarActions)
     if (footerLabel(@src(), "Settings")) cb.on_settings();
 }
 
-fn footerLabel(src: std.builtin.SourceLocation, text: []const u8) bool {
+fn footerLabel(src: std.lang.SourceLocation, text: []const u8) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{
         .background = false,
-        .color_fill_hover = style.hover_wash,
-        .color_fill_press = style.hover_wash,
-        .corner_radius = R.button,
+        .color_fill_hover = .{ .color = style.hover_wash },
+        .color_fill_press = .{ .color = style.hover_wash },
+        .corners = R.button,
         .padding = .{ .x = 8, .y = 6, .w = 8, .h = 6 },
         .margin = .{},
     });
@@ -412,7 +412,7 @@ fn footerLabel(src: std.builtin.SourceLocation, text: []const u8) bool {
     bw.drawBackground();
     dvui.labelNoFmt(@src(), text, .{}, .{
         .font = F.row,
-        .color_text = C.text_dim,
+        .color_text = .{ .color = C.text_dim },
         .padding = .{},
         .gravity_y = 0.5,
     });

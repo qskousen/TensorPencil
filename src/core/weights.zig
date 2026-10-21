@@ -245,7 +245,7 @@ pub const Mix = struct {
     }
 
     pub fn layerOf(name: []const u8) []const u8 {
-        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+        const dot = std.mem.findScalarLast(u8, name, '.') orelse return name;
         return name[0..dot];
     }
 

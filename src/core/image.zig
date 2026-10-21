@@ -209,7 +209,7 @@ pub fn pngText(data: []const u8, keyword: []const u8) ?[]const u8 {
         if (body_start + len + 4 > data.len) return null;
         if (std.mem.eql(u8, ctype, "tEXt")) {
             const body = data[body_start..][0..len];
-            if (std.mem.indexOfScalar(u8, body, 0)) |nul| {
+            if (std.mem.findScalar(u8, body, 0)) |nul| {
                 if (std.mem.eql(u8, body[0..nul], keyword)) return body[nul + 1 ..];
             }
         }
@@ -574,7 +574,7 @@ test "tEXt metadata chunk is embedded after IHDR" {
 
     // Payload is "parameters\0<params>".
     const p = text_payload.?;
-    const nul = std.mem.indexOfScalar(u8, p, 0).?;
+    const nul = std.mem.findScalar(u8, p, 0).?;
     try std.testing.expectEqualStrings("parameters", p[0..nul]);
     try std.testing.expectEqualStrings(params, p[nul + 1 ..]);
 }
@@ -712,7 +712,7 @@ pub fn readTextChunks(gpa: std.mem.Allocator, data: []const u8) ![]TextChunk {
         if (std.mem.eql(u8, kind, "tEXt")) {
             const body = data[body_start .. body_start + len];
             // keyword \0 text, a chunk without the separator is malformed.
-            const nul = std.mem.indexOfScalar(u8, body, 0) orelse return error.InvalidPng;
+            const nul = std.mem.findScalar(u8, body, 0) orelse return error.InvalidPng;
             try out.append(gpa, .{ .keyword = body[0..nul], .text = body[nul + 1 ..] });
         } else if (std.mem.eql(u8, kind, "IEND")) {
             break;

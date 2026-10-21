@@ -461,7 +461,7 @@ fn countBlocks(store: WeightStore, comptime prefix: []const u8) usize {
     var n: usize = 0;
     while (true) : (n += 1) {
         var buf: [128]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, prefix ++ "{d}.norm1.weight", .{n}) catch return n;
+        const name = std.mem.print(&buf, prefix ++ "{d}.norm1.weight", .{n}) catch return n;
         if (store.get(name) == null) return n;
     }
 }
@@ -493,7 +493,7 @@ pub const Kind = enum {
 
     /// Number of kinds, so the per-kind tables below cannot fall out of step
     /// with this enum.
-    pub const count = @typeInfo(Kind).@"enum".fields.len;
+    pub const count = @typeInfo(Kind).@"enum".field_names.len;
 
     pub fn tag(self: Kind) Tag {
         return switch (self) {
@@ -1036,7 +1036,7 @@ pub const DiT = struct {
     /// fused weight applies to its own rows of each view).
     device_lins: []const Weight = &.{},
 
-    pub const lins_per_block = @typeInfo(DeviceLin).@"enum".fields.len;
+    pub const lins_per_block = @typeInfo(DeviceLin).@"enum".field_names.len;
     pub const DeviceLin = enum { q, k, v, out, gate, up, fc2 };
 
     /// Keep blocks `[lo, hi)` only, for a test that runs part of the trunk. The device
@@ -1048,7 +1048,7 @@ pub const DiT = struct {
 
     /// Block `bi`'s linear `which`, as the device trunks run it.
     pub fn deviceLin(self: *const DiT, bi: usize, which: DeviceLin) Weight {
-        return self.device_lins[bi * lins_per_block + @intFromEnum(which)];
+        return self.device_lins[bi * lins_per_block + @backingInt(which)];
     }
 
     pub fn deinit(self: *DiT) void {
@@ -1190,7 +1190,7 @@ const Loader = struct {
 
     fn name(l: Loader, buf: []u8, comptime fmt: []const u8, args: anytype, suffix: []const u8) ![]const u8 {
         _ = l;
-        const base = try std.fmt.bufPrint(buf, fmt, args);
+        const base = try std.mem.print(buf, fmt, args);
         if (suffix.len == 0) return base;
         // The scale sidecar's name is the weight's plus a suffix, so it has to be
         // appended after formatting rather than being a second format string.
@@ -1418,7 +1418,7 @@ pub const Timesteps = struct {
         if (video_mask.len > 0) {
             v_t = try rowTimesteps(gpa, video_mask, sigma_v, @max(t_v, visual_aug));
             if (allSame(v_t) and !force_row_labels) {
-                pk[@intFromEnum(Kind.video)] = v_t[0];
+                pk[@backingInt(Kind.video)] = v_t[0];
                 gpa.free(v_t);
                 v_t = &.{};
             }
@@ -1426,7 +1426,7 @@ pub const Timesteps = struct {
         if (audio_mask.len > 0) {
             a_t = try rowTimesteps(gpa, audio_mask, sigma_a, @max(t_a, audio_aug));
             if (allSame(a_t) and !force_row_labels) {
-                pk[@intFromEnum(Kind.audio)] = a_t[0];
+                pk[@backingInt(Kind.audio)] = a_t[0];
                 gpa.free(a_t);
                 a_t = &.{};
             }
@@ -1449,9 +1449,9 @@ pub const Timesteps = struct {
         const t_v: f32 = 1.0 - sigma_v;
         const t_a: f32 = 1.0 - shifts.audioSigma(sigma_v);
         var out: [Kind.count]f32 = undefined;
-        inline for (@typeInfo(Kind).@"enum".fields) |f| {
-            const k: Kind = @enumFromInt(f.value);
-            out[f.value] = switch (k) {
+        inline for (@typeInfo(Kind).@"enum".field_values) |value| {
+            const k: Kind = @fromBackingInt(value);
+            out[value] = switch (k) {
                 // text follows the VIDEO stream, not a label of its own, and a
                 // spliced vision block follows the text it sits in: same
                 // TIMESTEP, different modality TAG.
@@ -1522,7 +1522,7 @@ pub const Timesteps = struct {
     }
 
     pub fn rowFor(self: *const Timesteps, k: Kind) usize {
-        return self.row_of_kind[@intFromEnum(k)];
+        return self.row_of_kind[@backingInt(k)];
     }
 
     /// Per-row label indices for a segment, or empty when the segment is uniform.
@@ -1605,7 +1605,7 @@ pub fn maskRowValues(
 /// timestep and tag the other way round reads a real vector from the wrong place.
 pub fn modRowOffset(t_row: usize, tag: Tag, slot: usize, hidden: usize) usize {
     std.debug.assert(slot < 6);
-    return (t_row * modality_count + @intFromEnum(tag)) * 6 * hidden + slot * hidden;
+    return (t_row * modality_count + @backingInt(tag)) * 6 * hidden + slot * hidden;
 }
 
 /// Interpolate the time-embedding curve at each label.
@@ -2572,7 +2572,7 @@ test "denoise-mask row values and their timesteps match the reference" {
     for (cases) |c| {
         const name = c[0];
         var buf: [64]u8 = undefined;
-        const mv = try st.require(try std.fmt.bufPrint(&buf, "mask.{s}", .{name}));
+        const mv = try st.require(try std.mem.print(&buf, "mask.{s}", .{name}));
         const mask = try mv.toF32Alloc(gpa);
         defer gpa.free(mask);
         errdefer std.debug.print("case {s}\n", .{name});
@@ -2580,7 +2580,7 @@ test "denoise-mask row values and their timesteps match the reference" {
         const got = try maskRowValues(gpa, mask, latent_t, c[1], c[2], lat_h, lat_w);
         defer if (got) |g| gpa.free(g);
 
-        const wv = try st.require(try std.fmt.bufPrint(&buf, "rows.{s}", .{name}));
+        const wv = try st.require(try std.mem.print(&buf, "rows.{s}", .{name}));
         const want = try wv.toF32Alloc(gpa);
         defer gpa.free(want);
         if (want.len == 0) {
@@ -2604,7 +2604,7 @@ test "denoise-mask row values and their timesteps match the reference" {
         );
         defer ts.deinit(gpa);
 
-        const tv = try st.require(try std.fmt.bufPrint(&buf, "t.{s}", .{name}));
+        const tv = try st.require(try std.mem.print(&buf, "t.{s}", .{name}));
         const want_t = try tv.toF32Alloc(gpa);
         defer gpa.free(want_t);
 
@@ -3661,12 +3661,12 @@ test "adaLN modulation offset interleaves timestep outside tag" {
     const n_labels = 5;
     var disagreements: usize = 0;
     for (0..n_labels) |m| {
-        inline for (@typeInfo(Tag).@"enum".fields) |f| {
-            const tag: Tag = @enumFromInt(f.value);
+        inline for (@typeInfo(Tag).@"enum".field_values) |value| {
+            const tag: Tag = @fromBackingInt(value);
             // the real layout, spelled out independently of the function
-            const real = (m * modality_count + f.value) * 6 * hidden;
+            const real = (m * modality_count + value) * 6 * hidden;
             try std.testing.expectEqual(real, modRowOffset(m, tag, 0, hidden));
-            const swapped = (@as(usize, f.value) * n_labels + m) * 6 * hidden;
+            const swapped = (@as(usize, value) * n_labels + m) * 6 * hidden;
             if (swapped != real) disagreements += 1;
         }
     }
@@ -3704,8 +3704,8 @@ test "timesteps: the two streams differ, conditions pin high, rows are sorted" {
     const end = Timesteps.init(0.0, visual_cond_timestep, audio_cond_timestep, .{});
     try std.testing.expectEqual(@as(usize, 1), end.labels().len);
     try std.testing.expectEqual(@as(f32, 1.0), end.labels()[0]);
-    inline for (@typeInfo(Kind).@"enum".fields) |f| {
-        try std.testing.expectEqual(@as(usize, 0), end.rowFor(@enumFromInt(f.value)));
+    inline for (@typeInfo(Kind).@"enum".field_values) |value| {
+        try std.testing.expectEqual(@as(usize, 0), end.rowFor(@fromBackingInt(value)));
     }
 
     // At the TOP of the schedule the visual pin is genuinely its own row: t_v is
@@ -3865,9 +3865,9 @@ pub fn buildModTable(
 
 test "modality tags are the adaLN row indices, not names" {
     // a modulation row is t_row * 3 + tag, so the numeric values are load bearing
-    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(Kind.video.tag()));
-    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(Kind.text.tag()));
-    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(Kind.audio.tag()));
+    try std.testing.expectEqual(@as(u2, 0), @backingInt(Kind.video.tag()));
+    try std.testing.expectEqual(@as(u2, 1), @backingInt(Kind.text.tag()));
+    try std.testing.expectEqual(@as(u2, 2), @backingInt(Kind.audio.tag()));
     // conditions carry their stream's tag, not a tag of their own
     try std.testing.expectEqual(Tag.video, Kind.cond.tag());
     try std.testing.expectEqual(Tag.video, Kind.ref_img.tag());

@@ -563,20 +563,20 @@ const Scratch = struct {
         };
         var done: usize = 0;
         errdefer {
-            inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-                if (i < done) gpa.free(@field(s, f.name));
+            inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+                if (i < done) gpa.free(@field(s, name));
             }
         }
-        inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            @field(s, f.name) = try gpa.alloc(f32, sizes[i]);
+        inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            @field(s, name) = try gpa.alloc(f32, sizes[i]);
             done = i + 1;
         }
         return s;
     }
 
     fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Scratch).@"struct".fields) |f| {
-            gpa.free(@field(s, f.name));
+        inline for (@typeInfo(Scratch).@"struct".field_names) |name| {
+            gpa.free(@field(s, name));
         }
         s.* = undefined;
     }

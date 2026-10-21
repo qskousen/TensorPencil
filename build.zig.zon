@@ -25,7 +25,7 @@
     .fingerprint = 0x2d18ddbed508c7b9, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,12 +33,11 @@
     // internet connectivity.
     .dependencies = .{
         // dvui (immediate-mode GUI) + its SDL3 backend, for the tp-gui
-        // executable ONLY. Pinned to the same commit DiffKeep uses (known-good
-        // on Zig 0.16.0). Like libvips, this stays out of the pure TensorPencil
-        // library module — it is linked into the tp-gui exe alone.
+        // executable ONLY. Like libvips, this stays out of the pure TensorPencil
+        // library module; it is linked into the tp-gui exe alone.
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui#14703fa6d6fea0c608886b5ce2071ef49323c8c0",
-            .hash = "dvui-0.5.0-dev-AQFJmbHY9QA1qvhf_l3RPazRT7QOF0pGjLtU4amMq2F-",
+            .url = "git+https://github.com/david-vanderson/dvui#5903456e099e746849b7304b0ef15ec0eeafa7aa",
+            .hash = "dvui-0.6.0-dev-AQFJmdZEBAFhXY4GyApa8_JVK_lcmUxwUCbTQPceLHjj",
             .lazy = true,
         },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
@@ -75,8 +74,8 @@
         // stays pure Zig. (Lazy does not keep `zig build test` from FETCHING
         // it; see the note in build.zig.)
         .known_folders = .{
-            .url = "git+https://github.com/ziglibs/known-folders#207c34a16e4365edc20d92c7892f962b3bed46e8",
-            .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
+            .url = "git+https://github.com/ziglibs/known-folders#6da0d0c41b78b9ed2d34fa364fcb81b5ebece6c4",
+            .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
             .lazy = true,
         },
         // ggml (llama.cpp tensor lib) — its AVX2 CPU quant kernels back the
@@ -91,11 +90,11 @@
             .lazy = true,
         },
         // TLS 1.3 server for tp-serve's remote links (std has only a client).
-        // Pinned to the tip of the maintained zig-0.16.x branch. Only the serve
+        // Pinned to a main commit (main targets Zig 0.17). Only the serve
         // exes and the tls-spike step link it, so no test binary carries it.
         .tls = .{
-            .url = "git+https://github.com/ianic/tls.zig#e04ae448ce7ee70c136d4d48b059314543203809",
-            .hash = "tls-0.1.0-ER2e0jGpBgCkVC-Yp12NgSdHNUtZr52MleJ8roHlUa54",
+            .url = "git+https://github.com/ianic/tls.zig#bd22bcb73f423389441a1de80bf031ef1b623cce",
+            .hash = "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
             .lazy = true,
         },
         // Prebuilt Windows SDKs (headers, import libs, DLLs) for the libvips and
@@ -129,6 +128,11 @@
             .url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip",
             .hash = "N-V-__8AANL3jAxtkd8Pk-KCVsWvAZms1rQw27W8qXNNHPuV",
             .lazy = true,
+        },
+        // Translates the ggml, libav and libvips headers (replaces @cImport).
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
+            .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
         },
     },
     // Specifies the set of files and directories that are included in this package.

@@ -84,7 +84,7 @@ pub const Config = struct {
         if (dim == 0 or dim % 128 != 0) return error.UnknownModelConfig;
         var layers: usize = 0;
         while (layers < max_blocks) : (layers += 1) {
-            const nm = std.fmt.bufPrint(&buf, "{s}layers.{d}.norm1.weight", .{ pfx, layers }) catch break;
+            const nm = std.mem.print(&buf, "{s}layers.{d}.norm1.weight", .{ pfx, layers }) catch break;
             if (store.get(nm) == null) break;
         }
         return .{
@@ -99,7 +99,7 @@ pub const Config = struct {
     }
 
     fn fmt(buf: []u8, pfx: []const u8, name: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}{s}", .{ pfx, name });
+        return std.mem.print(buf, "{s}{s}", .{ pfx, name });
     }
 };
 
@@ -748,14 +748,14 @@ fn checkToy(prefix: []const u8, want_fused: bool) !void {
 
     for ([_][]const u8{ "even", "odd" }) |case| {
         var kb: [32]u8 = undefined;
-        const xv = try ref.require(try std.fmt.bufPrint(&kb, "{s}.x", .{case}));
+        const xv = try ref.require(try std.mem.print(&kb, "{s}.x", .{case}));
         const x = try xv.toF32Alloc(gpa);
         defer gpa.free(x);
-        const ctx = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.ctx", .{case}))).toF32Alloc(gpa);
+        const ctx = try (try ref.require(try std.mem.print(&kb, "{s}.ctx", .{case}))).toF32Alloc(gpa);
         defer gpa.free(ctx);
-        const sig = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.sigma", .{case}))).toF32Alloc(gpa);
+        const sig = try (try ref.require(try std.mem.print(&kb, "{s}.sigma", .{case}))).toF32Alloc(gpa);
         defer gpa.free(sig);
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "{s}.out", .{case}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "{s}.out", .{case}))).toF32Alloc(gpa);
         defer gpa.free(want);
 
         const shape = xv.info.shape.slice();

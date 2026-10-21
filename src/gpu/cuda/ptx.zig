@@ -80,9 +80,9 @@ pub const Builder = struct {
     /// Allocate a fresh virtual register of the given class; returns its PTX name
     /// (e.g. "%r5"). The name is owned by the builder (valid until deinit).
     pub fn reg(self: *Builder, c: RegClass) ![]const u8 {
-        const idx = self.counts[@intFromEnum(c)];
-        self.counts[@intFromEnum(c)] = idx + 1;
-        const name = try std.fmt.allocPrint(self.gpa, "{s}{d}", .{ prefix(c), idx });
+        const idx = self.counts[@backingInt(c)];
+        self.counts[@backingInt(c)] = idx + 1;
+        const name = try self.gpa.print("{s}{d}", .{ prefix(c), idx });
         try self.owned.append(self.gpa, name);
         return name;
     }
@@ -99,7 +99,7 @@ pub const Builder = struct {
 
     /// Fresh unique label name (no leading `%`); emit it with `label()`.
     pub fn newLabel(self: *Builder, comptime tag: []const u8) ![]const u8 {
-        const name = try std.fmt.allocPrint(self.gpa, "L_{s}_{d}", .{ tag, self.label_next });
+        const name = try self.gpa.print("L_{s}_{d}", .{ tag, self.label_next });
         self.label_next += 1;
         try self.owned.append(self.gpa, name);
         return name;
@@ -181,7 +181,7 @@ pub const Builder = struct {
 
         // Register-file declarations (skip empty classes).
         inline for ([_]RegClass{ .pred, .b16, .b32, .b64, .f32 }) |c| {
-            const n = self.counts[@intFromEnum(c)];
+            const n = self.counts[@backingInt(c)];
             if (n != 0) try w.print(g, "\t.reg {s} {s}<{d}>;\n", .{ decl(c), prefix(c), n });
         }
         try w.append(g, '\n');
@@ -220,9 +220,9 @@ test "ptx builder emits a valid vector-add module" {
     defer gpa.free(mod);
 
     // Sanity: declarations present, entry present, closes cleanly.
-    try std.testing.expect(std.mem.indexOf(u8, mod, ".visible .entry vadd(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mod, ".reg .b64 %rd<1>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mod, ".reg .b32 %r<1>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mod, ".reg .pred %p<1>;") != null);
+    try std.testing.expect(std.mem.find(u8, mod, ".visible .entry vadd(") != null);
+    try std.testing.expect(std.mem.find(u8, mod, ".reg .b64 %rd<1>;") != null);
+    try std.testing.expect(std.mem.find(u8, mod, ".reg .b32 %r<1>;") != null);
+    try std.testing.expect(std.mem.find(u8, mod, ".reg .pred %p<1>;") != null);
     try std.testing.expect(std.mem.endsWith(u8, mod, "\tret;\n}\n"));
 }

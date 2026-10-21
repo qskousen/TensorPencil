@@ -177,7 +177,7 @@ pub fn statusLine(buf: []u8) []const u8 {
     for (cat.entries) |*e| if (e.unused()) {
         unusable += 1;
     };
-    return std.fmt.bufPrint(buf, "{d} model files, {d} of no use here{s}", .{
+    return std.mem.print(buf, "{d} model files, {d} of no use here{s}", .{
         cat.entries.len,
         unusable,
         if (g_report.bad_folders > 0) " · a folder could not be read" else "",

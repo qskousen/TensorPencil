@@ -84,7 +84,7 @@ pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: us
     try decoderLayerAttnMlp(spec, st, layer, l, seq, pos0);
     if (trace) {
         var lbl: [24]u8 = undefined;
-        traceBuf(st, std.fmt.bufPrint(&lbl, "layer {d}", .{l}) catch "layer", st.bufs.x, seq * st.cfg.hidden);
+        traceBuf(st, std.mem.print(&lbl, "layer {d}", .{l}) catch "layer", st.bufs.x, seq * st.cfg.hidden);
     }
 }
 

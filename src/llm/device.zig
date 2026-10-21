@@ -99,7 +99,7 @@ pub const Device = union(enum) {
             .cuda => |be| be.memTagBreakdown(),
             .vulkan => |ctx| blk: {
                 var out: [MemTag.count]u64 = @splat(0);
-                for (&out, 0..) |*v, i| v.* = ctx.memTagUsed(@enumFromInt(i));
+                for (&out, 0..) |*v, i| v.* = ctx.memTagUsed(@fromBackingInt(@intCast(i)));
                 break :blk out;
             },
         };

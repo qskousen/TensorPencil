@@ -280,11 +280,11 @@ fn toGib(v: u64) f64 {
 /// Lives here rather than in `meter.zig` because this module is the meter's math
 /// with no dvui in it, which is what lets `zig build gui-test` compile it at all.
 pub fn totalText(buf: []u8, name: []const u8, bytes: u64, off: u64, off_label: []const u8, layers: ?[2]usize) []const u8 {
-    if (off == 0) return std.fmt.bufPrint(buf, "{s} {d:.1}G", .{ name, toGib(bytes) }) catch name;
-    if (layers) |l| return std.fmt.bufPrint(buf, "{s} {d:.1}G · {d:.1}G {s} ({d}/{d})", .{
+    if (off == 0) return std.mem.print(buf, "{s} {d:.1}G", .{ name, toGib(bytes) }) catch name;
+    if (layers) |l| return std.mem.print(buf, "{s} {d:.1}G · {d:.1}G {s} ({d}/{d})", .{
         name, toGib(bytes), toGib(off), off_label, l[0], l[1],
     }) catch name;
-    return std.fmt.bufPrint(buf, "{s} {d:.1}G · {d:.1}G {s}", .{ name, toGib(bytes), toGib(off), off_label }) catch name;
+    return std.mem.print(buf, "{s} {d:.1}G · {d:.1}G {s}", .{ name, toGib(bytes), toGib(off), off_label }) catch name;
 }
 
 test "a fully resident side's total carries no offload suffix" {

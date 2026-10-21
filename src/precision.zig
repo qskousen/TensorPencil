@@ -31,7 +31,7 @@ pub const Component = enum {
 const ladder = [_]Act{ .f16, .f32 };
 
 fn rank(a: Act) usize {
-    return if (a == .bf16) 0 else std.mem.indexOfScalar(Act, &ladder, a).?;
+    return if (a == .bf16) 0 else std.mem.findScalar(Act, &ladder, a).?;
 }
 
 /// One component's dial and what `auto` has learned this session.
@@ -134,7 +134,7 @@ pub fn allFinite(xs: []const f32) bool {
 test "auto widens over what runs, remembers it, and forgets it with the dial" {
     const Runs = struct {
         fn f(ok: []const Act, a: Act) bool {
-            return std.mem.indexOfScalar(Act, ok, a) != null;
+            return std.mem.findScalar(Act, ok, a) != null;
         }
     };
     var s: State = .{};
@@ -156,9 +156,9 @@ test "auto widens over what runs, remembers it, and forgets it with the dial" {
 test "Acts reads as the PNG field writes it" {
     var buf: [96]u8 = undefined;
     const a: Acts = .{ .encoder = .f32, .denoiser = .bf16, .vae = .f16 };
-    try std.testing.expectEqualStrings("text encoder f32, denoiser bf16, VAE f16", try std.fmt.bufPrint(&buf, "{f}", .{a}));
+    try std.testing.expectEqualStrings("text encoder f32, denoiser bf16, VAE f16", try std.mem.print(&buf, "{f}", .{a}));
     const b: Acts = .{ .encoder = .f32, .denoiser = .f16, .vae = .f32, .encoder_int = .{ .w_bits = 8, .act = .int8 }, .denoiser_int = .{ .w_bits = 4, .act = .f32 } };
-    try std.testing.expectEqualStrings("text encoder f32 (W8A8), denoiser f16 (W4A32), VAE f32", try std.fmt.bufPrint(&buf, "{f}", .{b}));
+    try std.testing.expectEqualStrings("text encoder f32 (W8A8), denoiser f16 (W4A32), VAE f32", try std.mem.print(&buf, "{f}", .{b}));
 }
 
 test "allFinite" {

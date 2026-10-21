@@ -1122,16 +1122,16 @@ test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
         var kb: [64]u8 = undefined;
         // I32 in the fixture; `toF32Alloc` deliberately refuses integer dtypes
         // (silently floating token ids is never right), so read the bytes.
-        const idx_v = (try ref.require(try std.fmt.bufPrint(&kb, "dit.{d}.cond_index", .{ci}))).bytes;
+        const idx_v = (try ref.require(try std.mem.print(&kb, "dit.{d}.cond_index", .{ci}))).bytes;
         const ctx_i: usize = @intCast(std.mem.readInt(i32, idx_v[0..4], .little));
 
-        const ctx = try (try ref.require(try std.fmt.bufPrint(&kb, "te.cond.{d}", .{ctx_i}))).toF32Alloc(gpa);
+        const ctx = try (try ref.require(try std.mem.print(&kb, "te.cond.{d}", .{ctx_i}))).toF32Alloc(gpa);
         defer gpa.free(ctx);
         const seq_txt = ctx.len / cfg.cap_dim;
 
-        const sig = try (try ref.require(try std.fmt.bufPrint(&kb, "dit.{d}.sigma", .{ci}))).toF32Alloc(gpa);
+        const sig = try (try ref.require(try std.mem.print(&kb, "dit.{d}.sigma", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(sig);
-        const x_lat = try (try ref.require(try std.fmt.bufPrint(&kb, "dit.{d}.x", .{ci}))).toF32Alloc(gpa);
+        const x_lat = try (try ref.require(try std.mem.print(&kb, "dit.{d}.x", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(x_lat);
         const lat = std.math.sqrt(x_lat.len / cfg.channels);
         try testing.expectEqual(x_lat.len, cfg.channels * lat * lat);
@@ -1187,7 +1187,7 @@ test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
         defer gpa.free(got);
         try model.predict(io, gpa, got, x_lat, lat, lat, cap, cap_padded, adaln, null);
 
-        const want = try (try ref.require(try std.fmt.bufPrint(&kb, "dit.{d}.out", .{ci}))).toF32Alloc(gpa);
+        const want = try (try ref.require(try std.mem.print(&kb, "dit.{d}.out", .{ci}))).toF32Alloc(gpa);
         defer gpa.free(want);
         const rel = relL2(want, got);
         errdefer std.debug.print("case {d} (latent {d}): velocity rel L2 {e:.4}\n", .{ ci, lat, rel });
@@ -1245,8 +1245,8 @@ test "Z-Image LoRA keys land on the checkpoint's fused qkv and out" {
     const gpa = testing.allocator;
     const r: usize = 32;
     const d: usize = 64;
-    const a = [_]u8{0} ** (r * d * 2);
-    const b = [_]u8{0} ** (d * r * 2);
+    const a: [(r * d * 2)]u8 = @splat(0);
+    const b: [(d * r * 2)]u8 = @splat(0);
     const blob = try lora_mod.safetensorsBlob(gpa, &.{
         .{ "diffusion_model.layers.3.attention.to_v.lora_A.weight", "BF16", &.{ r, d }, &a },
         .{ "diffusion_model.layers.3.attention.to_v.lora_B.weight", "BF16", &.{ d, r }, &b },

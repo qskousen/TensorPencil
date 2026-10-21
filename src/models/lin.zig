@@ -118,7 +118,7 @@ pub fn integerKind(lins: []const Weight) ?Kind {
         .w4a8 => n[2] += 1,
         else => {},
     };
-    const best = std.mem.indexOfMax(usize, &n);
+    const best = std.mem.findMax(usize, &n);
     if (n[best] == 0) return null;
     return ([3]Kind{ .i8, .i4, .w4a8 })[best];
 }
@@ -233,7 +233,7 @@ pub fn collect(alloc: std.mem.Allocator, who: []const u8, layers: anytype, compt
             const w: ?Weight = if (@typeInfo(@TypeOf(v)) == .optional) v else v;
             if (w) |ww| {
                 var t = ww;
-                t.tag = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ who, i, f });
+                t.tag = try alloc.print("{s}.{d}.{s}", .{ who, i, f });
                 try out.append(alloc, t);
             }
         }
@@ -255,7 +255,7 @@ test "kindOf sorts every dtype into a class" {
 }
 
 test "unsupported names the first linear a backend lacks" {
-    const a = [_]u8{0} ** (4 * 8 * 2);
+    const a: [(4 * 8 * 2)]u8 = @splat(0);
     var lins = [_]Weight{
         Weight.init(&a, .bf16, 4, 8),
         Weight.init(a[0 .. 4 * 8], .i8, 4, 8),
@@ -268,7 +268,7 @@ test "unsupported names the first linear a backend lacks" {
 }
 
 test "convrot answers per checkpoint and refuses a mix" {
-    const a = [_]u8{0} ** 64;
+    const a: [64]u8 = @splat(0);
     var rot = Weight.init(a[0..32], .i8, 4, 8);
     rot.convrot = 256;
     const flat = Weight.init(a[0..32], .i8, 4, 8);
@@ -298,7 +298,7 @@ test "rowSlice moves the bytes and the per-row scale together" {
     try std.testing.expectEqualStrings("qkv", k.tag.?);
 
     // A block quant slices by whole rows of blocks: q8_0 is 34 bytes per 32 elements.
-    const bq = [_]u8{0} ** (rows * 34);
+    const bq: [(rows * 34)]u8 = @splat(0);
     const bw = Weight.init(&bq, .q8_0, rows, cols);
     const bs = try rowSlice(std.testing.allocator, bw, 4, 2);
     try std.testing.expectEqual(@as(usize, 2 * 34), bs.bytes.len);
@@ -346,7 +346,7 @@ test "three row-view GEMMs agree with the fused one the CPU forward runs" {
 
 test "collect flattens a layer list, skips absent optionals and tags by field" {
     const L = struct { q: Weight, v: ?Weight, norm: []const f32 = &.{} };
-    const a = [_]u8{0} ** 64;
+    const a: [64]u8 = @splat(0);
     const w = Weight.init(a[0..32], .i8, 4, 8);
     const layers = [_]L{ .{ .q = w, .v = w }, .{ .q = w, .v = null } };
     var head = w;

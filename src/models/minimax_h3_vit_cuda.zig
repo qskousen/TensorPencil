@@ -68,7 +68,7 @@ fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32
 
 /// A sized sub-view of a device buffer (raw pointer arithmetic, CUDA only).
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
+    return .{ .buf = @fromBackingInt(@intCast(@backingInt(b.buf) + off_bytes)), .mem = b.mem, .size = size };
 }
 
 /// `minimax_h3_vit.encode` on the device. Same contract, same `Encoded`; the

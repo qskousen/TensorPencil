@@ -54,7 +54,7 @@ const AttnBatchedPush = extern struct {
 /// `TensorPencil gpu-test` to survey int8 tensor-core availability.
 pub var dump_coop_configs: bool = false;
 
-/// std.posix.getenv is gone in 0.16 and we link libc (same as pipeline.zig).
+/// std.posix.getenv is gone and we link libc (same as pipeline.zig).
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Whether `Context.init` may screen the coop warp tiles on a device it has no measurement
@@ -152,7 +152,7 @@ pub fn coopTileCachePath(buf: []u8) ?[:0]const u8 {
 /// Key identifying a device+driver in the cache. Includes the driver version so a driver
 /// update re-measures rather than trusting a number produced by different codegen.
 pub fn coopTileCacheKey(buf: []u8, props: vk.PhysicalDeviceProperties) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{x}:{x}:{x}", .{ props.vendor_id, props.device_id, props.driver_version }) catch null;
+    return std.mem.print(buf, "{x}:{x}:{x}", .{ props.vendor_id, props.device_id, props.driver_version }) catch null;
 }
 
 pub const CachedTiles = struct { f16w: ?[2]u32 = null, i8: ?[2]u32 = null };
@@ -187,7 +187,7 @@ pub fn readCoopTileCache(io: std.Io, props: vk.PhysicalDeviceProperties) CachedT
         const lk = fields.next() orelse continue;
         if (!std.mem.eql(u8, lk, key)) continue;
         while (fields.next()) |fld| {
-            const eq = std.mem.indexOfScalar(u8, fld, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, fld, '=') orelse continue;
             const name = fld[0..eq];
             var mn = std.mem.splitScalar(u8, fld[eq + 1 ..], 'x');
             const a_s = mn.next() orelse continue;
@@ -229,7 +229,7 @@ pub fn writeCoopTileCache(io: std.Io, key: []const u8, f16w: [2]u32, i8t: [2]u32
             n += 1;
         }
     }
-    const mine = std.fmt.bufPrint(out[n..], "{s} f16={d}x{d} i8={d}x{d}\n", .{ key, f16w[0], f16w[1], i8t[0], i8t[1] }) catch return;
+    const mine = std.mem.print(out[n..], "{s} f16={d}x{d} i8={d}x{d}\n", .{ key, f16w[0], f16w[1], i8t[0], i8t[1] }) catch return;
     n += mine.len;
 
     pipe_cache_file.write(io, path, out[0..n]) catch return;
@@ -805,7 +805,7 @@ const elt_entry_sizes = [_]EntrySize{
 // A pipeline is found by `Elt` ordinal, so a slot out of order launches another kernel.
 comptime {
     @setEvalBranchQuota(200_000);
-    for (std.meta.fieldNames(Elt), elt_entry_sizes) |name, es| {
+    for (@typeInfo(Elt).@"enum".field_names, elt_entry_sizes) |name, es| {
         if (!std.mem.eql(u8, name, es.name)) @compileError("Elt." ++ name ++ " sits at the table slot of " ++ es.name);
     }
 }
@@ -928,9 +928,9 @@ fn patchKernelModule(gpa: std.mem.Allocator, code: []const u8, caps: []const u32
     defer gpa.free(current);
     const logical = try spv.withLogicalAddressing(gpa, current);
     defer gpa.free(logical);
-    const stripped = try spv.stripWorkgroupStrides(gpa, logical);
-    defer gpa.free(stripped);
-    return spv.dedupeDecorations(gpa, stripped);
+    const chains = try spv.fixAccessChainTypes(gpa, logical);
+    defer gpa.free(chains);
+    return spv.stripWorkgroupStrides(gpa, chains);
 }
 
 /// What a device demands of every shader module, read once at init.
@@ -978,14 +978,14 @@ fn createModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, r
     var module: vk.ShaderModule = .null_handle;
     try check(d.CreateShaderModule(device, &.{ .code_size = final.len, .p_code = @ptrCast(final.ptr) }, null, &module));
     const acc = try hazard.bindingAccess(gpa, final);
-    hazard.registry.put(.{ .device = @intFromEnum(device), .handle = @intFromEnum(module), .kind = .module }, acc);
+    hazard.registry.put(.{ .device = @backingInt(device), .handle = @backingInt(module), .kind = .module }, acc);
     if (Context.hazlog) std.log.info("vulkan hazard: {s} used {b:0>4} written {b:0>4}{s}", .{ name, acc.used, acc.written, if (acc.untracked) " UNTRACKED" else "" });
     return module;
 }
 
 /// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
-/// logical addressing, no workgroup ArrayStrides, see spv.zig) and create
-/// the module. All listed entry points get the same workgroup size.
+/// logical addressing, access-chain types, no workgroup ArrayStrides, see spv.zig)
+/// and create the module. All listed entry points get the same workgroup size.
 fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Device, rules: ModuleRules, code: []const u8, entries: []const EntrySize, caps: []const u32, ext: ?[]const u8, out: *vk.ShaderModule) Error!void {
     var current = try gpa.alignedAlloc(u8, .of(u32), code.len);
     @memcpy(current, code);
@@ -1002,16 +1002,16 @@ fn createKernelModule(gpa: std.mem.Allocator, d: *const Dispatch, device: vk.Dev
     defer gpa.free(current);
     const logical = try spv.withLogicalAddressing(gpa, current);
     defer gpa.free(logical);
-    const stripped = try spv.stripWorkgroupStrides(gpa, logical);
-    defer gpa.free(stripped);
-    const patched = try spv.dedupeDecorations(gpa, stripped);
+    const chains = try spv.fixAccessChainTypes(gpa, logical);
+    defer gpa.free(chains);
+    const patched = try spv.stripWorkgroupStrides(gpa, chains);
     defer gpa.free(patched);
     out.* = try createModule(gpa, d, device, rules, entries[0].name, patched) orelse return error.KernelExceedsDevice;
 }
 
 /// The Vulkan loader names, per platform. One list, so `loaderPresent` and the
 /// real open cannot disagree about what counts as installed.
-const vulkan_names: []const []const u8 = switch (builtin.os.tag) {
+const vulkan_names: []const []const u8 = switch (builtin.target.os.tag) {
     .windows => &.{"vulkan-1.dll"},
     // MoltenVK ships as the loader itself in the LunarG SDK layout, and as a
     // bare framework when an app bundles it.
@@ -1147,8 +1147,8 @@ fn check(r: vk.Result) Error!void {
 /// A pipeline does to its bindings what its module does.
 fn notePipelines(device: vk.Device, infos: []const vk.ComputePipelineCreateInfo, pipes: []const vk.Pipeline) void {
     for (infos, pipes) |info, pipe| {
-        const acc = hazard.registry.get(.{ .device = @intFromEnum(device), .handle = @intFromEnum(info.stage.module), .kind = .module });
-        hazard.registry.put(.{ .device = @intFromEnum(device), .handle = @intFromEnum(pipe), .kind = .pipeline }, acc);
+        const acc = hazard.registry.get(.{ .device = @backingInt(device), .handle = @backingInt(info.stage.module), .kind = .module });
+        hazard.registry.put(.{ .device = @backingInt(device), .handle = @backingInt(pipe), .kind = .pipeline }, acc);
     }
 }
 
@@ -1264,7 +1264,7 @@ const PipeBatch = struct {
                 var path_buf: [1024]u8 = undefined;
                 var name_buf: [96]u8 = undefined;
                 const path: ?[]const u8 = if (r.store) |s|
-                    std.fmt.bufPrint(&path_buf, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ s.dir, pipe_cache_file.pipeFileName(&name_buf, s.uuid, j.key) }) catch null
+                    std.mem.print(&path_buf, "{s}" ++ std.Io.Dir.path.sep_str ++ "{s}", .{ s.dir, pipe_cache_file.pipeFileName(&name_buf, s.uuid, j.key) }) catch null
                 else
                     null;
                 var own: vk.PipelineCache = .null_handle;
@@ -1317,7 +1317,7 @@ const PipeBatch = struct {
 /// pipeline changing.
 const keep_pipe_files = 128;
 
-const EltSet = std.StaticBitSet(elt_entry_sizes.len);
+const EltSet = std.bit_set.Static(elt_entry_sizes.len);
 
 /// What creating an eltwise pipeline needs, outside a `Context`.
 const EltMaker = struct {
@@ -1345,15 +1345,15 @@ const EltMaker = struct {
         defer gpa.free(sized);
         const sdot = std.mem.endsWith(u8, es.name, "_sdot");
         if (sdot and !m.int_dot) return error.KernelExceedsDevice;
-        // A decode row and a speculative verify's row must round alike, which only
-        // `NoContraction` holds across two kernels' shapes.
-        const dotted = if (sdot) dot: {
-            const capped = try spv.withCapabilities(gpa, sized, &.{ spv.cap_dot_product, spv.cap_dot_product_input_4x8_packed }, "SPV_KHR_integer_dot_product");
-            defer gpa.free(capped);
-            break :dot try spv.withNoContraction(gpa, capped);
-        } else sized;
-        defer if (sdot) gpa.free(dotted);
-        const module = try createModule(gpa, m.d, m.device, m.rules, es.name, dotted) orelse return error.KernelExceedsDevice;
+        const capped = if (sdot) try spv.withCapabilities(gpa, sized, &.{ spv.cap_dot_product, spv.cap_dot_product_input_4x8_packed }, "SPV_KHR_integer_dot_product") else sized;
+        defer if (sdot) gpa.free(capped);
+        // A quantized GEMV row must round alike in every kernel that computes it (a
+        // decode, a speculative verify, a routed expert), which only `NoContraction`
+        // holds across two kernels' shapes.
+        const exact = std.mem.startsWith(u8, es.name, "gemv") and std.mem.indexOf(u8, es.name, "_dual_") != null;
+        const code = if (exact) try spv.withNoContraction(gpa, capped) else capped;
+        defer if (exact) gpa.free(code);
+        const module = try createModule(gpa, m.d, m.device, m.rules, es.name, code) orelse return error.KernelExceedsDevice;
         defer m.d.DestroyShaderModule(m.device, module, null);
         var name: [64:0]u8 = @splat(0);
         @memcpy(name[0..es.name.len], es.name);
@@ -1372,7 +1372,7 @@ const keep_pipeline_caches = 4;
 fn moduleHash() u64 {
     // Bump when how a kernel's module is built changes: an old file's entries then
     // stay with the old name and are pruned.
-    const module_format = 3;
+    const module_format = 4;
     var h = std.hash.Wyhash.init(module_format);
     h.update(eltwise_spv);
     h.update(dual_spv);
@@ -1430,7 +1430,7 @@ fn readUsedKernels(gpa: std.mem.Allocator, io: std.Io, set: *EltSet) void {
     const text = pipe_cache_file.read(gpa, io, p) orelse return;
     defer gpa.free(text);
     var lines = std.mem.tokenizeAny(u8, text, "\r\n");
-    while (lines.next()) |name| if (std.meta.stringToEnum(Elt, name)) |e| set.set(@intFromEnum(e));
+    while (lines.next()) |name| if (std.meta.stringToEnum(Elt, name)) |e| set.set(@backingInt(e));
 }
 
 /// Function table. Field names match the command names minus the `vk` prefix;
@@ -1639,7 +1639,7 @@ pub const Context = struct {
     storage_align: u64 = 256,
     max_wg_invocations: u32 = 0,
     /// Kept so anything the context does later that needs file or clock access has one
-    /// (0.16 puts both behind Io). The measured-tile cache read at init uses it.
+    /// (std puts both behind Io). The measured-tile cache read at init uses it.
     io: std.Io,
     /// This device+driver's key in the measured-tile cache, so a tuner can write the
     /// entry back without re-querying properties.
@@ -1874,7 +1874,7 @@ pub const Context = struct {
     /// address: a weight inside one binds as a view of the group's single buffer,
     /// which keeps a model with thousands of experts under the driver's allocation
     /// limit (often 4096).
-    weight_groups: std.ArrayListUnmanaged(WeightGroup) = .empty,
+    weight_groups: std.ArrayList(WeightGroup) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Error!*Context {
         if (getenv("TP_VK_FULLBAR") != null) full_barriers = true;
@@ -1906,9 +1906,9 @@ pub const Context = struct {
         }
 
         var d: Dispatch = undefined;
-        inline for (@typeInfo(Dispatch).@"struct".fields) |field| {
-            const pfn = gipa(instance, "vk" ++ field.name) orelse return error.VulkanUnavailable;
-            @field(d, field.name) = @ptrCast(pfn);
+        inline for (@typeInfo(Dispatch).@"struct".field_names) |name| {
+            const pfn = gipa(instance, "vk" ++ name) orelse return error.VulkanUnavailable;
+            @field(d, name) = @ptrCast(pfn);
         }
         errdefer d.DestroyInstance(instance, null);
 
@@ -1991,7 +1991,7 @@ pub const Context = struct {
                                 std.log.info("coopmat cfg: {d}x{d}x{d} A={s} B={s} C={s} R={s} scope={d} sat={d}", .{
                                     cp.m_size,                     cp.n_size,                cp.k_size,
                                     componentName(cp.a_type),      componentName(cp.b_type), componentName(cp.c_type),
-                                    componentName(cp.result_type), @intFromEnum(cp.scope),   @intFromBool(cp.saturating_accumulation == vk.TRUE),
+                                    componentName(cp.result_type), @backingInt(cp.scope),   @intFromBool(cp.saturating_accumulation == vk.TRUE),
                                 });
                             }
                             // The f16 GEMM expresses any 8-or-16 M/N at K=16, so take the
@@ -2468,7 +2468,7 @@ pub const Context = struct {
         // from the whole module, ~0.4 s apiece, and a run binds a few dozen of ~400. The
         // ones earlier runs bound compile now, on every core.
         var pipes_e: [elt_entry_sizes.len]vk.Pipeline = @splat(vk.Pipeline.null_handle);
-        var elt_used: EltSet = .initEmpty();
+        var elt_used: EltSet = .empty;
         if (persist) readUsedKernels(gpa, io, &elt_used);
         const t_warm = std.Io.Clock.awake.now(io).nanoseconds;
         const warm_compiled = warmElt(io, &.{ .d = &d, .device = device, .cache = pipe_cache, .layout = pipeline_layout_e, .spv_e = spv_e, .spv_dual = spv_dual, .io = io, .feedback = has_feedback, .rules = rules, .int_dot = has_int_dot }, elt_used, &pipes_e);
@@ -2844,7 +2844,7 @@ pub const Context = struct {
 
         const warm_ns: u64 = if (warm_compiled > 0) @intCast(std.Io.Clock.awake.now(io).nanoseconds - t_warm) else 0;
         const t_batch = std.Io.Clock.awake.now(io).nanoseconds;
-        const batch_store: ?PipeBatch.Store = if (cache_path) |p| if (std.fs.path.dirname(p)) |dir| .{ .dir = dir, .uuid = props.pipeline_cache_uuid } else null else null;
+        const batch_store: ?PipeBatch.Store = if (cache_path) |p| if (std.Io.Dir.path.dirname(p)) |dir| .{ .dir = dir, .uuid = props.pipeline_cache_uuid } else null else null;
         const batch_compiled = try batch.run(io, gpa, &d, device, pipe_cache, has_feedback, batch_store);
         const batch_ns: u64 = if (batch_compiled > 0) @intCast(std.Io.Clock.awake.now(io).nanoseconds - t_batch) else 0;
 
@@ -3228,7 +3228,7 @@ pub const Context = struct {
     }
 
     fn orderDispatch(self: *Context) void {
-        const acc = hazard.registry.get(.{ .device = @intFromEnum(self.device), .handle = @intFromEnum(self.bound_pipe), .kind = .pipeline });
+        const acc = hazard.registry.get(.{ .device = @backingInt(self.device), .handle = @backingInt(self.bound_pipe), .kind = .pipeline });
         const binds = self.bindsOf(self.bound_set);
         if (acc.untracked or binds == null) {
             // Unknown accesses: wait for everything before, and make the next wait.
@@ -3241,7 +3241,7 @@ pub const Context = struct {
         for (binds.?, 0..) |b, i| {
             const bit = @as(u8, 1) << @intCast(i);
             if (acc.used & bit == 0) continue;
-            uses[n] = .{ .range = .{ .buf = @intFromEnum(b.buf), .lo = b.off }, .write = acc.written & bit != 0 };
+            uses[n] = .{ .range = .{ .buf = @backingInt(b.buf), .lo = b.off }, .write = acc.written & bit != 0 };
             n += 1;
         }
         if (self.hazards.conflicts(uses[0..n])) {
@@ -3331,7 +3331,7 @@ pub const Context = struct {
                 db.tag = self.mem_tag;
                 self.device_used += size;
                 self.max_alloc_bytes = @max(self.max_alloc_bytes, size);
-                if (self.track_tags) self.mem_tag_used[@intFromEnum(self.mem_tag)] += size;
+                if (self.track_tags) self.mem_tag_used[@backingInt(self.mem_tag)] += size;
                 return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return err;
@@ -3368,7 +3368,7 @@ pub const Context = struct {
         self.d.DestroyBuffer(self.device, db.buf, null);
         self.d.FreeMemory(self.device, db.mem, null);
         self.device_used -|= db.size;
-        if (self.track_tags) self.mem_tag_used[@intFromEnum(db.tag)] -|= db.size;
+        if (self.track_tags) self.mem_tag_used[@backingInt(db.tag)] -|= db.size;
     }
 
     /// Enable MEASURED per-component device-memory attribution (VRAM meter).
@@ -3383,7 +3383,7 @@ pub const Context = struct {
     pub fn enableLlmMemTags(self: *Context) void {
         self.track_tags = true;
         self.weight_tag = .lm_weights;
-        self.mem_tag_used[@intFromEnum(MemTag.other)] = self.device_used;
+        self.mem_tag_used[@backingInt(MemTag.other)] = self.device_used;
         self.mem_tag = .lm_act;
     }
 
@@ -3397,8 +3397,8 @@ pub const Context = struct {
 
     fn retag(self: *Context, db: *DeviceBuffer, tag: MemTag) void {
         if (self.track_tags) {
-            self.mem_tag_used[@intFromEnum(db.tag)] -|= db.size;
-            self.mem_tag_used[@intFromEnum(tag)] += db.size;
+            self.mem_tag_used[@backingInt(db.tag)] -|= db.size;
+            self.mem_tag_used[@backingInt(tag)] += db.size;
         }
         db.tag = tag;
     }
@@ -3431,7 +3431,7 @@ pub const Context = struct {
     }
     /// Live device bytes attributed to `tag` (0 unless tagging is active).
     pub fn memTagUsed(self: *const Context, tag: MemTag) u64 {
-        return self.mem_tag_used[@intFromEnum(tag)];
+        return self.mem_tag_used[@backingInt(tag)];
     }
 
     fn destroyHostBuffer(self: *Context, hb: *HostBuffer) void {
@@ -3534,7 +3534,7 @@ pub const Context = struct {
     /// device with no 16-bit GEMM runs one on.
     fn weightBufferWidened(self: *Context, bytes: []const u8, dt: tp_core.dtype.DType, rows: usize, cols: usize) Error!vk.Buffer {
         var key = weightKey(bytes, .f32_from_16);
-        key.src = @intFromEnum(dt);
+        key.src = @backingInt(dt);
         if (self.weights.getPtr(key)) |e| {
             self.use_counter += 1;
             e.last_use = self.use_counter;
@@ -4116,7 +4116,7 @@ pub const Context = struct {
             .u1 = @intCast(cols),
             .u2 = @intCast(nchunk),
             .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
-            .u4 = @intFromEnum(wcode),
+            .u4 = @backingInt(wcode),
             .u5 = @intCast(rows),
         }, (rows / 4) * nchunk, 1, 1);
     }
@@ -4318,7 +4318,7 @@ pub const Context = struct {
             .u1 = @intCast(cols),
             .u2 = @intCast(nchunk),
             .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
-            .u4 = @intFromEnum(wcode),
+            .u4 = @backingInt(wcode),
             .u5 = @intCast(rows),
             .f1 = @bitCast(@as(u32, @intCast(x_off_elems))),
         }, (rows / 8) * nchunk, 1, 1);
@@ -4877,7 +4877,7 @@ pub const Context = struct {
             .torch => |t| t,
         };
         var key = weightKey(t.w.bytes, if (bf) .bf16_from_conv else .f16_from_conv);
-        key.src = @intFromEnum(t.w.dtype);
+        key.src = @backingInt(t.w.dtype);
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
@@ -4900,7 +4900,7 @@ pub const Context = struct {
             .torch => |t| t,
         };
         var key = weightKey(t.w.bytes, .f32_from_conv);
-        key.src = @intFromEnum(t.w.dtype);
+        key.src = @backingInt(t.w.dtype);
         if (self.weights.getPtr(key)) |e| {
             self.use_counter += 1;
             e.last_use = self.use_counter;
@@ -6218,7 +6218,7 @@ pub const Context = struct {
             .u0 = @intCast(seq),
             .u1 = @intCast(n_experts),
             .u2 = @intCast(used),
-            .u3 = @intFromEnum(gating),
+            .u3 = @backingInt(gating),
             .u4 = @intCast(ids_off),
             .u5 = @intCast(w_off),
             .u6 = @intFromBool(normalize),
@@ -6642,7 +6642,7 @@ pub const Context = struct {
     /// The pipeline for `which`, created on its first use: from the cache in milliseconds,
     /// or compiled (~0.4 s) when a new build or driver left the cache without it.
     fn eltPipe(self: *Context, which: Elt) Error!vk.Pipeline {
-        const i = @intFromEnum(which);
+        const i = @backingInt(which);
         if (self.pipes_e[i] == .null_handle) {
             const m: EltMaker = .{ .d = &self.d, .device = self.device, .cache = self.pipe_cache, .layout = self.pipeline_layout_e, .spv_e = self.spv_e, .spv_dual = self.spv_dual, .io = self.io, .feedback = self.has_feedback, .rules = self.module_rules, .int_dot = self.has_int_dot };
             const t0 = std.Io.Clock.awake.now(self.io).nanoseconds;
@@ -6674,14 +6674,14 @@ pub const Context = struct {
                 break :save;
             };
             std.log.info("vulkan: saved pipeline cache ({d} MB) to {s}", .{ size >> 20, p });
-            if (std.fs.path.dirname(p)) |dir| pipe_cache_file.prune(self.gpa, self.io, dir, pipe_cache_file.build_prefix, keep_pipeline_caches);
+            if (std.Io.Dir.path.dirname(p)) |dir| pipe_cache_file.prune(self.gpa, self.io, dir, pipe_cache_file.build_prefix, keep_pipeline_caches);
         }
         if (self.elt_used.eql(self.elt_used_loaded)) return;
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(self.gpa);
         var it = self.elt_used.iterator(.{});
         while (it.next()) |i| {
-            text.appendSlice(self.gpa, @tagName(@as(Elt, @enumFromInt(i)))) catch return;
+            text.appendSlice(self.gpa, @tagName(@as(Elt, @fromBackingInt(@intCast(i))))) catch return;
             text.append(self.gpa, '\n') catch return;
         }
         var buf: [1024]u8 = undefined;
@@ -6703,7 +6703,7 @@ pub const Context = struct {
     ) Error!void {
         const pipe = try self.eltPipe(which);
         const dummy = try self.dummyBuf();
-        const es = elt_entry_sizes[@intFromEnum(which)];
+        const es = elt_entry_sizes[@backingInt(which)];
         try self.opBegin();
         const set = self.bindViews(.{
             a orelse raw(dummy),
@@ -7396,12 +7396,12 @@ pub const Context = struct {
 
     /// The name of a pipeline: its `Elt` entry, or the `Context` field holding it.
     fn pipeName(self: *const Context, p: vk.Pipeline, buf: []u8) []const u8 {
-        for (self.pipes_e, 0..) |e, i| if (e == p) return @tagName(@as(Elt, @enumFromInt(i)));
-        inline for (@typeInfo(Context).@"struct".fields) |f| {
-            if (f.type == vk.Pipeline) {
-                if (@field(self, f.name) == p) return f.name;
-            } else if (@typeInfo(f.type) == .array and @typeInfo(f.type).array.child == vk.Pipeline) {
-                for (@field(self, f.name), 0..) |e, i| if (e == p) return std.fmt.bufPrint(buf, "{s}[{d}]", .{ f.name, i }) catch f.name;
+        for (self.pipes_e, 0..) |e, i| if (e == p) return @tagName(@as(Elt, @fromBackingInt(@intCast(i))));
+        inline for (@typeInfo(Context).@"struct".field_names, @typeInfo(Context).@"struct".field_types) |name, FieldType| {
+            if (FieldType == vk.Pipeline) {
+                if (@field(self, name) == p) return name;
+            } else if (@typeInfo(FieldType) == .array and @typeInfo(FieldType).array.child == vk.Pipeline) {
+                for (@field(self, name), 0..) |e, i| if (e == p) return std.mem.print(buf, "{s}[{d}]", .{ name, i }) catch name;
             }
         }
         return "?";
@@ -7678,6 +7678,26 @@ test "a weight inside a registered group binds as a view, bit-identical to its o
     defer gpa.free(got);
     try ctx.tensorDownload(y, std.mem.sliceAsBytes(got));
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(got[rows..]), std.mem.sliceAsBytes(got[0..rows]));
+}
+
+test "every kernel module, patched as at load, has well-typed access chains and divisions" {
+    const gpa = std.testing.allocator;
+    const dual_caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic, spv.cap_storage_buffer_16bit };
+    const modules = [_]struct { name: []const u8, code: []const u8, caps: []const u32 }{
+        .{ .name = "eltwise", .code = eltwise_spv, .caps = &.{} },
+        .{ .name = "dual", .code = dual_spv, .caps = &dual_caps },
+        .{ .name = "matmul_f8", .code = matmul_f8_spv, .caps = &.{} },
+        .{ .name = "matmul_f32", .code = matmul_f32_spv, .caps = &.{} },
+        .{ .name = "transpose", .code = transpose_spv, .caps = &.{} },
+        .{ .name = "attn_batched", .code = attn_batched_spv, .caps = &.{} },
+    };
+    for (modules) |m| {
+        const patched = try patchKernelModule(gpa, m.code, m.caps, null);
+        defer gpa.free(patched);
+        const errs = try spv.typeErrors(gpa, patched);
+        errdefer std.debug.print("{s}: {} access chains, {} divisions mistyped\n", .{ m.name, errs.access_chains, errs.divisions });
+        try std.testing.expectEqual(spv.TypeErrors{}, errs);
+    }
 }
 
 test "every eltwise and dual kernel's bindings are tracked, and it writes only what it binds" {
@@ -9808,3 +9828,4 @@ test "gpu Mage-VAE kernels match their CPU references" {
         try close(want, got, 1e-5, "modulate_pr + gated_add_pr");
     }
 }
+

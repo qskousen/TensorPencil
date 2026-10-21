@@ -16,7 +16,7 @@ const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
 fn sized(b: Buf, off_bytes: usize, size: usize) Buf {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
+    return .{ .buf = @fromBackingInt(@intCast(@backingInt(b.buf) + off_bytes)), .mem = b.mem, .size = size };
 }
 
 /// Encode interleaved RGB pixels to Gemma 4 image-token embeddings on CUDA.

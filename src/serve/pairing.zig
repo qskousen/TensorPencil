@@ -16,9 +16,9 @@ pub const Paths = struct {
 
     pub fn init(arena: std.mem.Allocator, dir: []const u8) !Paths {
         return .{
-            .cert = try std.fs.path.join(arena, &.{ dir, "cert.pem" }),
-            .key = try std.fs.path.join(arena, &.{ dir, "key.pem" }),
-            .token_hash = try std.fs.path.join(arena, &.{ dir, "token.hash" }),
+            .cert = try std.Io.Dir.path.join(arena, &.{ dir, "cert.pem" }),
+            .key = try std.Io.Dir.path.join(arena, &.{ dir, "key.pem" }),
+            .token_hash = try std.Io.Dir.path.join(arena, &.{ dir, "token.hash" }),
         };
     }
 };
@@ -28,7 +28,7 @@ pub const Paths = struct {
 pub const cert_life_s: i64 = 10 * 365 * std.time.s_per_day;
 
 fn writePrivate(io: Io, path: []const u8, data: []const u8) !void {
-    const perms: Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+    const perms: Io.Dir.Permissions = if (builtin.target.os.tag == .windows) .default_file else .fromMode(0o600);
     const f = try Io.Dir.cwd().createFile(io, path, .{ .permissions = perms });
     defer f.close(io);
     try f.writeStreamingAll(io, data);
@@ -37,7 +37,7 @@ fn writePrivate(io: Io, path: []const u8, data: []const u8) !void {
 /// Create the directory (0700) and the certificate and key when either is
 /// missing. True when they were minted this call.
 pub fn ensureIdentity(gpa: std.mem.Allocator, io: Io, dir: []const u8, p: Paths, now_sec: i64) !bool {
-    const dir_perms: Io.Dir.Permissions = if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
+    const dir_perms: Io.Dir.Permissions = if (builtin.target.os.tag == .windows) .default_dir else .fromMode(0o700);
     _ = Io.Dir.cwd().createDirPathStatus(io, dir, dir_perms) catch {};
     const have_cert = Io.Dir.cwd().statFile(io, p.cert, .{}) catch null;
     const have_key = Io.Dir.cwd().statFile(io, p.key, .{}) catch null;
@@ -89,7 +89,7 @@ pub fn certB64Alloc(arena: std.mem.Allocator, io: Io, p: Paths) ![]const u8 {
 
 pub fn pairingAlloc(arena: std.mem.Allocator, io: Io, p: Paths, host: []const u8, port: u16, token: link.Secret) ![]u8 {
     const ep: link.Endpoint = .{ .tls = .{ .host = host, .port = port, .cert_b64 = try certB64Alloc(arena, io, p), .token = token } };
-    return std.fmt.allocPrint(arena, "{f}", .{ep});
+    return arena.print("{f}", .{ep});
 }
 
 test "the state directory holds a reusable identity and the token's hash, never the token" {
@@ -101,7 +101,7 @@ test "the state directory holds a reusable identity and the token's hash, never 
     defer arena.deinit();
     const a = arena.allocator();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
-    const state = try std.fs.path.join(a, &.{ dir, "serve" });
+    const state = try std.Io.Dir.path.join(a, &.{ dir, "serve" });
     const p = try Paths.init(a, state);
     const now: i64 = 1_800_000_000;
 

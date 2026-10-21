@@ -130,7 +130,7 @@ pub const Vit = struct {
     mm_proj: Weight,
 
     fn blockName(buf: []u8, i: usize, proj: []const u8, kind: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "v.blk.{d}.{s}.{s}", .{ i, proj, kind });
+        return std.mem.print(buf, "v.blk.{d}.{s}.{s}", .{ i, proj, kind });
     }
 
     pub fn load(gpa: std.mem.Allocator, g: *const Gguf) !Vit {
@@ -150,7 +150,7 @@ pub const Vit = struct {
             // Early mmproj conversions name the two MLP projections the other way
             // round; the shape says which is which.
             var nbuf: [64]u8 = undefined;
-            const down_name = try std.fmt.bufPrint(&nbuf, "v.blk.{d}.ffn_down.weight", .{i});
+            const down_name = try std.mem.print(&nbuf, "v.blk.{d}.ffn_down.weight", .{i});
             const swapped = if (store.get(down_name)) |v| v.info.shape.slice().len == 2 and v.info.shape.slice()[0] == cfg.ffn else false;
             const up_n = if (swapped) "ffn_down" else "ffn_up";
             const down_n = if (swapped) "ffn_up" else "ffn_down";
@@ -350,8 +350,8 @@ const Scratch = struct {
     fn init(gpa: std.mem.Allocator, np: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
         var done: usize = 0;
-        errdefer inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            if (i < done) gpa.free(@field(s, f.name));
+        errdefer inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            if (i < done) gpa.free(@field(s, name));
         };
         const sizes = [_]usize{
             np * cfg.dim, // normed
@@ -362,15 +362,15 @@ const Scratch = struct {
             np * cfg.dim, // tmp
             np * cfg.ffn, // ffn
         };
-        inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
-            @field(s, f.name) = try gpa.alloc(f32, sizes[i]);
+        inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+            @field(s, name) = try gpa.alloc(f32, sizes[i]);
             done = i + 1;
         }
         return s;
     }
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Scratch).@"struct".fields) |f| gpa.free(@field(self, f.name));
+        inline for (@typeInfo(Scratch).@"struct".field_names) |name| gpa.free(@field(self, name));
         self.* = undefined;
     }
 };

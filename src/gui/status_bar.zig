@@ -41,7 +41,7 @@ const hist_n = 26;
 
 /// A small fixed-capacity rolling history, iterated oldest->newest via `at`.
 const Ring = struct {
-    data: [hist_n]f32 = [_]f32{0} ** hist_n,
+    data: [hist_n]f32 = @splat(0),
     len: usize = 0,
     head: usize = 0,
 
@@ -135,10 +135,10 @@ pub fn render(v: *View, m: *const mirror.Mirror, name: []const u8, trouble: []co
         .expand = .horizontal,
         .min_size_content = .{ .h = bar_height },
         .max_size_content = .height(bar_height),
-        .color_fill = C.chrome,
+        .color_fill = .{ .color = C.chrome },
         .background = true,
         .border = style.Edge.top,
-        .color_border = style.hairline,
+        .color_border = .{ .color = style.hairline },
         .padding = .{ .x = 14, .y = pad_top, .w = 14, .h = pad_bottom },
     });
     defer bar.deinit();
@@ -160,9 +160,9 @@ pub fn render(v: *View, m: *const mirror.Mirror, name: []const u8, trouble: []co
                 .max_size_content = .width(120),
             });
             defer who.deinit();
-            if (name.len > 0) fonts.richLabel(@src(), name, .{ .color_text = C.text_dim });
+            if (name.len > 0) fonts.richLabel(@src(), name, .{ .color_text = .{ .color = C.text_dim } });
             if (note.len > 0) {
-                fonts.richLabel(@src(), note, .{ .font = F.mono_row, .color_text = C.amber });
+                fonts.richLabel(@src(), note, .{ .font = F.mono_row, .color_text = .{ .color = C.amber } });
             }
         }
         style.vsep(@src());
@@ -176,7 +176,7 @@ pub fn render(v: *View, m: *const mirror.Mirror, name: []const u8, trouble: []co
             .gravity_y = 0.5,
             .expand = .horizontal,
             .margin = .{ .x = 8 },
-            .color_text = C.danger,
+            .color_text = .{ .color = C.danger },
         });
         return;
     }
@@ -223,7 +223,7 @@ fn renderMeter(v: *const View, st: *const wire.State, split: *f32, limit: *f32, 
         fonts.richLabel(@src(), "waiting for this host's card", .{
             .gravity_y = 0.5,
             .expand = .horizontal,
-            .color_text = C.text_dim,
+            .color_text = .{ .color = C.text_dim },
         });
         return;
     }

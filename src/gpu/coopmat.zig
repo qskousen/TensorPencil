@@ -730,7 +730,7 @@ pub fn buildGemmSharedI8(
     var regs_next: [32]u32 = undefined;
     if (!double_buf) {
         try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
-        const k0v_name = try std.fmt.allocPrint(gpa, "%t{d}", .{k0v});
+        const k0v_name = try gpa.print("%t{d}", .{k0v});
         defer gpa.free(k0v_name);
         const regs = try db.load(&em, k0v_name);
         try db.store(&em, regs);
@@ -742,7 +742,7 @@ pub fn buildGemmSharedI8(
         try em.line("%t{d} = OpULessThan %bool %t{d} %pk", .{ ok, kb });
         const kbc = em.id();
         try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %cu_0", .{ kbc, ok, kb });
-        const kbc_name = try std.fmt.allocPrint(gpa, "%t{d}", .{kbc});
+        const kbc_name = try gpa.print("%t{d}", .{kbc});
         defer gpa.free(kbc_name);
         regs_next = try db.load(&em, kbc_name);
     }
@@ -1138,11 +1138,11 @@ const PrepI8Emit = struct {
     padded: bool,
 
     fn tmp(p: PrepI8Emit, i: u32) ![]const u8 {
-        return std.fmt.allocPrint(p.ar, "%t{d}", .{i});
+        return p.ar.print("%t{d}", .{i});
     }
 
     fn cst(p: PrepI8Emit, v: u32) ![]const u8 {
-        return std.fmt.allocPrint(p.ar, "%cu_{d}", .{v});
+        return p.ar.print("%cu_{d}", .{v});
     }
 
     fn barrier(p: PrepI8Emit) !void {
@@ -1963,7 +1963,7 @@ pub fn buildIntWoPack(gpa: std.mem.Allocator, rows_per_tile: u32, rotate: bool, 
     const ar = arena_inst.allocator();
     const tmp = struct {
         fn f(a2: std.mem.Allocator, i: u32) ![]const u8 {
-            return std.fmt.allocPrint(a2, "%t{d}", .{i});
+            return a2.print("%t{d}", .{i});
         }
     }.f;
 
@@ -2447,7 +2447,7 @@ pub fn buildGemmShared(
         nl: *std.ArrayList([]u8),
         g: std.mem.Allocator,
         fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
-            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            const s = try self.g.print(fmt, args);
             try self.nl.append(self.g, s);
             return s;
         }
@@ -2564,7 +2564,7 @@ pub fn buildGemmShared(
         nl: *std.ArrayList([]u8),
         fn get(self: @This(), v: u32) ![]const u8 {
             if (self.m.get(v)) |n| return n;
-            const name = try std.fmt.allocPrint(self.g, "c_k{d}", .{v});
+            const name = try self.g.print("c_k{d}", .{v});
             try self.nl.append(self.g, name);
             try self.e.line("%{s} = OpConstant %u32 {d}", .{ name, v });
             try self.m.put(self.g, v, name);
@@ -3130,7 +3130,7 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
         nl: *std.ArrayList([]u8),
         g: std.mem.Allocator,
         fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
-            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            const s = try self.g.print(fmt, args);
             try self.nl.append(self.g, s);
             return s;
         }
@@ -3664,7 +3664,7 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]ali
         nl: *std.ArrayList([]u8),
         g: std.mem.Allocator,
         fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
-            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            const s = try self.g.print(fmt, args);
             try self.nl.append(self.g, s);
             return s;
         }

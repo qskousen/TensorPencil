@@ -159,7 +159,7 @@ pub const Api = struct {
     /// dlopen cuBLASLt and resolve every symbol. Prefers the versioned
     /// `/usr/local/cuda` `.so.13`, then the plain soname, then `.so.12`.
     pub fn load() Error!Api {
-        var lib = dynlib.openFirst(switch (builtin.os.tag) {
+        var lib = dynlib.openFirst(switch (builtin.target.os.tag) {
             .windows => &.{ "cublasLt64_13.dll", "cublasLt64_12.dll" },
             else => &.{
                 "/usr/local/cuda/lib64/libcublasLt.so.13",

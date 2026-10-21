@@ -424,7 +424,7 @@ const L = struct {
 
     fn vec(s: L, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
         var buf: [160]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&buf, fmt, args);
+        const nm = try std.mem.print(&buf, fmt, args);
         const v = s.store.get(nm) orelse {
             std.log.err("minimax_h3_vae_encode: missing tensor {s}", .{nm});
             return error.MissingTensor;
@@ -438,7 +438,7 @@ const L = struct {
 
     fn conv(s: L, comptime fmt: []const u8, args: anytype, k: usize, pad_t: usize, pad_h: usize, pad_w: usize) !Conv3d {
         var buf: [160]u8 = undefined;
-        const wn = try std.fmt.bufPrint(&buf, fmt ++ ".weight", args);
+        const wn = try std.mem.print(&buf, fmt ++ ".weight", args);
         const wv = s.store.get(wn) orelse {
             std.log.err("minimax_h3_vae_encode: missing tensor {s}", .{wn});
             return error.MissingTensor;
@@ -452,7 +452,7 @@ const L = struct {
             return error.ShapeMismatch;
         }
         var bn_buf: [160]u8 = undefined;
-        const bn = try std.fmt.bufPrint(&bn_buf, fmt ++ ".bias", args);
+        const bn = try std.mem.print(&bn_buf, fmt ++ ".bias", args);
         const bias = if (s.store.get(bn)) |bv| try s.vecOf(bv, out_ch) else null;
         return .{
             .w = try s.vecOf(wv, out_ch * in_ch * k * k * k),
@@ -953,7 +953,7 @@ test "a single frame convolves against the last temporal tap only" {
     // that lands on the frame is the LAST one; picking the first or the middle
     // is finite and wrong, and every reference image takes this path.
     const kt = 3;
-    var w = [_]f32{0} ** (1 * 1 * kt * 1 * 1);
+    var w: [(1 * 1 * kt * 1 * 1)]f32 = @splat(0);
     var x = [_]f32{7};
     var out = [_]f32{0};
     const xv: Vol = .{ .d = &x, .ch = 1, .t = 1, .h = 1, .w = 1 };
@@ -1066,10 +1066,10 @@ test "the encode matches the reference at a toy width" {
 
     for (cases) |c| {
         var buf: [64]u8 = undefined;
-        const x = try (store.get(try std.fmt.bufPrint(&buf, "in.{s}", .{c.name})) orelse
+        const x = try (store.get(try std.mem.print(&buf, "in.{s}", .{c.name})) orelse
             return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(x);
-        const want = try (store.get(try std.fmt.bufPrint(&buf, "out.{s}", .{c.name})) orelse
+        const want = try (store.get(try std.mem.print(&buf, "out.{s}", .{c.name})) orelse
             return error.MissingTensor).toF32Alloc(gpa);
         defer gpa.free(want);
 

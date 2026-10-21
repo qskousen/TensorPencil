@@ -93,7 +93,7 @@ const TxtScratch = struct {
         return s;
     }
     fn deinit(s: *TxtScratch, be: *Backend) void {
-        inline for (@typeInfo(TxtScratch).@"struct".fields) |f| be.tensorDestroy(&@field(s, f.name));
+        inline for (@typeInfo(TxtScratch).@"struct".field_names) |name| be.tensorDestroy(&@field(s, name));
     }
 };
 
@@ -378,8 +378,8 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        inline for (@typeInfo(Workspace).@"struct".fields) |f| {
-            if (f.type == DeviceBuffer) be.tensorDestroy(&@field(self, f.name));
+        inline for (@typeInfo(Workspace).@"struct".field_names, @typeInfo(Workspace).@"struct".field_types) |name, FieldType| {
+            if (FieldType == DeviceBuffer) be.tensorDestroy(&@field(self, name));
         }
     }
 };

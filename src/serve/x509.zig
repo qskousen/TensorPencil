@@ -67,7 +67,7 @@ pub const Der = struct {
         var lb: [3]u8 = undefined;
         const n = encodeLength(len, &lb);
         const dst = mark + 1 + n;
-        std.mem.copyForwards(u8, d.buf[dst .. dst + len], d.buf[content_start .. content_start + len]);
+        @memmove(d.buf[dst .. dst + len], d.buf[content_start .. content_start + len]);
         @memcpy(d.buf[mark + 1 ..][0..n], lb[0..n]);
         d.pos = dst + len;
     }
@@ -279,7 +279,7 @@ fn generalizedTime(secs: i64, out: *[15]u8) void {
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    _ = std.fmt.bufPrint(out, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{
+    _ = std.mem.print(out, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{
         yd.year,
         md.month.numeric(),
         @as(u8, md.day_index) + 1,
@@ -347,9 +347,9 @@ pub fn bundleFromDer(gpa: std.mem.Allocator, der: []const u8, now_sec: i64) !Cer
 const testing = std.testing;
 
 fn testIdentity(dns: []const []const u8) !Identity {
-    const seed = [_]u8{0x42} ** Ecdsa.KeyPair.seed_length;
+    const seed: [Ecdsa.KeyPair.seed_length]u8 = @splat(0x42);
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
-    return selfSignedWithSerial(testing.allocator, kp, [_]u8{0x11} ** 16, .{
+    return selfSignedWithSerial(testing.allocator, kp, @as([16]u8, @splat(0x11)), .{
         .common_name = "tp-serve test",
         .dns_names = dns,
         .not_before = 1_700_000_000,
@@ -360,7 +360,7 @@ fn testIdentity(dns: []const []const u8) !Identity {
 test "der length forms round-trip through std's element parser" {
     var buf: [70000]u8 = undefined;
     var d = Der.init(&buf);
-    const content = [_]u8{0xAB} ** 65000;
+    const content: [65000]u8 = @splat(0xAB);
     for ([_]usize{ 0, 1, 127, 128, 255, 256, 65000 }) |n| {
         d.pos = 0;
         try d.tlv(Tag.octetstring, content[0..n]);
@@ -430,9 +430,9 @@ test "self-signed certificate parses, verifies, and rejects tampering" {
     try testing.expectError(error.CertificateIssuerNotFound, bundle.verify(bad3, now));
 
     // A different key's certificate under the same name is not this pin.
-    const other_seed = [_]u8{0x43} ** Ecdsa.KeyPair.seed_length;
+    const other_seed: [Ecdsa.KeyPair.seed_length]u8 = @splat(0x43);
     const other_kp = try Ecdsa.KeyPair.generateDeterministic(other_seed);
-    var other = try selfSignedWithSerial(testing.allocator, other_kp, [_]u8{0x11} ** 16, .{
+    var other = try selfSignedWithSerial(testing.allocator, other_kp, @as([16]u8, @splat(0x11)), .{
         .common_name = "tp-serve test",
         .not_before = 1_700_000_000,
         .not_after = 2_000_000_000,

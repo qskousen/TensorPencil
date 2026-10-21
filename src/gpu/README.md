@@ -20,7 +20,7 @@ Root: `../gpu.zig`.
 The SPIR-V kernels (`matmul_f8`, `matmul_f32`, `transpose`, `eltwise`, ...) are
 compiled to `.spv` by the self-hosted backend and embedded via
 `@embedFile("<name>_spv")`. `kernels/dual.zig` (bodies in `kernels/dual/`) is
-additionally compiled to PTX (LLVM IR, `tools/ptx_unalias.zig`, `zig cc`) and
+additionally compiled to PTX by the LLVM backend and
 embedded as `dual_ptx` for the CUDA backend, so its kernels are written once for
 both arms; `kernels/dual_table.zig` is the entry table both hosts read.
 

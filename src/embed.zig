@@ -57,7 +57,7 @@ pub const TextEncoder = struct {
     /// `backend` selects CPU / Vulkan / CUDA (the GPU handle must outlive it).
     pub fn open(gpa: std.mem.Allocator, io: std.Io, kind: TextModelKind, dir: []const u8, backend: Backend) !TextEncoder {
         var pbuf: [1024]u8 = undefined;
-        const tok_path = try std.fmt.bufPrint(&pbuf, "{s}/tokenizer.json", .{dir});
+        const tok_path = try std.mem.print(&pbuf, "{s}/tokenizer.json", .{dir});
         const tok_bytes = try std.Io.Dir.cwd().readFileAlloc(io, tok_path, gpa, .limited(64 * 1024 * 1024));
         defer gpa.free(tok_bytes);
 
@@ -143,7 +143,7 @@ pub const TextEncoder = struct {
     fn frameText(self: *const TextEncoder, a: std.mem.Allocator, text: []const u8, opts: Options) ![]const u32 {
         const kind: TextModelKind = self.impl;
         const prefix = rolePrefix(kind, opts.role);
-        const prefixed = if (prefix.len == 0) text else try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, text });
+        const prefixed = if (prefix.len == 0) text else try a.print("{s}{s}", .{ prefix, text });
 
         var content: std.ArrayList(u32) = .empty;
         try self.tok.encode(a, prefixed, &content);

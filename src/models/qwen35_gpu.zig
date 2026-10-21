@@ -111,18 +111,18 @@ const Bufs = struct {
         };
         var s: Bufs = undefined;
         var done: usize = 0;
-        errdefer inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-            if (i < done) ctx.tensorDestroy(&@field(s, f.name));
+        errdefer inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+            if (i < done) ctx.tensorDestroy(&@field(s, name));
         };
-        inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
-            @field(s, f.name) = try ctx.tensorCreate(sizes[i] * 4);
+        inline for (@typeInfo(Bufs).@"struct".field_names, 0..) |name, i| {
+            @field(s, name) = try ctx.tensorCreate(sizes[i] * 4);
             done = i + 1;
         }
         return s;
     }
 
     fn deinit(s: *Bufs, ctx: *gpu.Context) void {
-        inline for (@typeInfo(Bufs).@"struct".fields) |f| ctx.tensorDestroy(&@field(s, f.name));
+        inline for (@typeInfo(Bufs).@"struct".field_names) |name| ctx.tensorDestroy(&@field(s, name));
     }
 };
 
@@ -607,7 +607,7 @@ pub const VulkanLM = struct {
     /// layouts, real turns read. The context is emptied after.
     pub fn warmWeights(self: *VulkanLM) void {
         if (self.len != 0) return;
-        const zeros = [_]u32{0} ** 32;
+        const zeros: [32]u32 = @splat(0);
         const n = @min(zeros.len, self.capacity - 1);
         self.prefill(zeros[0..n]) catch |err| std.log.warn("qwen35 vulkan warm-up: {t}", .{err});
         self.stepOne(0) catch |err| std.log.warn("qwen35 vulkan warm-up: {t}", .{err});

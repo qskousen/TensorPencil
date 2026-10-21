@@ -58,7 +58,7 @@ pub const Target = struct {
 };
 
 /// LoRA stem -> target, in insertion order so a merge walks it reproducibly.
-pub const KeyMap = std.StringArrayHashMapUnmanaged(Target);
+pub const KeyMap = std.array_hash_map.String(Target);
 
 /// The component stores a merge reads, and the UNet layout the diffusers names
 /// derive from.
@@ -122,7 +122,7 @@ pub fn unetToDiffusers(arena: std.mem.Allocator, cfg: sd_unet.Config) ![]Pair {
     const nrb = cfg.layers_per_block;
     const P = struct {
         fn add(a: std.mem.Allocator, list: *std.ArrayList(Pair), comptime df: []const u8, dargs: anytype, comptime lf: []const u8, largs: anytype) !void {
-            try list.append(a, .{ .diffusers = try std.fmt.allocPrint(a, df, dargs), .ldm = try std.fmt.allocPrint(a, lf, largs) });
+            try list.append(a, .{ .diffusers = try a.print(df, dargs), .ldm = try a.print(lf, largs) });
         }
     };
     for (0..levels) |x| {
@@ -184,7 +184,7 @@ const clip_map = [_][2][]const u8{
 };
 
 fn underscored(arena: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]u8 {
-    const out = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, name });
+    const out = try arena.print("{s}{s}", .{ prefix, name });
     std.mem.replaceScalar(u8, out[prefix.len..], '.', '_');
     return out;
 }
@@ -200,7 +200,7 @@ fn openClipTarget(arena: std.mem.Allocator, b: usize, hf: []const u8, hidden: us
     const qkv = [_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj" };
     for (qkv, 0..) |q, i| if (std.mem.eql(u8, hf, q)) return .{
         .comp = .clip_g,
-        .name = try std.fmt.allocPrint(arena, "transformer.resblocks.{d}.attn.in_proj_weight", .{b}),
+        .name = try arena.print("transformer.resblocks.{d}.attn.in_proj_weight", .{b}),
         .row_off = i * hidden,
         .rows = hidden,
     };
@@ -211,7 +211,7 @@ fn openClipTarget(arena: std.mem.Allocator, b: usize, hf: []const u8, hidden: us
     };
     for (rest) |r| if (std.mem.eql(u8, hf, r[0])) return .{
         .comp = .clip_g,
-        .name = try std.fmt.allocPrint(arena, "transformer.resblocks.{d}.{s}.weight", .{ b, r[1] }),
+        .name = try arena.print("transformer.resblocks.{d}.{s}.weight", .{ b, r[1] }),
     };
     unreachable;
 }
@@ -226,7 +226,7 @@ pub fn keyMap(arena: std.mem.Allocator, m: Model) !KeyMap {
         const base = stripWeight(name) orelse continue;
         const t: Target = .{ .comp = .unet, .name = name };
         try map.put(arena, try underscored(arena, "lora_unet_", base), t);
-        try map.put(arena, try std.fmt.allocPrint(arena, "diffusion_model.{s}", .{base}), t);
+        try map.put(arena, try arena.print("diffusion_model.{s}", .{base}), t);
     }
     // UNet, diffusers names, only where the LDM tensor exists.
     for (try unetToDiffusers(arena, m.unet_cfg)) |p| {
@@ -238,29 +238,29 @@ pub fn keyMap(arena: std.mem.Allocator, m: Model) !KeyMap {
         for ([_][]const u8{ "", "unet." }) |pfx| {
             const proc = try std.mem.replaceOwned(u8, arena, base, ".to_", ".processor.to_");
             const key = if (std.mem.endsWith(u8, proc, ".to_out.0")) proc[0 .. proc.len - 2] else proc;
-            try map.put(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ pfx, key }), t);
+            try map.put(arena, try arena.print("{s}{s}", .{ pfx, key }), t);
         }
     }
     // CLIP-L, always HF naming relative to `text_model.`. `lora_te_` reaches it
     // on SDXL too, as in the reference.
     if (m.clip_l) |st| for (0..m.clip_l_layers) |b| for (clip_map) |c| {
-        const name = try std.fmt.allocPrint(arena, "encoder.layers.{d}.{s}.weight", .{ b, c[0] });
+        const name = try arena.print("encoder.layers.{d}.{s}.weight", .{ b, c[0] });
         if (st.get(name) == null) continue;
         const t: Target = .{ .comp = .clip_l, .name = name };
-        try map.put(arena, try std.fmt.allocPrint(arena, "lora_te_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
-        try map.put(arena, try std.fmt.allocPrint(arena, "lora_te1_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
-        try map.put(arena, try std.fmt.allocPrint(arena, "text_encoder.text_model.encoder.layers.{d}.{s}", .{ b, c[0] }), t);
+        try map.put(arena, try arena.print("lora_te_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
+        try map.put(arena, try arena.print("lora_te1_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
+        try map.put(arena, try arena.print("text_encoder.text_model.encoder.layers.{d}.{s}", .{ b, c[0] }), t);
     };
     if (m.clip_g) |st| {
         const open_clip = st.get("transformer.resblocks.0.attn.in_proj_weight") != null;
         for (0..m.clip_g_layers) |b| for (clip_map) |c| {
             const t = if (open_clip) try openClipTarget(arena, b, c[0], m.clip_g_hidden) else Target{
                 .comp = .clip_g,
-                .name = try std.fmt.allocPrint(arena, "encoder.layers.{d}.{s}.weight", .{ b, c[0] }),
+                .name = try arena.print("encoder.layers.{d}.{s}.weight", .{ b, c[0] }),
             };
             if (st.get(t.name) == null) continue;
-            try map.put(arena, try std.fmt.allocPrint(arena, "lora_te2_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
-            try map.put(arena, try std.fmt.allocPrint(arena, "text_encoder_2.text_model.encoder.layers.{d}.{s}", .{ b, c[0] }), t);
+            try map.put(arena, try arena.print("lora_te2_text_model_encoder_layers_{d}_{s}", .{ b, c[1] }), t);
+            try map.put(arena, try arena.print("text_encoder_2.text_model.encoder.layers.{d}.{s}", .{ b, c[0] }), t);
         };
     }
     return map;
@@ -296,7 +296,7 @@ fn sdFitsIn(a: std.mem.Allocator, store: WeightStore, cfg: sd_unet.Config) !bool
     const sdxl = cfg.context_dim == sd_unet.sdxl.context_dim;
     for (store.names()) |name| {
         // A kohya stem carries no dots, so the key up to its first is the stem.
-        const stem = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+        const stem = name[0 .. std.mem.findScalar(u8, name, '.') orelse name.len];
         if (std.mem.startsWith(u8, stem, "lora_unet_") and !kohya.contains(stem)) return false;
         if (!sdxl and std.mem.startsWith(u8, stem, "lora_te2_")) return false;
     }
@@ -310,11 +310,11 @@ fn sdFitsIn(a: std.mem.Allocator, store: WeightStore, cfg: sd_unet.Config) !bool
         const proc = try std.mem.replaceOwned(u8, a, dif, ".to_", ".processor.to_");
         const stems = [_][]const u8{
             try underscored(a, "lora_unet_", ldm),
-            try std.fmt.allocPrint(a, "diffusion_model.{s}", .{ldm}),
+            try a.print("diffusion_model.{s}", .{ldm}),
             try underscored(a, "lora_unet_", dif),
             try underscored(a, "lycoris_", dif),
             proc,
-            try std.fmt.allocPrint(a, "unet.{s}", .{proc}),
+            try a.print("unet.{s}", .{proc}),
         };
         for (stems) |stem| {
             const in_dim = stemInput(store, &buf, stem) orelse continue;
@@ -335,7 +335,7 @@ pub fn sidecarTakes(store: WeightStore) bool {
     var dora = false;
     for (store.names()) |n| {
         for (no_sidecar) |sfx| if (std.mem.endsWith(u8, n, sfx)) return false;
-        if (std.mem.indexOf(u8, n, ".lokr_") != null) lokr = true;
+        if (std.mem.find(u8, n, ".lokr_") != null) lokr = true;
         if (std.mem.endsWith(u8, n, ".dora_scale")) dora = true;
     }
     return !(lokr and dora);
@@ -345,12 +345,12 @@ pub fn sidecarTakes(store: WeightStore) bool {
 /// (LoKr), or null when the file does not patch it.
 fn stemInput(store: WeightStore, buf: []u8, stem: []const u8) ?usize {
     for (input_factors) |sfx| {
-        const v = store.get(std.fmt.bufPrint(buf, "{s}{s}", .{ stem, sfx }) catch return null) orelse continue;
+        const v = store.get(std.mem.print(buf, "{s}{s}", .{ stem, sfx }) catch return null) orelse continue;
         const sh = v.info.shape.slice();
         return if (sh.len >= 2) sh[1] else 0;
     }
     for ([_][]const u8{ ".lokr_w1", ".lokr_w1_a", ".lokr_w2", ".lokr_w2_a" }) |sfx| {
-        if (store.get(std.fmt.bufPrint(buf, "{s}{s}", .{ stem, sfx }) catch return null) != null) return 0;
+        if (store.get(std.mem.print(buf, "{s}{s}", .{ stem, sfx }) catch return null) != null) return 0;
     }
     return null;
 }
@@ -388,7 +388,7 @@ pub const Merged = struct {
     /// The store a component loads from: its overlay, or `base` when nothing
     /// patched it.
     pub fn store(self: *const Merged, c: Component, base: WeightStore) WeightStore {
-        return if (self.overlays[@intFromEnum(c)]) |ov| ov.store() else base;
+        return if (self.overlays[@backingInt(c)]) |ov| ov.store() else base;
     }
 };
 
@@ -421,7 +421,7 @@ pub fn merge(gpa: std.mem.Allocator, io: std.Io, m: Model, files: []const File) 
     const map = try keyMap(sa, m);
 
     // Per component, tensor name -> its hits in file order.
-    var per: [3]std.StringArrayHashMapUnmanaged(std.ArrayList(Hit)) = .{ .empty, .empty, .empty };
+    var per: [3]std.array_hash_map.String(std.ArrayList(Hit)) = .{ .empty, .empty, .empty };
     for (files, 0..) |f, fi| {
         var consumed: Consumed = .empty;
         defer consumed.deinit(gpa);
@@ -437,7 +437,7 @@ pub fn merge(gpa: std.mem.Allocator, io: std.Io, m: Model, files: []const File) 
                     return err;
                 },
             } orelse continue;
-            const gop = try per[@intFromEnum(e.value_ptr.comp)].getOrPut(sa, e.value_ptr.name);
+            const gop = try per[@backingInt(e.value_ptr.comp)].getOrPut(sa, e.value_ptr.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(sa, .{ .file = @intCast(fi), .target = e.value_ptr.*, .patch = p });
             result.applied[fi] += 1;
@@ -462,7 +462,7 @@ pub fn merge(gpa: std.mem.Allocator, io: std.Io, m: Model, files: []const File) 
     var jobs: std.ArrayList(Job) = .empty;
     for (&per, 0..) |*comp_jobs, ci| {
         if (comp_jobs.count() == 0) continue;
-        const base = m.store(@enumFromInt(ci)).?;
+        const base = m.store(@fromBackingInt(@intCast(ci))).?;
         const ov = try gpa.create(Overlay);
         ov.* = .{ .base = base };
         result.overlays[ci] = ov;
@@ -605,7 +605,7 @@ pub fn sidecars(gpa: std.mem.Allocator, m: Model, store: WeightStore, path: []co
         diffs: std.ArrayList(lora_mod.Diff) = .empty,
         dora: ?lora_mod.Dora = null,
     };
-    var targets: [3]std.StringArrayHashMapUnmanaged(Terms) = .{ .empty, .empty, .empty };
+    var targets: [3]std.array_hash_map.String(Terms) = .{ .empty, .empty, .empty };
     var keys: [3]std.StringHashMapUnmanaged(u8) = .{ .empty, .empty, .empty };
 
     var consumed: Consumed = .empty;
@@ -624,7 +624,7 @@ pub fn sidecars(gpa: std.mem.Allocator, m: Model, store: WeightStore, path: []co
             std.log.err("lora: {s}: {s} is DoRA on a row block of a fused tensor, whose norms span the whole tensor", .{ path, e.key_ptr.* });
             return error.UnsupportedLora;
         }
-        const ci = @intFromEnum(t.comp);
+        const ci = @backingInt(t.comp);
         if (arenas[ci] == null) arenas[ci] = .init(gpa);
         const alloc = arenas[ci].?.allocator();
         const base = m.store(t.comp).?.get(t.name).?;
@@ -672,7 +672,7 @@ pub fn sidecars(gpa: std.mem.Allocator, m: Model, store: WeightStore, path: []co
         var index: std.StringHashMapUnmanaged(lora_mod.Target) = .empty;
         var tit = tm.iterator();
         while (tit.next()) |e| {
-            const v = m.store(@enumFromInt(ci)).?.get(e.key_ptr.*).?;
+            const v = m.store(@fromBackingInt(@intCast(ci))).?.get(e.key_ptr.*).?;
             const shape = v.info.shape.slice();
             const name = try alloc.dupe(u8, e.key_ptr.*);
             try index.put(alloc, name, .{

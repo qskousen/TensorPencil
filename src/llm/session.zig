@@ -49,7 +49,7 @@ pub const Stats = struct {
     /// so callers can splice it into a stats line uniformly.
     pub fn vramSuffix(self: Stats, buf: []u8) []const u8 {
         const mb = (self.vram orelse return "") >> 20;
-        return std.fmt.bufPrint(buf, ", vram {d} MiB", .{mb}) catch "";
+        return std.mem.print(buf, ", vram {d} MiB", .{mb}) catch "";
     }
 };
 
@@ -102,9 +102,9 @@ pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f
 /// Per-category device profile rows (`--profile`), one line per non-empty
 /// CUDA op category. The caller prints any header and flushes.
 pub fn printCudaProfile(stdout: *std.Io.Writer, be: *const cuda.Backend) !void {
-    inline for (@typeInfo(cuda.Backend.ProfCat).@"enum".fields, 0..) |f, ci| {
+    inline for (@typeInfo(cuda.Backend.ProfCat).@"enum".field_names, 0..) |name, ci| {
         if (be.prof.n[ci] > 0)
-            try stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ f.name, be.prof.ms[ci], be.prof.n[ci] });
+            try stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ name, be.prof.ms[ci], be.prof.n[ci] });
     }
 }
 
@@ -343,26 +343,12 @@ pub fn run(
             return driver.drive(&model);
         },
         .@"zig-cuda", .cuda => {
-            // Weights never stream: an OOM anywhere below means the model (plus
-            // KV/activations) genuinely doesn't fit resident, point at the CPU
-            // split instead of failing silently.
-            errdefer |err| if (err == error.DeviceOutOfMemory) {
-                stdout.writeAll("\n[out of device VRAM: LLM weights never stream — rerun with --vram-budget <GiB> and --cpu-layers/--offload-grow to run part of the model on the CPU]\n") catch {};
-                stdout.flush() catch {};
-            };
-            var model = try S.buildCuda(gpa, dev.cu_be.?, lm, cap, first_seq);
+            // Weights never stream: an OOM here means the model (plus KV and
+            // activations) genuinely doesn't fit resident, so point at the CPU split.
+            const oom = "\n[out of device VRAM: LLM weights never stream - rerun with --vram-budget <GiB> and --cpu-layers/--offload-grow to run part of the model on the CPU]\n";
+            var model = S.buildCuda(gpa, dev.cu_be.?, lm, cap, first_seq) catch |err| return reportOom(err, stdout, oom);
             defer model.deinit();
-            // Prefill may arm a CPU split on VRAM pressure (auto-offload), whose
-            // host layers need `io`; set it before prefill, not just at decode.
-            if (@hasField(@TypeOf(model), "io")) model.io = io;
-            // Upload the weights BEFORE the first forward. `cachedWeight` is
-            // lazy, so without this the one-time host->device copy of every weight
-            // is charged to prefill, inflating `pp` and making it incomparable to
-            // llama.cpp, which offloads at load time and reports that separately.
-            // Opt-in per stepper; those without the decl keep the old behaviour.
-            if (@hasDecl(@TypeOf(model), "warmWeights")) model.warmWeights();
-            try prefiller.prefill(&model);
-            return driver.drive(&model);
+            return prefillAndDrive(&model, io, prefiller, driver) catch |err| reportOom(err, stdout, oom);
         },
         .vulkan => {
             if (comptime S.Vulkan == void) {
@@ -373,21 +359,36 @@ pub fn run(
                 // LLM weights never stream: pin everything; what does not fit moves
                 // to the host through the stepper's own split.
                 ctx.pin_budget = std.math.maxInt(u64);
-                errdefer |err| if (err == error.DeviceOutOfMemory) {
-                    stdout.writeAll("\n[out of device VRAM: this model doesn't fit resident]\n") catch {};
-                    stdout.flush() catch {};
-                };
-                var model = try S.buildVulkan(gpa, ctx, lm, cap, first_seq);
+                const oom = "\n[out of device VRAM: this model doesn't fit resident]\n";
+                var model = S.buildVulkan(gpa, ctx, lm, cap, first_seq) catch |err| return reportOom(err, stdout, oom);
                 defer model.deinit();
-                // As the CUDA branch: host layers need `io` from the first forward, and
-                // the one-time weight upload is not the prefill's.
-                if (@hasField(@TypeOf(model), "io")) model.io = io;
-                if (@hasDecl(@TypeOf(model), "warmWeights")) model.warmWeights();
-                try prefiller.prefill(&model);
-                return driver.drive(&model);
+                return prefillAndDrive(&model, io, prefiller, driver) catch |err| reportOom(err, stdout, oom);
             }
         },
     }
+}
+
+/// The device arms of `run` after the stepper is built.
+fn prefillAndDrive(model: anytype, io: std.Io, prefiller: anytype, driver: anytype) !RunResult {
+    // Prefill may arm a CPU split on VRAM pressure (auto-offload), whose host
+    // layers need `io`; set it before prefill, not just at decode.
+    if (@hasField(@TypeOf(model.*), "io")) model.io = io;
+    // Upload the weights BEFORE the first forward. `cachedWeight` is lazy, so
+    // without this the one-time host->device copy of every weight is charged to
+    // prefill, inflating `pp` and making it incomparable to llama.cpp, which
+    // offloads at load time and reports that separately.
+    if (@hasDecl(@TypeOf(model.*), "warmWeights")) model.warmWeights();
+    try prefiller.prefill(model);
+    return driver.drive(model);
+}
+
+/// Prints `msg` when `err` is a device OOM, and hands `err` back.
+fn reportOom(err: anytype, stdout: *std.Io.Writer, msg: []const u8) @TypeOf(err) {
+    if (err == error.DeviceOutOfMemory) {
+        stdout.writeAll(msg) catch {};
+        stdout.flush() catch {};
+    }
+    return err;
 }
 
 /// A no-op `prefiller` for text-only sessions (no image to interleave).
@@ -544,7 +545,7 @@ fn testGguf(gpa: std.mem.Allocator, arch: []const u8, type_id: u32, n: usize) ![
     try b.kvStr("general.architecture", arch);
     var buf: [64]u8 = undefined;
     for (0..n) |i| {
-        const name = try std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{i});
+        const name = try std.mem.print(&buf, "blk.{d}.ffn_down.weight", .{i});
         try b.tensor(name, &.{ 256, 2 }, type_id, 0);
     }
     try b.tensor("blk.0.ffn_norm.weight", &.{256}, 0, 0); // f32

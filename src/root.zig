@@ -5,6 +5,7 @@
 const std = @import("std");
 
 pub const init_defaults = @import("tp_core").init_defaults;
+pub const strings = @import("tp_core").strings;
 pub const dtype = @import("tp_core").dtype;
 pub const tensor = @import("tp_core").tensor;
 pub const filemap = @import("tp_core").filemap;

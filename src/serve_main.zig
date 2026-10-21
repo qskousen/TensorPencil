@@ -128,7 +128,7 @@ const Ctx = struct {
     /// own folders, so the empty request is the whole message).
     fn fileAdded(ctx: *anyopaque, path: []const u8) void {
         const self: *Ctx = @ptrCast(@alignCast(ctx));
-        log.info("received {s}", .{std.fs.path.basename(path)});
+        log.info("received {s}", .{std.Io.Dir.path.basename(path)});
         self.host.postRequest(.{ .scan = .{} });
     }
 
@@ -290,7 +290,7 @@ fn remoteSetup(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, environ
     const host = ra.pair_host orelse try hostName(arena);
     // One write: stderr logging from other threads must not land inside the
     // line a user is about to copy.
-    const line = try std.fmt.allocPrint(arena, "pair {s}\n", .{try pairing.pairingAlloc(arena, io, p, host, ra.bind.port, token)});
+    const line = try arena.print("pair {s}\n", .{try pairing.pairingAlloc(arena, io, p, host, ra.bind.port, token)});
     try out.writeAll(line);
     try out.flush();
     return r;
@@ -299,7 +299,7 @@ fn remoteSetup(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, environ
 /// The machine's own name, what a pairing string names when nothing better is
 /// given.
 fn hostName(arena: std.mem.Allocator) ![]const u8 {
-    if (builtin.os.tag == .windows) return "localhost";
+    if (builtin.target.os.tag == .windows) return "localhost";
     var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const name = std.posix.gethostname(&buf) catch return "localhost";
     return arena.dupe(u8, name);

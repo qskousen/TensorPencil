@@ -962,7 +962,7 @@ test "q8_0 quantize: scale, values, and integer exactness" {
     try std.testing.expectEqualSlices(f32, &src, &out);
 
     // All-zero block: d == 0, quants 0, expands to exact zeros.
-    const zeros = [_]f32{0} ** 32;
+    const zeros: [32]f32 = @splat(0);
     packQ80(&buf, 0, &zeros);
     unpackQ80(out[0..32], &buf, 0, 32);
     try std.testing.expectEqualSlices(f32, &zeros, out[0..32]);

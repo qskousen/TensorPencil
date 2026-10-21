@@ -31,7 +31,7 @@ pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMe
 pub const ForeignReclaim = @import("../context.zig").ForeignReclaim;
 
 /// io/allocator-free env-var presence check (std.posix.getenv / std.os.environ
-/// are gone in 0.16; we link libc, so call getenv directly).
+/// are gone; we link libc, so call getenv directly).
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn envSet(name: [*:0]const u8) bool {
     return getenv(name) != null;
@@ -124,7 +124,7 @@ pub const DeviceBuffer = struct {
     dt: Dt = .f32,
 
     pub fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
-        return @intFromEnum(self.buf);
+        return @backingInt(self.buf);
     }
 
     /// The same memory read as `dt`.
@@ -156,7 +156,7 @@ pub const DeviceBuffer = struct {
 };
 
 fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
-    return .{ .buf = @enumFromInt(p), .mem = .null_handle, .size = size };
+    return .{ .buf = @fromBackingInt(@intCast(p)), .mem = .null_handle, .size = size };
 }
 
 /// A non-owning view of `b` offset `off` bytes in (for a kernel launch that
@@ -165,7 +165,7 @@ fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
 /// Public so a model file can drive a per-item launch over a batched activation,
 /// `clip_text_cuda` runs one causal `attn` per prompt chunk this way.
 pub fn dbOffset(b: DeviceBuffer, off: u64) DeviceBuffer {
-    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0, .dt = b.dt };
+    return .{ .buf = @fromBackingInt(@intCast(@backingInt(b.buf) + off)), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0, .dt = b.dt };
 }
 
 /// Push constants for eltwise/attention kernels (matches the Vulkan EltPush).
@@ -350,7 +350,7 @@ pub const Backend = struct {
     /// per-weight completion event the compute stream waits on.
     async_uploads: bool = false,
     /// evicted-but-not-yet-freed weight buffers (deferred free; async path only).
-    free_pending: std.ArrayListUnmanaged(PendingFree) = .empty,
+    free_pending: std.ArrayList(PendingFree) = .empty,
     /// Bytes held by free_pending. Counted as available by reserveForWeights:
     /// deferred frees keep device_used inflated until their events signal, and
     /// without this credit the headroom loop would evict the entire unpinned
@@ -361,7 +361,7 @@ pub const Backend = struct {
     /// cuMemAlloc/cuMemFree cost ~0.3-1 ms each under an active DMA queue,
     /// per-token churn was 2x slower than the transfers themselves. Buffers
     /// here still count in ctx.device_used (they are still held).
-    weight_pool: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(DeviceBuffer)) = .empty,
+    weight_pool: std.AutoHashMapUnmanaged(u64, std.ArrayList(DeviceBuffer)) = .empty,
     /// Total bytes in streamed circulation (unpinned cache entries + deferred
     /// frees + pool), diffusion streaming accounting; always 0 under the LLM
     /// pin-all mode.
@@ -519,7 +519,7 @@ pub const Backend = struct {
 
     // cached PTX modules / functions.
     prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty, // keyed by cols
-    prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    prep_owned: std.ArrayList(ctxmod.Module) = .empty,
     fused_mod: ?ctxmod.Module = null,
     fused_fn: cu.CUfunction = null,
     // irescale (s32 acc * act_scale[row] * weight_scale[col]) for the cuBLASLt int8
@@ -546,10 +546,10 @@ pub const Backend = struct {
     /// property of the weight, so it is computed on first use and kept; only an
     /// activation's has to be recomputed every call.
     bq_scales: std.AutoHashMapUnmanaged(BqScaleKey, DeviceBuffer) = .empty,
-    bq_mods_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    bq_mods_owned: std.ArrayList(ctxmod.Module) = .empty,
     // int4 (W4A4) variants: prep quantizes to s4 and the GEMM is m16n8k64.s4.
     i4_prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
-    i4_prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    i4_prep_owned: std.ArrayList(ctxmod.Module) = .empty,
     i4_fused_mod: ?ctxmod.Module = null,
     i4_fused_fn: cu.CUfunction = null,
     mm_mod: ?ctxmod.Module = null,
@@ -613,7 +613,7 @@ pub const Backend = struct {
 
     // eltwise module cache: PTX string pointer -> function.
     elt_fns: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
-    elt_mods: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    elt_mods: std.ArrayList(ctxmod.Module) = .empty,
     // The dual-target kernel module (gpu/kernels/dual.zig, one PTX text with
     // many entries) and its functions by entry name.
     dual_mod: ?ctxmod.Module = null,
@@ -632,7 +632,7 @@ pub const Backend = struct {
     pub const ProfCat = enum { matmul, dequant, prep, attn, elt, attn_scores, attn_softmax, attn_pv };
     pub const Prof = struct {
         /// Sized from ProfCat so adding a category can't desync the arrays.
-        const ncat = @typeInfo(ProfCat).@"enum".fields.len;
+        const ncat = @typeInfo(ProfCat).@"enum".field_names.len;
         ms: [ncat]f64 = @splat(0),
         n: [ncat]u32 = @splat(0),
         pub fn reset(self: *Prof) void {
@@ -680,8 +680,8 @@ pub const Backend = struct {
         if (!self.profile) return;
         if (self.ptimer) |t| {
             const ms = self.ctx.timerEndMs(t) catch return;
-            self.prof.ms[@intFromEnum(c)] += ms;
-            self.prof.n[@intFromEnum(c)] += 1;
+            self.prof.ms[@backingInt(c)] += ms;
+            self.prof.n[@backingInt(c)] += 1;
         }
     }
 
@@ -1289,7 +1289,7 @@ pub const Backend = struct {
     pub fn enableLlmMemTags(self: *Backend) void {
         self.ctx.track_tags = true;
         self.weight_tag = .lm_weights;
-        self.ctx.mem_tag_used[@intFromEnum(ctxmod.MemTag.other)] = self.ctx.device_used;
+        self.ctx.mem_tag_used[@backingInt(ctxmod.MemTag.other)] = self.ctx.device_used;
         self.ctx.mem_tag = .lm_act;
     }
 
@@ -1325,7 +1325,7 @@ pub const Backend = struct {
     /// at rather than one hidden inside a component.
     pub fn memTagBreakdown(self: *Backend) [ctxmod.MemTag.count]u64 {
         var out: [ctxmod.MemTag.count]u64 = @splat(0);
-        for (&out, 0..) |*v, i| v.* = self.ctx.memTagUsed(@enumFromInt(i));
+        for (&out, 0..) |*v, i| v.* = self.ctx.memTagUsed(@fromBackingInt(@intCast(i)));
         return out;
     }
 
@@ -1398,7 +1398,7 @@ pub const Backend = struct {
     fn derivedKey(bytes: []const u8, out: Dt) usize {
         const a = @intFromPtr(bytes.ptr);
         std.debug.assert(a & ~key_addr_mask == 0);
-        return a | (@as(usize, @intFromEnum(out) + 1) << 56);
+        return a | (@as(usize, @backingInt(out) + 1) << 56);
     }
 
     fn evictWeightKey(self: *Backend, key: usize) void {
@@ -1760,7 +1760,7 @@ pub const Backend = struct {
     pub const GrowableTensor = struct {
         buf: DeviceBuffer = .{},
         va_size: u64 = 0,
-        handles: std.ArrayListUnmanaged(cu.CUmemGenericAllocationHandle) = .empty,
+        handles: std.ArrayList(cu.CUmemGenericAllocationHandle) = .empty,
     };
 
     /// Every growable buffer in the engine is a K/V cache (or recurrent state),
@@ -2037,7 +2037,7 @@ pub const Backend = struct {
         self.weight_scope = false;
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
-        var doomed: std.ArrayListUnmanaged(usize) = .empty;
+        var doomed: std.ArrayList(usize) = .empty;
         defer doomed.deinit(self.gpa);
         var it = self.weights.iterator();
         while (it.next()) |e| {
@@ -2064,7 +2064,7 @@ pub const Backend = struct {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream); // in-flight prefetch DMAs
         self.drainPending();
-        var doomed: std.ArrayListUnmanaged(usize) = .empty;
+        var doomed: std.ArrayList(usize) = .empty;
         defer doomed.deinit(self.gpa);
         var it = self.weights.iterator();
         while (it.next()) |e| {
@@ -2089,7 +2089,7 @@ pub const Backend = struct {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
         self.drainPending();
         const Candidate = struct { key: usize, last_use: u64 };
-        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        var candidates: std.ArrayList(Candidate) = .empty;
         defer candidates.deinit(self.gpa);
         var it = self.weights.iterator();
         while (it.next()) |e| {
@@ -2312,7 +2312,7 @@ pub const Backend = struct {
     // ---- int8 GEMM pair -----------------------------------------------------
 
     fn prepFn(self: *Backend, cols: usize, in_dt: Dt, rotate: bool, stage_global: bool) Error!cu.CUfunction {
-        const key = cols | (@as(usize, @intFromEnum(in_dt)) << 43) |
+        const key = cols | (@as(usize, @backingInt(in_dt)) << 43) |
             (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
             (if (stage_global) @as(usize, 1) << 42 else 0); // variants keyed separately
         if (self.prep_mods.get(key)) |f| return f;
@@ -3099,7 +3099,7 @@ pub const Backend = struct {
         const ptx = kernels.buildMmqPipeQ2_0(self.gpa, g) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var name_buf: [32]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&name_buf, "mmq_pipe_q2_0_{s}", .{g.tag}) catch unreachable;
+        const name = std.mem.printSentinel(&name_buf, "mmq_pipe_q2_0_{s}", .{g.tag}, 0) catch unreachable;
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.mmq_pipe2_fn[i] = mod.getFunction(self.ctx, name) catch return error.CudaError;
         self.mmq_pipe2_mod[i] = mod;
@@ -3973,7 +3973,7 @@ pub const Backend = struct {
     }
 
     fn attnGroupFn(self: *Backend, hd: usize, group: usize, kv_fmt: KvFmt) Error!cu.CUfunction {
-        const key = (hd * 32 + group) * 4 + @intFromEnum(kv_fmt);
+        const key = (hd * 32 + group) * 4 + @backingInt(kv_fmt);
         if (self.attn_g_mod != null and self.attn_g_group == key) return self.attn_g_fn;
         if (self.attn_g_mod) |m| m.unload(self.ctx); // a different group is a different kernel
         self.attn_g_mod = null;
@@ -4589,7 +4589,7 @@ pub const Backend = struct {
     }
 
     fn irescaleFn(self: *Backend, out: Dt) Error!cu.CUfunction {
-        const slot = @intFromEnum(out);
+        const slot = @backingInt(out);
         if (self.irescale_mods[slot] != null) return self.irescale_fns[slot];
         const src = switch (out) {
             inline else => |d| comptime kernels.irescalePtx(d),
@@ -4886,7 +4886,7 @@ pub const Backend = struct {
 
     /// Fetch/build the cached cuDNN fused int8-GEMM+dequant plan for this shape.
     fn mdqPlan(self: *Backend, m: usize, n: usize, k: usize, d: Dt) Error!cudnn.MatmulDequantPlan {
-        const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 23) | (@as(u64, k) << 2) | @intFromEnum(d);
+        const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 23) | (@as(u64, k) << 2) | @backingInt(d);
         if (self.mdq_plans.get(key)) |p| return p;
         const L = &self.libs.?;
         const p = cudnn.MatmulDequantPlan.build(&L.dnn, try self.dnnHandle(), m, n, k, d) catch return error.CudaError;
@@ -5011,7 +5011,7 @@ pub const Backend = struct {
     /// change the emitted PTX, so all three have to be in the key.
     fn bqKey(cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) usize {
         return cols | (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
-            (@as(usize, @intFromEnum(block)) << 42) | (if (bits == 4) @as(usize, 1) << 46 else 0);
+            (@as(usize, @backingInt(block)) << 42) | (if (bits == 4) @as(usize, 1) << 46 else 0);
     }
 
     fn bqPrepFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
@@ -9789,7 +9789,7 @@ test "tree flash-decode attention matches CPU reference" {
 
     // Meta table: [kv_len, anc_0..] per query, stride n+1, at the scratch tail.
     const meta_off = n * n_heads * nsplit * (hd + 4);
-    var meta = [_]u32{0} ** (n * (n + 1));
+    var meta: [n * (n + 1)]u32 = @splat(0);
     var depth: [n]usize = undefined;
     depth[0] = 0;
     for (parents[1..], 1..) |p, i| depth[i] = depth[p] + 1;
@@ -9819,7 +9819,7 @@ test "tree flash-decode attention matches CPU reference" {
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
     const meta_dst: DeviceBuffer = .{
-        .buf = @enumFromInt(@intFromEnum(scratch_d.buf) + meta_off * 4),
+        .buf = @fromBackingInt(@intCast(@backingInt(scratch_d.buf) + meta_off * 4)),
         .mem = scratch_d.mem,
         .size = meta.len * 4,
     };

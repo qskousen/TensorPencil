@@ -380,7 +380,7 @@ test "the resampler matches torchaudio at its defaults" {
     const phases = [_]usize{ 2, 320, 2 };
     for (cases, widths, phases) |c, want_width, want_phases| {
         var buf: [64]u8 = undefined;
-        const tag = try std.fmt.bufPrint(&buf, "{d}_{d}", .{ c[0], c[1] });
+        const tag = try std.mem.print(&buf, "{d}_{d}", .{ c[0], c[1] });
 
         var k = try sincKernel(gpa, c[0], c[1], .{});
         defer k.deinit(gpa);
@@ -396,19 +396,19 @@ test "the resampler matches torchaudio at its defaults" {
         // read as a 1e-5 error with nothing wrong, so the fixture carries both and
         // the f32 gap is asserted to be the LOOSER of the two.
         var kbuf: [80]u8 = undefined;
-        const kv = try st.require(try std.fmt.bufPrint(&kbuf, "kernel64.{s}", .{tag}));
+        const kv = try st.require(try std.mem.print(&kbuf, "kernel64.{s}", .{tag}));
         const want_k = try kv.toF32Alloc(gpa);
         defer gpa.free(want_k);
         const k_err = relL2(want_k, k.taps);
         errdefer std.debug.print("kernel rel L2 vs f64 {e}\n", .{k_err});
         try std.testing.expect(k_err < 1e-6);
 
-        const kv32 = try st.require(try std.fmt.bufPrint(&kbuf, "kernel.{s}", .{tag}));
+        const kv32 = try st.require(try std.mem.print(&kbuf, "kernel.{s}", .{tag}));
         const want_k32 = try kv32.toF32Alloc(gpa);
         defer gpa.free(want_k32);
         try std.testing.expect(relL2(want_k32, k.taps) >= k_err);
 
-        const wantv = try st.require(try std.fmt.bufPrint(&kbuf, "out.{s}", .{tag}));
+        const wantv = try st.require(try std.mem.print(&kbuf, "out.{s}", .{tag}));
         const want = try wantv.toF32Alloc(gpa);
         defer gpa.free(want);
 

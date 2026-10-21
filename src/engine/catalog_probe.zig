@@ -48,8 +48,8 @@ pub fn main(init: std.process.Init) !void {
             if (c.contents.decoder) " vae" else "",
             if (c.contents.decoder2) " vae2" else "",
         });
-        inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
-            const fam: catalog.Family = @enumFromInt(ff.value);
+        inline for (@typeInfo(catalog.Family).@"enum".field_values) |value| {
+            const fam: catalog.Family = @fromBackingInt(value);
             inline for ([_]catalog.Component{ .conditioner, .conditioner2, .decoder, .decoder2 }) |comp| {
                 if (e.side.has(fam, comp)) try out.print("    side   {t}/{t}\n", .{ fam, comp });
             }
@@ -57,8 +57,8 @@ pub fn main(init: std.process.Init) !void {
         }
         if (e.lora) |l| {
             try out.print("    lora   {d} weights, rank {d}, depth {d}\n", .{ l.info.targets, l.info.rank, l.info.depth });
-            inline for (@typeInfo(catalog.Family).@"enum".fields) |ff| {
-                if (l.has(@enumFromInt(ff.value))) try out.print("    lora   fits {s}\n", .{ff.name});
+            inline for (@typeInfo(catalog.Family).@"enum".field_names, @typeInfo(catalog.Family).@"enum".field_values) |name, value| {
+                if (l.has(@fromBackingInt(value))) try out.print("    lora   fits {s}\n", .{name});
             }
         }
         if (e.note.len > 0) try out.print("    note   {s}\n", .{e.note});
