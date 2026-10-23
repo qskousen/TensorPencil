@@ -17,6 +17,8 @@
 //! A configured file the catalog does not know (chosen through "other file…",
 //! or a folder since removed) is left exactly as configured. Only what the
 //! catalog can see is resolved; nothing here ever blanks a path it cannot judge.
+//! A remembered file it CAN judge and does not take for that family is forgotten
+//! and the slot resolved afresh.
 const std = @import("std");
 const config = @import("shared").config;
 const catalog = @import("shared").catalog;
@@ -148,6 +150,7 @@ pub fn resolveSides(cfg: *Config, cat: *const Catalog) void {
         // checkpoint): adopt it rather than replace it. A switch cleared the slots
         // first, so this never carries another family's file over.
         if (slot.mem(m).slice().len == 0 and field.slice().len > 0) slot.mem(m).set(field.slice());
+        if (knownMisfit(cat, ck.family, slot, slot.mem(m).slice())) slot.mem(m).set("");
         const remembered = slot.mem(m).slice();
         if (std.mem.eql(u8, remembered, config.choice_none)) {
             field.set("");
@@ -162,6 +165,14 @@ pub fn resolveSides(cfg: *Config, cat: *const Catalog) void {
             field.set("");
         }
     }
+}
+
+/// A file the catalog indexes and does not take for this slot, typically picked
+/// before a fit rule was tightened.
+fn knownMisfit(cat: *const Catalog, fam: Family, slot: Slot, ref: []const u8) bool {
+    if (ref.len == 0 or std.mem.eql(u8, ref, config.choice_none)) return false;
+    const e = cat.resolve(ref) orelse return false;
+    return if (slot.component()) |c| !e.side.has(fam, c) else !e.preview.has(fam);
 }
 
 fn firstCandidate(cat: *const Catalog, fam: Family, slot: Slot) ?usize {
@@ -609,6 +620,27 @@ test "resolving a pre-existing setup adopts it exactly as configured" {
     lcfg.vision_tower.set("/lm/t2.gguf");
     resolveAll(&lcfg, &tcat);
     try testing.expectEqualStrings("/lm/t2.gguf", lcfg.vision_tower.slice());
+}
+
+test "a remembered side file the catalog no longer takes for the family is replaced" {
+    const gpa = testing.allocator;
+    var cat = try Catalog.fromEntries(gpa, &.{
+        ckptEntry("/m/krea2/a.safetensors", .krea2, .{ .denoiser = true }),
+        // Indexed, fits nothing: what a generator trunk reads as once refused.
+        sideEntry("/m/checkpoints/generator.safetensors", &.{}),
+        sideEntry("/m/te/qwen3vl-4b.safetensors", &.{.{ .krea2, .conditioner }}),
+    });
+    defer cat.deinit();
+    var cfg: Config = .{};
+    cfg.diffusion_model.set("/m/krea2/a.safetensors");
+    cfg.familySidesMut("krea2").?.text_encoder.set("/m/checkpoints/generator.safetensors");
+    cfg.text_encoder.set("/m/checkpoints/generator.safetensors");
+    resolveAll(&cfg, &cat);
+    try testing.expectEqualStrings("/m/te/qwen3vl-4b.safetensors", cfg.text_encoder.slice());
+    try testing.expectEqualStrings("/m/te/qwen3vl-4b.safetensors", cfg.familySides("krea2").?.text_encoder.slice());
+    // A file the catalog has never seen is still the user's call.
+    chooseSide(&cfg, &cat, .text_encoder, "/elsewhere/te.safetensors");
+    try testing.expectEqualStrings("/elsewhere/te.safetensors", cfg.text_encoder.slice());
 }
 
 test "a checkpoint the catalog does not know: a resolve leaves its sides alone, a switch clears them" {

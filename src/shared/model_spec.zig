@@ -125,8 +125,7 @@ pub fn probeView(store: tp.weights.WeightStore, fam: Family, comp: Component) ?t
 /// Flux VAE. Each width is read off the engine's own config for that family, so
 /// this cannot disagree with what the loader will then demand.
 ///
-/// True for a probe with no width to check (the Wan VAE serves Krea2 and Anima
-/// alike; H3's audio VAE has one shape).
+/// True for a probe with no width to check (H3's audio VAE has one shape).
 pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) bool {
     const dims = view.info.shape.slice();
     const models = tp.models;
@@ -164,7 +163,10 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
                 (dims.len == 1 and dims[0] == models.mage_vae.latent_channels),
             // The nested stage's norm: `storeFits` checks the latent width.
             .qwen_image21 => dims.len == 4,
-            .krea2, .anima, .minimax_h3, .sensenova => true,
+            // `decoder.conv1.weight` is [inner][z][t][3][3]; the Qwen-Image 2.1 and
+            // Wan 2.2 VAEs carry it too, at 64 and 48 channels.
+            .krea2, .anima => dims.len == 5 and dims[1] == models.wan_vae.latent_channels,
+            .minimax_h3, .sensenova => true,
         },
         .decoder2, .denoiser => true,
     };
@@ -225,7 +227,24 @@ pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bo
     const name = v.info.name;
     if (!std.mem.endsWith(u8, name, suffix)) return false;
     const root = name[0 .. name.len - suffix.len];
+    if (trainedAsGenerator(store, root)) return false;
     return layerNormExists(store, root, cfg.n_layers - 1) and !layerNormExists(store, root, cfg.n_layers);
+}
+
+/// A language model with a timestep embedder beside it is an image generator's
+/// trunk (HiDream-O1 is Qwen3-VL-8B retrained that way). It has the encoder's
+/// exact shape, but not the hidden states the DiT was trained on: the render is noise.
+fn trainedAsGenerator(store: tp.weights.WeightStore, root: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, root, ".");
+    const parent = root[0 .. if (std.mem.findScalarLast(u8, trimmed, '.')) |i| i + 1 else 0];
+    for (store.names()) |name| {
+        if (!std.mem.startsWith(u8, name, parent)) continue;
+        const rest = name[parent.len..];
+        for ([_][]const u8{ "t_embedder", "time_embed", "timestep_embed" }) |m| {
+            if (std.mem.startsWith(u8, rest, m)) return true;
+        }
+    }
+    return false;
 }
 
 /// What a probed tensor name sits under, up to the language tower's own
@@ -879,7 +898,9 @@ test "traits: the families' defaults differ in the fields that matter" {
 /// A zero-payload safetensors over the given tensors, which is all a
 /// header-only probe reads. Same idea as `catalog.stFile`, kept here so this
 /// module's tests do not depend on that one's private helper.
-fn stFile(gpa: std.mem.Allocator, specs: []const struct { name: []const u8, dims: []const usize }) ![]u8 {
+const StTensor = struct { name: []const u8, dims: []const usize };
+
+fn stFile(gpa: std.mem.Allocator, specs: []const StTensor) ![]u8 {
     var header: std.ArrayList(u8) = .empty;
     defer header.deinit(gpa);
     var off: usize = 0;
@@ -1172,6 +1193,16 @@ test "componentFits tells the two Qwen3 encoders and the two KL VAEs apart" {
     try std.testing.expect(componentFits(kl16, .zimage, .decoder));
     try std.testing.expect(!componentFits(kl16, .sd15, .decoder));
 
+    // `decoder.conv1.weight` of the Wan 2.1, Wan 2.2 and Qwen-Image 2.1 VAEs.
+    const wan21 = viewOf(&.{ 384, 16, 3, 3, 3 });
+    const wan22 = viewOf(&.{ 1024, 48, 3, 3, 3 });
+    const qi21 = viewOf(&.{ 1152, 64, 1, 3, 3 });
+    for ([_]Family{ .krea2, .anima }) |fam| {
+        try std.testing.expect(componentFits(wan21, fam, .decoder));
+        try std.testing.expect(!componentFits(wan22, fam, .decoder));
+        try std.testing.expect(!componentFits(qi21, fam, .decoder));
+    }
+
     // CLIP-L and CLIP-G norms.
     try std.testing.expect(componentFits(viewOf(&.{768}), .sd15, .conditioner));
     try std.testing.expect(!componentFits(viewOf(&.{1280}), .sd15, .conditioner));
@@ -1332,6 +1363,38 @@ test "the vision tower tells krea2's encoder from Z-Image's at either nesting" {
         const store: tp.weights.WeightStore = .{ .safetensors = &st };
         try std.testing.expect(storeFits(store, .krea2, .conditioner));
         try std.testing.expect(!storeFits(store, .zimage, .conditioner));
+    }
+}
+
+test "a language model retrained as an image generator is no family's text encoder" {
+    const gpa = std.testing.allocator;
+    const hidden = tp.models.qwen3.Config.vl_8b.hidden;
+    var nb: [80]u8 = undefined;
+    const norm = try std.mem.print(&nb, "model.language_model.layers.{d}.input_layernorm.weight", .{tp.models.qwen3.Config.vl_8b.n_layers - 1});
+    const encoder = [_]StTensor{
+        .{ .name = "model.language_model.embed_tokens.weight", .dims = &.{ 4, hidden } },
+        .{ .name = norm, .dims = &.{hidden} },
+        .{ .name = "model.visual.patch_embed.proj.weight", .dims = &.{ 2, 2 } },
+    };
+    const cases = [_]struct { extra: ?StTensor, fits: bool }{
+        .{ .extra = null, .fits = true },
+        // HiDream-O1's layout: the generator heads sit beside the language model.
+        .{ .extra = .{ .name = "model.t_embedder1.mlp.0.weight", .dims = &.{ 2, 2 } }, .fits = false },
+        // A bundled checkpoint's denoiser lives under its own root, not beside the encoder.
+        .{ .extra = .{ .name = "model.diffusion_model.t_embedder.mlp.0.weight", .dims = &.{ 2, 2 } }, .fits = true },
+    };
+    for (cases) |c| {
+        var tensors: std.ArrayList(StTensor) = .empty;
+        defer tensors.deinit(gpa);
+        try tensors.appendSlice(gpa, &encoder);
+        if (c.extra) |e| try tensors.append(gpa, e);
+        const bytes = try stFile(gpa, tensors.items);
+        defer gpa.free(bytes);
+        var st = try tp.safetensors.SafeTensors.initFromSlice(gpa, bytes);
+        defer st.deinit();
+        const got = storeFits(.{ .safetensors = &st }, .qwen_image21, .conditioner);
+        errdefer std.debug.print("extra {?s}: fits={}\n", .{ if (c.extra) |e| e.name else null, got });
+        try std.testing.expectEqual(c.fits, got);
     }
 }
 
