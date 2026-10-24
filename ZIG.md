@@ -87,6 +87,10 @@ Build system:
   that package, `build` returns there and the runner rejects any `-D` flag declared
   after it with `invalid option` instead of fetching. Only a fresh checkout shows it
   (CI); a tree with every package in `zig-pkg/` never returns early.
+- A compile step misses the cache when an input file's inode or mtime changes, even with
+  identical contents: a `cp -a` of `zig-pkg/` rebuilt ggml and both exes. A fresh CI
+  checkout or a restored `.zig-cache` therefore never reuses a compile; caching
+  `zig-pkg/` still saves the downloads.
 - `b.args` is gone: `run.addPassthruArgs()`.
 - `b.build_root` -> `b.root` (a `Cache.Path`); `b.libc_file`, `b.sysroot`,
   `b.pathFromRoot`, `b.getInstallPath`, `Run.addPathDir` and custom steps are gone. An
