@@ -34,12 +34,14 @@ fn parseCpuLine(line: []const u8) ?CpuTimes {
 /// Null off Linux, where neither file exists and there is no equivalent to read.
 fn readSysFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
     if (builtin.target.os.tag != .linux) return null;
+    // `std.os.linux.errno`, not `std.posix.errno`: with libc linked the latter only
+    // treats -1 as an error, and a raw syscall returns -errno.
     const fd = std.os.linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-    if (std.posix.errno(fd) != .SUCCESS) return null;
+    if (std.os.linux.errno(fd) != .SUCCESS) return null;
     const ifd: i32 = @intCast(fd);
     defer _ = std.os.linux.close(ifd);
     const n = std.os.linux.read(ifd, buf.ptr, buf.len);
-    if (std.posix.errno(n) != .SUCCESS or n == 0) return null;
+    if (std.os.linux.errno(n) != .SUCCESS or n == 0) return null;
     return buf[0..@intCast(n)];
 }
 
@@ -479,6 +481,11 @@ test "parseCpuLine sums fields and idle=idle+iowait" {
     try std.testing.expectEqual(@as(u64, 840), t.idle); // 800 + 40
     try std.testing.expect(parseCpuLine("intr 1 2 3") == null); // wrong prefix
     try std.testing.expect(parseCpuLine("cpu") == null); // no fields
+}
+
+test "a sysfs file that does not exist reads as null" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(readSysFile("/sys/tp-sysmon-test-missing", &buf) == null);
 }
 
 test "CpuMeter first sample returns 0 (no baseline)" {

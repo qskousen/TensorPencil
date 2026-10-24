@@ -259,7 +259,7 @@ by the kernel):
 
 ```zig
 const rc = std.os.linux.mprotect(bytes.ptr, bytes.len, .{ .READ = true, .WRITE = true });
-if (std.posix.errno(rc) != .SUCCESS) return false;
+if (std.os.linux.errno(rc) != .SUCCESS) return false;
 ```
 
 ## `std.posix.write`, `std.posix.close`, `std.posix.ftruncate` removed
@@ -271,8 +271,15 @@ Linux syscalls instead:
 _ = std.os.linux.write(fd, buf.ptr, buf.len);
 _ = std.os.linux.close(fd);
 const rc = std.os.linux.ftruncate(fd, length);
-if (std.posix.errno(rc) != .SUCCESS) return error.FtruncateFailed;
+if (std.os.linux.errno(rc) != .SUCCESS) return error.FtruncateFailed;
 ```
+
+Decode a raw syscall's result with `std.os.linux.errno`, never `std.posix.errno`.
+The latter is `system.errno`, which is libc's when the binary links libc: it reports
+an error only for a return of exactly -1, and a raw syscall returns `-errno` in the
+top of `usize`. Every failure then reads as `.SUCCESS`, and the `@intCast` of the
+"fd" that follows panics. A test binary that links libc (`gui-test` does, through
+SDL) hits it on any machine missing the file, which is how CI found it.
 
 ## `std.time.sleep` removed
 
@@ -744,8 +751,8 @@ use-after-close. Ask for `testing.tmpDir(.{ .iterate = true })`.
 `GetDiskFreeSpaceEx` binding: a free-space check is a raw `syscall2(.statfs, ...)` with
 its own `extern struct` on Linux and a `kernel32` extern on Windows, which is why it
 lives in `core/diskspace.zig` beside the other per-platform shims. A raw syscall's
-return is `-errno` in the top of `usize`, so the check is `@as(isize, @bitCast(rc)) < 0`;
-`std.os.linux.E.init` does not exist. For writing at an offset, `Io.File.Writer` is
+return is `-errno` in the top of `usize`; decode it with `std.os.linux.errno(rc)`
+(`std.os.linux.E.init` does not exist, and `std.posix.errno` is wrong with libc linked). For writing at an offset, `Io.File.Writer` is
 positional and its `pos` field IS the write position: set `w.pos = offset` before the
 first write rather than looking for a seek (`seekTo` flushes and moves it too).
 `std.os.linux.fallocate(fd, 0, 0, len)` reserves space up front; `File.setLength` is

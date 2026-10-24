@@ -9,8 +9,8 @@ name: Build and Release
 # The binaries need an x86-64-v3 CPU (AVX2, FMA): ggml's kernels are built with AVX2
 # whatever -Dcpu says, so asking for less would only slow the Zig code.
 #
-# A tag push builds both and drafts a release; a manual run only builds, and the zips
-# are the run's artifacts.
+# A tag push tests, builds both and drafts a release; a manual run stops after the
+# build, and the zips are the run's artifacts. Nothing runs on an ordinary push.
 
 on:
   push:
@@ -22,7 +22,44 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config \
+            libvips-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libx11-dev libxcursor-dev libxi-dev libwayland-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      # The gated suite (-Dintegration) needs a GPU and real checkpoints, so it
+      # cannot run here. This is the CPU unit suite only.
+      - name: Unit tests
+        run: zig build test
+
+      - name: GUI tests
+        run: zig build gui-test
+
+      # tp-gui's failure modes are visual: this renders the whole workspace from
+      # canned data with no model, GPU or engine, so a crash or a layout blowup
+      # shows up without a display.
+      - name: UI probe renders
+        run: |
+          zig build ui-probe -- ui.png
+          zig build ui-probe -- ui-states.png --states
+          test -s ui.png && test -s ui-states.png
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

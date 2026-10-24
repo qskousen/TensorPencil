@@ -339,7 +339,8 @@ pub const Store = struct {
     fn preallocate(io: Io, file: Io.File, size: u64, name: []const u8) void {
         if (@import("builtin").target.os.tag == .linux) {
             const rc = std.os.linux.fallocate(file.handle, 0, 0, @intCast(size));
-            if (std.posix.errno(rc) != .SUCCESS) log.warn("could not reserve {d} bytes for {s} ({t}); the file grows as chunks land", .{ size, name, std.posix.errno(rc) });
+            const err = std.os.linux.errno(rc);
+            if (err != .SUCCESS) log.warn("could not reserve {d} bytes for {s} ({t}); the file grows as chunks land", .{ size, name, err });
         } else {
             file.setLength(io, size) catch {};
         }
