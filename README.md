@@ -2,7 +2,11 @@
 
 **This is an early Alpha-level program. Expect warts, crashes, frequent large changes, and bugs.**
 
-TensorPencil is about running local token generation and diffusion models with having to faff about
+Join us on our [self-hosted Fluxer](https://chat.syf.me/invite/T2JOigIZ) to talk about TensorPencil and related subjects!
+
+"Why not just use Discord like everyone else?" https://blog.qskousen.info/why-not-discord
+
+TensorPencil is about running local token generation and diffusion models without having to faff about
 with virtual environments or Python versions or Tensorflow or any of that stuff.
 
 TensorPencil consists of several parts:
