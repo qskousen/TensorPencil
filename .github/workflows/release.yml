@@ -41,6 +41,18 @@ jobs:
         with:
           version: 0.17.0
 
+      # A fresh runner downloads every package at once, and GitHub sometimes drops one
+      # of those connections (HttpConnectionClosing). Listing the steps runs the build
+      # script, which fetches what these flags need and compiles nothing, so a retry
+      # can only ever repeat a download; what already arrived is kept.
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            zig build -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
+
       # The gated suite (-Dintegration) needs a GPU and real checkpoints, so it
       # cannot run here. This is the CPU unit suite only.
       - name: Unit tests
@@ -82,6 +94,15 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+
+      # See the test job's step of the same name.
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 ${{ matrix.target }} -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
 
       - name: Build
         run: |
