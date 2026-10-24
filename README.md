@@ -47,6 +47,8 @@ Supported diffusion models:
 | Anima (Cosmos-Predict2)            | ✅ | ✅ | ✅ | ✅ |
 | Mage-Flow (+ Edit)                 | ✅ | ✅ | ✅ | ✅ |
 | SenseNova U1.5                     | ✅ | ✅ | ✅ | ✅ |
+| MOSS-Image                         | ✅ | ✅ | ✅ | ✅ |
+| Qwen-Image 2.1 (text-to-image)     | ✅ | ✅ | ✅ | ✅ |
 | SD 1.5                             | ✅ | ✅ | ✅ | ✅ |
 | SDXL                               | ✅ | ✅ | ✅ | ✅ |
 | MiniMax H3 (video+audio, CLI only) | ✅ | ✅ | ✅ | ✅ |
@@ -63,11 +65,12 @@ Supported LLMs:
 | Qwen 3           | Llama, Mistral-Nemo           | —      | ✅ | ✅ | ✅ | ✅ |
 | Qwen 3.5-class   | Qwen 3.6, 3.8, Bonsai         | ✅     | ✅ | ✅ | ✅ | ✅ |
 | Gemma 3          |                               | ✅     | ✅ | ✅ | ✅ | ✅ |
-| Gemma 4          |                               | ✅     | ✅ | — | ✅ | ✅ |
-| K2 Horizon       | MoE + MoVA, reasoning effort  | —      | ✅ | — | ✅ | ✅ |
+| Gemma 4          |                               | ✅     | ✅ | ✅ | ✅ | ✅ |
+| K2 Horizon       | MoE + MoVA, reasoning effort  | —      | ✅ | ✅ | ✅ | ✅ |
 
 GGUF block quants throughout, plus safetensors for the Qwen 3 VL 4B encoder. Vision towers
-run on CPU and the CUDA backends; only Gemma 3's also runs on Vulkan.
+run on every backend; in `tp-llm`, the interactive `@image` command is CUDA-only, while a
+one-shot `--image` also runs on Vulkan.
 
 ### AI Disclaimer
 TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
