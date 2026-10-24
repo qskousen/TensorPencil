@@ -210,9 +210,7 @@ pub fn sidebar(m: Sidebar, cb: SidebarActions) void {
                 .id_extra = gi,
                 .padding = .{ .x = 8, .y = if (gi == 0) 0 else 10, .h = 7 },
             });
-            for (g.rows, 0..) |r, ri| {
-                convRow(@src(), gi * 1024 + ri, r, m.selected == r.id, cb);
-            }
+            for (g.rows) |r| convRow(@src(), r, m.selected == r.id, cb);
         }
         if (m.groups.len == 0) {
             dvui.labelNoFmt(@src(), m.empty, .{}, .{
@@ -267,13 +265,15 @@ fn newChatButton(src: std.lang.SourceLocation, label: []const u8) bool {
 /// a row you were only trying to open.
 var arm_delete: ?u64 = null;
 
-fn convRow(src: std.lang.SourceLocation, id_extra: usize, r: ConvRow, selected: bool, cb: SidebarActions) void {
+fn convRow(src: std.lang.SourceLocation, r: ConvRow, selected: bool, cb: SidebarActions) void {
     // A plain box, NOT a ButtonWidget: a button processes its events before its
     // children exist, so it would swallow the click meant for the ✕ inside it.
     // Here the row's own click is tested AFTER the children have had their turn.
     //
     // The cost is that hover has to come from last frame (the background is
     // painted at init, before we can know), which is invisible at frame rate.
+    // Keyed by the conversation, so a row's hover follows it when the list shifts.
+    const id_extra: usize = @truncate(r.id);
     const row_id = dvui.parentGet().extendId(src, id_extra);
     const hovered = dvui.dataGet(null, row_id, "_hover", bool) orelse false;
     const armed = arm_delete == r.id;

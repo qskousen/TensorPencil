@@ -844,9 +844,6 @@ pub fn run(init: std.process.Init) !void {
             if (e.evt == .app and e.evt.app.action == .quit) res = .close;
         }
         var end_micros = try win.end(.{});
-        back.setCursor(win.cursorRequested());
-        back.textInputRect(win.textInputRequested());
-        back.renderPresent();
         if (res != .ok) break :main_loop;
 
         // A clicked image (chat transcript or studio gallery) opens/refocuses
@@ -891,9 +888,6 @@ pub fn run(init: std.process.Init) !void {
                 if (!e.handled and e.evt == .window and e.evt.window.action == .close) v.open = false;
             }
             const v_end = try v.win.end(.{});
-            v.back.setCursor(v.win.cursorRequested());
-            v.back.textInputRect(v.win.textInputRequested());
-            v.back.renderPresent();
             if (!v.shown) {
                 v.shown = true;
                 _ = SDLBackend.c.SDL_ShowWindow(v.back.window);

@@ -598,7 +598,7 @@ fn convLora(be: *Backend, sess: *Session, ws: *Workspace, dst: *Buf, src: *const
             try be.ensureDeviceBuffer(&ws.lora_lo, n * r * 4);
             try conv_cuda.conv2d(be, &ws.patch, &ws.lora_lo, src, h, w, a, mode, out_hw, 1.0);
             var lws = try lora_cuda.borrowed(be, r, n * cv.co);
-            try lora_cuda.accumulate(be, &lws, dst.*, ws.lora_lo, r, n, f.b.bytes, cv.co, r, t.scale * strength * f.gain);
+            try lora_cuda.accumulate(be, &lws, dst.*, ws.lora_lo, r, n, f.b, r, t.scale * strength * f.gain);
         }
         for (t.kron) |k| try kronGroups(be, sess, ws, dst.*, src, h, w, cv, mode, out_hw, n, k, strength * t.scale * k.gain);
         for (t.diffs) |df| {

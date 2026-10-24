@@ -3467,7 +3467,7 @@ pub const Context = struct {
     /// routes may read it differently (an LLM weight decodes through the GEMV layout and
     /// prefills through the coop one), so the layout is part of the key; a pointer alone
     /// would serve one route the other's copy.
-    const WeightLayout = enum(u8) { kmajor, raw, f16_from_f32, bf16_coop, f16_from_bf16, bf16_from_f32, f16_from_conv, bf16_from_conv, f32_from_16, f32_from_conv };
+    const WeightLayout = enum(u8) { kmajor, raw, f16_from_f32, bf16_coop, f16_from_bf16, bf16_from_f32, f16_from_conv, bf16_from_conv, f32_from_16, f32_from_conv, f16_from_dense, bf16_from_dense };
 
     /// The length is part of it: a row slice starts at its whole weight's address.
     /// `src` is the format a decode read, for a key whose layout does not imply it: the
@@ -5264,6 +5264,50 @@ pub const Context = struct {
         return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0);
     }
 
+    /// Whether the coop GEMM runs bf16 operands on this device, f16 otherwise.
+    pub fn coopBf16(self: *const Context) bool {
+        return self.pipe_coop_bf16w != .null_handle;
+    }
+
+    /// A dense f32, f16 or bf16 `[rows][cols]` weight as the coop GEMM's 16-bit operand,
+    /// bf16 when `bf16` and f16 otherwise, cached under the source bytes. A weight
+    /// already at the operand width is only transposed; any other pairing is converted
+    /// on the host once.
+    pub fn weightBufferCoop16(self: *Context, bytes: []const u8, dt: tp_core.dtype.DType, rows: usize, cols: usize, bf16: bool) Error!vk.Buffer {
+        switch (dt) {
+            // `native` copies the 16-bit lanes verbatim, so it carries f16 bits too.
+            .bf16 => return self.weightBufferF16FromBf16(bytes, rows, cols, bf16),
+            .f16 => if (!bf16) return self.weightBufferF16FromBf16(bytes, rows, cols, true),
+            .f32 => {},
+            else => return error.UnsupportedDType,
+        }
+        var key = weightKey(bytes, if (bf16) .bf16_from_dense else .f16_from_dense);
+        key.src = @backingInt(dt);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const wide = transient.alloc(f32, rows * cols) catch return error.OutOfMemory;
+        defer transient.free(wide);
+        tp_core.safetensors.convertToF32(dt, bytes, wide) catch return error.UnsupportedDType;
+        return self.upload16(key, wide, rows, cols, bf16);
+    }
+
+    /// The coop GEMM over a prebuilt operand: `y[m][rows] = x @ Wᵀ + bias`, `x` and `y`
+    /// at their own dtypes.
+    pub fn opMatmulCoopW(self: *Context, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_buf: vk.Buffer, rows: usize, cols: usize, bias: []const f32, bf16: bool) Error!void {
+        return self.coopF16WDispatch(y, 0, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf16, 1.0);
+    }
+
+    /// The f32 GEMM over a dense f32, f16 or bf16 `[rows][cols]` weight: `y[m][rows] =
+    /// x @ Wᵀ`, `x` and `y` f32. A 16-bit weight is widened once (`weightBufferWidened`).
+    pub fn opMatmulF32Dense(self: *Context, y: DeviceBuffer, x: DeviceBuffer, m: usize, bytes: []const u8, dt: tp_core.dtype.DType, rows: usize, cols: usize) Error!void {
+        std.debug.assert(x.dt == .f32 and y.dt == .f32);
+        const w_buf = if (dt == .f32) try self.weightBuffer(bytes, 4, rows, cols) else try self.weightBufferWidened(bytes, dt, rows, cols);
+        return self.opMatmulW(y, 0, x, 0, m, w_buf, false, rows, cols, 1.0, null);
+    }
+
     /// Shared body of the f16/bf16-weight coop GEMM: the weight is already
     /// uploaded as k-major padded 16-bit (`w_buf`); convert x to f16 (or bf16
     /// when `bf16_ab`), run the coop dispatch into the padded scratch, then strip
@@ -5936,9 +5980,14 @@ pub const Context = struct {
     /// scale * x @ Wᵀ`, W a raw bf16 `[rows][cols]`. The LoRA sidecar's B half, which
     /// otherwise stores a delta plane only to read it back for the add.
     pub fn opMatmulCoopAcc(self: *Context, dst: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32) Error!void {
-        const bf = self.pipe_coop_bf16w != .null_handle;
-        const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, bf);
-        const n_pad = try self.coopGemmPad(x, m, w_buf, rows, cols, bf, 1.0);
+        const bf = self.coopBf16();
+        return self.opMatmulCoopAccW(dst, x, m, try self.weightBufferF16FromBf16(w_bytes, rows, cols, bf), rows, cols, bf, scale);
+    }
+
+    /// `opMatmulCoopAcc` over a coop operand already built (`weightBufferCoop16`), its
+    /// width `bf16` or f16.
+    pub fn opMatmulCoopAccW(self: *Context, dst: DeviceBuffer, x: DeviceBuffer, m: usize, w_buf: vk.Buffer, rows: usize, cols: usize, bf16: bool, scale: f32) Error!void {
+        const n_pad = try self.coopGemmPad(x, m, w_buf, rows, cols, bf16, 1.0);
         try self.opElt(eltAt("compact_acc", dst.dt), self.y_pad, null, null, dst, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),

@@ -10,11 +10,12 @@ const gpu = @import("tp_gpu").context;
 
 const Buf = gpu.DeviceBuffer;
 const Target = lora.Target;
+const Weight = @import("tp_ops").matmul.Weight;
 
-/// Whether every term of `t` can run here: the GEMMs read a factor, a linear LoKr's
-/// `w2` and a linear diff as raw bf16; a conv's are f16 convolutions.
+/// Whether every term of `t` can run here: a factor is f32, f16 or bf16, a linear
+/// LoKr's `w2` and a linear diff raw bf16, and a conv's f16 convolutions.
 pub fn supported(t: *const Target) bool {
-    for (t.factors) |f| if (f.a.dtype != .bf16 or f.b.dtype != .bf16) return false;
+    for (t.factors) |f| if (!denseFactor(f.a.dtype) or !denseFactor(f.b.dtype)) return false;
     for (t.kron) |k| if (k.w2.dtype != .bf16 and k.w2.dtype != .f16) return false;
     for (t.diffs) |d| if (d.w.dtype != .bf16 and d.w.dtype != .f16) return false;
     return true;
@@ -143,9 +144,14 @@ pub fn doraCols(ctx: *gpu.Context, dst: Buf, src: Buf, d: Buf, rows: usize, widt
     try ctx.opElt(gpu.eltAt("dora_cols", src.dt), dst, src, d, null, .{ .u0 = @intCast(total), .u1 = @intCast(width) }, total, 1, 1);
 }
 
-/// `dst[m][n] += strength * t.scale * B[row0 .. row0+n] (A x)`, `x` the f32 activation
-/// the base GEMM read and `dst` its f32 output. `zb` is a zero bias at least as wide as
-/// the rank and `n`, passed WHOLE (`smallBuffer` caches by host pointer).
+/// `dst[m][n] += strength * t.scale * B[row0 .. row0+n] (A x)`, `x` the activation the
+/// base GEMM read and `dst` its output, each at its own dtype. `zb` is a zero bias at
+/// least as wide as the rank and `n`, passed WHOLE (`smallBuffer` caches by host
+/// pointer).
+///
+/// A factor keeps its file's dtype and `lora.device_math` picks the arithmetic:
+/// `op16` runs the coop GEMM at `lora.operandFor`'s width (`weightBufferCoop16`, free
+/// for a file already at it), `f32` the f32 GEMM on an f32 copy of `x`.
 pub fn apply(ctx: *gpu.Context, s: *Scratch, zb: []const f32, dst: Buf, x: Buf, m: usize, t: *const Target, strength: f32, row0: usize, n: usize) !void {
     std.debug.assert(row0 + n <= t.out_dim);
     const f = t.factorAt(row0, n) orelse {
@@ -153,26 +159,52 @@ pub fn apply(ctx: *gpu.Context, s: *Scratch, zb: []const f32, dst: Buf, x: Buf, 
         return error.Unsupported;
     };
     const rank = f.a.rows;
-    std.debug.assert(f.a.dtype == .bf16 and f.b.dtype == .bf16);
     std.debug.assert(rank <= zb.len and n <= zb.len);
     try s.ensure(ctx, m * rank);
-    try gemm16(ctx, s.lo, x, m, f.a.bytes, rank, t.in_dim, zb);
-    // Rows of a row-major weight are contiguous, so a range of B is a view.
-    const b_off = (row0 - f.out_off) * rank * 2;
-    try accumulate(ctx, s, dst, m, f.b.bytes[b_off..][0 .. n * rank * 2], n, rank, t.scale * strength * f.gain);
+    if (lora.device_math == .f32) {
+        const x32 = if (x.dt == .f32) x else blk: {
+            const c = try s.inPlane(ctx, m * t.in_dim * 4, .f32);
+            try ctx.opElt(gpu.eltCopy(x.dt, .f32), x, c, null, null, .{ .u0 = @intCast(m * t.in_dim) }, m * t.in_dim, 1, 1);
+            break :blk c;
+        };
+        try ctx.opMatmulF32Dense(s.lo, x32, m, f.a.bytes, f.a.dtype, rank, t.in_dim);
+    } else {
+        const bf = operandBf16(ctx, x.dt);
+        try ctx.opMatmulCoopW(s.lo, x, m, try ctx.weightBufferCoop16(f.a.bytes, f.a.dtype, rank, t.in_dim, bf), rank, t.in_dim, zb, bf);
+    }
+    try accumulate(ctx, s, dst, m, lora.rowSlice(f.b, row0 - f.out_off, n), rank, t.scale * strength * f.gain);
 }
 
-/// The B half alone: `dst[m][n] += scale * s.lo[m][rank] @ b_rowsᵀ`, for a caller that
-/// made `s.lo` itself (a 3x3 conv's A is a convolution, not a GEMM).
-pub fn accumulate(ctx: *gpu.Context, s: *Scratch, dst: Buf, m: usize, b_rows: []const u8, n: usize, rank: usize, scale: f32) !void {
-    std.debug.assert(b_rows.len == n * rank * 2);
+/// The B half alone: `dst[m][n] += scale * s.lo[m][rank] @ bᵀ`, `b` the `[n][rank]`
+/// rows of B this output takes, for a caller that made `s.lo` itself (a 3x3 conv's A
+/// is a convolution, not a GEMM).
+pub fn accumulate(ctx: *gpu.Context, s: *Scratch, dst: Buf, m: usize, b: Weight, rank: usize, scale: f32) !void {
+    const n = b.rows;
+    std.debug.assert(b.cols == rank);
     try s.ensure(ctx, m * rank);
-    try ctx.opMatmulCoopAcc(dst, s.lo, m, b_rows, n, rank, scale);
+    if (lora.device_math == .f32) {
+        const h = try s.outPlane(ctx, m * n);
+        var lo = s.lo;
+        lo.dt = .f32;
+        try ctx.opMatmulF32Dense(h, lo, m, b.bytes, b.dtype, n, rank);
+        return ctx.opElt(gpu.eltAt("add_scaled", dst.dt), dst, h, null, null, .{ .u0 = @intCast(m * n), .f0 = scale }, m * n, 1, 1);
+    }
+    const bf = operandBf16(ctx, dst.dt);
+    try ctx.opMatmulCoopAccW(dst, s.lo, m, try ctx.weightBufferCoop16(b.bytes, b.dtype, n, rank, bf), n, rank, bf, scale);
 }
 
+/// Whether a coop GEMM whose 16-bit-facing side is `side` runs bf16 operands
+/// (`lora.operandFor`). f16 coop is every device's; bf16 is taken where it exists.
+fn operandBf16(ctx: *const gpu.Context, side: gpu.Dt) bool {
+    return lora.operandFor(side) == .bf16 and ctx.coopBf16();
+}
+
+fn denseFactor(dt: @import("tp_core").dtype.DType) bool {
+    return dt == .f32 or dt == .f16 or dt == .bf16;
+}
+
+/// The coop GEMM over a raw bf16 `[rows][cols]` weight (a LoKr's `w2`, a diff).
 fn gemm16(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: []const u8, rows: usize, cols: usize, zb: []const f32) !void {
-    if (ctx.pipe_coop_bf16w != .null_handle)
-        try ctx.opMatmulCoopBf16(y, 0, x, m, w, rows, cols, zb)
-    else
-        try ctx.opMatmulCoopF16Wb(y, 0, x, m, w, rows, cols, zb);
+    const bf = ctx.coopBf16();
+    try ctx.opMatmulCoopW(y, x, m, try ctx.weightBufferCoop16(w, .bf16, rows, cols, bf), rows, cols, zb, bf);
 }

@@ -756,7 +756,7 @@ fn convLora(ctx: *Context, sess: *const Session, ws: *Workspace, dst: *DeviceBuf
             };
             try scratch.ensure(ctx, n * r);
             try conv_gpu.conv2d(ctx, &ws.patch, &scratch.lo, src, h, w, a, mode, out_hw, null, 1.0);
-            try lora_gpu.accumulate(ctx, scratch, dst.*, n, f.b.bytes, cv.co, r, t.scale * strength * f.gain);
+            try lora_gpu.accumulate(ctx, scratch, dst.*, n, f.b, r, t.scale * strength * f.gain);
         }
         for (t.kron) |k| try kronGroups(ctx, sess, ws, dst.*, src, h, w, cv, mode, out_hw, n, k, strength * t.scale * k.gain);
         for (t.diffs) |df| {

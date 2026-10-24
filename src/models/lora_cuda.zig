@@ -8,7 +8,7 @@
 //! ⚠️ **The accumulate is not free and was the larger half of the cost.** Writing
 //! the delta to a scratch plane and adding it is three extra passes over an f32
 //! `[m][n]` plane, ~70 GB per step at H3's widths, and measured at roughly twice
-//! the two GEMMs it served. `opGemmBf16Acc` folds it into cuBLASLt's epilogue;
+//! the two GEMMs it served. `opGemm16Acc` folds it into cuBLASLt's epilogue;
 //! `Workspace.fused` says whether this backend can, and the scratch plane only
 //! exists when it cannot. See that function for the numbers.
 //!
@@ -22,11 +22,12 @@
 //!    gate delta with no shuffle. This is also why `applyRange` does not care
 //!    whether the target was split into block-diagonal factors: a range either
 //!    is a factor or is a row slice of one.
-//! 2. **bf16 factors only.** `opGemmBf16` reads the raw 16-bit weight as its B
-//!    operand. `supported` refuses anything else by name rather than at a
-//!    launch, and the host path still works, so a non-bf16 LoRA is slow, not
-//!    broken. The one exception is `How.a_i8`: an int8 copy of A made at attach,
-//!    which runs on the int8 activation a base GEMM already staged.
+//! 2. **A factor keeps its file's dtype** (f32, f16 or bf16), and `lora.device_math`
+//!    picks the arithmetic. `op16` converts it once on the device (`weight16`, cached)
+//!    to the 16-bit operand width, which is free for a file already at that width;
+//!    `f32` runs both GEMMs as true f32 on cuBLASLt (`weight32`). The one other route
+//!    is `How.a_i8`: an int8 copy of A made at attach, which runs on the int8
+//!    activation a base GEMM already staged.
 
 const std = @import("std");
 const lora = @import("lora.zig");
@@ -65,23 +66,31 @@ fn skipA(tag: []const u8) bool {
 
 /// Whether every factor of `t` can run here.
 ///
-/// Both GEMMs go through `opGemmBf16`, which needs every width a multiple of 32
-/// and pads a narrow output to its 128 tile itself. The rank is the A GEMM's
-/// output and the B GEMM's contraction, and `Sidecar.load` pads it to
-/// `lora.rank_align`, so every file rank clears it; a hand-built target may not.
-/// B's output width must be a multiple of 128, which is the base linear's own
-/// width: SD1.5's 320-wide linears miss it, and that belongs to the SD sidecar
-/// when there is one.
+/// A factor is f32, f16 or bf16 (`lora.loadTarget` widens anything else). Every
+/// width must be a multiple of 32: the rank is the A GEMM's output and the B GEMM's
+/// contraction, and `Sidecar.load` pads it to `lora.rank_align`, so every file rank
+/// clears it; a hand-built target may not. B's output width is the base linear's
+/// own, and SD1.5's 320-wide linears belong to the SD sidecar.
 pub fn supported(t: *const Target) bool {
     for (t.kron) |k| if (k.w2.dtype != .bf16 and k.w2.dtype != .f16) return false;
     for (t.diffs) |d| if (d.w.dtype != .bf16 and d.w.dtype != .f16) return false;
     for (t.factors) |f| {
-        if (f.a.dtype != .bf16 or f.b.dtype != .bf16) return false;
+        if (!denseFactor(f.a.dtype) or !denseFactor(f.b.dtype)) return false;
         if (f.a.rows % lora.rank_align != 0) return false;
         if (f.a.cols % 32 != 0) return false; // A's contraction
         if (f.b.rows % 32 != 0) return false; // B's output width
     }
     return true;
+}
+
+fn denseFactor(dt: @import("tp_core").dtype.DType) bool {
+    return dt == .f32 or dt == .f16 or dt == .bf16;
+}
+
+/// `lora.device_math` as this backend runs it: true f32 is cuBLASLt's, so the
+/// hand-PTX arm keeps 16-bit operands.
+fn mathOn(be: *const Backend) lora.Math {
+    return if (be.kernels == .libs) lora.device_math else .op16;
 }
 
 /// `lo` elements one apply of a rank-`rank` factor over `m` rows needs. The int8 A
@@ -166,9 +175,8 @@ pub const How = struct {
 /// the base GEMM's output, each at its own dtype. A 16-bit `dst` is accumulated in
 /// place by the GEMM on `libs`, through the f32 plane and a scaled add elsewhere.
 ///
-/// `[row0, row0 + n)` must sit inside one factor. It always does in practice:
-/// the ranges a trunk asks for are the fused linear's own pieces, and a
-/// block-diagonal split cuts on exactly those boundaries.
+/// `[row0, row0 + n)` must sit inside one factor, which `lora.Target.rowsFit`
+/// checked at attach: either it is a factor, or a row slice of one.
 pub fn applyRange(
     be: *Backend,
     ws: *Workspace,
@@ -201,15 +209,19 @@ pub fn apply(
         return error.Unsupported;
     };
     const rank = f.a.rows;
-    // `supported` is the gate; this is the assert that the caller ran it. The
-    // byte arithmetic below hardcodes 16-bit elements.
-    std.debug.assert(f.a.dtype == .bf16 and f.b.dtype == .bf16);
+    const math = mathOn(be);
     std.debug.assert(m * rank <= ws.lo_elems);
-    std.debug.assert(ws.fused or m * n <= ws.hi_elems);
 
     // A: lo[m][lo_ld] = x[m][in] @ A^T, of which the first `rank` columns are read.
     var lo_ld = rank;
-    if (skipA(t.tag)) {} else if (how.a_i8) |aq| {
+    if (skipA(t.tag)) {} else if (math == .f32) {
+        const x32 = if (x.dt == .f32) x else blk: {
+            const c = try inPlane(be, m * t.in_dim * 4, .f32);
+            try be.opCast(x, c, m * t.in_dim, 0);
+            break :blk c;
+        };
+        try be.opMatmulF32LtDev(ws.lo, x32, m, try be.weight32(f.a.bytes, f.a.dtype, rank, t.in_dim), rank, t.in_dim, null);
+    } else if (how.a_i8) |aq| {
         // `quantizeA` pads A to the int8 GEMM's 128-row tile with zero rows, so
         // `lo` comes back that wide and the B GEMM reads it at that stride.
         std.debug.assert(aq.rows == std.mem.alignForward(usize, rank, 128) and aq.cols == t.in_dim);
@@ -217,15 +229,15 @@ pub fn apply(
         try be.opI8Gemm(ws.lo, aq.bytes, aq.row_scale.?, aq.rows, null);
         lo_ld = aq.rows;
     } else if (x.dt != .f32 and be.kernels != .libs) {
-        try be.opMatmulBf16(ws.lo, x, m, f.a.bytes, rank, t.in_dim, null);
-    } else if (x.dt == .f16) {
-        try be.opGemmHalfIn(ws.lo, x, m, f.a.bytes, rank, t.in_dim);
-    } else try be.opGemmBf16(ws.lo, x, m, f.a.bytes, rank, t.in_dim, null);
-    // B: dst[m][n] += scale * lo @ B[row0 - f.out_off ..][n]^T. Rows of a
-    // row-major weight are contiguous, so the slice is a view.
-    const b_off = (row0 - f.out_off) * rank * 2;
-    const b_rows = f.b.bytes[b_off..][0 .. n * rank * 2];
-    return accumulate(be, ws, dst, ws.lo, lo_ld, m, b_rows, n, rank, t.scale * strength * f.gain);
+        try be.opMatmulHalfW(ws.lo, x, m, f.a.bytes, f.a.dtype, rank, t.in_dim, null);
+    } else if (lora.operandFor(x.dt) == .f16) {
+        try be.opGemmHalfIn(ws.lo, x, m, try be.weight16(f.a.bytes, f.a.dtype, false, rank, t.in_dim, 1, 1, .f16), rank, t.in_dim);
+    } else {
+        try be.opGemmBf16LdDev(ws.lo, x, t.in_dim, m, try be.weight16(f.a.bytes, f.a.dtype, false, rank, t.in_dim, 1, 1, .bf16), rank, t.in_dim, null);
+    }
+    // B: dst[m][n] += scale * lo @ B[row0 - f.out_off ..][n]^T.
+    const b_rows = lora.rowSlice(f.b, row0 - f.out_off, n);
+    return accumulate(be, ws, dst, ws.lo, lo_ld, m, b_rows, rank, t.scale * strength * f.gain);
 }
 
 /// `dst[m][n] += strength * delta x` for every term of `t` in output rows
@@ -275,17 +287,28 @@ pub fn hostVec(be: *Backend, v: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(v)), .size = v.len * 4 };
 }
 
-/// The B half alone: `dst[m][n] += scale * lo[m][..rank] @ b_rowsᵀ`, `lo` f32 read at
-/// stride `lo_ld`, `dst` at its own dtype. For a caller that made `lo` itself, a 3x3
-/// conv's A being a convolution rather than a GEMM.
-pub fn accumulate(be: *Backend, ws: *Workspace, dst: Buf, lo: Buf, lo_ld: usize, m: usize, b_rows: []const u8, n: usize, rank: usize, scale: f32) !void {
-    std.debug.assert(b_rows.len == n * rank * 2);
+/// The B half alone: `dst[m][n] += scale * lo[m][..rank] @ bᵀ`, `b` the `[n][rank]`
+/// rows of B this output takes, `lo` f32 read at stride `lo_ld`, `dst` at its own
+/// dtype. For a caller that made `lo` itself, a 3x3 conv's A being a convolution
+/// rather than a GEMM.
+pub fn accumulate(be: *Backend, ws: *Workspace, dst: Buf, lo: Buf, lo_ld: usize, m: usize, b: Weight, rank: usize, scale: f32) !void {
+    const n = b.rows;
+    std.debug.assert(b.cols == rank);
+    if (mathOn(be) == .f32 and lo_ld == rank) {
+        const w = try be.weight32(b.bytes, b.dtype, n, rank);
+        if (dst.dt == .f32) return be.opGemmF32Acc(dst, lo, m, w, n, rank, scale, 1.0);
+        const h = try outPlane(be, m * n);
+        try be.opGemmF32Acc(h, lo, m, w, n, rank, 1.0, 0.0);
+        if (bench_skip_add) return;
+        return be.opAddScaled(dst, h, m * n, scale);
+    }
+    // A 16-bit `dst` sets the width: cuBLASLt has no bf16 GEMM writing f16.
     if (ws.fused) return if (dst.dt != .f32)
-        be.opGemmHalfAcc(dst, lo, lo_ld, m, b_rows, n, rank, scale)
+        be.opGemmHalfAcc(dst, lo, lo_ld, m, try be.weight16(b.bytes, b.dtype, false, n, rank, 1, 1, dst.dt), n, rank, scale)
     else
-        be.opGemmBf16Acc(dst, lo, lo_ld, m, b_rows, n, rank, scale);
+        be.opGemm16Acc(dst, lo, lo_ld, m, try be.weight16(b.bytes, b.dtype, false, n, rank, 1, 1, lora.operandFor(.f32)), n, rank, scale);
     std.debug.assert(m * n <= ws.hi_elems);
-    try be.opGemmBf16Ld(ws.hi, lo, lo_ld, m, b_rows, n, rank, null);
+    try be.opGemmBf16LdDev(ws.hi, lo, lo_ld, m, try be.weight16(b.bytes, b.dtype, false, n, rank, 1, 1, .bf16), n, rank, null);
     if (bench_skip_add) return;
     try be.opAddScaled(dst, ws.hi, m * n, scale);
 }
@@ -355,11 +378,13 @@ test "device support is refused by shape rather than discovered at a launch" {
     t.factors = &.{f};
     try testing.expect(!supported(&t));
 
-    // f32 factors: no bf16 GEMM to read them.
+    // An f32 factor runs (`weight16` / `weight32` read it); a raw fp8 one, which
+    // `lora.loadTarget` always widens, has no GEMM here.
     const f32_a: [(128 * 64 * 4)]u8 = @splat(0);
-    var fw = bf16Weight(&ok_a, 128, 64);
-    fw = Weight.init(&f32_a, .f32, 128, 64);
-    f = .{ .a = fw, .b = bf16Weight(&ok_b, 256, 128), .out_off = 0 };
+    f = .{ .a = Weight.init(&f32_a, .f32, 128, 64), .b = bf16Weight(&ok_b, 256, 128), .out_off = 0 };
+    t.factors = &.{f};
+    try testing.expect(supported(&t));
+    f = .{ .a = Weight.init(ok_a[0 .. 128 * 64], .f8_e4m3, 128, 64), .b = bf16Weight(&ok_b, 256, 128), .out_off = 0 };
     t.factors = &.{f};
     try testing.expect(!supported(&t));
 }

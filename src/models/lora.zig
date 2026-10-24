@@ -231,8 +231,8 @@ pub const Target = struct {
     }
 
     /// `applyHost` over output rows `[row0, row0 + n)` only, into a `y` whose
-    /// column 0 is row `row0`. A factor must lie wholly inside or outside the
-    /// window, which `Stack.resolve` checked at attach.
+    /// column 0 is row `row0`. Which terms may cross the window is `rowsFit`'s
+    /// rule, checked by `Stack.resolve` at attach.
     pub fn applyHostRows(t: *const Target, io: std.Io, gpa: std.mem.Allocator, y: []f32, y_stride: usize, x: []const f32, m: usize, strength: f32, row0: usize, n: usize) !void {
         var fb: [max_slots]Factor = undefined;
         var kb: [max_slots]Kron = undefined;
@@ -245,31 +245,43 @@ pub const Target = struct {
         return view.applyHost(io, gpa, y, y_stride, x, m, strength);
     }
 
-    /// The terms of `all` inside rows `[row0, row0 + n)`, moved to that origin. A term
-    /// must lie wholly inside or outside, which `Stack.resolve` checked at attach.
+    /// The terms of `all` that touch rows `[row0, row0 + n)`, moved to that origin.
+    /// A factor containing the window is cut down to its rows of B.
     fn rowsOf(comptime T: type, buf: *[max_slots]T, all: []const T, row0: usize, n: usize) []const T {
         var k: usize = 0;
         for (all) |e| {
             const rows = termRows(e);
             if (e.out_off >= row0 + n or e.out_off + rows <= row0) continue;
-            std.debug.assert(e.out_off >= row0 and e.out_off + rows <= row0 + n);
             buf[k] = e;
-            buf[k].out_off -= row0;
+            if (e.out_off >= row0 and e.out_off + rows <= row0 + n) {
+                buf[k].out_off -= row0;
+            } else if (T == Factor) {
+                buf[k].b = rowSlice(e.b, row0 - e.out_off, n);
+                buf[k].out_off = 0;
+            } else unreachable;
             k += 1;
         }
         return buf[0..k];
     }
 
-    /// Whether some term covers exactly rows inside `[row0, row0 + n)`, and none
-    /// straddles them: a row view applies only what lies wholly in its rows.
+    /// Whether a row view `[row0, row0 + n)` can be applied on its own: every term
+    /// lies wholly inside or outside it, or one factor contains it and nothing else
+    /// touches it. The device arms take the containing factor alone (`factorAt`),
+    /// and B's rows are the output's, so a slice of one is exact. A LoKr or diff
+    /// term crossing the window is refused: the device arms skip those silently.
     pub fn rowsFit(t: *const Target, row0: usize, n: usize) bool {
+        var containing = false;
+        var inside = false;
         inline for (.{ t.factors, t.kron, t.diffs }) |all| for (all) |e| {
             const r = termRows(e);
-            const inside = e.out_off >= row0 and e.out_off + r <= row0 + n;
-            const outside = e.out_off >= row0 + n or e.out_off + r <= row0;
-            if (!inside and !outside) return false;
+            if (e.out_off >= row0 + n or e.out_off + r <= row0) continue;
+            if (e.out_off >= row0 and e.out_off + r <= row0 + n) {
+                inside = true;
+            } else if (@TypeOf(e) == Factor and e.out_off <= row0 and e.out_off + r >= row0 + n) {
+                containing = true;
+            } else return false;
         };
-        return true;
+        return !(containing and inside);
     }
 
     /// The bytes every term holds, for residency and the eviction walk.
@@ -1236,24 +1248,63 @@ fn mergeSlots(alloc: std.mem.Allocator, base: []const u8, slots: []const ?Target
 /// GEMM, which contracts over the rank.
 pub const rank_align: usize = 32;
 
+/// How a device sidecar runs a factor's two GEMMs. `op16` gives the tensor cores
+/// 16-bit operands, the factor converted once on the device to the activation's
+/// width (free when the file is already at it); `f32` runs true f32 GEMMs, so an
+/// f32 factor and the activation reach the product unrounded.
+pub const Math = enum { op16, f32 };
+pub var device_math: Math = .op16;
+
+/// `op16`'s operand width. `auto` takes f16 where the GEMM's 16-bit side (A's input,
+/// B's output) already is f16 and bf16 elsewhere, since an f32 activation can pass
+/// f16's 65504; the other two force one width, for measuring.
+pub const Operand = enum { auto, f16, bf16 };
+pub var operand: Operand = .auto;
+
+const Dt = @import("tp_gpu").dual_table.Dt;
+
+/// The operand width for a GEMM whose 16-bit-facing side is `side`.
+pub fn operandFor(side: Dt) Dt {
+    return switch (operand) {
+        .auto => if (side == .f16) .f16 else .bf16,
+        .f16 => .f16,
+        .bf16 => .bf16,
+    };
+}
+
 /// `f` with its rank zero-padded to `rank_align`, copied into `alloc`. A factor
-/// already aligned, or not bf16, comes back as is.
+/// already aligned comes back as is, unless its bytes are not aligned to their
+/// element: an f32 one read from a file can sit on any even offset.
 pub fn padRank(alloc: std.mem.Allocator, f: Factor) !Factor {
     const r = f.rank();
-    if (f.a.dtype != .bf16 or f.b.dtype != .bf16 or r % rank_align == 0) return f;
+    const ea = elemBytes(f.a.dtype);
+    const eb = elemBytes(f.b.dtype);
+    std.debug.assert(ea != 0 and eb != 0 and f.b.cols == r);
+    const aligned = @intFromPtr(f.a.bytes.ptr) % ea == 0 and @intFromPtr(f.b.bytes.ptr) % eb == 0;
+    if (r % rank_align == 0 and aligned) return f;
     const rp = std.mem.alignForward(usize, r, rank_align);
     const in_dim = f.a.cols;
     const out = f.b.rows;
-    std.debug.assert(f.b.cols == r and f.a.bytes.len == r * in_dim * 2 and f.b.bytes.len == out * r * 2);
 
-    // Word-aligned: the device kernels read these as 16- and 32-bit words.
-    const a = try alloc.alignedAlloc(u8, .of(u32), rp * in_dim * 2);
-    @memcpy(a[0 .. r * in_dim * 2], f.a.bytes);
-    @memset(a[r * in_dim * 2 ..], 0);
-    const b = try alloc.alignedAlloc(u8, .of(u32), out * rp * 2);
+    const a = try alloc.alignedAlloc(u8, .of(u32), rp * in_dim * ea);
+    @memcpy(a[0 .. r * in_dim * ea], f.a.bytes);
+    @memset(a[r * in_dim * ea ..], 0);
+    const b = try alloc.alignedAlloc(u8, .of(u32), out * rp * eb);
     @memset(b, 0);
-    for (0..out) |o| @memcpy(b[o * rp * 2 ..][0 .. r * 2], f.b.bytes[o * r * 2 ..][0 .. r * 2]);
-    return .{ .a = Weight.init(a, .bf16, rp, in_dim), .b = Weight.init(b, .bf16, out, rp), .out_off = f.out_off, .gain = f.gain };
+    for (0..out) |o| @memcpy(b[o * rp * eb ..][0 .. r * eb], f.b.bytes[o * r * eb ..][0 .. r * eb]);
+    return .{ .a = Weight.init(a, f.a.dtype, rp, in_dim), .b = Weight.init(b, f.b.dtype, out, rp), .out_off = f.out_off, .gain = f.gain };
+}
+
+/// `w` in a dtype every backend's sidecar runs: bf16, f16 and f32 as they are,
+/// anything else (fp8, f64) widened to f32 in `alloc`.
+fn factorDtype(alloc: std.mem.Allocator, w: Weight) !Weight {
+    if (elemBytes(w.dtype) != 0) return w;
+    const vals = try alloc.alignedAlloc(f32, .of(u32), w.rows * w.cols);
+    try tp_core.safetensors.convertToF32(w.dtype, w.bytes, vals);
+    if (w.scale != 1.0) for (vals) |*v| {
+        v.* *= w.scale;
+    };
+    return Weight.fromF32(vals, w.rows, w.cols);
 }
 
 /// A stem that is not a plain pair, read as ComfyUI reads it (`lora_adapter.parse`) and
@@ -1344,8 +1395,8 @@ fn loadTarget(
         return error.UnsupportedDType;
     }
 
-    const a_full = Weight.init(a_view.bytes, a_dt, rank, in_dim);
-    const b_full = Weight.init(b_view.bytes, b_dt, out_dim, rank);
+    const a_full = try factorDtype(alloc, Weight.init(a_view.bytes, a_dt, rank, in_dim));
+    const b_full = try factorDtype(alloc, Weight.init(b_view.bytes, b_dt, out_dim, rank));
 
     const groups = blockGroups(b_full);
     const factors = try alloc.alloc(Factor, groups);
@@ -1440,7 +1491,7 @@ fn elemBytes(dt: DType) usize {
 
 /// Rows `[from, from + n)` of a row-major weight, as a view. Contiguous, since
 /// rows are `cols` elements apart with no padding.
-fn rowSlice(w: Weight, from: usize, n: usize) Weight {
+pub fn rowSlice(w: Weight, from: usize, n: usize) Weight {
     const stride = w.dtype.storageBytes(w.cols);
     var out = w;
     out.bytes = w.bytes[from * stride ..][0 .. n * stride];
@@ -2058,6 +2109,72 @@ pub fn safetensorsBlob(gpa: std.mem.Allocator, tensors: []const struct { []const
     return out;
 }
 
+test "an f32 factor pads in its own dtype and an fp8 one widens to f32" {
+    // The device sidecars run f32, f16 and bf16 factors as they are; a factor that
+    // came back narrowed, or an fp8 one left raw, would apply a different LoRA.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var prng = std.Random.DefaultPrng.init(0xf32f);
+    const rnd = prng.random();
+    const in_dim: usize = 64;
+    const out_dim: usize = 96;
+    const r: usize = 8;
+    const a = try gpa.alloc(f32, r * in_dim);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, out_dim * r);
+    defer gpa.free(b);
+    for (a) |*v| v.* = rnd.floatNorm(f32) * 0.1;
+    for (b) |*v| v.* = rnd.floatNorm(f32) * 0.1;
+    const q8 = try gpa.alloc(u8, r * in_dim);
+    defer gpa.free(q8);
+    for (q8, 0..) |*v, i| v.* = @intCast(i % 0x7e); // every finite e4m3 code below 0x7e
+
+    const blob = try safetensorsBlob(gpa, &.{
+        .{ "diffusion_model.blk.f.lora_down.weight", "F32", &.{ r, in_dim }, std.mem.sliceAsBytes(a) },
+        .{ "diffusion_model.blk.f.lora_up.weight", "F32", &.{ out_dim, r }, std.mem.sliceAsBytes(b) },
+        .{ "diffusion_model.blk.q.lora_down.weight", "F8_E4M3", &.{ r, in_dim }, q8 },
+        .{ "diffusion_model.blk.q.lora_up.weight", "F32", &.{ out_dim, r }, std.mem.sliceAsBytes(b) },
+    });
+    defer gpa.free(blob);
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, blob);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+    var stack: Stack = .{};
+    defer stack.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), try stack.add(gpa, store, 1.0, "f32", .{}));
+
+    const f = stack.index.get("blk.f.weight").?.items[0].target.factors[0];
+    try testing.expectEqual(DType.f32, f.a.dtype);
+    try testing.expectEqual(DType.f32, f.b.dtype);
+    try testing.expectEqual(rank_align, f.rank());
+    for (0..r) |i| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(a[i * in_dim ..][0..in_dim]), f.a.bytes[i * in_dim * 4 ..][0 .. in_dim * 4]);
+    try testing.expect(allZero(f.a.bytes[r * in_dim * 4 ..]));
+
+    const q = stack.index.get("blk.q.weight").?.items[0].target.factors[0];
+    try testing.expectEqual(DType.f32, q.a.dtype);
+    const qa = std.mem.bytesAsSlice(f32, q.a.bytes);
+    for (q8, 0..) |code, i| try testing.expectEqual(tp_core.dtype.f8e4m3ToF32(code), qa[i]);
+
+    // Padded, the target applies exactly what the file's own rank-8 factor does.
+    const t = stack.index.get("blk.f.weight").?.items[0].target;
+    const file_t: Target = .{
+        .factors = &.{.{ .a = Weight.fromF32(a, r, in_dim), .b = Weight.fromF32(b, out_dim, r), .out_off = 0 }},
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .scale = t.scale,
+        .tag = "file",
+    };
+    const m: usize = 3;
+    const x = try gpa.alloc(f32, m * in_dim);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    var want: [m * out_dim]f32 = @splat(0);
+    var got: [m * out_dim]f32 = @splat(0);
+    try file_t.applyHost(io, gpa, &want, out_dim, x, m, 1.0);
+    try t.applyHost(io, gpa, &got, out_dim, x, m, 1.0);
+    for (want, got) |w, g| try testing.expectApproxEqAbs(w, g, 1e-6);
+}
+
 test "a rank-8 factor pads to the slab, keeps the file's scale, and applies unchanged" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -2183,6 +2300,60 @@ test "applyHost writes into a fused destination's own column range" {
     try t.applyHost(testing.io, testing.allocator, &y, 6, &x, 2, 1.0);
     // x row 0 is [1, 9] -> lo = 1 -> hi = [2, 3] at columns 2 and 3.
     try testing.expectEqualSlices(f32, &.{ 0, 0, 2, 3, 0, 0, 0, 0, 4, 6, 0, 0 }, &y);
+}
+
+test "a row view of one fused factor applies that factor's own rows" {
+    // A trunk that runs a fused up/gate linear as two row views (MOSS-Image's
+    // `ffn_up_gate`) against a LoRA trained on the fused tensor: each half must
+    // take its half of B, not refuse and not take the other half.
+    const in_dim: usize = 2;
+    const a = [_]f32{ 1, 2 }; // rank 1
+    const b = [_]f32{ 1, 2, 3, 4 }; // 4 output rows
+    const t: Target = .{
+        .factors = &.{.{ .a = Weight.fromF32(&a, 1, in_dim), .b = Weight.fromF32(&b, 4, 1), .out_off = 0 }},
+        .in_dim = in_dim,
+        .out_dim = 4,
+        .scale = 0.5,
+        .tag = "up_gate",
+    };
+    const x = [_]f32{ 1, 1, 2, 0 }; // lo = 3, then 2
+    var whole: [2 * 4]f32 = @splat(0);
+    try t.applyHost(testing.io, testing.allocator, &whole, 4, &x, 2, 1.0);
+    for (0..2) |half| {
+        try testing.expect(t.rowsFit(half * 2, 2));
+        var y: [2 * 2]f32 = @splat(0);
+        try t.applyHostRows(testing.io, testing.allocator, &y, 2, &x, 2, 1.0, half * 2, 2);
+        for (0..2) |i| for (0..2) |o| {
+            errdefer std.debug.print("half {d} row {d} col {d}\n", .{ half, i, o });
+            try testing.expectEqual(whole[i * 4 + half * 2 + o], y[i * 2 + o]);
+        };
+    }
+
+    // Two factors: a view inside one of them fits, one spanning both does not,
+    // and nor does a containing factor with a second term inside the view.
+    const two: Target = .{
+        .factors = &.{
+            .{ .a = Weight.fromF32(&a, 1, in_dim), .b = Weight.fromF32(b[0..2], 2, 1), .out_off = 0 },
+            .{ .a = Weight.fromF32(&a, 1, in_dim), .b = Weight.fromF32(b[2..4], 2, 1), .out_off = 2 },
+        },
+        .in_dim = in_dim,
+        .out_dim = 4,
+        .scale = 1,
+        .tag = "two",
+    };
+    try testing.expect(two.rowsFit(2, 1));
+    try testing.expect(!two.rowsFit(1, 2));
+    const nested: Target = .{
+        .factors = &.{
+            .{ .a = Weight.fromF32(&a, 1, in_dim), .b = Weight.fromF32(&b, 4, 1), .out_off = 0 },
+            .{ .a = Weight.fromF32(&a, 1, in_dim), .b = Weight.fromF32(b[0..1], 1, 1), .out_off = 1 },
+        },
+        .in_dim = in_dim,
+        .out_dim = 4,
+        .scale = 1,
+        .tag = "nested",
+    };
+    try testing.expect(!nested.rowsFit(0, 2));
 }
 
 test "applyHost accumulates rather than overwriting" {

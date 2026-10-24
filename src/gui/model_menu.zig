@@ -153,7 +153,8 @@ fn menuBody(menu: Menu) ?Pick {
             .corners = style.R.chip,
         };
         if (dvui.menuItemLabel(@src(), g.label, .{ .submenu = true }, opts)) |r| {
-            var fw = dvui.floatingMenu(@src(), .{ .from = r, .avoid = .horizontal }, .{});
+            // Focus moving to the next group mid-frame opens both submenus that frame.
+            var fw = dvui.floatingMenu(@src(), .{ .from = r, .avoid = .horizontal }, .{ .id_extra = gi });
             defer fw.deinit();
             fw.menu.submenus_activated = true;
             for (g.items, 0..) |it, ii| {

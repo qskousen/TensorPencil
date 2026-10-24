@@ -8193,6 +8193,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 std.log.err("--dit-dequant-at-load: expected off|f32|bf16 (got '{s}')", .{val});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, flag, "--lora-math")) {
+            TensorPencil.models.lora.device_math = std.meta.stringToEnum(TensorPencil.models.lora.Math, val) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, flag, "--lora-host-bf16")) {
             // DIAGNOSTIC: the control row for a device-vs-host sidecar
             // comparison. See `lora.host_bf16_act`.
@@ -10065,6 +10067,10 @@ fn loraVkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         try stdout.print("FAILED\n", .{});
         std.process.exit(1);
     }
+    loraDtypeSweep(arena, io, stdout, LoraVkDev{ .ctx = ctx, .scratch = &scratch, .zb = zb }) catch {
+        try stdout.print("FAILED\n", .{});
+        std.process.exit(1);
+    };
     try stdout.print("OK\n", .{});
 }
 
@@ -10350,8 +10356,197 @@ fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool
         try stdout.print("FAIL: the device sidecar disagrees with the host one\n", .{});
         return error.Unsupported;
     }
+    {
+        const mpad = std.mem.alignForward(usize, 150, 128);
+        var ws = try lora_cuda.Workspace.init(be, lora_cuda.loElems(150, 128), mpad * 16384);
+        defer ws.deinit(be);
+        try loraDtypeSweep(arena, io, stdout, LoraCudaDev{ .be = be, .ws = &ws, .has_f32 = be.kernels == .libs });
+    }
     try stdout.print("OK\n", .{});
 }
+
+/// The factor-dtype half of `lora-cuda-test` and `lora-vk-test`: every factor dtype a
+/// file ships (bf16, f16, f32) under both `lora.device_math` arms and every activation
+/// width, against the host's exact apply of the SAME stored factors, so a row measures
+/// only what the device rounds. The f16 and bf16 activations are scored on a zero base,
+/// since the accumulate onto a real one is the bf16 section's job above.
+///
+/// Two shapes, both MOSS-Image's: a plain 3072-wide linear, and the fused 16384-row
+/// `ffn_up_gate` asked for as its two halves, which slices one factor's B by rows.
+fn loraDtypeSweep(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, dev: anytype) !void {
+    const lora = TensorPencil.models.lora;
+    const Weight = TensorPencil.ops.matmul.Weight;
+    const DType = TensorPencil.dtype.DType;
+    const Dt = TensorPencil.gpu.dual_table.Dt;
+    const m: usize = 150;
+    const rank: usize = 128;
+    const scale: f32 = 1.0;
+    var prng = std.Random.DefaultPrng.init(0xd7e5);
+    const rnd = prng.random();
+    defer lora.device_math = .op16;
+    defer lora.operand = .auto;
+    // `auto` at every activation width, each forced width where `auto` takes the
+    // other, and true f32.
+    const Arm = struct { label: []const u8, math: lora.Math = .op16, operand: lora.Operand = .auto, x: Dt };
+    const arms = [_]Arm{
+        .{ .label = "auto/f32", .x = .f32 },
+        .{ .label = "auto/bf16", .x = .bf16 },
+        .{ .label = "auto/f16", .x = .f16 },
+        .{ .label = "f16/f32", .operand = .f16, .x = .f32 },
+        .{ .label = "bf16/f16", .operand = .bf16, .x = .f16 },
+        .{ .label = "f32/f32", .math = .f32, .x = .f32 },
+        .{ .label = "f32/bf16", .math = .f32, .x = .bf16 },
+        .{ .label = "f32/f16", .math = .f32, .x = .f16 },
+    };
+
+    const encode = struct {
+        fn f(a: std.mem.Allocator, v: []const f32, dt: DType) ![]u8 {
+            const out = try a.alignedAlloc(u8, .of(u32), dt.storageBytes(v.len));
+            switch (dt) {
+                .f32 => @memcpy(out, std.mem.sliceAsBytes(v)),
+                .f16 => TensorPencil.dtype.f32ToF16Row(v, out),
+                .bf16 => TensorPencil.dtype.f32ToBf16Row(v, out),
+                else => unreachable,
+            }
+            return out;
+        }
+        fn act(a: std.mem.Allocator, v: []const f32, dt: Dt) ![]u8 {
+            return f(a, v, switch (dt) {
+                .f32 => .f32,
+                .f16 => .f16,
+                .bf16 => .bf16,
+            });
+        }
+        fn back(b: []const u8, dt: Dt, i: usize) f32 {
+            return switch (dt) {
+                .f32 => std.mem.bytesAsSlice(f32, b)[i],
+                .f16 => @as(f16, @bitCast(std.mem.readInt(u16, b[i * 2 ..][0..2], .little))),
+                .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, b[i * 2 ..][0..2], .little)) << 16),
+            };
+        }
+    };
+
+    var worst_exact: f64 = 0;
+    var worst_16: f64 = 0;
+    try stdout.print("factor dtype x operand, rank {d}, m {d}, rel against the host on the same stored factors:\n", .{ rank, m });
+    for ([_]struct { name: []const u8, in: usize, out: usize, split: usize }{
+        .{ .name = "q", .in = 3072, .out = 3072, .split = 1 },
+        .{ .name = "ffn_up_gate", .in = 3072, .out = 16384, .split = 2 },
+    }) |c| {
+        const a32 = try arena.alloc(f32, rank * c.in);
+        const b32 = try arena.alloc(f32, c.out * rank);
+        for (a32) |*v| v.* = rnd.floatNorm(f32) * 0.02;
+        for (b32) |*v| v.* = rnd.floatNorm(f32) * 0.02;
+        const x = try arena.alloc(f32, m * c.in);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const n = c.out / c.split;
+        try stdout.print("  {s} {d} -> {d} as {d} row range(s)\n    {s:<6}", .{ c.name, c.in, c.out, c.split, "" });
+        for (arms) |arm| try stdout.print(" {s:>9}", .{arm.label});
+        try stdout.print("   (operand/activation)\n", .{});
+        for ([_]DType{ .bf16, .f16, .f32 }) |fdt| {
+            const f = try arena.alloc(lora.Factor, 1);
+            f[0] = .{ .a = Weight.init(try encode.f(arena, a32, fdt), fdt, rank, c.in), .b = Weight.init(try encode.f(arena, b32, fdt), fdt, c.out, rank), .out_off = 0 };
+            const t: lora.Target = .{ .factors = f, .in_dim = c.in, .out_dim = c.out, .scale = scale, .tag = c.name };
+            if (!dev.supported(&t)) {
+                try stdout.print("FAIL: {t} factors have no device path\n", .{fdt});
+                return error.Unsupported;
+            }
+            const want = try arena.alloc(f32, m * c.out);
+            @memset(want, 0);
+            try t.applyHost(io, arena, want, c.out, x, m, 1.0);
+            try stdout.print("    {t:<6}", .{fdt});
+            for (arms) |arm| {
+                const mt = arm.math;
+                const xdt = arm.x;
+                lora.device_math = mt;
+                lora.operand = arm.operand;
+                const xd = try dev.upload(try encode.act(arena, x, xdt), xdt);
+                var l2_ref: f64 = 0;
+                var l2_err: f64 = 0;
+                for (0..c.split) |r| {
+                    const zeros = try arena.alloc(f32, m * n);
+                    @memset(zeros, 0);
+                    const yd = try dev.upload(try encode.act(arena, zeros, xdt), xdt);
+                    try dev.apply(&t, yd, xd, m, r * n, n);
+                    const got = try dev.download(arena, yd, m * n * xdt.bytes());
+                    for (0..m) |i| for (0..n) |j| {
+                        const e = want[i * c.out + r * n + j];
+                        const d = encode.back(got, xdt, i * n + j) - e;
+                        l2_ref += @as(f64, e) * e;
+                        l2_err += @as(f64, d) * d;
+                    };
+                }
+                const rel = @sqrt(l2_err / l2_ref);
+                if (mt == .f32 and xdt == .f32 and dev.has_f32) worst_exact = @max(worst_exact, rel) else worst_16 = @max(worst_16, rel);
+                try stdout.print(" {e:>9.2}", .{rel});
+            }
+            try stdout.print("\n", .{});
+            try stdout.flush();
+        }
+        dev.evict();
+    }
+    // f32 math on an f32 activation sums in f32 in another order than the host: ~1e-6.
+    // Everything else rounds the activation, the factor or the output to 16 bits.
+    try stdout.print("worst rel: f32 math on f32 activations {e}, every 16-bit row {e}\n", .{ worst_exact, worst_16 });
+    if (worst_exact > 1e-5 or worst_16 > 5e-3) {
+        try stdout.print("FAIL: a factor dtype disagrees with the host\n", .{});
+        return error.Unsupported;
+    }
+}
+
+const LoraCudaDev = struct {
+    be: *TensorPencil.gpu.cuda.Backend,
+    ws: *TensorPencil.models.lora_cuda.Workspace,
+    has_f32: bool,
+    const Buf = TensorPencil.gpu.cuda.backend.DeviceBuffer;
+    fn supported(_: LoraCudaDev, t: *const TensorPencil.models.lora.Target) bool {
+        return TensorPencil.models.lora_cuda.supported(t);
+    }
+    fn upload(d: LoraCudaDev, bytes: []const u8, dt: TensorPencil.gpu.dual_table.Dt) !Buf {
+        const b = try d.be.tensorCreate(bytes.len);
+        try d.be.tensorUpload(b, bytes);
+        return b.as(dt);
+    }
+    fn apply(d: LoraCudaDev, t: *const TensorPencil.models.lora.Target, y: Buf, x: Buf, m: usize, row0: usize, n: usize) !void {
+        try d.be.beginBatch();
+        errdefer if (d.be.batching()) d.be.abortBatch();
+        try TensorPencil.models.lora_cuda.applyRange(d.be, d.ws, y, x, m, t, 1.0, row0, n);
+        try d.be.endBatch();
+    }
+    fn download(d: LoraCudaDev, a: std.mem.Allocator, b: Buf, len: usize) ![]u8 {
+        const out = try a.alignedAlloc(u8, .of(u32), len);
+        try d.be.tensorDownload(b, out);
+        return out;
+    }
+    fn evict(d: LoraCudaDev) void {
+        d.be.evictWeights();
+    }
+};
+
+const LoraVkDev = struct {
+    ctx: *TensorPencil.gpu.Context,
+    scratch: *TensorPencil.models.lora_gpu.Scratch,
+    zb: []const f32,
+    has_f32: bool = true,
+    const Buf = TensorPencil.gpu.context.DeviceBuffer;
+    fn supported(_: LoraVkDev, t: *const TensorPencil.models.lora.Target) bool {
+        return TensorPencil.models.lora_gpu.supported(t);
+    }
+    fn upload(d: LoraVkDev, bytes: []const u8, dt: TensorPencil.gpu.dual_table.Dt) !Buf {
+        const b = try d.ctx.tensorCreate(std.mem.alignForward(usize, bytes.len, 4));
+        try d.ctx.tensorUpload(b, bytes);
+        return b.as(dt);
+    }
+    fn apply(d: LoraVkDev, t: *const TensorPencil.models.lora.Target, y: Buf, x: Buf, m: usize, row0: usize, n: usize) !void {
+        try TensorPencil.models.lora_gpu.apply(d.ctx, d.scratch, d.zb, y, x, m, t, 1.0, row0, n);
+    }
+    fn download(d: LoraVkDev, a: std.mem.Allocator, b: Buf, len: usize) ![]u8 {
+        const out = try a.alignedAlloc(u8, .of(u32), len);
+        try d.ctx.tensorDownload(b, out);
+        return out;
+    }
+    fn evict(_: LoraVkDev) void {}
+};
 
 /// `velocity-diff <ckpt> [--text-encoder P] [--text-encoder-2 P] [--vae P] [--size N]
 /// [--backend cuda|zig-cuda|vulkan] [--lora P] [--lora-bf16-a] [--dit-act D]
@@ -11764,8 +11959,14 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
         .preview = false,
         .loras = &specs,
     };
-    if (te.len != 0) opts.text_encoder_path = te;
-    if (vae.len != 0) opts.vae_path = vae;
+    if (te.len != 0) {
+        opts.text_encoder_path = te;
+        opts.explicit_text_encoder = true;
+    }
+    if (vae.len != 0) {
+        opts.vae_path = vae;
+        opts.explicit_vae = true;
+    }
     try stdout.print("== lora-sidecar-bench ==\nckpt: {s}\nlora: {s}\n{d}x{d}, {d} steps, {t}\n", .{ ckpt, lora_path, size, size, opts.steps, backend });
     var sess = pipeline.Session.init(io, arena, opts, stdout) catch |err| {
         try stdout.print("cannot load: {t}\n", .{err});
@@ -11782,22 +11983,35 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
     // `old` and `new` are the two sidecars compared; CUDA's skip_a rows time the A
     // GEMMs (`lora_cuda.bench_skip_a`) and render nothing.
     const SkipA = @TypeOf(lora_cuda.bench_skip_a);
-    const Variant = struct { name: []const u8, strength: f32, i8a: bool = true, plain: bool = false, skip_a: SkipA = .none, overwrite: bool = false };
+    const Variant = struct { name: []const u8, strength: f32, i8a: bool = true, plain: bool = false, skip_a: SkipA = .none, overwrite: bool = false, math: TensorPencil.models.lora.Math = .op16, operand: TensorPencil.models.lora.Operand = .auto, render: bool = false };
     const cuda_variants = [_]Variant{
-        .{ .name = "no_lora", .strength = 0, .plain = true },
-        .{ .name = "lora_off", .strength = 0 },
-        .{ .name = "old_sidecar", .strength = 1, .i8a = false },
-        .{ .name = "new_sidecar", .strength = 1 },
+        .{ .name = "no_lora", .strength = 0, .plain = true, .render = true },
+        .{ .name = "lora_off", .strength = 0, .render = true },
+        .{ .name = "old_sidecar", .strength = 1, .i8a = false, .render = true },
+        .{ .name = "new_sidecar", .strength = 1, .render = true },
         .{ .name = "skip_a_all", .strength = 1, .skip_a = .all },
         .{ .name = "skip_a_shared", .strength = 1, .skip_a = .shared },
         // The B GEMM's read of the output plane removed, its result wrong: what
         // running the sidecar before the base GEMM could save at most.
         .{ .name = "b_overwrite", .strength = 1, .overwrite = true },
+        // Both factor GEMMs in true f32 (`lora.device_math`), the factors unrounded,
+        // and the control for it: the same arm nudged by about what 16-bit rounding
+        // moves the LoRA's delta, read against how far a W8A8 trunk carries that.
+        .{ .name = "f32_sidecar", .strength = 1, .math = .f32, .render = true },
+        .{ .name = "f32_nudge", .strength = 1.003, .math = .f32, .render = true },
+        // The 16-bit operand width forced each way (`lora.operand`), bf16 A GEMMs
+        // so the width is the only difference.
+        .{ .name = "f16_operand", .strength = 1, .i8a = false, .operand = .f16, .render = true },
+        .{ .name = "bf16_operand", .strength = 1, .i8a = false, .operand = .bf16, .render = true },
     };
     const vk_variants = [_]Variant{
-        .{ .name = "no_lora", .strength = 0, .plain = true },
-        .{ .name = "lora_off", .strength = 0 },
-        .{ .name = "sidecar", .strength = 1 },
+        .{ .name = "no_lora", .strength = 0, .plain = true, .render = true },
+        .{ .name = "lora_off", .strength = 0, .render = true },
+        .{ .name = "sidecar", .strength = 1, .render = true },
+        .{ .name = "f32_sidecar", .strength = 1, .math = .f32, .render = true },
+        .{ .name = "f32_nudge", .strength = 1.003, .math = .f32, .render = true },
+        .{ .name = "f16_operand", .strength = 1, .operand = .f16, .render = true },
+        .{ .name = "bf16_operand", .strength = 1, .operand = .bf16, .render = true },
     };
     const variants: []const Variant = if (backend == .vulkan) &vk_variants else &cuda_variants;
     const set = struct {
@@ -11806,8 +12020,21 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
             lin_cuda.lora_i8_a = v.i8a;
             lora_cuda.bench_skip_a = v.skip_a;
             TensorPencil.gpu.cuda.Backend.bench_acc_overwrite = v.overwrite;
+            TensorPencil.models.lora.device_math = v.math;
+            TensorPencil.models.lora.operand = v.operand;
         }
     }.f;
+    defer TensorPencil.models.lora.device_math = .op16;
+    defer TensorPencil.models.lora.operand = .auto;
+    const at = struct {
+        fn f(vs: []const Variant, name: []const u8) usize {
+            for (vs, 0..) |v, i| if (std.mem.eql(u8, v.name, name)) return i;
+            unreachable;
+        }
+    }.f;
+    const f32_at = at(variants, "f32_sidecar");
+    const nudge_at = at(variants, "f32_nudge");
+    const op16_at = at(variants, if (backend == .vulkan) "sidecar" else "old_sidecar");
 
     var cond = try sess.encode(arena, opts.prompt, .{});
     defer cond.deinit(arena);
@@ -11851,8 +12078,15 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
     try stdout.print("velocity at sigma {d:.3}: sidecar vs lora off rel {e:.3} (what the LoRA moves); lora off vs no lora rel {e:.3}\n", .{
         sigmas[0], relOf(vel[2], vel[1]), relOf(vel[0], vel[1]),
     });
-    if (variants.len > 3) try stdout.print("new vs old sidecar rel {e:.3}\n", .{relOf(vel[2], vel[3])});
-    if (variants.len > 4)
+    if (backend != .vulkan) try stdout.print("new vs old sidecar rel {e:.3}\n", .{relOf(vel[2], vel[3])});
+    try stdout.print("f32 sidecar vs {s} rel {e:.3}; control, f32 vs itself at strength 1.003: rel {e:.3}; the LoRA's own move {e:.3}\n", .{
+        variants[op16_at].name, relOf(vel[f32_at], vel[op16_at]), relOf(vel[f32_at], vel[nudge_at]), relOf(vel[f32_at], vel[1]),
+    });
+    if (backend != .vulkan) try stdout.print("f32 sidecar vs new_sidecar rel {e:.3}\n", .{relOf(vel[f32_at], vel[at(variants, "new_sidecar")])});
+    const f16_at = at(variants, "f16_operand");
+    const bf16_at = at(variants, "bf16_operand");
+    try stdout.print("f32 sidecar vs f16 operands rel {e:.3}, vs bf16 operands rel {e:.3}\n", .{ relOf(vel[f32_at], vel[f16_at]), relOf(vel[f32_at], vel[bf16_at]) });
+    if (backend != .vulkan)
         try stdout.print("skipped A changes the velocity: all rel {e:.3}, shared rel {e:.3}\n", .{ relOf(vel[3], vel[4]), relOf(vel[3], vel[5]) });
 
     // Interleaved: each round runs every variant once, starting one later per round.
@@ -11881,20 +12115,23 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
         try stdout.print("  {s:<12} {d:.4} s/step median, {d:.4} min, {d:.4} max\n", .{ vr.name, med[i], col[0], col[rounds - 1] });
     }
     try stdout.print("  over no LoRA: attached at 0 +{d:.1}%, {s} +{d:.1}%\n", .{ 100 * (med[1] - med[0]) / med[0], variants[2].name, 100 * (med[2] - med[0]) / med[0] });
-    if (variants.len > 3) try stdout.print("  over no LoRA: {s} +{d:.1}%\n", .{ variants[3].name, 100 * (med[3] - med[0]) / med[0] });
-    if (variants.len > 4) try stdout.print("  A GEMMs: all {d:.1} ms/step, the ones a shared A would absorb {d:.1} ms/step\n", .{
+    if (backend != .vulkan) try stdout.print("  over no LoRA: {s} +{d:.1}%\n", .{ variants[3].name, 100 * (med[3] - med[0]) / med[0] });
+    try stdout.print("  over no LoRA: f32_sidecar +{d:.1}%, the sidecar alone {d:.2}x the {s} one\n", .{
+        100 * (med[f32_at] - med[0]) / med[0], (med[f32_at] - med[1]) / (med[op16_at] - med[1]), variants[op16_at].name,
+    });
+    if (backend != .vulkan) try stdout.print("  A GEMMs: all {d:.1} ms/step, the ones a shared A would absorb {d:.1} ms/step\n", .{
         1e3 * (med[3] - med[4]), 1e3 * (med[3] - med[5]),
     });
-    if (variants.len > 6) try stdout.print("  B's read of the output plane: {d:.1} ms/step ({d:.1}% of new_sidecar's step), the most a sidecar-first order saves\n", .{
+    if (backend != .vulkan) try stdout.print("  B's read of the output plane: {d:.1} ms/step ({d:.1}% of new_sidecar's step), the most a sidecar-first order saves\n", .{
         1e3 * (med[3] - med[6]), 100 * (med[3] - med[6]) / med[3],
     });
     try stdout.print("  timing: {d} rounds, each round every variant once in an order rotated by one per round, {d} predict calls per sample, same denoiser and latent\n", .{ rounds, per });
 
     // One render per variant that renders, the whole 8-step trajectory.
     try std.Io.Dir.cwd().createDirPath(io, "scratch_out");
-    const renders = @min(variants.len, 4);
-    var rgb: [4][]u8 = undefined;
-    for (variants[0..renders], 0..) |vr, i| {
+    const rgb = try arena.alloc([]u8, variants.len);
+    for (variants, 0..) |vr, i| {
+        if (!vr.render) continue;
         set(sess, vr);
         const img = try sess.generate(opts, null);
         rgb[i] = img.rgb;
@@ -11917,7 +12154,11 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
         }
     }.f;
     try stdout.print("image PSNR: sidecar vs lora off {d:.2} dB (what the LoRA moves)\n", .{psnr(rgb[2], rgb[1])});
-    if (renders > 3) try stdout.print("image PSNR: new vs old sidecar {d:.2} dB\n", .{psnr(rgb[2], rgb[3])});
+    if (backend != .vulkan) try stdout.print("image PSNR: new vs old sidecar {d:.2} dB\n", .{psnr(rgb[at(variants, "new_sidecar")], rgb[op16_at])});
+    try stdout.print("image PSNR: f32 sidecar vs {s} {d:.2} dB; control, f32 vs f32 at strength 1.003: {d:.2} dB\n", .{
+        variants[op16_at].name, psnr(rgb[f32_at], rgb[op16_at]), psnr(rgb[f32_at], rgb[nudge_at]),
+    });
+    try stdout.print("image PSNR: f32 sidecar vs f16 operands {d:.2} dB, vs bf16 operands {d:.2} dB\n", .{ psnr(rgb[f32_at], rgb[f16_at]), psnr(rgb[f32_at], rgb[bf16_at]) });
     try stdout.flush();
 }
 

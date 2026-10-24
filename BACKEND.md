@@ -544,12 +544,29 @@ Where the apply runs:
 
 | piece | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
-| linear sidecar | each model's host funnel (`mm` / `linear`) | inside `lin_gpu.gemm`, two bf16 coop GEMMs, B accumulating onto the output | inside `lin_cuda.gemm` | same, B folded into cuBLASLt's epilogue | `lora.zig`, `lora_gpu.zig`, `lora_cuda.zig` |
+| linear sidecar | each model's host funnel (`mm` / `linear`) | inside `lin_gpu.gemm`, two 16-bit coop GEMMs, B accumulating onto the output | inside `lin_cuda.gemm` | same, B folded into cuBLASLt's epilogue | `lora.zig`, `lora_gpu.zig`, `lora_cuda.zig` |
+| f32 / f16 / bf16 factors (`--lora-math op16`) | ✅ any | ✅ converted once to the coop operand | ✅ `weight16` | ✅ `weight16` | |
+| true-f32 factor GEMMs (`--lora-math f32`) | always | ✅ f32 GEMM + `add_scaled` | falls back to `op16` | ✅ `COMPUTE_32F`, beta into an f32 output | |
 | patch embeds, output heads | ✅ | ✅ (`lin_gpu.linearAt`) | ✅ offset views | ✅ | |
 | SD 3x3 conv `A` | ✅ | conv (`sd_unet_gpu.convLora`) | ✅ | ✅ | `lora_sd.zig` |
 | int8 `A` on an int8-prep route (int8, W4A8, block-quant int8) | | | ✅ `opI8Gemm` | ✅ | `lin_cuda.quantizeLora` |
 | SD f16 activation chain | | | | ✅ `opGemmHalfIn` / `opGemmHalfAcc` | |
 
+- **A factor keeps its file's dtype** (f32, f16, bf16; fp8 and f64 widen to f32 at load),
+  and `lora.device_math` picks the device arithmetic. `op16` (default) converts it once,
+  on the device, to the GEMM's 16-bit operand; `f32` keeps it and the activation exact.
+  Measured on MOSS-Image's f32 DMD LoRA at 1024² (int8 trunk, 3090): `f32` costs +32% a
+  step over no LoRA against `op16`'s +19% on cuda (+64% against +21% on vulkan), and moves
+  the image less than the control, the same arm at strength 1.003 (39.0 dB against 35.4 dB
+  on cuda, 37.2 against 35.4 on vulkan). Per linear (`lora-cuda-test`): `op16` is 2-3e-3
+  relative on an f32 activation (bf16 operands), 4e-4 on an f16 one, `f32` 1e-6.
+  Unmeasured: a dense bf16 trunk, whose own noise floor is lower than W8A8's.
+- **`op16`'s operand width is `lora.operandFor`**, the same on both backends: f16 where
+  the GEMM's 16-bit side (A's input, B's output) already is f16, bf16 elsewhere, since an
+  f32 activation can pass 65504. Forced f16 on MOSS's f32 activations: 2.9e-4 per linear
+  against bf16's 2.3e-3, the same speed (±1%), and no difference past the control end to
+  end (37.8 / 38.9 dB on cuda, 37.9 / 37.2 on vulkan, both below the 35.4 dB nudge).
+  cuda keeps a 16-bit output's own width for B: cuBLASLt has no bf16 GEMM writing f16.
 - **Key spellings are the family's `lora.KeyMap`**: ComfyUI's `diffusion_model.` always,
   plus its trainers' prefixes; a bundled checkpoint's `model.diffusion_model.` also matches
   (`lora.baseName`). Qwen-Image 2.1 takes diffusers' `transformer.` and bare names, and its

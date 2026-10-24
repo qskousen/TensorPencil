@@ -194,7 +194,8 @@ const WeightEntry = struct {
     /// re-uploaded gets a new id and so a new perturbation; LLM weights are pinned
     /// and never stream, which is the only path this matters on.
     noise_id: u32 = 0,
-    /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
+    /// Pinned entries (first-touch, up to pin_budget) are evicted only as the
+    /// reclaim ladder's last rung, and never on an LLM backend.
     pinned: bool = false,
     /// Cached while a weight scope was open (weightScopeBegin): released as
     /// a group by weightScopeEnd. The GPU ViT tags its weights so a
@@ -314,8 +315,8 @@ pub const Backend = struct {
     /// (prefetchWeight). pin_budget is computed BEFORE the per-image working set
     /// (activations + attention scratch, gigabytes at high resolution) is
     /// allocated and is blind to other processes on the card, so it can
-    /// over-commit; pinned weights are then non-evictable on the streaming path
-    /// (evictOneWeight skips them), leaving no way to recover. Gating each pin on
+    /// over-commit, and a pinned weight comes back only through the reclaim
+    /// ladder's slow last rung (a sync and a re-stream). Gating each pin on
     /// live free VRAM staying above this floor makes pinning self-limit to
     /// genuinely-free memory and stream the rest, the low-VRAM case just streams
     /// more. 0 = disabled (only refuse a pin that physically won't fit): the LLM
@@ -1069,7 +1070,7 @@ pub const Backend = struct {
                 // prefetch) and queued kernels may still be reading them. Drain
                 // first so nothing is in flight when they go.
                 _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
-                if (self.reclaimRung(size)) continue;
+                if (self.reclaimRung(size, true)) continue;
                 return self.allocFailed(size, true);
             }
             if (self.ctx.alloc(@intCast(size))) |b| {
@@ -1078,12 +1079,7 @@ pub const Backend = struct {
                 return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
-                if (self.reclaimRung(size)) continue;
-                const es = self.evict_skip;
-                std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
-                    size >> 20, self.ctx.freeMiB(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
-                    es.pin,     es.awaiting,                      es.mru,                  es.pf,                     es.small,
-                });
+                if (self.reclaimRung(size, false)) continue;
                 return self.allocFailed(size, false);
             }
         }
@@ -1107,6 +1103,15 @@ pub const Backend = struct {
                 "Activations cannot stream, so raise the budget or render smaller.",
             .{ self.budget_override >> 20, size >> 20, self.ctx.device_used >> 20 },
         );
+        // What the ladder could not free, and why, from its last pass.
+        const es = self.evict_skip;
+        std.log.err("[vram] held: pinned={d}MB streamed={d}MB pending={d}MB free={d}MB · te={d} dit={d} vae={d} latent={d} other={d}MB · cache={d} unevictable: pin={d} await={d} mru={d} pf={d} small={d}", .{
+            self.pinned_bytes >> 20,                 self.streamed_bytes >> 20,           self.pending_free_bytes >> 20,
+            self.ctx.freeMiB(),                      self.memTagUsed(.te) >> 20,          self.memTagUsed(.dit) >> 20,
+            self.memTagUsed(.vae) >> 20,             self.memTagUsed(.latent) >> 20,      self.memTagUsed(.other) >> 20,
+            self.weights.count(),                    es.pin,                              es.awaiting,
+            es.mru,                                  es.pf,                               es.small,
+        });
         return error.DeviceOutOfMemory;
     }
 
@@ -1413,7 +1418,11 @@ pub const Backend = struct {
         self.tensorDestroy(&d);
     }
 
-    fn evictOneWeight(self: *Backend, allow_small: bool) bool {
+    /// `pins` also takes pinned weights, demoting them to streamed: the last thing
+    /// a diffusion backend can give up, since activations cannot stream. Ignored on
+    /// an LLM backend (`pinAllWeights`), whose weights must never stream.
+    fn evictOneWeight(self: *Backend, allow_small: bool, pins: bool) bool {
+        const take_pins = pins and self.pin_budget != std.math.maxInt(u64);
         // In-flight prefetches (pf_gen > pf_completed) must not be freed, the
         // prefetch thread is about to DMA into them.
         const completed = self.pf_completed.load(.acquire);
@@ -1431,10 +1440,10 @@ pub const Backend = struct {
         var sk_small: usize = 0;
         var it = self.weights.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.pinned) {
+            if (e.value_ptr.pinned and !take_pins) {
                 sk_pin += 1;
                 continue;
-            } // pinned prefix never streams
+            }
             if (e.value_ptr.awaiting_use) {
                 sk_await += 1;
                 continue;
@@ -1457,8 +1466,8 @@ pub const Backend = struct {
             }
         }
         if (lru_use == std.math.maxInt(u64)) {
-            // Record why nothing was evictable; [oom-dbg] prints it iff the whole
-            // reclaim ladder (incl. the pool drain) then fails. Not logged here:
+            // Record why nothing was evictable; `allocFailed` prints it iff the
+            // whole reclaim ladder (incl. the pool drain) then fails. Not logged here:
             // a failed eviction is normal under streaming (the pool holds the
             // reclaimable bytes) and the caller usually recovers.
             self.evict_skip = .{ .pin = @intCast(sk_pin), .awaiting = @intCast(sk_await), .mru = @intCast(sk_mru), .pf = @intCast(sk_pf), .small = @intCast(sk_small) };
@@ -1466,6 +1475,13 @@ pub const Backend = struct {
         }
         self.evictions += 1;
         const e = self.weights.fetchRemove(lru_key).?;
+        if (e.value.pinned) {
+            // From here on it is accounted like any streamed buffer, and the cap
+            // drops with it so the next touch streams instead of re-pinning.
+            self.pinned_bytes -|= e.value.db.size;
+            self.streamed_bytes += e.value.db.size;
+            self.pin_budget = @min(self.pin_budget, self.pinned_bytes);
+        }
         if (e.value.upload_ev) |ev| {
             // The buffer may still be the target of an in-flight prefetch DMA
             // (evicted before any GEMM consumed it): make the compute stream
@@ -1529,7 +1545,7 @@ pub const Backend = struct {
         if (!found) return false;
         self.evictions += 1; // invalidate any captured graph (matches evictOneWeight)
         const e = self.weights.fetchRemove(best_key).?;
-        std.debug.print("[oom-dbg] evicting farthest prefetch gen={d} ({d}MB) — free-VRAM estimate went stale (external pressure?)\n", .{ best_gen, e.value.db.size >> 20 });
+        std.log.info("[vram] out of room: dropped the farthest-out prefetch gen={d} ({d}MB), it re-streams when reached", .{ best_gen, e.value.db.size >> 20 });
         if (e.value.upload_ev) |ev| {
             _ = self.ctx.api.cuEventSynchronize(ev); // the DMA into this buffer must finish before we free it
             self.ctx.eventDestroy(ev);
@@ -1697,14 +1713,14 @@ pub const Backend = struct {
         // exactly the in-flight weights and nothing else, at any resolution and
         // without a byte figure to get wrong.
         if (self.min_weights) {
-            while (self.evictOneWeight(false) or self.evictOneWeight(true)) {}
+            while (self.evictOneWeight(false, false) or self.evictOneWeight(true, false)) {}
             return;
         }
         // pending_free_bytes: deferred frees WILL come back without another
         // eviction; counting them stops the loop from over-evicting while
         // their events are still in flight.
         while (self.budgetHeadroom() + self.pending_free_bytes < need + self.budgetOvershoot(0)) {
-            if (!self.evictOneWeight(false) and !self.evictOneWeight(true)) return;
+            if (!self.evictOneWeight(false, false) and !self.evictOneWeight(true, false)) return;
         }
     }
 
@@ -1733,13 +1749,21 @@ pub const Backend = struct {
     /// Ordered so it converges under a budget: an async eviction only DEFERS its
     /// free, leaving `device_used` untouched, and the bytes come back through
     /// the two pending rungs above it on the next pass.
-    fn reclaimRung(self: *Backend, size: u64) bool {
+    ///
+    /// Past the streamable cache, the two diverge. Another context freeing memory
+    /// cannot raise our budget, so a budget refusal demotes pinned weights instead,
+    /// and before dropping prefetches: a demotion lowers the pin cap once, where a
+    /// dropped prefetch is refilled and dropped again on every step. A physical OOM
+    /// tries the other context first and demotes only when that came up empty.
+    fn reclaimRung(self: *Backend, size: u64, budget_bound: bool) bool {
         self.reclaimPending();
         if (self.blockOldestPending()) return true;
-        if (self.evictOneWeight(true)) return true;
+        if (self.evictOneWeight(true, false)) return true;
         if (self.drainPoolForOom() > 0) return true; // sacrifice the recycle pool
-        if (self.evictNewestPrefetch()) return true; // last resort: drop the farthest-out prefetch
-        return self.foreignReclaim(size); // finally: another context on this card
+        if (budget_bound and self.evictOneWeight(true, true)) return true;
+        if (self.evictNewestPrefetch()) return true; // drop the farthest-out prefetch
+        if (!budget_bound and self.foreignReclaim(size)) return true;
+        return self.evictOneWeight(true, true);
     }
 
     pub fn tensorDestroy(self: *Backend, db: *DeviceBuffer) void {
@@ -1803,7 +1827,7 @@ pub const Backend = struct {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
-                if (self.evictOneWeight(true)) continue;
+                if (self.evictOneWeight(true, false)) continue;
                 if (self.foreignReclaim(delta)) continue; // another context on this card
                 return error.DeviceOutOfMemory;
             };
@@ -4312,6 +4336,14 @@ pub const Backend = struct {
     /// `opGemmBf16` whose source rows are `src_ld` elements apart (`src_ld >= k`),
     /// read at the source's dtype.
     pub fn opGemmBf16Ld(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        std.debug.assert(w_bytes.len == co * k * 2);
+        return self.opGemmBf16LdDev(dst, src, src_ld, m, try self.cachedWeight(w_bytes), co, k, bias);
+    }
+
+    /// `opGemmBf16Ld` against a bf16 `[co][k]` weight already on the device.
+    pub fn opGemmBf16LdDev(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w: DeviceBuffer, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        self.hold(w);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
         std.debug.assert(src_ld >= k);
@@ -4320,9 +4352,8 @@ pub const Backend = struct {
         // the bias, which at Mage-Flow's widths is ~10 GB a forward of traffic
         // for an add cuBLASLt does for free.
         if (self.kernels == .libs) {
-            std.debug.assert(w_bytes.len == co * k * 2);
             std.debug.assert(co % 32 == 0 and k % 32 == 0);
-            const w_direct = try self.cachedWeight(w_bytes);
+            const w_direct = w;
             try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
             if (!bench_gemm_only) {
                 try self.pad2dAt("pad_bf16", src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
@@ -4343,11 +4374,11 @@ pub const Backend = struct {
         // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
         // in Debug only, since asserts vanish in ReleaseFast.
         const bias_s = bias orelse try self.zeroBias(co);
-        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
+        std.debug.assert(bias_s.len >= co);
         std.debug.assert(co % 32 == 0 and k % 32 == 0);
         const m_pad = std.mem.alignForward(usize, m, 128);
         const co_pad = std.mem.alignForward(usize, co, 128);
-        var w_db = try self.cachedWeight(w_bytes); // raw bf16, resident, no convert
+        var w_db = w;
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
         if (co_pad != co) {
             // The GEMM's B tiles are 128 weight rows. The pad rows are left as they
@@ -4387,43 +4418,71 @@ pub const Backend = struct {
     /// scratch-plus-add route. Returns `error.Unsupported` there rather than
     /// silently overwriting, which would drop the base GEMM's output.
     ///
-    /// `src` rows are `src_ld` f32 apart (`src_ld >= k`).
-    pub fn opGemmBf16Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
+    /// `src` rows are `src_ld` f32 apart (`src_ld >= k`), and W is a `[co][k]` device
+    /// weight whose width (f16 or bf16) is the operand width.
+    pub fn opGemm16Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w: DeviceBuffer, co: usize, k: usize, scale: f32) Error!void {
         if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.hold(w);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(w_bytes.len == co * k * 2);
-        std.debug.assert(co % 32 == 0 and k % 32 == 0 and src_ld >= k);
-        const w_direct = try self.cachedWeight(w_bytes);
+        std.debug.assert(co % 32 == 0 and k % 32 == 0 and src_ld >= k and w.dt != .f32 and dst.dt == .f32);
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
-        try self.pad2dAt("pad_bf16", src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
-        try self.ltMatmulBf16Scaled(dst, w_direct, self.conv_a16, co, m, k, scale, if (bench_acc_overwrite) 0.0 else 1.0);
+        try self.pad2dTo(w.dt, src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
+        const plan = try self.ltPlan(if (w.dt == .bf16) .bf16 else .f16, co, m, k, 0, .f32);
+        var alpha = scale;
+        var beta: f32 = if (bench_acc_overwrite) 0 else 1;
+        try self.ltRun(plan, dst, w, self.conv_a16, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
-    /// `dst[m][co]` f32 = `src[m][k]` f16 @ Wᵀ, W bf16 `[co][k]` run as f16
-    /// (`weightF16`): a sidecar's A GEMM on an f16 activation. `libs` only.
-    pub fn opGemmHalfIn(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize) Error!void {
+    /// `dst[m][co] = alpha * (src[m][k] @ Wᵀ) + beta * dst` in true f32 (COMPUTE_32F),
+    /// `dst`, `src` and W `[co][k]` all f32 on the device. `libs` only.
+    pub fn opGemmF32Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w: DeviceBuffer, co: usize, k: usize, alpha_v: f32, beta_v: f32) Error!void {
         if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.hold(w);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(k % 8 == 0);
-        const w16 = try self.weightF16(w_bytes, .bf16, false, co, k, 1, 1);
+        std.debug.assert(dst.dt == .f32 and src.dt == .f32 and w.dt == .f32);
+        const plan = try self.ltPlan(.f32, co, m, k, 0, .f32);
+        var alpha = alpha_v;
+        var beta = if (bench_acc_overwrite) 0.0 else beta_v;
+        try self.ltRun(plan, dst, w, src, @ptrCast(&alpha), @ptrCast(&beta), 0);
+    }
+
+    /// `dst[m][co]` f32 = `src[m][k]` @ Wᵀ on f16 operands, W an f16 `[co][k]` device
+    /// weight (`weight16`): a sidecar's A GEMM. An f16 `src` is read in place, any
+    /// other is converted, which an f32 one can overflow. `libs` only.
+    pub fn opGemmHalfIn(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w16: DeviceBuffer, co: usize, k: usize) Error!void {
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.hold(w16);
+        defer self.unhold();
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(k % 8 == 0 and w16.dt == .f16);
+        const a16 = if (src.dt == .f16) src else blk: {
+            try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
+            try self.pad2dTo(.f16, src, self.conv_a16, m * k, k, m, k, k, 1.0);
+            break :blk self.conv_a16.as(.f16);
+        };
         const plan = try self.ltPlan(.f16, co, m, k, 0, .f32);
         var alpha: f32 = 1;
         var beta: f32 = 0;
-        try self.ltRun(plan, dst, w16, src, @ptrCast(&alpha), @ptrCast(&beta), 0);
+        try self.ltRun(plan, dst, w16, a16, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
-    /// `opGemmBf16Acc` onto a 16-bit `dst`: `dst[m][co] += scale * src[m][..k] @ Wᵀ`,
-    /// `src` with rows `src_ld` apart, W bf16, the operands at `dst.dt` and the add done
-    /// by the GEMM (beta 1) so `dst` is rounded once. `libs` only.
-    pub fn opGemmHalfAcc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
+    /// `opGemm16Acc` onto a 16-bit `dst`: `dst[m][co] += scale * src[m][..k] @ Wᵀ`,
+    /// `src` with rows `src_ld` apart, W a `[co][k]` device weight at `dst.dt`
+    /// (`weight16`), and the add done by the GEMM (beta 1) so `dst` is rounded once.
+    /// `libs` only.
+    pub fn opGemmHalfAcc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, src_ld: usize, m: usize, w16: DeviceBuffer, co: usize, k: usize, scale: f32) Error!void {
         if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.hold(w16);
+        defer self.unhold();
         self.ptic();
         defer self.ptoc(.matmul);
         const op = dst.dt;
-        std.debug.assert(k % 8 == 0 and src_ld >= k and op != .f32);
-        const w16 = try self.weight16(w_bytes, .bf16, false, co, k, 1, 1, op);
+        std.debug.assert(k % 8 == 0 and src_ld >= k and op != .f32 and w16.dt == op);
         try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
         try self.pad2dTo(op, src, self.conv_a16, m * k, k, m, k, src_ld, 1.0);
         const plan = try self.ltPlan(if (op == .bf16) .bf16 else .f16, co, m, k, 0, op);
@@ -4444,13 +4503,15 @@ pub const Backend = struct {
         return self.opMatmulHalfW(dst, src, m, w_bytes, .f16, co, k, bias);
     }
 
-    fn opMatmulHalfW(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, wdt: dtypes.DType, co: usize, k: usize, bias: ?[]const f32) Error!void {
+    /// The dense-16 GEMM over an f32, f16 or bf16 `[co][k]` weight, converted to the
+    /// operand width once by `weight16`.
+    pub fn opMatmulHalfW(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, wdt: dtypes.DType, co: usize, k: usize, bias: ?[]const f32) Error!void {
         // `bias.len >= co`, not `== co`: a caller may pass its whole zero array for a
         // null bias (a bias is cached by pointer and sized from the first call's
         // length, so a narrow layer seen first would leave every wider one reading
         // past the end), and the kernels read only `co` entries.
         const bias_s = bias orelse try self.zeroBias(co);
-        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
+        std.debug.assert(w_bytes.len == wdt.storageBytes(co * k) and bias_s.len >= co);
         const op = operand16(src, dst);
         return self.opGemm16(dst, 0, src, m, try self.weight16(w_bytes, wdt, false, co, k, 1, 1, op), co, k, bias_s, 1.0, op);
     }
@@ -4520,7 +4581,55 @@ pub const Backend = struct {
             const cb = ctxmod.Buffer{ .ptr = self.conv_stage.ptr(), .bytes = @intCast(bytes.len) };
             self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
         }
-        const size = pairs * 4;
+        const Fill = struct {
+            out: Dt,
+            u: [7]u32,
+            pairs: usize,
+            fn run(f: @This(), be: *Backend, db: DeviceBuffer) Error!void {
+                try be.convW16(f.out, be.conv_stage, db, f.u, f.pairs);
+            }
+        };
+        const u = [7]u32{ @intCast(pairs), @intCast(ci), @intCast(kk), src_kind, @intFromBool(torch_order), @intCast(n), @intCast(kt) };
+        return self.derivedWeight(key, pairs * 4, out, Fill{ .out = out, .u = u, .pairs = pairs });
+    }
+
+    /// The f32 `[co][k]` device copy of a dense f32, f16 or bf16 weight, for a true-f32
+    /// GEMM: an f32 weight is its own cached bytes, a 16-bit one is widened once and
+    /// cached beside them under `derivedKey`, as `weight16` does.
+    pub fn weight32(self: *Backend, bytes: []const u8, dt: dtypes.DType, co: usize, k: usize) Error!DeviceBuffer {
+        const n = co * k;
+        std.debug.assert(bytes.len == dt.storageBytes(n));
+        const src: Dt = switch (dt) {
+            .f32 => return (try self.cachedWeight(bytes)).as(.f32),
+            .f16 => .f16,
+            .bf16 => .bf16,
+            else => return error.UnsupportedDtype,
+        };
+        const key = derivedKey(bytes, .f32);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            self.touch(e);
+            return e.db.as(.f32);
+        }
+        try self.ensureDeviceBuffer(&self.conv_stage, bytes.len);
+        {
+            const cb = ctxmod.Buffer{ .ptr = self.conv_stage.ptr(), .bytes = @intCast(bytes.len) };
+            self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
+        }
+        const Fill = struct {
+            src: Dt,
+            n: usize,
+            fn run(f: @This(), be: *Backend, db: DeviceBuffer) Error!void {
+                try be.opCast(be.conv_stage.as(f.src), db.as(.f32), f.n, 0);
+            }
+        };
+        return self.derivedWeight(key, n * 4, .f32, Fill{ .src = src, .n = n });
+    }
+
+    /// A `size`-byte cache buffer for a weight converted from its checkpoint bytes,
+    /// charged to the pin budget like any weight, filled by `fill.run(self, db)` and
+    /// cached under `key` at dtype `out`.
+    fn derivedWeight(self: *Backend, key: usize, size: usize, out: Dt, fill: anytype) Error!DeviceBuffer {
         self.reserveForWeights(size);
         const pin = self.pinNew(size);
         errdefer if (pin) {
@@ -4532,8 +4641,7 @@ pub const Backend = struct {
             var d = db;
             self.tensorDestroy(&d);
         }
-        const u = [7]u32{ @intCast(pairs), @intCast(ci), @intCast(kk), src_kind, @intFromBool(torch_order), @intCast(n), @intCast(kt) };
-        try self.convW16(out, self.conv_stage, db, u, pairs);
+        try fill.run(self, db);
         db.dt = out;
         try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .fetch_seq = self.ctx.launch_seq, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId() });
         return db;
