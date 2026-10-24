@@ -36,10 +36,24 @@ jobs:
             libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
             libx11-dev libxcursor-dev libxi-dev libwayland-dev
 
+      # The debug test binaries fill about 2.8 GB of cache. Past the default 2 GB
+      # limit setup-zig clears the whole cache before saving, so every run would
+      # compile from scratch.
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+          cache-size-limit: 4096
+
+      # Zig 0.17 keeps packages in `zig-pkg/`, which setup-zig does not cache. Each job
+      # keys its own copy, since each fetches a different set; a changed
+      # build.zig.zon still restores the last copy and fetches only what is new.
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-test-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-test-
 
       # A fresh runner downloads every package at once, and GitHub sometimes drops one
       # of those connections (HttpConnectionClosing). Listing the steps runs the build
@@ -90,12 +104,23 @@ jobs:
       - name: Install zip
         run: sudo apt-get update && sudo apt-get install -y zip
 
+      # `cache-key` gives each target its own build cache; without it both legs
+      # share the job's one entry and each restores the other's.
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+          cache-key: ${{ matrix.name }}
+          cache-size-limit: 4096
 
-      # See the test job's step of the same name.
+      # See the test job's steps of the same names.
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ matrix.name }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-${{ matrix.name }}-
+
       - name: Fetch dependencies
         run: |
           for i in 1 2 3; do
