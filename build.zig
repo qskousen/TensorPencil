@@ -22,6 +22,29 @@ pub fn build(b: *std.Build) !void {
         "Prioritize performance, safety, or binary size",
     ) orelse if (integration) std.lang.Optimize.safe else std.lang.Optimize.debug;
 
+    // Declare every option before the first `dependencyLazy`: on a checkout missing a
+    // lazy package, `build` returns at that call, and the runner then rejects any -D
+    // flag declared after it as an invalid option instead of fetching and rerunning.
+
+    // `-Dself-hosted` builds the executables with Zig's self-hosted x86_64
+    // codegen backend instead of LLVM (backend A/B benchmarking). `null` = Zig's
+    // default (LLVM in Release). SPIR-V kernels always stay self-hosted.
+    const self_hosted = b.option(bool, "self-hosted", "Build executables with the self-hosted backend (no LLVM)") orelse false;
+    const bundle_libs = is_windows or (b.option(bool, "bundle-libs", "Linux: link the pinned libvips and FFmpeg packages and install them beside the executables, instead of the system's (a release build)") orelse false);
+    // Privacy: the code paths that print the user's prompt or reply are
+    // COMPILED OUT of the engine layer, which since the socket split is linked
+    // only by tp-serve and the engine probes (tp-gui has no engine). A flag is
+    // a promise; a missing code path is a fact. `-Dprivacy=false` puts the
+    // dumps back for a debugging build of chat-probe.
+    const privacy = b.option(bool, "privacy", "Compile the prompt/reply debug dumps out of the engine layer (default true)") orelse true;
+    // Where the real-model tests and device commands look for checkpoints.
+    const model_root = b.option([]const u8, "model-root", "Root of the diffusion model folders (checkpoints/, vae/, text_encoders/, ...)") orelse "/mnt/watch/models/diffusion";
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name matches this substring");
+    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
+    // `-Dtest-timing`: swap Zig's runner for one that reports per-test wall time
+    // (tools/test_timing_runner.zig), for finding what makes the gated suite slow.
+    const test_timing = b.option(bool, "test-timing", "Report per-test wall time instead of the normal runner") orelse false;
+
     const translate_c = b.dependency("translate_c", .{});
 
     // GPU compute kernels: Zig source compiled to SPIR-V by the self-hosted
@@ -208,24 +231,10 @@ pub fn build(b: *std.Build) !void {
     // off, GPU `init` fails in test builds (so GPU tests self-skip via their
     // `catch SkipZigTest`) and the heavy model tests skip via
     // `test_gate.requireIntegration`.
-    // `-Dself-hosted` builds the executables with Zig's self-hosted x86_64
-    // codegen backend instead of LLVM (backend A/B benchmarking). `null` = Zig's
-    // default (LLVM in Release). SPIR-V kernels always stay self-hosted.
-    const self_hosted = b.option(bool, "self-hosted", "Build executables with the self-hosted backend (no LLVM)") orelse false;
     const use_llvm: ?bool = if (self_hosted) false else null;
-
-    // Privacy: the code paths that print the user's prompt or reply are
-    // COMPILED OUT of the engine layer, which since the socket split is linked
-    // only by tp-serve and the engine probes (tp-gui has no engine). A flag is
-    // a promise; a missing code path is a fact. `-Dprivacy=false` puts the
-    // dumps back for a debugging build of chat-probe.
-    const bundle_libs = is_windows or (b.option(bool, "bundle-libs", "Linux: link the pinned libvips and FFmpeg packages and install them beside the executables, instead of the system's (a release build)") orelse false);
-    const privacy = b.option(bool, "privacy", "Compile the prompt/reply debug dumps out of the engine layer (default true)") orelse true;
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
-    // Where the real-model tests and device commands look for checkpoints.
-    const model_root = b.option([]const u8, "model-root", "Root of the diffusion model folders (checkpoints/, vae/, text_encoders/, ...)") orelse "/mnt/watch/models/diffusion";
     build_opts.addOption([]const u8, "model_root", model_root);
     build_opts.addOption(bool, "privacy", privacy);
     // Tie the compile-time flag to whether ggml was actually wired, so a build
@@ -550,7 +559,7 @@ pub fn build(b: *std.Build) !void {
     // (client). All CPU-only. Kept off the default `test` step, which
     // stays free of known-folders.
     for ([_]*std.Build.Module{ shared_mod, engine_mod, client_mod }) |m| {
-        gui_test_step.dependOn(&testRun(b, b.addTest(.{ .root_module = m })).step);
+        gui_test_step.dependOn(&testRun(b, b.addTest(.{ .root_module = m, .filters = test_filters })).step);
     }
 
     // Pure-std gui files: the markdown parser and the viewer zoom/pan math. The
@@ -562,6 +571,7 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
+            .filters = test_filters,
         });
         gui_test_step.dependOn(&testRun(b, t).step);
     }
@@ -583,6 +593,7 @@ pub fn build(b: *std.Build) !void {
                     .{ .name = "dvui", .module = dvui_mod },
                 },
             }),
+            .filters = test_filters,
         });
         linkWindowing(t, target);
         gui_test_step.dependOn(&testRun(b, t).step);
@@ -610,6 +621,7 @@ pub fn build(b: *std.Build) !void {
                     .{ .name = "client", .module = client_mod },
                 },
             }),
+            .filters = test_filters,
         });
         linkWindowing(t, target);
         gui_test_step.dependOn(&testRun(b, t).step);
@@ -743,11 +755,6 @@ pub fn build(b: *std.Build) !void {
         b.step(bench.name, bench.desc).dependOn(&bench_run.step);
     }
 
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name matches this substring");
-    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
-    // `-Dtest-timing`: swap Zig's runner for one that reports per-test wall time
-    // (tools/test_timing_runner.zig), for finding what makes the gated suite slow.
-    const test_timing = b.option(bool, "test-timing", "Report per-test wall time instead of the normal runner") orelse false;
     const test_runner: ?std.Build.Step.Compile.TestRunner = if (test_timing)
         .{ .path = b.path("tools/test_timing_runner.zig"), .mode = .simple }
     else

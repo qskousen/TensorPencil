@@ -83,6 +83,10 @@ std (renames unless noted):
 Build system:
 - `build` may return `!void`; `try b.dependencyLazy(...)` replaces the
   `if (b.lazyDependency(...)) |d|` dance (the build fetches and reruns).
+  Declare every `b.option` before the first `dependencyLazy`: on a checkout missing
+  that package, `build` returns there and the runner rejects any `-D` flag declared
+  after it with `invalid option` instead of fetching. Only a fresh checkout shows it
+  (CI); a tree with every package in `zig-pkg/` never returns early.
 - `b.args` is gone: `run.addPassthruArgs()`.
 - `b.build_root` -> `b.root` (a `Cache.Path`); `b.libc_file`, `b.sysroot`,
   `b.pathFromRoot`, `b.getInstallPath`, `Run.addPathDir` and custom steps are gone. An
