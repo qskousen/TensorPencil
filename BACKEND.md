@@ -433,9 +433,10 @@ and `qwen_image21_text.zig`'s headers.
   ComfyUI scheduler also moves with resolution.
 - Turbo is the `turbo` scheduler's 8 fixed sigmas. Base and turbo checkpoints cannot be
   told apart by weights.
-- Released formats: bf16, int8, W4A8, NVFP4, W6A8, and Nunchaku's SVDQuant int4 under
-  diffusers names (`Config.nunchaku_names`: `to_qkv` fused, `net.0.proj` rows `[up | gate]`,
-  the reverse of `gate_up`). Its fp4 sibling is refused by name.
+- Released formats: bf16, int8, W4A8, NVFP4, W6A8, and Nunchaku's SVDQuant int4 and fp4
+  under diffusers names (`Config.nunchaku_names`: `to_qkv` fused, `net.0.proj` rows
+  `[up | gate]`, the reverse of `gate_up`). Nunchaku runs the fp4 file on Blackwell only;
+  here it decodes like int4, so every arm takes it.
 
 Gates: `qwen-image21-cuda-test` / `qwen-image21-vk-test` (`--layers`, `--lat`, `--cap`,
 `--sigma`, a checkpoint path; two sigmas on one session, so the second reads the cached
@@ -459,7 +460,7 @@ tensor name at session build.
 | **w4a8** | ✅ | ✅ | ✅ | ✅ |
 | **int8 / int4 / w4a8, weight-only** | ❌ | ✅ (`opMatmulCoopIntWo`) | ✅ →bf16 / →f16 / →f32 | ✅ →bf16 / →f16 / →f32 |
 | **nvfp4** | ✅ | ✅ | ✅ | ✅ |
-| **svdq4** (Nunchaku int4) | ✅ | ✅ W8A8 + weight-only | ✅ W8A8 + weight-only | ✅ ditto |
+| **svdq4** (Nunchaku int4 / fp4) | ✅ | ✅ W8A8 + weight-only | ✅ W8A8 + weight-only | ✅ ditto |
 | **bf16 dense** | ✅ | ✅ native/f16 | ✅ native/f16 | ✅ cuBLASLt `R_16BF` |
 | **f32** | ✅ | ✅ (offload) | ❌ | ❌ |
 | **GGUF q2_k** | ✅ | ✅ →f16 / →bf16³ | ✅ →int8-convrot or →int4-convrot | ✅ ditto |
@@ -1055,7 +1056,7 @@ path; GGUF `q*` are the **LLM** path.
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; decodes to int8 per GEMM, then the int8 convrot GEMM (`ops/w4a8.zig`) |
 | **w6a8** (`w6a8_int8`) | ✅ | ✅ `w6a8_decode_t` | ✅ `w6a8_decode` | ✅ ditto | 6-bit uniform `(q − 32)·s_rel`, nibble plane then top-2-bit plane, `I8 [rows, 3·cols/4]`; same routes as w4a8 |
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | E2M1 + fp8 per-16 scale + per-tensor scale; decodes to bf16 per GEMM, then the bf16 GEMM. Weight-only (`ops/nvfp4.zig`) |
-| **svdq4** (Nunchaku SVDQuant int4) | ✅ | ✅ | ✅ | ✅ | int4 codes in Nunchaku's MMA tile order + bf16 per-64 scale + per-input smoothing + rank-32 low-rank branch (`ops/svdq.zig`). W8A8: the activation times `1/smooth`, the unrotated int8 prep, the weight decoded per GEMM to int8 on a per-row grid. Weight-only (bf16/f16/f32): the exact weight expanded per GEMM. The low-rank branch runs on the raw activation through the LoRA sidecar's GEMMs, in true f32 on the f32 route |
+| **svdq4** (Nunchaku SVDQuant int4 / fp4) | ✅ | ✅ | ✅ | ✅ | 4-bit codes in Nunchaku's MMA tile order (int4, or E2M1 with an fp8 per-16 micro-scale and a per-row `wcscales * wtscale`) + bf16 per-64 scale for int4 + per-input smoothing + rank-32 low-rank branch (`ops/svdq.zig`). W8A8: the activation times `1/smooth`, the unrotated int8 prep, the weight decoded per GEMM to int8 on a per-row grid. Weight-only (bf16/f16/f32): the exact weight expanded per GEMM. The low-rank branch runs on the raw activation through the LoRA sidecar's GEMMs, in true f32 on the f32 route |
 | **GGUF q4_0** | ✅ ggml | ✅ `gemv_dual_q4_0` | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_dual_q8_0` | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ `gemv_dual_*` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | MMQ prefill routed for q4_k/q5_k only (`mmqPipeFaster`) |

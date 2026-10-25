@@ -401,9 +401,9 @@ fn svdqRegridF32(gpa: std.mem.Allocator, w: Weight) Error![]f32 {
         var k: usize = 0;
         while (k < w.cols) : (k += 8) {
             const wd = svdq_mod.word(w.bytes, w.cols, n, k);
-            const s = svdq_mod.scaleAt(sq.scales, w.cols, n, k / svdq_mod.group_size);
+            const s = sq.groupScale(w.cols, n, k);
             for (0..8) |i| {
-                const q = svdq_mod.decodeI8(svdq_mod.nibble(wd, i), s, sq.inv_row_scale[n]);
+                const q = svdq_mod.decodeI8(svdq_mod.value(sq.codes, wd, i), s, sq.i8_mul[n]);
                 out[n * w.cols + k + i] = @as(f32, @floatFromInt(q)) * rs * sq.inv_smooth[k + i];
             }
         }
@@ -2002,7 +2002,11 @@ test "emulateActQuant lands on the device grid and is idempotent" {
 
 test "matmul runs an svdq weight: Nunchaku's effective weight plus its low-rank branch, on both paths" {
     const gpa = std.testing.allocator;
-    var f = try svdq_mod.TestFixture.open();
+    for ([_]svdq_mod.Codes{ .int4, .fp4 }) |kind| try matmulSvdqCase(gpa, kind);
+}
+
+fn matmulSvdqCase(gpa: std.mem.Allocator, kind: svdq_mod.Codes) !void {
+    var f = try svdq_mod.TestFixture.open(kind);
     defer f.st.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2025,7 +2029,7 @@ test "matmul runs an svdq weight: Nunchaku's effective weight plus its low-rank 
         defer gpa.free(y);
         try matmul(std.testing.io, gpa, y, xs, m, w, null);
         for (0..m) |i| for (y[i * f.rows ..][0..f.rows], want[(i % m0) * f.rows ..][0..f.rows], 0..) |got, exp, n| {
-            errdefer std.debug.print("m {d}, row {d}, out {d}: {d} vs {d}\n", .{ m, i, n, got, exp });
+            errdefer std.debug.print("{t}: m {d}, row {d}, out {d}: {d} vs {d}\n", .{ kind, m, i, n, got, exp });
             try std.testing.expectApproxEqAbs(exp, got, 1e-4 * (1 + @abs(exp)));
         };
     }

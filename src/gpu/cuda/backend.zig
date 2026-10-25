@@ -5309,7 +5309,7 @@ pub const Backend = struct {
 
     /// An SVDQuant weight expanded exactly to row-major `dt` in the weight-only scratch
     /// of that width (`wo_w32` or `fp8_w16`).
-    fn svdqRow(self: *Backend, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, comptime dt: Dt) Error!DeviceBuffer {
+    fn svdqRow(self: *Backend, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, comptime dt: Dt) Error!DeviceBuffer {
         self.ptic();
         defer self.ptoc(.dequant);
         const out = if (dt == .f32) &self.wo_w32 else &self.fp8_w16;
@@ -5318,32 +5318,34 @@ pub const Backend = struct {
         const s_db = try self.cachedWeight(scales);
         const i_db = try self.cachedWeight(std.mem.sliceAsBytes(inv_smooth));
         const n = rows * cols / 8;
-        try self.dualElemsAt("svdq_unpack", dt, c_db, out.*, s_db, i_db, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        try self.dualElemsAt("svdq_unpack", dt, c_db, out.*, s_db, i_db, .{ @intCast(n), @intCast(cols), 0, @intFromBool(fp4), 0, 0, 0 }, .{ 0, 0 }, n);
         return out.*;
     }
 
     /// SVDQuant weight-only, the weight expanded to bf16 against the unquantized `x`.
-    pub fn opSvdqGemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
-        try self.gemmBf16X(y, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .bf16), rows, cols, bias);
+    /// fp4's `row_mul` is the caller's to apply to `y`.
+    pub fn opSvdqGemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, bias: []const f32) Error!void {
+        try self.gemmBf16X(y, x, m, try self.svdqRow(codes, scales, inv_smooth, fp4, rows, cols, .bf16), rows, cols, bias);
     }
 
-    pub fn opSvdqGemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
-        try self.opConvF16W(y, 0, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .f16), rows, cols, bias, 1.0);
+    pub fn opSvdqGemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, bias: []const f32) Error!void {
+        try self.opConvF16W(y, 0, x, m, try self.svdqRow(codes, scales, inv_smooth, fp4, rows, cols, .f16), rows, cols, bias, 1.0);
     }
 
-    pub fn opSvdqGemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
-        try self.gemmF32Dev(y, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .f32), rows, cols, bias);
+    pub fn opSvdqGemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        try self.gemmF32Dev(y, x, m, try self.svdqRow(codes, scales, inv_smooth, fp4, rows, cols, .f32), rows, cols, bias);
     }
 
     /// The int8 GEMM over a Nunchaku SVDQuant weight decoded into `w4a8_i8` this call
-    /// (`ops/svdq.zig`): `codes` and the packed bf16 `scales` as the checkpoint stores
-    /// them, `inv_row_scale` what the decode divides by and `row_scale` the GEMM's.
+    /// (`ops/svdq.zig`): `codes` and the packed `scales` as the checkpoint stores them,
+    /// `i8_mul` what the decode multiplies by and `row_scale` the GEMM's.
     pub fn opI8GemmSvdq(
         self: *Backend,
         y: DeviceBuffer,
         codes: []const u8,
         scales: []const u8,
-        inv_row_scale: []const f32,
+        i8_mul: []const f32,
+        fp4: bool,
         row_scale: []const f32,
         rows: usize,
         cols: usize,
@@ -5355,10 +5357,10 @@ pub const Backend = struct {
             std.debug.assert(codes.len == rows * cols / 2 and rows % 128 == 0 and cols % 128 == 0);
             const c_db = try self.cachedWeight(codes);
             const s_db = try self.cachedWeight(scales);
-            const i_db = try self.cachedWeight(std.mem.sliceAsBytes(inv_row_scale));
+            const i_db = try self.cachedWeight(std.mem.sliceAsBytes(i8_mul));
             try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
             const threads = rows * cols / 8;
-            try self.dualElems("svdq_decode", c_db, self.w4a8_i8, s_db, i_db, .{ @intCast(threads), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+            try self.dualElems("svdq_decode", c_db, self.w4a8_i8, s_db, i_db, .{ @intCast(threads), @intCast(cols), 0, @intFromBool(fp4), 0, 0, 0 }, .{ 0, 0 }, threads);
         }
         return self.opI8GemmDev(y, self.w4a8_i8, row_scale, rows, bias);
     }

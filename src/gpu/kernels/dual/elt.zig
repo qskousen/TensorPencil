@@ -1981,35 +1981,64 @@ inline fn svdqScaleIndex(groups: u32, n: u32, g: u32) u32 {
     return (((((n / 128) * groups + g) * 8 + nn / 16) * 4 + (nn % 8) / 2) * 2 + (nn % 16) / 8) * 2 + nn % 2;
 }
 
-/// Row `n`'s scale for column `kc`, from the packed bf16 scales in slot c.
+/// fp8-e4m3 to f32, exact (`dtypes.f8e4m3ToF32`); NaN codes do not occur in scales.
+inline fn fp8e4m3(b: u32) f32 {
+    const sign: u32 = (b & 0x80) << 24;
+    const ex = (b >> 3) & 0xF;
+    const m = b & 7;
+    if (ex == 0) {
+        const v = @as(f32, @floatFromInt(m)) * (1.0 / 512.0);
+        return if (sign != 0) -v else v;
+    }
+    return @bitCast(sign | ((ex + 120) << 23) | (m << 20));
+}
+
+/// Row `n`'s scale for column `kc`, slot c: int4's packed bf16 per 64, or with u3 set,
+/// fp4's packed fp8 per 16 (`ops.svdq.microIndex`).
 inline fn svdqScale(e: Env, n: u32, kc: u32, cols: u32) f32 {
+    if (e.u(3) != 0) {
+        const nn = n % 128;
+        const g = kc / 16;
+        const i = (((((n / 128) * (cols / 64) + g / 4) * 8 + nn % 8) * 4 + (nn % 32) / 8) * 4 + nn / 32) * 4 + g % 4;
+        return fp8e4m3(e.byte(.c, i));
+    }
     const si = svdqScaleIndex(cols / 64, n, kc / 64);
     return @bitCast(((e.ldW(.c, si / 2) >> @intCast(16 * (si % 2))) & 0xFFFF) << 16);
 }
 
-inline fn svdqCode(w: u32, comptime i: u32) i32 {
-    const c: i32 = @intCast((w >> (4 * i)) & 0xF);
-    return if (c >= 8) c - 16 else c;
+/// Code `i` of a word as its value: the signed nibble, or with u3 set E2M1.
+inline fn svdqValue(e: Env, w: u32, comptime i: u32) f32 {
+    const v = (w >> (4 * i)) & 0xF;
+    if (e.u(3) != 0) {
+        const m = v & 7;
+        const ex = m >> 1;
+        const half = @as(f32, @floatFromInt(m & 1)) * 0.5;
+        const mag = if (ex == 0) half else (1 + half) * @as(f32, @floatFromInt(@as(u32, 1) << @intCast(ex - 1)));
+        return if (v & 8 != 0) -mag else mag;
+    }
+    const c: i32 = @intCast(v);
+    return @floatFromInt(if (c >= 8) c - 16 else c);
 }
 
 /// Row `n`'s codes `[kc, kc + 8)` as int8, `ops.svdq.decodeI8` each, packed four a word.
-/// a = codes, c = packed bf16 scales, d = f32 `1 / row_scale`.
+/// a = codes, c = packed scales, d = f32 `i8_mul` per row.
 inline fn svdqWord(e: Env, n: u32, kc: u32, cols: u32) [2]u32 {
     const w = e.ldW(.a, svdqWordIndex(cols, n, kc));
     const s = svdqScale(e, n, kc, cols);
     const inv = e.ld(.d, n);
     var out: [2]u32 = .{ 0, 0 };
     inline for (0..8) |i| {
-        const p = @as(f32, @floatFromInt(svdqCode(w, i))) * s * inv;
+        const p = svdqValue(e, w, i) * s * inv;
         const q: i32 = @intFromFloat(@min(@max(rintEven(p), -127.0), 127.0));
         out[i / 4] |= (@as(u32, @bitCast(q)) & 0xFF) << (8 * (i % 4));
     }
     return out;
 }
 
-/// An SVDQuant weight to row-major `dt` `[rows][cols]`, exact: `code * scale * inv_smooth`,
-/// in `ops.svdq.decodeSliceF32`'s order. a = codes, b = out, c = scales, d = f32
-/// `1 / smooth_factor`. u0 = rows * cols / 8, u1 = cols.
+/// An SVDQuant weight to row-major `dt` `[rows][cols]`, exact but for fp4's `row_mul`,
+/// which the caller applies to the GEMM's output: `value * scale * inv_smooth`. a = codes,
+/// b = out, c = scales, d = f32 `1 / smooth_factor`. u0 = rows * cols / 8, u1 = cols,
+/// u3 = fp4.
 pub inline fn svdqUnpack(e: Env, comptime dt: Dt) void {
     const t = k.elem(e) orelse return;
     const cols = e.u(1);
@@ -2019,13 +2048,13 @@ pub inline fn svdqUnpack(e: Env, comptime dt: Dt) void {
     const s = svdqScale(e, n, kc, cols);
     inline for (0..8) |i| {
         const c: u32 = i;
-        e.stT(.b, dt, n * cols + kc + c, @as(f32, @floatFromInt(svdqCode(w, c))) * s * e.ld(.d, kc + c));
+        e.stT(.b, dt, n * cols + kc + c, svdqValue(e, w, c) * s * e.ld(.d, kc + c));
     }
 }
 
 /// An SVDQuant weight to row-major int8 `[rows][cols]` (the CUDA layout), eight columns
-/// a thread. a = codes, b = int8 out, c = scales, d = `1 / row_scale`.
-/// u0 = rows * cols / 8, u1 = cols.
+/// a thread. a = codes, b = int8 out, c = scales, d = `i8_mul`.
+/// u0 = rows * cols / 8, u1 = cols, u3 = fp4.
 pub inline fn svdqDecode(e: Env) void {
     const t = k.elem(e) orelse return;
     const cols = e.u(1);
@@ -2039,7 +2068,7 @@ pub inline fn svdqDecode(e: Env) void {
 
 /// `svdqDecode` into the k-major `[cols][rows]` int8 Vulkan's GEMM reads: a thread owns
 /// four rows by eight columns and writes eight words, rows fastest.
-/// u0 = (rows / 4) * (cols / 8), u1 = cols, u2 = rows / 4.
+/// u0 = (rows / 4) * (cols / 8), u1 = cols, u2 = rows / 4, u3 = fp4.
 pub inline fn svdqDecodeT(e: Env) void {
     const t = k.elem(e) orelse return;
     const cols = e.u(1);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference fixtures for Nunchaku's SVDQuant W4A4 (int4) weight format.
+"""Reference fixtures for Nunchaku's SVDQuant W4A4 weight format, int4 and fp4.
 
 The packed tensors come from Nunchaku's own `NunchakuWeightPacker` run on random plain
 values, never from ours. An `SVDQW4A4Linear` (precision int4) ships:
@@ -16,6 +16,11 @@ and computes, per Nunchaku's `quantize_w4a4_act_fuse_lora` and `gemm_w4a4` kerne
 
 with the low-rank branch on the RAW x. The fixture's `weff` and `y` drop only the
 activation quantization: `weff = codes * scale / smooth`.
+
+The fp4 layer (keys under `fp4.`) stores E2M1 bit patterns in the same word order, an
+fp8-e4m3 scale per 16 inputs packed by `pack_micro_scale`, and `wcscales` (packed like a
+vector) times a scalar `wtscale` per output row, which multiplies the 4-bit product only:
+`weff = e2m1(codes) * scale * wcscales * wtscale / smooth`.
 
 Every packed layout is a permutation that keeps every magnitude, so the generator
 asserts each one actually moves values, and that the corpus has a -8 code, a
@@ -64,6 +69,55 @@ def load_packer(root):
     return load("nunchaku.lora.flux.packer", f"{root}/nunchaku/lora/flux/packer.py").NunchakuWeightPacker(bits=4)
 
 
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+
+
+def fp4_layer(p, g):
+    codes = torch.randint(0, 16, (ROWS, COLS), generator=g, dtype=torch.int32)
+    # Scales already on the fp8 grid, so the packer's own cast to fp8 is exact.
+    scales = (torch.rand(ROWS, COLS // 16, generator=g) * 3 + 0.05).to(torch.float8_e4m3fn).to(torch.bfloat16)
+    smooth = torch.exp(torch.randn(COLS, generator=g) * 0.7).to(torch.bfloat16)
+    wc = (torch.rand(ROWS, generator=g) * 0.02 + 0.001).to(torch.bfloat16)
+    wtscale = torch.tensor([0.75])
+    down = (torch.randn(RANK, COLS, generator=g) * 0.05).to(torch.bfloat16)
+    up = (torch.randn(ROWS, RANK, generator=g) * 0.05).to(torch.bfloat16)
+    x = torch.randn(M, COLS, generator=g)
+
+    qweight = p.pack_weight(codes.clone())
+    wscales = p.pack_micro_scale(scales.clone(), group_size=16)
+    wc_p = p.pack_scale(wc.clone(), group_size=-1).view(-1)
+    smooth_p = p.pack_scale(smooth.clone(), group_size=-1).view(-1)
+
+    for c in (7, 8, 15):
+        assert (codes == c).any(), f"corpus lacks E2M1 pattern {c}"
+    assert not torch.equal(wscales.view(torch.uint8).reshape(-1), scales.to(torch.float8_e4m3fn).t().contiguous().view(torch.uint8).reshape(-1)), "micro-scale packing is a transpose"
+    assert not torch.equal(wc_p, wc), "wcscales packing is the identity"
+    assert wc.float().std() > 0, "wcscales constant: its order would be untested"
+
+    row_mul = wc.float() * wtscale
+    weff = E2M1[codes.long()] * scales.float().repeat_interleave(16, dim=1) * row_mul[:, None] / smooth.float()[None, :]
+    xd = x.double()
+    y = (xd @ weff.double().t() + (xd @ down.double().t()) @ up.double().t()).float()
+    return {
+        "fp4.qweight": qweight.contiguous(),
+        "fp4.wscales": wscales.contiguous(),
+        "fp4.wcscales": wc_p.contiguous(),
+        "fp4.wtscale": wtscale.contiguous(),
+        "fp4.smooth_factor": smooth_p.contiguous(),
+        "fp4.proj_down": p.pack_lowrank_weight(down.clone(), down=True).contiguous(),
+        "fp4.proj_up": p.pack_lowrank_weight(up.clone(), down=False).contiguous(),
+        "fp4.codes": codes.to(torch.int8).contiguous(),
+        "fp4.scales": scales.float().contiguous(),
+        "fp4.smooth": smooth.float().contiguous(),
+        "fp4.row_mul": row_mul.contiguous(),
+        "fp4.down": down.contiguous(),
+        "fp4.up": up.contiguous(),
+        "fp4.weff": weff.contiguous(),
+        "fp4.x": x.contiguous(),
+        "fp4.y": y.contiguous(),
+    }
+
+
 def main():
     root = sys.argv[1]
     commit = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
@@ -102,7 +156,9 @@ def main():
     xd = x.double()
     y = (xd @ weff.double().t() + (xd @ down.double().t()) @ up.double().t()).float()
 
+    fp4 = fp4_layer(p, g)
     tensors = {
+        **fp4,
         "qweight": qweight.contiguous(),
         "wscales": wscales.contiguous(),
         "smooth_factor": smooth_p.contiguous(),

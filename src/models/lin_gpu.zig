@@ -896,12 +896,25 @@ pub const Lin = struct {
             .svdq => {
                 std.debug.assert(o.y_off == 0);
                 const sq = w.svdq.?;
-                const wbuf = try ctx.svdqDecode(w.bytes, sq.scales, sq.inv_row_scale, w.rows, w.cols);
+                const wbuf = try ctx.svdqDecode(w.bytes, sq.scales, sq.i8_mul, sq.codes == .fp4, w.rows, w.cols);
                 try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows);
                 folded = o.bias == null;
             },
-            inline .svdq_wo, .svdq_wo16 => |rt| try ctx.opMatmulCoopSvdq(y, o.y_off, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb, rt == .svdq_wo),
-            .svdq_wo32 => try ctx.opMatmulSvdqF32(y, o.y_off, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, o.bias),
+            // fp4's `row_mul` scales the 4-bit product before the bias, so the bias waits.
+            inline .svdq_wo, .svdq_wo16, .svdq_wo32 => |rt| {
+                std.debug.assert(o.y_off == 0);
+                const sq = w.svdq.?;
+                const fp4 = sq.codes == .fp4;
+                if (rt == .svdq_wo32)
+                    try ctx.opMatmulSvdqF32(y, 0, x, m, w.bytes, sq.scales, sq.inv_smooth, fp4, w.rows, w.cols, if (fp4) null else o.bias)
+                else
+                    try ctx.opMatmulCoopSvdq(y, 0, x, m, w.bytes, sq.scales, sq.inv_smooth, fp4, w.rows, w.cols, if (fp4) self.zero_bias else zb, rt == .svdq_wo);
+                if (sq.row_mul) |rm| {
+                    const n = m * w.rows;
+                    try ctx.opElt(gpu.eltAt("mul_cols", y.dt), y, y, try lora_gpu.hostVec(ctx, rm), null, .{ .u0 = @intCast(n), .u1 = @intCast(w.rows) }, n, 1, 1);
+                    folded = o.bias == null;
+                }
+            },
             .nvfp4 => {
                 std.debug.assert(o.y_off == 0);
                 const meta = w.nvfp4.?;

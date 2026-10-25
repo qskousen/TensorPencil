@@ -834,14 +834,26 @@ test "the real Qwen-Image 2.1 checkpoint's config" {
     try testing.expectEqual(Config{ .dim = 4096, .heads = 32, .layers = 32, .ffn = 12288, .txt_dim = 4096, .in_ch = 64, .out_ch = 64, .fused_mlp = true }, cfg);
 }
 
-const nunchaku_ckpt = build_options.model_root ++ "/diffusion_models/qwen2.1/svdq-int4_r32-Qwen-Image-2.1-Turbo-Nunchaku.safetensors";
+const nunchaku_ckpts = [_][]const u8{
+    build_options.model_root ++ "/diffusion_models/qwen2.1/svdq-int4_r32-Qwen-Image-2.1-Turbo-Nunchaku.safetensors",
+    build_options.model_root ++ "/diffusion_models/qwen2.1/svdq-fp4_r32-Qwen-Image-2.1-Turbo-Nunchaku.safetensors",
+};
 const turbo_ckpt = build_options.model_root ++ "/diffusion_models/qwen2.1/qwen_image_2.1_turbo_bf16.safetensors";
 
 test "every linear of a Nunchaku block decodes to its dense Turbo counterpart, gate and up the right way round" {
+    try test_gate.requireModelFile(testing.io, turbo_ckpt);
+    var ran: usize = 0;
+    for (nunchaku_ckpts) |path| {
+        test_gate.requireModelFile(testing.io, path) catch continue;
+        try nunchakuBlockCase(path);
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+fn nunchakuBlockCase(nunchaku_ckpt: []const u8) !void {
     const io = testing.io;
     const gpa = testing.allocator;
-    try test_gate.requireModelFile(io, nunchaku_ckpt);
-    try test_gate.requireModelFile(io, turbo_ckpt);
     var nf = try safetensors.SafeTensors.open(gpa, io, nunchaku_ckpt);
     defer nf.deinit();
     var df = try safetensors.SafeTensors.open(gpa, io, turbo_ckpt);
@@ -872,8 +884,8 @@ test "every linear of a Nunchaku block decodes to its dense Turbo counterpart, g
         try ops.matmul.matmul(io, gpa, yn[0..n], xs, picks.len, nw, null);
         try ops.matmul.matmul(io, gpa, yd[0..n], xs, picks.len, dw, null);
         const rel = relL2(yd[0..n], yn[0..n]);
-        errdefer std.debug.print("{s}: rel {d}\n", .{ name, rel });
-        // The format's own error on this file's layers is 0.09 to 0.13.
+        errdefer std.debug.print("{s} {s}: rel {d}\n", .{ nunchaku_ckpt, name, rel });
+        // The format's own error on these files' layers is 0.07 to 0.13.
         try testing.expect(rel < 0.25);
     }
     // `yd` still holds the dense `down`; the dense `up` against the Nunchaku `gate` is

@@ -4755,29 +4755,31 @@ pub const Context = struct {
     /// A Nunchaku SVDQuant weight (`ops/svdq.zig`) decoded to the k-major int8 the int8
     /// GEMM reads, into `w4a8_t`. The codes and scales are read as the checkpoint packs
     /// them, so they upload verbatim.
-    pub fn svdqDecode(self: *Context, codes: []const u8, scales: []const u8, inv_row_scale: []const f32, rows: usize, cols: usize) Error!vk.Buffer {
+    pub fn svdqDecode(self: *Context, codes: []const u8, scales: []const u8, i8_mul: []const f32, fp4: bool, rows: usize, cols: usize) Error!vk.Buffer {
         std.debug.assert(rows % 128 == 0 and cols % 128 == 0 and std.mem.alignForward(usize, rows, tile_n) == rows);
         try self.ensureDeviceBuffer(&self.w4a8_t, w4a8ScratchBytes(rows, cols));
-        const iv: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_row_scale)), .mem = .null_handle, .size = 0 };
+        const iv: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(i8_mul)), .mem = .null_handle, .size = 0 };
         const quads = rows / 4;
         const total = quads * (cols / 8);
         try self.opElt(.svdq_decode_t, try self.weightRaw(codes), self.w4a8_t, try self.weightRaw(scales), iv, .{
             .u0 = @intCast(total),
             .u1 = @intCast(cols),
             .u2 = @intCast(quads),
+            .u3 = @intFromBool(fp4),
         }, total, 1, 1);
         return self.w4a8_t.buf;
     }
 
     /// `y = x @ Wᵀ + bias` for an SVDQuant weight expanded exactly to 16 bits, in the coop
-    /// GEMM's k-major operand, against the unquantized activation. `y_off` in elements.
-    pub fn opMatmulCoopSvdq(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32, comptime bf16: bool) Error!void {
+    /// GEMM's k-major operand, against the unquantized activation; fp4's `row_mul` is the
+    /// caller's to apply to `y`. `y_off` in elements.
+    pub fn opMatmulCoopSvdq(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, bias: []const f32, comptime bf16: bool) Error!void {
         std.debug.assert((if (bf16) self.pipe_coop_bf16w else self.pipe_coop_f16w) != .null_handle);
         try self.ensureStaging(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
         try self.ensureStaging(&self.deq_rows, rows * cols * 2);
         const is: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_smooth)), .mem = .null_handle, .size = 0 };
         const n = rows * cols / 8;
-        try self.opElt(if (bf16) .svdq_unpack_bf16 else .svdq_unpack_f16, try self.weightRaw(codes), self.deq_rows, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols) }, n, 1, 1);
+        try self.opElt(if (bf16) .svdq_unpack_bf16 else .svdq_unpack_f16, try self.weightRaw(codes), self.deq_rows, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols), .u3 = @intFromBool(fp4) }, n, 1, 1);
         const pairs = self.coopNPad(rows) / 2;
         const chunks = std.mem.alignForward(usize, cols, 64) / 16;
         try self.opElt(.transpose_kmajor16, self.deq_rows, null, null, self.deq_f16k, .{
@@ -4791,12 +4793,12 @@ pub const Context = struct {
 
     /// `opMatmulCoopSvdq` in true f32: the exact f32 rows transposed into the f32 GEMM's
     /// layout, as `opMatmulIntWoF32` does. `y_off` in elements.
-    pub fn opMatmulSvdqF32(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+    pub fn opMatmulSvdqF32(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, fp4: bool, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
         const stride = std.mem.alignForward(usize, rows, tile_n);
         try self.reserveWo32(rows, cols);
         const is: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_smooth)), .mem = .null_handle, .size = 0 };
         const n = rows * cols / 8;
-        try self.opElt(.svdq_unpack, try self.weightRaw(codes), self.wo32_r, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols) }, n, 1, 1);
+        try self.opElt(.svdq_unpack, try self.weightRaw(codes), self.wo32_r, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols), .u3 = @intFromBool(fp4) }, n, 1, 1);
         const nt = cols * stride;
         try self.opElt(.transpose_pad_f32, self.wo32_r, self.wo32_t, null, null, .{ .u0 = @intCast(nt), .u1 = @intCast(cols), .u2 = @intCast(stride), .u3 = @intCast(rows) }, nt, 1, 1);
         const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;

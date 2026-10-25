@@ -545,11 +545,24 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
         .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
         .svdq => {
             const sq = w.svdq.?;
-            try be.opI8GemmSvdq(y, w.bytes, sq.scales, sq.inv_row_scale, w.row_scale.?, w.rows, w.cols, bias);
+            try be.opI8GemmSvdq(y, w.bytes, sq.scales, sq.i8_mul, sq.codes == .fp4, w.row_scale.?, w.rows, w.cols, bias);
         },
-        .svdq_wo => try be.opSvdqGemmWo(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb),
-        .svdq_wo16 => try be.opSvdqGemmWoF16(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb),
-        .svdq_wo32 => try be.opSvdqGemmWoF32(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, bias),
+        // fp4's `row_mul` scales the 4-bit product before the bias, so the bias waits.
+        inline .svdq_wo, .svdq_wo16, .svdq_wo32 => |rt| {
+            const sq = w.svdq.?;
+            const fp4 = sq.codes == .fp4;
+            const b = if (fp4) try be.zeroBias(w.rows) else zb;
+            switch (rt) {
+                .svdq_wo => try be.opSvdqGemmWo(y, x, m, w.bytes, sq.scales, sq.inv_smooth, fp4, w.rows, w.cols, b),
+                .svdq_wo16 => try be.opSvdqGemmWoF16(y, x, m, w.bytes, sq.scales, sq.inv_smooth, fp4, w.rows, w.cols, b),
+                .svdq_wo32 => try be.opSvdqGemmWoF32(y, x, m, w.bytes, sq.scales, sq.inv_smooth, fp4, w.rows, w.cols, if (fp4) null else bias),
+                else => unreachable,
+            }
+            if (sq.row_mul) |rm| {
+                try be.opMulCols(y, y, rm, m, w.rows);
+                folded = bias == null;
+            }
+        },
         // The packed 4-bit weight is decoded into the backend's scratch on the way in and
         // runs the same int8 GEMM, so the 4-bit form stays resident.
         .w4a8 => {
