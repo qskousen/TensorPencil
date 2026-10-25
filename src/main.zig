@@ -10877,7 +10877,7 @@ fn linTestScore(stdout: *Io.Writer, name: []const u8, label: []const u8, r: Tens
     const cpu_rel = @sqrt(c_num / c_den);
     const cpu_tol: f64 = switch (r.prep()) {
         .i4 => 0.3,
-        .i8, .mmq, .q8 => 0.05,
+        .i8, .mmq, .q8, .svdq => 0.05,
         .none => 0.02,
     };
     const ok = bias_rel <= 1e-4 + store_tol and cpu_rel <= cpu_tol + store_tol;

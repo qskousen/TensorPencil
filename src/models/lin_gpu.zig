@@ -157,6 +157,9 @@ pub const Caps = struct {
     pub fn nvfp4(c: Caps) bool {
         return c.nvfp4dec;
     }
+    pub fn svdq(c: Caps) bool {
+        return c.i8;
+    }
     /// `Dense.f16`: every dense weight on the f16-weight coop GEMM.
     pub fn h16(c: Caps) bool {
         return c.f16w;
@@ -204,6 +207,8 @@ pub const Caps = struct {
             if (w.cols % @as(usize, if (rot) 256 else 4) != 0) return .int_shape;
         }
         return switch (r) {
+            // Nunchaku's packing tiles 128 both ways, and `opI8GemmBuf` stores whole row tiles.
+            .svdq, .svdq_wo, .svdq_wo16, .svdq_wo32 => if (w.rows % 128 != 0 or w.cols % 128 != 0 or w.rows % gpu.i8_row_tile != 0) .int_shape else null,
             // `i4Decode` emits a weight quantized after the rotation and has no
             // unrotated build.
             .i4_i8 => if (!rot) .int4_unrotated else null,
@@ -276,6 +281,7 @@ pub fn actQuant(ctx: *gpu.Context, p: Plan, w: Weight, m: usize) ops.matmul.ActQ
     const r = dual_lin.routeOf(Caps, Caps.fromContext(ctx), w, m, p.policy()) orelse return .{};
     return switch (r) {
         .i8, .i4_i8, .w4a8 => .{ .bits = 8, .rotate = p.rot },
+        .svdq => .{ .bits = 8, .regrid = true },
         else => .{},
     };
 }
@@ -334,7 +340,11 @@ pub fn presize(ctx: *gpu.Context, p: Plan, lins: []const Weight) !void {
     var i4s: usize = 0;
     for (lins) |w| switch (dual_lin.routeOf(Caps, caps, w, 128, p.policy()) orelse continue) {
         .nvfp4 => nv = @max(nv, ctx.kmajor16Bytes(w.rows, w.cols)),
-        .w4a8 => w4 = @max(w4, gpu.Context.w4a8ScratchBytes(w.rows, w.cols)),
+        .w4a8, .svdq => w4 = @max(w4, gpu.Context.w4a8ScratchBytes(w.rows, w.cols)),
+        .svdq_wo, .svdq_wo16 => {
+            bq_rows = @max(bq_rows, w.rows * w.cols * 2);
+            bq16 = @max(bq16, ctx.kmajor16Bytes(w.rows, w.cols));
+        },
         .blockq_f16, .blockq_bf16 => {
             bq_rows = @max(bq_rows, w.rows * w.cols * 2);
             bq16 = @max(bq16, ctx.kmajor16Bytes(w.rows, w.cols));
@@ -401,9 +411,9 @@ pub const Lin = struct {
     /// The LoRA sidecar's scratch, behind a pointer so a const `gemm` can grow it.
     lora: *lora_gpu.Scratch,
     /// Staged input and output: `linearAt`'s offset copies, and `prep`'s widened `x`
-    /// and `gemm`'s f32 `y` for a route that cannot take 16-bit. Behind a pointer for
-    /// the same reason.
-    stage: *[2]Buf,
+    /// and `gemm`'s f32 `y` for a route that cannot take 16-bit, then an SVDQuant
+    /// group's smoothed `x`. Behind a pointer for the same reason.
+    stage: *[3]Buf,
 
     /// `max_out` is the widest output any linear here writes; `groups` the widest
     /// `linearGroup`, and 0 for a caller that runs no GEMV.
@@ -422,7 +432,7 @@ pub const Lin = struct {
         const ls = try gpa.create(lora_gpu.Scratch);
         errdefer gpa.destroy(ls);
         ls.* = .{};
-        const st = try gpa.create([2]Buf);
+        const st = try gpa.create([3]Buf);
         st.* = @splat(.{ .buf = .null_handle, .mem = .null_handle, .size = 0 });
         return .{ .ctx = ctx, .gpa = gpa, .caps = Caps.fromContext(ctx), .partials = partials, .zero_bias = zero_bias, .nchunk = nchunk, .lora = ls, .stage = st };
     }
@@ -481,14 +491,30 @@ pub const Lin = struct {
     pub fn prep(self: *const Lin, p: Plan, x: Buf, m: usize, cols: usize, group: []const Weight) !Group {
         var want: Prep = .none;
         var widen = false;
+        var smooth: ?[]const f32 = null;
         for (group) |w| {
             const r = self.routeAt(p, w, m) orelse return error.UnsupportedDType;
             std.debug.assert(w.cols == cols);
             if (x.dt != .f32 and !self.readsTyped(r, w, x.dt)) widen = true;
-            switch (r.prep()) {
+            const k = r.prep();
+            if (k != .none and want != .none and k != want) {
+                std.log.err("lin_gpu: a linear group mixes {t} and {t} activation preps; one cannot serve both", .{ want, k });
+                return error.UnsupportedCheckpoint;
+            }
+            switch (k) {
                 .none => {},
                 .i8 => want = .i8,
                 .q8 => want = .q8,
+                .svdq => {
+                    // One smoothed activation serves the group, as on CUDA.
+                    const s = w.svdq.?.inv_smooth;
+                    if (smooth) |o| if (o.ptr != s.ptr) {
+                        std.log.err("lin_gpu: {s} smooths its input differently from the rest of its group", .{w.tag orelse "<untagged>"});
+                        return error.UnsupportedCheckpoint;
+                    };
+                    smooth = s;
+                    want = .svdq;
+                },
                 // `Caps` never routes to the other preps.
                 .i4, .mmq => return error.UnsupportedDType,
             }
@@ -512,6 +538,16 @@ pub const Lin = struct {
                 try self.ctx.opGemvQuantizeXRows(xf, m, cols);
                 serial_q8 +%= 1;
                 g.serial = serial_q8;
+            },
+            .svdq => {
+                const n = m * cols;
+                try self.ctx.ensureDeviceBuffer(&self.stage[2], n * 4);
+                var xs = self.stage[2];
+                xs.dt = .f32;
+                try self.ctx.opElt(gpu.eltAt("mul_cols", xf.dt), xs, xf, try lora_gpu.hostVec(self.ctx, smooth.?), null, .{ .u0 = @intCast(n), .u1 = @intCast(cols) }, n, 1, 1);
+                try self.ctx.opI8PrepR(xs, m, cols, false);
+                serial_i8 +%= 1;
+                g.serial = serial_i8;
             },
             else => {},
         }
@@ -572,7 +608,7 @@ pub const Lin = struct {
             if (!direct) try self.ctx.opElt(gpu.eltCopy(.f32, y.dt), ys, y, null, null, .{ .u0 = @intCast(g.m * w.rows) }, g.m * w.rows, 1, 1);
             return;
         }
-        if (r.prep() == .i8) std.debug.assert(g.prep == .i8 and g.serial == serial_i8);
+        if (r.prep() == .i8 or r.prep() == .svdq) std.debug.assert(g.prep == r.prep() and g.serial == serial_i8);
         if (r.prep() == .q8) std.debug.assert(g.prep == .q8 and g.serial == serial_q8);
         if (o.bias) |b| std.debug.assert(b.len >= w.rows);
         // A real check, not an assert: a release build would read the bias past the end.
@@ -583,6 +619,7 @@ pub const Lin = struct {
         if (g.x32 != null and x.buf == g.x32.?.buf) std.debug.assert(o.x_off == 0);
         if (y.dt == .f32 or self.writesTyped(r, w, y.dt)) {
             try self.exec(r, y, x, g.m, w, o);
+            if (w.svdq != null) try self.svdqLowrank(r, y, x, g.m, w, o);
             if (p.lora) |stack| try self.sidecar(stack, y, x, g.m, w, o);
             return;
         }
@@ -591,6 +628,7 @@ pub const Lin = struct {
         var so = o;
         so.y_off = 0;
         try self.exec(r, ys, x, g.m, w, so);
+        if (w.svdq != null) try self.svdqLowrank(r, ys, x, g.m, w, so);
         if (p.lora) |stack| try self.sidecar(stack, ys, x, g.m, w, so);
         const n = g.m * w.rows;
         try self.ctx.opElt(gpu.eltCopy(.f32, y.dt), ys, y, null, null, .{ .u0 = @intCast(n), .u2 = @intCast(o.y_off) }, n, 1, 1);
@@ -631,6 +669,33 @@ pub const Lin = struct {
     /// Every LoRA hit against `w`, added onto the base GEMM's output. A no-op when
     /// nothing patches `w`, so it sits beside the one dispatch every caller goes
     /// through and cannot be skipped at some call site.
+    /// The low-rank branch an SVDQuant weight carries (`ops/svdq.zig`), onto `y` from the
+    /// raw `x`: the LoRA sidecar's GEMMs over a one-factor target, or on the f32
+    /// weight-only route two true f32 GEMMs, since the sidecar's 16-bit operands would cap
+    /// that route's accuracy.
+    fn svdqLowrank(self: *const Lin, r: Route, y: Buf, x: Buf, m: usize, w: Weight, o: Out) !void {
+        if (o.y_off != 0) {
+            std.log.err("lin_gpu: {s} is SVDQuant with an offset output, which its low-rank branch cannot add onto", .{w.tag orelse "<untagged>"});
+            return error.UnsupportedCheckpoint;
+        }
+        const sq = w.svdq.?;
+        const rank: usize = sq.rank;
+        if (r == .svdq_wo32) {
+            const t = try self.lora.inPlane(self.ctx, m * rank * 4, .f32);
+            try self.ctx.opMatmulF32Dense(t, x, m, sq.down, .bf16, rank, w.cols);
+            const u = try self.lora.outPlane(self.ctx, m * w.rows);
+            try self.ctx.opMatmulF32Dense(u, t, m, sq.up, .bf16, w.rows, rank);
+            return lora_gpu.addPlane(self.ctx, y, u, m, w.rows, w.rows, 0, 1);
+        }
+        const f = [_]lora_mod.Factor{.{
+            .a = Weight.init(sq.down, .bf16, rank, w.cols),
+            .b = Weight.init(sq.up, .bf16, w.rows, rank),
+            .out_off = 0,
+        }};
+        const t: lora_mod.Target = .{ .factors = &f, .in_dim = w.cols, .out_dim = w.rows, .scale = 1, .tag = w.tag orelse "svdq" };
+        try lora_gpu.applyTarget(self.ctx, self.lora, self.zero_bias, y, x, m, &t, 1, 0, w.rows);
+    }
+
     fn sidecar(self: *const Lin, stack: *const lora_mod.Stack, y: Buf, x: Buf, m: usize, w: Weight, o: Out) !void {
         const hits = stack.forWeight(w);
         if (hits.len == 0) return;
@@ -828,6 +893,15 @@ pub const Lin = struct {
                 try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows);
                 folded = o.bias == null;
             },
+            .svdq => {
+                std.debug.assert(o.y_off == 0);
+                const sq = w.svdq.?;
+                const wbuf = try ctx.svdqDecode(w.bytes, sq.scales, sq.inv_row_scale, w.rows, w.cols);
+                try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows);
+                folded = o.bias == null;
+            },
+            inline .svdq_wo, .svdq_wo16 => |rt| try ctx.opMatmulCoopSvdq(y, o.y_off, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb, rt == .svdq_wo),
+            .svdq_wo32 => try ctx.opMatmulSvdqF32(y, o.y_off, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, o.bias),
             .nvfp4 => {
                 std.debug.assert(o.y_off == 0);
                 const meta = w.nvfp4.?;

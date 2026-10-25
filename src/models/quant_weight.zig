@@ -455,6 +455,55 @@ pub fn w4a8(
     return w;
 }
 
+/// Build a `Weight` for a Nunchaku SVDQuant layer, or null when `name` is not one.
+///
+/// `name` is the layer's `<base>.weight`, which such a file does not have: it ships
+/// `<base>.qweight`, `.wscales`, `.smooth_factor`, `.proj_down` and `.proj_up`, all in
+/// Nunchaku's packing (`ops/svdq.zig`). The codes and scales stay views into the store.
+pub fn svdq(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, rows: usize, cols: usize, who: []const u8) !?Weight {
+    if (!std.mem.endsWith(u8, name, ".weight")) return null;
+    const base = name[0 .. name.len - ".weight".len];
+    var buf: [256]u8 = undefined;
+    const qv = store.get(std.mem.print(&buf, "{s}.qweight", .{base}) catch return null) orelse return null;
+    const part = struct {
+        fn get(s: WeightStore, b: []const u8, field: []const u8, w: []const u8) !weights_mod.TensorView {
+            var nb: [256]u8 = undefined;
+            const nm = std.mem.print(&nb, "{s}.{s}", .{ b, field }) catch return error.MissingTensor;
+            return s.get(nm) orelse {
+                std.log.err("{s}: SVDQuant layer {s} has no {s}", .{ w, b, field });
+                return error.MissingTensor;
+            };
+        }
+    };
+    const sv = try part.get(store, base, "wscales", who);
+    if (sv.info.dtype != .bf16) {
+        // The fp4 variant: fp8 scales per 16, a per-channel `wcscales`, E2M1 codes.
+        std.log.err("{s}: {s} is SVDQuant {t}-scaled (the fp4 variant), which is not supported; use the int4 file", .{ who, base, sv.info.dtype });
+        return error.UnsupportedDType;
+    }
+    const smooth = try part.get(store, base, "smooth_factor", who);
+    const down = try part.get(store, base, "proj_down", who);
+    const up = try part.get(store, base, "proj_up", who);
+    const qs = qv.info.shape.slice();
+    const ds = down.info.shape.slice();
+    if ((qv.info.dtype != .i8 and qv.info.dtype != .u8) or qs.len != 2 or qs[0] != rows or qs[1] * 2 != cols or
+        smooth.info.dtype != .bf16 or down.info.dtype != .bf16 or up.info.dtype != .bf16 or ds.len != 2)
+    {
+        std.log.err("{s}: SVDQuant layer {s} has qweight {any} ({t}), expected I8 [{d}, {d}]", .{ who, base, qs, qv.info.dtype, rows, cols / 2 });
+        return error.ShapeMismatch;
+    }
+    const rank = ds[1];
+    ops.svdq.validate(rows, cols, rank, qv.bytes.len, sv.bytes.len) catch |e| {
+        std.log.err("{s}: SVDQuant layer {s} is [{d}, {d}] rank {d}, which Nunchaku's packing does not tile", .{ who, base, rows, cols, rank });
+        return e;
+    };
+    const l = try ops.svdq.load(alloc, sv.bytes, smooth.bytes, down.bytes, up.bytes, rows, cols, rank);
+    var w = Weight.init(qv.bytes, .svdq4, rows, cols);
+    w.svdq = l.meta;
+    w.row_scale = l.row_scale;
+    return w;
+}
+
 /// What a family's loader wants that this cannot decide for it.
 pub const LoadOptions = struct {
     /// The family, for every diagnostic. A bare `ShapeMismatch` across 450 weights
@@ -479,6 +528,8 @@ pub fn load(
     cols: usize,
     opts: LoadOptions,
 ) !Weight {
+    // An SVDQuant layer has no `.weight` at all, so it is asked first.
+    if (try svdq(alloc, store, name, rows, cols, opts.who)) |w| return tag(alloc, w, name);
     const view = store.get(name) orelse {
         std.log.err("{s}: missing tensor {s}", .{ opts.who, name });
         return error.MissingTensor;

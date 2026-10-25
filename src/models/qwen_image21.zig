@@ -21,7 +21,7 @@
 //!     projection is `[gate | up]`, SwiGLU.
 //!
 //! Loads from any `WeightStore`; the FFN is fused (`gate_up`) or split (`proj` the up
-//! half, `gate_layer` the gate).
+//! half, `gate_layer` the gate), or under Nunchaku's names (`Config.nunchaku_names`).
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -153,6 +153,10 @@ pub const Config = struct {
     in_ch: usize,
     out_ch: usize,
     fused_mlp: bool,
+    /// Nunchaku's diffusers names: `attn.to_qkv` fused, the FFN in as
+    /// `img_mlp.net.0.proj` with rows `[up | gate]` (the reverse of `gate_up`), and out
+    /// as `img_mlp.net.2`.
+    nunchaku_names: bool = false,
     axes: [3]usize = .{ 16, 56, 56 },
 
     pub fn headDim(c: Config) usize {
@@ -171,9 +175,14 @@ pub const Config = struct {
         const po = store.get(try name(&buf, pfx, "proj_out.weight")) orelse return error.UnknownModelConfig;
         const tn = store.get(try name(&buf, pfx, "txt_in.text_norm.weight")) orelse return error.UnknownModelConfig;
         var fused = true;
+        var nunchaku = false;
         const ffn = if (store.get(try name(&buf, pfx, "transformer_blocks.0.img_mlp.gate_up.weight"))) |v|
             v.info.shape.slice()[0] / 2
-        else blk: {
+        else if (store.get(try name(&buf, pfx, "transformer_blocks.0.img_mlp.net.0.proj.qweight"))) |v| blk: {
+            fused = false;
+            nunchaku = true;
+            break :blk v.info.shape.slice()[0] / 2;
+        } else blk: {
             fused = false;
             const p = store.get(try name(&buf, pfx, "transformer_blocks.0.img_mlp.proj.weight")) orelse return error.UnknownModelConfig;
             break :blk p.info.shape.slice()[0];
@@ -193,6 +202,7 @@ pub const Config = struct {
             .in_ch = in_ch,
             .out_ch = po.info.shape.slice()[0],
             .fused_mlp = fused,
+            .nunchaku_names = nunchaku,
         };
     }
 
@@ -685,6 +695,25 @@ const Loader = struct {
         const ffn = l.cfg.ffn;
         const hd = l.cfg.headDim();
         const p = "transformer_blocks.{d}.";
+        if (l.cfg.nunchaku_names) {
+            const qkv = (try l.linear(p ++ "attn.to_qkv", .{i}, 3 * d, d)).w;
+            const ffn_in = (try l.linear(p ++ "img_mlp.net.0.proj", .{i}, 2 * ffn, d)).w;
+            var b: Block = .{
+                .q = .{ .w = try lin.rowSlice(l.alloc, qkv, 0, d) },
+                .k = .{ .w = try lin.rowSlice(l.alloc, qkv, d, d) },
+                .v = .{ .w = try lin.rowSlice(l.alloc, qkv, 2 * d, d) },
+                .o = try l.linear(p ++ "attn.to_out.0", .{i}, d, d),
+                .q_norm = try l.vec(p ++ "attn.norm_q.weight", .{i}, hd),
+                .k_norm = try l.vec(p ++ "attn.norm_k.weight", .{i}, hd),
+                .gate_up = null,
+                .up = .{ .w = try lin.rowSlice(l.alloc, ffn_in, 0, ffn) },
+                .gate = .{ .w = try lin.rowSlice(l.alloc, ffn_in, ffn, ffn) },
+                .down = try l.linear(p ++ "img_mlp.net.2", .{i}, d, ffn),
+                .dev = undefined,
+            };
+            b.dev = .{ b.q.w, b.k.w, b.v.w, b.o.w, b.gate.w, b.up.w, b.down.w };
+            return b;
+        }
         var b: Block = .{
             .q = try l.linear(p ++ "attn.to_q", .{i}, d, d),
             .k = try l.linear(p ++ "attn.to_k", .{i}, d, d),
@@ -803,6 +832,61 @@ test "the real Qwen-Image 2.1 checkpoint's config" {
     defer ck.deinit();
     const cfg = try Config.detect(.{ .safetensors = &ck });
     try testing.expectEqual(Config{ .dim = 4096, .heads = 32, .layers = 32, .ffn = 12288, .txt_dim = 4096, .in_ch = 64, .out_ch = 64, .fused_mlp = true }, cfg);
+}
+
+const nunchaku_ckpt = build_options.model_root ++ "/diffusion_models/qwen2.1/svdq-int4_r32-Qwen-Image-2.1-Turbo-Nunchaku.safetensors";
+const turbo_ckpt = build_options.model_root ++ "/diffusion_models/qwen2.1/qwen_image_2.1_turbo_bf16.safetensors";
+
+test "every linear of a Nunchaku block decodes to its dense Turbo counterpart, gate and up the right way round" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    try test_gate.requireModelFile(io, nunchaku_ckpt);
+    try test_gate.requireModelFile(io, turbo_ckpt);
+    var nf = try safetensors.SafeTensors.open(gpa, io, nunchaku_ckpt);
+    defer nf.deinit();
+    var df = try safetensors.SafeTensors.open(gpa, io, turbo_ckpt);
+    defer df.deinit();
+    var ncfg = try Config.detect(.{ .safetensors = &nf });
+    try testing.expect(ncfg.nunchaku_names and !ncfg.fused_mlp and ncfg.ffn == 12288 and ncfg.layers == 32);
+    ncfg.layers = 1;
+    var dcfg = try Config.detect(.{ .safetensors = &df });
+    dcfg.layers = 1;
+    var nm = try DiT.loadWith(gpa, .{ .safetensors = &nf }, ncfg);
+    defer nm.deinit();
+    var dm = try DiT.loadWith(gpa, .{ .safetensors = &df }, dcfg);
+    defer dm.deinit();
+    // `matmul` on one-hot rows reads out weight columns, low-rank branch included.
+    const picks = [_]usize{ 0, 1, 2047, 4095 };
+    const x = try gpa.alloc(f32, picks.len * ncfg.ffn);
+    defer gpa.free(x);
+    const yn = try gpa.alloc(f32, picks.len * ncfg.ffn);
+    defer gpa.free(yn);
+    const yd = try gpa.alloc(f32, picks.len * ncfg.ffn);
+    defer gpa.free(yd);
+    const names = [7][]const u8{ "q", "k", "v", "o", "gate", "up", "down" };
+    for (nm.blocks[0].dev, dm.blocks[0].dev, names) |nw, dw, name| {
+        const xs = x[0 .. picks.len * nw.cols];
+        @memset(xs, 0);
+        for (picks, 0..) |c, i| xs[i * nw.cols + c] = 1;
+        const n = picks.len * nw.rows;
+        try ops.matmul.matmul(io, gpa, yn[0..n], xs, picks.len, nw, null);
+        try ops.matmul.matmul(io, gpa, yd[0..n], xs, picks.len, dw, null);
+        const rel = relL2(yd[0..n], yn[0..n]);
+        errdefer std.debug.print("{s}: rel {d}\n", .{ name, rel });
+        // The format's own error on this file's layers is 0.09 to 0.13.
+        try testing.expect(rel < 0.25);
+    }
+    // `yd` still holds the dense `down`; the dense `up` against the Nunchaku `gate` is
+    // what a swapped `[up | gate]` would compare, and it is nowhere near.
+    const xs = x[0 .. picks.len * ncfg.dim];
+    @memset(xs, 0);
+    for (picks, 0..) |c, i| xs[i * ncfg.dim + c] = 1;
+    const n = picks.len * ncfg.ffn;
+    try ops.matmul.matmul(io, gpa, yd[0..n], xs, picks.len, dm.blocks[0].up.w, null);
+    try ops.matmul.matmul(io, gpa, yn[0..n], xs, picks.len, nm.blocks[0].gate.w, null);
+    const swapped = relL2(yd[0..n], yn[0..n]);
+    errdefer std.debug.print("swapped: rel {d}\n", .{swapped});
+    try testing.expect(swapped > 0.8);
 }
 
 const vae_ref = "src/models/assets/qwen_image21_vae.safetensors";

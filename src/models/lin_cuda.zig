@@ -96,6 +96,7 @@ pub fn actQuant(_: *Backend, p: Plan, w: Weight, m: usize) ops.matmul.ActQuant {
     return switch (r) {
         .i8, .i4_i8, .w4a8 => .{ .bits = 8, .rotate = p.rot },
         .i4 => .{ .bits = 4, .rotate = p.rot },
+        .svdq => .{ .bits = 8, .regrid = true },
         else => .{},
     };
 }
@@ -191,9 +192,20 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
     var want: Prep = .none;
     var bq = false;
     var widen = false;
+    var smooth: ?[]const f32 = null;
     for (group) |w| {
         const r = routeAt(p, w, m) orelse return error.UnsupportedDType;
         std.debug.assert(w.cols == cols);
+        if (r == .svdq) {
+            // One smoothed activation serves the group: views of one fused tensor share
+            // their vector, and two different ones would need two preps.
+            const s = w.svdq.?.inv_smooth;
+            if (smooth) |o| if (o.ptr != s.ptr) {
+                std.log.err("lin_cuda: {s} smooths its input differently from the rest of its group", .{w.tag orelse "<untagged>"});
+                return error.UnsupportedCheckpoint;
+            };
+            smooth = s;
+        }
         if (x.dt != .f32 and !typedOn(be, r)) widen = true;
         const k = r.prep();
         if (k == .none) continue;
@@ -231,6 +243,14 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
             serial_int +%= 1;
             g.serial = serial_int;
         },
+        .svdq => {
+            try be.ensureDeviceBuffer(&be.lin_xs, m * cols * 4);
+            const xs = be.lin_xs.as(.f32);
+            try be.opMulCols(xs, xf, smooth.?, m, cols);
+            try be.opI8PrepR(xs, m, cols, false);
+            serial_int +%= 1;
+            g.serial = serial_int;
+        },
         .q8 => {
             try be.opGemvQuantizeX(xf, m * cols);
             serial_q8 +%= 1;
@@ -263,7 +283,7 @@ pub fn gemm(be: *Backend, p: Plan, g: Group, y: Buf, w: Weight, bias: ?[]const f
     // A prepped route needs the scratch this group wrote, and nothing since.
     switch (r.prep()) {
         .none => {},
-        .i8, .i4 => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
+        .i8, .i4, .svdq => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
         .q8 => std.debug.assert((g.prep == .q8 or g.prep == .mmq) and g.serial == serial_q8),
         .mmq => std.debug.assert(g.prep == .mmq and g.serial == serial_q8),
     }
@@ -279,6 +299,7 @@ pub fn gemm(be: *Backend, p: Plan, g: Group, y: Buf, w: Weight, bias: ?[]const f
         break :blk be.lin_y32.as(.f32);
     };
     try exec(be, r, o, ys, x, g.m, w, if (split) null else bias);
+    if (w.svdq != null) try if (r == .svdq_wo32) svdqLowrank32(be, ys, x, g.m, w) else svdqLowrank(be, ys, x, g.m, w);
     if (p.lora) |stack| try sidecar(be, p, r, stack, ys, x, g.m, w, if (split) null else bias, true);
     if (split) try addBias(be, ys, g.m, w.rows, bias.?);
     if (ys.buf != y.buf) try be.opCast(ys, y, g.m * w.rows, 0);
@@ -376,6 +397,9 @@ pub const Caps = struct {
     pub fn intWeightOnly(_: Caps, _: dual_lin.IntGemm) bool {
         return true;
     }
+    pub fn svdq(_: Caps) bool {
+        return true;
+    }
     pub fn nvfp4(_: Caps) bool {
         return true;
     }
@@ -421,6 +445,8 @@ pub const Caps = struct {
             // 256. The weight-only twins need no more than this, which is what lets
             // `Plan.int8` be set after the fact.
             .i8, .i4 => if (w.rows % 128 != 0 or w.cols % 256 != 0) return .int_shape,
+            // No rotation, so no 256-wide groups; Nunchaku's packing tiles 128 both ways.
+            .svdq => if (w.rows % 128 != 0 or w.cols % 128 != 0) return .int_shape,
             .mmq, .none, .q8 => {},
         }
         return switch (r) {
@@ -517,6 +543,13 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
             folded = bias == null;
         },
         .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
+        .svdq => {
+            const sq = w.svdq.?;
+            try be.opI8GemmSvdq(y, w.bytes, sq.scales, sq.inv_row_scale, w.row_scale.?, w.rows, w.cols, bias);
+        },
+        .svdq_wo => try be.opSvdqGemmWo(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb),
+        .svdq_wo16 => try be.opSvdqGemmWoF16(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, zb),
+        .svdq_wo32 => try be.opSvdqGemmWoF32(y, x, m, w.bytes, w.svdq.?.scales, w.svdq.?.inv_smooth, w.rows, w.cols, bias),
         // The packed 4-bit weight is decoded into the backend's scratch on the way in and
         // runs the same int8 GEMM, so the 4-bit form stays resident.
         .w4a8 => {
@@ -635,17 +668,17 @@ pub fn probeInput(be: *Backend, x: Buf, m: usize, w: anytype) !void {
     p.input(p.ctx, w, host, m);
 }
 
-/// Pre-size the decode scratches to the widest linear, so nothing grows mid-forward.
-/// Growth is safe (`ensureDeviceBuffer` syncs the stream first) but the first block
-/// would pay a sync per linear for nothing.
 /// Whether route `r` takes a bias array even for a linear that has none.
 fn readsZeroBias(r: dual_lin.Route) bool {
     return switch (r) {
-        .gemm_bf16, .gemm_fp8_bf16, .h16_f32, .h16_f16, .h16_bf16, .i8_wo, .i4_wo, .w4a8_wo, .i8_wo16, .i4_wo16, .w4a8_wo16, .nvfp4, .blockq_bf16 => true,
+        .gemm_bf16, .gemm_fp8_bf16, .h16_f32, .h16_f16, .h16_bf16, .i8_wo, .i4_wo, .w4a8_wo, .i8_wo16, .i4_wo16, .w4a8_wo16, .svdq_wo, .svdq_wo16, .nvfp4, .blockq_bf16 => true,
         else => false,
     };
 }
 
+/// Pre-size the decode scratches to the widest linear, so nothing grows mid-forward.
+/// Growth is safe (`ensureDeviceBuffer` syncs the stream first) but the first block
+/// would pay a sync per linear for nothing.
 pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
     var bq: usize = 0;
     var w4: usize = 0;
@@ -658,14 +691,14 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
     for (lins) |w| switch (route(p, w) orelse continue) {
         .blockq_i8 => bq = @max(bq, Backend.blockQScratchBytes(w.rows, w.cols)),
         .blockq_i4 => bq = @max(bq, Backend.blockQScratchBytesI4(w.rows, w.cols)),
-        .w4a8 => w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols)),
+        .w4a8, .svdq => w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols)),
         // Grown per linear, never shrunk, so the loop leaves the widest.
         .w4a8_wo, .w4a8_wo16 => {
             w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols));
             try be.reserveWo(w.rows, w.cols, 0);
         },
-        .i8_wo, .i4_wo, .i8_wo16, .i4_wo16 => try be.reserveWo(w.rows, w.cols, 0),
-        .i8_wo32, .i4_wo32 => try be.reserveWo32(w.rows, w.cols),
+        .i8_wo, .i4_wo, .i8_wo16, .i4_wo16, .svdq_wo, .svdq_wo16 => try be.reserveWo(w.rows, w.cols, 0),
+        .i8_wo32, .i4_wo32, .svdq_wo32 => try be.reserveWo32(w.rows, w.cols),
         .w4a8_wo32 => {
             w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols));
             try be.reserveWo32(w.rows, w.cols);
@@ -680,7 +713,7 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
 /// routes' bf16 copy of it. `max_rows` as in `presizeLora`.
 pub fn presizeRows(be: *Backend, p: Plan, lins: []const Weight, max_rows: usize) !void {
     for (lins) |w| switch (route(p, w) orelse continue) {
-        .i8_wo, .i4_wo, .w4a8_wo => try be.reserveWo(w.rows, w.cols, max_rows),
+        .i8_wo, .i4_wo, .w4a8_wo, .svdq_wo => try be.reserveWo(w.rows, w.cols, max_rows),
         else => {},
     };
 }
@@ -765,6 +798,33 @@ fn i8A(be: *Backend, p: Plan, r: Route, w: Weight, m: usize, h: lora_mod.Stack.H
 /// The sidecar scratch for `w`'s hits, sized by `lora_cuda.loElems`: the int8 A
 /// GEMM stores whole tiles, so sizing from `m` and the rank lets its last store
 /// run past the buffer.
+/// The low-rank branch an SVDQuant weight carries (`ops/svdq.zig`), onto `y` from the
+/// raw `x`: the LoRA sidecar's two GEMMs over a one-factor target at strength 1.
+fn svdqLowrank(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
+    const sq = w.svdq.?;
+    const rank: usize = sq.rank;
+    const f = [_]lora_mod.Factor{.{
+        .a = Weight.init(sq.down, .bf16, rank, w.cols),
+        .b = Weight.init(sq.up, .bf16, w.rows, rank),
+        .out_off = 0,
+    }};
+    const t: lora_mod.Target = .{ .factors = &f, .in_dim = w.cols, .out_dim = w.rows, .scale = 1, .tag = w.tag orelse "svdq" };
+    var ws = try lora_cuda.borrowed(be, lora_cuda.loElems(m, rank), std.mem.alignForward(usize, m, 128) * w.rows);
+    try lora_cuda.applyTarget(be, &ws, y, x, m, &t, 1, 0, w.rows, .{});
+}
+
+/// `svdqLowrank` in true f32, for the f32 weight-only route: the sidecar rounds its
+/// operands to 16 bits on one arm and would cap that route's accuracy there.
+fn svdqLowrank32(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
+    const sq = w.svdq.?;
+    const rank: usize = sq.rank;
+    const t = try lora_cuda.inPlane(be, m * rank * 4, .f32);
+    try be.gemmF32Dev(t, x, m, try be.weight32(sq.down, .bf16, rank, w.cols), rank, w.cols, null);
+    const u = try lora_cuda.outPlane(be, m * w.rows);
+    try be.gemmF32Dev(u, t, m, try be.weight32(sq.up, .bf16, w.rows, rank), w.rows, rank, null);
+    try lora_cuda.addPlane(be, y, u, m, w.rows, w.rows, 0, 1);
+}
+
 fn workspace(be: *Backend, hits: []const lora_mod.Stack.Hit, m: usize, w: Weight) !lora_cuda.Workspace {
     var rank: usize = 0;
     for (hits) |h| for (h.target.factors) |f| {

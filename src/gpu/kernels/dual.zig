@@ -1025,6 +1025,14 @@ const bodies = .{
     .{ "w6a8_decode", elt.w6a8Decode },
     .{ "w6a8_decode_t", elt.w6a8DecodeT },
     .{ "attn_bounded", attn.attnBounded },
+    .{ "mul_cols", At(elt.mulCols, .f32).run },
+    .{ "mul_cols_f16", At(elt.mulCols, .f16).run },
+    .{ "mul_cols_bf16", At(elt.mulCols, .bf16).run },
+    .{ "svdq_decode", elt.svdqDecode },
+    .{ "svdq_decode_t", elt.svdqDecodeT },
+    .{ "svdq_unpack", At(elt.svdqUnpack, .f32).run },
+    .{ "svdq_unpack_f16", At(elt.svdqUnpack, .f16).run },
+    .{ "svdq_unpack_bf16", At(elt.svdqUnpack, .bf16).run },
 };
 
 comptime {

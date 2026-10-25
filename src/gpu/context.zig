@@ -389,7 +389,7 @@ const fp8_table: [256]f32 = blk: {
 /// inline so a caller can pass it through `@call`.
 pub const FlashPass = enum { md, out };
 
-pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, moe_route, gemv_rows_f32, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q2_k_sdot, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q3_k_sdot, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q4_k_sdot, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q8_0_sdot, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_q4_0_sdot, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_nl_sdot, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_iq4_xs_sdot, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q5_k_sdot, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q6_k_sdot, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q1_0_sdot, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g64_sdot, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_q2_0_g128_sdot, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xxs_sdot, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq2_xs_sdot, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_xxs_sdot, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, gemv_dual_iq3_s_sdot, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q2_k_sdot, gemv4_dual_q3_k, gemv4_dual_q3_k_sdot, gemv4_dual_q4_k, gemv4_dual_q4_k_sdot, gemv4_dual_q8_0, gemv4_dual_q8_0_sdot, gemv4_dual_q4_0, gemv4_dual_q4_0_sdot, gemv4_dual_iq4_nl, gemv4_dual_iq4_nl_sdot, gemv4_dual_iq4_xs, gemv4_dual_iq4_xs_sdot, gemv4_dual_q5_k, gemv4_dual_q5_k_sdot, gemv4_dual_q6_k, gemv4_dual_q6_k_sdot, gemv4_dual_q1_0, gemv4_dual_q1_0_sdot, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g64_sdot, gemv4_dual_q2_0_g128, gemv4_dual_q2_0_g128_sdot, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xxs_sdot, gemv4_dual_iq2_xs, gemv4_dual_iq2_xs_sdot, gemv4_dual_iq3_xxs, gemv4_dual_iq3_xxs_sdot, gemv4_dual_iq3_s, gemv4_dual_iq3_s_sdot, gemvx_dual_q2_k, gemvx_dual_q2_k_sdot, gemvx_dual_q3_k, gemvx_dual_q3_k_sdot, gemvx_dual_q4_k, gemvx_dual_q4_k_sdot, gemvx_dual_q8_0, gemvx_dual_q8_0_sdot, gemvx_dual_q4_0, gemvx_dual_q4_0_sdot, gemvx_dual_iq4_nl, gemvx_dual_iq4_nl_sdot, gemvx_dual_iq4_xs, gemvx_dual_iq4_xs_sdot, gemvx_dual_q5_k, gemvx_dual_q5_k_sdot, gemvx_dual_q6_k, gemvx_dual_q6_k_sdot, gemvx_dual_q1_0, gemvx_dual_q1_0_sdot, gemvx_dual_q2_0_g64, gemvx_dual_q2_0_g64_sdot, gemvx_dual_q2_0_g128, gemvx_dual_q2_0_g128_sdot, gemvx_dual_iq2_xxs, gemvx_dual_iq2_xxs_sdot, gemvx_dual_iq2_xs, gemvx_dual_iq2_xs_sdot, gemvx_dual_iq3_xxs, gemvx_dual_iq3_xxs_sdot, gemvx_dual_iq3_s, gemvx_dual_iq3_s_sdot, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16, dup_up_add, dup_up_add_f16, dup_up_add_bf16, w6a8_decode, w6a8_decode_t, attn_bounded };
+pub const Elt = enum(usize) { act_steer, rmsnorm, rms_apply_w, rms_partial, rms_combine, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, attn_out, f32_to_h16, pad_h16, vae_norm, im2col, bias_compact, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, gelu_mul, gelu, layernorm, attn_full, pad_bf16, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, kv_store_f16, penalize, kv_store_q8_0, transpose_kmajor16, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, scale_f32, add_scaled, gelu_quick_mul, softplus_gate, rope_half_pos, rope_half_part, deinterleave3, gdn_gates_batch, gdn_conv_batch, gdn_conv_state, head_pad, gather_head, gather_vt, scatter_head, gather_head_b, gather_vt_b, scatter_head_b, f16_to_f32, bias_add, add_bias_rows, gather_rows, scatter_add_rows, moe_combine, moe_route, gemv_rows_f32, rope_imrope, rope_imrope_pos, rope_vision, rope_vision_gemma4, im2col1d, im2col3d, aa_up_snake, aa_down, convt1d_ca, snake1d_ca, mean_heads_pool, dequant_fp8_f16, dequant_fp8_bf16, dequant_q8_0_f16, dequant_q8_0_bf16, dequant_q4_0_f16, dequant_q4_0_bf16, dequant_q1_0_f16, dequant_q1_0_bf16, dequant_q2_0_g64_f16, dequant_q2_0_g64_bf16, dequant_q2_0_g128_f16, dequant_q2_0_g128_bf16, dequant_iq4_nl_f16, dequant_iq4_nl_bf16, dequant_iq4_xs_f16, dequant_iq4_xs_bf16, dequant_q4_k_f16, dequant_q4_k_bf16, dequant_q5_k_f16, dequant_q5_k_bf16, dequant_q6_k_f16, dequant_q6_k_bf16, group_rmsnorm, rms_mod, rms_mod_h16, ln_mod, l2norm_rows_g, rope_half_span_pos, rope_inter_span_pos, pixel_shuffle, im2col_stride, dw_conv3, col_mean, mul_cols_sigmoid, nerf_feat, patch_scatter, win_gather, win_scatter, modulate_pr, gated_add_pr, dequant_q2_k_f16, dequant_q2_k_bf16, dequant_q3_k_f16, dequant_q3_k_bf16, dequant_iq2_xxs_f16, dequant_iq2_xxs_bf16, dequant_iq2_xs_f16, dequant_iq2_xs_bf16, dequant_iq3_xxs_f16, dequant_iq3_xxs_bf16, dequant_iq3_s_f16, dequant_iq3_s_bf16, gemv_dual_q2_k, gemv_dual_q2_k_q8, gemv_dual_q2_k_sdot, gemv_dual_q3_k, gemv_dual_q3_k_q8, gemv_dual_q3_k_sdot, gemv_dual_q4_k, gemv_dual_q4_k_q8, gemv_dual_q4_k_sdot, gemv_dual_q8_0, gemv_dual_q8_0_q8, gemv_dual_q8_0_sdot, gemv_dual_q4_0, gemv_dual_q4_0_q8, gemv_dual_q4_0_sdot, gemv_dual_iq4_nl, gemv_dual_iq4_nl_q8, gemv_dual_iq4_nl_sdot, gemv_dual_iq4_xs, gemv_dual_iq4_xs_q8, gemv_dual_iq4_xs_sdot, gemv_dual_q5_k, gemv_dual_q5_k_q8, gemv_dual_q5_k_sdot, gemv_dual_q6_k, gemv_dual_q6_k_q8, gemv_dual_q6_k_sdot, gemv_dual_q1_0, gemv_dual_q1_0_q8, gemv_dual_q1_0_sdot, gemv_dual_q2_0_g64, gemv_dual_q2_0_g64_q8, gemv_dual_q2_0_g64_sdot, gemv_dual_q2_0_g128, gemv_dual_q2_0_g128_q8, gemv_dual_q2_0_g128_sdot, gemv_dual_iq2_xxs, gemv_dual_iq2_xxs_q8, gemv_dual_iq2_xxs_sdot, gemv_dual_iq2_xs, gemv_dual_iq2_xs_q8, gemv_dual_iq2_xs_sdot, gemv_dual_iq3_xxs, gemv_dual_iq3_xxs_q8, gemv_dual_iq3_xxs_sdot, gemv_dual_iq3_s, gemv_dual_iq3_s_q8, gemv_dual_iq3_s_sdot, compact_acc, attn_rows_f32, attn_rows_f16, attn_rows_q8, attn_merge, gdn_delta_chunk_d64, gdn_delta_chunk_d128, quantize_q8_1, gemv4_dual_q2_k, gemv4_dual_q2_k_sdot, gemv4_dual_q3_k, gemv4_dual_q3_k_sdot, gemv4_dual_q4_k, gemv4_dual_q4_k_sdot, gemv4_dual_q8_0, gemv4_dual_q8_0_sdot, gemv4_dual_q4_0, gemv4_dual_q4_0_sdot, gemv4_dual_iq4_nl, gemv4_dual_iq4_nl_sdot, gemv4_dual_iq4_xs, gemv4_dual_iq4_xs_sdot, gemv4_dual_q5_k, gemv4_dual_q5_k_sdot, gemv4_dual_q6_k, gemv4_dual_q6_k_sdot, gemv4_dual_q1_0, gemv4_dual_q1_0_sdot, gemv4_dual_q2_0_g64, gemv4_dual_q2_0_g64_sdot, gemv4_dual_q2_0_g128, gemv4_dual_q2_0_g128_sdot, gemv4_dual_iq2_xxs, gemv4_dual_iq2_xxs_sdot, gemv4_dual_iq2_xs, gemv4_dual_iq2_xs_sdot, gemv4_dual_iq3_xxs, gemv4_dual_iq3_xxs_sdot, gemv4_dual_iq3_s, gemv4_dual_iq3_s_sdot, gemvx_dual_q2_k, gemvx_dual_q2_k_sdot, gemvx_dual_q3_k, gemvx_dual_q3_k_sdot, gemvx_dual_q4_k, gemvx_dual_q4_k_sdot, gemvx_dual_q8_0, gemvx_dual_q8_0_sdot, gemvx_dual_q4_0, gemvx_dual_q4_0_sdot, gemvx_dual_iq4_nl, gemvx_dual_iq4_nl_sdot, gemvx_dual_iq4_xs, gemvx_dual_iq4_xs_sdot, gemvx_dual_q5_k, gemvx_dual_q5_k_sdot, gemvx_dual_q6_k, gemvx_dual_q6_k_sdot, gemvx_dual_q1_0, gemvx_dual_q1_0_sdot, gemvx_dual_q2_0_g64, gemvx_dual_q2_0_g64_sdot, gemvx_dual_q2_0_g128, gemvx_dual_q2_0_g128_sdot, gemvx_dual_iq2_xxs, gemvx_dual_iq2_xxs_sdot, gemvx_dual_iq2_xs, gemvx_dual_iq2_xs_sdot, gemvx_dual_iq3_xxs, gemvx_dual_iq3_xxs_sdot, gemvx_dual_iq3_s, gemvx_dual_iq3_s_sdot, attn_rows_g2_f32, attn_rows_g2_f16, attn_rows_g2_q8, attn_rows_g4_f32, attn_rows_g4_f16, attn_rows_g4_q8, attn_rows_g8_f32, attn_rows_g8_f16, attn_rows_g8_q8, qk_norm_rope, add_f16, add_bf16, geglu_f16, geglu_bf16, bias_compact_f16, bias_compact_bf16, add_bias_rows_f16, add_bias_rows_bf16, gn_apply_f16, gn_apply_bf16, im2col_sd_f16, im2col_sd_bf16, qknorm_rope_f16, qknorm_rope_bf16, layernorm_f16, layernorm_bf16, gn_stats_f16, gn_stats_bf16, pad_h16_f16, pad_h16_bf16, pad_bf16_f16, pad_bf16_bf16, bias_add_f16, bias_add_bf16, scale_i32_f16, scale_i32_bf16, copy_f16, copy_bf16, copy_f32_f16, copy_f32_bf16, copy_f16_f32, copy_bf16_f32, concat_ch_f16, concat_ch_bf16, compact_acc_f16, compact_acc_bf16, silu_mul_f16, silu_mul_bf16, sigmoid_mul_f16, sigmoid_mul_bf16, gated_add_f16, gated_add_bf16, rope_inter_f16, rope_inter_bf16, act_steer_f16, act_steer_bf16, rmsnorm_f16, rmsnorm_bf16, rms_mod_f16, rms_mod_bf16, rms_mod_h16_f16, rms_mod_h16_bf16, modulate_f16, modulate_bf16, gelu_erf_f16, gelu_erf_bf16, ln_mod_f16, ln_mod_bf16, gelu_f16, gelu_bf16, flag_nonfinite, flag_nonfinite_f16, flag_nonfinite_bf16, add_scaled_f16, add_scaled_bf16, gated_add_scaled, gated_add_scaled_f16, gated_add_scaled_bf16, wo_unpack_f32, transpose_pad_f32, vae_norm_f16, vae_norm_bf16, im2col_h16, im2col_h16_f16, im2col_h16_bf16, im2col_bf16, im2col_bf16_f16, im2col_bf16_bf16, silu_f16, silu_bf16, modulate_pr_f16, modulate_pr_bf16, gated_add_pr_f16, gated_add_pr_bf16, dw_conv3_f16, dw_conv3_bf16, col_mean_f16, col_mean_bf16, mul_cols_sigmoid_f16, mul_cols_sigmoid_bf16, nerf_feat_f16, nerf_feat_bf16, layernorm_f32_f16, layernorm_f32_bf16, kron_mix, kron_mix_f16, kron_mix_bf16, kron_stack, kron_stack_f16, kron_stack_bf16, dora_rows, dora_rows_f16, dora_rows_bf16, dora_cols, dora_cols_f16, dora_cols_bf16, situ, situ_f16, situ_bf16, dup_up_add, dup_up_add_f16, dup_up_add_bf16, w6a8_decode, w6a8_decode_t, attn_bounded, mul_cols, mul_cols_f16, mul_cols_bf16, svdq_decode, svdq_decode_t, svdq_unpack, svdq_unpack_f16, svdq_unpack_bf16 };
 const elt_entry_sizes = [_]EntrySize{
     dualEntry("act_steer"),
     dualEntry("rmsnorm"),
@@ -802,6 +802,14 @@ const elt_entry_sizes = [_]EntrySize{
     dualEntry("w6a8_decode"),
     dualEntry("w6a8_decode_t"),
     dualEntry("attn_bounded"),
+    dualEntry("mul_cols"),
+    dualEntry("mul_cols_f16"),
+    dualEntry("mul_cols_bf16"),
+    dualEntry("svdq_decode"),
+    dualEntry("svdq_decode_t"),
+    dualEntry("svdq_unpack"),
+    dualEntry("svdq_unpack_f16"),
+    dualEntry("svdq_unpack_bf16"),
 };
 
 // A pipeline is found by `Elt` ordinal, so a slot out of order launches another kernel.
@@ -4744,6 +4752,57 @@ pub const Context = struct {
         return self.w4a8_t.buf;
     }
 
+    /// A Nunchaku SVDQuant weight (`ops/svdq.zig`) decoded to the k-major int8 the int8
+    /// GEMM reads, into `w4a8_t`. The codes and scales are read as the checkpoint packs
+    /// them, so they upload verbatim.
+    pub fn svdqDecode(self: *Context, codes: []const u8, scales: []const u8, inv_row_scale: []const f32, rows: usize, cols: usize) Error!vk.Buffer {
+        std.debug.assert(rows % 128 == 0 and cols % 128 == 0 and std.mem.alignForward(usize, rows, tile_n) == rows);
+        try self.ensureDeviceBuffer(&self.w4a8_t, w4a8ScratchBytes(rows, cols));
+        const iv: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_row_scale)), .mem = .null_handle, .size = 0 };
+        const quads = rows / 4;
+        const total = quads * (cols / 8);
+        try self.opElt(.svdq_decode_t, try self.weightRaw(codes), self.w4a8_t, try self.weightRaw(scales), iv, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(quads),
+        }, total, 1, 1);
+        return self.w4a8_t.buf;
+    }
+
+    /// `y = x @ Wᵀ + bias` for an SVDQuant weight expanded exactly to 16 bits, in the coop
+    /// GEMM's k-major operand, against the unquantized activation. `y_off` in elements.
+    pub fn opMatmulCoopSvdq(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32, comptime bf16: bool) Error!void {
+        std.debug.assert((if (bf16) self.pipe_coop_bf16w else self.pipe_coop_f16w) != .null_handle);
+        try self.ensureStaging(&self.deq_f16k, self.kmajor16Bytes(rows, cols));
+        try self.ensureStaging(&self.deq_rows, rows * cols * 2);
+        const is: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_smooth)), .mem = .null_handle, .size = 0 };
+        const n = rows * cols / 8;
+        try self.opElt(if (bf16) .svdq_unpack_bf16 else .svdq_unpack_f16, try self.weightRaw(codes), self.deq_rows, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols) }, n, 1, 1);
+        const pairs = self.coopNPad(rows) / 2;
+        const chunks = std.mem.alignForward(usize, cols, 64) / 16;
+        try self.opElt(.transpose_kmajor16, self.deq_rows, null, null, self.deq_f16k, .{
+            .u0 = @intCast(pairs * chunks),
+            .u1 = @intCast(rows),
+            .u2 = @intCast(cols),
+            .u3 = @intCast(pairs),
+        }, pairs * chunks, 1, 1);
+        return self.coopF16WDispatch(y, y_off, x, m, self.deq_f16k.buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, bf16, 1.0);
+    }
+
+    /// `opMatmulCoopSvdq` in true f32: the exact f32 rows transposed into the f32 GEMM's
+    /// layout, as `opMatmulIntWoF32` does. `y_off` in elements.
+    pub fn opMatmulSvdqF32(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        try self.reserveWo32(rows, cols);
+        const is: DeviceBuffer = .{ .buf = try self.smallBuffer(std.mem.sliceAsBytes(inv_smooth)), .mem = .null_handle, .size = 0 };
+        const n = rows * cols / 8;
+        try self.opElt(.svdq_unpack, try self.weightRaw(codes), self.wo32_r, try self.weightRaw(scales), is, .{ .u0 = @intCast(n), .u1 = @intCast(cols) }, n, 1, 1);
+        const nt = cols * stride;
+        try self.opElt(.transpose_pad_f32, self.wo32_r, self.wo32_t, null, null, .{ .u0 = @intCast(nt), .u1 = @intCast(cols), .u2 = @intCast(stride), .u3 = @intCast(rows) }, nt, 1, 1);
+        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
+        return self.opMatmulW(y, y_off * 4, x, 0, m, self.wo32_t.buf, false, rows, cols, 1.0, bias_buf);
+    }
+
     /// Whether a nibble-packed int4-convrot weight can be decoded on the device instead of
     /// being widened to int8 at load. Needs the int8 coop GEMM the decode feeds.
     pub fn hasI4Decode(self: *const Context) bool {
@@ -6405,11 +6464,6 @@ pub const Context = struct {
         w4a8: struct { packed_bytes: []const u8, s_rel: []const u8, levels: []const u8, group_size: usize },
     };
 
-    /// An int8, int4 or W4A8 weight expanded per call to 16-bit k-major for the coop GEMM,
-    /// against the unquantized activation. The rotation comes off the WEIGHT, in f32:
-    /// rotating the activation instead would round it to 16 bits after the rotation has
-    /// smeared an outlier channel over its group. The int8 reaches the pack in the
-    /// k-major layout the int8 GEMM reads: cached at load, or the 4-bit decode's.
     /// An integer convrot linear weight-only in true f32 (W8A32; int4 and W4A8 through
     /// their int8 decode): the weight times its row scale as f32 rows, the rotation undone,
     /// transposed into the f32 GEMM's layout, then that GEMM on the f32 activation.
@@ -6444,6 +6498,11 @@ pub const Context = struct {
         try self.ensureDeviceBuffer(&self.wo32_p, @max(4, rows * (cols / 256) * 4));
     }
 
+    /// An int8, int4 or W4A8 weight expanded per call to 16-bit k-major for the coop GEMM,
+    /// against the unquantized activation. The rotation comes off the WEIGHT, in f32:
+    /// rotating the activation instead would round it to 16 bits after the rotation has
+    /// smeared an outlier channel over its group. The int8 reaches the pack in the
+    /// k-major layout the int8 GEMM reads: cached at load, or the 4-bit decode's.
     pub fn opMatmulCoopIntWo(self: *Context, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w: IntWeight, row_scale: []const f32, rows: usize, cols: usize, rotate: bool, bias: []const f32, comptime bf16: bool) Error!void {
         const pipe = self.pipe_wo_pack[@as(usize, @intFromBool(rotate)) * 2 + @intFromBool(bf16)];
         std.debug.assert(pipe != .null_handle and (if (bf16) self.pipe_coop_bf16w else self.pipe_coop_f16w) != .null_handle);

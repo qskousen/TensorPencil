@@ -433,7 +433,9 @@ and `qwen_image21_text.zig`'s headers.
   ComfyUI scheduler also moves with resolution.
 - Turbo is the `turbo` scheduler's 8 fixed sigmas. Base and turbo checkpoints cannot be
   told apart by weights.
-- Released formats: bf16, int8, W4A8, NVFP4, W6A8.
+- Released formats: bf16, int8, W4A8, NVFP4, W6A8, and Nunchaku's SVDQuant int4 under
+  diffusers names (`Config.nunchaku_names`: `to_qkv` fused, `net.0.proj` rows `[up | gate]`,
+  the reverse of `gate_up`). Its fp4 sibling is refused by name.
 
 Gates: `qwen-image21-cuda-test` / `qwen-image21-vk-test` (`--layers`, `--lat`, `--cap`,
 `--sigma`, a checkpoint path; two sigmas on one session, so the second reads the cached
@@ -457,6 +459,7 @@ tensor name at session build.
 | **w4a8** | ✅ | ✅ | ✅ | ✅ |
 | **int8 / int4 / w4a8, weight-only** | ❌ | ✅ (`opMatmulCoopIntWo`) | ✅ →bf16 / →f16 / →f32 | ✅ →bf16 / →f16 / →f32 |
 | **nvfp4** | ✅ | ✅ | ✅ | ✅ |
+| **svdq4** (Nunchaku int4) | ✅ | ✅ W8A8 + weight-only | ✅ W8A8 + weight-only | ✅ ditto |
 | **bf16 dense** | ✅ | ✅ native/f16 | ✅ native/f16 | ✅ cuBLASLt `R_16BF` |
 | **f32** | ✅ | ✅ (offload) | ❌ | ❌ |
 | **GGUF q2_k** | ✅ | ✅ →f16 / →bf16³ | ✅ →int8-convrot or →int4-convrot | ✅ ditto |
@@ -674,7 +677,7 @@ Gates: `zig build test` (SenseNova's layout offsets pinned against
 | 3x3 patch into 16-bit operand | | `im2col_h16`/`im2col_bf16` (`opConvCoop`) | `opConvGemm16` | ↤ | f16/bf16 |
 | nearest-2× upsample | explicit | fused into im2col | fused into im2col | ↤ | — |
 | convrot (Hadamard un-rotate) | `ops/convrot.zig` | `rotate`/`rotate_fwht` | `buildPrep` | ↤ | int8/int4, group 256 |
-| 4-bit decode | `ops/{w4a8,nvfp4}.zig` | `w4a8_decode_t`/`nvfp4_decode_t`/`i4_decode_t` | `w4a8_decode`/`nvfp4_decode` PTX | ↤ | per GEMM into scratch |
+| 4-bit decode | `ops/{w4a8,nvfp4,svdq}.zig` | `w4a8_decode_t`/`nvfp4_decode_t`/`i4_decode_t`/`svdq_decode_t`/`svdq_unpack*` | `w4a8_decode`/`nvfp4_decode` PTX, `svdq_decode`/`svdq_unpack*` dual | ↤ | per GEMM into scratch |
 
 `↤` = `cuda` reuses zig-cuda's hand-PTX kernel (only batched GEMM and prefill attention
 differ).
@@ -1037,7 +1040,7 @@ whole layers to the CPU instead. Per-step weight streaming is diffusion-only.
 ---
 ## 7. Data-format support matrix
 
-DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, w4a8, nvfp4, q4_0, q8_0, q2_k, q3_k, q4_k, q5_k,
+DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, w4a8, nvfp4, svdq4, q4_0, q8_0, q2_k, q3_k, q4_k, q5_k,
 q6_k, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq3_xxs, iq3_s, q1_0, q2_0_g64, q2_0_g128, w6a8`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
 path; GGUF `q*` are the **LLM** path.
 
@@ -1052,6 +1055,7 @@ path; GGUF `q*` are the **LLM** path.
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; decodes to int8 per GEMM, then the int8 convrot GEMM (`ops/w4a8.zig`) |
 | **w6a8** (`w6a8_int8`) | ✅ | ✅ `w6a8_decode_t` | ✅ `w6a8_decode` | ✅ ditto | 6-bit uniform `(q − 32)·s_rel`, nibble plane then top-2-bit plane, `I8 [rows, 3·cols/4]`; same routes as w4a8 |
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | E2M1 + fp8 per-16 scale + per-tensor scale; decodes to bf16 per GEMM, then the bf16 GEMM. Weight-only (`ops/nvfp4.zig`) |
+| **svdq4** (Nunchaku SVDQuant int4) | ✅ | ✅ | ✅ | ✅ | int4 codes in Nunchaku's MMA tile order + bf16 per-64 scale + per-input smoothing + rank-32 low-rank branch (`ops/svdq.zig`). W8A8: the activation times `1/smooth`, the unrotated int8 prep, the weight decoded per GEMM to int8 on a per-row grid. Weight-only (bf16/f16/f32): the exact weight expanded per GEMM. The low-rank branch runs on the raw activation through the LoRA sidecar's GEMMs, in true f32 on the f32 route |
 | **GGUF q4_0** | ✅ ggml | ✅ `gemv_dual_q4_0` | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_dual_q8_0` | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ `gemv_dual_*` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | MMQ prefill routed for q4_k/q5_k only (`mmqPipeFaster`) |
@@ -1074,6 +1078,10 @@ path; GGUF `q*` are the **LLM** path.
   NVFP4, `_s_rel` for W4A8) BEFORE the int4 heuristic. W6A8 goes through the W4A8 reader, bit
   depth from the stored row width, cross-checked against `comfy_quant`'s `format`.
 - **w4a8 shares int8's activation prep and GEMM**, so a block mixing int8 and W4A8 works.
+- **svdq4 has its own prep** (`Prep.svdq`): one smoothing vector per group, which a fused
+  tensor's row views share; a group mixing it with another prep is refused. An SVDQuant
+  layer has no `.weight` tensor, so its reader runs first (`<base>.qweight`). Row views must
+  sit on its 128-row tiles.
 - ⚠️ **CUDA's W4A8 decode needs `group_size % 8 == 0`** (`dit.w4a8SmallGroup` refuses smaller by
   name). Vulkan's takes any group but requires its input pre-transposed through `weightBuffer`.
 - ⚠️ **The device weight caches key on HOST POINTER.** A reused weight-shaped buffer scores a stale
@@ -1094,6 +1102,8 @@ path; GGUF `q*` are the **LLM** path.
 One source, SPIR-V and PTX; the full list is `dual_table.entries`. By area:
 
 - activations: `add{,_relu,_scaled,_h16}` · `relu` · `silu{,_mul,_mul16,_mul_h16}` · `sigmoid_mul{,_h16,_g16}` · `gelu{,_mul,_quick,_quick_mul,_erf}` · `geglu{,_h16}` · `softplus_gate`
+- svdq: `mul_cols{,_f16,_bf16}` (the smoothing) · `svdq_decode` (row-major int8, CUDA) ·
+  `svdq_decode_t` (k-major int8, Vulkan) · `svdq_unpack{,_f16,_bf16}` (exact weight-only)
 - moves: `copy` · `scale_f32` · `concat_ch` · `scale_concat` · `scale_i32` · `quantize_i8` · `kv_store_f16` · `transpose_kmajor16` · `gather_kmajor{,_h16,16}` · `gather_head{,_b}` · `gather_vt{,_b}` · `scatter_head{,_b}` · `head_pad{,_h16}` · `head_unpad` · `deinterleave{2,3}` · `gather_rows` · `scatter_add_rows` · `moe_combine` · `moe_route`
 - converts: `f32_to_h16{,_pad}` · `f32_to_bf16_pad` · `h16_to_h16_pad` · `bf16_to_h16_pad` · `f16_to_f32`
 - modulation: `modulate` · `gated_add{,16}` · `rms_apply_mod{,_h16}` · `rms_apply_w` · `rms_partial` · `rms_combine`

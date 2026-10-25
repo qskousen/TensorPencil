@@ -377,6 +377,18 @@
   4. The prefix's text runs on Vulkan go through the per-thread `attn_causal_batched`.
      Fine at a prompt's length and run once per conditioning; long prompts or image
      prefixes want the tensor-core path with a causal row bound.
+  5. Nunchaku SVDQuant (`ops/svdq.zig`), what is left:
+     - the fp4 file (`svdq-fp4_r32-...`: E2M1 codes, fp8 per-16 scales, a per-channel
+       `wcscales`, `wtscale`) is refused by name.
+     - the format's own W4A4 group-64 arithmetic: on CUDA a group-scaled s4 IMMA GEMM
+       would run what Nunchaku runs; today W8A8 against a per-row int8 regrid.
+     - speed: measured once each on a shared card at 1024², W8A8 ran 1.51 s/step against
+       int8's 1.48 on zig-cuda and 1.71 against 1.50 on Vulkan. Candidates, unmeasured:
+       the smoothing as its own pass (fuse into the int8 prep), the f32 widening of a
+       16-bit `x` and f32 `y` plane (no typed path yet), the low-rank GEMMs per view
+       where one fused `to_qkv` pair would serve three.
+     - a user LoRA on a Nunchaku file: names its targets `to_q` / `img_mlp.proj`, which
+       these files ship fused under other names; untested.
 - EmbeddingGemma 2 (`DIFFKEEP_GEMMA2.md`), what is left:
   - the audio tower (a Gemma 4 conformer, 300M, `gemma4_audio` in transformers) and video
     (frames through the image tower at 140 tokens each, one `<|image>` block per frame).

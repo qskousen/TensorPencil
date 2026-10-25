@@ -26,7 +26,7 @@ pub const Weight = ops.matmul.Weight;
 
 /// Storage class of one weight. `blockq` is every ggml block quant; a device arm picks
 /// its route per format from there.
-pub const Kind = enum { f32, f16, bf16, fp8, i8, i4, w4a8, nvfp4, blockq, other };
+pub const Kind = enum { f32, f16, bf16, fp8, i8, i4, w4a8, nvfp4, svdq, blockq, other };
 
 pub fn kindOf(dt: DType) Kind {
     return switch (dt) {
@@ -39,6 +39,7 @@ pub fn kindOf(dt: DType) Kind {
         // W6A8 decodes through the same int8 funnel on every arm (`ops/w4a8.zig`).
         .w4a8, .w6a8 => .w4a8,
         .nvfp4 => .nvfp4,
+        .svdq4 => .svdq,
         else => if (dt.isBlockQuant()) .blockq else .other,
     };
 }
@@ -54,6 +55,7 @@ pub const Caps = struct {
     i4: bool = false,
     w4a8: bool = false,
     nvfp4: bool = false,
+    svdq: bool = false,
     blockq: bool = false,
 
     pub fn has(c: Caps, k: Kind) bool {
@@ -66,6 +68,7 @@ pub const Caps = struct {
             .i4 => c.i4,
             .w4a8 => c.w4a8,
             .nvfp4 => c.nvfp4,
+            .svdq => c.svdq,
             .blockq => c.blockq,
             .other => false,
         };
@@ -95,37 +98,34 @@ pub fn prepOf(k: Kind) Prep {
     };
 }
 
-/// Whether the linears sharing the int8 activation prep carry the convrot rotation, or
-/// null when they disagree. False when there are none.
-///
-/// ComfyUI's `int8_tensorwise` ships rotated (a scale per output row) and unrotated
-/// (one scale per tensor). The rotation cancels across the GEMM only when both sides
-/// apply it, and one prep serves every GEMM in a group, so a checkpoint that mixes the
-/// two has no prep that is right for all of them. W4A8 is counted: it decodes to a
-/// rotated int8 weight and takes int8's prep.
-/// Whether any of `lins` is an integer convrot weight (int8, int4, W4A8), the storage an
-/// `IntGemm` policy governs.
+/// Whether any of `lins` is an integer weight (int8, int4, W4A8, SVDQuant), the storage
+/// an `IntGemm` policy governs.
 pub fn anyInteger(lins: []const Weight) bool {
     return integerKind(lins) != null;
 }
 
-/// The most common integer convrot kind among `lins`, or null for none.
+/// The most common integer kind among `lins`, or null for none.
 pub fn integerKind(lins: []const Weight) ?Kind {
-    var n = [3]usize{ 0, 0, 0 };
+    var n = [4]usize{ 0, 0, 0, 0 };
     for (lins) |w| switch (kindOf(w.dtype)) {
         .i8 => n[0] += 1,
         .i4 => n[1] += 1,
         .w4a8 => n[2] += 1,
+        .svdq => n[3] += 1,
         else => {},
     };
     const best = std.mem.findMax(usize, &n);
     if (n[best] == 0) return null;
-    return ([3]Kind{ .i8, .i4, .w4a8 })[best];
+    return ([4]Kind{ .i8, .i4, .w4a8, .svdq })[best];
 }
 
 /// Whether the int8 prep rotates: the checkpoint's choice, read off every weight that
 /// takes a prep, W4A8 included (its weights are rotated, and an unrotated activation
-/// against them renders noise). Null when the list mixes the two.
+/// against them renders noise). Null when the list mixes the two; false for none.
+///
+/// ComfyUI's `int8_tensorwise` ships rotated (a scale per output row) and unrotated (one
+/// scale per tensor). The rotation cancels across the GEMM only when both sides apply
+/// it, and one prep serves every GEMM in a group, so a mix has no right prep.
 pub fn convrot(lins: []const Weight) ?bool {
     var seen: ?bool = null;
     for (lins) |w| {
@@ -214,6 +214,13 @@ pub fn rowSlice(alloc: std.mem.Allocator, w: Weight, row0: usize, nrows: usize) 
         const nm = try alloc.create(ops.w4a8.Meta);
         nm.* = m.rowSlice(w.cols, row0, nrows);
         s.w4a8 = nm;
+    }
+    if (w.svdq) |m| {
+        // Each 128-row tile is contiguous; a view inside one is not.
+        if (row0 % ops.svdq.tile_rows != 0 or nrows % ops.svdq.tile_rows != 0) return error.ShapeMismatch;
+        const nm = try alloc.create(ops.svdq.Meta);
+        nm.* = m.rows(w.cols, row0, nrows);
+        s.svdq = nm;
     }
     return s;
 }

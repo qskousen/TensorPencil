@@ -69,6 +69,13 @@ pub const Route = enum {
     i4_wo32,
     w4a8_wo32,
     nvfp4,
+    /// Nunchaku SVDQuant decoded to int8 per call against its own prep: the activation
+    /// smoothed, then the int8 prep unrotated (`ops/svdq.zig`). The `_wo` twins expand
+    /// it exactly against the unquantized activation, at bf16, f16 or f32.
+    svdq,
+    svdq_wo,
+    svdq_wo16,
+    svdq_wo32,
     /// Block quants as a batch: re-quantized to int8 or int4 convrot per call (both
     /// quantize the activation too), expanded to bf16 or f16 per call, or MMQ on the
     /// packed weight against a q8_1 activation.
@@ -95,6 +102,7 @@ pub const Route = enum {
             .i8, .w4a8, .i4_i8, .blockq_i8 => .i8,
             .i4, .blockq_i4 => .i4,
             .blockq_mmq => .mmq,
+            .svdq => .svdq,
             .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8, .gemv_dualn_q8 => .q8,
             else => .none,
         };
@@ -102,8 +110,8 @@ pub const Route = enum {
 };
 
 /// What a route reads besides the weight: only `x`, the int8 or int4 convrot
-/// activation, the MMQ tile's q8_1 one, or the GEMVs' q8 one.
-pub const Prep = enum { none, i8, i4, mmq, q8 };
+/// activation, the MMQ tile's q8_1 one, the GEMVs' q8 one, or SVDQuant's smoothed int8.
+pub const Prep = enum { none, i8, i4, mmq, q8, svdq };
 
 /// Which GEMM a GGUF block-quant weight takes as a batch. A caller's choice: a DiT and a
 /// text encoder want different trades from the same file.
@@ -372,6 +380,7 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
         else if (caps.i4Decode() and caps.i8Gemm()) .i4_i8 else null,
         .w4a8 => return if (caps.w4a8()) intRoute(C, caps, pol, .w4a8, .{ .w4a8_wo, .w4a8_wo16, .w4a8_wo32 }) else null,
         .nvfp4 => return if (caps.nvfp4()) .nvfp4 else null,
+        .svdq => return if (!caps.svdq()) null else intRoute(C, caps, pol, .svdq, .{ .svdq_wo, .svdq_wo16, .svdq_wo32 }),
         .other => return null,
         else => {},
     }

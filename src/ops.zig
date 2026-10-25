@@ -9,6 +9,7 @@ pub const attention = @import("ops/attention.zig");
 pub const convrot = @import("ops/convrot.zig");
 pub const w4a8 = @import("ops/w4a8.zig");
 pub const nvfp4 = @import("ops/nvfp4.zig");
+pub const svdq = @import("ops/svdq.zig");
 pub const conv = @import("ops/conv.zig");
 pub const cancel = @import("ops/cancel.zig");
 pub const pause = @import("ops/pause.zig");
@@ -23,6 +24,7 @@ test {
     _ = convrot;
     _ = w4a8;
     _ = nvfp4;
+    _ = svdq;
     _ = conv;
     _ = cancel;
     _ = pause;

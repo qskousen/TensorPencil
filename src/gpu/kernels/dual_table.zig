@@ -508,6 +508,14 @@ pub const entries = [_]Entry{
     .{ .name = "w6a8_decode", .wg = elem_wg },
     .{ .name = "w6a8_decode_t", .wg = elem_wg },
     .{ .name = "attn_bounded", .wg = row_wg, .kind = .rows },
+    .{ .name = "mul_cols", .wg = elem_wg },
+    .{ .name = "mul_cols_f16", .wg = elem_wg },
+    .{ .name = "mul_cols_bf16", .wg = elem_wg },
+    .{ .name = "svdq_decode", .wg = elem_wg },
+    .{ .name = "svdq_decode_t", .wg = elem_wg },
+    .{ .name = "svdq_unpack", .wg = elem_wg },
+    .{ .name = "svdq_unpack_f16", .wg = elem_wg },
+    .{ .name = "svdq_unpack_bf16", .wg = elem_wg },
 };
 
 pub fn get(comptime name: []const u8) Entry {

@@ -1950,3 +1950,107 @@ pub inline fn gatedAddPerRow(e: Env, comptime dt: Dt) void {
     const j = i % d;
     e.st(.a, i, e.ld(.a, i) + e.ldT(.c, dt, r * 3 * d + 2 * d + j) * e.ldT(.b, dt, i));
 }
+
+/// A column-scaled copy into f32: `a[p][j] = c[j] * b[p][j]`, `b` `dt`. The smoothing an
+/// SVDQuant linear applies to its activation. u0 = rows * u1, u1 = width.
+pub inline fn mulCols(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    e.st(.a, i, e.ld(.c, i % e.u(1)) * e.ldT(.b, dt, i));
+}
+
+/// Round half to even, as `ops.svdq.decodeI8` does; `@round` is half away from zero.
+inline fn rintEven(x: f32) f32 {
+    const r = @round(x);
+    if (@abs(r - x) == 0.5) {
+        const ri: i32 = @intFromFloat(r);
+        if (ri & 1 != 0) return if (x > 0) r - 1 else r + 1;
+    }
+    return r;
+}
+
+// `ops.svdq.wordIndex` and `scaleIndex`; a kernel cannot import tp_ops.
+inline fn svdqWordIndex(cols: u32, n: u32, kc: u32) u32 {
+    const nn = n % 128;
+    const kk = kc % 64;
+    const tile = (n / 128) * (cols / 64) + kc / 64;
+    return ((((tile * 8 + nn / 16) * 8 + nn % 8) * 4 + (kk % 32) / 8) * 2 + (nn % 16) / 8) * 2 + kk / 32;
+}
+
+inline fn svdqScaleIndex(groups: u32, n: u32, g: u32) u32 {
+    const nn = n % 128;
+    return (((((n / 128) * groups + g) * 8 + nn / 16) * 4 + (nn % 8) / 2) * 2 + (nn % 16) / 8) * 2 + nn % 2;
+}
+
+/// Row `n`'s scale for column `kc`, from the packed bf16 scales in slot c.
+inline fn svdqScale(e: Env, n: u32, kc: u32, cols: u32) f32 {
+    const si = svdqScaleIndex(cols / 64, n, kc / 64);
+    return @bitCast(((e.ldW(.c, si / 2) >> @intCast(16 * (si % 2))) & 0xFFFF) << 16);
+}
+
+inline fn svdqCode(w: u32, comptime i: u32) i32 {
+    const c: i32 = @intCast((w >> (4 * i)) & 0xF);
+    return if (c >= 8) c - 16 else c;
+}
+
+/// Row `n`'s codes `[kc, kc + 8)` as int8, `ops.svdq.decodeI8` each, packed four a word.
+/// a = codes, c = packed bf16 scales, d = f32 `1 / row_scale`.
+inline fn svdqWord(e: Env, n: u32, kc: u32, cols: u32) [2]u32 {
+    const w = e.ldW(.a, svdqWordIndex(cols, n, kc));
+    const s = svdqScale(e, n, kc, cols);
+    const inv = e.ld(.d, n);
+    var out: [2]u32 = .{ 0, 0 };
+    inline for (0..8) |i| {
+        const p = @as(f32, @floatFromInt(svdqCode(w, i))) * s * inv;
+        const q: i32 = @intFromFloat(@min(@max(rintEven(p), -127.0), 127.0));
+        out[i / 4] |= (@as(u32, @bitCast(q)) & 0xFF) << (8 * (i % 4));
+    }
+    return out;
+}
+
+/// An SVDQuant weight to row-major `dt` `[rows][cols]`, exact: `code * scale * inv_smooth`,
+/// in `ops.svdq.decodeSliceF32`'s order. a = codes, b = out, c = scales, d = f32
+/// `1 / smooth_factor`. u0 = rows * cols / 8, u1 = cols.
+pub inline fn svdqUnpack(e: Env, comptime dt: Dt) void {
+    const t = k.elem(e) orelse return;
+    const cols = e.u(1);
+    const n = t / (cols / 8);
+    const kc = (t % (cols / 8)) * 8;
+    const w = e.ldW(.a, svdqWordIndex(cols, n, kc));
+    const s = svdqScale(e, n, kc, cols);
+    inline for (0..8) |i| {
+        const c: u32 = i;
+        e.stT(.b, dt, n * cols + kc + c, @as(f32, @floatFromInt(svdqCode(w, c))) * s * e.ld(.d, kc + c));
+    }
+}
+
+/// An SVDQuant weight to row-major int8 `[rows][cols]` (the CUDA layout), eight columns
+/// a thread. a = codes, b = int8 out, c = scales, d = `1 / row_scale`.
+/// u0 = rows * cols / 8, u1 = cols.
+pub inline fn svdqDecode(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const cols = e.u(1);
+    const n = t / (cols / 8);
+    const kc = (t % (cols / 8)) * 8;
+    const out = svdqWord(e, n, kc, cols);
+    const o = (n * cols + kc) / 4;
+    e.stW(.b, o, out[0]);
+    e.stW(.b, o + 1, out[1]);
+}
+
+/// `svdqDecode` into the k-major `[cols][rows]` int8 Vulkan's GEMM reads: a thread owns
+/// four rows by eight columns and writes eight words, rows fastest.
+/// u0 = (rows / 4) * (cols / 8), u1 = cols, u2 = rows / 4.
+pub inline fn svdqDecodeT(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const cols = e.u(1);
+    const quads = e.u(2);
+    const rq = t % quads;
+    const kc = (t / quads) * 8;
+    var rows: [4][2]u32 = undefined;
+    inline for (0..4) |r| rows[r] = svdqWord(e, rq * 4 + @as(u32, r), kc, cols);
+    inline for (0..8) |kk| {
+        var w: u32 = 0;
+        inline for (0..4) |r| w |= ((rows[r][kk / 4] >> (8 * (kk % 4))) & 0xFF) << (8 * r);
+        e.stW(.b, (kc + @as(u32, kk)) * quads + rq, w);
+    }
+}

@@ -38,6 +38,11 @@ pub const DType = enum {
     /// off `ops.matmul.Weight.nvfp4`; see `ops/nvfp4.zig`. Sub-byte, so use
     /// `storageBytes` for lengths.
     nvfp4,
+    /// Nunchaku's SVDQuant W4A4: signed int4 codes in Nunchaku's MMA tile order (not
+    /// row-major), a bf16 scale per 64 inputs, a per-input smoothing divisor and a
+    /// rank-r low-rank branch. Sidecars hang off `ops.matmul.Weight.svdq`; see
+    /// `ops/svdq.zig`. Sub-byte, so use `storageBytes` for lengths.
+    svdq4,
     u16,
     i16,
     u32,
@@ -172,7 +177,7 @@ pub const DType = enum {
             .f16, .bf16, .u16, .i16 => .{ .byte_size = 2, .bit_size = 16, .block_elems = 1, .block_bytes = null },
             .f32, .u32, .i32 => .{ .byte_size = 4, .bit_size = 32, .block_elems = 1, .block_bytes = null },
             .f64, .u64, .i64 => .{ .byte_size = 8, .bit_size = 64, .block_elems = 1, .block_bytes = null },
-            .i4, .w4a8, .nvfp4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
+            .i4, .w4a8, .nvfp4, .svdq4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
             .w6a8 => .{ .byte_size = null, .bit_size = 6, .block_elems = 1, .block_bytes = null },
             .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },

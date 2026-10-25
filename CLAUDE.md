@@ -266,6 +266,7 @@ Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the
 | int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan decodes to int8 |
 | `asym_w4a8_int8` / `w6a8_int8` | 4- or 6-bit codes + fp8 group scales | decodes to int8 convrot per GEMM |
 | NVFP4 | E2M1 + fp8 block scales | decodes to bf16 |
+| Nunchaku SVDQuant int4 | int4 in Nunchaku's tile order + bf16 group scales, smoothing, rank-32 low-rank | decodes per GEMM to int8 (W8A8) or a dense weight-only GEMM; the low-rank branch rides the LoRA sidecar |
 | GGUF block quants | ggml blocks | decodes per GEMM to int8 or a 16-bit dense (`--dit-gguf-gemm`) |
 
 ## Compatibility and metadata

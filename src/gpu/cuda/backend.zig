@@ -475,6 +475,8 @@ pub const Backend = struct {
     /// that reads or writes only f32.
     lin_x32: DeviceBuffer = .{},
     lin_y32: DeviceBuffer = .{},
+    /// `lin_cuda`'s smoothed f32 activation, an SVDQuant group's prep input.
+    lin_xs: DeviceBuffer = .{},
     /// `allFinite`'s flag word.
     finite_flag: DeviceBuffer = .{},
 
@@ -884,6 +886,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.lora_out);
         self.tensorDestroy(&self.lora_in);
         self.tensorDestroy(&self.lin_x32);
+        self.tensorDestroy(&self.lin_xs);
         self.tensorDestroy(&self.lin_y32);
         self.tensorDestroy(&self.finite_flag);
         self.tensorDestroy(&self.cudnn_q16);
@@ -3497,7 +3500,8 @@ pub const Backend = struct {
 
     /// `y[m][rows] = x[m][cols] @ w32ᵀ + bias` in true f32: cuBLASLt's FFMA GEMM where it
     /// runs, the f32 kernel otherwise.
-    fn gemmF32Dev(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w32: DeviceBuffer, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+    /// `y[m][rows] = x @ w32ᵀ` in true f32 over a device weight, on either arm.
+    pub fn gemmF32Dev(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w32: DeviceBuffer, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
         self.opMatmulF32LtDev(y, x, m, w32, rows, cols, bias) catch |err| switch (err) {
             error.UnsupportedKernelArm => return self.opMatmulDev(y, 0, x, 0, m, w32, rows, cols, 1.0, bias),
             else => return err,
@@ -5303,6 +5307,62 @@ pub const Backend = struct {
         return self.opI8GemmDev(y, w_db, weight_scale, rows, bias);
     }
 
+    /// An SVDQuant weight expanded exactly to row-major `dt` in the weight-only scratch
+    /// of that width (`wo_w32` or `fp8_w16`).
+    fn svdqRow(self: *Backend, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, comptime dt: Dt) Error!DeviceBuffer {
+        self.ptic();
+        defer self.ptoc(.dequant);
+        const out = if (dt == .f32) &self.wo_w32 else &self.fp8_w16;
+        try self.ensureDeviceBuffer(out, rows * cols * dt.bytes());
+        const c_db = try self.cachedWeight(codes);
+        const s_db = try self.cachedWeight(scales);
+        const i_db = try self.cachedWeight(std.mem.sliceAsBytes(inv_smooth));
+        const n = rows * cols / 8;
+        try self.dualElemsAt("svdq_unpack", dt, c_db, out.*, s_db, i_db, .{ @intCast(n), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+        return out.*;
+    }
+
+    /// SVDQuant weight-only, the weight expanded to bf16 against the unquantized `x`.
+    pub fn opSvdqGemmWo(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+        try self.gemmBf16X(y, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .bf16), rows, cols, bias);
+    }
+
+    pub fn opSvdqGemmWoF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+        try self.opConvF16W(y, 0, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .f16), rows, cols, bias, 1.0);
+    }
+
+    pub fn opSvdqGemmWoF32(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, codes: []const u8, scales: []const u8, inv_smooth: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        try self.gemmF32Dev(y, x, m, try self.svdqRow(codes, scales, inv_smooth, rows, cols, .f32), rows, cols, bias);
+    }
+
+    /// The int8 GEMM over a Nunchaku SVDQuant weight decoded into `w4a8_i8` this call
+    /// (`ops/svdq.zig`): `codes` and the packed bf16 `scales` as the checkpoint stores
+    /// them, `inv_row_scale` what the decode divides by and `row_scale` the GEMM's.
+    pub fn opI8GemmSvdq(
+        self: *Backend,
+        y: DeviceBuffer,
+        codes: []const u8,
+        scales: []const u8,
+        inv_row_scale: []const f32,
+        row_scale: []const f32,
+        rows: usize,
+        cols: usize,
+        bias: ?[]const f32,
+    ) Error!void {
+        {
+            self.ptic();
+            defer self.ptoc(.prep);
+            std.debug.assert(codes.len == rows * cols / 2 and rows % 128 == 0 and cols % 128 == 0);
+            const c_db = try self.cachedWeight(codes);
+            const s_db = try self.cachedWeight(scales);
+            const i_db = try self.cachedWeight(std.mem.sliceAsBytes(inv_row_scale));
+            try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
+            const threads = rows * cols / 8;
+            try self.dualElems("svdq_decode", c_db, self.w4a8_i8, s_db, i_db, .{ @intCast(threads), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+        }
+        return self.opI8GemmDev(y, self.w4a8_i8, row_scale, rows, bias);
+    }
+
     /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here, the raw
     /// `[rows][cols]` the hand-PTX and cuBLASLt int8 GEMMs both read directly. (Vulkan's
     /// rule differs: its GEMM wants a row-padded k-major copy.)
@@ -6263,6 +6323,17 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const total = rows * width;
         try self.dualElemsAt("dora_rows", y.dt, y, ratio, bias orelse ratio, null, .{ @intCast(total), @intCast(width), @intFromBool(bias != null), 0, 0, 0, 0 }, .{ s, 0 }, total);
+    }
+
+    /// `dst[p][j] = scale[j] * src[p][j]` into f32, `src` at its dtype, `scale` a host
+    /// vector cached by pointer like a weight.
+    pub fn opMulCols(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, scale: []const f32, rows: usize, width: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(dst.dt == .f32 and scale.len == width);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(scale));
+        const total = rows * width;
+        try self.dualElemsAt("mul_cols", src.dt, dst, src, s_db, null, .{ @intCast(total), @intCast(width), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// `dst[p][j] = (d[j] - 1) * src[p][j]` into f32, `src` at its dtype.

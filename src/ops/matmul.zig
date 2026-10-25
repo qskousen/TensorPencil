@@ -12,6 +12,7 @@ const quants = @import("tp_core").quants;
 const convrot_mod = @import("convrot.zig");
 const w4a8_mod = @import("w4a8.zig");
 const nvfp4_mod = @import("nvfp4.zig");
+const svdq_mod = @import("svdq.zig");
 const prof = @import("tp_core").prof;
 const cancel = @import("cancel.zig");
 
@@ -160,6 +161,10 @@ pub const Weight = struct {
     /// `convrot` 0, because its scale is per 16-element block plus one per tensor. See
     /// `ops/nvfp4.zig`.
     nvfp4: ?*const nvfp4_mod.Meta = null,
+    /// Nunchaku SVDQuant sidecars, set iff `dtype == .svdq4`. `bytes` is then the codes in
+    /// Nunchaku's tile order, `row_scale` the device int8 decode's per-row scale, and the
+    /// low-rank branch is part of the weight: `matmul` adds it. See `ops/svdq.zig`.
+    svdq: ?*const svdq_mod.Meta = null,
     /// ConvRot group size (0 = none). When non-zero, `.i8`/`.i4`/`.w4a8` weights are
     /// stored rotated by a group-wise Hadamard along the input dim and are
     /// un-rotated at dequant time; `cols` must be a multiple of this. i4 packs
@@ -200,7 +205,7 @@ pub const Error = error{ UnsupportedDType, UnsupportedCheckpoint, QuantBackendUn
 /// problem at the point furthest from its cause.
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4 => true,
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4, .svdq4 => true,
         .q4_0, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q1_0, .q2_0_g64 => have_ggml,
         // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
         .q2_0_g128 => true,
@@ -311,7 +316,8 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
 /// y[m, w.rows] = x[m, w.cols] @ w^T + bias.
 /// What a device's integer GEMM does to the activation before it: rotated when
 /// `rotate`, then quantized per row to `bits` (0: left alone).
-pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false };
+/// `regrid`: the weight too as the device runs it, an svdq weight on its per-row int8 grid.
+pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false, regrid: bool = false };
 
 /// A device check's reference: called per linear, so the CPU carries the activation
 /// quantization of the route the device takes for that weight, and the check measures
@@ -348,11 +354,61 @@ pub fn matmul(
             std.debug.assert(x.len == m * w.cols);
             const xq = try gpa.dupe(f32, x);
             defer gpa.free(xq);
-            for (0..m) |i| emulateActQuant(xq[i * w.cols ..][0..w.cols], q);
-            return matmulExact(io, gpa, y, xq, m, w, bias);
+            // An svdq device quantizes the smoothed activation, `x * inv_smooth`.
+            const inv_smooth = if (w.svdq) |sq| sq.inv_smooth else null;
+            for (0..m) |i| {
+                const row = xq[i * w.cols ..][0..w.cols];
+                if (inv_smooth) |s| for (row, s) |*v, f| {
+                    v.* *= f;
+                };
+                emulateActQuant(row, q);
+                if (inv_smooth) |s| for (row, s) |*v, f| {
+                    v.* /= f;
+                };
+            }
+            if (q.regrid) {
+                const wr = try svdqRegridF32(gpa, w);
+                defer gpa.free(wr);
+                try matmulExact(io, gpa, y, xq, m, Weight.fromF32(wr, w.rows, w.cols), bias);
+            } else try matmulExact(io, gpa, y, xq, m, w, bias);
+            if (w.svdq) |sq| try svdqLowrank(io, gpa, y, x, m, w, sq.*);
+            return;
         }
     }
-    return matmulExact(io, gpa, y, x, m, w, bias);
+    try matmulExact(io, gpa, y, x, m, w, bias);
+    if (w.svdq) |sq| try svdqLowrank(io, gpa, y, x, m, w, sq.*);
+}
+
+/// `y += (x @ down^T) @ up^T`, an svdq weight's low-rank branch, on the raw `x`.
+fn svdqLowrank(io: std.Io, gpa: std.mem.Allocator, y: []f32, x: []const f32, m: usize, w: Weight, sq: svdq_mod.Meta) Error!void {
+    const rank: usize = sq.rank;
+    const t = try gpa.alloc(f32, m * rank);
+    defer gpa.free(t);
+    try matmulExact(io, gpa, t, x, m, Weight.init(sq.down, .bf16, rank, w.cols), null);
+    const u = try gpa.alloc(f32, m * w.rows);
+    defer gpa.free(u);
+    try matmulExact(io, gpa, u, t, m, Weight.init(sq.up, .bf16, w.rows, rank), null);
+    for (y, u) |*a, b| a.* += b;
+}
+
+/// An svdq weight as the device decodes it, on its per-row int8 grid, against the
+/// unsmoothed activation: `int8 * row_scale * inv_smooth`. For `ActQuant.regrid`.
+fn svdqRegridF32(gpa: std.mem.Allocator, w: Weight) Error![]f32 {
+    const sq = w.svdq.?;
+    const out = try gpa.alloc(f32, w.rows * w.cols);
+    for (0..w.rows) |n| {
+        const rs = w.row_scale.?[n];
+        var k: usize = 0;
+        while (k < w.cols) : (k += 8) {
+            const wd = svdq_mod.word(w.bytes, w.cols, n, k);
+            const s = svdq_mod.scaleAt(sq.scales, w.cols, n, k / svdq_mod.group_size);
+            for (0..8) |i| {
+                const q = svdq_mod.decodeI8(svdq_mod.nibble(wd, i), s, sq.inv_row_scale[n]);
+                out[n * w.cols + k + i] = @as(f32, @floatFromInt(q)) * rs * sq.inv_smooth[k + i];
+            }
+        }
+    }
+    return out;
 }
 
 fn matmulExact(
@@ -370,7 +426,7 @@ fn matmulExact(
     std.debug.assert(y.len == m * w.rows);
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4 => {},
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .w6a8, .nvfp4, .svdq4 => {},
         .q4_0, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
@@ -404,6 +460,7 @@ fn matmulExact(
         std.debug.assert(w.nvfp4 != null);
         std.debug.assert(w.row_scale == null and w.convrot == 0);
     }
+    if (w.dtype == .svdq4) std.debug.assert(w.svdq != null and w.convrot == 0);
     if (m == 0 or w.rows == 0) return;
 
     // Activation observer (see `probe`): after validation, before any dispatch, so
@@ -764,7 +821,7 @@ fn packedTask(
 ) void {
     // i4 is sub-byte packed (nibbles), so it can't ride the byteSize-based
     // typed path; it has its own kernel that unpacks two values per byte.
-    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4 or w.dtype == .svdq4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
@@ -1006,6 +1063,8 @@ fn packedTaskI4(
                 var tmp: [KC]f32 = undefined;
                 if (w.dtype == .w4a8 or w.dtype == .w6a8)
                     dequantW4A8Slice(w, row, kc0, kl, tmp[0..kl])
+                else if (w.dtype == .svdq4)
+                    svdq_mod.decodeSliceF32(tmp[0..kl], w.bytes, w.svdq.?.*, cols, row, kc0)
                 else if (w.dtype == .nvfp4)
                     nvfp4_mod.decodeSliceF32(tmp[0..kl], w.bytes, w.nvfp4.?.*, cols, row, kc0, kl)
                 else
@@ -1136,7 +1195,7 @@ fn runRange(
     scratch: []f32,
     tok: cancel.Token,
 ) void {
-    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .w6a8 or w.dtype == .nvfp4 or w.dtype == .svdq4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch, tok);
@@ -1220,6 +1279,8 @@ fn runRangeI4(
             const dst = scratch[j * cols ..][0..cols];
             if (w.dtype == .w4a8 or w.dtype == .w6a8)
                 dequantW4A8Slice(w, r + j, 0, cols, dst)
+            else if (w.dtype == .svdq4)
+                svdq_mod.decodeSliceF32(dst, w.bytes, w.svdq.?.*, cols, r + j, 0)
             else if (w.dtype == .nvfp4)
                 nvfp4_mod.decodeSliceF32(dst, w.bytes, w.nvfp4.?.*, cols, r + j, 0, cols)
             else
@@ -1936,5 +1997,36 @@ test "emulateActQuant lands on the device grid and is idempotent" {
         for (once, row) |a, v| diff = @max(diff, @abs(a - v));
         errdefer std.debug.print("bits {d}: max change {d}\n", .{ bits, diff });
         try std.testing.expect(diff > 0);
+    }
+}
+
+test "matmul runs an svdq weight: Nunchaku's effective weight plus its low-rank branch, on both paths" {
+    const gpa = std.testing.allocator;
+    var f = try svdq_mod.TestFixture.open();
+    defer f.st.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const l = try f.loaded(arena.allocator());
+    var w = Weight.init(f.bytes("qweight"), .svdq4, f.rows, f.cols);
+    w.svdq = l.meta;
+    w.row_scale = l.row_scale;
+    const x = f.f32s("x");
+    const want = f.f32s("y");
+    const m0 = x.len / f.cols;
+    // Tiled past `small_m_max` too, which takes the packed path instead of `runRange`.
+    for ([_]usize{ 1, small_m_max / m0 + 1 }) |reps| {
+        const m = m0 * reps;
+        const xs = try gpa.alloc(f32, m * f.cols);
+        defer gpa.free(xs);
+        for (0..m) |i| for (xs[i * f.cols ..][0..f.cols], x[(i % m0) * f.cols ..][0..f.cols]) |*d, s| {
+            d.* = s;
+        };
+        const y = try gpa.alloc(f32, m * f.rows);
+        defer gpa.free(y);
+        try matmul(std.testing.io, gpa, y, xs, m, w, null);
+        for (0..m) |i| for (y[i * f.rows ..][0..f.rows], want[(i % m0) * f.rows ..][0..f.rows], 0..) |got, exp, n| {
+            errdefer std.debug.print("m {d}, row {d}, out {d}: {d} vs {d}\n", .{ m, i, n, got, exp });
+            try std.testing.expectApproxEqAbs(exp, got, 1e-4 * (1 + @abs(exp)));
+        };
     }
 }
