@@ -34,6 +34,8 @@ pub const Remote = struct {
     /// A request or the events socket failed; the host is gone for us.
     failed: std.atomic.Value(bool) = .init(false),
     child: ?std.process.Child = null,
+    /// The host's build as its `hello` gave it, empty from one that predates the field.
+    version: []u8 = &.{},
 
     /// Connect to a listening host: hello on the control link, then the events
     /// upgrade and the two threads. Blocks for the round trips; callers run
@@ -44,7 +46,10 @@ pub const Remote = struct {
         const r = try gpa.create(Remote);
         errdefer gpa.destroy(r);
         r.* = .{ .gpa = gpa, .io = io, .control = control, .events = undefined, .on_out = on_out };
-        r.gen = try hello(gpa, control);
+        const h = try hello(gpa, control);
+        r.gen = h.gen;
+        r.version = h.version;
+        errdefer gpa.free(r.version);
 
         r.events = try link.connect(gpa, io, ep);
         errdefer r.events.close(gpa);
@@ -60,10 +65,11 @@ pub const Remote = struct {
     pub fn check(gpa: std.mem.Allocator, io: Io, ep: link.Endpoint) !void {
         const control = try link.connect(gpa, io, ep);
         defer control.close(gpa);
-        _ = try hello(gpa, control);
+        gpa.free((try hello(gpa, control)).version);
     }
 
-    fn hello(gpa: std.mem.Allocator, control: *link.Link) !wire.HostGen {
+    /// The host's generation and build; the caller owns `version`.
+    fn hello(gpa: std.mem.Allocator, control: *link.Link) !struct { gen: wire.HostGen, version: []u8 } {
         const resp = try httpc.request(gpa, control, "GET", "/v1/hello", "", "", 1 << 16);
         defer gpa.free(resp.body);
         if (resp.status == 401) return error.Unauthorized;
@@ -76,7 +82,7 @@ pub const Remote = struct {
             log.err("host speaks protocol {d}, this client {d}", .{ ev.hello.proto, wire.proto });
             return error.ProtoMismatch;
         }
-        return ev.hello.gen;
+        return .{ .gen = ev.hello.gen, .version = try gpa.dupe(u8, ev.hello.version) };
     }
 
     /// Spawn `tp-serve` beside our own executable and connect to it. `extra`
@@ -138,6 +144,7 @@ pub const Remote = struct {
         };
         self.inbox.deinit(gpa);
         self.outbox.deinit(gpa);
+        gpa.free(self.version);
         gpa.destroy(self);
     }
 

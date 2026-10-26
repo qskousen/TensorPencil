@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     // Flush on the error path too, or a diagnostic printed before returning an
     // error is lost and the user sees only a stack trace.
     defer stdout.flush() catch {};
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) return stdout.print("TensorPencil {s}\n", .{@import("version").string});
     runCommand(arena, io, args, gpa, stdout) catch |err| {
         // A forward that checks its own output aborts the device check it runs in.
         if (err == error.NonFiniteActivation) if (test_act) |a|

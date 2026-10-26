@@ -218,6 +218,10 @@ pub const Hosts = struct {
     /// `canRenderAnywhere` as last pushed, so a host coming up or going down
     /// re-tells the chat host whether the image tool is worth offering.
     told_image_tool: ?bool = null,
+    /// What a connect learned that the user should read once (`connectNotices`).
+    notices: std.ArrayList(Notice) = .empty,
+
+    pub const Notice = struct { tone: enum { info, warn }, text: []u8 };
 
     pub fn init(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, on_out: *const fn () void, config_path: ?[]const u8, local_socket: ?[]const u8) !Hosts {
         var h: Hosts = .{ .gpa = gpa, .io = io, .environ = environ, .on_out = on_out, .config_path = config_path, .local_socket = local_socket };
@@ -233,6 +237,33 @@ pub const Hosts = struct {
         self.calls.deinit(self.gpa);
         for (self.slots.items) |s| self.freeSlot(s);
         self.slots.deinit(self.gpa);
+        for (self.notices.items) |n| self.gpa.free(n.text);
+        self.notices.deinit(self.gpa);
+    }
+
+    /// The oldest notice waiting; the caller frees `text`.
+    pub fn takeNotice(self: *Hosts) ?Notice {
+        if (self.notices.items.len == 0) return null;
+        return self.notices.orderedRemove(0);
+    }
+
+    /// What reaching `s` (a first connect, or after a restart) tells the user: that the
+    /// local host was a tp-serve already running, which outlives this client and is
+    /// not the one beside it; and that a host is another build, whose missing or
+    /// different features would otherwise surface as unexplained failures.
+    fn connectNotices(self: *Hosts, s: *const Slot, host_version: []const u8, spawned: bool) void {
+        const own = @import("serve").version;
+        if (s.id == self.local().id and !spawned and self.local_socket == null)
+            self.notice(.info, "Connected to a tp-serve that was already running ({s}). It keeps running after tp-gui exits.", .{if (host_version.len > 0) host_version else "version unknown"});
+        if (host_version.len == 0)
+            self.notice(.warn, "{s} runs an older tp-serve that does not report its version; this tp-gui is {s}. Restart it to use this build's features.", .{ s.name, own })
+        else if (!std.mem.eql(u8, host_version, own))
+            self.notice(.warn, "{s} runs tp-serve {s}, but this tp-gui is {s}. Restart it to use this build's features.", .{ s.name, host_version, own });
+    }
+
+    fn notice(self: *Hosts, tone: @FieldType(Notice, "tone"), comptime fmt: []const u8, args: anytype) void {
+        const text = self.gpa.print(fmt, args) catch return;
+        self.notices.append(self.gpa, .{ .tone = tone, .text = text }) catch self.gpa.free(text);
     }
 
     // ── Trying a host before it is in force ──────────────────────────────────
@@ -800,6 +831,7 @@ pub const Hosts = struct {
                 defer arena.deinit();
                 var adopt: []const wire.Message = &.{};
                 if (restarted) {
+                    self.connectNotices(s, r.version, r.child != null);
                     self.hostRestarted(s);
                     if (s.id == self.chat) adopt = s.mirror.toWire(arena.allocator()) catch &.{};
                 } else self.cancelStrays(s);
@@ -2417,6 +2449,43 @@ test "a chat host met for the first time starts a new chat; a reconnect, a carri
     mark = rb.outbox.items.items.len;
     h.setChat(b.id);
     try testing.expect(sentIndex(&rb, ar, mark, .chat_new) != null);
+}
+
+test "a connect says when the local host was already running, and when any host is another build" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try Hosts.init(testing.allocator, testing.io, &env, noop, null, null);
+    defer h.deinit();
+    const b = try h.addSlot("lydia", .{});
+    const own = @import("serve").version;
+    const Want = struct { tone: @FieldType(Hosts.Notice, "tone"), has: []const u8 };
+    const check = struct {
+        fn f(hh: *Hosts, want: []const Want) !void {
+            for (want) |w| {
+                const n = hh.takeNotice() orelse return error.MissingNotice;
+                defer testing.allocator.free(n.text);
+                errdefer std.debug.print("got {t} \"{s}\", want {t} with \"{s}\"\n", .{ n.tone, n.text, w.tone, w.has });
+                try testing.expectEqual(w.tone, n.tone);
+                try testing.expect(std.mem.find(u8, n.text, w.has) != null);
+            }
+            try testing.expect(hh.takeNotice() == null);
+        }
+    }.f;
+
+    // Spawned beside this client and the same build: nothing to say.
+    h.connectNotices(h.local(), own, true);
+    try check(&h, &.{});
+    // Found running: said once, with its version.
+    h.connectNotices(h.local(), own, false);
+    try check(&h, &.{.{ .tone = .info, .has = "already running" }});
+    // An older daemon found running: both.
+    h.connectNotices(h.local(), "0.1.0 (v0.1.0)", false);
+    try check(&h, &.{ .{ .tone = .info, .has = "0.1.0 (v0.1.0)" }, .{ .tone = .warn, .has = "local runs tp-serve 0.1.0 (v0.1.0)" } });
+    // A remote host is always one that was running; only its build is news.
+    h.connectNotices(b, own, false);
+    try check(&h, &.{});
+    h.connectNotices(b, "", false);
+    try check(&h, &.{.{ .tone = .warn, .has = "lydia runs an older tp-serve" }});
 }
 
 test "the same daemon coming back is told to stop what this client already put elsewhere" {

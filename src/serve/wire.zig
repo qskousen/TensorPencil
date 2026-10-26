@@ -481,7 +481,8 @@ pub const ErrCode = enum {
 /// Everything a host tells a client, in the order the host queued it, on the
 /// one events socket.
 pub const Event = union(enum) {
-    hello: struct { proto: u32 = proto, gen: HostGen = 0 },
+    /// `version` is the host's build (`serve.version`); empty from a host that predates it.
+    hello: struct { proto: u32 = proto, gen: HostGen = 0, version: []const u8 = "" },
     state: State,
     /// The whole transcript. Sent after a structural change (adopt, new chat, a
     /// regenerate adding a variant) and in a snapshot; text then streams by `delta`.

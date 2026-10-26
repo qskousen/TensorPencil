@@ -14,6 +14,17 @@ pub const server = @import("server.zig");
 pub const pairing = @import("pairing.zig");
 pub const blob = @import("blob.zig");
 
+/// This build's identity, `0.1.0 (v0.1.0-3-g45259f6-dirty)` (`tools/version_stamp.zig`).
+pub const version: []const u8 = @import("version").string;
+
+/// `--version` for a binary that links this layer.
+pub fn printVersion(io: @import("std").Io, name: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    var w: @import("std").Io.File.Writer = .initStreaming(.stdout(), io, &buf);
+    try w.interface.print("{s} {s}\n", .{ name, version });
+    try w.interface.flush();
+}
+
 test {
     _ = blob;
     _ = @import("privacy_test.zig");

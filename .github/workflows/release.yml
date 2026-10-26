@@ -98,8 +98,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # Full history and tags, so the binaries' `--version` names the release tag.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install zip
         run: sudo apt-get update && sudo apt-get install -y zip

@@ -294,6 +294,13 @@ fn pumpHost() void {
         }
     }
     reportFailures();
+    while (g_hosts.takeNotice()) |n| {
+        toast.postText(switch (n.tone) {
+            .info => .info,
+            .warn => .warn,
+        }, n.text);
+        g_gpa.free(n.text);
+    }
     // The host has the message, or the load that will take it: drop the
     // provisional bubble.
     if (g_pending_text != null and (g_m.state.llm_resident and !g_m.state.pending_submit)) {
@@ -674,6 +681,10 @@ fn wakeupFrame() void {
 }
 
 pub fn run(init: std.process.Init) !void {
+    {
+        const a = try init.minimal.args.toSlice(init.arena.allocator());
+        if (a.len == 2 and std.mem.eql(u8, a[1], "--version")) return @import("serve").printVersion(init.io, "tp-gui");
+    }
     dvui.App.main_init = init;
     SDLBackend.c.SDL_SetMainReady();
 

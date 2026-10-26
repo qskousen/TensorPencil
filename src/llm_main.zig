@@ -180,6 +180,10 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) {
+        try stdout.print("tp-llm {s}\n", .{@import("version").string});
+        return stdout.flush();
+    }
 
     var model_path: ?[]const u8 = null;
     var debug_batch: usize = 0;

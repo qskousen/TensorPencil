@@ -455,7 +455,7 @@ pub const Host = struct {
         switch (req) {
             .hello => |h| {
                 if (h.proto != wire.proto) return self.emitErr(.proto_mismatch, "proto");
-                self.emit(.{ .hello = .{ .gen = self.gen } });
+                self.emit(.{ .hello = .{ .gen = self.gen, .version = @import("serve").version } });
             },
             .snapshot => self.forgetEmitted(),
             .settings => |s| {

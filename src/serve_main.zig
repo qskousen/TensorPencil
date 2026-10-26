@@ -134,7 +134,7 @@ const Ctx = struct {
 
     fn hello(ctx: *anyopaque, gpa: std.mem.Allocator) anyerror![]u8 {
         const self: *Ctx = @ptrCast(@alignCast(ctx));
-        return wire.encodeAlloc(gpa, wire.Event{ .hello = .{ .gen = self.host.gen } });
+        return wire.encodeAlloc(gpa, wire.Event{ .hello = .{ .gen = self.host.gen, .version = @import("serve").version } });
     }
     fn request(ctx: *anyopaque, bytes: []u8) void {
         const self: *Ctx = @ptrCast(@alignCast(ctx));
@@ -311,6 +311,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) return @import("serve").printVersion(io, "tp-serve");
     var sock_arg: ?[]const u8 = null;
     var cfg_path: ?[]const u8 = null;
     var index_arg: ?[]const u8 = null;
@@ -490,6 +491,7 @@ fn usage() error{BadArgs} {
         \\       tp-serve --remote <bind>:<port> [--models <dir>]... [--backend cpu|vulkan|zig_cuda|cuda]
         \\                [--state <dir>] [--pair-host <name>] [--new-token] [--incoming <dir>]
         \\                [--config <file>]
+        \\       tp-serve --version
         \\
     , .{});
     return error.BadArgs;
