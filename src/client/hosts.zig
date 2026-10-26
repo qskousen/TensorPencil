@@ -786,6 +786,7 @@ pub const Hosts = struct {
                 if (s.remote) |old| old.deinit();
                 s.remote = r;
                 s.status_len = 0;
+                const first = s.last_gen == null;
                 const restarted = if (s.last_gen) |g| g != r.gen else true;
                 if (s.down) {
                     s.reconnects +|= 1;
@@ -802,7 +803,7 @@ pub const Hosts = struct {
                     self.hostRestarted(s);
                     if (s.id == self.chat) adopt = s.mirror.toWire(arena.allocator()) catch &.{};
                 } else self.cancelStrays(s);
-                self.greet(s, cfg, adopt);
+                self.greet(s, cfg, adopt, first);
             },
         }
     }
@@ -870,9 +871,16 @@ pub const Hosts = struct {
     /// What a freshly connected host is told, in order: the settings, the
     /// transcript it should carry on (a restart, or a re-pin), a snapshot of
     /// what it holds, the meter handles, the folders to scan.
-    fn greet(self: *Hosts, s: *Slot, cfg: *const config.Config, adopt: []const wire.Message) void {
+    ///
+    /// `first`: the host's first connect in this client's life. A daemon that outlived
+    /// the last client still holds that client's conversation, and this client opens on
+    /// a new chat (the old one is in its history), so the chat host is told so.
+    fn greet(self: *Hosts, s: *Slot, cfg: *const config.Config, adopt: []const wire.Message, first: bool) void {
         _ = self.postSettingsTo(s, cfg);
-        if (adopt.len > 0) s.post(.{ .chat_adopt = .{ .messages = adopt } });
+        if (adopt.len > 0)
+            s.post(.{ .chat_adopt = .{ .messages = adopt } })
+        else if (first and s.id == self.chat)
+            s.post(.chat_new);
         s.post(.snapshot);
         s.postMeter();
         postScanTo(s, cfg);
@@ -1059,8 +1067,9 @@ pub const Hosts = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         to.post(.chat_cancel);
+        // An empty conversation still replaces whatever the new host was holding.
         if (from.mirror.toWire(arena.allocator())) |msgs| {
-            if (msgs.len > 0) to.post(.{ .chat_adopt = .{ .messages = msgs } });
+            to.post(if (msgs.len > 0) .{ .chat_adopt = .{ .messages = msgs } } else .chat_new);
         } else |_| {}
         from.post(.chat_cancel);
         from.post(.chat_new);
@@ -2351,6 +2360,63 @@ test "a render this client asked for is kept whole, and a failure names a host t
     const g = h.takeFailure(&cfg).?;
     try testing.expectEqualStrings("out of memory", g.why);
     try testing.expect(g.moved_to == null);
+}
+
+/// Where a fake remote was first handed a request of kind `tag`, from position `from` on.
+fn sentIndex(r: *remote.Remote, arena: std.mem.Allocator, from: usize, tag: std.meta.Tag(wire.Request)) ?usize {
+    for (r.outbox.items.items[from..], from..) |o, i| {
+        const req = wire.decode(wire.Request, arena, o.text) catch continue;
+        if (req == tag) return i;
+    }
+    return null;
+}
+
+test "a chat host met for the first time starts a new chat; a reconnect, a carried transcript and other hosts do not" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    const a = h.local();
+    const b = try h.addSlot("b", .{});
+    var ra = fakeRemote();
+    var rb = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    defer rb.outbox.deinit(testing.allocator);
+    a.remote = &ra;
+    b.remote = &rb;
+    defer {
+        a.remote = null;
+        b.remote = null;
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    try testing.expectEqual(a.id, h.chat);
+
+    // The daemon may still hold the last client's conversation: replaced before the
+    // snapshot, so the mirror never shows it.
+    h.greet(a, &cfg, &.{}, true);
+    const fresh = sentIndex(&ra, ar, 0, .chat_new) orelse return error.NoNewChat;
+    try testing.expect(fresh < sentIndex(&ra, ar, 0, .snapshot).?);
+    // Not this client's chat host: whatever it holds is somebody else's.
+    h.greet(b, &cfg, &.{}, true);
+    try testing.expect(sentIndex(&rb, ar, 0, .chat_new) == null);
+    // The same daemon back after a dropped link holds this client's own conversation.
+    var mark = ra.outbox.items.items.len;
+    h.greet(a, &cfg, &.{}, false);
+    try testing.expect(sentIndex(&ra, ar, mark, .chat_new) == null);
+    // A transcript to carry on replaces it instead.
+    mark = ra.outbox.items.items.len;
+    const msgs = [_]wire.Message{.{ .role = .user, .variants = &.{.{ .text = "hello" }} }};
+    h.greet(a, &cfg, &msgs, true);
+    try testing.expect(sentIndex(&ra, ar, mark, .chat_adopt) != null);
+    try testing.expect(sentIndex(&ra, ar, mark, .chat_new) == null);
+
+    // Moving the chat to a host while the conversation is empty clears that host too.
+    mark = rb.outbox.items.items.len;
+    h.setChat(b.id);
+    try testing.expect(sentIndex(&rb, ar, mark, .chat_new) != null);
 }
 
 test "the same daemon coming back is told to stop what this client already put elsewhere" {
