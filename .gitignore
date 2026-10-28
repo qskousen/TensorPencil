@@ -6,7 +6,9 @@
 /zig-pkg/
 /scratch_out/
 /models/
-
+__pycache__/
+# A config test's file in the cwd, left behind when a test run crashes.
+/.gui-config-*-test.*
 
 # Opt-in marker: GPU device tests run only when this exists (see test_gate.zig).
 /testdata/gpu-tests
