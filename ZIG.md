@@ -655,15 +655,20 @@ The single-level form is `createDir(dir, io, sub_path, permissions)`. There is n
 `makePath` / `makeDir` any more, so the old names fail to compile rather than
 silently doing nothing.
 
-## A Debug `std.json` struct parse needs a stack of about fields × `@sizeOf(T)`
+## A Debug `std.json` struct parse needs a stack of tens of MiB for a big struct
 
 `parseFromSliceLeaky(Config, ...)` segfaulted inside `innerParse` on a `std.Thread`
-with no message: in Debug the generated per-field code keeps a copy of the whole
-struct per field in ONE frame, and 63 fields of a 250 KB struct is the thread's
-default 16 MiB. The main thread's tests passed, so the crash only showed on the
-engine thread. Spawn any thread that parses a big struct with
-`.stack_size = config.parse_stack_size` (64 MiB); the regression test in
-`shared/config.zig` does the parse on such a thread.
+with no message. std's struct branch assigns every field from ONE `inline for`, and
+a Debug build gives each unrolled arm its own stack slots in that one frame, so the
+frame scales with the field count times the size of what each arm holds: 62 MiB for
+a 91-field, 332 KB `Config`, past the 64 MiB thread it parsed on. Rewriting the loop
+body (each arm calling a `noinline` helper) did not shrink it; the arms are the cost.
+
+`Config.jsonParse` is the fix: one setter function per field in a comptime table,
+looked up by key at runtime, so no `inline for` sits in the parse frame (2.6 MiB).
+A type with its own `jsonParse` is what std calls, so every parse of it gets this.
+Any other big struct parsed in Debug wants the same; a thread that parses one still
+spawns with `.stack_size = config.parse_stack_size`.
 
 ## A refused unix connect is `error.Unexpected` (errno 111), with a Debug trace
 

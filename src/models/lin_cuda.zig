@@ -864,7 +864,7 @@ fn sidecar(be: *Backend, p: Plan, r: Route, stack: *const lora_mod.Stack, y: Buf
     if (hits.len == 0) return;
     var ws = try workspace(be, hits, m, w);
     for (hits) |h| {
-        const s = stack.files.items[h.file].strength;
+        const s = stack.strengthOf(h.file);
         // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
         if (s == 0) continue;
         if (dora_base) if (h.target.dora) |d| try doraBase(be, p, y, x, m, w, d, bias, s);

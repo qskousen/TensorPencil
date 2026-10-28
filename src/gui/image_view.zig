@@ -21,14 +21,18 @@
 //! writes a form buffer, and Generate snapshots the lot onto the `GenImage`
 //! (`req_*` + `wire.RenderParams` + a LoRA set of its own). Settings holds
 //! the DEFAULTS the form is seeded from, and the only things this module writes
-//! back to config are the two pieces of view state -- which size control is
-//! showing, and which sections are folded -- plus whatever "Save as defaults"
-//! is explicitly asked to copy.
+//! back to config are view state -- which size control is showing, which
+//! sections are folded, and Expand mode's choices -- plus whatever "Save as
+//! defaults" is explicitly asked to copy.
 //!
 //! That split is the answer to a bug this codebase has already had once: two
 //! screens each seeding a form buffer from one config field, where whichever
 //! was touched last silently won, on the framing chips. One writer
 //! per value, and here the writer is the request.
+//!
+//! Expand mode swaps the prompt box for a prefix, an idea and a suffix: the chat
+//! model turns the idea into the middle of the prompt (`hosts.Hosts.expand`),
+//! and the negative goes to the render as typed.
 //!
 //! State is process-global (the dvui idiom, mirroring app.zig): only the
 //! transient form fields live here; the engine owns every image.
@@ -50,6 +54,8 @@ const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
 const style = @import("style.zig");
 const bubbles = @import("bubbles.zig");
+const lora_schedule = @import("lora_schedule.zig");
+const Expand = @import("client").hosts.Hosts.Expand;
 
 const C = style.C;
 const F = style.F;
@@ -104,6 +110,14 @@ pub var viewer_request: ?ImageId = null;
 /// nothing from the store.
 pub var recorded_prompt: ?struct { prompt: []const u8, negative: []const u8 } = null;
 
+/// Set when Generate runs, for app.zig to keep in the config as this checkpoint's
+/// settings (`config.rememberModelSettings`). Cleared by the reader.
+pub var remembered: ?config.ModelSettings = null;
+
+/// Set when the composer changes one of Expand mode's choices (the mode, the
+/// expander, reasoning, the batch); app.zig persists them. Cleared by the reader.
+pub var expand_choice_moved: bool = false;
+
 // Memoized inspection of the configured checkpoint, so the form can default to
 // the architecture's own parameters (see `seed`). Live only after `setEnv`.
 var g_spec: model_spec.Cache = undefined;
@@ -117,12 +131,18 @@ var g_selected: ?ImageId = null;
 // ------------------------------------------------------------- form buffers
 
 var seeded: bool = false;
-/// The architecture the form was last seeded for. A change means the user picked
-/// a different KIND of model, and the architecture-dependent defaults re-seed.
+/// The architecture the form's LoRA list was last seeded for: LoRAs are per
+/// architecture, so a change re-seeds that list and nothing else.
 var seeded_family: ?model_spec.Family = null;
+/// The checkpoint the form's steps, CFG, sampler and scheduler are for (`syncForm`).
+var seeded_model: config.PathBuf = .{};
 
 var prompt_buf: [4096]u8 = @splat(0);
 var negative_buf: [1024]u8 = @splat(0);
+// Expand mode's three parts; only the idea reaches the chat model.
+var prefix_buf: [1024]u8 = @splat(0);
+var idea_buf: [2048]u8 = @splat(0);
+var suffix_buf: [1024]u8 = @splat(0);
 var width_buf: [12]u8 = @splat(0);
 var height_buf: [12]u8 = @splat(0);
 var mp_buf: [12]u8 = @splat(0);
@@ -177,7 +197,12 @@ const max_loras = config.max_family_loras;
 var f_lora_path: [max_loras]config.PathBuf = @splat(.{});
 var f_lora_strength: [max_loras]f32 = @splat(1.0);
 var f_lora_on: [max_loras]bool = @splat(true);
+var f_lora_sched: [max_loras]Schedule = @splat(.always);
+/// The row whose schedule editor is open.
+var f_lora_editing: ?usize = null;
 var f_lora_n: usize = 0;
+
+const Schedule = lora_schedule.Schedule;
 
 /// The form was filled from one specific image ("Open in Studio"), so the next
 /// render adopts it instead of re-seeding. `seeded` alone does not hold it: the
@@ -211,6 +236,8 @@ pub fn deinit() void {
     loaded_from_image = false;
     viewer_request = null;
     recorded_prompt = null;
+    remembered = null;
+    seeded_model = .{};
     g_selected = null;
     if (g_spec_ready) {
         g_spec.deinit();
@@ -228,6 +255,13 @@ pub fn deinit() void {
 /// and is empty for the first frames of a cold start, which dropped a LoRA once
 /// already.
 pub var forced_family: ?model_spec.Family = null;
+
+/// `ui-probe`'s way to show Expand mode with text in its fields.
+pub fn setExpandText(prefix: []const u8, idea: []const u8, suffix: []const u8) void {
+    for ([_][]u8{ &prefix_buf, &idea_buf, &suffix_buf }, [_][]const u8{ prefix, idea, suffix }) |buf, text| {
+        _ = std.mem.printSentinel(buf, "{s}", .{text[0..@min(text.len, buf.len - 1)]}, 0) catch {};
+    }
+}
 
 /// The architecture of the configured checkpoint, if it can be read. Memoized on
 /// the path, so this is one header parse per model change, not per frame.
@@ -310,8 +344,53 @@ fn seedLoras(cfg: *const config.Config, fam: ?model_spec.Family) void {
         f_lora_path[f_lora_n].set(l.path.slice());
         f_lora_strength[f_lora_n] = l.strength;
         f_lora_on[f_lora_n] = l.enabled;
+        // Ours, written by `saveForm`; an unreadable one shows as every step,
+        // which the row's chip then says.
+        f_lora_sched[f_lora_n] = Schedule.parse(l.schedule.slice()) catch .always;
         f_lora_n += 1;
     }
+    f_lora_editing = null;
+}
+
+/// Keep the form in step with the configured model without taking back what the user
+/// set. The first time (or after `reseed`) the form comes from the config, then the
+/// checkpoint's own settings. A different architecture re-seeds the LoRA list only,
+/// since another family's LoRAs cannot load. A different checkpoint brings its last
+/// rendered steps, CFG, sampler and scheduler (`config.modelSettings`), or for a file
+/// never rendered with, its architecture's recommendation. Size is never touched.
+fn syncForm(cfg: *const config.Config, fam: ?model_spec.Family) void {
+    const model = cfg.diffusion_model.slice();
+    if (loaded_from_image) {
+        loaded_from_image = false;
+        seeded = true;
+        seeded_family = fam;
+        seeded_model.set(model);
+        return;
+    }
+    if (!seeded) {
+        seed(cfg, fam);
+        if (cfg.modelSettings(model)) |ms| applyModelSettings(ms);
+        seeded_model.set(model);
+        return;
+    }
+    if (!famEql(fam, seeded_family)) {
+        seedLoras(cfg, fam);
+        seeded_family = fam;
+    }
+    if (std.mem.eql(u8, model, seeded_model.slice())) return;
+    seeded_model.set(model);
+    if (cfg.modelSettings(model)) |ms| return applyModelSettings(ms);
+    const t = model_spec.traits(fam orelse return);
+    setFmt(&steps_buf, "{d}", .{t.steps});
+    setFmt(&cfg_buf, "{d:.1}", .{t.cfg});
+    f_scheduler = .default;
+}
+
+fn applyModelSettings(ms: config.ModelSettings) void {
+    setFmt(&steps_buf, "{d}", .{ms.steps});
+    setFmt(&cfg_buf, "{d:.1}", .{ms.cfg_scale});
+    f_sampler = ms.sampler;
+    f_scheduler = ms.scheduler;
 }
 
 fn famEql(a: ?model_spec.Family, b: ?model_spec.Family) bool {
@@ -372,6 +451,20 @@ pub const Callbacks = struct {
     /// Stop one render. The canvas is where a render in flight is shown in the
     /// studio, so it is also where it can be called off.
     cancel: *const fn (ImageId) void,
+    /// Queue renders whose prompt the chat model writes (Expand mode).
+    expand: *const fn (Expand) void,
+    /// What the chat host offers Expand mode.
+    llm: Llm = .{},
+    /// The prompt Expand mode last wrote, "" before the first.
+    last_expansion: []const u8 = "",
+};
+
+pub const Llm = struct {
+    /// A chat model is set, so there is something to write prompts with.
+    configured: bool = false,
+    /// It reasons, and takes an effort.
+    thinking: bool = false,
+    effort: bool = false,
 };
 
 /// This frame's callbacks, so the canvas tiles can reach `cancel` without every
@@ -391,15 +484,7 @@ pub fn render(cfg: *config.Config, m: *mirror.Mirror, u: *const models.Union, im
     g_post = post;
     g_cb = cb;
     const fam = currentFamily(cfg);
-    // Re-seed when the user switches to a different ARCHITECTURE: the CFG
-    // default and the LoRA set are both architecture-specific, and carrying
-    // krea2's over to SD1.5 (or back) is a visibly wrong image, not a
-    // preference.
-    if (loaded_from_image) {
-        loaded_from_image = false;
-        seeded = true;
-        seeded_family = fam;
-    } else if (!seeded or !famEql(fam, seeded_family)) seed(cfg, fam);
+    syncForm(cfg, fam);
 
     // No header here: the window's title bar already names this view, owns the
     // Chat/Studio switch and now carries the gear, so a second title row was two
@@ -499,11 +584,7 @@ fn renderForm(cfg: *config.Config, u: *const models.Union, fam: ?model_spec.Fami
 /// Last frame's composer height, so this frame can reserve it. Seeded with a
 /// plausible value for the very first frame.
 var g_composer_h: f32 = 168;
-var prompt_h: f32 = 42;
-var negative_h: f32 = 20;
-/// Everything in the composer that is NOT the two entries: the block's padding,
-/// the frame's border and padding, and the button row with its margin.
-const composer_chrome: f32 = 86;
+const Part = enum { prompt, negative, prefix, idea, suffix };
 
 fn renderNoModel(cb: Callbacks) void {
     var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .gravity_x = 0.5, .gravity_y = 0.5, .padding = dvui.Rect.all(24) });
@@ -1137,7 +1218,8 @@ fn renderSamplingSection(cfg: *config.Config) void {
 ///
 /// Hidden outright when the architecture has no sidecar path in this build
 /// (`Family.supportsLora`, the same list `Session.attachLoras` refuses by), so a
-/// user is never offered a control whose only outcome is a failed load.
+/// user is never offered a control whose only outcome is a failed load. Shown
+/// with nothing to add, so the place to look is there before any LoRA is.
 fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?model_spec.Family) void {
     const f = fam orelse return;
     if (!f.supportsLora()) return;
@@ -1149,50 +1231,68 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
     for (0..f_lora_n) |i| {
         if (f_lora_on[i]) active += 1;
     }
-    if (cands.len == 0 and f_lora_n == 0) return;
 
-    var sum_buf: [48]u8 = undefined;
+    var pill_buf: [24]u8 = undefined;
     var sec = style.collapsibleBegin(@src(), "LORAS", &cfg.studio_open_loras, .{
-        .summary = if (active == 0)
-            "none"
-        else
-            std.mem.print(&sum_buf, "{d} active", .{active}) catch "",
+        .summary = if (active == 0) "none" else "",
+        .pill = if (active == 0) "" else std.mem.print(&pill_buf, "{d} active", .{active}) catch "",
     });
     defer style.collapsibleEnd(&sec);
     if (!sec.open()) return;
+
+    if (cands.len == 0 and f_lora_n == 0) {
+        help(0, "No LoRAs for this model's architecture were found in the model folders.");
+        return;
+    }
 
     help(0, "Applied beside the model's weights, never merged in, so strength stays a dial. " ++
         "These ride on the image you queue: change them and the next render picks them up " ++
         "with no model reload.");
 
+    // The noise level of each step this form would render, which is what a
+    // schedule reads.
+    const levels = blk: {
+        const dims = formDims(cfg);
+        const steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
+        break :blk lora_schedule.levelsFor(arena, f, dims.w, dims.h, steps, pipeline_map.toPipelineScheduler(f_scheduler));
+    };
+
     var remove: ?usize = null;
     for (0..f_lora_n) |i| {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal, .margin = .{ .h = 4 } });
-        defer row.deinit();
+        var item = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = i, .expand = .horizontal, .margin = .{ .h = 4 } });
+        defer item.deinit();
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
 
-        _ = dvui.checkbox(@src(), &f_lora_on[i], null, .{ .gravity_y = 0.5 });
-        // The file name, not the path: it sits next to a slider in a fixed
-        // width. Amber when the catalog has never seen the file, which is the
-        // difference between "off" and "gone".
-        const path = f_lora_path[i].slice();
-        const known = cat.resolve(path) != null;
-        var nb: [96]u8 = undefined;
-        dvui.labelNoFmt(@src(), style.ellipsize(&nb, cat.refName(path), F.ui, 200), .{}, .{
-            .font = F.ui,
-            .color_text = .{ .color = if (known) C.text else C.amber },
-            .padding = .{},
-            .margin = .{ .x = 4, .w = 8 },
-            .gravity_y = 0.5,
-            .min_size_content = .{ .w = 200 },
-            .max_size_content = .width(200),
-        });
-        _ = dvui.sliderEntry(@src(), "{d:0.2}", .{
-            .value = &f_lora_strength[i],
-            .min = -1.0,
-            .max = 2.0,
-            .interval = 0.05,
-        }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 } });
-        if (bubbles.secondaryButton(@src(), i, "Remove", true)) remove = i;
+            _ = dvui.checkbox(@src(), &f_lora_on[i], null, .{ .gravity_y = 0.5 });
+            // The file name, not the path: it sits next to a slider in a fixed
+            // width. Amber when the catalog has never seen the file, which is the
+            // difference between "off" and "gone".
+            const path = f_lora_path[i].slice();
+            const known = cat.resolve(path) != null;
+            var nb: [96]u8 = undefined;
+            dvui.labelNoFmt(@src(), style.ellipsize(&nb, cat.refName(path), F.ui, 200), .{}, .{
+                .font = F.ui,
+                .color_text = .{ .color = if (known) C.text else C.amber },
+                .padding = .{},
+                .margin = .{ .x = 4, .w = 8 },
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 200 },
+                .max_size_content = .width(200),
+            });
+            _ = dvui.sliderEntry(@src(), "{d:0.2}", .{
+                .value = &f_lora_strength[i],
+                .min = -1.0,
+                .max = 2.0,
+                .interval = 0.05,
+            }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 } });
+            if (lora_schedule.chip(@src(), i, f_lora_sched[i], levels)) {
+                f_lora_editing = if (f_lora_editing == i) null else i;
+            }
+            if (bubbles.secondaryButton(@src(), i, "Remove", true)) remove = i;
+        }
+        if (f_lora_editing == i) _ = lora_schedule.editor(@src(), i, &f_lora_sched[i], levels);
     }
     if (remove) |i| {
         // Shift rather than swap: order is what `applyStrengths`' positional
@@ -1202,8 +1302,10 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
             f_lora_path[j] = f_lora_path[j + 1];
             f_lora_strength[j] = f_lora_strength[j + 1];
             f_lora_on[j] = f_lora_on[j + 1];
+            f_lora_sched[j] = f_lora_sched[j + 1];
         }
         f_lora_n -= 1;
+        f_lora_editing = null;
     }
 
     if (f_lora_n >= max_loras) {
@@ -1233,6 +1335,7 @@ fn renderLoraSection(cfg: *config.Config, cat: *const catalog.Catalog, fam: ?mod
             f_lora_path[f_lora_n].set(paths.items[pick - 1]);
             f_lora_strength[f_lora_n] = 1.0;
             f_lora_on[f_lora_n] = true;
+            f_lora_sched[f_lora_n] = .always;
             f_lora_n += 1;
         }
     }
@@ -1643,7 +1746,7 @@ fn help(id: usize, text: []const u8) void {
 
 // ----------------------------------------------------------------- composer
 
-fn renderComposer(cfg: *const config.Config, ready: bool) void {
+fn renderComposer(cfg: *config.Config, ready: bool) void {
     var block = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .background = true,
@@ -1653,106 +1756,175 @@ fn renderComposer(cfg: *const config.Config, ready: bool) void {
         .padding = .{ .x = 18, .y = 10, .w = 18, .h = 12 },
     });
     defer block.deinit();
-
-    var frame = dvui.box(@src(), .{ .dir = .vertical }, .{
-        .expand = .horizontal,
-        .background = true,
-        .color_fill = .{ .color = C.sunken },
-        .border = style.Edge.all,
-        .color_border = .{ .color = style.hairline_hi },
-        .corners = R.input,
-        .padding = .{ .x = 12, .y = 8, .w = 12, .h = 8 },
-    });
-    defer frame.deinit();
-
+    // What the composer ASKED for last frame, not the height it was given: given
+    // too little, the parts below the fields are clipped, and a measurement of
+    // what was drawn would keep reserving too little for good.
+    if (dvui.minSizeGet(block.data().id)) |ms| g_composer_h = ms.h;
     {
-        var te = dvui.textEntry(@src(), .{
-            .text = .{ .buffer = &prompt_buf },
-            .multiline = true,
-            .placeholder = "Describe the image…",
-            .scroll_horizontal = false,
-            .break_lines = true,
-        }, .{
+        var frame = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .horizontal,
-            .background = false,
-            .border = .{},
-            .padding = .{},
-            .min_size_content = .{ .h = 42 },
-            .max_size_content = .height(96),
-            .font = F.input,
-            .theme = style.noFocusTheme(),
+            .background = true,
+            .color_fill = .{ .color = C.sunken },
+            .border = style.Edge.all,
+            .color_border = .{ .color = style.hairline_hi },
+            .corners = R.input,
+            .padding = .{ .x = 12, .y = 8, .w = 12, .h = 8 },
         });
-        prompt_h = te.data().rect.h;
-        te.deinit();
+        defer frame.deinit();
+
+        if (cfg.studio_expand) {
+            entry(.prefix, &prefix_buf, "Before the idea: style, medium, quality words (optional)", false, F.ui, C.text_dim);
+            entry(.idea, &idea_buf, "An idea for the chat model to turn into a prompt…", true, F.input, null);
+            entry(.suffix, &suffix_buf, "After it: lighting, lens, anything every image gets (optional)", false, F.ui, C.text_dim);
+        } else {
+            entry(.prompt, &prompt_buf, "Describe the image…", true, F.input, null);
+        }
+        // The negative is a second prompt, not a knob, so it sits in the same frame
+        // rather than in a section. It only bites when guidance is above 1, and
+        // Expand mode never hands it to the chat model.
+        entry(.negative, &negative_buf, "Negative prompt (needs guidance above 1)", true, F.ui, C.text_dim);
+        if (cfg.studio_expand and g_cb.last_expansion.len > 0) lastExpansion(g_cb.last_expansion);
     }
-    // The negative is a second prompt, not a knob, so it sits in the same frame
-    // rather than in a section. It only bites when guidance is above 1.
-    {
-        var te = dvui.textEntry(@src(), .{
-            .text = .{ .buffer = &negative_buf },
-            .multiline = true,
-            .placeholder = "Negative prompt (needs guidance above 1)",
-            .scroll_horizontal = false,
-            .break_lines = true,
-        }, .{
-            .expand = .horizontal,
-            .background = false,
-            .border = .{},
-            .padding = .{},
-            .min_size_content = .{ .h = 20 },
-            .max_size_content = .height(56),
-            .font = F.ui,
-            .color_text = .{ .color = C.text_dim },
-            .theme = style.noFocusTheme(),
-        });
-        negative_h = te.data().rect.h;
-        te.deinit();
-    }
-    // The two ENTRIES are measured, not the block around them: an entry is given
-    // its natural height, where the block is the flex child the scroll area left
-    // over, so feeding the block's height back would converge on whatever the
-    // first frame happened to grant it (zero, and it stayed zero). `chrome` is
-    // this function's own padding, border and button row, the same shape
-    // `app.g_input_h` uses for the chat composer.
-    g_composer_h = prompt_h + negative_h + composer_chrome;
+    if (cfg.studio_expand) expandRow(cfg);
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 4 } });
     defer row.deinit();
 
+    if (style.segmented(@src(), &.{ "Prompt", "Expand" }, @intFromBool(cfg.studio_expand))) |i| {
+        if ((i == 1) != cfg.studio_expand) {
+            cfg.studio_expand = i == 1;
+            expand_choice_moved = true;
+        }
+    }
     const st = &g_m.state;
     const generating = st.diff_busy or st.pending_images > 0;
     if (!ready) {
-        dvui.labelNoFmt(@src(), "Loading model…", .{}, .{
-            .font = F.ui,
-            .color_text = .{ .color = C.text_dim },
-            .padding = .{},
-            .gravity_y = 0.5,
-        });
+        statusNote("Loading model…", F.ui, C.text_dim);
     } else if (generating) {
         var n: [40]u8 = undefined;
-        dvui.labelNoFmt(@src(), std.mem.print(&n, "{d} in the queue", .{st.pending_images + 1}) catch "", .{}, .{
-            .font = F.mono,
-            .color_text = .{ .color = C.text_faint },
-            .padding = .{},
-            .gravity_y = 0.5,
-        });
+        statusNote(std.mem.print(&n, "{d} in the queue", .{st.pending_images + 1}) catch "", F.mono, C.text_faint);
     }
     {
         var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
         sp.deinit();
     }
     if (generating and bubbles.secondaryButton(@src(), 0, "Stop", true)) g_post(.img_cancel_all);
-    if (bubbles.primaryButton(@src(), "Generate", ready)) generate(cfg);
+    if (bubbles.primaryButton(@src(), "Generate", ready and canGenerate(cfg))) generate(cfg);
+}
+
+fn statusNote(text: []const u8, font: dvui.Font, color: dvui.Color) void {
+    dvui.labelNoFmt(@src(), text, .{}, .{
+        .font = font,
+        .color_text = .{ .color = color },
+        .padding = .{ .x = 10 },
+        .gravity_y = 0.5,
+    });
+}
+
+/// One of the composer's borderless text entries.
+fn entry(part: Part, buf: []u8, placeholder: []const u8, multiline: bool, font: dvui.Font, color: ?dvui.Color) void {
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = buf },
+        .multiline = multiline,
+        .placeholder = placeholder,
+        .scroll_horizontal = !multiline,
+        .break_lines = multiline,
+    }, .{
+        .id_extra = @intFromEnum(part),
+        .expand = .horizontal,
+        .background = false,
+        .border = .{},
+        .padding = .{},
+        .min_size_content = .{ .h = if (part == .prompt or part == .idea) 42 else 20 },
+        .max_size_content = .height(if (part == .prompt or part == .idea) 96 else 56),
+        .font = font,
+        .color_text = if (color) |c| .{ .color = c } else null,
+        .theme = style.noFocusTheme(),
+    });
+    te.deinit();
+}
+
+/// The prompt Expand mode last wrote, under the fields that made it, so what
+/// the model did with an idea is visible before its picture is.
+fn lastExpansion(text: []const u8) void {
+    var tl = dvui.textLayout(@src(), .{}, .{
+        .expand = .horizontal,
+        .background = false,
+        .max_size_content = .height(76),
+        .padding = .{ .y = 4 },
+    });
+    defer tl.deinit();
+    fonts.addStyled(tl, "Last prompt: ", .{}, .{ .font = F.row, .color_text = .{ .color = C.text_faint } });
+    fonts.addStyled(tl, text, .{}, .{ .font = F.row, .color_text = .{ .color = C.text_ghost } });
+}
+
+/// Expand mode's choices: the expander, the chat model's reasoning, one prompt
+/// per image or one for the batch. Or why Expand cannot run.
+fn expandRow(cfg: *config.Config) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 6 } });
+    defer row.deinit();
+    if (!g_cb.llm.configured) return statusNote("Expand needs a chat model: choose one in Settings.", F.ui, C.text_dim);
+    if (cfg.expanders.count == 0) return statusNote("No expanders: add one in Settings.", F.ui, C.text_dim);
+
+    // The expander: the model's own match unless one is picked by name.
+    var labels: [config.max_expanders + 1][]const u8 = undefined;
+    var auto_buf: [96]u8 = undefined;
+    const auto = cfg.expanderFor(promptStyle(cfg));
+    const picked = cfg.findExpander(cfg.studio_expander.slice());
+    labels[0] = std.mem.print(&auto_buf, "match the model: {s}", .{if (picked == null and auto != null) auto.?.name.slice() else "…"}) catch "match the model";
+    for (cfg.expanders.slice(), 1..) |*e, i| labels[i] = e.name.slice();
+    var choice: usize = if (picked) |i| i + 1 else 0;
+    if (style.chipDropdown(@src(), labels[0 .. cfg.expanders.count + 1], &choice, .{})) {
+        if (choice == 0) cfg.studio_expander.set("") else cfg.studio_expander.set(labels[choice]);
+        expand_choice_moved = true;
+    }
+
+    if (g_cb.llm.thinking) switch (bubbles.reasoningChips(@src(), cfg.studio_expand_reasoning, cfg.studio_expand_effort, g_cb.llm.effort, 8)) {
+        .none => {},
+        .toggle => {
+            cfg.studio_expand_reasoning = !cfg.studio_expand_reasoning;
+            expand_choice_moved = true;
+        },
+        .cycle_effort => {
+            cfg.studio_expand_effort = switch (cfg.studio_expand_effort) {
+                .high => .medium,
+                .medium => .low,
+                .low => .high,
+            };
+            expand_choice_moved = true;
+        },
+    };
+
+    var batch: usize = @intFromBool(cfg.studio_expand_shared);
+    if (style.chipDropdown(@src(), &.{ "a prompt per image", "one prompt for all" }, &batch, .{ .id_extra = 1, .margin_x = 8 })) {
+        cfg.studio_expand_shared = batch == 1;
+        expand_choice_moved = true;
+    }
+}
+
+/// The prompt style the configured model reads, prose when it is unknown.
+fn promptStyle(cfg: *const config.Config) config.PromptStyle {
+    const fam = currentFamily(cfg) orelse return .prose;
+    return model_spec.traits(fam).prompt_style;
+}
+
+/// Expand mode has what it needs: a chat model, an expander and an idea.
+fn canGenerate(cfg: *const config.Config) bool {
+    if (!cfg.studio_expand) return true;
+    if (!g_cb.llm.configured or cfg.expanderFor(promptStyle(cfg)) == null) return false;
+    return std.mem.trim(u8, std.mem.sliceTo(&idea_buf, 0), " \t\r\n").len > 0;
 }
 
 // ----------------------------------------------------------------- generate
 
-/// Ask the host for `count` generations from the current form values.
+/// Ask for `count` generations from the current form values: rendered from the
+/// prompt box, or in Expand mode from prompts the chat model writes.
 fn generate(cfg: *const config.Config) void {
     // Empty is allowed: it encodes to the unconditional embedding, which is a
     // render the model can do and some workflows want.
     const prompt = std.mem.trim(u8, std.mem.sliceTo(&prompt_buf, 0), " \t\r\n");
     const neg = std.mem.trim(u8, std.mem.sliceTo(&negative_buf, 0), " \t\r\n");
+    const idea = std.mem.trim(u8, std.mem.sliceTo(&idea_buf, 0), " \t\r\n");
 
     const dims = formDims(cfg);
     const steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
@@ -1792,36 +1964,67 @@ fn generate(cfg: *const config.Config) void {
     }
 
     var specs: [max_loras]wire.LoraSpec = undefined;
+    var sched_text: [max_loras][config.max_lora_schedule]u8 = undefined;
     var n_specs: usize = 0;
     for (0..f_lora_n) |i| {
         // A disabled row is OMITTED rather than passed at strength 0: a stack
         // entry costs its factors resident, and "off" should cost nothing.
         if (!f_lora_on[i]) continue;
-        specs[n_specs] = .{ .path = f_lora_path[i].slice(), .strength = f_lora_strength[i] };
+        specs[n_specs] = .{
+            .path = f_lora_path[i].slice(),
+            .strength = f_lora_strength[i],
+            .schedule = lora_schedule.text(&sched_text[n_specs], f_lora_sched[i]),
+        };
         n_specs += 1;
     }
 
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        g_post(.{ .img_enqueue = .{
-            .prompt = prompt,
-            .negative = neg,
-            .width = @intCast(dims.w),
-            .height = @intCast(dims.h),
-            .steps = @intCast(steps),
-            .cfg = cfg_scale,
-            // Random: the host draws a fresh distinct seed each (0). Fixed: the
-            // entered seed, advanced per image so a batch still varies.
-            .seed = if (random_seed) 0 else base_seed +% i,
-            .params = params,
-            .loras = specs[0..n_specs],
-            .from_studio = true,
-        } });
+    // Random: the host draws a fresh distinct seed each (0). Fixed: the entered
+    // seed, advanced per image so a batch still varies.
+    const recipe: wire.ImageRequest = .{
+        .prompt = prompt,
+        .negative = neg,
+        .width = @intCast(dims.w),
+        .height = @intCast(dims.h),
+        .steps = @intCast(steps),
+        .cfg = cfg_scale,
+        .seed = base_seed,
+        .params = params,
+        .loras = specs[0..n_specs],
+        .from_studio = true,
+    };
+    if (cfg.studio_expand) {
+        const expander = cfg.expanderFor(promptStyle(cfg)) orelse return;
+        g_cb.expand(.{
+            .recipe = recipe,
+            .count = @intCast(@min(count, std.math.maxInt(u32))),
+            .shared = cfg.studio_expand_shared,
+            .prefix = std.mem.sliceTo(&prefix_buf, 0),
+            .idea = idea,
+            .suffix = std.mem.sliceTo(&suffix_buf, 0),
+            .system = expander.text.slice(),
+            .think = cfg.studio_expand_reasoning,
+            .effort = switch (cfg.studio_expand_effort) {
+                .low => .low,
+                .medium => .medium,
+                .high => .high,
+            },
+        });
+    } else {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            var req = recipe;
+            if (!random_seed) req.seed = base_seed +% i;
+            g_post(.{ .img_enqueue = req });
+        }
     }
     // The canvas follows the newest render.
     g_selected = null;
-    // The prompt library is app.zig's; hand it the text and let it record.
-    recorded_prompt = .{ .prompt = prompt, .negative = neg };
+    // The prompt library is app.zig's; hand it the text and let it record. In
+    // Expand mode that is the idea: the prompt is the model's, not the user's.
+    recorded_prompt = .{ .prompt = if (cfg.studio_expand) idea else prompt, .negative = neg };
+    var ms: config.ModelSettings = .{ .steps = steps, .cfg_scale = cfg_scale, .sampler = f_sampler, .scheduler = f_scheduler };
+    ms.model.set(cfg.diffusion_model.slice());
+    remembered = ms;
 }
 
 test "reseeding the studio form asks for a random seed again" {
@@ -1835,6 +2038,51 @@ test "reseeding the studio form asks for a random seed again" {
     seed(&cfg, null);
     try std.testing.expect(random_seed);
     try std.testing.expectEqual(@as(u64, 0), parseU64(&seed_buf));
+}
+
+test "a model switch keeps the size, and brings the file's own settings or its family's" {
+    defer {
+        seeded = false;
+        seeded_family = null;
+        seeded_model = .{};
+    }
+    var cfg: config.Config = .{ .steps = 35, .cfg_scale = 0, .framing_ratio = .wide_16_9, .sampler = .euler_ancestral, .scheduler = .normal };
+    cfg.diffusion_model.set("/m/qwen_turbo.safetensors");
+    seeded = false;
+    syncForm(&cfg, .qwen_image21);
+    // Opened on a file with nothing remembered: the config, as before.
+    try std.testing.expectEqual(@as(usize, 35), parseNum(&steps_buf, 0));
+    try std.testing.expectEqual(config.Scheduler.normal, f_scheduler);
+
+    // What the user sets in the form.
+    ratio = .square;
+    setFmt(&steps_buf, "{d}", .{9});
+    // Another architecture, never rendered with: its recommendation, and the size kept.
+    cfg.diffusion_model.set("/m/krea.safetensors");
+    syncForm(&cfg, .krea2);
+    const k = model_spec.traits(.krea2);
+    try std.testing.expectEqual(k.steps, parseNum(&steps_buf, 0));
+    try std.testing.expectEqual(k.cfg, parseFloat(&cfg_buf, -1));
+    try std.testing.expectEqual(config.Scheduler.default, f_scheduler);
+    try std.testing.expectEqual(config.Sampler.euler_ancestral, f_sampler);
+    try std.testing.expectEqual(framing.Ratio.square, ratio);
+    try std.testing.expectEqual(@as(?model_spec.Family, .krea2), seeded_family);
+
+    // Back to a file with settings of its own: those, the size still kept.
+    var ms: config.ModelSettings = .{ .steps = 8, .cfg_scale = 1, .sampler = .euler, .scheduler = .karras };
+    ms.model.set("/m/qwen_turbo.safetensors");
+    cfg.rememberModelSettings(ms);
+    cfg.diffusion_model.set("/m/qwen_turbo.safetensors");
+    syncForm(&cfg, .qwen_image21);
+    try std.testing.expectEqual(@as(usize, 8), parseNum(&steps_buf, 0));
+    try std.testing.expectEqual(config.Sampler.euler, f_sampler);
+    try std.testing.expectEqual(config.Scheduler.karras, f_scheduler);
+    try std.testing.expectEqual(framing.Ratio.square, ratio);
+
+    // Every other frame on the same file leaves the form alone.
+    setFmt(&steps_buf, "{d}", .{12});
+    syncForm(&cfg, .qwen_image21);
+    try std.testing.expectEqual(@as(usize, 12), parseNum(&steps_buf, 0));
 }
 
 test "a preview smaller than its tile is grown to fill it, keeping its shape" {
@@ -1968,6 +2216,8 @@ pub fn saveDefaults(cfg: *config.Config, fam: ?model_spec.Family) void {
             if (cfg.addFamilyLora(key, f_lora_path[i].slice())) |l| {
                 l.strength = f_lora_strength[i];
                 l.enabled = f_lora_on[i];
+                var tb: [config.max_lora_schedule]u8 = undefined;
+                l.schedule.set(lora_schedule.text(&tb, f_lora_sched[i]));
             }
         }
     };

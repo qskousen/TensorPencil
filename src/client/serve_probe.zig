@@ -1,5 +1,6 @@
 //! `zig build serve-probe -- --config <file> [--message <text>] [--image <prompt>]
-//! [--kill-mid-turn [<deltas>]] [--timeout <s>] [--socket <path>]`: what
+//! [--complete <idea> [--think] [--cancel]] [--kill-mid-turn [<deltas>]] [--timeout <s>]
+//! [--socket <path>]`: what
 //! `driver-probe` does, through a tp-serve process over the socket. Without
 //! `--socket` it spawns `tp-serve` (the sibling binary this build installed) as
 //! tp-gui will, hands it the config, and prints every event as one JSON line.
@@ -10,6 +11,13 @@
 //! transcript this client holds, the message is sent again, and the run
 //! passes only if the second host's transcript starts with the first host's
 //! partial reply byte for byte.
+//!
+//! `--complete` asks for one `llm_complete` and passes once it is answered
+//! without an error. With `--message` too, the message is held until the host
+//! reports the completion running, so it arrives while the LLM is busy with it:
+//! the run then also needs that turn to end, which is what a message dropped as
+//! "busy" would never do. `--cancel` stops the completion as soon as it is seen
+//! running and then needs its answer to be `Stopped`.
 const std = @import("std");
 const Io = std.Io;
 const config = @import("shared").config;
@@ -32,6 +40,9 @@ pub fn main(init: std.process.Init) !void {
     var image: ?[]const u8 = null;
     var socket: ?[]const u8 = null;
     var kill_after: ?u32 = null;
+    var idea: ?[]const u8 = null;
+    var think = false;
+    var cancel = false;
     var timeout_s: u64 = 900;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -47,6 +58,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--socket") and i + 1 < args.len) {
             i += 1;
             socket = args[i];
+        } else if (std.mem.eql(u8, args[i], "--complete") and i + 1 < args.len) {
+            i += 1;
+            idea = args[i];
+        } else if (std.mem.eql(u8, args[i], "--think")) {
+            think = true;
+        } else if (std.mem.eql(u8, args[i], "--cancel")) {
+            cancel = true;
         } else if (std.mem.eql(u8, args[i], "--kill-mid-turn")) {
             kill_after = 5;
             if (i + 1 < args.len) if (std.fmt.parseInt(u32, args[i + 1], 10)) |n| {
@@ -57,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             timeout_s = try std.fmt.parseInt(u64, args[i], 10);
         } else {
-            std.debug.print("usage: serve-probe --config <file> [--message <text>] [--image <prompt>] [--kill-mid-turn [<deltas>]] [--timeout <s>] [--socket <path>]\n", .{});
+            std.debug.print("usage: serve-probe --config <file> [--message <text>] [--image <prompt>] [--complete <idea> [--think] [--cancel]] [--kill-mid-turn [<deltas>]] [--timeout <s>] [--socket <path>]\n", .{});
             return error.BadArgs;
         }
     }
@@ -65,6 +83,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("serve-probe: --config is required (never the real settings file)\n", .{});
         return error.BadArgs;
     };
+    if (idea != null and kill_after != null) {
+        std.debug.print("serve-probe: --complete and --kill-mid-turn are separate runs\n", .{});
+        return error.BadArgs;
+    }
     if (kill_after != null and (message == null or socket != null)) {
         std.debug.print("serve-probe: --kill-mid-turn needs --message and a spawned host (no --socket)\n", .{});
         return error.BadArgs;
@@ -97,7 +119,19 @@ pub fn main(init: std.process.Init) !void {
 
     remote.postRequest(.{ .settings = .{ .json = settings_json } });
     remote.postRequest(.snapshot);
-    if (message) |m| remote.postRequest(.{ .chat_submit = .{ .text = m } });
+    const complete_ref: u64 = 7;
+    if (idea) |text| remote.postRequest(.{ .llm_complete = .{
+        .ref = complete_ref,
+        .system = "You write prompts for an image model. Expand the idea you are given into one vivid image prompt of two or three sentences. Reply with the prompt only.",
+        .user = text,
+        .think = think,
+        .seed = 7,
+        .max_tokens = if (think) 1536 else 256,
+    } });
+    // Behind a completion, the message waits for it to start (see the module doc).
+    var hold_message = idea != null and message != null;
+    var cancel_pending = cancel;
+    if (message) |m| if (!hold_message) remote.postRequest(.{ .chat_submit = .{ .text = m } });
     if (image) |p| remote.postRequest(.{ .img_enqueue = .{
         .client_ref = 1,
         .prompt = p,
@@ -114,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
     defer mirror.deinit();
 
     var want_turn = message != null;
+    var want_completion = idea != null;
     var want_image = image != null;
     var image_id: wire.ImageId = 0;
     var want_pixels = false;
@@ -127,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
     defer frames.deinit(gpa);
     const deadline = Io.Clock.real.now(io).nanoseconds + @as(i96, @intCast(timeout_s)) * std.time.ns_per_s;
 
-    while (want_turn or want_image or want_pixels) {
+    while (want_turn or want_image or want_pixels or want_completion) {
         if (Io.Clock.real.now(io).nanoseconds > deadline) {
             try out.writeAll("{\"probe\":\"timeout\"}\n");
             try out.flush();
@@ -169,6 +204,30 @@ pub fn main(init: std.process.Init) !void {
                     switch (ev) {
                         .turn_end => want_turn = false,
                         .err => failed = true,
+                        .state => |st| if (st.completing) {
+                            if (cancel_pending) {
+                                cancel_pending = false;
+                                try out.writeAll("{\"probe\":\"cancelling the completion\"}\n");
+                                remote.postRequest(.{ .llm_complete_cancel = .{ .ref = complete_ref } });
+                            }
+                            if (hold_message) {
+                                hold_message = false;
+                                try out.writeAll("{\"probe\":\"message sent while completing\"}\n");
+                                remote.postRequest(.{ .chat_submit = .{ .text = message.? } });
+                            }
+                        },
+                        .llm_completion => |c| if (c.ref == complete_ref) {
+                            want_completion = false;
+                            if (cancel) {
+                                if (!std.mem.eql(u8, c.err, "Stopped")) failed = true;
+                            } else if (c.err.len > 0 or c.text.len == 0) failed = true;
+                            // The message was never sent: the host finished before it saw one.
+                            if (hold_message) {
+                                try out.writeAll("{\"probe\":\"completion ended before it was seen running\"}\n");
+                                failed = true;
+                                want_turn = false;
+                            }
+                        },
                         .delta => {
                             deltas += 1;
                             if (kill_after) |k| if (!killed and deltas >= k) {

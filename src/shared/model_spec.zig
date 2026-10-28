@@ -27,6 +27,7 @@
 //! exports those two facts, delete the tables and call it.
 const std = @import("std");
 const tp = @import("TensorPencil");
+const PromptStyle = @import("config.zig").PromptStyle;
 
 const pipeline = tp.pipeline;
 
@@ -373,7 +374,7 @@ pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
         }
         out.targets += 1;
         const depth = if (layerIndex(name)) |n| n + 1 else 0;
-        if (std.mem.startsWith(u8, name, lora.Sidecar.prefix)) {
+        if (std.mem.startsWith(u8, name, lora.Sidecar.prefix) or std.mem.startsWith(u8, name, lora.kohya_prefix)) {
             native = true;
             out.depth = @max(out.depth, depth);
         } else {
@@ -385,19 +386,23 @@ pub fn loraScan(store: tp.weights.WeightStore) ?LoraInfo {
     return if (out.targets == 0) null else out;
 }
 
-/// The deepest `layers.<N>.` or `blocks.<N>.` index in a tensor name, or null.
-/// `blocks.` also matches `transformer_blocks.` and `layerwise_blocks.`, which
-/// is the point: it is what tells a 60-block Qwen-Image LoRA from a Mage-Flow
-/// one, the two sharing every name and width.
+/// The deepest `layers.<N>.` or `blocks.<N>.` index in a tensor name, or null,
+/// with `_` for either dot in kohya's spelling. `blocks` also matches
+/// `transformer_blocks` and `layerwise_blocks`, which is the point: it is what
+/// tells a 60-block Qwen-Image LoRA from a Mage-Flow one, the two sharing every
+/// name and width.
 fn layerIndex(name: []const u8) ?u32 {
     var best: ?u32 = null;
-    for ([_][]const u8{ "layers.", "blocks." }) |key| {
+    for ([_][]const u8{ "layers", "blocks" }) |key| {
         var from: usize = 0;
         while (std.mem.findPos(u8, name, from, key)) |at| {
-            const rest = name[at + key.len ..];
             from = at + key.len;
-            const end = std.mem.findScalar(u8, rest, '.') orelse rest.len;
-            const n = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
+            const rest = name[from..];
+            if (rest.len < 2 or (rest[0] != '.' and rest[0] != '_')) continue;
+            var end: usize = 1;
+            while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+            if (end == 1 or (end < rest.len and rest[end] != '.' and rest[end] != '_')) continue;
+            const n = std.fmt.parseInt(u32, rest[1..end], 10) catch continue;
             best = @max(best orelse 0, n);
         }
     }
@@ -423,8 +428,11 @@ pub fn loraFits(store: tp.weights.WeightStore, fam: Family) bool {
     // One target, checked on both sides: `a` contracts the model's width and `b`
     // emits the linear's own. A LoRA for another variant of this architecture has
     // the right names and the wrong widths.
+    var kb: [256]u8 = undefined;
+    const kohya_probe = tp.models.lora.kohyaStem(&kb, spec.probe) orelse return false;
     if (info.sidecar and info.depth <= spec.layers and
-        loraTargetFits(store, tp.models.lora.Sidecar.prefix, spec.probe, spec.in_dim, spec.out_dim)) return true;
+        (loraTargetFits(store, tp.models.lora.Sidecar.prefix, spec.probe, spec.in_dim, spec.out_dim) or
+            loraTargetFits(store, tp.models.lora.kohya_prefix, kohya_probe, spec.in_dim, spec.out_dim))) return true;
     // A diffusers spelling: its targets are bare or `transformer.`, and only a family
     // whose key map lists those reads them.
     if (info.refused or !info.foreign or info.foreign_depth > spec.layers) return false;
@@ -541,6 +549,10 @@ pub const Traits = struct {
     /// shows a `VAE — none` row in amber, reporting a required piece missing
     /// that cannot exist, and the readiness check never passes.
     no_decoder: bool = false,
+    /// The prompt its text encoder reads best: tags for the CLIP families,
+    /// sentences for the ones that encode with an LLM. Picks Expand mode's
+    /// default expander.
+    prompt_style: PromptStyle = .prose,
     /// Default pixel frame count. 1 for every still-image family; a video family
     /// SNAPS this to its own grid, so read the shape back from
     /// `Session.latentShape` rather than trusting it.
@@ -671,6 +683,7 @@ pub fn traits(fam: Family) Traits {
             .label = "SD1.5 (UNet)",
             .short = "SD 1.5",
             .backends = &all_backends,
+            .prompt_style = .tags,
             .width = 512,
             .height = 512,
             .steps = 20,
@@ -684,6 +697,7 @@ pub fn traits(fam: Family) Traits {
             .short = "SDXL",
             .backends = &all_backends,
             .dual_conditioner = true,
+            .prompt_style = .tags,
             .width = 1024,
             .height = 1024,
             .steps = 20,
@@ -883,6 +897,17 @@ test "traits: each family has a label, a resolution and a positive step count" {
     }
 }
 
+test "traits: the CLIP families read tags and every LLM-encoded one reads prose" {
+    for (std.enums.values(Family)) |f| {
+        const want: PromptStyle = switch (f) {
+            .sd15, .sdxl => .tags,
+            else => .prose,
+        };
+        errdefer std.debug.print("{t} reads {t}\n", .{ f, traits(f).prompt_style });
+        try std.testing.expectEqual(want, traits(f).prompt_style);
+    }
+}
+
 test "traits: the families' defaults differ in the fields that matter" {
     // Swapping one family's CFG or resolution for another's is a visibly wrong
     // image, not a preference, these must not converge by accident.
@@ -1054,7 +1079,6 @@ test "a partial-depth LoRA fits, a DoRA fits, and a reshaped pad is refused" {
         const store: tp.weights.WeightStore = .{ .safetensors = &st };
         const info = loraScan(store).?;
         try std.testing.expectEqual(@as(u32, 2), info.targets);
-        try std.testing.expect(!info.sidecar);
         try std.testing.expect(loraFits(store, .sd15));
         try std.testing.expect(!loraFits(store, .sdxl));
         try std.testing.expect(!loraFits(store, .sensenova));

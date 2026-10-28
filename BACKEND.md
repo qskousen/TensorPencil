@@ -573,9 +573,17 @@ Where the apply runs:
   cuda keeps a 16-bit output's own width for B: cuBLASLt has no bf16 GEMM writing f16.
 - **Key spellings are the family's `lora.KeyMap`**: ComfyUI's `diffusion_model.` always,
   plus its trainers' prefixes; a bundled checkpoint's `model.diffusion_model.` also matches
-  (`lora.baseName`). Qwen-Image 2.1 takes diffusers' `transformer.` and bare names, and its
+  (`lora.baseName`). kohya's flattened `lora_unet_<name with _>` reads on every family,
+  mapped through the checkpoint's own tensor names (`KeyMap.names`); a flatten two names
+  share is refused. Qwen-Image 2.1 takes diffusers' `transformer.` and bare names, and its
   fused FFN-half keys (`gate_layer`, `proj`), which ComfyUI drops. The catalog offers a file
   by the same list (`loraFits`, `model_spec.loraSpec`) plus a block-depth bound.
+- **Schedules** (`--lora-schedule`, `lora.Schedule`): a file's strength by noise level, a
+  window or a curve. A change rebuilds the denoiser's cross-step caches
+  (`Denoiser.syncLora`), the one path every image family builds through, ~0.2 s on a
+  1024² krea2 int8 render; an H3 clip refuses one. Gate: `lora-schedule-test <ckpt>
+  <lora>` (each step against a fresh denoiser at that step's strength, exact). Run on
+  krea2, cuda and vulkan; the other families and zig-cuda are unrun.
 - **SD** keeps three stacks (UNet, CLIP-L, CLIP-G). Keys: LDM, diffusers, `lycoris_*`
   (`lora_sd.unetToDiffusers`), `lora_te`/`lora_te1` to CLIP-L, `lora_te2` to CLIP-G,
   including row blocks of the fused `in_proj_weight`.

@@ -216,6 +216,8 @@ pub const RenderParams = struct {
 pub const LoraSpec = struct {
     path: []const u8 = "",
     strength: f32 = 1.0,
+    /// `lora.Schedule`'s text form; empty is every step.
+    schedule: []const u8 = "",
 };
 
 /// One take of a message. Assistant messages accumulate variants as the user
@@ -323,6 +325,14 @@ pub const Request = union(enum) {
     /// render it placed on some other host.
     chat_note: struct { text: []const u8 = "" },
 
+    /// Run one prompt on the chat host's LLM, apart from the conversation: the
+    /// transcript and its KV are untouched. Queued behind chat turns; answered
+    /// by one `llm_completion` with the same `ref`.
+    llm_complete: Complete,
+    /// Drop a queued completion, or stop the running one. Either way its
+    /// `llm_completion` still comes, saying `Stopped`.
+    llm_complete_cancel: struct { ref: u64 = 0 },
+
     img_enqueue: ImageRequest,
     img_cancel: struct { image: ImageId = 0 },
     img_cancel_all,
@@ -344,6 +354,21 @@ pub const Request = union(enum) {
 };
 
 pub const PixelKind = enum { preview, pixels };
+
+pub const Effort = enum { low, medium, high };
+
+/// `llm_complete`'s request. `ref` is the client's own, echoed back.
+pub const Complete = struct {
+    ref: u64 = 0,
+    system: []const u8 = "",
+    user: []const u8 = "",
+    think: bool = false,
+    effort: Effort = .high,
+    /// The sampling seed; the host's sampling settings otherwise.
+    seed: u64 = 0,
+    /// Tokens the reply may take, its thought included.
+    max_tokens: u32 = 1024,
+};
 
 /// The small block of session and engine state a client renders from. Sent
 /// whole whenever any of it changes; it is tens of bytes.
@@ -377,6 +402,10 @@ pub const State = struct {
     thinking: bool = false,
     reasoning_effort: bool = false,
     weight_noise: bool = false,
+    /// A completion is running on the LLM (`llm_busy` stays a chat turn's).
+    completing: bool = false,
+    /// Completions queued or running.
+    completions: u32 = 0,
     diff_present: bool = false,
     diff_busy: bool = false,
     diff_paused: bool = false,
@@ -440,6 +469,7 @@ pub const LoraInfo = struct {
     name: []const u8 = "",
     hash: []const u8 = "",
     strength: f32 = 1.0,
+    schedule: []const u8 = "",
 };
 
 pub const Telemetry = struct {
@@ -494,6 +524,10 @@ pub const Event = union(enum) {
     /// host keeps no record of who heard them. Nothing is queued here; the
     /// client places each one and answers with `chat_image`.
     img_requested: struct { calls: []const ImageCall = &.{} },
+    /// One `llm_complete` finished: `text` is the answer with any thought
+    /// removed, or `err` names why there is none (`Stopped`, `ThoughtUnfinished`,
+    /// a load or device error). Sent once, to whoever is attached.
+    llm_completion: struct { ref: u64 = 0, text: []const u8 = "", err: []const u8 = "" },
     ctx: struct { tokens: u64 = 0, kv_bytes: u64 = 0 },
     /// The whole unified image list, in creation order (snapshot).
     queue: struct { images: []const ImageInfo = &.{} },
@@ -614,6 +648,30 @@ test "a populated transcript round-trips with its nested slices" {
     try testing.expectEqualStrings("</think>", msgs[1].variants[1].reason_close);
     try testing.expectEqual(@as(ImageId, 42), msgs[1].variants[1].images[0]);
     try testing.expectEqual(@as(?f64, 3.0), msgs[1].variants[1].stats.tgRate());
+}
+
+test "a completion request round-trips with every field set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const req: Request = .{ .llm_complete = .{
+        .ref = 1 << 40,
+        .system = "write prompts",
+        .user = "adventurer returning home",
+        .think = true,
+        .effort = .low,
+        .seed = 7,
+        .max_tokens = 300,
+    } };
+    const back = try decode(Request, a, try encodeAlloc(a, req));
+    const c = back.llm_complete;
+    try testing.expectEqual(@as(u64, 1 << 40), c.ref);
+    try testing.expectEqualStrings("write prompts", c.system);
+    try testing.expectEqualStrings("adventurer returning home", c.user);
+    try testing.expect(c.think);
+    try testing.expectEqual(Effort.low, c.effort);
+    try testing.expectEqual(@as(u64, 7), c.seed);
+    try testing.expectEqual(@as(u32, 300), c.max_tokens);
 }
 
 test "unknown fields are ignored and missing fields take their defaults" {

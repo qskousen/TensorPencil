@@ -797,6 +797,32 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             if (std.mem.eql(u8, args[i], "--text-encoder")) te = args[i + 1] else if (std.mem.eql(u8, args[i], "--vae")) vae = args[i + 1] else if (std.mem.eql(u8, args[i], "--backend")) backend = TensorPencil.pipeline.Backend.fromStr(args[i + 1]) orelse return error.InvalidArgs;
         }
         try loraRestackTest(arena, io, stdout, args[2], args[3], te, vae, backend);
+    } else if (args.len >= 4 and std.mem.eql(u8, args[1], "lora-schedule-test")) {
+        var te: []const u8 = "";
+        var vae: []const u8 = "";
+        var backend: TensorPencil.pipeline.Backend = .cuda;
+        var sched: TensorPencil.models.lora.Schedule = .{ .window = .{ .hi = 1, .lo = 0.85 } };
+        var steps: usize = 4;
+        var size: usize = 256;
+        var i: usize = 4;
+        while (i + 1 < args.len) : (i += 2) {
+            const f = args[i];
+            const v = args[i + 1];
+            if (std.mem.eql(u8, f, "--text-encoder")) {
+                te = v;
+            } else if (std.mem.eql(u8, f, "--vae")) {
+                vae = v;
+            } else if (std.mem.eql(u8, f, "--backend")) {
+                backend = TensorPencil.pipeline.Backend.fromStr(v) orelse return error.InvalidArgs;
+            } else if (std.mem.eql(u8, f, "--schedule")) {
+                sched = try TensorPencil.models.lora.Schedule.parse(v);
+            } else if (std.mem.eql(u8, f, "--steps")) {
+                steps = try std.fmt.parseInt(usize, v, 10);
+            } else if (std.mem.eql(u8, f, "--size")) {
+                size = try std.fmt.parseInt(usize, v, 10);
+            } else return error.InvalidArgs;
+        }
+        try loraScheduleTest(io, stdout, args[2], args[3], sched, steps, size, te, vae, backend);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lora-info")) {
         try loraInfo(arena, io, stdout, args[2..]);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "diffusion-profile")) {
@@ -1010,6 +1036,13 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\                         "model.diffusion_model." key prefix is also
             \\                         auto-detected. Default: krea2 Fp8
             \\      --vae <path>       VAE decoder checkpoint
+            \\      --lora <path[:strength]>  a LoRA sidecar; repeat for a stack
+            \\      --lora-strength S  the most recent --lora's dial
+            \\      --lora-schedule S  when the most recent --lora applies, by noise
+            \\                         level (1 = pure noise, 0 = finished):
+            \\                         always | window:HI-LO | curve:L=G,L=G,...
+            \\                         window:1-0.93 is the first two of krea2's
+            \\                         8 default steps
             \\      --te-act / --dit-act / --vae-act <auto|f32|f16|bf16>
             \\                         activation precision of the text encoder, the
             \\                         denoiser (--unet-act is the same) and the VAE.
@@ -1079,6 +1112,10 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\  TensorPencil lora-restack-test <ckpt> <lora> [--backend cuda|zig-cuda|vulkan]
             \\      swap a LoRA stack on a live session: the image must come back
             \\      bit-identical and the factors' VRAM be handed back
+            \\  TensorPencil lora-schedule-test <ckpt> <lora> [--schedule S] [--steps N] [--size N] [--backend B] [--text-encoder P] [--vae P]
+            \\      a scheduled LoRA (default window:1-0.85) against a fresh denoiser per
+            \\      step at that step's strength, which shares none of the cached state;
+            \\      non-zero on any byte of difference or if the gate changes nothing
             \\  TensorPencil lora-info <lora>...
             \\      load each file as a sidecar stack would: targets, ranks and the
             \\      resident bytes, rank padding included
@@ -3606,6 +3643,7 @@ fn renderParams(
         .name = std.Io.Dir.path.stem(l.path),
         .hash = hashes.autoV2(arena, io, l.path),
         .strength = l.strength,
+        .schedule = if (l.schedule == .always) "" else try arena.print("{f}", .{l.schedule}),
     });
     const used = TensorPencil.pipeline.usedPath;
     // A VAE baked into the checkpoint gets no field, as in A1111.
@@ -4493,7 +4531,7 @@ fn mageflowCudaTest(
         });
     }
     mageflow_cuda.force_naive_attn = saved;
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{})) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{ .names = store.names() })) |st| {
         failures += try reportAttach(stdout, st, try model.attachLora(arena, st), layers != 0);
         try TensorPencil.models.lin_cuda.quantizeLora(arena, st, model.device_lins, TensorPencil.models.lin_cuda.blockq_gemm, .w8a8);
         const want_l = try arena.alloc(f32, x_lat.len);
@@ -5052,7 +5090,7 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         });
     }
     zimage_cuda.force_naive_attn = saved;
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{ .renames = &zimage.lora_keys })) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{ .renames = &zimage.lora_keys, .names = ck.store().names() })) |st| {
         failures += try reportAttach(stdout, st, try model.attachLora(arena, st), layers != 0);
         try TensorPencil.models.lin_cuda.quantizeLora(arena, st, model.device_lins, TensorPencil.models.lin_cuda.blockq_gemm, .w8a8);
         // The caption half and the AdaLN linears are patched too, so both are rebuilt.
@@ -6434,7 +6472,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
         failures += try animaForwardCheck(arena, io, stdout, be, &model, depth, qdt, rnd);
     }
 
-    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{})) |st| {
+    if (try openTestLora(arena, io, stdout, lora.path, lora.strength, .{ .names = dstore.names() })) |st| {
         var cfg = full;
         if (lora_layers != 0) cfg.n_layers = lora_layers;
         var model = try anima.DiT.load(arena, dstore, cfg);
@@ -7894,7 +7932,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         if (!std.math.isFinite(rel) or rel > checkTol(tol)) return error.GpuMismatch;
         try stdout.print("cuda DiT forward OK ({s}; int4 vs W4A16 ref includes activation-quant)\n", .{qtag});
 
-        const st = (try openTestLora(arena, io, stdout, lora_path, strength, .{})) orelse return;
+        const st = (try openTestLora(arena, io, stdout, lora_path, strength, .{ .names = container.store().names() })) orelse return;
         var control: f64 = 0;
         // The control row: the same delta comparison for a small change of the INPUT,
         // with no sidecar anywhere. The LoRA's delta figure means something only
@@ -8209,6 +8247,15 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 return error.InvalidArgs;
             }
             loras.items[loras.items.len - 1].strength = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, flag, "--lora-schedule")) {
+            if (loras.items.len == 0) {
+                try stdout.print("--lora-schedule before any --lora\n", .{});
+                return error.InvalidArgs;
+            }
+            loras.items[loras.items.len - 1].schedule = TensorPencil.models.lora.Schedule.parse(val) catch {
+                try stdout.print("bad --lora-schedule '{s}' (expected: always, window:HI-LO, curve:L=G,...)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--dit-gguf-gemm")) {
             TensorPencil.models.lin_cuda.blockq_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.BlockQGemm, val) orelse {
                 try stdout.print("unknown gguf gemm target '{s}' (expected: auto, int8, int4, bf16, f16, mmq)\n", .{val});
@@ -8328,9 +8375,10 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             var im = try sess.generate(per, stdout);
             defer im.deinit(arena);
             const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e9;
+            const params = try renderParams(arena, io, &per, &im, im.width, im.height);
             var png: std.ArrayList(u8) = .empty;
             defer png.deinit(arena);
-            try TensorPencil.image.encodePngRgb(arena, &png, im.rgb, im.width, im.height);
+            try im.encodePng(arena, &png, &.{.{ .keyword = "parameters", .text = params }});
             const p = try arena.print("{s}.{d}.png", .{ out_path, n });
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = png.items });
             try stdout.print("[repeat] image {d}/{d} in {d:.1}s -> {s}\n", .{ n + 1, repeat, dt, p });
@@ -9820,6 +9868,127 @@ fn loraInfo(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             b, @as(f64, @floatFromInt(b)) / 1048576.0, pad, @as(f64, @floatFromInt(pad)) / 1048576.0, @as(f64, @floatFromInt(b - pad)) / 1048576.0,
         });
     }
+}
+
+/// `lora-schedule-test <ckpt> <lora>`: a scheduled LoRA must give, at every step,
+/// exactly the velocity a FRESH denoiser gives with the dial set by hand to that
+/// step's strength. Fresh, because every family caches parts of its forward across
+/// steps through LoRA-patched linears, and a reference reusing the denoiser would
+/// share whatever those caches were built at. Non-zero exit on any difference.
+fn loraScheduleTest(io: Io, stdout: *Io.Writer, ckpt: []const u8, lora_path: []const u8, sched: TensorPencil.models.lora.Schedule, steps: usize, size: usize, te: []const u8, vae: []const u8, backend: TensorPencil.pipeline.Backend) !void {
+    const pipeline = TensorPencil.pipeline;
+    const gpa = std.heap.smp_allocator;
+    const dial: f32 = 1.0;
+    const specs = [_]pipeline.LoraSpec{.{ .path = lora_path, .strength = dial, .schedule = sched }};
+    var opts: pipeline.Options = .{
+        .prompt = "a red ceramic cube on a wooden table",
+        .dit_path = ckpt,
+        .width = size,
+        .height = size,
+        .backend = backend,
+        .preview = false,
+        .loras = &specs,
+    };
+    if (te.len > 0) {
+        opts.text_encoder_path = te;
+        opts.explicit_text_encoder = true;
+    }
+    if (vae.len > 0) {
+        opts.vae_path = vae;
+        opts.explicit_vae = true;
+    }
+    try stdout.print("== lora-schedule-test ==\nckpt: {s}\nlora: {s}\nschedule: {f}\n", .{ ckpt, lora_path, sched });
+    var sess = pipeline.Session.init(io, gpa, opts, stdout) catch |err| {
+        try stdout.print("cannot load: {t}\n", .{err});
+        try stdout.flush();
+        std.process.exit(1);
+    };
+    defer sess.deinit();
+    if (!sess.family().supportsLora()) {
+        try stdout.print("{t} has no sidecar path in this build; nothing to test\n", .{sess.family()});
+        return;
+    }
+
+    var cond = try sess.encode(gpa, opts.prompt, .{});
+    defer cond.deinit(gpa);
+    const sigmas = try sess.schedule(gpa, steps, opts.shift);
+    defer gpa.free(sigmas);
+    const ds = sess.spatialDownscale();
+    const lat_h = size / ds;
+    const lat_w = size / ds;
+    const n = sess.latentChannels() * lat_h * lat_w;
+
+    // The scheduled run: one denoiser across every step, as `generate` drives it.
+    // Each step's input is kept so the reference sees the same latents.
+    const xs = try gpa.alloc(f32, steps * n);
+    defer gpa.free(xs);
+    const vs = try gpa.alloc(f32, steps * n);
+    defer gpa.free(vs);
+    {
+        const x = try gpa.alloc(f32, n);
+        defer gpa.free(x);
+        var prng = std.Random.DefaultPrng.init(7);
+        for (x) |*v| v.* = prng.random().floatNorm(f32);
+        sess.scaleInitialNoise(x, sigmas[0], .{ .channels = sess.latentChannels(), .h = lat_h, .w = lat_w });
+        var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
+        defer den.deinit(gpa);
+        for (0..steps) |i| {
+            @memcpy(xs[i * n ..][0..n], x);
+            const v = vs[i * n ..][0..n];
+            try den.predict(gpa, v, x, sigmas[i], null);
+            const dt = sigmas[i + 1] - sigmas[i];
+            for (x, v) |*e, d| e.* += dt * d;
+        }
+    }
+
+    sess.setLoraSchedule(0, .always);
+    const Stat = struct { max: f32 = 0, count: usize = 0 };
+    const diff = struct {
+        fn f(a: []const f32, b: []const f32) Stat {
+            var s: Stat = .{};
+            for (a, b) |p, q| if (@as(u32, @bitCast(p)) != @as(u32, @bitCast(q))) {
+                s.count += 1;
+                s.max = @max(s.max, @abs(p - q));
+            };
+            return s;
+        }
+    }.f;
+    const fresh = try gpa.alloc(f32, n);
+    defer gpa.free(fresh);
+    const again = try gpa.alloc(f32, n);
+    defer gpa.free(again);
+    const full = try gpa.alloc(f32, n);
+    defer gpa.free(full);
+    var failed = false;
+    var teeth = false;
+    try stdout.print("step  sigma   level   strength  vs fresh (diff/max)   control   gate effect\n", .{});
+    for (0..steps) |i| {
+        const x = xs[i * n ..][0..n];
+        const strength = dial * sched.gain(sess.noiseLevel(sigmas[i]));
+        sess.setLoraStrength(0, strength);
+        for ([_][]f32{ fresh, again }) |out| {
+            var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas[i..]);
+            defer den.deinit(gpa);
+            try den.predict(gpa, out, x, sigmas[i], null);
+        }
+        sess.setLoraStrength(0, dial);
+        {
+            var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas[i..]);
+            defer den.deinit(gpa);
+            try den.predict(gpa, full, x, sigmas[i], null);
+        }
+        const got = diff(vs[i * n ..][0..n], fresh);
+        const ctl = diff(fresh, again);
+        const eff = diff(fresh, full);
+        if (strength != dial and eff.count > 0) teeth = true;
+        if (got.count > 0) failed = true;
+        try stdout.print("{d:>4}  {d:.4}  {d:.4}  {d:>8.3}  {d:>9}/{e:.2}  {d:>8}  {e:.2}\n", .{ i, sigmas[i], sess.noiseLevel(sigmas[i]), strength, got.count, got.max, ctl.count, eff.max });
+        if (ctl.count > 0) try stdout.print("      the same forward twice differs: this backend is not deterministic here, so the row above is noise\n", .{});
+    }
+    if (!teeth) try stdout.print("NO TEETH: no gated-off step changed the velocity; widen --steps or the schedule\n", .{});
+    try stdout.print("{s}\n", .{if (failed or !teeth) "FAIL" else "PASS"});
+    try stdout.flush();
+    if (failed or !teeth) std.process.exit(1);
 }
 
 /// `lora-restack-test <ckpt> <lora>`: swap a LoRA stack on a LIVE session and
@@ -11741,7 +11910,7 @@ fn loraCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: boo
             pr.stack = .{};
             for ([_]f32{ strength, 0.6 }) |s| try pr.stack.files.append(a, .{
                 .side = .{ .arena = std.heap.ArenaAllocator.init(a), .index = .empty, .unclaimed = 0 },
-                .strength = s,
+                .dial = s,
                 .path = "synthetic",
             });
         }

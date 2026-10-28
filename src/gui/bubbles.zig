@@ -19,6 +19,7 @@ const dvui = @import("dvui");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const markdown_view = @import("markdown_view.zig");
+const ReasoningEffort = @import("shared").config.ReasoningEffort;
 
 const C = style.C;
 /// Widest a tool-call tile is allowed to be. Big enough to watch a render
@@ -398,6 +399,32 @@ pub fn toolCard(src: std.lang.SourceLocation, tc: ToolCall, cb: ToolActions) voi
 }
 
 /// The light-on-dark primary action. Never amber: a button is the user acting.
+/// What a `reasoningChips` click asks for.
+pub const ReasoningClick = enum { none, toggle, cycle_effort };
+
+/// The thinking toggle, and beside it the effort chip when the model takes one
+/// and thinking is on. The chat and the studio each keep their own setting and
+/// draw it here, so the two read the same.
+pub fn reasoningChips(src: std.lang.SourceLocation, on: bool, effort: ReasoningEffort, show_effort: bool, margin_x: f32) ReasoningClick {
+    var row = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+    defer row.deinit();
+    var click: ReasoningClick = .none;
+    if (style.chip(@src(), if (on) "thinking: on" else "thinking: off", .{
+        .margin_x = margin_x,
+        .fill = if (on) style.over(style.C.chip, style.C.blue, 0.16) else style.C.chip,
+        .text = if (on) style.C.blue else style.C.text_dim,
+    })) click = .toggle;
+    if (on and show_effort) {
+        const label = switch (effort) {
+            .high => "effort: high",
+            .medium => "effort: medium",
+            .low => "effort: low",
+        };
+        if (style.chip(@src(), label, .{ .margin_x = 8 })) click = .cycle_effort;
+    }
+    return click;
+}
+
 pub fn primaryButton(src: std.lang.SourceLocation, label: []const u8, enabled: bool) bool {
     var bw: dvui.ButtonWidget = undefined;
     bw.init(src, .{}, .{

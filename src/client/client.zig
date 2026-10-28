@@ -10,6 +10,7 @@ pub const hosts = @import("hosts.zig");
 pub const models = @import("models.zig");
 pub const sync = @import("sync.zig");
 pub const sched = @import("sched.zig");
+pub const expand = @import("expand.zig");
 
 test {
     _ = sync;
@@ -22,4 +23,5 @@ test {
     _ = remote;
     _ = hosts;
     _ = models;
+    _ = expand;
 }

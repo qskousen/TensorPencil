@@ -20,6 +20,7 @@ const kv_gpu = @import("kv_gpu.zig");
 const init_defaults = @import("tp_core").init_defaults;
 const sample = @import("tp_core").sample;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 const build_options = @import("build_options");
 const cuda = @import("tp_gpu").cuda;
@@ -152,10 +153,10 @@ pub const VulkanLM = struct {
     lin: lin_gpu.Lin,
     lin_plan: lin_gpu.Plan,
     /// One K and V per attention slot.
-    kv: kv_gpu.Kv,
+    kv: kv_gpu.Kv = .empty,
     /// Per-linear-layer recurrent state.
-    conv_state: []Buf,
-    ssm_state: []Buf,
+    conv_state: []Buf = &.{},
+    ssm_state: []Buf = &.{},
     freqs_d: Buf,
     sin_off: usize,
     /// The step's (t, h, w) position triple, and a chunk's, one per row.
@@ -193,6 +194,88 @@ pub const VulkanLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `state` and `freqs`, present exactly when a split is armed.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        pos_next: usize = 0,
+        kv: kv_gpu.Kv = .empty,
+        conv_state: []Buf = &.{},
+        ssm_state: []Buf = &.{},
+        host: ?Host = null,
+
+        pub const Host = struct { state: qwen35.State, freqs: ops.rope.Freqs };
+    };
+
+    /// An empty sequence for the current layer placement (see `qwen35_cuda`'s).
+    fn seqAlloc(self: *const VulkanLM, initial: usize, max: usize) !Seq {
+        const ctx = self.be;
+        const cfg = self.cfg;
+        const gpa = self.gpa;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        s.kv = try kv_gpu.Kv.init(gpa, ctx, cfg.nAttnLayers(), initial, cfg.kvDim(), self.kv_dtype, &.{});
+        if (self.split) |*sp| for (sp.on_gpu, 0..) |on, l| {
+            if (!on and !cfg.isRecurrent(l)) s.kv.release(ctx, l / cfg.full_attn_interval);
+        };
+        const n_lin = cfg.n_layers - cfg.nAttnLayers();
+        s.conv_state = try gpa.alloc(Buf, n_lin);
+        @memset(s.conv_state, .none);
+        s.ssm_state = try gpa.alloc(Buf, n_lin);
+        @memset(s.ssm_state, .none);
+        for (s.conv_state, s.ssm_state) |*cs, *ss| {
+            cs.* = try ctx.tensorCreate(convBytes(cfg));
+            ss.* = try ctx.tensorCreate(ssmBytes(cfg));
+            try zeroBuf(ctx, gpa, cs.*, convBytes(cfg));
+            try zeroBuf(ctx, gpa, ss.*, ssmBytes(cfg));
+        }
+        if (self.split != null) {
+            var state = try qwen35.State.init(gpa, cfg, initial, self.kv_dtype);
+            errdefer state.deinit(gpa);
+            s.host = .{ .state = state, .freqs = try ops.rope.rotateHalfFreqs(gpa, initial, cfg.rope_dim, cfg.rope_theta) };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const VulkanLM, s: *Seq) void {
+        const ctx = self.be;
+        s.kv.deinit(self.gpa, ctx);
+        for (s.conv_state) |*b| ctx.tensorDestroy(b);
+        for (s.ssm_state) |*b| ctx.tensorDestroy(b);
+        self.gpa.free(s.conv_state);
+        self.gpa.free(s.ssm_state);
+        if (s.host) |*h| {
+            h.state.deinit(self.gpa);
+            h.freqs.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` rows that never grows (see `qwen35_cuda`'s).
+    pub fn seqCreate(self: *VulkanLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *VulkanLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(qwen35.State, &sp.state, &h.state);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs, &h.freqs);
+        } else std.debug.assert(s.host == null);
+    }
+
+    /// Free a sequence made by `seqCreate`, after the device is done with it: a
+    /// stopped run can leave a submitted batch still reading its KV.
+    pub fn seqDestroy(self: *VulkanLM, s: *Seq) void {
+        self.be.waitIdle();
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen35.Model, cap: kvmod.Capacity) !VulkanLM {
         return initUse(gpa, ctx, lm, cap, lin_gpu.Use.llm(prefill_chunk));
     }
@@ -209,15 +292,8 @@ pub const VulkanLM = struct {
         self.lm = lm;
         self.cfg = cfg;
         self.gpa = gpa;
-        self.capacity = @max(@min(cap.initial, cap.max), 1);
-        self.initial_capacity = self.capacity;
-        self.max_capacity = cap.max;
+        self.initial_capacity = @max(@min(cap.initial, cap.max), 1);
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
-        self.pos_next = 0;
-        self.boundary = null;
-        self.io = null;
-        self.split = null;
         ctx.weight_noise.setDepth(cfg.n_layers);
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, cfg.rope_dim, cfg.rope_theta);
@@ -246,17 +322,15 @@ pub const VulkanLM = struct {
         for (lins) |w| if (w.bytes.ptr != lm.head.bytes.ptr) try batched.append(alloc, w);
         try lin_gpu.presize(ctx, self.lin_plan, batched.items);
 
-        self.kv = try kv_gpu.Kv.init(gpa, ctx, cfg.nAttnLayers(), self.capacity, cfg.kvDim(), cap.kv_dtype, &.{});
+        var first = try self.seqAlloc(self.initial_capacity, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
+        }
 
         const n_lin = cfg.n_layers - cfg.nAttnLayers();
-        self.conv_state = try alloc.alloc(Buf, n_lin);
-        self.ssm_state = try alloc.alloc(Buf, n_lin);
-        for (self.conv_state, self.ssm_state) |*cs, *ss| {
-            cs.* = try ctx.tensorCreate(convBytes(cfg));
-            ss.* = try ctx.tensorCreate(ssmBytes(cfg));
-            try zeroBuf(ctx, gpa, cs.*, convBytes(cfg));
-            try zeroBuf(ctx, gpa, ss.*, ssmBytes(cfg));
-        }
 
         self.a_dt = try alloc.alloc([]f32, n_lin);
         var lin_idx: usize = 0;
@@ -285,11 +359,11 @@ pub const VulkanLM = struct {
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.be;
         self.freeSplit();
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         self.bufs.deinit(ctx);
         inline for (.{ "freqs_d", "pos3_d", "pos3s_d" }) |f| ctx.tensorDestroy(&@field(self, f));
-        self.kv.deinit(self.gpa, ctx);
-        for (self.conv_state) |*b| ctx.tensorDestroy(b);
-        for (self.ssm_state) |*b| ctx.tensorDestroy(b);
         self.lin.deinit();
         self.arena.deinit();
     }

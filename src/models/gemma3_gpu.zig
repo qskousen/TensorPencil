@@ -26,6 +26,7 @@ const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 const sample = @import("tp_core").sample;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 const build_options = @import("build_options");
 
@@ -69,7 +70,7 @@ pub const VulkanLM = struct {
     max_capacity: usize,
     kv_dtype: kvmod.KvDtype = .f32,
     len: usize,
-    kv: kv_gpu.Kv,
+    kv: kv_gpu.Kv = .empty,
     lin: lin_gpu.Lin,
     lin_plan: lin_gpu.Plan,
     /// Global (theta 1e6, scale 1/8) and local (theta 1e4) RoPE tables, each
@@ -115,6 +116,69 @@ pub const VulkanLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `cache` and RoPE tables, present exactly when a split is armed.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        kv: kv_gpu.Kv = .empty,
+        host: ?Host = null,
+
+        pub const Host = struct { cache: kvmod.KvCache, freqs_global: ops.rope.Freqs, freqs_local: ops.rope.Freqs };
+    };
+
+    /// An empty sequence for the current layer placement.
+    fn seqAlloc(self: *const VulkanLM, initial: usize, max: usize) !Seq {
+        const cfg = self.cfg;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        s.kv = try self.newKv(initial, self.kv_dtype);
+        if (self.split) |*sp| {
+            for (sp.on_gpu, 0..) |on, l| if (!on) s.kv.release(self.be, l);
+            var cache = try kvmod.KvCache.init(self.gpa, cfg.n_layers, initial, cfg.kvDim(), self.kv_dtype);
+            errdefer cache.deinit(self.gpa);
+            var fg = try ops.rope.rotateHalfFreqsScaled(self.gpa, initial, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
+            errdefer fg.deinit(self.gpa);
+            const fl = try ops.rope.rotateHalfFreqsScaled(self.gpa, initial, cfg.head_dim, cfg.rope_theta_local, 1.0);
+            s.host = .{ .cache = cache, .freqs_global = fg, .freqs_local = fl };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const VulkanLM, s: *Seq) void {
+        s.kv.deinit(self.gpa, self.be);
+        if (s.host) |*h| {
+            h.cache.deinit(self.gpa);
+            h.freqs_global.deinit(self.gpa);
+            h.freqs_local.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` rows that never grows (see `gemma3_cuda`'s).
+    pub fn seqCreate(self: *VulkanLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *VulkanLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(kvmod.KvCache, &sp.cache, &h.cache);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs_global, &h.freqs_global);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs_local, &h.freqs_local);
+        } else std.debug.assert(s.host == null);
+    }
+
+    /// Free a sequence made by `seqCreate` once the device is done with it.
+    pub fn seqDestroy(self: *VulkanLM, s: *Seq) void {
+        self.be.waitIdle();
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const gemma3.Model, cap: kvmod.Capacity) !VulkanLM {
         const cfg = lm.cfg;
         var self: VulkanLM = init_defaults.of(VulkanLM);
@@ -122,16 +186,8 @@ pub const VulkanLM = struct {
         self.lm = lm;
         self.cfg = cfg;
         self.gpa = gpa;
-        self.capacity = @max(@min(cap.initial, cap.max), 1);
-        self.initial_capacity = self.capacity;
-        self.max_capacity = cap.max;
+        self.initial_capacity = @max(@min(cap.initial, cap.max), 1);
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
-        self.bidir_end = 0;
-        self.residual_pending = false;
-        self.boundary = null;
-        self.io = null;
-        self.split = null;
         self.sin_off = cap.max * (cfg.head_dim / 2);
         ctx.weight_noise.setDepth(cfg.n_layers);
 
@@ -155,8 +211,13 @@ pub const VulkanLM = struct {
         self.freqs_local = try uploadFreqs(ctx, gpa, cap.max, cfg.head_dim, cfg.rope_theta_local, 1.0);
         errdefer ctx.tensorDestroy(&self.freqs_local);
 
-        self.kv = try self.newKv(self.capacity, cap.kv_dtype);
-        errdefer self.kv.deinit(gpa, ctx);
+        var first = try self.seqAlloc(self.initial_capacity, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
+        }
         self.bufs = try Bufs.init(ctx, cfg);
         return self;
     }
@@ -187,7 +248,9 @@ pub const VulkanLM = struct {
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.be;
         self.freeSplit();
-        self.kv.deinit(self.gpa, ctx);
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         ctx.tensorDestroy(&self.freqs_global);
         ctx.tensorDestroy(&self.freqs_local);
         self.bufs.deinit(ctx);

@@ -198,8 +198,8 @@ test "a whole job's text reaches no file the host wrote and no line it logged" {
 
     try acc.start();
 
-    // A turn and a render, both carrying the canary, plus an upload: every
-    // verb that takes something the user wrote.
+    // A turn, a completion and a render, all carrying the canary, plus an
+    // upload: every verb that takes something the user wrote.
     const control = try link_mod.connect(gpa, io, listener.endpoint);
     {
         const body = try wire.encodeAlloc(gpa, wire.Request{ .chat_submit = .{ .text = canary ++ " draw me a fox" } });
@@ -212,6 +212,17 @@ test "a whole job's text reaches no file the host wrote and no line it logged" {
         const body = try wire.encodeAlloc(gpa, wire.Request{ .img_enqueue = .{
             .prompt = canary ++ " a fox in snow",
             .negative = canary ++ " blurry",
+        } });
+        defer gpa.free(body);
+        const r = try httpc.request(gpa, control, "POST", "/v1/req", "application/json", body, 1 << 16);
+        defer gpa.free(r.body);
+        try testing.expectEqual(@as(u16, 202), r.status);
+    }
+    {
+        const body = try wire.encodeAlloc(gpa, wire.Request{ .llm_complete = .{
+            .ref = 1,
+            .system = canary ++ " write prompts",
+            .user = canary ++ " adventurer returning home",
         } });
         defer gpa.free(body);
         const r = try httpc.request(gpa, control, "POST", "/v1/req", "application/json", body, 1 << 16);

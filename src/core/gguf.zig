@@ -265,6 +265,11 @@ pub const Gguf = struct {
         defer if (!keep_file) file.close(io);
         const len = try file.length(io);
         if (len < 24) return error.FileTooSmall;
+        // Both paths below pull in the whole file (a read, or a prefetch of the
+        // mapping), so a wrong pick is caught here.
+        var magic: [4]u8 = undefined;
+        if (try file.readPositionalAll(io, &magic, 0) != magic.len) return error.ShortRead;
+        if (!std.mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
 
         if (!safetensors.useMmap()) {
             const buf = try gpa.alloc(u8, @intCast(len));
@@ -972,6 +977,24 @@ test "openHeader grows past a short first chunk and keeps no bytes" {
     // Declared data past the end of the file is still caught from the header.
     try tmp.dir.writeFile(io, .{ .sub_path = "cut.gguf", .data = file[0 .. file.len - 8] });
     try std.testing.expectError(error.InvalidOffsets, Gguf.openHeaderChunked(gpa, io, tmp.dir, "cut.gguf", 24));
+}
+
+test "open rejects a file that is not GGUF before reading its body" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A safetensors header: what a text encoder picked as a chat model starts with.
+    try tmp.dir.writeFile(io, .{ .sub_path = "te.safetensors", .data = "\x10\x00\x00\x00\x00\x00\x00\x00{\"a\":1}         xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" });
+
+    const saved = safetensors.read_mode;
+    defer safetensors.read_mode = saved;
+    // A failing allocator: the buffered read allocates the whole file first, so
+    // OutOfMemory there means the body was read before the magic was checked.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for ([_]safetensors.ReadMode{ .buffered, .pread }) |mode| {
+        safetensors.read_mode = mode;
+        try std.testing.expectError(error.InvalidMagic, Gguf.openIn(failing.allocator(), io, tmp.dir, "te.safetensors"));
+    }
 }
 
 test "reject malformed gguf" {

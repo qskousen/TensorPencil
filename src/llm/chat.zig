@@ -64,6 +64,15 @@ pub fn setReasoningEffort(effort: ReasoningEffort) void {
     reasoning_effort = effort;
 }
 
+/// A prompt's reasoning request, for a caller that builds one apart from the
+/// chat's own setting (`appendSystemFor`, `openAssistantFor`).
+pub const Think = struct { on: bool, effort: ReasoningEffort = .high };
+
+/// The chat's own reasoning setting.
+pub fn liveThink() Think {
+    return .{ .on = enable_thinking, .effort = reasoning_effort };
+}
+
 /// Delimiters of a family's reasoning block as they appear in the *generated
 /// text* (decoded tokens): `open` starts the thought, `close` ends it. null =>
 /// the family has no reasoning channel and the thinking toggle is a no-op.
@@ -138,9 +147,14 @@ pub fn reasoningForEffort(f: Family, effort: ReasoningEffort) ?Reasoning {
 /// A family with selectable effort keeps the family answer, since its template names
 /// every variant's markers and only the request says which one this turn asked for.
 pub fn reasoning() ?Reasoning {
+    return reasoningAt(reasoning_effort);
+}
+
+/// `reasoning` for a prompt asked at `effort` rather than the chat's setting.
+pub fn reasoningAt(effort: ReasoningEffort) ?Reasoning {
     if (reasoning_override) |r| return r;
     if (!familySupportsReasoningEffort(family)) if (reasoning_observed) |r| return r;
-    return reasoningForEffort(family, reasoning_effort);
+    return reasoningForEffort(family, effort);
 }
 
 pub fn familySupportsReasoningEffort(f: Family) bool {
@@ -271,10 +285,14 @@ pub fn isStop(id: u32) bool {
 /// just the cue — the shape the reference template emits. Taking `?[]const u8`
 /// here rather than adding a second entry point means no caller can pick wrong.
 pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text_opt: ?[]const u8, out: *std.ArrayList(u32)) !void {
+    return appendSystemFor(tok, gpa, text_opt, liveThink(), out);
+}
+
+pub fn appendSystemFor(tok: *const Tokenizer, gpa: std.mem.Allocator, text_opt: ?[]const u8, think: Think, out: *std.ArrayList(u32)) !void {
     // Nothing to emit, so emit nothing -- not even the BOS below. gemma4 with
     // thinking on is the one case that still wants a turn with no system text
     // (it holds just the cue); gemma4 with thinking off wants none either.
-    if (text_opt == null and !(family == .gemma4 and enable_thinking)) return;
+    if (text_opt == null and !(family == .gemma4 and think.on)) return;
     const text = text_opt orelse "";
     try appendBosIfStart(gpa, out);
     switch (family) {
@@ -295,7 +313,7 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text_opt: ?[]
             // whole point of the optional text. The turn stands alone, so the
             // next appendUser opens a fresh user turn.
             try tok.encode(gpa, "<|turn>system\n", out);
-            if (enable_thinking) try tok.encode(gpa, "<|think|>\n", out);
+            if (think.on) try tok.encode(gpa, "<|think|>\n", out);
             try tok.encode(gpa, text, out);
             try tok.encode(gpa, "<turn|>\n", out);
         },
@@ -409,19 +427,23 @@ pub fn appendGemma4Image(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens
 /// Start the assistant turn the model completes (ChatML: `<|im_start|>
 /// assistant\n`; Gemma: `<start_of_turn>model\n`).
 pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
+    return openAssistantFor(tok, gpa, liveThink(), out);
+}
+
+pub fn openAssistantFor(tok: *const Tokenizer, gpa: std.mem.Allocator, think: Think, out: *std.ArrayList(u32)) !void {
     switch (family) {
         .chatml => {
             try tok.encode(gpa, "<|im_start|>assistant\n", out);
             // Non-thinking: prime an empty reasoning block (Qwen's
             // <think>\n\n</think> convention) so the model answers directly.
             // Thinking: unprimed, the model emits its own <think>...</think>.
-            if (!enable_thinking) try tok.encode(gpa, "<think>\n\n</think>\n\n", out);
+            if (!think.on) try tok.encode(gpa, "<think>\n\n</think>\n\n", out);
         },
         .k2_horizon => {
             try tok.encode(gpa, "<|ifm|im_start|>assistant\n", out);
-            if (!enable_thinking) {
+            if (!think.on) {
                 try tok.encode(gpa, "<ifm|think>\n</ifm|think>\n", out);
-            } else switch (reasoning_effort) {
+            } else switch (think.effort) {
                 .high => try tok.encode(gpa, "<ifm|think>\n", out),
                 .medium => try tok.encode(gpa, "<ifm|think_fast>\n", out),
                 .low => try tok.encode(gpa, "<ifm|think_faster>\n", out),
@@ -433,7 +455,7 @@ pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.Ar
             // Non-thinking: prime an empty thought channel so the model answers
             // directly. Thinking: unprimed, the model opens its own
             // <|channel>thought ... <channel|> (cued by <|think|> in the system).
-            if (!enable_thinking) try tok.encode(gpa, "<|channel>thought\n<channel|>", out);
+            if (!think.on) try tok.encode(gpa, "<|channel>thought\n<channel|>", out);
         },
     }
 }

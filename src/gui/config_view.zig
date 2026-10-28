@@ -19,6 +19,7 @@ const models = @import("client").models;
 const selection = @import("client").selection;
 const model_lib = @import("model_lib.zig");
 const fonts = @import("fonts.zig");
+const lora_schedule = @import("lora_schedule.zig");
 const mirror = @import("client").mirror;
 const SDLBackend = @import("backend");
 
@@ -213,6 +214,10 @@ var fpen_buf: [16]u8 = @splat(0);
 var preset_name_buf: [config.max_preset_name]u8 = @splat(0);
 // System-prompt name entry (save/load/delete target in the system-prompt section).
 var sys_prompt_name_buf: [config.max_sys_prompt_name]u8 = @splat(0);
+// The expander being edited: loaded from the library, saved back by name.
+var expander_name_buf: [config.max_preset_name]u8 = @splat(0);
+var expander_text_buf: [config.max_expander_text]u8 = @splat(0);
+var expander_style: config.PromptStyle = .prose;
 
 
 /// Call when the view is (re)entered so numeric buffers reseed from the config.
@@ -599,6 +604,69 @@ pub fn render(cfg: *config.Config, m: *const mirror.Mirror, u: *const models.Uni
             .break_lines = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 90 }, .max_size_content = .height(220) });
         te.deinit();
+    }
+
+    expanderSection(cfg);
+}
+
+/// The studio's expander library: load one into the editor, change it, save it
+/// back by name. Edits land on Apply like the rest of this screen.
+fn expanderSection(cfg: *config.Config) void {
+    section("Studio prompt expanders");
+    help("What the studio's Expand mode tells the chat model when it turns a short " ++
+        "idea into an image prompt. Tags expanders suit SD 1.5 and SDXL, which read " ++
+        "comma-separated tags; prose ones suit the other models. The studio uses the " ++
+        "one picked there, or the first that suits the loaded model.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+        defer row.deinit();
+        dvui.label(@src(), "Expander", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        {
+            var dd: dvui.DropdownWidget = undefined;
+            dd.init(@src(), .{ .label = if (cfg.expanders.count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+            defer dd.deinit();
+            if (dd.dropped()) {
+                for (cfg.expanders.slice()) |*e| {
+                    if (dd.addChoiceLabel(e.name.slice())) {
+                        _ = std.mem.printSentinel(&expander_name_buf, "{s}", .{e.name.slice()}, 0) catch {};
+                        _ = std.mem.printSentinel(&expander_text_buf, "{s}", .{e.text.slice()}, 0) catch {};
+                        expander_style = e.style;
+                    }
+                }
+            }
+        }
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = &expander_name_buf },
+            .placeholder = "expander name",
+        }, .{ .expand = .horizontal, .gravity_y = 0.5, .margin = .{ .x = 4 } });
+        te.deinit();
+        if (style.segmented(@src(), &.{ "Tags", "Prose" }, @backingInt(expander_style))) |i| {
+            expander_style = @fromBackingInt(@intCast(i));
+        }
+        if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+            _ = cfg.upsertExpander(std.mem.sliceTo(&expander_name_buf, 0), std.mem.sliceTo(&expander_text_buf, 0), expander_style);
+        }
+        if (dvui.button(@src(), "Delete", .{}, .{ .gravity_y = 0.5 })) {
+            _ = cfg.removeExpanderNamed(std.mem.sliceTo(&expander_name_buf, 0));
+        }
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+        defer row.deinit();
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = &expander_text_buf },
+            .multiline = true,
+            .scroll_horizontal = false,
+            .break_lines = true,
+            .placeholder = "Load an expander above, or write a new one and name it",
+        }, .{ .expand = .horizontal, .min_size_content = .{ .h = 70 }, .max_size_content = .height(180) });
+        te.deinit();
+    }
+    help("Restore built-ins puts the four shipped expanders back as they shipped; your own stay.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+        defer row.deinit();
+        if (dvui.button(@src(), "Restore built-ins", .{}, .{ .gravity_y = 0.5 })) _ = cfg.restoreBuiltinExpanders();
     }
 }
 
@@ -1530,7 +1598,7 @@ fn llmRows(cfg: *config.Config) void {
     // Architecture: the classes, the current one named. An unknown file shows as
     // itself so nothing pretends to know what it is.
     var labels = arena.alloc([]const u8, classes.len + 1) catch return;
-    var cur_label: []const u8 = "none";
+    var cur_label: []const u8 = if (classes.len == 0) "none found: no .gguf chat model in your model folders" else "none";
     for (classes, 0..) |c, i| {
         labels[i] = if (c.supported) c.label else arena.print("{s} (unsupported)", .{c.label}) catch c.label;
         if (cur) |e| if (std.mem.eql(u8, e.llm.?.class, c.label)) {
@@ -1538,8 +1606,9 @@ fn llmRows(cfg: *config.Config) void {
         };
     }
     labels[classes.len] = "none";
-    if (cur == null) if (cfg.llm_model.opt()) |p| {
-        cur_label = arena.print("{s} (not in a model folder)", .{cat.refName(p)}) catch "other file";
+    // The file row names the file; this row says only that nothing has read it.
+    if (cur == null) if (cfg.llm_model.opt() != null) {
+        cur_label = "unknown: the file is not in a model folder";
     };
     if (choiceRow("llm/arch", "Architecture", cur_label, labels, false)) |i| {
         if (i == classes.len) selection.clearLlm(cfg) else selection.selectLlm(cfg, cat, cat.entries[classes[i].members[0]].path);
@@ -1710,6 +1779,9 @@ fn imageRows(cfg: *config.Config) void {
 /// the dial is per file. The whole section is hidden when the family has no
 /// sidecar path and nothing is configured for it, since an empty row is a
 /// question with no answer.
+/// The LoRA row whose schedule editor is open.
+var g_lora_editing: ?usize = null;
+
 fn loraRows(cfg: *config.Config, fam: selection.Family) void {
     const arena = dvui.currentWindow().arena();
     const cat = &g_u.cat;
@@ -1727,11 +1799,16 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
     // filtered view mid-iteration pointing at shifted entries.
     var rows: std.ArrayList(config.FamilyLora) = .empty;
     for (on) |l| rows.append(arena, l) catch return;
+    // The steps a render at these defaults takes, which the schedule chips name.
+    const levels = lora_schedule.levelsFor(arena, fam, cfg.width, cfg.height, cfg.steps, pipeline_map.toPipelineScheduler(cfg.scheduler));
 
     for (rows.items, 0..) |l, ri| {
         const path = l.path.slice();
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = ri, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
-        defer row.deinit();
+        // Ours, written by the studio or below; unreadable shows as every step.
+        var sched = lora_schedule.Schedule.parse(l.schedule.slice()) catch .always;
+        var item = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = ri, .expand = .horizontal });
+        defer item.deinit();
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
 
         var enabled = l.enabled;
         if (dvui.checkbox(@src(), &enabled, null, .{ .gravity_y = 0.5 })) {
@@ -1753,8 +1830,21 @@ fn loraRows(cfg: *config.Config, fam: selection.Family) void {
         })) {
             if (cfg.familyLoraMut(selection.familyKey(fam), path)) |m| m.strength = strength;
         }
-        if (dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5 })) {
+        if (lora_schedule.chip(@src(), ri, sched, levels)) {
+            g_lora_editing = if (g_lora_editing == ri) null else ri;
+        }
+        const removed = dvui.button(@src(), "Remove", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 6 } });
+        row.deinit();
+        if (removed) {
             cfg.removeFamilyLora(selection.familyKey(fam), path);
+            g_lora_editing = null;
+            continue;
+        }
+        if (g_lora_editing == ri and lora_schedule.editor(@src(), ri, &sched, levels)) {
+            if (cfg.familyLoraMut(selection.familyKey(fam), path)) |m| {
+                var tb: [config.max_lora_schedule]u8 = undefined;
+                m.schedule.set(lora_schedule.text(&tb, sched));
+            }
         }
     }
 

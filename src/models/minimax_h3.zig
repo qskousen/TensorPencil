@@ -945,7 +945,7 @@ fn matLin(
 ) !void {
     try ops.matmul.matmul(io, gpa, y[0 .. m * y_stride], x, m, l.w, bias);
     for (l.lora) |h| {
-        const s = stack.?.files.items[h.file].strength;
+        const s = stack.?.strengthOf(h.file);
         // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
         if (s == 0) continue;
         try h.target.applyHost(io, gpa, y, y_stride, x, m, s);

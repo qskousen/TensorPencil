@@ -639,6 +639,8 @@ pub const CollapsibleOpts = struct {
     /// folded section that says nothing about its contents is one nobody opens,
     /// so every caller should pass something ("2 active", "euler · 20 · 4.0").
     summary: []const u8 = "",
+    /// A count the user set, drawn as a blue pill after the summary while collapsed.
+    pill: []const u8 = "",
 };
 
 /// A titled section that folds, for a form too long to show at once. The header
@@ -692,6 +694,26 @@ pub fn collapsibleBegin(src: std.lang.SourceLocation, title: []const u8, flag: *
             .gravity_x = 1.0,
             .gravity_y = 0.5,
         });
+        if (!flag.* and o.pill.len > 0) {
+            var p = dvui.box(@src(), .{}, .{
+                .background = true,
+                .color_fill = .{ .color = over(C.rail, C.blue, 0.16) },
+                .border = Edge.all,
+                .color_border = .{ .color = tint(C.blue, 70) },
+                .corners = R.pill(16),
+                .padding = .{ .x = 7, .w = 7 },
+                .margin = .{ .x = 6 },
+                .gravity_x = 1.0,
+                .gravity_y = 0.5,
+            });
+            defer p.deinit();
+            dvui.labelNoFmt(@src(), o.pill, .{}, .{
+                .font = F.mono,
+                .color_text = .{ .color = C.blue },
+                .padding = .{},
+                .gravity_y = 0.5,
+            });
+        }
     }
     const clicked = hdr.clicked();
     hdr.drawFocus();

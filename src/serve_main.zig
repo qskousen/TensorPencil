@@ -57,7 +57,9 @@
 //!   each through a `.tmp` and a rename;
 //! - `~/.nv/ComputeCache/*` and `~/.cache/nvidia/GLCache/*`, which the NVIDIA
 //!   driver writes on its own account (compiled kernels, no user content) and
-//!   which no unit test would find.
+//!   which no unit test would find; `~/.cache/mesa_shader_cache/index` and
+//!   `~/.cache/radv_builtin_shaders/index`, which Mesa opens read-write when the
+//!   Vulkan loader probes its drivers at start.
 //!
 //! Nothing on that list holds a prompt, a reply or a rendered pixel: the
 //! engine writes no files at all, and saving an image is the client's job.

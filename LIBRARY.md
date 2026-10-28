@@ -13,7 +13,7 @@ kernels, the GPU backends, the offload logic, or the whole thing:
 | `tp_core` | dtypes, tensors, checkpoint parsing (safetensors/GGUF), quant **quantize + dequant**, tokenizer, K/V cache, sampler | — (pure Zig) |
 | `tp_ops` | CPU numeric kernels: `matmul` (GEMM), `attention`, `rope`, `norm`, `act`, `convrot` | `tp_core` |
 | `tp_gpu` | GPU backends: Vulkan + embedded SPIR-V kernels, CUDA driver-API PTX | `tp_core`, `tp_ops` |
-| `tp_runtime` | offload/scheduling: the VRAM arbiter + CPU/GPU residency planner | — (pure Zig) |
+| `tp_runtime` | offload/scheduling: the VRAM arbiter, the CPU/GPU residency planner, and the per-sequence context swap | — (pure Zig) |
 | `tp_models` | NN architectures (DiT/VAE/qwen/gemma/ViT) + LLM generation (chat/engine/spec) | all of the above |
 | `TensorPencil` | the umbrella: the diffusion pipeline + re-exports of every layer | all of the above |
 

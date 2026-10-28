@@ -12,6 +12,8 @@
 //!  - The worker thread runs `engine.generate`, whose per-token writes land in
 //!    `TokenSink.drain`, the only place `pending` is written. `drain` fires the
 //!    SDL wakeup so the event-driven render loop repaints promptly.
+//!  - `complete` runs a prompt outside the transcript on the same worker, one job
+//!    at a time with turns, on a sequence of its own (`tp_runtime.seq`).
 const std = @import("std");
 const tp = @import("TensorPencil");
 const build_options = @import("build_options");
@@ -591,6 +593,49 @@ pub fn samplingParams(cfg: *const config.Config) sample.Params {
     };
 }
 
+pub const Think = chat.Think;
+
+/// One prompt run apart from the conversation (`Session.complete`): its own
+/// system prompt, reasoning setting and seed, on a sequence of its own, so the
+/// chat's transcript and KV are exactly as they were afterwards.
+pub const Completion = struct {
+    system: []const u8,
+    user: []const u8,
+    think: Think,
+    seed: u64,
+    /// Tokens the reply may take, its thought included.
+    max_tokens: usize = 1024,
+
+    pub const Result = struct {
+        /// The answer with any thought removed, trimmed. gpa-owned.
+        text: []u8 = "",
+        /// Why there is no answer, when there is none: `error.Stopped` for a
+        /// cancel, `error.ThoughtUnfinished` for a reply that spent its tokens
+        /// thinking.
+        err: ?anyerror = null,
+
+        pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
+            gpa.free(self.text);
+            self.* = .{};
+        }
+    };
+};
+
+/// A `Completion` staged for the worker, its strings owned.
+const SideJob = struct {
+    system: []u8,
+    user: []u8,
+    think: chat.Think,
+    seed: u64,
+    max_tokens: usize,
+    sampling: sample.Params,
+
+    fn deinit(self: *SideJob, gpa: std.mem.Allocator) void {
+        gpa.free(self.system);
+        gpa.free(self.user);
+    }
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -805,6 +850,17 @@ pub const Session = struct {
     /// them just before the user's next message.
     pending_notes: std.ArrayList([]u8) = .empty,
 
+    /// A `complete` staged for the worker. UI thread writes, worker takes.
+    side_job: ?SideJob = null,
+    /// The finished `complete`, published under `mu` before `generating`
+    /// clears, for `takeCompletion`.
+    side_result: ?Completion.Result = null,
+    /// The options the running completion's prefill boundaries check, in place
+    /// of the chat's. Worker thread only.
+    side_opts: ?engine.Options = null,
+    /// The worker last spawned runs a completion, not a turn. UI thread.
+    side_active: bool = false,
+
     /// Loads the model on the zig-cuda backend. `arena` holds load-once data
     /// (weights are mmap views into the GGUF and must outlive the session);
     /// `gpa` is a thread-safe allocator for the churny generation buffers and
@@ -830,7 +886,10 @@ pub const Session = struct {
         const base = std.Io.Dir.path.basename(cfg.model_path);
         self.model_name = try arena.dupe(u8, base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len]);
 
-        self.gguf = try Gguf.open(arena, io, cfg.model_path);
+        self.gguf = Gguf.open(arena, io, cfg.model_path) catch |err| return switch (err) {
+            error.InvalidMagic => error.ChatModelNotGguf,
+            else => err,
+        };
         errdefer self.gguf.deinit();
         const arch_str = self.gguf.getStr("general.architecture") orelse "";
 
@@ -1603,6 +1662,7 @@ pub const Session = struct {
     /// too, so a reload can reprefill `ids` and continue (Tier 3).
     fn prefillBoundaryThunk(ctx: *anyopaque) bnd.Outcome {
         const self = fromCtx(ctx);
+        if (self.side_opts) |so| return if (engine.checkpoint(self.io, so) == .stop) .stop else .proceed;
         var o = self.opts;
         o.suspended_out = &self.turn_suspended;
         return if (engine.checkpoint(self.io, o) == .stop) .stop else .proceed;
@@ -1727,6 +1787,7 @@ pub const Session = struct {
         for (self.pending_notes.items) |n| self.gpa.free(n);
         self.pending_notes.deinit(self.gpa);
         if (self.turn_text.len > 0) self.gpa.free(self.turn_text);
+        if (self.side_result) |*r| r.deinit(self.gpa);
         switch (self.arch) {
             inline else => |*a| {
                 a.model.deinit();
@@ -1765,6 +1826,11 @@ pub const Session = struct {
 
     pub fn busy(self: *Session) bool {
         return self.generating.load(.acquire);
+    }
+
+    /// The worker is running a `complete`, not a turn.
+    pub fn completing(self: *Session) bool {
+        return self.side_active and self.busy();
     }
 
     /// A turn is staged but not running: `submit` accepted it and `spawnWorker`
@@ -1932,6 +1998,149 @@ pub const Session = struct {
         // spawnWorker defers if paused: the turn stays queued (shown in the
         // transcript with a pending assistant slot) and runs on resume (Tier 2).
         try self.spawnWorker();
+    }
+
+    /// Run `c` on the worker, apart from the conversation; `takeCompletion`
+    /// has the answer once `busy()` clears. Refused like `submit` while a turn
+    /// runs or waits. Uses the sampling settings staged for the next turn.
+    pub fn complete(self: *Session, c: Completion) !void {
+        if (self.busy() or self.turn_staged) return error.Busy;
+        if (self.worker) |t| {
+            t.join();
+            self.worker = null;
+        }
+        const system = try self.gpa.dupe(u8, c.system);
+        errdefer self.gpa.free(system);
+        const user = try self.gpa.dupe(u8, c.user);
+        errdefer self.gpa.free(user);
+        if (self.side_result) |*r| r.deinit(self.gpa);
+        self.side_result = null;
+        self.side_job = .{
+            .system = system,
+            .user = user,
+            .think = c.think,
+            .seed = c.seed,
+            .max_tokens = c.max_tokens,
+            .sampling = self.pending_sampling,
+        };
+        self.cancel.store(false, .release);
+        self.side_active = true;
+        self.generating.store(true, .release);
+        self.worker = std.Thread.spawn(.{}, completeMain, .{self}) catch |err| {
+            self.generating.store(false, .release);
+            self.side_job.?.deinit(self.gpa);
+            self.side_job = null;
+            return err;
+        };
+    }
+
+    /// The finished `complete`, once. Null while it runs or when none ran.
+    pub fn takeCompletion(self: *Session) ?Completion.Result {
+        if (self.busy()) return null;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const r = self.side_result;
+        self.side_result = null;
+        return r;
+    }
+
+    fn completeMain(self: *Session) void {
+        self.dev.bindThread();
+        var job = self.side_job.?;
+        self.side_job = null;
+        defer job.deinit(self.gpa);
+        var result: Completion.Result = .{};
+        if (self.runCompletion(&job)) |text| {
+            result.text = text;
+        } else |err| {
+            result.err = err;
+            if (err != error.Stopped and err != error.ThoughtUnfinished) std.log.err("completion failed: {t}", .{err});
+        }
+        self.mu.lockUncancelable(self.io);
+        self.side_result = result;
+        self.mu.unlock(self.io);
+        self.generating.store(false, .release);
+        self.wake();
+    }
+
+    /// The worker half of `complete`. The chat's sequence is parked for the
+    /// whole run and put back on every path out, and nothing here moves a
+    /// layer: no residency poll runs, and the arbiter and `imageReclaim` leave
+    /// a busy session alone.
+    fn runCompletion(self: *Session, job: *const SideJob) ![]u8 {
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(self.gpa);
+        try self.completionIds(job, &ids);
+        const markers: ?toolcall.Reasoning = if (chat.reasoningAt(job.think.effort)) |r| .{ .open = r.open, .close = r.close } else null;
+        const primed = primed: {
+            const tail = try self.tok.decodeAlloc(self.gpa, ids.items[ids.items.len - @min(ids.items.len, 16) ..]);
+            defer self.gpa.free(tail);
+            break :primed toolcall.endsInsideThought(tail, markers);
+        };
+
+        var opts = self.opts;
+        opts.sampling = job.sampling;
+        opts.seed = job.seed;
+        opts.max_new_tokens = job.max_tokens;
+        opts.spec_k = 0;
+        opts.tree_nodes = 0;
+        opts.spec_stats = null;
+        opts.pause = null;
+        opts.suspended_out = null;
+        opts.residency_poll = null;
+        opts.timing = null;
+        opts.progress = null;
+        self.side_opts = opts;
+        defer self.side_opts = null;
+        const cs = engine.publishCancel(opts);
+        defer cs.end();
+
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        switch (self.arch) {
+            inline else => |*a| {
+                var side = try a.model.seqCreate(ids.items.len + job.max_tokens);
+                a.model.seqSwap(&side);
+                defer {
+                    a.model.seqSwap(&side);
+                    a.model.seqDestroy(&side);
+                }
+                _ = engine.generate(&a.model, &self.tok, self.io, self.gpa, &ids, opts, &out.writer) catch |err| {
+                    if (engine.isCancelUnwind(err)) return error.Stopped;
+                    return err;
+                };
+            },
+        }
+        if (self.cancel.load(.acquire)) return error.Stopped;
+        const split = toolcall.splitThought(out.written(), markers, primed);
+        if (split.open) return error.ThoughtUnfinished;
+        return self.gpa.dupe(u8, std.mem.trim(u8, split.answer, " \t\r\n"));
+    }
+
+    /// `job`'s prompt as a fresh conversation: its system turn, its user turn,
+    /// and an open assistant turn, through the model's own template when it has
+    /// one. Never the chat's tools.
+    fn completionIds(self: *Session, job: *const SideJob, ids: *std.ArrayList(u32)) !void {
+        if (self.template) |*t| {
+            const msgs = [_]chat_template.Message{
+                .{ .role = .system, .content = job.system },
+                .{ .role = .user, .content = job.user },
+            };
+            return t.renderIds(&self.tok, self.gpa, .{
+                .messages = &msgs,
+                .bos_token = self.bos_str,
+                .eos_token = self.eos_str,
+                .enable_thinking = job.think.on,
+                .reasoning_effort = if (chat.supportsReasoningEffort()) @tagName(job.think.effort) else null,
+                .add_generation_prompt = true,
+            }, ids);
+        }
+        if (self.arch.family() == .gemma3 or self.arch.family() == .gemma4) {
+            if (self.tok.specialId("<bos>")) |bos| try ids.append(self.gpa, bos);
+        }
+        try chat.appendSystemFor(&self.tok, self.gpa, job.system, job.think, ids);
+        try chat.appendUser(&self.tok, self.gpa, job.user, ids);
+        try chat.openAssistantFor(&self.tok, self.gpa, job.think, ids);
     }
 
     /// The checkpoint covering the CURRENT last turn's boundary, when one
@@ -2111,6 +2320,7 @@ pub const Session = struct {
         self.stats_live = true;
         self.mu.unlock(self.io);
         self.cancel.store(false, .release);
+        self.side_active = false;
         self.generating.store(true, .release);
         self.worker = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
             self.generating.store(false, .release);
@@ -3353,6 +3563,22 @@ test "Message variants: regenerate bookkeeping keeps older takes" {
 // A tool call is REPORTED, never rendered here: the client places it, so the
 // picture can be drawn on whichever host is free. Anything queued or recorded
 // on this side would pin it to the machine holding the chat.
+test "a chat model that is not GGUF fails with its own error, which the GUI explains" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "te.safetensors", .data = "\x10\x00\x00\x00\x00\x00\x00\x00{\"a\":1}         xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.mem.print(buf[dir_len..], "/te.safetensors", .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const noWake = struct {
+        fn f() void {}
+    }.f;
+    try std.testing.expectError(error.ChatModelNotGguf, Session.init(arena.allocator(), std.testing.allocator, io, noWake, .{ .model_path = buf[0 .. dir_len + path.len] }));
+}
+
 test "an image tool call is parsed and nothing is queued for it" {
     const gpa = std.testing.allocator;
     var v: Variant = .{};

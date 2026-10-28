@@ -35,6 +35,7 @@ const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const residency = @import("tp_runtime").residency;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -196,8 +197,8 @@ pub const CudaLM = struct {
     suppress_pen: []const sample.PenaltyEntry,
     bufs: Bufs,
     /// Per-layer K/V caches (variable stride = kvDim(l)).
-    k_cache: []Growable,
-    v_cache: []Growable,
+    k_cache: []Growable = &.{},
+    v_cache: []Growable = &.{},
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set
     /// by the step entry points, or seeded by the session owner BEFORE the
     /// first forward (tp-gui prefills before any step, and an over-budget
@@ -254,6 +255,92 @@ pub const CudaLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `cache` and `rope`, present exactly when a split is armed. The device RoPE
+    /// tables are not in it: they only grow, and cover every sequence.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        ring_rows: usize = 0,
+        k_cache: []Growable = &.{},
+        v_cache: []Growable = &.{},
+        host: ?Host = null,
+
+        pub const Host = struct { cache: kvmod.PerLayerKvCache, rope: ops.rope.RopeTables(2) };
+    };
+
+    /// An empty text sequence for the current layer placement: device K/V for
+    /// the device layers (LOCAL layers a text-sized ring), and the split's host
+    /// side when one is armed.
+    fn seqAlloc(self: *const CudaLM, initial: usize, max: usize) !Seq {
+        const cfg = self.cfg;
+        const be = self.be;
+        const dt = self.kv_dtype;
+        const ring = localRingText(cfg);
+        var s: Seq = .{ .capacity = initial, .max_capacity = max, .ring_rows = ring };
+        errdefer self.seqFree(&s);
+        s.k_cache = try self.gpa.alloc(Growable, cfg.n_layers);
+        @memset(s.k_cache, .{});
+        s.v_cache = try self.gpa.alloc(Growable, cfg.n_layers);
+        @memset(s.v_cache, .{});
+        for (s.k_cache, s.v_cache, 0..) |*kb, *vb, l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            const kvd = cfg.kvDim(l);
+            if (usesRing(cfg, l)) {
+                kb.* = try be.growableCreate(ringBytes(cfg, dt, l, ring, initial), ringBytes(cfg, dt, l, ring, std.math.maxInt(usize)));
+                vb.* = try be.growableCreate(ringBytes(cfg, dt, l, ring, initial), ringBytes(cfg, dt, l, ring, std.math.maxInt(usize)));
+            } else {
+                kb.* = try be.growableCreate(dt.sizeBytes(initial * kvd), dt.sizeBytes(max * kvd));
+                vb.* = try be.growableCreate(dt.sizeBytes(initial * kvd), dt.sizeBytes(max * kvd));
+            }
+        }
+        if (self.split != null) {
+            var cache = try self.hostShadowCacheAt(ring, initial, dt);
+            errdefer cache.deinit(self.gpa);
+            const rope = try ops.rope.RopeTables(2).init(self.gpa, .{
+                .{ .head_dim = cfg.head_dim_global, .theta = cfg.rope_theta, .freq_factors = self.lm.rope_freqs },
+                .{ .head_dim = cfg.head_dim_local, .theta = cfg.rope_theta_local },
+            }, initial);
+            s.host = .{ .cache = cache, .rope = rope };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const CudaLM, s: *Seq) void {
+        for (s.k_cache) |*b| self.be.growableDestroy(b);
+        for (s.v_cache) |*b| self.be.growableDestroy(b);
+        self.gpa.free(s.k_cache);
+        self.gpa.free(s.v_cache);
+        if (s.host) |*h| {
+            h.cache.deinit(self.gpa);
+            h.rope.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty text sequence of `rows` committed rows that never grows,
+    /// so running it can never ask the dynamic split to migrate a layer.
+    pub fn seqCreate(self: *CudaLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        try self.growRope(rows);
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *CudaLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(kvmod.PerLayerKvCache, &sp.cache, &h.cache);
+            std.mem.swap(ops.rope.RopeTables(2), &sp.rope, &h.rope);
+        } else std.debug.assert(s.host == null);
+    }
+
+    pub fn seqDestroy(self: *CudaLM, s: *Seq) void {
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const gemma4.Model, cap: kvmod.Capacity) !CudaLM {
         const cfg = lm.cfg;
         // The weight-noise curve is written in normalized depth, so it cannot be
@@ -276,11 +363,8 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
-        self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
-        self.max_capacity = cap.max;
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
         // RoPE tables cover the COMMITTED capacity, not `cap.max`, and grow with
         // it in `growRope`. Sized at `cap.max` they were the single largest
         // activation allocation on a long-context model: at the GUI's 128k
@@ -306,13 +390,16 @@ pub const CudaLM = struct {
         errdefer be.tensorDestroy(&self.ones);
         try be.tensorUpload(self.ones, std.mem.sliceAsBytes(ones_host));
 
-        self.ring_rows = localRingText(cfg);
         self.buf_rows = textBufRows();
         self.bufs = try Bufs.init(be, cfg, self.buf_rows);
 
-        self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
-        self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
-        try self.allocKvCaches();
+        var first = try self.seqAlloc(cap.initial, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
+        }
 
         const spen = try alloc.alloc(sample.PenaltyEntry, lm.suppress_tokens.len);
         for (spen, lm.suppress_tokens) |*e, id| e.* = .{ .id = id, .count = 1 };
@@ -322,28 +409,15 @@ pub const CudaLM = struct {
         return self;
     }
 
-    /// (Re)create the per-layer K/V device buffers at `self.kv_dtype`, sized from
-    /// `self.initial_capacity`/`self.max_capacity`. The `k_cache`/`v_cache`
-    /// SLICES must already exist (arena-owned); this fills them with fresh
-    /// Growables. Used by `init` and `reinitCache` so the sizing stays in one
-    /// place. LOCAL layers are a fixed sliding-window ring (never grow).
-    /// Host-resident layers of an armed split are skipped, they keep no
-    /// device KV (their shadow lives in `split.cache`).
-    fn allocKvCaches(self: *CudaLM) !void {
-        const cfg = self.cfg;
-        const be = self.be;
-        const dt = self.kv_dtype;
-        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
-            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
-            const kvd = cfg.kvDim(l);
-            if (usesRing(cfg, l)) {
-                kb.* = try be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.initial_capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
-                vb.* = try be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.initial_capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
-            } else {
-                kb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
-                vb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
-            }
-        }
+    /// Replace the live sequence's device K/V with empty text-sized ones at the
+    /// initial capacity, keeping the split's host side.
+    fn renewDeviceKv(self: *CudaLM) !void {
+        var fresh = try self.seqAlloc(self.initial_capacity, self.max_capacity);
+        defer self.seqFree(&fresh);
+        std.mem.swap([]Growable, &self.k_cache, &fresh.k_cache);
+        std.mem.swap([]Growable, &self.v_cache, &fresh.v_cache);
+        self.capacity = self.initial_capacity;
+        self.ring_rows = fresh.ring_rows;
     }
 
     /// Rebuild the KV cache at a new element dtype (GUI f32<->f16 toggle),
@@ -352,15 +426,9 @@ pub const CudaLM = struct {
     /// re-prefills the whole transcript. gemma4 decodes straight through
     /// `opAttnDecode` (no captured graph to invalidate).
     pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
-        // Host-resident layers keep no device KV (growableDestroy is
-        // idempotent on their already-destroyed buffers; allocKvCaches skips
-        // them).
-        for (self.k_cache) |*b| self.be.growableDestroy(b);
-        for (self.v_cache) |*b| self.be.growableDestroy(b);
         self.kv_dtype = dtype;
-        self.capacity = self.initial_capacity;
+        try self.renewDeviceKv();
         self.len = 0;
-        try self.allocKvCaches();
         if (self.split) |*sp| {
             // The host shadow stores the device dtype; rebuild it to match.
             const cache = try self.hostShadowCache(dtype);
@@ -373,20 +441,20 @@ pub const CudaLM = struct {
     /// SAME ring layout as the device rings (`ring_rows`), full-context
     /// linear rows for GLOBAL layers, at the current `self.capacity`.
     fn hostShadowCache(self: *CudaLM, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
-        return self.hostShadowCacheAt(self.ring_rows, dtype);
+        return self.hostShadowCacheAt(self.ring_rows, self.capacity, dtype);
     }
 
     /// The shadow mirrors the DEVICE ring layout, so its ring size is a parameter
     /// rather than read from `ring_rows`: `growLocalRing` builds the replacement
     /// at the new size while the old one is still live and being read from.
-    fn hostShadowCacheAt(self: *CudaLM, ring: usize, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
+    fn hostShadowCacheAt(self: *const CudaLM, ring: usize, rows: usize, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
         const cfg = self.cfg;
         const dims = try cfg.kvDims(self.gpa);
         defer self.gpa.free(dims);
         const rings = try self.gpa.alloc(usize, cfg.n_layers);
         defer self.gpa.free(rings);
         for (rings, 0..) |*r, l| r.* = if (usesRing(cfg, l)) ring else 0;
-        return kvmod.PerLayerKvCache.init(self.gpa, self.capacity, dims, rings, dtype);
+        return kvmod.PerLayerKvCache.init(self.gpa, rows, dims, rings, dtype);
     }
 
     /// Build a device RoPE table (cos[rows*half] ++ sin[rows*half]) with an
@@ -407,13 +475,14 @@ pub const CudaLM = struct {
 
     pub fn deinit(self: *CudaLM) void {
         const be = self.be;
-        for (self.k_cache) |*b| be.growableDestroy(b);
-        for (self.v_cache) |*b| be.growableDestroy(b);
+        self.freeSplit();
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         be.tensorDestroy(&self.freqs_global);
         be.tensorDestroy(&self.freqs_local);
         be.tensorDestroy(&self.ones);
         self.bufs.deinit(be);
-        self.freeSplit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -698,10 +767,7 @@ pub const CudaLM = struct {
     /// copy is needed (unlike promoteLayers).
     pub fn resetResidency(self: *CudaLM, budget: u64) !void {
         self.freeSplit();
-        for (self.k_cache) |*b| self.be.growableDestroy(b);
-        for (self.v_cache) |*b| self.be.growableDestroy(b);
-        self.capacity = self.initial_capacity;
-        try self.allocKvCaches();
+        try self.renewDeviceKv();
         try self.resetCache();
         _ = try self.autoOffload(budget);
     }
@@ -1124,7 +1190,7 @@ pub const CudaLM = struct {
         var new_cache: ?kvmod.PerLayerKvCache = null;
         errdefer if (new_cache) |*c| c.deinit(self.gpa);
         if (self.split != null) {
-            new_cache = try self.hostShadowCacheAt(new_ring, dt);
+            new_cache = try self.hostShadowCacheAt(new_ring, self.capacity, dt);
             new_cache.?.len = self.len;
             const sp = &self.split.?;
             for (0..cfg.n_layers) |l| {

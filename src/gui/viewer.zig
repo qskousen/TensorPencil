@@ -67,7 +67,7 @@ pub const Viewer = struct {
             .persist_window_geometry = false,
         });
         errdefer self.back.deinit();
-        self.win = try dvui.Window.init(@src(), gpa, self.back.backend(), .{ .id_extra = 1 });
+        self.win = try dvui.Window.init(@src(), gpa, self.back.backend(), .{ .id_extra = 1, .open_flag = &self.open });
         self.win_id = SDLBackend.c.SDL_GetWindowID(self.back.window);
         self.src = src;
         self.cur = cur;

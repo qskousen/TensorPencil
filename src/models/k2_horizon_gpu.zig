@@ -20,6 +20,7 @@ const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const init_defaults = @import("tp_core").init_defaults;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 
 const Buf = gpu.DeviceBuffer;
@@ -118,7 +119,7 @@ pub const VulkanLM = struct {
     /// The Io of the last step, which the host experts run on.
     io: ?std.Io = null,
     sin_off: u32,
-    kv: kv_gpu.Kv,
+    kv: kv_gpu.Kv = .empty,
     freqs_d: Buf,
     bufs: Bufs,
     cpu_scratch: k2.Scratch,
@@ -145,6 +146,37 @@ pub const VulkanLM = struct {
         order: []usize = &.{},
         next: usize = 0,
     };
+
+    /// One sequence's context (see `tp_runtime.seq`). A split here moves only
+    /// experts, so the KV is all on the device.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        kv: kv_gpu.Kv = .empty,
+    };
+
+    /// A second, empty sequence of `rows` rows that never grows.
+    pub fn seqCreate(self: *VulkanLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return .{
+            .capacity = rows,
+            .max_capacity = rows,
+            .kv = try kv_gpu.Kv.init(self.gpa, self.be, self.cfg.n_layers, rows, self.cfg.kvDim(), self.kv_dtype, &.{}),
+        };
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *VulkanLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+    }
+
+    /// Free a sequence made by `seqCreate` once the device is done with it.
+    pub fn seqDestroy(self: *VulkanLM, s: *Seq) void {
+        self.be.waitIdle();
+        s.kv.deinit(self.gpa, self.be);
+        s.* = .{};
+    }
 
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const k2.Model, cap: kvmod.Capacity) !VulkanLM {
         const c = lm.cfg;

@@ -134,6 +134,33 @@ test "an urgent verb jumps the queue behind it, never the queue ahead of it" {
 /// a load was running, applied once the transcript is this thread's again.
 pub const PendingTranscript = union(enum) { new, adopt: std.ArrayList(chat.Message) };
 
+/// A prompt waiting to run apart from the conversation (`chat.Session.complete`),
+/// its strings owned. `ref` is the asker's.
+pub const CompletionJob = struct {
+    ref: u64,
+    system: []u8,
+    user: []u8,
+    think: chat.Think,
+    seed: u64,
+    max_tokens: usize,
+
+    fn deinit(self: *CompletionJob, gpa: std.mem.Allocator) void {
+        gpa.free(self.system);
+        gpa.free(self.user);
+    }
+};
+
+/// A finished completion for the host to report. `err` is an error name, static.
+pub const CompletionDone = struct {
+    ref: u64,
+    text: []u8 = "",
+    err: []const u8 = "",
+
+    pub fn deinit(self: *CompletionDone, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+    }
+};
+
 var g_instance: ?*Driver = null;
 
 /// How long a worker waits for the engine thread to enact a release. Generous
@@ -233,6 +260,19 @@ pub const Driver = struct {
     pending_regenerate: bool = false,
     pending_transcript: ?PendingTranscript = null,
 
+    /// Completions waiting for the LLM, oldest first; one runs at a time, and
+    /// never while a chat turn runs or waits.
+    completions: std.ArrayList(CompletionJob) = .empty,
+    /// The `ref` of the completion the session is running.
+    completion_running: ?u64 = null,
+    /// Finished completions, until the host reports them.
+    completions_done: std.ArrayList(CompletionDone) = .empty,
+    /// Chat actions that arrived while a completion ran, which the session
+    /// would otherwise drop as busy: applied in this order once it finishes.
+    held_variant: ?u32 = null,
+    held_submit: ?[]u8 = null,
+    held_regenerate: bool = false,
+
     /// Guards `session` teardown against the diffusion WORKER thread, which reads
     /// the session in its VRAM-coordinator hooks (budget/reclaim).
     session_mu: std.Io.Mutex = std.Io.Mutex.init,
@@ -318,6 +358,11 @@ pub const Driver = struct {
         self.freeLlmSuspend();
         self.dropPendingTranscript();
         if (self.pending_submit) |p| self.gpa.free(p);
+        if (self.held_submit) |p| self.gpa.free(p);
+        for (self.completions.items) |*j| j.deinit(self.gpa);
+        self.completions.deinit(self.gpa);
+        for (self.completions_done.items) |*d| d.deinit(self.gpa);
+        self.completions_done.deinit(self.gpa);
         self.clearStaged();
         self.staged.deinit(self.gpa);
         if (self.family_cache) |*c| c.deinit();
@@ -365,7 +410,13 @@ pub const Driver = struct {
     // inbox. Engine thread.
 
     pub fn cancelLlm(self: *Driver) void {
-        if (self.uiSession()) |s| return s.requestCancel();
+        if (self.uiSession()) |s| {
+            // A running completion is the studio's, not this chat's: the stop
+            // is for the message waiting behind it.
+            if (!s.completing()) return s.requestCancel();
+            self.dropHeld();
+            return;
+        }
         // Nothing resident to cancel: the stop is for the message (or the
         // regenerate) waiting on the load, which `maybeStartReload` would
         // otherwise submit the moment the load finished.
@@ -1141,7 +1192,13 @@ pub const Driver = struct {
         var n: usize = 0;
         for (self.settings.loras.slice()) |*l| {
             if (!l.enabled or !std.mem.eql(u8, l.family.slice(), key)) continue;
-            S.buf[n] = .{ .path = l.path.slice(), .strength = l.strength };
+            // Left out rather than run unscheduled, which would render a different
+            // picture with nothing to say so.
+            const sched = tp.models.lora.Schedule.parse(l.schedule.slice()) catch {
+                std.log.err("lora: {s} has an unreadable schedule '{s}'; not applied", .{ l.path.slice(), l.schedule.slice() });
+                continue;
+            };
+            S.buf[n] = .{ .path = l.path.slice(), .strength = l.strength, .schedule = sched };
             n += 1;
         }
         return S.buf[0..n];
@@ -1355,6 +1412,11 @@ pub const Driver = struct {
         // freeing/rebuilding it. Submit only when it's live; otherwise stash the text
         // and the load-completion path (maybeStartReload) auto-submits it.
         if (self.uiSession()) |s| {
+            if (s.completing()) {
+                if (self.held_submit) |p| self.gpa.free(p);
+                self.held_submit = self.gpa.dupe(u8, trimmed) catch return false;
+                return true;
+            }
             s.submit(trimmed) catch |err| {
                 log.err("submit failed: {t}", .{err});
                 return false;
@@ -1368,6 +1430,36 @@ pub const Driver = struct {
         if (self.pending_submit == null) return false; // nothing stashed, so don't reload for it
         if (!self.loading.load(.acquire)) self.reload_requested = true; // else the in-flight load will pick it up
         return true;
+    }
+
+    /// Regenerate the last reply, now, after a running completion, or once the
+    /// LLM has lazy-loaded.
+    pub fn regenerate(self: *Driver) !void {
+        self.assertEngineThread();
+        const s = self.uiSession() orelse return self.requestRegenLoad();
+        if (s.completing()) {
+            self.held_regenerate = true;
+            return;
+        }
+        try s.regenerate();
+    }
+
+    /// Show another take of the last reply, now or after a running completion.
+    pub fn selectVariant(self: *Driver, idx: u32) void {
+        self.assertEngineThread();
+        const s = self.uiSession() orelse return;
+        if (s.completing()) {
+            self.held_variant = idx;
+            return;
+        }
+        s.selectVariant(idx);
+    }
+
+    fn dropHeld(self: *Driver) void {
+        if (self.held_submit) |p| self.gpa.free(p);
+        self.held_submit = null;
+        self.held_regenerate = false;
+        self.held_variant = null;
     }
 
     /// Regenerate asked for while the LLM is unloaded: lazy-load it and regenerate
@@ -1470,6 +1562,110 @@ pub const Driver = struct {
             .new => self.newChatNow(),
             .adopt => |m| self.adoptTranscriptNow(m),
         }
+    }
+
+    // ── Completions ───────────────────────────────────────────────────────────
+
+    /// Queue a prompt to run apart from the conversation, lazy-loading the LLM
+    /// when none is resident. Takes ownership of `job`'s strings. One with no
+    /// model to run on is answered at once with `NoModel`.
+    pub fn requestCompletion(self: *Driver, job: CompletionJob) void {
+        self.assertEngineThread();
+        var j = job;
+        if (self.settings.llm_model.opt() == null) {
+            j.deinit(self.gpa);
+            return self.finishCompletion(j.ref, "", "NoModel");
+        }
+        self.completions.append(self.gpa, j) catch {
+            j.deinit(self.gpa);
+            return self.finishCompletion(job.ref, "", "OutOfMemory");
+        };
+        if (self.session == null and !self.loading.load(.acquire)) self.reload_requested = true;
+        self.wake();
+    }
+
+    /// Drop a queued completion, or stop the running one. Its answer still
+    /// comes, as `Stopped`.
+    pub fn cancelCompletion(self: *Driver, ref: u64) void {
+        self.assertEngineThread();
+        for (self.completions.items, 0..) |*j, i| if (j.ref == ref) {
+            j.deinit(self.gpa);
+            _ = self.completions.orderedRemove(i);
+            return self.finishCompletion(ref, "", "Stopped");
+        };
+        if (self.completion_running == ref) if (self.uiSession()) |s| s.requestCancel();
+    }
+
+    /// Completions queued or running.
+    pub fn completionCount(self: *const Driver) usize {
+        return self.completions.items.len + @intFromBool(self.completion_running != null);
+    }
+
+    fn finishCompletion(self: *Driver, ref: u64, text: []u8, err: []const u8) void {
+        self.completions_done.append(self.gpa, .{ .ref = ref, .text = text, .err = err }) catch {
+            self.gpa.free(text);
+            log.err("completion {d} finished but could not be reported", .{ref});
+        };
+    }
+
+    /// Main-loop hook, after the session's `poll`: report a finished completion,
+    /// apply what a chat turn held back while it ran, and start the next one when
+    /// the LLM has nothing else to do. Chat goes first: a completion waits for a
+    /// turn that runs or is staged, a held message, a regenerate, a pending
+    /// transcript change, a pause or an armed eject.
+    pub fn pumpCompletions(self: *Driver) void {
+        self.assertEngineThread();
+        const s = self.uiSession() orelse return self.awaitLoadForCompletions();
+        if (self.completion_running) |ref| {
+            if (s.busy()) return;
+            self.completion_running = null;
+            if (s.takeCompletion()) |r| {
+                self.finishCompletion(ref, r.text, if (r.err) |e| @errorName(e) else "");
+            } else self.finishCompletion(ref, "", "Lost");
+            self.applyHeld(s);
+        }
+        if (self.completions.items.len == 0) return;
+        if (s.busy() or s.turnPending() or self.llm_paused or self.llm_eject_armed or self.pending_transcript != null) return;
+        var job = self.completions.orderedRemove(0);
+        defer job.deinit(self.gpa);
+        s.complete(.{
+            .system = job.system,
+            .user = job.user,
+            .think = job.think,
+            .seed = job.seed,
+            .max_tokens = job.max_tokens,
+        }) catch |err| return self.finishCompletion(job.ref, "", @errorName(err));
+        self.completion_running = job.ref;
+    }
+
+    fn applyHeld(self: *Driver, s: *chat.Session) void {
+        if (self.held_variant) |v| s.selectVariant(v);
+        self.held_variant = null;
+        if (self.held_submit) |text| {
+            self.held_submit = null;
+            defer self.gpa.free(text);
+            s.submit(text) catch |err| log.err("held submit: {t}", .{err});
+        }
+        if (self.held_regenerate) {
+            self.held_regenerate = false;
+            s.regenerate() catch |err| log.err("held regenerate: {t}", .{err});
+        }
+    }
+
+    /// No session: once a load has finished without one, every queued completion
+    /// fails with its error, or is asked to load again (after an eject).
+    fn awaitLoadForCompletions(self: *Driver) void {
+        if (self.completions.items.len == 0) return;
+        if (self.loading.load(.acquire) or self.loader != null or self.reload_requested) return;
+        if (self.load_err) |e| {
+            for (self.completions.items) |*j| {
+                self.finishCompletion(j.ref, "", @errorName(e));
+                j.deinit(self.gpa);
+            }
+            self.completions.clearRetainingCapacity();
+            return;
+        }
+        self.reload_requested = true;
     }
 
     // ── Load and reload ───────────────────────────────────────────────────────

@@ -529,6 +529,71 @@ fn defaultNoiseCurves() NoiseCurveList {
     return list;
 }
 
+/// The prompt a text-to-image model reads best: comma-separated tags (CLIP
+/// models trained on booru captions) or plain sentences (the LLM-encoded DiTs).
+pub const PromptStyle = enum { tags, prose };
+
+/// Saved expanders (`expanders.slice()`): the system prompts the studio's Expand
+/// mode hands the LLM to turn an idea into an image prompt. Kept apart from
+/// `sys_prompts`, which are the chat's. Edited in Settings; the studio picks one.
+pub const max_expanders = 12;
+/// Longest expander text. Smaller than `max_prompt` because the library is held
+/// by value in `Config`, whose size the settings parse pays for per field.
+pub const max_expander_text = 2048;
+
+pub const Expander = struct {
+    name: TextBuf(max_preset_name) = .{},
+    text: TextBuf(max_expander_text) = .{},
+    /// Which models it writes for; the studio's automatic pick matches this
+    /// against the loaded model's `model_spec.Traits.prompt_style`.
+    style: PromptStyle = .prose,
+};
+
+/// What a fresh config ships with: two of each style, a fuller and a shorter one.
+/// None asks for quality words ("masterpiece", "8k"): those belong in the prefix
+/// the user writes once, not in every expansion.
+const builtin_expanders = [_]struct { []const u8, PromptStyle, []const u8 }{
+    .{ "Tags, detailed", .tags,
+        "You write prompts for an image model that reads comma-separated tags. " ++
+            "Turn the idea you are given into one line of 20 to 35 short, concrete tags, " ++
+            "in this order: the subject, their pose and action, clothing and details, " ++
+            "the setting, lighting, camera framing, mood, and art medium. No sentences, " ++
+            "no quality words, no tags for things that are not in the picture. " ++
+            "Reply with the tags only.",
+    },
+    .{ "Tags, concise", .tags,
+        "You write prompts for an image model that reads comma-separated tags. " ++
+            "Turn the idea you are given into one line of 8 to 15 short, concrete tags " ++
+            "covering the subject, the setting, the lighting and the mood. No sentences " ++
+            "and no quality words. Reply with the tags only.",
+    },
+    .{ "Prose, cinematic", .prose,
+        "You write prompts for an image model that reads natural language. Turn the " ++
+            "idea you are given into a vivid description of one single image in three " ++
+            "to five sentences: the subject and what they are doing, the setting, the " ++
+            "light and time of day, the camera angle and lens, the mood and colour " ++
+            "palette. Describe only what can be seen. Reply with the description only, " ++
+            "with no title and no preamble.",
+    },
+    .{ "Prose, plain", .prose,
+        "You write prompts for an image model that reads natural language. Turn the " ++
+            "idea you are given into one or two plain sentences saying exactly what is in " ++
+            "the picture: the subject, what they are doing, and where. No embellishment " ++
+            "and no style words. Reply with the description only.",
+    },
+};
+
+fn defaultExpanders() ExpanderList {
+    var list: ExpanderList = .{};
+    for (builtin_expanders) |e| {
+        list.items[list.count].name.set(e[0]);
+        list.items[list.count].style = e[1];
+        list.items[list.count].text.set(e[2]);
+        list.count += 1;
+    }
+    return list;
+}
+
 /// A fixed-capacity list (`items[0..count]`). Kept as a value type (no
 /// allocation) so `Config` stays a plain copyable value, but (de)serializes as
 /// a variable-length JSON array of the live entries, a raw `[cap]T` would
@@ -574,6 +639,7 @@ pub fn FixedList(comptime T: type, comptime cap: usize) type {
 pub const PresetList = FixedList(Preset, max_presets);
 pub const SysPromptList = FixedList(SysPrompt, max_sys_prompts);
 pub const NoiseCurveList = FixedList(NoiseCurve, max_noise_curves);
+pub const ExpanderList = FixedList(Expander, max_expanders);
 
 /// A fixed-capacity, nul-terminated text buffer. `data` is handed directly to
 /// dvui's `textEntry` as its backing store, so the buffer is the single source
@@ -726,6 +792,18 @@ pub const FamilySides = struct {
 pub const max_family_sides = 8;
 pub const FamilySidesList = FixedList(FamilySides, max_family_sides);
 
+/// What the studio last rendered with on one diffusion checkpoint, restored when that
+/// file is picked again. Size is absent on purpose: it follows the user, not the model.
+pub const ModelSettings = struct {
+    model: PathBuf = .{},
+    steps: usize = 20,
+    cfg_scale: f32 = 1,
+    sampler: Sampler = .euler,
+    scheduler: Scheduler = .default,
+};
+pub const max_model_settings = 32;
+pub const ModelSettingsList = FixedList(ModelSettings, max_model_settings);
+
 /// One LoRA the user turned on for a diffusion FAMILY, and its dial.
 ///
 /// Keyed by family like `FamilySides`, and FLAT rather than a list nested inside
@@ -741,10 +819,14 @@ pub const FamilyLora = struct {
     /// Multiplies the file's own `alpha / rank`. Load-neutral: the engine reads
     /// it at every apply, so moving it needs no reload.
     strength: f32 = 1.0,
+    /// `lora.Schedule`'s text form; empty is every step. Load-neutral like the dial.
+    schedule: TextBuf(max_lora_schedule) = .{},
     /// Off without forgetting the pick or the dial.
     enabled: bool = true,
 };
 pub const max_family_loras = 12;
+/// Fits a full eight-point curve at three decimals.
+pub const max_lora_schedule = 128;
 pub const FamilyLoraList = FixedList(FamilyLora, max_family_loras);
 
 /// The vision tower last used with one LLM class ("gemma4|5376": architecture
@@ -883,6 +965,8 @@ pub const Config = struct {
     /// stay in the catalog across restarts.
     model_files: ModelDirList = .{},
     family_sides: FamilySidesList = .{},
+    /// Per checkpoint, most recently rendered last (`rememberModelSettings`).
+    model_settings: ModelSettingsList = .{},
     /// LoRA sidecars, per family. Load-BEARING (the stack is built at session
     /// init), unlike the strengths inside them.
     loras: FamilyLoraList = .{},
@@ -1033,6 +1117,8 @@ pub const Config = struct {
     /// Saved curve library (`noise_curves.slice()`). Pure data the settings view
     /// and the composer dropdown read; the ACTIVE curve is `weight_noise_curve`.
     noise_curves: NoiseCurveList = defaultNoiseCurves(),
+    /// Expand mode's system prompts (see `Expander`).
+    expanders: ExpanderList = defaultExpanders(),
     /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
     /// footprint, lossy). Changing it rebuilds the KV context, the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
@@ -1093,6 +1179,18 @@ pub const Config = struct {
     /// on the request instead, and reaches config only through "Save as
     /// defaults".
     studio_size_mode: StudioSizeMode = .framing,
+    /// The studio's composer writes the prompt itself, or has the chat model
+    /// expand an idea into one (Expand mode).
+    studio_expand: bool = false,
+    /// Expand mode writes one prompt for a whole batch rather than one per image.
+    studio_expand_shared: bool = false,
+    /// Expand mode's expander, by name; empty picks one whose style matches the
+    /// loaded model (`expanderFor`).
+    studio_expander: TextBuf(max_preset_name) = .{},
+    /// Expand mode's own reasoning toggle and effort, apart from the chat's:
+    /// a quick prompt rarely wants the chat's long thought.
+    studio_expand_reasoning: bool = false,
+    studio_expand_effort: ReasoningEffort = .high,
     studio_open_size: bool = true,
     studio_open_sampling: bool = true,
     studio_open_loras: bool = false,
@@ -1313,6 +1411,117 @@ pub const Config = struct {
         return true;
     }
 
+    /// std.json's own struct parse writes every field from one `inline for`, and
+    /// a Debug build gives each of its arms a slot in the one frame: a `Config`
+    /// needed 62 MiB of stack and outgrew the parse thread (2.6 MiB this way). Here a key is looked
+    /// up in a table of per-field setters, so no frame holds more than one field.
+    /// Same rules as std's: unknown keys follow `ignore_unknown_fields`, a
+    /// repeated key `duplicate_field_behavior`, and a missing one keeps its default.
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Config {
+        const Source = @TypeOf(source);
+        const names = @typeInfo(Config).@"struct".field_names;
+        const setters = comptime fieldSetters(Source);
+        const out = try allocator.create(Config);
+        out.* = .{};
+        var seen: [names.len]bool = @splat(false);
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        while (true) {
+            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const key = switch (token) {
+                inline .string, .allocated_string => |slice| slice,
+                .object_end => break,
+                else => return error.UnexpectedToken,
+            };
+            const i = for (names, 0..) |name, i| {
+                if (std.mem.eql(u8, name, key)) break i;
+            } else {
+                if (!options.ignore_unknown_fields) return error.UnknownField;
+                try source.skipValue();
+                continue;
+            };
+            if (seen[i]) switch (options.duplicate_field_behavior) {
+                .use_first => {
+                    try source.skipValue();
+                    continue;
+                },
+                .@"error" => return error.DuplicateField,
+                .use_last => {},
+            };
+            try setters[i](out, allocator, source, options);
+            seen[i] = true;
+        }
+        return out.*;
+    }
+
+    fn FieldSetter(comptime Source: type) type {
+        return *const fn (*Config, std.mem.Allocator, Source, std.json.ParseOptions) std.json.ParseError(@typeInfo(Source).pointer.child)!void;
+    }
+
+    fn fieldSetters(comptime Source: type) [@typeInfo(Config).@"struct".field_names.len]FieldSetter(Source) {
+        const names = @typeInfo(Config).@"struct".field_names;
+        var table: [names.len]FieldSetter(Source) = undefined;
+        for (names, &table) |name, *entry| entry.* = struct {
+            fn set(out: *Config, allocator: std.mem.Allocator, source: Source, options: std.json.ParseOptions) std.json.ParseError(@typeInfo(Source).pointer.child)!void {
+                @field(out, name) = try std.json.innerParse(@FieldType(Config, name), allocator, source, options);
+            }
+        }.set;
+        return table;
+    }
+
+    /// Find an expander by name (cleaned like `upsertExpander`).
+    pub fn findExpander(self: *const Config, raw_name: []const u8) ?usize {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return null;
+        for (self.expanders.slice(), 0..) |*e, i| {
+            if (std.mem.eql(u8, e.name.slice(), name)) return i;
+        }
+        return null;
+    }
+
+    /// Save an expander under `raw_name`, replacing one of that name. False when
+    /// the name is empty after cleaning or the library is full.
+    pub fn upsertExpander(self: *Config, raw_name: []const u8, text: []const u8, style: PromptStyle) bool {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return false;
+        const i = self.findExpander(name) orelse i: {
+            if (self.expanders.count >= max_expanders) return false;
+            self.expanders.items[self.expanders.count] = .{};
+            self.expanders.items[self.expanders.count].name.set(name);
+            self.expanders.count += 1;
+            break :i self.expanders.count - 1;
+        };
+        self.expanders.items[i].text.set(text);
+        self.expanders.items[i].style = style;
+        return true;
+    }
+
+    /// Remove the expander named `raw_name`. Returns whether one was removed.
+    pub fn removeExpanderNamed(self: *Config, raw_name: []const u8) bool {
+        const i = self.findExpander(raw_name) orelse return false;
+        @memmove(self.expanders.items[i .. self.expanders.count - 1], self.expanders.items[i + 1 .. self.expanders.count]);
+        self.expanders.count -= 1;
+        self.expanders.items[self.expanders.count] = .{};
+        return true;
+    }
+
+    /// Put the shipped expanders back as they shipped, replacing any of the same
+    /// name and leaving the user's own alone. False when the library had no room
+    /// for all of them.
+    pub fn restoreBuiltinExpanders(self: *Config) bool {
+        var all = true;
+        for (builtin_expanders) |e| all = self.upsertExpander(e[0], e[2], e[1]) and all;
+        return all;
+    }
+
+    /// The expander Expand mode uses for a model that reads `style`: the one the
+    /// studio picked while it still exists, else the first of that style, else
+    /// the first at all. Null only for an empty library.
+    pub fn expanderFor(self: *const Config, style: PromptStyle) ?*const Expander {
+        if (self.findExpander(self.studio_expander.slice())) |i| return &self.expanders.items[i];
+        for (self.expanders.slice()) |*e| if (e.style == style) return e;
+        return if (self.expanders.count > 0) &self.expanders.items[0] else null;
+    }
+
     /// Find a saved system prompt by name (cleaned like `upsertSysPrompt`).
     pub fn findSysPrompt(self: *const Config, raw_name: []const u8) ?usize {
         var buf: [max_sys_prompt_name]u8 = undefined;
@@ -1403,6 +1612,28 @@ pub const Config = struct {
             const p = pb.opt() orelse continue;
             if (std.Io.Dir.path.dirname(p)) |d| _ = self.addModelDir(d);
         }
+    }
+
+    pub fn modelSettings(self: *const Config, model: []const u8) ?ModelSettings {
+        for (self.model_settings.slice()) |s| if (std.mem.eql(u8, s.model.slice(), model)) return s;
+        return null;
+    }
+
+    /// Record `s` for its model as the most recent; the least recent goes when full.
+    pub fn rememberModelSettings(self: *Config, s: ModelSettings) void {
+        const l = &self.model_settings;
+        var n: usize = 0;
+        for (l.items[0..l.count]) |e| {
+            if (std.mem.eql(u8, e.model.slice(), s.model.slice())) continue;
+            l.items[n] = e;
+            n += 1;
+        }
+        if (n == max_model_settings) {
+            @memmove(l.items[0 .. n - 1], l.items[1..n]);
+            n -= 1;
+        }
+        l.items[n] = s;
+        l.count = n + 1;
     }
 
     pub fn familySides(self: *const Config, family: []const u8) ?*const FamilySides {
@@ -1576,13 +1807,8 @@ pub const Config = struct {
             }
         };
         var ctx: Ctx = .{ .gpa = gpa, .bytes = bytes };
-        // 64 MB, not 16: `std.json`'s recursive `innerParse` builds a frame per
-        // struct field and `Config` is ~264 KB BY VALUE, so the stack this needs
-        // scales with the FIELD COUNT, adding two scalar fields was enough to
-        // blow a 16 MB stack and segfault every save/load test. A thread stack is
-        // reserved address space, so the headroom costs nothing until touched;
-        // sizing it tight here just means the next field added crashes config
-        // loading, which is a nasty way to find out.
+        // See `parse_stack_size`. A thread stack is reserved address space, so
+        // the headroom costs nothing until touched.
         const t = std.Thread.spawn(.{ .stack_size = parse_stack_size }, Ctx.run, .{&ctx}) catch {
             // Spawn failed (very unlikely): parse in-line as a best effort.
             const parsed = std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return null;
@@ -2112,6 +2338,90 @@ test "noise curve library: built-ins, upsert, delete, match-by-expression" {
     try std.testing.expectEqual(@as(?usize, null), cfg2.findNoiseCurve("mine"));
     try std.testing.expect(cfg2.findNoiseCurve("front") != null);
     try std.testing.expect(!cfg2.removeNoiseCurveNamed("mine")); // already gone
+}
+
+test "Config's own parse skips unknown keys, keeps defaults for missing ones, refuses a repeat" {
+    const gpa = std.testing.allocator;
+    const got = Config.parseJsonBigStack(gpa,
+        \\{"steps": 7, "no_such_key": {"steps": 99, "list": [1, 2]}, "width": 640,
+        \\ "expanders": [{"name": "only", "text": "t", "style": "tags"}]}
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 7), got.steps);
+    try std.testing.expectEqual(@as(usize, 640), got.width);
+    try std.testing.expectEqual(@as(Config, .{}).height, got.height);
+    try std.testing.expectEqual(@as(usize, 1), got.expanders.count);
+    try std.testing.expectEqual(PromptStyle.tags, got.expanders.items[0].style);
+    // Unset here, so the built-in library a fresh config carries.
+    try std.testing.expectEqual(@as(Config, .{}).noise_curves.count, got.noise_curves.count);
+    try std.testing.expect(Config.parseJsonBigStack(gpa, "{\"steps\": 3, \"steps\": 4}") == null);
+}
+
+test "expander library: built-ins, the studio's pick, upsert, delete, round-trip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cfg: Config = .{};
+    var per_style: [2]usize = .{ 0, 0 };
+    for (cfg.expanders.slice()) |*e| {
+        per_style[@backingInt(e.style)] += 1;
+        // `TextBuf.set` truncates without a word: a built-in must fit whole.
+        errdefer std.debug.print("built-in expander '{s}' is cut off\n", .{e.name.slice()});
+        try std.testing.expect(e.text.slice().len + 1 < max_expander_text);
+        try std.testing.expect(std.mem.find(u8, e.text.slice(), "Reply with") != null);
+    }
+    try std.testing.expectEqual([2]usize{ 2, 2 }, per_style);
+
+    // No pick: the first of the model's style.
+    try std.testing.expectEqual(PromptStyle.tags, cfg.expanderFor(.tags).?.style);
+    try std.testing.expectEqual(PromptStyle.prose, cfg.expanderFor(.prose).?.style);
+    // A pick wins over the style, until it no longer exists.
+    cfg.studio_expander.set("Prose, plain");
+    try std.testing.expectEqualStrings("Prose, plain", cfg.expanderFor(.tags).?.name.slice());
+    try std.testing.expect(cfg.removeExpanderNamed("Prose, plain"));
+    try std.testing.expectEqual(PromptStyle.tags, cfg.expanderFor(.tags).?.style);
+
+    const n0 = cfg.expanders.count;
+    try std.testing.expect(cfg.upsertExpander("  mine  ", "write tags", .tags));
+    try std.testing.expectEqual(n0 + 1, cfg.expanders.count);
+    try std.testing.expect(cfg.upsertExpander("mine", "write prose", .prose));
+    try std.testing.expectEqual(n0 + 1, cfg.expanders.count);
+    const mine = cfg.findExpander("mine") orelse return error.NotSaved;
+    try std.testing.expectEqualStrings("write prose", cfg.expanders.items[mine].text.slice());
+    try std.testing.expectEqual(PromptStyle.prose, cfg.expanders.items[mine].style);
+    try std.testing.expect(!cfg.upsertExpander("   ", "x", .tags));
+    cfg.studio_expander.set("mine");
+    cfg.studio_expand_reasoning = true;
+    cfg.studio_expand_effort = .low;
+
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "expanders");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try cfg.save(io, gpa, &environ, file);
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(cfg.expanders.count, back.expanders.count);
+    try std.testing.expectEqualStrings("write prose", back.expanderFor(.tags).?.text.slice());
+    try std.testing.expect(back.studio_expand_reasoning);
+    try std.testing.expectEqual(ReasoningEffort.low, back.studio_expand_effort);
+
+    // Restoring brings the shipped four back as shipped and keeps the user's own.
+    var restored = back;
+    _ = restored.upsertExpander("Tags, concise", "edited", .prose);
+    try std.testing.expect(restored.restoreBuiltinExpanders());
+    try std.testing.expectEqual(@as(usize, 5), restored.expanders.count);
+    try std.testing.expect(restored.findExpander("mine") != null);
+    const concise = restored.findExpander("Tags, concise") orelse return error.NotRestored;
+    try std.testing.expectEqual(PromptStyle.tags, restored.expanders.items[concise].style);
+    try std.testing.expect(!std.mem.eql(u8, "edited", restored.expanders.items[concise].text.slice()));
+
+    // An emptied library stays empty: the built-ins seed a missing key only.
+    var empty = cfg;
+    while (empty.expanders.count > 0) _ = empty.removeExpanderNamed(empty.expanders.items[0].name.slice());
+    try std.testing.expect(empty.expanderFor(.prose) == null);
+    try empty.save(io, gpa, &environ, file);
+    const back_empty = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 0), back_empty.expanders.count);
 }
 
 test "weight_noise: defaults, save/load, live-only" {
@@ -2660,6 +2970,49 @@ test "family sides and class towers: get-or-create, remember, round-trip" {
     try std.testing.expectEqual(@as(usize, max_class_towers), back.class_towers.count);
 }
 
+test "model settings: remembered per file, most recent last, the least recent dropped, round-trip" {
+    var c: Config = .{};
+    try std.testing.expect(c.modelSettings("/m/turbo.safetensors") == null);
+    var t: ModelSettings = .{ .steps = 8, .cfg_scale = 1, .sampler = .euler, .scheduler = .default };
+    t.model.set("/m/turbo.safetensors");
+    var b: ModelSettings = .{ .steps = 50, .cfg_scale = 4, .sampler = .dpmpp_2m, .scheduler = .karras };
+    b.model.set("/m/base.safetensors");
+    c.rememberModelSettings(t);
+    c.rememberModelSettings(b);
+    t.steps = 6;
+    c.rememberModelSettings(t); // replaces, and moves to the end
+    try std.testing.expectEqual(@as(usize, 2), c.model_settings.count);
+    try std.testing.expectEqual(@as(usize, 6), c.modelSettings("/m/turbo.safetensors").?.steps);
+    try std.testing.expectEqualStrings("/m/turbo.safetensors", c.model_settings.items[1].model.slice());
+
+    // Full: the least recent goes, which is `base` once everything else is newer.
+    var i: usize = 0;
+    while (i < max_model_settings - 1) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        var e: ModelSettings = .{};
+        e.model.set(try std.mem.print(&buf, "/m/{d}.safetensors", .{i}));
+        c.rememberModelSettings(e);
+    }
+    try std.testing.expectEqual(@as(usize, max_model_settings), c.model_settings.count);
+    try std.testing.expect(c.modelSettings("/m/base.safetensors") == null);
+    try std.testing.expect(c.modelSettings("/m/turbo.safetensors") != null);
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [256]u8 = undefined;
+    const path = try std.mem.print(&pbuf, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
+    var env: Environ = .init(gpa);
+    defer env.deinit();
+    try c.save(io, gpa, &env, path);
+    const back = Config.load(io, gpa, &env, path);
+    const got = back.modelSettings("/m/turbo.safetensors").?;
+    try std.testing.expectEqual(@as(usize, 6), got.steps);
+    try std.testing.expectEqual(Sampler.euler, got.sampler);
+    try std.testing.expectEqual(@as(usize, max_model_settings), back.model_settings.count);
+}
+
 test "family loras: add dedupes, remove keeps order, table caps" {
     var c: Config = .{};
     // Two families in ONE flat table, which is the point of the family key: a
@@ -2804,10 +3157,10 @@ test "sys_prompts save/load round-trip (JSON, multi-line text)" {
     try std.testing.expectEqualStrings("pirate", b.sys_prompts.items[1].name.slice());
 }
 
-/// Stack for any thread that parses a `Config` from JSON. In Debug the
-/// std.json struct parser holds a copy of the struct per field in ONE frame,
-/// about 63 x 250 KB here, which overflows the 16 MiB a thread gets by default
-/// and segfaults inside the parser with no message.
+/// Stack for any thread that parses a `Config` from JSON. `Config.jsonParse`
+/// holds the Debug parse to a few MiB; std.json's generic struct parse took tens,
+/// and a parse that outgrows its thread segfaults inside the parser with no
+/// message.
 pub const parse_stack_size: usize = 64 << 20;
 
 test "the settings JSON parses on a spawned thread, as the engine host does" {
@@ -2898,7 +3251,7 @@ test "HostSettings carries every host field and none of the client's" {
         // its default is one the list names and this test forgot.
         try std.testing.expect(!std.meta.eql(@field(h, name), @field(@as(Config, .{}), name)));
     }
-    inline for (.{ "output_dir", "win_w", "win_h", "viewer_w", "sys_prompts", "presets", "noise_curves", "model_dirs", "model_files", "family_sides", "class_towers", "cfg_scale", "framing_ratio", "studio_size_mode", "hosts", "chat_host" }) |name| {
+    inline for (.{ "output_dir", "win_w", "win_h", "viewer_w", "sys_prompts", "presets", "noise_curves", "model_dirs", "model_files", "family_sides", "class_towers", "cfg_scale", "framing_ratio", "studio_size_mode", "studio_expander", "studio_expand_reasoning", "expanders", "hosts", "chat_host" }) |name| {
         try std.testing.expect(!@hasField(HostSettings, name));
     }
 
@@ -2906,7 +3259,7 @@ test "HostSettings carries every host field and none of the client's" {
     // Config it restores exactly the host fields.
     const json = try std.json.Stringify.valueAlloc(gpa, h, .{});
     defer gpa.free(json);
-    for ([_][]const u8{ "\"output_dir\"", "\"win_", "\"viewer_", "\"studio_", "\"sys_prompts\"", "\"presets\"", "\"noise_curves\"", "\"model_dirs\"", "\"family_sides\"", "\"class_towers\"", "\"hosts\"", "/c/", "secret", "mine", "beta", "lydia", "5e5e5e" }) |needle| {
+    for ([_][]const u8{ "\"output_dir\"", "\"win_", "\"viewer_", "\"studio_", "\"sys_prompts\"", "\"presets\"", "\"noise_curves\"", "\"expanders\"", "\"model_dirs\"", "\"family_sides\"", "\"class_towers\"", "\"hosts\"", "/c/", "secret", "mine", "beta", "lydia", "5e5e5e" }) |needle| {
         errdefer std.debug.print("client data on the wire: {s}\n", .{needle});
         try std.testing.expect(std.mem.find(u8, json, needle) == null);
     }

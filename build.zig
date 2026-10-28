@@ -625,6 +625,7 @@ pub fn build(b: *std.Build) !void {
         "src/gui/meter.zig",
         "src/gui/status_bar.zig",
         "src/gui/image_view.zig",
+        "src/gui/lora_schedule.zig",
         "src/gui/model_lib.zig",
     }) |path| {
         const t = b.addTest(.{

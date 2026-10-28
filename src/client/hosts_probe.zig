@@ -1,8 +1,8 @@
 //! `zig build hosts-probe -- --config <file> --message <text> --image <prompt>
 //! [--kill-b] [--llm <file>] [--remote <pairing string>] [--size <px>]
 //! [--steps <n>] [--timeout <s>] [--send-model <file>]
-//! [--pull-model <stem> --pull-into <dir>]`: tp-gui's multi-host path with no
-//! window.
+//! [--pull-model <stem> --pull-into <dir>] [--expand <idea>]`: tp-gui's
+//! multi-host path with no window.
 //! Two hosts driven through `client/hosts.zig` exactly as the app drives
 //! them: the chat goes to A (the local slot), the image lands on B
 //! (`placeRender` keeps it off the chat host). B is a second tp-serve child on
@@ -18,6 +18,12 @@
 //! non-zero on any miss. Both local children share one card, so `--llm` puts
 //! a small chat model on A: a 31B beside a diffusion pipeline prefills at one
 //! token a second.
+//!
+//! `--expand` replaces `--image` with the studio's Expand mode: A's model writes
+//! the prompt from the idea (queued behind the chat turn) and the render goes
+//! wherever the queue places it. The run then also needs the job to have waited
+//! as "writing prompt" and the finished render's prompt to be the marked prefix,
+//! a non-empty answer and the marked suffix, one per line.
 const std = @import("std");
 const link = @import("serve").link;
 const Io = std.Io;
@@ -46,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg_path: ?[]const u8 = null;
     var message: ?[]const u8 = null;
     var image: ?[]const u8 = null;
+    var idea: ?[]const u8 = null;
     var kill_b = false;
     var llm: ?[]const u8 = null;
     var pairing: ?[]const u8 = null;
@@ -73,6 +80,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--pull-into") and more) {
             i += 1;
             pull_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--expand") and more) {
+            i += 1;
+            idea = args[i];
         } else if (std.mem.eql(u8, args[i], "--kill-b")) {
             kill_b = true;
         } else if (std.mem.eql(u8, args[i], "--llm") and more) {
@@ -94,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             timeout_s = try std.fmt.parseInt(u64, args[i], 10);
         } else {
-            std.debug.print("usage: hosts-probe --config <file> --message <text> --image <prompt> [--kill-b] [--llm <file>] [--remote <pairing string>] [--send-model <file>] [--pull-model <stem> --pull-into <dir>] [--size <px>] [--steps <n>] [--timeout <s>]\n", .{});
+            std.debug.print("usage: hosts-probe --config <file> --message <text> --image <prompt> [--kill-b] [--llm <file>] [--remote <pairing string>] [--send-model <file>] [--pull-model <stem> --pull-into <dir>] [--expand <idea>] [--size <px>] [--steps <n>] [--timeout <s>]\n", .{});
             return error.BadArgs;
         }
     }
@@ -103,7 +113,11 @@ pub fn main(init: std.process.Init) !void {
         return error.BadArgs;
     };
     const msg = message orelse return error.BadArgs;
-    const prompt = image orelse return error.BadArgs;
+    const prompt = image orelse if (idea != null) "" else return error.BadArgs;
+    if (kill_b and idea != null) {
+        std.debug.print("hosts-probe: --kill-b and --expand are separate runs\n", .{});
+        return error.BadArgs;
+    }
     if (kill_b and pairing != null) {
         std.debug.print("hosts-probe: --kill-b needs a local B\n", .{});
         return error.BadArgs;
@@ -293,6 +307,12 @@ pub fn main(init: std.process.Init) !void {
     var card_peak_mhz: u32 = 0;
     var card_peak_vram: u64 = 0;
     var b_gen_before: wire.HostGen = b.remote.?.gen;
+    // The ref the render is followed by: the probe's own, or the queue's for an
+    // expanded job.
+    var image_ref: u64 = 1;
+    var seen_writing = false;
+    const prefix = "PREFIX-MARK, masterpiece";
+    const suffix = "SUFFIX-MARK";
     const deadline = Io.Clock.real.now(io).nanoseconds + @as(i96, @intCast(timeout_s)) * std.time.ns_per_s;
 
     while (true) {
@@ -346,6 +366,34 @@ pub fn main(init: std.process.Init) !void {
             }
             h.postSettings(&cfg);
         }
+        if (idea != null and !image_posted and picked and b.mirror.state.diff_present) {
+            image_posted = true;
+            const expander = cfg.expanderFor(.tags) orelse return error.NoExpander;
+            const batch = h.expand(&cfg, .{
+                .recipe = .{
+                    .width = @intCast(cfg.width),
+                    .height = @intCast(cfg.height),
+                    .steps = @intCast(cfg.steps),
+                    .seed = 1234,
+                    .from_studio = true,
+                },
+                .prefix = prefix,
+                .idea = idea.?,
+                .suffix = suffix,
+                .system = expander.text.slice(),
+            });
+            if (batch == 0) return error.ExpandRefused;
+            for (h.asked.items) |*q| if (q.batch == batch) {
+                image_ref = q.ref;
+            };
+            try out.print("{{\"probe\":\"expand queued\",\"expander\":\"{s}\",\"ref\":{d}}}\n", .{ expander.name.slice(), image_ref });
+        }
+        if (idea != null and !seen_writing) for (h.asked.items) |*q| {
+            if (q.ref == image_ref and q.waiting and h.waitReason(&cfg, q) == .writing) {
+                seen_writing = true;
+                try out.writeAll("{\"probe\":\"writing prompt\"}\n");
+            }
+        };
         if (!image_posted and picked and b.mirror.state.diff_present) {
             image_posted = true;
             image_host = switch (h.placeRender(&cfg, @intCast(cfg.width), @intCast(cfg.height), @intCast(cfg.steps))) {
@@ -397,11 +445,15 @@ pub fn main(init: std.process.Init) !void {
         var im_status: ?wire.ImageStatus = null;
         var im_failure: []const u8 = "";
         var im_step: u32 = 0;
-        for (h.slots.items) |s| for (s.mirror.images.items) |*im| if (im.info.client_ref == 1) {
+        var im_prompt: []const u8 = "";
+        var im_host: []const u8 = "";
+        for (h.slots.items) |s| for (s.mirror.images.items) |*im| if (im.info.client_ref == image_ref) {
             image_id = im.info.id;
             im_status = im.status();
             im_failure = im.info.failure;
             im_step = im.info.step;
+            im_prompt = im.info.prompt;
+            im_host = s.name;
         };
         if (kill_b and !killed and im_status == .generating and im_step >= 2) {
             killed = true;
@@ -417,7 +469,15 @@ pub fn main(init: std.process.Init) !void {
         const image_done = if (im_status) |st| st == .done or st == .failed or st == .canceled else false;
         const b_back = !kill_b or (killed and b.reconnects > 0 and b.up());
         if (turns_seen >= 1 and image_done and b_back) {
-            const ok_image = if (kill_b) im_status == .failed and std.mem.eql(u8, im_failure, "HostLost") else im_status == .done;
+            var ok_image = if (kill_b) im_status == .failed and std.mem.eql(u8, im_failure, "HostLost") else im_status == .done;
+            if (idea != null) {
+                const lines_ok = std.mem.startsWith(u8, im_prompt, prefix ++ "\n") and std.mem.endsWith(u8, im_prompt, "\n" ++ suffix) and
+                    im_prompt.len > prefix.len + suffix.len + 2;
+                try out.print("{{\"probe\":\"expanded\",\"host\":\"{s}\",\"seen_writing\":{},\"lines_ok\":{},\"prompt\":{f}}}\n", .{
+                    im_host, seen_writing, lines_ok, std.json.fmt(im_prompt, .{}),
+                });
+                ok_image = ok_image and seen_writing and lines_ok;
+            }
             const ok_chat = a.mirror.messages.items.len == 2 and a.up() and a.reconnects == 0;
             if (card_seen) try out.print("{{\"probe\":\"card peak\",\"host\":\"B\",\"gpu_util\":{d:.0},\"gpu_mhz\":{d},\"vram_used_mb\":{d}}}\n", .{ card_peak_util, card_peak_mhz, card_peak_vram >> 20 });
             try out.print("{{\"probe\":\"hosts\",\"image\":\"{t}\",\"failure\":\"{s}\",\"chat_messages\":{d},\"a_untouched\":{},\"pass\":{}}}\n", .{

@@ -2,7 +2,9 @@
 //! data into a PNG, with no model, no GPU and no engine.
 //! `zig build ui-probe -- out.png [width height] [mode] [--click=X,Y]`, mode one of
 //! `--states` (the status bar under three loads), `--settings`, `--studio` (with
-//! `--lora`, over a selection that has a LoRA section), `--hosts` (one status bar
+//! `--lora`, over a selection that has LoRAs, `--folded`, which leaves its
+//! sections closed to show their folded summaries, and `--expand`, the composer
+//! in Expand mode with text in it), `--hosts` (one status bar
 //! per host, through the real `status_bar.render`, so two bars sharing a history
 //! ring, widget id or handle shows), `--library` or `--reopened` (a run whose
 //! files have gone: ghost slots, no toast, no retry). `--click` is in the PNG's
@@ -243,6 +245,17 @@ const quick = [_]bubbles.QuickSetting{
 // ------------------------------------------------------------------ actions
 
 fn noop() void {}
+/// What Generate in Expand mode hands the queue, printed so `--click` on it can
+/// be checked.
+fn noopExpand(e: @import("client").hosts.Hosts.Expand) void {
+    std.debug.print("ui-probe: expand count={d} shared={} think={} idea=\"{s}\" prefix=\"{s}\" suffix=\"{s}\" system starts \"{s}\" steps={d} {d}x{d}\n", .{
+        e.count, e.shared, e.think, e.idea, e.prefix, e.suffix, e.system[0..@min(e.system.len, 48)], e.recipe.steps, e.recipe.width, e.recipe.height,
+    });
+}
+
+/// What a model wrote last, for `--expand`: long enough to wrap, as one does.
+const canned_expansion = "oil painting, muted palette\nA weathered traveller in a frayed cloak stops at the crest of a hill above his home village at dusk, smoke rising from the chimneys, a dog running up the path to meet him.\ngolden hour, 35mm";
+
 fn noopId(_: u64) void {}
 fn noopCtx(_: *anyopaque) void {}
 fn noopCtxIdx(_: *anyopaque, _: usize) void {}
@@ -806,11 +819,13 @@ fn cannedCatalog(gpa: std.mem.Allocator) !catalog.Catalog {
 /// capability the engine does not have.
 ///
 /// The dial is set to something other than 1, since a slider parked at its
-/// default says nothing about whether the row renders the value it holds.
+/// default says nothing about whether the row renders the value it holds, and
+/// the schedule to a window, so its chip names steps.
 fn cannedLoraSelection(cfg: *config.Config) void {
     selection.selectCheckpoint(cfg, &probe_mirror.catalog, "/models/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors");
     if (cfg.addFamilyLora("sensenova", "/models/loras/sensenovaU158BMot_8StepTurboLora.safetensors")) |l| {
         l.strength = 0.85;
+        l.schedule.set("window:1-0.85");
     }
 }
 
@@ -1110,7 +1125,14 @@ fn studioFrame() void {
                 .max_size_content = .width(col_w),
             });
             defer col.deinit();
-            image_view.render(&probe_cfg, &probe_mirror, &probe_models, probeImages(), noopPost, true, .{ .settings = noop, .save_defaults = noop, .cancel = noopId });
+            image_view.render(&probe_cfg, &probe_mirror, &probe_models, probeImages(), noopPost, true, .{
+                .settings = noop,
+                .save_defaults = noop,
+                .cancel = noopId,
+                .expand = noopExpand,
+                .llm = .{ .configured = true, .thinking = true },
+                .last_expansion = if (probe_cfg.studio_expand) canned_expansion else "",
+            });
         }
 
         // The same rail as chat: work in motion is on the canvas here and in the
@@ -1174,7 +1196,9 @@ pub fn main(init: std.process.Init) !void {
     var studio_mode = false;
     var click_pt: ?dvui.Point.Physical = null;
     var lora_mode = false;
+    var folded = false;
     var hosts_mode = false;
+    var no_chat = false;
     var dims: [2]?u32 = .{ null, null };
     var seen_out = false;
     for (args[1..]) |arg| {
@@ -1204,11 +1228,18 @@ pub fn main(init: std.process.Init) !void {
             setCannedCatalog(try cannedCatalog(std.heap.smp_allocator));
             try buildProbeModels(std.heap.smp_allocator);
             _ = probe_cfg.addModelDir("/models");
+        } else if (std.mem.eql(u8, arg, "--expand")) {
+            probe_cfg.studio_expand = true;
+            image_view.setExpandText("oil painting, muted palette", "adventurer returning home after ten years", "golden hour, 35mm");
         } else if (std.mem.eql(u8, arg, "--lora")) {
             lora_mode = true;
+        } else if (std.mem.eql(u8, arg, "--folded")) {
+            folded = true;
         } else if (std.mem.eql(u8, arg, "--library")) {
             g_rail_tab = .library;
             try cannedLibrary(std.heap.smp_allocator);
+        } else if (std.mem.eql(u8, arg, "--no-chat-models")) {
+            no_chat = true;
         } else if (std.mem.eql(u8, arg, "--reopened")) {
             g_reopened = true;
         } else if (std.mem.eql(u8, arg, "--hosts")) {
@@ -1229,12 +1260,17 @@ pub fn main(init: std.process.Init) !void {
     // The flag may arrive after `--settings`, so the swap happens once the whole
     // command line has been read.
     if (settings_mode and lora_mode) cannedLoraSelection(&probe_cfg);
+    // `--settings --no-chat-models`: folders with no GGUF chat model, and a
+    // diffusion text encoder picked through "Other file".
+    if (settings_mode and no_chat) {
+        for (probe_models.cat.entries) |*e| e.llm = null;
+        selection.selectLlm(&probe_cfg, &probe_models.cat, "/elsewhere/qwen3.5_9b_uncensored_int8_convrot.safetensors");
+    }
     if (!settings_mode and !states_mode and !studio_mode and !hosts_mode) {
         if (g_reopened) try cannedReopened(std.heap.smp_allocator) else try cannedTiles(std.heap.smp_allocator);
     }
     // The studio needs a checkpoint selected for its architecture-dependent
-    // rows; `--lora` puts it on SenseNova, which is the only family here with a
-    // LoRA section to draw (see Family.supportsLora).
+    // rows; `--lora` puts it on SenseNova, the family the canned LoRAs are for.
     if (studio_mode) {
         if (lora_mode) {
             cannedLoraSelection(&probe_cfg);
@@ -1259,6 +1295,12 @@ pub fn main(init: std.process.Init) !void {
             probe_cfg.cond_steers.items[0] = .{ .text = .lit("tentacles, suckers"), .scale = 1.2 };
             probe_cfg.cond_steers.items[1] = .{ .text = .lit("anime, cel shading"), .scale = -0.8 };
             probe_cfg.cond_steers.count = 2;
+        }
+        if (folded) {
+            probe_cfg.studio_open_size = false;
+            probe_cfg.studio_open_sampling = false;
+            probe_cfg.studio_open_loras = false;
+            probe_cfg.studio_open_advanced = false;
         }
         try cannedStudio(std.heap.smp_allocator);
     }

@@ -704,7 +704,7 @@ pub const Lin = struct {
             return error.UnsupportedCheckpoint;
         }
         for (hits) |h| {
-            const s = stack.files.items[h.file].strength;
+            const s = stack.strengthOf(h.file);
             // Exact: adding `0 * delta` changes nothing, so a dial at zero is free.
             if (s == 0) continue;
             if (h.target.dora) |d| try self.doraBase(y, x, m, w, d, o.bias, s);

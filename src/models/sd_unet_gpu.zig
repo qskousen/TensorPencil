@@ -718,7 +718,7 @@ fn convLora(ctx: *Context, sess: *const Session, ws: *Workspace, dst: *DeviceBuf
     const scratch = sess.lin.lora;
     const zb = sess.lin.zero_bias;
     for (hits) |hit| {
-        const strength = stack.files.items[hit.file].strength;
+        const strength = stack.strengthOf(hit.file);
         if (strength == 0) continue;
         const t = hit.target;
         if (t.dora) |d| {

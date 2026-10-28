@@ -32,6 +32,7 @@ const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 const residency = @import("tp_runtime").residency;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -284,8 +285,8 @@ pub const CudaLM = struct {
     max_rows: usize,
     sin_off: usize,
     /// Only cfg.n_layers entries are live.
-    k_cache: [qwen3.Config.max_layers]Growable,
-    v_cache: [qwen3.Config.max_layers]Growable,
+    k_cache: [qwen3.Config.max_layers]Growable = @splat(.{}),
+    v_cache: [qwen3.Config.max_layers]Growable = @splat(.{}),
     freqs_d: Buf,
     bufs: LmBufs,
     /// Hidden-state taps for the EAGLE-3 drafter (enableTaps): the residual
@@ -357,6 +358,77 @@ pub const CudaLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `cache` and `freqs`, present exactly when a split is armed.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        k_cache: [qwen3.Config.max_layers]Growable = @splat(.{}),
+        v_cache: [qwen3.Config.max_layers]Growable = @splat(.{}),
+        graph_exec: cuda.cu.CUgraphExec = null,
+        decode_warm: bool = false,
+        host: ?Host = null,
+
+        pub const Host = struct { cache: kvmod.KvCache, freqs: ops.rope.Freqs };
+    };
+
+    /// An empty sequence for the current layer placement: device KV for the
+    /// device layers, and the split's host side when one is armed.
+    fn seqAlloc(self: *const CudaLM, initial: usize, max: usize) !Seq {
+        const be = self.be;
+        const c = self.cfg;
+        const dt = self.kv_dtype;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        for (s.k_cache[0..c.n_layers], s.v_cache[0..c.n_layers], 0..) |*kb, *vb, l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            kb.* = try be.growableCreate(dt.sizeBytes(initial * c.kvDim()), dt.sizeBytes(max * c.kvDim()));
+            vb.* = try be.growableCreate(dt.sizeBytes(initial * c.kvDim()), dt.sizeBytes(max * c.kvDim()));
+        }
+        if (self.split != null) {
+            var cache = try kvmod.KvCache.init(self.gpa, c.n_layers, initial, c.kvDim(), dt);
+            errdefer cache.deinit(self.gpa);
+            s.host = .{ .cache = cache, .freqs = try ops.rope.rotateHalfFreqs(self.gpa, initial, hd, c.rope_theta) };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const CudaLM, s: *Seq) void {
+        const be = self.be;
+        if (s.graph_exec != null) be.graphDestroy(s.graph_exec);
+        for (&s.k_cache) |*b| be.growableDestroy(b);
+        for (&s.v_cache) |*b| be.growableDestroy(b);
+        if (s.host) |*h| {
+            h.cache.deinit(self.gpa);
+            h.freqs.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` committed rows that never grows, so
+    /// running it can never ask the dynamic split to migrate a layer. Not with
+    /// EAGLE taps or tree verify, whose layouts stride by the live capacity.
+    pub fn seqCreate(self: *CudaLM, rows: usize) !Seq {
+        if (self.taps_on or self.tree != null) return error.SeqUnsupported;
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *CudaLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(kvmod.KvCache, &sp.cache, &h.cache);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs, &h.freqs);
+        } else std.debug.assert(s.host == null);
+    }
+
+    pub fn seqDestroy(self: *CudaLM, s: *Seq) void {
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, cap: kvmod.Capacity, first_seq: usize) !CudaLM {
         // Embedding/LM-head kernels exist for bf16, f16, and the ggml block-quant
         // formats (tied or untied head); anything else has no gather kernel.
@@ -380,27 +452,14 @@ pub const CudaLM = struct {
             defer arena.deinit();
             self.lin_plan = try lin_cuda.plan(try lm.deviceLins(arena.allocator()), lin_cuda.Use.llm(@max(first_seq, spec_limits.max_draft + 1)), "qwen3 cuda");
         }
-        self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
-        self.max_capacity = cap.max;
-        self.split = null;
-        self.io = null; // field defaults do not apply to `undefined`-built structs
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
         // Activation buffers always cover a speculative verify batch; padded
         // GEMM buffers are 128-row anyway, so the floor is nearly free.
         self.max_rows = @max(@max(first_seq, 1), spec_limits.max_draft + 1);
         // RoPE table (and its sin offset, baked into captured graphs as a
         // kernel param) cover max_capacity so KV growth never touches them.
         self.sin_off = cap.max * half;
-        self.graph_exec = null;
-        self.decode_warm = false;
-        self.graph_ok = true;
-        self.tap_layers = .{ 0, 0, 0 };
-        self.tap_d = .{};
-        self.taps_on = false;
-        self.tree = null;
-        self.tree_n = 0;
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, hd, c.rope_theta);
         defer freqs.deinit(gpa);
@@ -412,18 +471,12 @@ pub const CudaLM = struct {
         errdefer be.tensorDestroy(&self.freqs_d);
         try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
-        const dt = cap.kv_dtype;
-        var created: usize = 0;
-        errdefer for (self.k_cache[0..created]) |*b| be.growableDestroy(b);
-        for (self.k_cache[0..c.n_layers]) |*b| {
-            b.* = try be.growableCreate(dt.sizeBytes(cap.initial * c.kvDim()), dt.sizeBytes(cap.max * c.kvDim()));
-            created += 1;
-        }
-        var vcreated: usize = 0;
-        errdefer for (self.v_cache[0..vcreated]) |*b| be.growableDestroy(b);
-        for (self.v_cache[0..c.n_layers]) |*b| {
-            b.* = try be.growableCreate(dt.sizeBytes(cap.initial * c.kvDim()), dt.sizeBytes(cap.max * c.kvDim()));
-            vcreated += 1;
+        var first = try self.seqAlloc(cap.initial, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
         }
 
         self.bufs = try LmBufs.init(be, self.max_rows, c);
@@ -524,19 +577,18 @@ pub const CudaLM = struct {
     }
 
     pub fn deinit(self: *CudaLM) void {
+        var live: Seq = .{};
+        if (self.split) |*sp| live.host = .{ .cache = sp.cache, .freqs = sp.freqs };
+        self.seqSwap(&live);
+        self.seqFree(&live);
         if (self.split) |*sp| {
-            sp.cache.deinit(self.gpa);
             sp.scratch.deinit(self.gpa);
-            sp.freqs.deinit(self.gpa);
             self.gpa.free(sp.hx);
             self.gpa.free(sp.on_gpu);
             self.gpa.free(sp.order);
         }
         if (self.tree) |*tb| tb.deinit(self.be);
         if (self.taps_on) self.be.tensorDestroy(&self.tap_d);
-        if (self.graph_exec != null) self.be.graphDestroy(self.graph_exec);
-        for (self.k_cache[0..self.cfg.n_layers]) |*b| self.be.growableDestroy(b);
-        for (self.v_cache[0..self.cfg.n_layers]) |*b| self.be.growableDestroy(b);
         self.be.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.be);
         self.* = undefined;

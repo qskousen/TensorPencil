@@ -14,6 +14,7 @@ const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 
 const Backend = cuda.Backend;
@@ -383,6 +384,55 @@ pub const CudaLM = struct {
         next: usize = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). A split here moves only
+    /// experts, so the KV is all on the device.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        k_cache: []Growable = &.{},
+        v_cache: []Growable = &.{},
+    };
+
+    fn seqAlloc(self: *const CudaLM, initial: usize, max: usize) !Seq {
+        const c = self.cfg;
+        const dt = self.kv_dtype;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        s.k_cache = try self.gpa.alloc(Growable, c.n_layers);
+        @memset(s.k_cache, .{});
+        s.v_cache = try self.gpa.alloc(Growable, c.n_layers);
+        @memset(s.v_cache, .{});
+        for (s.k_cache, s.v_cache) |*kb, *vb| {
+            kb.* = try self.be.growableCreate(dt.sizeBytes(initial * c.kvDim()), dt.sizeBytes(max * c.kvDim()));
+            vb.* = try self.be.growableCreate(dt.sizeBytes(initial * c.kvDim()), dt.sizeBytes(max * c.kvDim()));
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const CudaLM, s: *Seq) void {
+        for (s.k_cache) |*b| self.be.growableDestroy(b);
+        for (s.v_cache) |*b| self.be.growableDestroy(b);
+        self.gpa.free(s.k_cache);
+        self.gpa.free(s.v_cache);
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` committed rows that never grows.
+    pub fn seqCreate(self: *CudaLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *CudaLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+    }
+
+    pub fn seqDestroy(self: *CudaLM, s: *Seq) void {
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const k2.Model, cap: kvmod.Capacity) !CudaLM {
         const c = lm.cfg;
         const rows = prefillRows(cap.max);
@@ -397,10 +447,7 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = c;
-        self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
-        self.max_capacity = cap.max;
-        self.len = 0;
         self.kv_dtype = cap.kv_dtype;
         self.max_rows = rows;
         self.sin_off = cap.max * (c.head_dim / 2);
@@ -424,21 +471,12 @@ pub const CudaLM = struct {
         errdefer be.tensorDestroy(&self.freqs_d);
         try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
-        self.k_cache = try gpa.alloc(Growable, c.n_layers);
-        errdefer gpa.free(self.k_cache);
-        self.v_cache = try gpa.alloc(Growable, c.n_layers);
-        errdefer gpa.free(self.v_cache);
-        var nk: usize = 0;
-        errdefer for (self.k_cache[0..nk]) |*buf| be.growableDestroy(buf);
-        for (self.k_cache) |*buf| {
-            buf.* = try be.growableCreate(cap.kv_dtype.sizeBytes(cap.initial * c.kvDim()), cap.kv_dtype.sizeBytes(cap.max * c.kvDim()));
-            nk += 1;
-        }
-        var nv: usize = 0;
-        errdefer for (self.v_cache[0..nv]) |*buf| be.growableDestroy(buf);
-        for (self.v_cache) |*buf| {
-            buf.* = try be.growableCreate(cap.kv_dtype.sizeBytes(cap.initial * c.kvDim()), cap.kv_dtype.sizeBytes(cap.max * c.kvDim()));
-            nv += 1;
+        var first = try self.seqAlloc(cap.initial, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
         }
         self.bufs = try Bufs.init(be, c, rows);
         errdefer self.bufs.deinit(be);
@@ -465,10 +503,9 @@ pub const CudaLM = struct {
     }
 
     pub fn deinit(self: *CudaLM) void {
-        for (self.k_cache) |*buf| self.be.growableDestroy(buf);
-        for (self.v_cache) |*buf| self.be.growableDestroy(buf);
-        self.gpa.free(self.k_cache);
-        self.gpa.free(self.v_cache);
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         self.be.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.be);
         self.cpu_scratch.deinit(self.gpa);

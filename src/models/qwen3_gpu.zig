@@ -29,6 +29,7 @@ const transformer_gpu = @import("transformer_gpu.zig");
 const kv_gpu = @import("kv_gpu.zig");
 const kvmod = @import("tp_core").kv_cache;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 
 // Only `head_dim` is a family-wide constant here. Every other dimension is read
@@ -371,7 +372,7 @@ pub const VulkanLM = struct {
     /// The Io of the last step, as the CUDA stepper keeps it for its host layers.
     io: ?std.Io = null,
     sin_off: u32,
-    kv: kv_gpu.Kv,
+    kv: kv_gpu.Kv = .empty,
     freqs_d: Buf,
     bufs: LmBufs,
     /// `bufs.t` holds a residual not yet added to `bufs.x`: the next hidden norm adds it
@@ -404,6 +405,64 @@ pub const VulkanLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `cache` and `freqs`, present exactly when a split is armed.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        kv: kv_gpu.Kv = .empty,
+        host: ?Host = null,
+
+        pub const Host = struct { cache: kvmod.KvCache, freqs: ops.rope.Freqs };
+    };
+
+    /// An empty sequence for the current layer placement.
+    fn seqAlloc(self: *const VulkanLM, initial: usize, max: usize) !Seq {
+        const c = self.cfg;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        s.kv = try kv_gpu.Kv.init(self.gpa, self.be, c.n_layers, initial, c.kvDim(), self.kv_dtype, &.{});
+        if (self.split) |*sp| {
+            for (sp.on_gpu, 0..) |on, l| if (!on) s.kv.release(self.be, l);
+            var cache = try kvmod.KvCache.init(self.gpa, c.n_layers, initial, c.kvDim(), self.kv_dtype);
+            errdefer cache.deinit(self.gpa);
+            s.host = .{ .cache = cache, .freqs = try ops.rope.rotateHalfFreqs(self.gpa, initial, hd, c.rope_theta) };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const VulkanLM, s: *Seq) void {
+        s.kv.deinit(self.gpa, self.be);
+        if (s.host) |*h| {
+            h.cache.deinit(self.gpa);
+            h.freqs.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` rows that never grows (see `qwen3_cuda`'s).
+    pub fn seqCreate(self: *VulkanLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *VulkanLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(kvmod.KvCache, &sp.cache, &h.cache);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs, &h.freqs);
+        } else std.debug.assert(s.host == null);
+    }
+
+    /// Free a sequence made by `seqCreate` once the device is done with it.
+    pub fn seqDestroy(self: *VulkanLM, s: *Seq) void {
+        self.be.waitIdle();
+        self.seqFree(s);
+    }
+
     /// Rows per batched forward. Each chunk expands every block-quant weight to f16
     /// once, so a bigger one amortizes that: Qwen3-4B q4_k, a 1309-token prompt, 512
     /// rows 1563 tok/s, 1024 1779, 2048 1951.
@@ -430,14 +489,8 @@ pub const VulkanLM = struct {
         self.be = ctx;
         self.gpa = gpa;
         self.cfg = c;
-        self.capacity = @max(@min(cap.initial, cap.max), 1);
-        self.initial_capacity = self.capacity;
-        self.max_capacity = cap.max;
-        self.split = null;
+        self.initial_capacity = @max(@min(cap.initial, cap.max), 1);
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
-        self.boundary = null;
-        self.io = null;
         self.sin_off = @intCast(cap.max * half);
         ctx.weight_noise.setDepth(c.n_layers);
 
@@ -466,15 +519,22 @@ pub const VulkanLM = struct {
         errdefer ctx.tensorDestroy(&self.freqs_d);
         try ctx.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
-        self.kv = try kv_gpu.Kv.init(gpa, ctx, c.n_layers, self.capacity, c.kvDim(), cap.kv_dtype, &.{});
-        errdefer self.kv.deinit(gpa, ctx);
+        var first = try self.seqAlloc(self.initial_capacity, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
+        }
         self.bufs = try LmBufs.init(ctx, c);
         return self;
     }
 
     pub fn deinit(self: *VulkanLM) void {
         self.freeSplit();
-        self.kv.deinit(self.gpa, self.be);
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         self.be.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.be);
         self.lin.deinit();

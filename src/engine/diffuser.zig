@@ -92,6 +92,7 @@ pub fn failureText(err: anyerror) []const u8 {
         => "out of VRAM",
         error.GpuDecodeNonFinite => "the GPU decode produced invalid pixels",
         error.NonFiniteActivation => "a model component produced invalid values at the chosen precision",
+        error.BackendUnavailable => "the GPU backend failed to start (the log has the driver's error); try again",
         error.FileNotFound => "a model file is missing",
         error.UnknownArchitecture => "the checkpoint's architecture is not recognized",
         error.UnsupportedCheckpoint => "this checkpoint cannot run on the selected backend",
@@ -182,21 +183,24 @@ pub const ModelConfig = struct {
             std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path);
     }
 
-    /// The LoRA LIST, ignoring strengths. A difference here is a stack swap; a
-    /// difference in the dials alone is `applyStrengths` and nothing else.
+    /// The LoRA LIST, ignoring strengths and schedules. A difference here is a
+    /// stack swap; a difference in those alone is `applyStrengths` and nothing else.
     fn sameLoraPaths(a: []const pipeline.LoraSpec, b: []const pipeline.LoraSpec) bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| if (!std.mem.eql(u8, x.path, y.path)) return false;
         return true;
     }
 
-    /// Move a live session's dials onto this config's, no reload.
+    /// Move a live session's dials and schedules onto this config's, no reload.
     ///
     /// Positional, because `Session` holds the stack in the order `Options.loras`
     /// gave it. `eql` has already established the paths match, which is the only
     /// thing that makes the index meaningful.
     fn applyStrengths(self: ModelConfig, sess: *pipeline.Session) void {
-        for (self.loras, 0..) |l, i| sess.setLoraStrength(i, l.strength);
+        for (self.loras, 0..) |l, i| {
+            sess.setLoraStrength(i, l.strength);
+            sess.setLoraSchedule(i, l.schedule);
+        }
     }
 
     /// Write this model set onto `opts`, the only place the GUI's paths become
@@ -237,7 +241,8 @@ fn dupeLoras(gpa: std.mem.Allocator, src: []const pipeline.LoraSpec) ![]const pi
         gpa.free(out);
     }
     while (done < src.len) : (done += 1) {
-        out[done] = .{ .path = try gpa.dupe(u8, src[done].path), .strength = src[done].strength };
+        out[done] = src[done];
+        out[done].path = try gpa.dupe(u8, src[done].path);
     }
     return out;
 }
@@ -303,7 +308,10 @@ pub const ImageMeta = struct {
     }
 
     fn deinit(self: *ImageMeta, gpa: std.mem.Allocator) void {
-        for (self.loras) |l| gpa.free(l.name);
+        for (self.loras) |l| {
+            gpa.free(l.name);
+            if (l.schedule.len > 0) gpa.free(l.schedule);
+        }
         if (self.loras.len > 0) gpa.free(self.loras);
         self.* = .{};
     }
@@ -1018,15 +1026,23 @@ pub const Diffuser = struct {
         const out = self.gpa.alloc(wire.LoraInfo, m.loras.len) catch return;
         var made: usize = 0;
         errdefer {
-            for (out[0..made]) |l| self.gpa.free(l.name);
+            for (out[0..made]) |l| {
+                self.gpa.free(l.name);
+                if (l.schedule.len > 0) self.gpa.free(l.schedule);
+            }
             self.gpa.free(out);
         }
         for (m.loras, out) |spec, *l| {
             const name = self.gpa.dupe(u8, modelStem(spec.path)) catch return;
+            const sched: []const u8 = if (spec.schedule == .always) "" else self.gpa.print("{f}", .{spec.schedule}) catch {
+                self.gpa.free(name);
+                return;
+            };
             l.* = .{
                 .name = name,
                 .hash = self.hashes.autoV2(self.gpa, self.io, spec.path),
                 .strength = spec.strength,
+                .schedule = sched,
             };
             made += 1;
         }

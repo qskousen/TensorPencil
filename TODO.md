@@ -231,9 +231,29 @@
 - gui: replaying a conversation into a DIFFERENT model feeds the old model's
   reasoning markup in as literal content; real chat templates vary in whether
   they keep prior reasoning at all (Qwen's drops it)
+- studio Expand mode (the LLM writes the middle of the prompt from an idea), what is left.
+  Every layer is in, from `chat.Session.complete` to the studio composer; checked by
+  `chat-probe --complete`, `serve-probe --complete [--cancel]`, `hosts-probe --expand`
+  and `ui-probe --studio --expand [--click]`.
+  - not yet driven in the running app: the composer's clicks were checked through
+    `ui-probe`, the queue and the hosts through `hosts-probe`, never the two together.
+  - the first Vulkan `--complete` run on Qwen3.5-9B diverged (the empty-session
+    completion and the chat run after it) and did not reproduce in seven later runs,
+    two with a cold pipeline cache. Cause unknown; plain chat was deterministic in
+    every run.
 - lora: DoRA over LoKr refuses (no file seen); in a stack, a DoRA's norms read the
   base weight where ComfyUI's merge reads it with the earlier files merged in; a
   denoiser adapter on a convolution refuses (the SD path takes them)
+- lora schedules: an H3 clip refuses a scheduled file (`clipDenoiser`), since its text
+  rows and device sessions are built once without `Denoiser.syncLora`'s rebuild. A
+  rebuild costs ~0.2 s per change on a 1024² krea2 int8 render (one per image for a
+  window, every step for a curve); rebuilding only the per-conditioning state instead
+  of the whole denoiser would cut that. The SDA LoRA (gate on the first 2 of 8 steps,
+  `window:1-0.93` on our default schedule) measured on a krea2 Turbo finetune, 3
+  prompts x 16 seeds: CLIP-H pairwise distance +59%, pixel std +12% (its card: +85%,
+  +34%); always-on degrades visibly, as the card says. SenseNova's prefix KV is built at
+  encode, outside any schedule; whether its LoRAs (on the `_mot_gen` copy) reach that
+  path is unchecked
 - lora: `textxl` (SDXL, old diffusers `processor.to_k_lora` spelling) loads its UNet
   half; whether its `text_encoder.*.lora_linear_layer` keys reach CLIP is unchecked
   (its conditioning moved by nothing measurable)

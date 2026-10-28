@@ -48,6 +48,10 @@
 //! copied and a device arm that runs q, k and v as three row views
 //! (`Weight.row_off`) applies each slot's factor to its own view.
 //!
+//! kohya's `lora_unet_blocks_0_attn_wq` is a base name with its dots flattened,
+//! which only the checkpoint's own names can undo (`KeyMap.names`), the way
+//! ComfyUI builds its key map forward from the model's state dict.
+//!
 //! `dialects` is the spellings those factors come in, from
 //! `comfy/weight_adapter/lora.py`. Only the suffixes differ; the algebra does
 //! not. ⚠️ **The reference's own `A_name` holds `lora_B`**, inverted from PEFT's
@@ -72,6 +76,12 @@
 //! not mean re-reading a gigabyte. `Stack` is N files over one model, each with
 //! its own live dial; their deltas add, so order does not matter and stacking is
 //! a merged name index.
+//!
+//! A `Schedule` makes a file's strength change between steps. Anything a model
+//! computes once per render through a patched linear (text tokens, timestep
+//! vectors, a prefix KV) is then stale when it moves, so it must live in
+//! `pipeline.Denoiser`, which rebuilds it (`syncLora`); a cache kept anywhere
+//! else applies the first step's strength to every step, with no error.
 
 const std = @import("std");
 const ops = @import("tp_ops");
@@ -467,6 +477,10 @@ pub const Sidecar = struct {
         var renamed: std.array_hash_map.String([max_slots]?Target) = .empty;
         var slots_of: std.StringHashMapUnmanaged(u8) = .empty;
 
+        var kohya_arena = std.heap.ArenaAllocator.init(gpa);
+        defer kohya_arena.deinit();
+        const kohya = try kohyaMap(kohya_arena.allocator(), keys.names);
+
         var unclaimed: usize = 0;
         var pad_bytes: usize = 0;
         for (store.names()) |full| {
@@ -474,6 +488,7 @@ pub const Sidecar = struct {
             // the file belongs to another component (a text-encoder LoRA) and is
             // not evidence of a problem.
             const pfx = keys.prefixOf(full) orelse continue;
+            const is_kohya = pfx.ptr == kohya_prefix.ptr;
 
             if (refusedSuffix(full)) |sfx| {
                 std.log.err("lora: {s} is a {s} adapter, which is a different calculation and not a plain LoRA", .{ full, sfx[1..] });
@@ -489,6 +504,10 @@ pub const Sidecar = struct {
                 if (std.mem.endsWith(u8, full, sfx)) break sfx;
             } else null) |sfx| {
                 stem = full[pfx.len .. full.len - sfx.len];
+                if (is_kohya) stem = (kohya.get(stem) orelse null) orelse {
+                    unclaimed += 1;
+                    continue;
+                };
                 t = try adapterTarget(gpa, alloc, store, full[0 .. full.len - sfx.len], stem);
             } else {
                 const d: Dialect = for (dialects) |cand| {
@@ -499,6 +518,10 @@ pub const Sidecar = struct {
                 };
                 const full_stem = full[0 .. full.len - d.a.len];
                 stem = full[pfx.len .. full.len - d.a.len];
+                if (is_kohya) stem = (kohya.get(stem) orelse null) orelse {
+                    unclaimed += 1;
+                    continue;
+                };
                 // A pair with a Tucker core or a DoRA magnitude is not a plain pair.
                 var kb: [512]u8 = undefined;
                 const odd = for ([_][]const u8{ ".lora_mid.weight", ".dora_scale" }) |sib| {
@@ -635,14 +658,35 @@ pub const Stack = struct {
     /// Storage behind every `Hit.a_i8`.
     quant: std.ArrayList(QuantA) = .empty,
 
+    /// The noise level the denoiser forward in progress runs at, which every
+    /// file's `schedule` reads. Null outside a denoiser forward (a text encoder's
+    /// LoRA, or a model encoding its own conditioning), where the dial applies as is.
+    level: ?f32 = null,
+
     pub const File = struct {
         side: Sidecar,
-        /// The dial, read at every apply. Nothing folds it into a factor, so
-        /// moving it costs nothing and no second copy can disagree with it.
-        strength: f32,
+        /// The user's dial. Read it through `strengthOf`, which applies the
+        /// schedule; nothing folds it into a factor, so moving it costs nothing.
+        dial: f32,
+        schedule: Schedule = .always,
         /// The file it came from, for diagnostics and the GUI row. Owned.
         path: []const u8,
     };
+
+    /// What `file` applies at right now: its dial times its schedule at `level`.
+    pub fn strengthOf(self: *const Stack, file: usize) f32 {
+        const f = &self.files.items[file];
+        const l = self.level orelse return f.dial;
+        return f.dial * f.schedule.gain(l);
+    }
+
+    /// `strengthOf` for every file, zero past the last. Anything built from the
+    /// stack's output and kept across forwards is valid only while this is unchanged.
+    pub fn strengths(self: *const Stack) [max_files]f32 {
+        var out: [max_files]f32 = @splat(0);
+        for (0..self.files.items.len) |i| out[i] = self.strengthOf(i);
+        return out;
+    }
 
     pub const Hit = struct {
         target: *const Target,
@@ -697,7 +741,7 @@ pub const Stack = struct {
         errdefer gpa.free(owned_path);
 
         const idx: u32 = @intCast(self.files.items.len);
-        try self.files.append(gpa, .{ .side = side, .strength = strength, .path = owned_path });
+        try self.files.append(gpa, .{ .side = side, .dial = strength, .path = owned_path });
         // Past this point the file is owned by `files` and freed by `deinit`.
         errdefer _ = self.files.pop();
 
@@ -886,7 +930,7 @@ pub const Stack = struct {
         bias: ?[]const f32,
     ) !void {
         for (self.forWeight(w)) |h| {
-            const s = self.files.items[h.file].strength;
+            const s = self.strengthOf(h.file);
             // Exact: adding `0 * delta` changes nothing, so a dial at zero is
             // free rather than two GEMMs whose result is discarded.
             if (s == 0) continue;
@@ -931,7 +975,7 @@ pub const Stack = struct {
         const tmp = try gpa.alloc(f32, n * c.co);
         defer gpa.free(tmp);
         for (hits) |hit| {
-            const s = self.files.items[hit.file].strength;
+            const s = self.strengthOf(hit.file);
             if (s == 0) continue;
             const t = hit.target;
             if (t.dora) |d| {
@@ -1141,6 +1185,115 @@ pub fn quantizeA(gpa: std.mem.Allocator, a: Weight, rotate: bool) !QuantA {
 /// fits on screen rather than anything the algebra needs.
 pub const max_files: usize = 16;
 
+/// How much of its dial a file applies at each noise level: the model's own
+/// timestep scaled to [0, 1], 1 at pure noise and 0 at the clean image (sigma
+/// on the flow families). Keyed on the noise level rather than the step index so
+/// it means the same thing at any step count or shift, and for a sampler that
+/// evaluates between steps.
+pub const Schedule = union(enum) {
+    always,
+    /// The whole dial for levels in `[lo, hi]`, nothing outside.
+    window: struct { hi: f32, lo: f32 },
+    curve: Curve,
+
+    pub fn gain(s: Schedule, level: f32) f32 {
+        return switch (s) {
+            .always => 1,
+            .window => |w| if (level >= w.lo and level <= w.hi) 1 else 0,
+            .curve => |c| c.at(level),
+        };
+    }
+
+    /// The one text form, shared by the CLI, the PNG record and the config:
+    /// `always`, `window:HI-LO`, or `curve:L=G,L=G,...` with levels descending.
+    pub fn parse(text: []const u8) error{BadSchedule}!Schedule {
+        if (text.len == 0 or std.mem.eql(u8, text, "always")) return .always;
+        if (std.mem.cutPrefix(u8, text, "window:")) |rest| {
+            const dash = std.mem.findScalar(u8, rest, '-') orelse return error.BadSchedule;
+            const hi = parseLevel(rest[0..dash]) orelse return error.BadSchedule;
+            const lo = parseLevel(rest[dash + 1 ..]) orelse return error.BadSchedule;
+            if (lo > hi) return error.BadSchedule;
+            return .{ .window = .{ .hi = hi, .lo = lo } };
+        }
+        if (std.mem.cutPrefix(u8, text, "curve:")) |rest| {
+            var pts: [Curve.max_points]Curve.Point = undefined;
+            var n: usize = 0;
+            var it = std.mem.splitScalar(u8, rest, ',');
+            while (it.next()) |pair| {
+                if (n == pts.len) return error.BadSchedule;
+                const eq = std.mem.findScalar(u8, pair, '=') orelse return error.BadSchedule;
+                const g = std.fmt.parseFloat(f32, pair[eq + 1 ..]) catch return error.BadSchedule;
+                if (!std.math.isFinite(g)) return error.BadSchedule;
+                pts[n] = .{ .level = parseLevel(pair[0..eq]) orelse return error.BadSchedule, .gain = g };
+                n += 1;
+            }
+            return .{ .curve = Curve.init(pts[0..n]) catch return error.BadSchedule };
+        }
+        return error.BadSchedule;
+    }
+
+    fn parseLevel(text: []const u8) ?f32 {
+        const v = std.fmt.parseFloat(f32, text) catch return null;
+        return if (v >= 0 and v <= 1) v else null;
+    }
+
+    pub fn format(s: Schedule, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (s) {
+            .always => try w.writeAll("always"),
+            .window => |win| try w.print("window:{d}-{d}", .{ win.hi, win.lo }),
+            .curve => |*c| {
+                try w.writeAll("curve:");
+                for (c.slice(), 0..) |p, i| try w.print("{s}{d}={d}", .{ if (i == 0) "" else ",", p.level, p.gain });
+            },
+        }
+    }
+
+    pub fn eql(a: Schedule, b: Schedule) bool {
+        return switch (a) {
+            .always => b == .always,
+            .window => |x| b == .window and x.hi == b.window.hi and x.lo == b.window.lo,
+            .curve => |*x| b == .curve and x.n == b.curve.n and for (x.slice(), b.curve.slice()) |p, q| {
+                if (p.level != q.level or p.gain != q.gain) break false;
+            } else true,
+        };
+    }
+};
+
+/// A gain over the noise level, linear between points and flat past the ends.
+pub const Curve = struct {
+    pub const max_points = 8;
+    pub const Point = struct { level: f32, gain: f32 };
+
+    /// Sorted by `level`, highest first. At least one.
+    points: [max_points]Point = undefined,
+    n: u8 = 0,
+
+    pub fn init(pts: []const Point) error{BadCurve}!Curve {
+        if (pts.len == 0 or pts.len > max_points) return error.BadCurve;
+        var c: Curve = .{ .n = @intCast(pts.len) };
+        @memcpy(c.points[0..pts.len], pts);
+        for (c.points[1..pts.len], c.points[0 .. pts.len - 1]) |p, prev| {
+            if (!(p.level < prev.level)) return error.BadCurve;
+        }
+        return c;
+    }
+
+    pub fn slice(c: *const Curve) []const Point {
+        return c.points[0..c.n];
+    }
+
+    pub fn at(c: Curve, level: f32) f32 {
+        const p = c.points[0..c.n];
+        if (level >= p[0].level) return p[0].gain;
+        for (p[1..], p[0 .. p.len - 1]) |lo, hi| {
+            if (level < lo.level) continue;
+            const t = (level - lo.level) / (hi.level - lo.level);
+            return lo.gain + t * (hi.gain - lo.gain);
+        }
+        return p[p.len - 1].gain;
+    }
+};
+
 /// One key spelling a family's LoRAs use for a tensor its checkpoint names
 /// differently, matched on the end of the file's stem.
 /// How a family's LoRA files name its tensors: ComfyUI's `diffusion_model.` prefix,
@@ -1149,14 +1302,56 @@ pub const max_files: usize = 16;
 pub const KeyMap = struct {
     renames: []const Rename = &.{},
     prefixes: []const []const u8 = &.{},
+    /// The checkpoint's denoiser tensor names, which is what reads a kohya key: its
+    /// stem is a base name with every `.` turned to `_`, which only a list of the
+    /// real names can undo (`blocks_0_attn_wq` vs `txtfusion_projector`). Empty
+    /// leaves every `lora_unet_` key unclaimed.
+    names: []const []const u8 = &.{},
 
     /// The prefix `full` is written under, or null when it is none of this map's.
     fn prefixOf(self: KeyMap, full: []const u8) ?[]const u8 {
         if (std.mem.startsWith(u8, full, Sidecar.prefix)) return Sidecar.prefix;
+        if (std.mem.startsWith(u8, full, kohya_prefix)) return kohya_prefix;
         for (self.prefixes) |p| if (std.mem.startsWith(u8, full, p)) return p;
         return null;
     }
 };
+
+/// kohya's denoiser prefix. ComfyUI derives these keys from the model's own names
+/// (`model_lora_keys_unet`), so they reach every family, not only SD.
+pub const kohya_prefix = "lora_unet_";
+
+/// A base name as kohya spells it, without `.weight`: dots to underscores.
+pub fn kohyaStem(buf: []u8, base_stem: []const u8) ?[]const u8 {
+    if (base_stem.len > buf.len) return null;
+    const out = buf[0..base_stem.len];
+    for (out, base_stem) |*o, c| o.* = if (c == '.') '_' else c;
+    return out;
+}
+
+/// kohya stem -> the checkpoint stem it names, built once per load. A stem two
+/// checkpoint names flatten to maps to null and is refused rather than guessed.
+/// Values borrow `KeyMap.names`.
+const KohyaMap = std.StringHashMapUnmanaged(?[]const u8);
+
+fn kohyaMap(alloc: std.mem.Allocator, names: []const []const u8) !KohyaMap {
+    var map: KohyaMap = .empty;
+    var buf: [512]u8 = undefined;
+    for (names) |full| {
+        const name = baseName(full);
+        if (!std.mem.endsWith(u8, name, ".weight")) continue;
+        const stem = name[0 .. name.len - ".weight".len];
+        const flat = kohyaStem(&buf, stem) orelse continue;
+        const gop = try map.getOrPut(alloc, flat);
+        if (gop.found_existing) {
+            gop.value_ptr.* = null;
+        } else {
+            gop.key_ptr.* = try alloc.dupe(u8, flat);
+            gop.value_ptr.* = stem;
+        }
+    }
+    return map;
+}
 
 pub const Rename = struct {
     /// As the LoRA spells it, e.g. `.attention.to_q`.
@@ -1703,7 +1898,7 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
         defer gpa.free(want1);
         for (want1, bare, only1) |*d, b, o| d.* = b + s1 * (o - b);
 
-        stack.files.items[1].strength = 0;
+        stack.files.items[1].dial = 0;
         @memset(got, 0);
         try ops.matmul.matmul(io, gpa, got, x, m, w, null);
         try stack.applyHost(io, gpa, got, out_dim, x, m, w, null);
@@ -1712,7 +1907,7 @@ test "N stacked LoRAs add, and each file keeps its own live dial" {
         try testing.expect(rel1 < 1e-6);
         // ...and that really is a different picture from the stack.
         try testing.expect(relL2(want, want1) > 0.02);
-        stack.files.items[1].strength = s2;
+        stack.files.items[1].dial = s2;
     }
 }
 
@@ -2468,6 +2663,105 @@ test "a target no linear matches is counted and named, and a bundled tag still m
     // A fresh walk forgets the last one.
     stack.beginAttach();
     try testing.expectEqual(Stack.Coverage{ .applied = 0, .total = 3 }, stack.coverage(0));
+}
+
+test "a schedule gates the dial by noise level, and only inside a denoiser forward" {
+    const win: Schedule = .{ .window = .{ .hi = 1, .lo = 0.85 } };
+    // Both ends are inside.
+    try testing.expectEqual(@as(f32, 1), win.gain(1));
+    try testing.expectEqual(@as(f32, 1), win.gain(0.85));
+    try testing.expectEqual(@as(f32, 0), win.gain(0.8499));
+    try testing.expectEqual(@as(f32, 0), win.gain(0));
+
+    const c: Schedule = .{ .curve = try Curve.init(&.{ .{ .level = 0.9, .gain = 1 }, .{ .level = 0.5, .gain = 0 }, .{ .level = 0.2, .gain = 0.5 } }) };
+    try testing.expectEqual(@as(f32, 1), c.gain(1)); // flat past the top
+    try testing.expectEqual(@as(f32, 1), c.gain(0.9));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), c.gain(0.7), 1e-6);
+    try testing.expectEqual(@as(f32, 0), c.gain(0.5));
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.gain(0.35), 1e-6);
+    try testing.expectEqual(@as(f32, 0.5), c.gain(0)); // flat past the bottom
+    try testing.expectError(error.BadCurve, Curve.init(&.{ .{ .level = 0.5, .gain = 1 }, .{ .level = 0.5, .gain = 0 } }));
+
+    var stack: Stack = .{};
+    defer stack.files.deinit(testing.allocator);
+    try stack.files.append(testing.allocator, .{ .side = undefined, .dial = 0.8, .schedule = win, .path = "a" });
+    try stack.files.append(testing.allocator, .{ .side = undefined, .dial = 0.5, .path = "b" });
+    // No level: a text encoder's apply, which the schedule does not reach.
+    try testing.expectEqual(@as(f32, 0.8), stack.strengthOf(0));
+    stack.level = 0.5;
+    try testing.expectEqual(@as(f32, 0), stack.strengthOf(0));
+    try testing.expectEqual(@as(f32, 0.5), stack.strengthOf(1));
+    stack.level = 0.95;
+    const s = stack.strengths();
+    try testing.expectEqual(@as(f32, 0.8), s[0]);
+    try testing.expectEqual(@as(f32, 0.5), s[1]);
+    try testing.expectEqual(@as(f32, 0), s[2]);
+}
+
+test "a schedule's text form round-trips and refuses what it cannot read" {
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "always", "window:1-0.85", "curve:1=1,0.9=0.5,0.8=0" }) |text| {
+        const s = try Schedule.parse(text);
+        const out = try std.fmt.bufPrint(&buf, "{f}", .{s});
+        errdefer std.debug.print("{s} -> {s}\n", .{ text, out });
+        try testing.expectEqualStrings(text, out);
+        try testing.expect(s.eql(try Schedule.parse(out)));
+    }
+    try testing.expect((try Schedule.parse("")) == .always);
+    for ([_][]const u8{ "window:0.5-0.9", "window:1.5-0", "window:1", "curve:", "curve:0.5=1,0.9=0", "curve:1=nan", "steps:0-1" }) |bad| {
+        errdefer std.debug.print("accepted {s}\n", .{bad});
+        try testing.expectError(error.BadSchedule, Schedule.parse(bad));
+    }
+}
+
+test "kohya keys resolve through the checkpoint's names, and an ambiguous flatten is refused" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4b0a);
+    const rnd = prng.random();
+    const in_dim: usize = 32;
+    const out_dim: usize = 64;
+    const r: usize = 32;
+    var bufs: [8][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| b.* = try randomBf16(gpa, rnd, if (i % 2 == 0) r * in_dim else out_dim * r, 0.1);
+    defer for (bufs) |b| gpa.free(b);
+    const alpha: [4]u8 = @bitCast(@as(f32, 16));
+    const blob = try safetensorsBlob(gpa, &.{
+        .{ "lora_unet_blocks_0_attn_wq.alpha", "F32", &.{}, &alpha },
+        .{ "lora_unet_blocks_0_attn_wq.lora_down.weight", "BF16", &.{ r, in_dim }, bufs[0] },
+        .{ "lora_unet_blocks_0_attn_wq.lora_up.weight", "BF16", &.{ out_dim, r }, bufs[1] },
+        .{ "lora_unet_txtfusion_projector.lora_down.weight", "BF16", &.{ r, in_dim }, bufs[2] },
+        .{ "lora_unet_txtfusion_projector.lora_up.weight", "BF16", &.{ out_dim, r }, bufs[3] },
+        .{ "lora_unet_a_b_c.lora_down.weight", "BF16", &.{ r, in_dim }, bufs[4] },
+        .{ "lora_unet_a_b_c.lora_up.weight", "BF16", &.{ out_dim, r }, bufs[5] },
+        .{ "lora_unet_not_here.lora_down.weight", "BF16", &.{ r, in_dim }, bufs[6] },
+        .{ "lora_unet_not_here.lora_up.weight", "BF16", &.{ out_dim, r }, bufs[7] },
+    });
+    defer gpa.free(blob);
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, blob);
+    defer st.deinit();
+    const names = [_][]const u8{
+        "model.diffusion_model.blocks.0.attn.wq.weight",
+        "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+        "txtfusion.projector.weight",
+        // Both flatten to `a_b_c`.
+        "a.b_c.weight",
+        "a_b.c.weight",
+    };
+
+    var side = try Sidecar.load(gpa, .{ .safetensors = &st }, .{ .names = &names });
+    defer side.deinit();
+    try testing.expectEqual(@as(usize, 2), side.count());
+    try testing.expectEqual(@as(usize, 2), side.unclaimed);
+    const wq = side.index.get("blocks.0.attn.wq.weight").?;
+    try testing.expectEqual(@as(f32, 0.5), wq.scale);
+    try testing.expectEqualStrings("blocks.0.attn.wq", wq.tag);
+    try testing.expect(side.index.get("txtfusion.projector.weight") != null);
+
+    // Without the checkpoint's names a kohya key names nothing it can read.
+    var blind = try Sidecar.load(gpa, .{ .safetensors = &st }, .{});
+    defer blind.deinit();
+    try testing.expectEqual(@as(usize, 0), blind.count());
+    try testing.expectEqual(@as(usize, 4), blind.unclaimed);
 }
 
 test "split q/k/v keys merge onto row blocks of the fused tensor, each with its own alpha" {

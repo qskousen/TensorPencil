@@ -12,7 +12,8 @@ pub const methods = [_][]const u8{
     "reinitCache",     "warmWeights",    "autoOffload",     "resetResidency",    "promoteLayers",
     "promoteLayer",    "promoteCost",    "migrateLayer",    "enableCpuSplit",    "offloadUntilFree",
     "offloadToBudget", "noiseAtLayer",   "vramUsed",        "stepArgmax",        "stepArgmaxPen",
-    "stepSelect",      "stepSelectPen",  "maxSelect",
+    "stepSelect",      "stepSelectPen",  "maxSelect",       "seqCreate",         "seqSwap",
+    "seqDestroy",
 };
 
 pub const fields = [_][]const u8{ "io", "boundary", "split", "cfg", "kv_dtype" };

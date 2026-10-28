@@ -272,6 +272,8 @@ pub const Snapshot = struct {
 pub const LoraSpec = struct {
     path: []const u8,
     strength: f32 = 1.0,
+    /// Which noise levels it applies at; also live (`Session.setLoraSchedule`).
+    schedule: lora_mod.Schedule = .always,
 };
 
 pub const Options = struct {
@@ -1025,6 +1027,8 @@ pub const LoraRecord = struct {
     /// AutoV2, or empty when it could not be computed.
     hash: []const u8 = "",
     strength: f32 = 1.0,
+    /// `lora.Schedule`'s text form, empty for every step.
+    schedule: []const u8 = "",
 };
 
 /// Everything a render used that the settings line does not already name.
@@ -1132,6 +1136,23 @@ pub fn appendExtraParams(gpa: std.mem.Allocator, base: []u8, r: Extras) ![]u8 {
             try out.print(gpa, "{s}: {d:.2}", .{ l.name, l.strength });
         }
         try out.appendSlice(gpa, "\"");
+        // Ours: nothing upstream schedules a LoRA. Beside `Lora strengths` rather
+        // than inside it, whose values every reader parses as a number, and only
+        // when one is scheduled, so an ordinary block is unchanged.
+        const scheduled = for (r.loras) |l| {
+            if (l.schedule.len > 0) break true;
+        } else false;
+        if (scheduled) {
+            try out.appendSlice(gpa, ", Lora schedules: \"");
+            var first = true;
+            for (r.loras) |l| {
+                if (l.schedule.len == 0) continue;
+                if (!first) try out.appendSlice(gpa, ", ");
+                first = false;
+                try out.print(gpa, "{s}: {s}", .{ l.name, l.schedule });
+            }
+            try out.appendSlice(gpa, "\"");
+        }
     }
 
     // Civitai's resource map. Keys are kind-prefixed (`lora:<name>`); the model
@@ -2334,8 +2355,17 @@ pub const Denoiser = struct {
     sn_vk: ?sensenova_gpu.Session = null,
     sn_vk_neg: ?sensenova_gpu.Session = null,
     sn_vk_ws: ?sensenova_gpu.Workspace = null,
+    /// The schedule, owned: a LoRA rebuild needs it after the caller's copy is gone.
+    sigmas: []f32 = &.{},
+    /// The LoRA strengths everything above was built at. Each family caches the
+    /// parts of its forward that are constant across steps (krea2's text tokens and
+    /// timestep vectors, Z-Image's caption half, SenseNova's prefix KV), all through
+    /// LoRA-patched linears, so a scheduled LoRA rebuilds them when this changes.
+    lora_built: [lora_mod.max_files]f32 = @splat(0),
 
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
+        if (self.sess.denoiserLora()) |st| st.level = null;
+        gpa.free(self.sigmas);
         if (self.v_neg) |b| gpa.free(b);
         if (self.sd_ws) |*w| w.deinit();
         for ([_][]SdBranch{ self.sd_pos, self.sd_neg }) |arr| {
@@ -2444,6 +2474,24 @@ pub const Denoiser = struct {
         try self.sess.checkFinite(.denoiser, v_out, step);
     }
 
+    /// Point the LoRA schedule at `sigma`, rebuilding the cached state when that
+    /// changes what any file applies.
+    fn syncLora(self: *Denoiser, gpa: std.mem.Allocator, sigma: f32) !void {
+        const st = self.sess.denoiserLora() orelse return;
+        const level = self.sess.noiseLevel(sigma);
+        st.level = level;
+        const now = st.strengths();
+        if (std.mem.eql(f32, &now, &self.lora_built)) return;
+        const keep = self.*;
+        const sigmas = try gpa.dupe(f32, keep.sigmas);
+        defer gpa.free(sigmas);
+        self.deinit(gpa);
+        // A failed build leaves a denoiser that owns nothing, so the caller's
+        // deinit stays safe.
+        self.* = .{ .sess = keep.sess, .lat_h = keep.lat_h, .lat_w = keep.lat_w, .cfg = keep.cfg, .cond_pos = keep.cond_pos, .cond_neg = keep.cond_neg, .mf_refs = keep.mf_refs };
+        self.* = try keep.sess.buildDenoiser(gpa, keep.cond_pos, keep.cond_neg, keep.cfg, keep.lat_h, keep.lat_w, sigmas, keep.mf_refs, level);
+    }
+
     fn predictRaw(
         self: *Denoiser,
         gpa: std.mem.Allocator,
@@ -2453,6 +2501,7 @@ pub const Denoiser = struct {
         step: usize,
         cancel: ?*std.atomic.Value(bool),
     ) !void {
+        try self.syncLora(gpa, sigma);
         const s = self.sess;
         const io = s.io;
         switch (s.family()) {
@@ -4106,6 +4155,93 @@ fn interleavedToPlanar(gpa: std.mem.Allocator, inter: []const f32, c: usize, n: 
 /// The sigma-schedule shift a family was trained with, for a caller that did not ask
 /// for one. The SD arm's value is unused, its ladder comes from the betas, and is
 /// returned only so this is total.
+pub fn familySigmaTable(fam: Family, ladder: []const f32, shift: f32) sampler.SigmaTable {
+    return switch (fam) {
+        .krea2 => .{ .flux = shift },
+        // A DIFFERENT flow table, not `.flux` with a converted shift: 1000
+        // rungs against 10000, and the same formula rounded differently. See
+        // `schedule.discreteFlowSigma`.
+        .zimage => .{ .discrete_flow = shift },
+        // The SAME table as Z-Image's, bit for bit: both are
+        // `ModelSamplingDiscreteFlow` at multiplier 1.0. What differs is the
+        // argument the DiT is then conditioned on, see `predictAnima`.
+        .anima => .{ .discrete_flow = shift },
+        // Also `ModelSamplingDiscreteFlow`, which is what `ModelSamplingAV`
+        // extends. The audio stream does NOT get its own table: the sampler
+        // carries the audio latent scaled onto this schedule and the model
+        // converts, so there is one table for the pack.
+        .minimax_h3 => .{ .discrete_flow = shift },
+        // `ModelSamplingDiscreteFlow` at multiplier 1.0, like Z-Image's; only
+        // the shift differs, and it is large (6.0).
+        .mageflow => .{ .discrete_flow = shift },
+        // `ModelSamplingDiscreteFlow` again, at shift 5.
+        .moss_image => .{ .discrete_flow = shift },
+        // `SenseNovaModelSampling` subclasses `ModelSamplingDiscreteFlow`, so
+        // this is the same 1000-rung table again. Only the default shift
+        // differs (3.0), and that is `defaultShift`'s answer, not this one's.
+        .sensenova => .{ .discrete_flow = shift },
+        // `ModelSamplingFlux`: the shift IS diffusers' mu, which `resolvedShift`
+        // reads off the target's size, so every scheduler moves with resolution.
+        .qwen_image21 => .{ .flux = shift },
+        .sd15, .sdxl => .{ .discrete = ladder },
+    };
+}
+
+/// `Session.scheduleAt` with the family and SD's ladder spelled out, so a caller
+/// with no session builds the same list.
+pub fn familySchedule(gpa: std.mem.Allocator, fam: Family, ladder: []const f32, steps: usize, shift: f32, sched: ?sampler.Scheduler, lat_h: usize, lat_w: usize) ![]f32 {
+    const sm = sampler.schedule_mod;
+    return switch (sched orelse defaultSchedulerFor(fam)) {
+        // `shift` is the mu, resolved from the target by `resolvedShift`.
+        .reference => switch (fam) {
+            .qwen_image21 => (sm.DiffusersFlow{}).buildAt(gpa, steps, shift, lat_h * lat_w),
+            else => error.SchedulerUnsupported,
+        },
+        // The release's own list: the step count is the list's.
+        .turbo => switch (fam) {
+            .qwen_image21 => sm.fixedSigmas(gpa, &sm.qwen_image21_turbo_sigmas),
+            else => error.SchedulerUnsupported,
+        },
+        else => |kind| sm.build(gpa, familySigmaTable(fam, ladder, shift), kind, steps),
+    };
+}
+
+/// `sigma` as a `lora.Schedule` reads it: the model's timestep on [0, 1], which is
+/// sigma itself on the flow families and SD's fractional timestep over its ladder.
+pub fn familyNoiseLevel(fam: Family, ladder: []const f32, sigma: f32) f32 {
+    return switch (fam) {
+        .sd15, .sdxl => sampler.sdTimestepForSigma(ladder, sigma) / @as(f32, @floatFromInt(ladder.len - 1)),
+        else => sigma,
+    };
+}
+
+/// The noise level of every step a render at these settings takes, with the
+/// family's own shift, for a UI to show what a LoRA schedule does before anything
+/// loads. Qwen-Image 2.1's latent scale comes from its VAE, which is not known
+/// here; this takes its usual 16, which moves only its resolution-dependent shift.
+pub fn stepLevels(gpa: std.mem.Allocator, fam: Family, width: usize, height: usize, steps: usize, sched: ?sampler.Scheduler) ![]f32 {
+    const ladder: []f32 = switch (fam) {
+        .sd15, .sdxl => try sampler.sdSigmasFull(gpa),
+        else => &.{},
+    };
+    defer gpa.free(ladder);
+    const ds: usize = switch (fam) {
+        .krea2, .anima => wan_vae.spatial_scale,
+        .zimage => zimage.spatial_scale,
+        .sd15, .sdxl => sd_vae.spatial_scale,
+        .minimax_h3 => minimax_h3.spatial_downscale,
+        .sensenova => sensenova.spatial_scale,
+        .mageflow, .moss_image, .qwen_image21 => mage_vae.spatial_scale,
+    };
+    const lat_h = height / ds;
+    const lat_w = width / ds;
+    const sigmas = try familySchedule(gpa, fam, ladder, steps, defaultShiftAt(fam, lat_h, lat_w), sched, lat_h, lat_w);
+    defer gpa.free(sigmas);
+    const out = try gpa.alloc(f32, sigmas.len - 1);
+    for (out, sigmas[0 .. sigmas.len - 1]) |*l, sg| l.* = familyNoiseLevel(fam, ladder, sg);
+    return out;
+}
+
 pub fn defaultShift(fam: Family) f32 {
     return switch (fam) {
         .krea2 => sampler.default_shift,
@@ -4595,6 +4731,7 @@ pub const Session = struct {
             sts[i] = try Container.openNamed(gpa, io, spec.path);
             opened += 1;
             _ = try stack.add(gpa, sts[i].store(), spec.strength, spec.path, self.loraKeys());
+            stack.files.items[i].schedule = spec.schedule;
         }
 
         // Install before attaching: the attach stores pointers into the stack,
@@ -4611,12 +4748,14 @@ pub const Session = struct {
 
     /// How this family's LoRAs name tensors its checkpoint names differently.
     fn loraKeys(self: *const Session) lora_mod.KeyMap {
-        return switch (self.models) {
+        var keys: lora_mod.KeyMap = switch (self.models) {
             .zimage => .{ .renames = &zimage.lora_keys },
             .moss_image => |*m| .{ .renames = if (m.dit.cfg.fused_qkv) &moss_image.lora_keys_fused else &.{} },
             .qwen_image21 => |*m| qwen_image21.loraKeys(m.dit.cfg.fused_mlp),
             else => .{},
         };
+        keys.names = self.denoiserStore().names();
+        return keys;
     }
 
     /// Give back the pointers the models borrowed from the stack.
@@ -4726,6 +4865,7 @@ pub const Session = struct {
                 const own = side.* orelse lora_mod.Sidecar{ .arena = .init(gpa), .index = .empty, .unclaimed = 0 };
                 side.* = null;
                 _ = try st.addSidecar(gpa, own, spec.strength, spec.path);
+                st.files.items[st.files.items.len - 1].schedule = spec.schedule;
             }
         }
 
@@ -4822,13 +4962,26 @@ pub const Session = struct {
         if (self.sd()) |m| {
             const sl = m.lora orelse return;
             for (&sl.stacks) |*st| if (file < st.files.items.len) {
-                st.files.items[file].strength = strength;
+                st.files.items[file].dial = strength;
             };
             return;
         }
         if (self.lora == null) return;
         const stack = &self.lora.?;
-        if (file < stack.files.items.len) stack.files.items[file].strength = strength;
+        if (file < stack.files.items.len) stack.files.items[file].dial = strength;
+    }
+
+    /// `setLoraStrength` for the schedule. The next denoiser forward picks it up.
+    pub fn setLoraSchedule(self: *Session, file: usize, sched: lora_mod.Schedule) void {
+        if (self.sd()) |m| {
+            const sl = m.lora orelse return;
+            for (&sl.stacks) |*st| if (file < st.files.items.len) {
+                st.files.items[file].schedule = sched;
+            };
+            return;
+        }
+        const stack = if (self.lora) |*st| st else return;
+        if (file < stack.files.items.len) stack.files.items[file].schedule = sched;
     }
 
     /// Payload bytes of the denoiser's container, for the VRAM meter.
@@ -4874,7 +5027,9 @@ pub const Session = struct {
                 try note(progress, "gpu: {s}\n", .{ctx.deviceName()});
                 if (progress) |w| try ctx.writeCoopStatus(w);
             } else |err| {
-                try note(progress, "gpu unavailable ({t}); using cpu\n", .{err});
+                // Never a quiet CPU fallback: a GPU-sized model on the CPU runs for hours.
+                try note(progress, "vulkan unavailable ({t})\n", .{err});
+                return error.BackendUnavailable;
             }
         }
         errdefer if (self.gpu_ctx) |ctx| {
@@ -4898,7 +5053,8 @@ pub const Session = struct {
                     try note(progress, "cuda dit: {s}\n", .{b.deviceName()});
                 }
             } else |err| {
-                try note(progress, "cuda unavailable ({t}); using cpu dit\n", .{err});
+                try note(progress, "cuda unavailable ({t})\n", .{err});
+                return error.BackendUnavailable;
             }
         }
         errdefer if (self.cu_be) |b| b.deinit();
@@ -5777,34 +5933,14 @@ pub const Session = struct {
     /// beta ladder it already caches, borrowed (so this allocates nothing, and the
     /// slice lives as long as the session).
     pub fn sigmaTable(self: *const Session, shift: f32) sampler.SigmaTable {
+        return familySigmaTable(self.family(), self.sigmaLadder(), shift);
+    }
+
+    /// SD's sigma ladder; empty for the flow families, which have none.
+    fn sigmaLadder(self: *const Session) []const f32 {
         return switch (self.models) {
-            .krea2 => .{ .flux = shift },
-            // A DIFFERENT flow table, not `.flux` with a converted shift: 1000
-            // rungs against 10000, and the same formula rounded differently. See
-            // `schedule.discreteFlowSigma`.
-            .zimage => .{ .discrete_flow = shift },
-            // The SAME table as Z-Image's, bit for bit: both are
-            // `ModelSamplingDiscreteFlow` at multiplier 1.0. What differs is the
-            // argument the DiT is then conditioned on, see `predictAnima`.
-            .anima => .{ .discrete_flow = shift },
-            // Also `ModelSamplingDiscreteFlow`, which is what `ModelSamplingAV`
-            // extends. The audio stream does NOT get its own table: the sampler
-            // carries the audio latent scaled onto this schedule and the model
-            // converts, so there is one table for the pack.
-            .minimax_h3 => .{ .discrete_flow = shift },
-            // `ModelSamplingDiscreteFlow` at multiplier 1.0, like Z-Image's; only
-            // the shift differs, and it is large (6.0).
-            .mageflow => .{ .discrete_flow = shift },
-            // `ModelSamplingDiscreteFlow` again, at shift 5.
-            .moss_image => .{ .discrete_flow = shift },
-            // `SenseNovaModelSampling` subclasses `ModelSamplingDiscreteFlow`, so
-            // this is the same 1000-rung table again. Only the default shift
-            // differs (3.0), and that is `defaultShift`'s answer, not this one's.
-            .sensenova => .{ .discrete_flow = shift },
-            // `ModelSamplingFlux`: the shift IS diffusers' mu, which `resolvedShift`
-            // reads off the target's size, so every scheduler moves with resolution.
-            .qwen_image21 => .{ .flux = shift },
-            .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
+            .sd15, .sdxl => |*m| m.sigma_ladder,
+            else => &.{},
         };
     }
 
@@ -5845,20 +5981,7 @@ pub const Session = struct {
         lat_h: usize,
         lat_w: usize,
     ) ![]f32 {
-        const sm = sampler.schedule_mod;
-        return switch (sched orelse defaultSchedulerFor(self.family())) {
-            // `shift` is the mu, resolved from the target by `resolvedShift`.
-            .reference => switch (self.family()) {
-                .qwen_image21 => (sm.DiffusersFlow{}).buildAt(gpa, steps, shift, lat_h * lat_w),
-                else => error.SchedulerUnsupported,
-            },
-            // The release's own list: the step count is the list's.
-            .turbo => switch (self.family()) {
-                .qwen_image21 => sm.fixedSigmas(gpa, &sm.qwen_image21_turbo_sigmas),
-                else => error.SchedulerUnsupported,
-            },
-            else => |kind| sm.build(gpa, self.sigmaTable(shift), kind, steps),
-        };
+        return familySchedule(gpa, self.family(), self.sigmaLadder(), steps, shift, sched, lat_h, lat_w);
     }
 
     /// The shift this session's sigma table should use, honouring an explicit
@@ -7316,6 +7439,35 @@ pub const Session = struct {
         sigmas: []const f32,
         mf_refs: []const mageflow.Ref,
     ) !Denoiser {
+        return self.buildDenoiser(gpa, cond_pos, cond_neg, cfg, lat_h, lat_w, sigmas, mf_refs, null);
+    }
+
+    /// The scheduled-LoRA denoiser's denoiser stack, the one `Stack.level` drives:
+    /// the UNet's on SD, the session's own elsewhere.
+    pub fn denoiserLora(self: *Session) ?*lora_mod.Stack {
+        if (self.sd()) |m| return if (m.lora) |sl| &sl.stacks[0] else null;
+        return if (self.lora) |*st| st else null;
+    }
+
+    /// `sigma` as a `lora.Schedule` reads it (`familyNoiseLevel`).
+    pub fn noiseLevel(self: *const Session, sigma: f32) f32 {
+        return familyNoiseLevel(self.family(), self.sigmaLadder(), sigma);
+    }
+
+    /// `denoiserWithRefs` with every cached part built at the LoRA strengths of
+    /// noise level `level`, or of the first step's when null.
+    fn buildDenoiser(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        cond_pos: Cond,
+        cond_neg: ?Cond,
+        cfg: f32,
+        lat_h: usize,
+        lat_w: usize,
+        sigmas: []const f32,
+        mf_refs: []const mageflow.Ref,
+        level: ?f32,
+    ) !Denoiser {
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
@@ -7326,6 +7478,7 @@ pub const Session = struct {
         // `self.k()` and panic with "access of union field 'krea2'".
         if (self.family() == .minimax_h3) return error.FamilyNotImplemented;
 
+        const owned_sigmas = try gpa.dupe(f32, sigmas);
         var d: Denoiser = .{
             .sess = self,
             .lat_h = lat_h,
@@ -7334,8 +7487,13 @@ pub const Session = struct {
             .cond_pos = cond_pos,
             .cond_neg = cond_neg,
             .mf_refs = mf_refs,
+            .sigmas = owned_sigmas,
         };
         errdefer d.deinit(gpa);
+        if (self.denoiserLora()) |st| {
+            st.level = level orelse if (sigmas.len > 0) self.noiseLevel(sigmas[0]) else null;
+            d.lora_built = st.strengths();
+        }
 
         // The SD family needs the input-scaling scratch and a UNet workspace, both
         // per resolution, plus SDXL's `y`, which is per resolution too. On Vulkan
@@ -8288,6 +8446,13 @@ pub const Session = struct {
     /// Build the per-render state for a clip.
     pub fn clipDenoiser(self: *Session, gpa: std.mem.Allocator, cond: Cond, shape: LatentShape, shifts: minimax_h3.Shifts) !ClipDenoiser {
         if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
+        // A clip caches its text rows and device sessions without the rebuild
+        // `Denoiser.syncLora` does, so a scheduled file would apply its step-0
+        // strength to the whole clip.
+        if (self.lora) |*st| for (st.files.items) |f| if (f.schedule != .always) {
+            std.log.err("lora: {s} has a step schedule, which a video clip does not apply yet", .{f.path});
+            return error.LoraScheduleUnsupported;
+        };
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         const m = &self.models.minimax_h3;
         const audio = shape.audio orelse return error.FamilyIsNotVideo;
@@ -11012,6 +11177,26 @@ test "decode does not modify the caller's latent" {
     defer img.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 128), img.width);
     try std.testing.expectEqualSlices(f32, before, x);
+}
+
+test "stepLevels is the session's schedule, read as noise levels" {
+    // The levels `lora-schedule-test` printed for krea2 at 4 steps and 256x256
+    // from a loaded session; a UI preview that disagreed would label the wrong
+    // steps. SD's level is its timestep fraction, falling from near 1 to 0.
+    const gpa = std.testing.allocator;
+    const k = try stepLevels(gpa, .krea2, 256, 256, 4, null);
+    defer gpa.free(k);
+    errdefer std.debug.print("krea2 levels {any}\n", .{k});
+    try std.testing.expectEqual(@as(usize, 4), k.len);
+    for (k, [_]f32{ 1.0, 0.9045, 0.7595, 0.5128 }) |got, want| try std.testing.expectApproxEqAbs(want, got, 5e-5);
+
+    const sd = try stepLevels(gpa, .sd15, 512, 512, 10, null);
+    defer gpa.free(sd);
+    errdefer std.debug.print("sd15 levels {any}\n", .{sd});
+    try std.testing.expect(sd[0] > 0.99 and sd[0] <= 1);
+    for (sd[1..], sd[0 .. sd.len - 1]) |b, a| try std.testing.expect(b < a);
+    // The last step starts at the ladder's smallest sigma, which is timestep 0.
+    try std.testing.expectEqual(@as(f32, 0), sd[sd.len - 1]);
 }
 
 test "a CFG denoiser needs a negative conditioning" {

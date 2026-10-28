@@ -82,6 +82,7 @@ pub const limits = struct {
         for (ir.loras) |l| {
             if (l.path.len == 0 or l.path.len >= config.max_path) return "lora path";
             if (!inRange(l.strength, -max_lora_strength, max_lora_strength)) return "lora strength";
+            _ = tp.models.lora.Schedule.parse(l.schedule) catch return "lora schedule";
         }
         return null;
     }
@@ -419,6 +420,7 @@ pub const Host = struct {
             self.drv.flushNotesTo(s);
             self.reportImageCalls(s, false);
         }
+        self.drv.pumpCompletions();
         self.drv.maybeApplyPendingTranscript();
         self.emitAll();
     }
@@ -485,18 +487,14 @@ pub const Host = struct {
             .chat_submit => |c| {
                 if (!drv.submit(c.text)) self.emitErr(.refused, "submit");
             },
-            .chat_regenerate => {
-                if (drv.uiSession()) |s| {
-                    s.regenerate() catch |err| self.emitErr(.internal, @errorName(err));
-                } else drv.requestRegenLoad();
-            },
+            .chat_regenerate => drv.regenerate() catch |err| self.emitErr(.internal, @errorName(err)),
             .chat_cancel => drv.cancelLlm(),
             .chat_pause => |p| drv.setLlmPaused(p.paused),
             .chat_new => drv.newChat(),
             .chat_adopt => |a| self.adopt(a.messages),
             .chat_select_variant => |sv| if (drv.uiSession()) |s| {
                 // The session's own API navigates the LAST message only.
-                if (@as(usize, sv.msg) + 1 == s.messages.items.len) s.selectVariant(sv.variant);
+                if (@as(usize, sv.msg) + 1 == s.messages.items.len) drv.selectVariant(sv.variant);
             } else {
                 // Nothing resident: the carried transcript just shows another
                 // take; the next session adopts whichever is active.
@@ -515,6 +513,8 @@ pub const Host = struct {
             .chat_note => |n| if (n.text.len > 0) {
                 drv.queueNote(self.gpa.dupe(u8, n.text) catch return);
             },
+            .llm_complete => |c| self.complete(c),
+            .llm_complete_cancel => |c| drv.cancelCompletion(c.ref),
 
             .img_enqueue => |ir| self.enqueue(ir),
             .act_derive => |dr| self.actDerive(dr),
@@ -565,6 +565,39 @@ pub const Host = struct {
     ///
     /// Inline on the engine thread: it takes seconds and there is nothing useful to
     /// do meanwhile, so it blocks rather than growing a second kind of queued job.
+    fn complete(self: *Host, c: wire.Complete) void {
+        if (c.max_tokens < 1 or c.max_tokens > limits.max_new_tokens) return self.emitErr(.bad_request, "max_tokens");
+        const system = self.gpa.dupe(u8, c.system) catch return self.emitErr(.internal, "OutOfMemory");
+        const user = self.gpa.dupe(u8, c.user) catch {
+            self.gpa.free(system);
+            return self.emitErr(.internal, "OutOfMemory");
+        };
+        self.drv.requestCompletion(.{
+            .ref = c.ref,
+            .system = system,
+            .user = user,
+            .think = .{ .on = c.think, .effort = switch (c.effort) {
+                .low => .low,
+                .medium => .medium,
+                .high => .high,
+            } },
+            .seed = c.seed,
+            .max_tokens = c.max_tokens,
+        });
+    }
+
+    /// Report every finished completion. One that cannot be queued stays for
+    /// the next pass rather than being lost.
+    fn emitCompletions(self: *Host) void {
+        const done = &self.drv.completions_done;
+        while (done.items.len > 0) {
+            const d = done.items[0];
+            if (!self.emitOk(.{ .llm_completion = .{ .ref = d.ref, .text = d.text, .err = d.err } })) return;
+            var owned = done.orderedRemove(0);
+            owned.deinit(self.gpa);
+        }
+    }
+
     fn actDerive(self: *Host, dr: anytype) void {
         const gpa = self.gpa;
         // Every exit answers with `act_derived`: the client is waiting on it, and an
@@ -615,7 +648,8 @@ pub const Host = struct {
             p.set(l.path);
             resolveRef(p, &scan.cat, self.folders != null);
             const path = p.opt() orelse return self.emitErr(if (catalog.parseId(l.path) != null) .not_found else .bad_request, "lora");
-            s.* = .{ .path = path, .strength = l.strength };
+            // Parsed once already by `checkImageRequest`.
+            s.* = .{ .path = path, .strength = l.strength, .schedule = tp.models.lora.Schedule.parse(l.schedule) catch unreachable };
         }
         const d = &(drv.diffuser orelse return self.emitErr(.no_model, "no image model"));
         const gpa = self.gpa;
@@ -895,6 +929,7 @@ pub const Host = struct {
     fn emitAll(self: *Host) void {
         self.emitState();
         self.emitTranscript();
+        self.emitCompletions();
         self.emitImages();
         self.emitTelemetry();
         if (self.drv.takePeakUpdate()) |u| self.emit(.{ .diff_peak = .{ .peak = u.peak, .key = u.key } });
@@ -913,7 +948,8 @@ pub const Host = struct {
             .load_err = if (drv.load_err) |e| @errorName(e) else "",
             .llm_paused = drv.llm_paused,
             .llm_eject_armed = drv.llm_eject_armed,
-            .pending_submit = drv.pending_submit != null,
+            .pending_submit = drv.pending_submit != null or drv.held_submit != null,
+            .completions = @intCast(drv.completionCount()),
             .staged = @intCast(drv.staged.items.len),
             .diff_eject_armed = drv.diff_eject_armed,
             .vision = drv.visionAvailable(),
@@ -930,7 +966,8 @@ pub const Host = struct {
             }
             st.gen_err = if (s.gen_err) |e| @errorName(e) else "";
             st.ctx_lost = s.dev.isLost();
-            st.llm_busy = s.busy();
+            st.completing = s.completing();
+            st.llm_busy = s.busy() and !st.completing;
             st.turn_pending = s.turnPending();
             for (s.pendingAttachments()) |gi| {
                 if (n_attach == attach_buf.len) break;
@@ -1382,6 +1419,56 @@ const TestHost = struct {
         return n;
     }
 };
+
+/// Run passes until an `llm_completion` for `ref` comes out, for at most ~5 s.
+fn awaitCompletion(h: *Host, arena: std.mem.Allocator, ref: u64) !@FieldType(wire.Event, "llm_completion") {
+    for (0..500) |_| {
+        h.runOnce();
+        for (try TestHost.events(h, arena)) |e| if (e == .llm_completion and e.llm_completion.ref == ref) return e.llm_completion;
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.TestNoCompletion;
+}
+
+test "a completion with no LLM configured is answered at once, and a bad token cap is refused" {
+    try TestHost.run(.{}, struct {
+        fn body(h: *Host) !void {
+            try TestHost.expectErr(h, .{ .llm_complete = .{ .ref = 1, .max_tokens = 0 } }, .bad_request, "max_tokens");
+            var arena = std.heap.ArenaAllocator.init(h.gpa);
+            defer arena.deinit();
+            h.postRequest(.{ .llm_complete = .{ .ref = 9, .system = "s", .user = "u" } });
+            const done = try awaitCompletion(h, arena.allocator(), 9);
+            try testing.expectEqualStrings("NoModel", done.err);
+            try testing.expectEqualStrings("", done.text);
+            try testing.expectEqual(@as(usize, 0), h.drv.completionCount());
+        }
+    }.body);
+}
+
+test "completions queued for a model that fails to load each fail with the load's error" {
+    try TestHost.run(.{}, struct {
+        fn body(h: *Host) !void {
+            // A real failed load logs at `err`, which fails any test: the pause
+            // holds the load, and the test leaves what a failed one leaves.
+            h.drv.settings.llm_model.set("/nonexistent/tp-test-model.gguf");
+            h.drv.llm_paused = true;
+            var arena = std.heap.ArenaAllocator.init(h.gpa);
+            defer arena.deinit();
+            h.postRequest(.{ .llm_complete = .{ .ref = 1, .user = "a" } });
+            h.postRequest(.{ .llm_complete = .{ .ref = 2, .user = "b" } });
+            h.postRequest(.{ .llm_complete_cancel = .{ .ref = 2 } });
+            const two = try awaitCompletion(h, arena.allocator(), 2);
+            try testing.expectEqualStrings("Stopped", two.err);
+            try testing.expectEqual(@as(usize, 1), h.drv.completionCount());
+            try testing.expect(h.drv.loader == null);
+            h.drv.reload_requested = false;
+            h.drv.load_err = error.FileNotFound;
+            const one = try awaitCompletion(h, arena.allocator(), 1);
+            try testing.expectEqualStrings("FileNotFound", one.err);
+            try testing.expectEqual(@as(usize, 0), h.drv.completionCount());
+        }
+    }.body);
+}
 
 test "image cancels posted in one pass all reach the urgent ring, and a full ring falls through to the inbox" {
     try TestHost.run(.{}, struct {

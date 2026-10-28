@@ -38,7 +38,12 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
     // knows it, the client writes the file, so it rides on `ImageInfo`.
     var loras: std.ArrayList(tp.pipeline.LoraRecord) = .empty;
     defer loras.deinit(gpa);
-    for (info.loras) |l| try loras.append(gpa, .{ .name = l.name, .hash = l.hash, .strength = l.strength });
+    for (info.loras) |l| try loras.append(gpa, .{
+        .name = l.name,
+        .hash = l.hash,
+        .strength = l.strength,
+        .schedule = l.schedule,
+    });
     return tp.pipeline.appendExtraParams(gpa, base, .{
         .clip1 = info.clip1_stem,
         .clip2 = info.clip2_stem,
@@ -443,6 +448,29 @@ test "a conditioning-noise curve round-trips with its commas intact" {
     // the line either.
     try std.testing.expectEqual(@as(?u64, 77), got.seed);
     try std.testing.expectEqual(@as(?usize, 8), got.steps);
+}
+
+test "a scheduled LoRA gets its own field, and an unscheduled stack none" {
+    const gpa = std.testing.allocator;
+    const text = "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 3, Size: 8x8, Model: m, Prompt syntax: ComfyUI";
+    {
+        const out = try tp.pipeline.appendExtraParams(gpa, try gpa.dupe(u8, text), .{ .loras = &.{
+            .{ .name = "sda", .strength = 1, .schedule = "window:1-0.85" },
+            .{ .name = "style", .strength = 0.8 },
+            .{ .name = "fade", .strength = 0.5, .schedule = "curve:1=1,0.5=0" },
+        } });
+        defer gpa.free(out);
+        errdefer std.debug.print("{s}\n", .{out});
+        try std.testing.expect(std.mem.find(u8, out, ", Lora strengths: \"sda: 1.00, style: 0.80, fade: 0.50\"") != null);
+        try std.testing.expect(std.mem.find(u8, out, ", Lora schedules: \"sda: window:1-0.85, fade: curve:1=1,0.5=0\"") != null);
+        // The quoted, comma-carrying curve leaves the rest of the line readable.
+        try std.testing.expectEqual(@as(?u64, 3), parseA1111Params(out).seed);
+    }
+    {
+        const out = try tp.pipeline.appendExtraParams(gpa, try gpa.dupe(u8, text), .{ .loras = &.{.{ .name = "style", .strength = 0.8 }} });
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.find(u8, out, "Lora schedules") == null);
+    }
 }
 
 test "an empty Resources leaves the block byte-identical" {

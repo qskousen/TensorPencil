@@ -3,9 +3,11 @@
 //! One writer, the frame thread. Chat is pinned to one host. New images join
 //! THIS client's queue (`Asked`) and are handed out as hosts free up, one in
 //! flight per host; a request naming an image goes to the host that minted
-//! it. Connects run on their own threads, and a host that cannot be reached is
-//! retried on a widening backoff for as long as the client runs. Only an entry
-//! that cannot name an endpoint is given up on.
+//! it. An Expand job waits in that queue until the chat host has written the
+//! prompts of its whole batch (`expand`). Connects run on their own threads,
+//! and a host that cannot be reached is retried on a widening backoff for as
+//! long as the client runs. Only an entry that cannot name an endpoint is given
+//! up on.
 const std = @import("std");
 const Io = std.Io;
 const wire = @import("serve").wire;
@@ -16,6 +18,7 @@ const remote = @import("remote.zig");
 const mirror = @import("mirror.zig");
 const sched = @import("sched.zig");
 const models = @import("models.zig");
+const expand_text = @import("expand.zig");
 
 const log = std.log.scoped(.hosts);
 
@@ -220,6 +223,13 @@ pub const Hosts = struct {
     told_image_tool: ?bool = null,
     /// What a connect learned that the user should read once (`connectNotices`).
     notices: std.ArrayList(Notice) = .empty,
+    /// Prompts being written for Expand mode, oldest first (see `expand`).
+    prompts: std.ArrayList(Prompt) = .empty,
+    next_batch: u64 = 0,
+    /// Scratch for draining a host's finished completions.
+    completed: std.ArrayList(mirror.Completed) = .empty,
+    /// The prompt Expand mode last wrote, whole (prefix and suffix included).
+    last_expansion: []u8 = "",
 
     pub const Notice = struct { tone: enum { info, warn }, text: []u8 };
 
@@ -239,6 +249,10 @@ pub const Hosts = struct {
         self.slots.deinit(self.gpa);
         for (self.notices.items) |n| self.gpa.free(n.text);
         self.notices.deinit(self.gpa);
+        for (self.prompts.items) |*p| p.free(self.gpa);
+        self.prompts.deinit(self.gpa);
+        self.completed.deinit(self.gpa);
+        self.gpa.free(self.last_expansion);
     }
 
     /// The oldest notice waiting; the caller frees `text`.
@@ -578,7 +592,11 @@ pub const Hosts = struct {
         req.prompt = a.dupe(u8, req.prompt) catch return;
         req.negative = a.dupe(u8, req.negative) catch return;
         const loras = a.alloc(wire.LoraSpec, req.loras.len) catch return;
-        for (req.loras, loras) |src, *dst| dst.* = .{ .path = a.dupe(u8, src.path) catch "", .strength = src.strength };
+        for (req.loras, loras) |src, *dst| dst.* = .{
+            .path = a.dupe(u8, src.path) catch "",
+            .strength = src.strength,
+            .schedule = a.dupe(u8, src.schedule) catch "",
+        };
         req.loras = loras;
         self.post(cfg, .{ .img_enqueue = req });
     }
@@ -1120,6 +1138,7 @@ pub const Hosts = struct {
         // Place first, then report: an image has no id until a host takes it.
         defer self.reportModelImages(cfg);
         defer self.dispatch(cfg);
+        defer self.syncPrompts();
         const local_seq = self.local().mirror.catalog_seq;
         const now = Io.Clock.awake.now(self.io).nanoseconds;
         const can_render = self.canRenderAnywhere(cfg);
@@ -1127,6 +1146,7 @@ pub const Hosts = struct {
         self.told_image_tool = can_render;
         for (self.slots.items) |s| {
             self.drain(s);
+            self.takeAnswers(s);
             self.measure(s);
             self.cancelStrays(s);
             self.takeModelCalls(s);
@@ -1393,6 +1413,12 @@ pub const Hosts = struct {
         told_id: wire.ImageId = 0,
         /// ...and how it turned out.
         outcome_told: bool = false,
+        /// Expand mode: the prompt this render waits for (`Prompt.ref`), 0 once
+        /// it is written; no host is offered it before then.
+        prompt_ref: u64 = 0,
+        /// Expand mode: the renders asked for together, none of which goes out
+        /// before every prompt among them is written.
+        batch: u64 = 0,
 
         fn was(self: *const Asked, id: HostId) bool {
             for (self.tried[0..self.n_tried]) |t| if (t == id) return true;
@@ -1408,7 +1434,10 @@ pub const Hosts = struct {
         fn free(self: *Asked, gpa: std.mem.Allocator) void {
             gpa.free(self.req.prompt);
             gpa.free(self.req.negative);
-            for (self.req.loras) |l| gpa.free(l.path);
+            for (self.req.loras) |l| {
+                gpa.free(l.path);
+                gpa.free(l.schedule);
+            }
             gpa.free(self.req.loras);
         }
     };
@@ -1453,7 +1482,11 @@ pub const Hosts = struct {
             return 0;
         };
         for (req.loras, loras) |src, *dst| {
-            dst.* = .{ .path = self.gpa.dupe(u8, src.path) catch "", .strength = src.strength };
+            dst.* = .{
+                .path = self.gpa.dupe(u8, src.path) catch "",
+                .strength = src.strength,
+                .schedule = self.gpa.dupe(u8, src.schedule) catch "",
+            };
         }
         owned.loras = loras;
         self.asked.append(self.gpa, .{ .ref = owned.client_ref, .req = owned }) catch {
@@ -1562,7 +1595,7 @@ pub const Hosts = struct {
         var held: [config.max_hosts + 1]HostId = undefined;
         var n_held: usize = 0;
         for (self.asked.items) |*a| {
-            if (!a.waiting) continue;
+            if (!a.waiting or self.writing(a)) continue;
             const target = self.pick(cfg, a, held[0..n_held]) orelse continue;
             if (self.hasRoom(target)) {
                 self.handTo(a, target);
@@ -1599,6 +1632,8 @@ pub const Hosts = struct {
     /// that will finish it soonest looks identical to one nobody can run,
     /// unless the rail says which it is.
     pub const Wait = union(enum) {
+        /// Its prompt, or another in its batch, is still being written.
+        writing,
         /// A host has room; it goes out this pass.
         ready,
         /// Waiting for the host that would still finish it first.
@@ -1608,6 +1643,7 @@ pub const Hosts = struct {
     };
 
     pub fn waitReason(self: *Hosts, cfg: *const config.Config, a: *const Asked) Wait {
+        if (self.writing(a)) return .writing;
         const target = self.pick(cfg, a, &.{}) orelse return .nowhere;
         if (self.hasRoom(target)) return .ready;
         return .{ .behind = if (self.several()) target.name else "" };
@@ -1646,7 +1682,8 @@ pub const Hosts = struct {
         for (self.asked.items, 0..) |*a, i| {
             if (a.ref != ref or !a.waiting) continue;
             var gone = self.asked.orderedRemove(i);
-            gone.free(self.gpa);
+            defer gone.free(self.gpa);
+            if (gone.prompt_ref != 0) self.dropPromptIfUnwanted(gone.prompt_ref);
             return;
         }
     }
@@ -1661,6 +1698,218 @@ pub const Hosts = struct {
             var gone = self.asked.orderedRemove(i);
             gone.free(self.gpa);
         }
+        while (self.prompts.items.len > 0) self.cancelPrompt(0);
+    }
+
+    // ── Expand mode ───────────────────────────────────────────────────────────
+
+    /// A render whose prompt the chat model writes from an idea (see `expand`).
+    pub const Expand = struct {
+        /// What each render is, but for its prompt. A nonzero seed is advanced
+        /// per image, as the studio does for a batch.
+        recipe: wire.ImageRequest,
+        count: u32 = 1,
+        /// One prompt for the whole batch rather than one per image.
+        shared: bool = false,
+        prefix: []const u8 = "",
+        idea: []const u8,
+        suffix: []const u8 = "",
+        /// The expander's text, the system prompt the model writes under.
+        system: []const u8,
+        think: bool = false,
+        effort: wire.Effort = .high,
+        max_tokens: u32 = 1024,
+    };
+
+    /// One prompt being written: the request as sent, and where to put the
+    /// answer. Kept whole so a host that goes away is simply asked again.
+    pub const Prompt = struct {
+        /// The `llm_complete` ref it was last sent under, which is also every
+        /// waiting render's `prompt_ref`. Re-minted on each send, so a late
+        /// answer to an abandoned send matches nothing.
+        ref: u64,
+        prefix: []u8,
+        suffix: []u8,
+        system: []u8,
+        idea: []u8,
+        think: bool,
+        effort: wire.Effort,
+        seed: u64,
+        max_tokens: u32,
+        /// The host it was sent to, and that host's `reconnects` then: a host
+        /// that has dropped since may never answer.
+        sent: ?struct { host: HostId, reconnects: u32 } = null,
+
+        fn free(self: *Prompt, gpa: std.mem.Allocator) void {
+            gpa.free(self.prefix);
+            gpa.free(self.suffix);
+            gpa.free(self.system);
+            gpa.free(self.idea);
+        }
+    };
+
+    /// Queue `e.count` renders whose prompt the chat model writes from `e.idea`.
+    /// They wait in this client's queue, named by the idea, until every prompt
+    /// of the batch is written, then go out like any other render. Answers the
+    /// batch number, 0 when nothing could be queued.
+    pub fn expand(self: *Hosts, cfg: *const config.Config, e: Expand) u64 {
+        if (e.count == 0) return 0;
+        self.next_batch += 1;
+        const batch = self.next_batch;
+        var prompt_ref: u64 = 0;
+        for (0..e.count) |i| {
+            if (i == 0 or !e.shared) prompt_ref = self.addPrompt(e) orelse break;
+            var req = e.recipe;
+            req.prompt = e.idea;
+            if (req.seed != 0) req.seed +%= i;
+            const ref = self.remember(req);
+            const a = self.askedOf(ref) orelse {
+                self.dropPromptIfUnwanted(prompt_ref);
+                break;
+            };
+            a.prompt_ref = prompt_ref;
+            a.batch = batch;
+        }
+        self.syncPrompts();
+        self.dispatch(cfg);
+        return if (self.inBatch(batch)) batch else 0;
+    }
+
+    fn addPrompt(self: *Hosts, e: Expand) ?u64 {
+        var seed: [8]u8 = undefined;
+        self.io.random(&seed);
+        var p: Prompt = .{
+            .ref = self.mintRef(),
+            .prefix = self.gpa.dupe(u8, e.prefix) catch return null,
+            .suffix = "",
+            .system = "",
+            .idea = "",
+            .think = e.think,
+            .effort = e.effort,
+            .seed = std.mem.readInt(u64, &seed, .little),
+            .max_tokens = e.max_tokens,
+        };
+        p.suffix = self.gpa.dupe(u8, e.suffix) catch return self.freePrompt(&p);
+        p.system = self.gpa.dupe(u8, e.system) catch return self.freePrompt(&p);
+        p.idea = self.gpa.dupe(u8, e.idea) catch return self.freePrompt(&p);
+        self.prompts.append(self.gpa, p) catch return self.freePrompt(&p);
+        return p.ref;
+    }
+
+    fn freePrompt(self: *Hosts, p: *Prompt) ?u64 {
+        p.free(self.gpa);
+        return null;
+    }
+
+    fn mintRef(self: *Hosts) u64 {
+        self.next_ref += 1;
+        return client_ref_base | self.next_ref;
+    }
+
+    fn inBatch(self: *Hosts, batch: u64) bool {
+        for (self.asked.items) |*a| if (a.batch == batch) return true;
+        return false;
+    }
+
+    /// Its own prompt, or one of its batch's, is still being written.
+    fn writing(self: *Hosts, a: *const Asked) bool {
+        if (a.prompt_ref != 0) return true;
+        if (a.batch == 0) return false;
+        for (self.asked.items) |*o| if (o.batch == a.batch and o.waiting and o.prompt_ref != 0) return true;
+        return false;
+    }
+
+    /// Send every prompt not yet asked of the chat host, and ask again where the
+    /// host it went to has dropped since, or is no longer the chat host. A
+    /// re-ask goes under a new ref, so the abandoned send answers nothing.
+    fn syncPrompts(self: *Hosts) void {
+        const target = self.chatSlot();
+        for (self.prompts.items) |*p| {
+            if (p.sent) |sent| {
+                const at = self.slotOf(sent.host);
+                const lost = at == null or at.?.reconnects != sent.reconnects or sent.host != target.id;
+                if (!lost) continue;
+                if (at) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = p.ref } });
+                p.sent = null;
+                const fresh = self.mintRef();
+                for (self.asked.items) |*a| if (a.prompt_ref == p.ref) {
+                    a.prompt_ref = fresh;
+                };
+                p.ref = fresh;
+            }
+            if (!target.up() or !target.mirror.spokeOnce()) continue;
+            target.post(.{ .llm_complete = .{
+                .ref = p.ref,
+                .system = p.system,
+                .user = p.idea,
+                .think = p.think,
+                .effort = p.effort,
+                .seed = p.seed,
+                .max_tokens = p.max_tokens,
+            } });
+            p.sent = .{ .host = target.id, .reconnects = target.reconnects };
+        }
+    }
+
+    /// The prompts `s` has answered: each becomes the prompt of every render
+    /// waiting on it. A failed or empty answer drops those renders and says why.
+    fn takeAnswers(self: *Hosts, s: *Slot) void {
+        s.mirror.takeCompleted(&self.completed);
+        defer {
+            for (self.completed.items) |*c| c.deinit(self.gpa);
+            self.completed.clearRetainingCapacity();
+        }
+        for (self.completed.items) |*c| {
+            const i = for (self.prompts.items, 0..) |*p, i| {
+                if (p.ref == c.ref) break i;
+            } else continue;
+            var p = self.prompts.orderedRemove(i);
+            defer p.free(self.gpa);
+            const joined: ?[]u8 = if (c.err.len == 0 and expand_text.cleanAnswer(c.text).len > 0)
+                expand_text.join(self.gpa, p.prefix, c.text, p.suffix) catch null
+            else
+                null;
+            defer if (joined) |j| self.gpa.free(j);
+            if (joined) |j| if (self.gpa.dupe(u8, j)) |copy| {
+                self.gpa.free(self.last_expansion);
+                self.last_expansion = copy;
+            } else |_| {};
+            var k: usize = 0;
+            while (k < self.asked.items.len) {
+                const a = &self.asked.items[k];
+                if (a.prompt_ref != p.ref) {
+                    k += 1;
+                    continue;
+                }
+                if (joined) |j| if (self.gpa.dupe(u8, j)) |owned| {
+                    self.gpa.free(a.req.prompt);
+                    a.req.prompt = owned;
+                    a.prompt_ref = 0;
+                    k += 1;
+                    continue;
+                } else |_| {};
+                var gone = self.asked.orderedRemove(k);
+                gone.free(self.gpa);
+            }
+            if (joined == null and !std.mem.eql(u8, c.err, "Stopped")) {
+                const why = if (c.err.len > 0) c.err else "an empty answer";
+                const text = self.gpa.print("Writing a prompt failed on {s}: {s}", .{ s.name, why }) catch continue;
+                self.notices.append(self.gpa, .{ .tone = .warn, .text = text }) catch self.gpa.free(text);
+            }
+        }
+    }
+
+    /// Stop writing a prompt no waiting render needs any more.
+    fn dropPromptIfUnwanted(self: *Hosts, ref: u64) void {
+        for (self.asked.items) |*a| if (a.prompt_ref == ref) return;
+        for (self.prompts.items, 0..) |*p, i| if (p.ref == ref) return self.cancelPrompt(i);
+    }
+
+    fn cancelPrompt(self: *Hosts, i: usize) void {
+        var p = self.prompts.orderedRemove(i);
+        defer p.free(self.gpa);
+        const sent = p.sent orelse return;
+        if (self.slotOf(sent.host)) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = p.ref } });
     }
 
     /// Move a waiting job before `before`, or to the end of the waiting run.
@@ -3184,4 +3433,245 @@ test "a host that drops is failed once, retried on the backoff, and never given 
     try testing.expectEqual(@as(u32, 2), s.tries);
     try testing.expect(!s.lost);
     try testing.expectEqual(@as(u32, 0), s.reconnects);
+}
+
+/// Every request of kind `tag` a fake host was sent, in order.
+fn sentOf(r: *remote.Remote, arena: std.mem.Allocator, tag: std.meta.Tag(wire.Request)) ![]wire.Request {
+    var out: std.ArrayList(wire.Request) = .empty;
+    for (0..r.outbox.items.items.len) |i| {
+        const req = try sentRequest(r, arena, i);
+        if (req == tag) try out.append(arena, req);
+    }
+    return out.items;
+}
+
+/// A host with a fake link, ready to render and to write prompts.
+fn expandHost(h: *Hosts, r: *remote.Remote) *Slot {
+    const a = h.local();
+    a.remote = r;
+    ready(a);
+    return a;
+}
+
+const test_expand: Hosts.Expand = .{
+    .recipe = .{ .width = 512, .height = 512, .steps = 8, .seed = 100 },
+    .count = 2,
+    .prefix = "oil painting",
+    .idea = "adventurer returning home",
+    .suffix = "golden hour",
+    .system = "write prompts",
+};
+
+test "an expanded batch waits until every prompt is written, then renders prefix, answer and suffix" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    try testing.expect(h.expand(&cfg, test_expand) != 0);
+    // One prompt per image, both asked of the chat host at once; no render yet.
+    const asks = try sentOf(&ra, ar, .llm_complete);
+    try testing.expectEqual(@as(usize, 2), asks.len);
+    try testing.expectEqualStrings("write prompts", asks[0].llm_complete.system);
+    try testing.expectEqualStrings("adventurer returning home", asks[0].llm_complete.user);
+    try testing.expect(asks[0].llm_complete.ref != asks[1].llm_complete.ref);
+    try testing.expect(asks[0].llm_complete.seed != asks[1].llm_complete.seed);
+    try testing.expectEqual(@as(usize, 0), (try sentOf(&ra, ar, .img_enqueue)).len);
+    var buf: [8]*const Hosts.Asked = undefined;
+    const rows = h.waiting(&buf);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("adventurer returning home", rows[0].req.prompt);
+    try testing.expectEqual(Hosts.Wait.writing, h.waitReason(&cfg, rows[0]));
+
+    // One answer: that render has its prompt, but its batch still waits.
+    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[0].llm_complete.ref, .text = "Prompt: \"a knight at a gate\"" } });
+    h.takeAnswers(a);
+    h.dispatch(&cfg);
+    try testing.expectEqual(@as(usize, 0), (try sentOf(&ra, ar, .img_enqueue)).len);
+    try testing.expectEqual(Hosts.Wait.writing, h.waitReason(&cfg, h.waiting(&buf)[0]));
+
+    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[1].llm_complete.ref, .text = "a lantern on a hill" } });
+    h.takeAnswers(a);
+    h.dispatch(&cfg);
+    const sent = try sentOf(&ra, ar, .img_enqueue);
+    try testing.expectEqual(@as(usize, 1), sent.len);
+    try testing.expectEqualStrings("oil painting\na knight at a gate\ngolden hour", sent[0].img_enqueue.prompt);
+    try testing.expectEqual(@as(u64, 100), sent[0].img_enqueue.seed);
+    const left = h.waiting(&buf);
+    try testing.expectEqual(@as(usize, 1), left.len);
+    try testing.expectEqualStrings("oil painting\na lantern on a hill\ngolden hour", left[0].req.prompt);
+    try testing.expectEqual(@as(u64, 101), left[0].req.seed);
+    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+}
+
+test "a shared prompt is written once for the whole batch" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    a.mirror.state.diff_busy = true; // hold the renders, to read them back
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var e = test_expand;
+    e.count = 3;
+    e.shared = true;
+    e.prefix = "";
+    e.suffix = "";
+    try testing.expect(h.expand(&cfg, e) != 0);
+    const asks = try sentOf(&ra, arena.allocator(), .llm_complete);
+    try testing.expectEqual(@as(usize, 1), asks.len);
+    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[0].llm_complete.ref, .text = "a knight" } });
+    h.takeAnswers(a);
+    var buf: [8]*const Hosts.Asked = undefined;
+    const rows = h.waiting(&buf);
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows, 0..) |r, i| {
+        try testing.expectEqualStrings("a knight", r.req.prompt);
+        try testing.expectEqual(@as(u64, 100 + i), r.req.seed);
+        try testing.expect(h.waitReason(&cfg, r) != .writing);
+    }
+}
+
+test "stopping a render that waits for its prompt stops that prompt, unless another render needs it" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var buf: [8]*const Hosts.Asked = undefined;
+
+    // Shared: dropping one of two renders leaves the prompt being written.
+    var shared = test_expand;
+    shared.shared = true;
+    _ = h.expand(&cfg, shared);
+    h.post(&cfg, .{ .img_cancel = .{ .image = h.waiting(&buf)[0].ref } });
+    try testing.expectEqual(@as(usize, 0), (try sentOf(&ra, ar, .llm_complete_cancel)).len);
+    try testing.expectEqual(@as(usize, 1), h.prompts.items.len);
+    // Its last render gone, it is stopped at the host.
+    h.post(&cfg, .{ .img_cancel = .{ .image = h.waiting(&buf)[0].ref } });
+    const stops = try sentOf(&ra, ar, .llm_complete_cancel);
+    try testing.expectEqual(@as(usize, 1), stops.len);
+    try testing.expectEqual((try sentOf(&ra, ar, .llm_complete))[0].llm_complete.ref, stops[0].llm_complete_cancel.ref);
+    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+
+    // Stop all takes every prompt with it.
+    _ = h.expand(&cfg, test_expand);
+    h.post(&cfg, .img_cancel_all);
+    try testing.expectEqual(@as(usize, 3), (try sentOf(&ra, ar, .llm_complete_cancel)).len);
+    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+    try testing.expectEqual(@as(usize, 0), h.waiting(&buf).len);
+}
+
+test "a prompt that fails drops its renders and says why; a stopped one says nothing" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [8]*const Hosts.Asked = undefined;
+
+    var one = test_expand;
+    one.count = 1;
+    _ = h.expand(&cfg, one);
+    _ = h.expand(&cfg, one);
+    const asks = try sentOf(&ra, arena.allocator(), .llm_complete);
+    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[0].llm_complete.ref, .err = "NoModel" } });
+    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[1].llm_complete.ref, .err = "Stopped" } });
+    h.takeAnswers(a);
+    try testing.expectEqual(@as(usize, 0), h.waiting(&buf).len);
+    const failed = h.takeNotice() orelse return error.TestExpectedNotice;
+    defer testing.allocator.free(failed.text);
+    try testing.expect(std.mem.find(u8, failed.text, "NoModel") != null);
+    try testing.expect(h.takeNotice() == null);
+    // An answer that is blank once cleaned is a failure too.
+    _ = h.expand(&cfg, one);
+    const third = (try sentOf(&ra, arena.allocator(), .llm_complete))[2].llm_complete.ref;
+    try feedEvent(a, .{ .llm_completion = .{ .ref = third, .text = "Prompt: \"\"" } });
+    h.takeAnswers(a);
+    try testing.expectEqual(@as(usize, 0), h.waiting(&buf).len);
+    const blank = h.takeNotice() orelse return error.TestExpectedNotice;
+    defer testing.allocator.free(blank.text);
+    try testing.expect(std.mem.find(u8, blank.text, "an empty answer") != null);
+}
+
+test "a prompt is asked again when its host has dropped since, or the chat has moved, and a late answer to the old ask is ignored" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    var rb = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    defer rb.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    const b = try h.addSlot("b", .{});
+    b.remote = &rb;
+    defer b.remote = null;
+    ready(b);
+    a.mirror.state.diff_busy = true;
+    b.mirror.state.diff_busy = true;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var buf: [8]*const Hosts.Asked = undefined;
+
+    var one = test_expand;
+    one.count = 1;
+    _ = h.expand(&cfg, one);
+    const first = (try sentOf(&ra, ar, .llm_complete))[0].llm_complete.ref;
+
+    // The chat host came back after a loss: its answer may be gone with the link.
+    a.reconnects += 1;
+    h.syncPrompts();
+    const again = try sentOf(&ra, ar, .llm_complete);
+    try testing.expectEqual(@as(usize, 2), again.len);
+    const second = again[1].llm_complete.ref;
+    try testing.expect(second != first);
+    try testing.expectEqual(first, (try sentOf(&ra, ar, .llm_complete_cancel))[0].llm_complete_cancel.ref);
+    try testing.expectEqual(second, h.waiting(&buf)[0].prompt_ref);
+
+    // The chat moves: the prompt follows it.
+    h.chat = b.id;
+    h.syncPrompts();
+    const on_b = try sentOf(&rb, ar, .llm_complete);
+    try testing.expectEqual(@as(usize, 1), on_b.len);
+    const third = on_b[0].llm_complete.ref;
+
+    // Answers to the abandoned asks change nothing; the live one lands.
+    try feedEvent(a, .{ .llm_completion = .{ .ref = first, .text = "stale one" } });
+    try feedEvent(a, .{ .llm_completion = .{ .ref = second, .text = "stale two" } });
+    h.takeAnswers(a);
+    try testing.expectEqual(Hosts.Wait.writing, h.waitReason(&cfg, h.waiting(&buf)[0]));
+    try feedEvent(b, .{ .llm_completion = .{ .ref = third, .text = "a knight" } });
+    h.takeAnswers(b);
+    try testing.expectEqualStrings("oil painting\na knight\ngolden hour", h.waiting(&buf)[0].req.prompt);
 }

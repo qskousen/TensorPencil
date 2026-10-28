@@ -26,6 +26,7 @@ const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 const residency = @import("tp_runtime").residency;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
@@ -81,7 +82,7 @@ pub const VulkanLM = struct {
     max_capacity: usize,
     kv_dtype: kvmod.KvDtype = .f32,
     len: usize,
-    kv: kv_gpu.Kv,
+    kv: kv_gpu.Kv = .empty,
     /// Rows each local ring holds: `localRingText`, then `localRingMax` from the first
     /// image on (`growLocalRing`).
     ring_rows: usize = 0,
@@ -140,6 +141,73 @@ pub const VulkanLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `cache` and `rope`, present exactly when a split is armed. The device RoPE
+    /// tables are not in it: they only grow, and cover every sequence.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        ring_rows: usize = 0,
+        kv: kv_gpu.Kv = .empty,
+        host: ?Host = null,
+
+        pub const Host = struct { cache: kvmod.PerLayerKvCache, rope: ops.rope.RopeTables(2) };
+    };
+
+    /// An empty text sequence for the current layer placement.
+    fn seqAlloc(self: *const VulkanLM, initial: usize, max: usize) !Seq {
+        const cfg = self.cfg;
+        const ring = localRingText(cfg);
+        var s: Seq = .{ .capacity = initial, .max_capacity = max, .ring_rows = ring };
+        errdefer self.seqFree(&s);
+        s.kv = try self.newKv(initial, ring, self.kv_dtype);
+        if (self.split) |*sp| {
+            for (sp.on_gpu, 0..) |on, l| if (!on) s.kv.release(self.be, l);
+            var cache = try self.hostShadowCacheAt(ring, initial, self.kv_dtype);
+            errdefer cache.deinit(self.gpa);
+            const rope = try ops.rope.RopeTables(2).init(self.gpa, .{
+                .{ .head_dim = cfg.head_dim_global, .theta = cfg.rope_theta, .freq_factors = self.lm.rope_freqs },
+                .{ .head_dim = cfg.head_dim_local, .theta = cfg.rope_theta_local },
+            }, initial);
+            s.host = .{ .cache = cache, .rope = rope };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const VulkanLM, s: *Seq) void {
+        s.kv.deinit(self.gpa, self.be);
+        if (s.host) |*h| {
+            h.cache.deinit(self.gpa);
+            h.rope.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty text sequence of `rows` rows that never grows (see
+    /// `gemma4_cuda`'s).
+    pub fn seqCreate(self: *VulkanLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        try self.growRope(rows);
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *VulkanLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(kvmod.PerLayerKvCache, &sp.cache, &h.cache);
+            std.mem.swap(ops.rope.RopeTables(2), &sp.rope, &h.rope);
+        } else std.debug.assert(s.host == null);
+    }
+
+    /// Free a sequence made by `seqCreate` once the device is done with it.
+    pub fn seqDestroy(self: *VulkanLM, s: *Seq) void {
+        self.be.waitIdle();
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const gemma4.Model, cap: kvmod.Capacity) !VulkanLM {
         const cfg = lm.cfg;
         var self: VulkanLM = init_defaults.of(VulkanLM);
@@ -147,16 +215,8 @@ pub const VulkanLM = struct {
         self.lm = lm;
         self.cfg = cfg;
         self.gpa = gpa;
-        self.capacity = @max(@min(cap.initial, cap.max), 1);
-        self.initial_capacity = self.capacity;
-        self.max_capacity = cap.max;
+        self.initial_capacity = @max(@min(cap.initial, cap.max), 1);
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
-        self.bidir_end = 0;
-        self.residual_pending = false;
-        self.boundary = null;
-        self.io = null;
-        self.split = null;
         ctx.weight_noise.setDepth(cfg.n_layers);
 
         const max_out = @max(cfg.vocab, @max(cfg.intermediate, cfg.maxQDim()));
@@ -175,9 +235,9 @@ pub const VulkanLM = struct {
         }
 
         self.rope_rows = 0;
-        self.freqs_global = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
-        self.freqs_local = self.freqs_global;
-        try self.growRope(self.capacity);
+        self.freqs_global = .none;
+        self.freqs_local = .none;
+        try self.growRope(self.initial_capacity);
         errdefer {
             ctx.tensorDestroy(&self.freqs_global);
             ctx.tensorDestroy(&self.freqs_local);
@@ -194,35 +254,40 @@ pub const VulkanLM = struct {
         errdefer gpa.free(self.suppress_pen);
         for (self.suppress_pen, lm.suppress_tokens) |*e, id| e.* = .{ .id = id, .count = 1 };
 
-        self.ring_rows = localRingText(cfg);
-        self.kv = try self.newKv(self.capacity, cap.kv_dtype);
-        errdefer self.kv.deinit(gpa, ctx);
+        var first = try self.seqAlloc(self.initial_capacity, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
+        }
         self.buf_rows = text_buf_rows;
         self.bufs = try Bufs.init(ctx, cfg, self.buf_rows);
         return self;
     }
 
-    /// A cache with every local layer a ring of `ring_rows` and the global layers at
+    /// A cache with every local layer a ring of `ring` rows and the global layers at
     /// `capacity` rows, each at its own width.
-    fn newKv(self: *const VulkanLM, capacity: usize, dtype: kvmod.KvDtype) !kv_gpu.Kv {
-        const cfg = self.cfg;
-        const dims = try cfg.kvDims(self.gpa);
-        defer self.gpa.free(dims);
-        const rings = try self.gpa.alloc(usize, cfg.n_layers);
-        defer self.gpa.free(rings);
-        for (rings, 0..) |*r, l| r.* = if (cfg.isGlobal(l)) 0 else self.ring_rows;
-        return kv_gpu.Kv.initDims(self.gpa, self.be, capacity, dims, dtype, rings);
-    }
-
-    /// The split's host cache in the device layout: local layers rings of `ring`.
-    fn hostShadowCacheAt(self: *const VulkanLM, ring: usize, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
+    fn newKv(self: *const VulkanLM, capacity: usize, ring: usize, dtype: kvmod.KvDtype) !kv_gpu.Kv {
         const cfg = self.cfg;
         const dims = try cfg.kvDims(self.gpa);
         defer self.gpa.free(dims);
         const rings = try self.gpa.alloc(usize, cfg.n_layers);
         defer self.gpa.free(rings);
         for (rings, 0..) |*r, l| r.* = if (cfg.isGlobal(l)) 0 else ring;
-        return kvmod.PerLayerKvCache.init(self.gpa, self.capacity, dims, rings, dtype);
+        return kv_gpu.Kv.initDims(self.gpa, self.be, capacity, dims, dtype, rings);
+    }
+
+    /// The split's host cache in the device layout at `rows` rows: local layers rings
+    /// of `ring`.
+    fn hostShadowCacheAt(self: *const VulkanLM, ring: usize, rows: usize, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
+        const cfg = self.cfg;
+        const dims = try cfg.kvDims(self.gpa);
+        defer self.gpa.free(dims);
+        const rings = try self.gpa.alloc(usize, cfg.n_layers);
+        defer self.gpa.free(rings);
+        for (rings, 0..) |*r, l| r.* = if (cfg.isGlobal(l)) 0 else ring;
+        return kvmod.PerLayerKvCache.init(self.gpa, rows, dims, rings, dtype);
     }
 
     fn uploadFreqs(ctx: *gpu.Context, gpa: std.mem.Allocator, rows: usize, head_dim: usize, theta: f64, factors: ?[]const f32) !Buf {
@@ -259,7 +324,9 @@ pub const VulkanLM = struct {
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.be;
         self.freeSplit();
-        self.kv.deinit(self.gpa, ctx);
+        var live: Seq = .{};
+        self.seqSwap(&live);
+        self.seqFree(&live);
         ctx.tensorDestroy(&self.freqs_global);
         ctx.tensorDestroy(&self.freqs_local);
         ctx.tensorDestroy(&self.ones);
@@ -344,21 +411,15 @@ pub const VulkanLM = struct {
 
     /// Re-create the KV at another element type, at the initial capacity, empty.
     pub fn reinitCache(self: *VulkanLM, dtype: kvmod.KvDtype) !void {
-        var kv = try self.newKv(self.initial_capacity, dtype);
+        var kv = try self.newKv(self.initial_capacity, self.ring_rows, dtype);
         errdefer kv.deinit(self.gpa, self.be);
         if (self.split) |*sp| {
             for (sp.on_gpu, 0..) |on, l| if (!on) kv.release(self.be, l);
-        }
-        const saved_cap = self.capacity;
-        self.capacity = self.initial_capacity;
-        if (self.split) |*sp| {
-            const cache = self.hostShadowCacheAt(self.ring_rows, dtype) catch |err| {
-                self.capacity = saved_cap;
-                return err;
-            };
+            const cache = try self.hostShadowCacheAt(self.ring_rows, self.initial_capacity, dtype);
             sp.cache.deinit(self.gpa);
             sp.cache = cache;
         }
+        self.capacity = self.initial_capacity;
         self.kv.deinit(self.gpa, self.be);
         self.kv = kv;
         self.kv_dtype = dtype;
@@ -538,7 +599,7 @@ pub const VulkanLM = struct {
         var new_cache: ?kvmod.PerLayerKvCache = null;
         errdefer if (new_cache) |*c| c.deinit(self.gpa);
         if (self.split) |*sp| {
-            new_cache = try self.hostShadowCacheAt(new_ring, self.kv_dtype);
+            new_cache = try self.hostShadowCacheAt(new_ring, self.capacity, self.kv_dtype);
             new_cache.?.len = self.len;
             for (0..cfg.n_layers) |l| {
                 if (sp.on_gpu[l]) continue;
@@ -817,7 +878,7 @@ pub const VulkanLM = struct {
         const on_gpu = try gpa.alloc(bool, cfg.n_layers);
         errdefer gpa.free(on_gpu);
         @memset(on_gpu, true);
-        var cache = try self.hostShadowCacheAt(self.ring_rows, self.kv_dtype);
+        var cache = try self.hostShadowCacheAt(self.ring_rows, self.capacity, self.kv_dtype);
         errdefer cache.deinit(gpa);
         cache.len = self.len;
         var scratch = try gemma4.Scratch.init(gpa, cfg.maxBatch(), cfg);
@@ -897,7 +958,7 @@ pub const VulkanLM = struct {
     /// and re-arm the dynamic offload.
     pub fn resetResidency(self: *VulkanLM, budget: u64) !void {
         self.freeSplit();
-        const kv = try self.newKv(self.initial_capacity, self.kv_dtype);
+        const kv = try self.newKv(self.initial_capacity, self.ring_rows, self.kv_dtype);
         self.kv.deinit(self.gpa, self.be);
         self.kv = kv;
         self.capacity = self.initial_capacity;

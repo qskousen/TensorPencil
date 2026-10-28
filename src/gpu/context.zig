@@ -1530,6 +1530,9 @@ pub const DeviceBuffer = struct {
     /// of a dtype-generic kernel (`eltAt`). Views keep it, and so does a regrow.
     dt: Dt = .f32,
 
+    /// No buffer, what `tensorDestroy` leaves; destroying it again is a no-op.
+    pub const none: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+
     /// The same memory read as `dt`.
     pub fn as(self: DeviceBuffer, dt: Dt) DeviceBuffer {
         var v = self;
@@ -3376,6 +3379,12 @@ pub const Context = struct {
 
     /// Central device-buffer free, keeps `device_used` honest. All
     /// DeviceBuffer teardown must route through here.
+    /// Wait until the device has finished everything submitted, so a buffer it may
+    /// still be reading can be destroyed.
+    pub fn waitIdle(self: *Context) void {
+        _ = self.d.DeviceWaitIdle(self.device);
+    }
+
     fn freeDeviceBuffer(self: *Context, db: DeviceBuffer) void {
         self.d.DestroyBuffer(self.device, db.buf, null);
         self.d.FreeMemory(self.device, db.mem, null);
@@ -3721,7 +3730,7 @@ pub const Context = struct {
             // old buffer; submit them before destroying it.
             if (self.batching) try self.flushBatch();
             self.freeDeviceBuffer(db.*);
-            db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+            db.* = .none;
         }
         // Grow with slack to avoid realloc churn, but don't power-of-two
         // round large buffers: a 722 MB activation plane would jump to
@@ -3754,7 +3763,7 @@ pub const Context = struct {
         if (db.buf == .null_handle) return;
         std.debug.assert(db.off == 0 and db.mem != .null_handle);
         self.freeDeviceBuffer(db.*);
-        db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        db.* = .none;
     }
 
     pub fn tensorUpload(self: *Context, db: DeviceBuffer, bytes: []const u8) Error!void {

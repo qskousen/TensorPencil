@@ -560,7 +560,7 @@ fn convLora(be: *Backend, sess: *Session, ws: *Workspace, dst: *Buf, src: *const
     };
     const n = oh * ow;
     for (hits) |hit| {
-        const strength = stack.files.items[hit.file].strength;
+        const strength = stack.strengthOf(hit.file);
         if (strength == 0) continue;
         const d = hit.target.dora orelse continue;
         const ratio = try lora_cuda.hostVec(be, d.ratio);
@@ -580,7 +580,7 @@ fn convLora(be: *Backend, sess: *Session, ws: *Workspace, dst: *Buf, src: *const
     }
     if (cv.k == 1) return lin_cuda.sidecarDense(be, stack, dst.*, src.*, h * w, cw);
     for (hits) |hit| {
-        const strength = stack.files.items[hit.file].strength;
+        const strength = stack.strengthOf(hit.file);
         if (strength == 0) continue;
         const t = hit.target;
         for (t.factors) |f| {

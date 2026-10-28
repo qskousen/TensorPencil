@@ -19,6 +19,9 @@ pub const Kv = struct {
     /// Each layer's elements per row: kv heads times head dim.
     dims: []usize,
 
+    /// No layers; `deinit` takes it.
+    pub const empty: Kv = .{ .k = &.{}, .v = &.{}, .ring = &.{}, .dtype = .f32, .dims = &.{} };
+
     /// Device bytes for `layers` linear layers of `capacity` rows.
     pub fn windowBytes(layers: usize, capacity: usize, dim: usize, dtype: kvmod.KvDtype) usize {
         return 2 * layers * dtype.sizeBytes(capacity * dim);

@@ -20,6 +20,7 @@ const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const residency = @import("tp_runtime").residency;
 const bnd = @import("tp_runtime").boundary;
+const seqmod = @import("tp_runtime").seq;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -111,12 +112,12 @@ pub const CudaLM = struct {
 
     bufs: Bufs,
     /// Per-attention-slot KV caches, [capacity][kvDim] f32 (growable).
-    k_cache: []Growable,
-    v_cache: []Growable,
+    k_cache: []Growable = &.{},
+    v_cache: []Growable = &.{},
     /// [n_lin][channels][kernel-1] rolling conv tails.
-    conv_state: Buf,
+    conv_state: Buf = .{},
     /// [n_lin][heads][d][d] delta-rule states.
-    ssm_state: Buf,
+    ssm_state: Buf = .{},
     freqs_d: Buf,
     sin_off: usize,
     /// Per-step (t, h, w) M-RoPE position triple, uploaded before each token.
@@ -201,6 +202,97 @@ pub const CudaLM = struct {
         budget: u64 = 0,
     };
 
+    /// One sequence's context (see `tp_runtime.seq`). `host` is the split's
+    /// `state` and `freqs`, present exactly when a split is armed.
+    pub const Seq = struct {
+        capacity: usize = 0,
+        max_capacity: usize = 0,
+        len: usize = 0,
+        pos_next: usize = 0,
+        k_cache: []Growable = &.{},
+        v_cache: []Growable = &.{},
+        conv_state: Buf = .{},
+        ssm_state: Buf = .{},
+        graph_exec: cuda.cu.CUgraphExec = null,
+        decode_warm: bool = false,
+        host: ?Host = null,
+
+        pub const Host = struct { state: qwen35.State, freqs: ops.rope.Freqs };
+    };
+
+    /// An empty sequence for the current layer placement: device KV for the
+    /// device attention layers, zeroed recurrent state, and the split's host
+    /// side when one is armed.
+    fn seqAlloc(self: *const CudaLM, initial: usize, max: usize) !Seq {
+        const be = self.be;
+        const cfg = self.cfg;
+        const gpa = self.gpa;
+        const kdt = self.kv_dtype;
+        var s: Seq = .{ .capacity = initial, .max_capacity = max };
+        errdefer self.seqFree(&s);
+        s.k_cache = try gpa.alloc(Growable, cfg.nAttnLayers());
+        @memset(s.k_cache, .{});
+        s.v_cache = try gpa.alloc(Growable, cfg.nAttnLayers());
+        @memset(s.v_cache, .{});
+        for (0..cfg.n_layers) |l| {
+            if (cfg.isRecurrent(l)) continue;
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            const slot = l / cfg.full_attn_interval;
+            s.k_cache[slot] = try be.growableCreate(kdt.sizeBytes(initial * cfg.kvDim()), kdt.sizeBytes(max * cfg.kvDim()));
+            s.v_cache[slot] = try be.growableCreate(kdt.sizeBytes(initial * cfg.kvDim()), kdt.sizeBytes(max * cfg.kvDim()));
+        }
+        const n_lin = cfg.n_layers - cfg.nAttnLayers();
+        const conv_bytes = n_lin * cfg.convChannels() * (cfg.conv_kernel - 1) * 4;
+        const ssm_bytes = n_lin * cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim * 4;
+        s.conv_state = try be.tensorCreate(conv_bytes);
+        s.ssm_state = try be.tensorCreate(ssm_bytes);
+        try zeroBuffer(be, gpa, s.conv_state, conv_bytes);
+        try zeroBuffer(be, gpa, s.ssm_state, ssm_bytes);
+        if (self.split != null) {
+            var state = try qwen35.State.init(gpa, cfg, initial, kdt);
+            errdefer state.deinit(gpa);
+            s.host = .{ .state = state, .freqs = try ops.rope.rotateHalfFreqs(gpa, initial, cfg.rope_dim, cfg.rope_theta) };
+        }
+        return s;
+    }
+
+    fn seqFree(self: *const CudaLM, s: *Seq) void {
+        const be = self.be;
+        if (s.graph_exec != null) be.graphDestroy(s.graph_exec);
+        for (s.k_cache) |*b| be.growableDestroy(b);
+        for (s.v_cache) |*b| be.growableDestroy(b);
+        self.gpa.free(s.k_cache);
+        self.gpa.free(s.v_cache);
+        be.tensorDestroy(&s.conv_state);
+        be.tensorDestroy(&s.ssm_state);
+        if (s.host) |*h| {
+            h.state.deinit(self.gpa);
+            h.freqs.deinit(self.gpa);
+        }
+        s.* = .{};
+    }
+
+    /// A second, empty sequence of `rows` committed rows that never grows, so
+    /// running it can never ask the dynamic split to migrate a layer.
+    pub fn seqCreate(self: *CudaLM, rows: usize) !Seq {
+        if (rows > self.max_capacity) return error.ContextFull;
+        return self.seqAlloc(rows, rows);
+    }
+
+    /// Exchange the live sequence with `s`.
+    pub fn seqSwap(self: *CudaLM, s: *Seq) void {
+        seqmod.swapShared(Seq, self, s);
+        if (self.split) |*sp| {
+            const h = &s.host.?;
+            std.mem.swap(qwen35.State, &sp.state, &h.state);
+            std.mem.swap(ops.rope.Freqs, &sp.freqs, &h.freqs);
+        } else std.debug.assert(s.host == null);
+    }
+
+    pub fn seqDestroy(self: *CudaLM, s: *Seq) void {
+        self.seqFree(s);
+    }
+
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, cap: kvmod.Capacity) !CudaLM {
         return initUse(gpa, be, lm, cap, lin_cuda.Use.llm(prefill_chunk));
     }
@@ -221,19 +313,8 @@ pub const CudaLM = struct {
         self.gpa = gpa;
         self.cfg = cfg;
         be.weight_noise.setDepth(cfg.n_layers);
-        self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
-        self.max_capacity = cap.max;
         self.kv_dtype = cap.kv_dtype;
-        self.len = 0;
-        self.pos_next = 0;
-        self.layer_dump = null;
-        self.op_dump = null;
-        self.op_dump_row = 0;
-        self.graph_exec = null;
-        self.split = null;
-        self.io = null; // field defaults do not apply to `undefined`-built structs
-        self.decode_warm = false;
         // The graph path needs a device-side embedding gather kernel.
         self.graph_ok = graphOkFor(lm.embed.dtype);
 
@@ -255,22 +336,15 @@ pub const CudaLM = struct {
 
         self.bufs = try Bufs.init(be, cfg);
 
-        const n_attn = cfg.nAttnLayers();
-        const kdt = cap.kv_dtype;
-        self.k_cache = try alloc.alloc(Growable, n_attn);
-        self.v_cache = try alloc.alloc(Growable, n_attn);
-        for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try be.growableCreate(kdt.sizeBytes(cap.initial * cfg.kvDim()), kdt.sizeBytes(cap.max * cfg.kvDim()));
-            vb.* = try be.growableCreate(kdt.sizeBytes(cap.initial * cfg.kvDim()), kdt.sizeBytes(cap.max * cfg.kvDim()));
+        var first = try self.seqAlloc(cap.initial, cap.max);
+        self.seqSwap(&first);
+        errdefer {
+            var live: Seq = .{};
+            self.seqSwap(&live);
+            self.seqFree(&live);
         }
 
-        const n_lin = cfg.n_layers - n_attn;
-        const conv_bytes = n_lin * cfg.convChannels() * (cfg.conv_kernel - 1) * 4;
-        const ssm_bytes = n_lin * cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim * 4;
-        self.conv_state = try be.tensorCreate(conv_bytes);
-        self.ssm_state = try be.tensorCreate(ssm_bytes);
-        try zeroBuffer(be, gpa, self.conv_state, conv_bytes);
-        try zeroBuffer(be, gpa, self.ssm_state, ssm_bytes);
+        const n_lin = cfg.n_layers - cfg.nAttnLayers();
 
         // Concatenated [a | dt_bias] per linear layer for gdn_gates.
         self.a_dt = try alloc.alloc([]f32, n_lin);
@@ -368,19 +442,16 @@ pub const CudaLM = struct {
 
     pub fn deinit(self: *CudaLM) void {
         const be = self.be;
-        if (self.graph_exec != null) be.graphDestroy(self.graph_exec);
-        for (self.k_cache) |*b| be.growableDestroy(b);
-        for (self.v_cache) |*b| be.growableDestroy(b);
-        be.tensorDestroy(&self.conv_state);
-        be.tensorDestroy(&self.ssm_state);
+        var live: Seq = .{};
+        if (self.split) |*sp| live.host = .{ .state = sp.state, .freqs = sp.freqs };
+        self.seqSwap(&live);
+        self.seqFree(&live);
         be.tensorDestroy(&self.freqs_d);
         be.tensorDestroy(&self.pos3_d);
         be.tensorDestroy(&self.pos3s_d);
         self.bufs.deinit(be);
         if (self.split) |*sp| {
-            sp.state.deinit(self.gpa);
             sp.scratch.deinit(self.gpa);
-            sp.freqs.deinit(self.gpa);
             self.gpa.free(sp.hx);
             self.gpa.free(sp.on_gpu);
             self.gpa.free(sp.order);

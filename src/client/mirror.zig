@@ -61,6 +61,19 @@ pub const Variant = struct {
     }
 };
 
+/// One answered `llm_complete`: `text` when it succeeded, `err` (an error
+/// name) when it did not.
+pub const Completed = struct {
+    ref: u64,
+    text: []u8 = "",
+    err: []u8 = "",
+
+    pub fn deinit(self: *Completed, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        gpa.free(self.err);
+    }
+};
+
 pub const Message = struct {
     role: wire.Role = .user,
     synthetic: bool = false,
@@ -321,6 +334,10 @@ pub const Mirror = struct {
     /// its own tool calls but queues none of them; the owner drains this and
     /// puts each through the same queue a user's render goes through.
     asked_for: std.ArrayList(Call) = .empty,
+    /// Finished `llm_complete`s, in arrival order, until the owner takes them.
+    /// Kept across `clear`: an answer that arrived is still the answer. One the
+    /// host never answered (it restarted) is the owner's to give up on, by `ref`.
+    completed: std.ArrayList(Completed) = .empty,
     scanning: bool = false,
     scan_report: catalog.ScanReport = .{},
 
@@ -332,6 +349,8 @@ pub const Mirror = struct {
         self.clear();
         self.dropCalls();
         self.asked_for.deinit(self.gpa);
+        for (self.completed.items) |*c| c.deinit(self.gpa);
+        self.completed.deinit(self.gpa);
         self.messages.deinit(self.gpa);
         self.images.deinit(self.gpa);
         self.catalog.deinit();
@@ -362,6 +381,14 @@ pub const Mirror = struct {
         out.clearRetainingCapacity();
         out.appendSlice(self.gpa, self.asked_for.items) catch return;
         self.asked_for.clearRetainingCapacity();
+    }
+
+    /// Take the completions that finished since the last call. The caller owns
+    /// them and frees each.
+    pub fn takeCompleted(self: *Mirror, out: *std.ArrayList(Completed)) void {
+        out.clearRetainingCapacity();
+        out.appendSlice(self.gpa, self.completed.items) catch return;
+        self.completed.clearRetainingCapacity();
     }
 
     /// Drop what the model asked for and nobody placed: the conversation it
@@ -663,6 +690,15 @@ pub const Mirror = struct {
                     var tmp: Call = .{ .msg = c.msg, .variant = c.variant, .index = c.index, .req = owned };
                     tmp.deinit(gpa);
                 };
+            },
+            .llm_completion => |c| {
+                var done: Completed = .{ .ref = c.ref };
+                done.text = gpa.dupe(u8, c.text) catch return;
+                done.err = gpa.dupe(u8, c.err) catch {
+                    done.deinit(gpa);
+                    return;
+                };
+                self.completed.append(gpa, done) catch done.deinit(gpa);
             },
             .act_derived => |d| {
                 self.act_busy = false;

@@ -744,7 +744,8 @@ pub fn run(init: std.process.Init) !void {
     // Restore the saved position / maximized state (size is already set above).
     applyWindowGeom(back.window, g_config.win_w, g_config.win_h, g_config.win_x, g_config.win_y, g_config.win_max);
 
-    var win = try dvui.Window.init(@src(), gpa, back.backend(), .{});
+    var open = true;
+    var win = try dvui.Window.init(@src(), gpa, back.backend(), .{ .open_flag = &open });
     defer win.deinit();
 
     // Register the bundled broad-coverage font in a bootstrap frame (addFont /
@@ -848,14 +849,8 @@ pub fn run(init: std.process.Init) !void {
         _ = SDLBackend.c.SDL_SetRenderDrawColor(back.renderer, 0, 0, 0, 255);
         _ = SDLBackend.c.SDL_RenderClear(back.renderer);
         frame();
-        var res: dvui.App.Result = .ok;
-        for (dvui.events()) |*e| {
-            if (e.handled) continue;
-            if (e.evt == .window and e.evt.window.action == .close) res = .close;
-            if (e.evt == .app and e.evt.app.action == .quit) res = .close;
-        }
         var end_micros = try win.end(.{});
-        if (res != .ok) break :main_loop;
+        if (!open) break :main_loop;
 
         // A clicked image (chat transcript or studio gallery) opens/refocuses
         // the viewer, which navigates the engine's unified image history.
@@ -895,9 +890,6 @@ pub fn run(init: std.process.Init) !void {
             _ = SDLBackend.c.SDL_SetRenderDrawColor(v.back.renderer, 0, 0, 0, 255);
             _ = SDLBackend.c.SDL_RenderClear(v.back.renderer);
             v.render();
-            for (dvui.events()) |*e| {
-                if (!e.handled and e.evt == .window and e.evt.window.action == .close) v.open = false;
-            }
             const v_end = try v.win.end(.{});
             if (!v.shown) {
                 v.shown = true;
@@ -1211,6 +1203,8 @@ fn frame() void {
 /// place, and Library is where a finished one lives whichever tab made it.
 fn studioBody() void {
     recordStudioPrompt();
+    rememberStudioSettings();
+    persistExpandChoices();
     renderPromptSidebar();
 
     {
@@ -1233,6 +1227,13 @@ fn studioBody() void {
             .settings = openSettings,
             .save_defaults = saveStudioDefaults,
             .cancel = onCancelImage,
+            .expand = onExpand,
+            .llm = .{
+                .configured = g_config.llm_model.opt() != null,
+                .thinking = g_hosts.chatMirror().state.thinking,
+                .effort = g_hosts.chatMirror().state.reasoning_effort,
+            },
+            .last_expansion = g_hosts.last_expansion,
         });
     }
 
@@ -1398,6 +1399,7 @@ fn railTitle(buf: []u8, im: *const mirror.Image) []const u8 {
 /// Why a waiting render has not gone out, in the rail's few words.
 fn waitNote(buf: []u8, a: *const hosts.Hosts.Asked) []const u8 {
     return switch (g_hosts.waitReason(&g_config, a)) {
+        .writing => "writing prompt",
         .ready => "",
         .behind => |host| if (host.len == 0) "" else std.mem.print(buf, "waiting for {s}", .{host}) catch "",
         .nowhere => "no host can run this yet",
@@ -1725,6 +1727,31 @@ fn recordStudioPrompt() void {
     const rec = image_view.recorded_prompt orelse return;
     image_view.recorded_prompt = null;
     _ = g_prompts.record(g_gpa, g_io, nowMs(), rec.prompt, rec.negative);
+}
+
+fn onExpand(e: hosts.Hosts.Expand) void {
+    _ = g_hosts.expand(&g_config, e);
+}
+
+/// Expand mode's choices are the studio's own, like window geometry: kept in
+/// both copies, so a later Settings -> Cancel does not drop them.
+fn persistExpandChoices() void {
+    if (!image_view.expand_choice_moved) return;
+    image_view.expand_choice_moved = false;
+    inline for (.{ "studio_expand", "studio_expand_shared", "studio_expander", "studio_expand_reasoning", "studio_expand_effort" }) |name| {
+        @field(g_config_baseline, name) = @field(g_config, name);
+    }
+    g_config_baseline.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+}
+
+/// Keep what the studio just generated with as that checkpoint's settings, in both
+/// copies so a later Settings -> Cancel does not drop it.
+fn rememberStudioSettings() void {
+    const ms = image_view.remembered orelse return;
+    image_view.remembered = null;
+    g_config.rememberModelSettings(ms);
+    g_config_baseline.rememberModelSettings(ms);
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
 }
 
 /// Point the store at `<config dir>/conversations` and scan it.
@@ -2260,6 +2287,8 @@ fn renderNoModel() void {
             var msg: [320]u8 = undefined;
             const text = if (std.mem.eql(u8, err, "MmprojNotVisionTower"))
                 "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
+            else if (std.mem.eql(u8, err, "ChatModelNotGguf"))
+                "The chat model file is not a GGUF file. Chat runs GGUF models (the format llama.cpp uses); a .safetensors file is usually an image model or a text encoder for one.\n\nIn Settings, pick a .gguf chat model, or add the folder that holds yours."
             else
                 (std.mem.print(&msg, "Failed to load the model: {s}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
             fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = .{ .color = style.C.text } });
@@ -3262,26 +3291,11 @@ fn renderInput() void {
 
         // The reasoning toggle is a quick setting too: it changes what the next
         // turn does, which is what this row is for. Only for a family that can.
-        const can_reason = st.thinking;
-        if (can_reason) {
-            const on = g_config.reasoning;
-            if (style.chip(@src(), if (on) "thinking: on" else "thinking: off", .{
-                .id_extra = 2,
-                .margin_x = 8,
-                .fill = if (on) style.over(style.C.chip, style.C.blue, 0.16) else style.C.chip,
-                .text = if (on) style.C.blue else style.C.text_dim,
-            })) toggleReasoning();
-
-            const has_effort = st.reasoning_effort;
-            if (on and has_effort) {
-                const label = switch (g_config.reasoning_effort) {
-                    .high => "effort: high",
-                    .medium => "effort: medium",
-                    .low => "effort: low",
-                };
-                if (style.chip(@src(), label, .{ .id_extra = 3, .margin_x = 8 })) cycleReasoningEffort();
-            }
-        }
+        if (st.thinking) switch (bubbles.reasoningChips(@src(), g_config.reasoning, g_config.reasoning_effort, st.reasoning_effort, 8)) {
+            .none => {},
+            .toggle => toggleReasoning(),
+            .cycle_effort => cycleReasoningEffort(),
+        };
 
         var link: dvui.ButtonWidget = undefined;
         link.init(@src(), .{}, .{
