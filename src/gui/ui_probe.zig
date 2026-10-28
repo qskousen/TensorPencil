@@ -1260,8 +1260,8 @@ pub fn main(init: std.process.Init) !void {
     // The flag may arrive after `--settings`, so the swap happens once the whole
     // command line has been read.
     if (settings_mode and lora_mode) cannedLoraSelection(&probe_cfg);
-    // `--settings --no-chat-models`: folders with no GGUF chat model, and a
-    // diffusion text encoder picked through "Other file".
+    // `--settings --no-chat-models`: folders with no chat model, and a file
+    // picked from outside them through "Other file".
     if (settings_mode and no_chat) {
         for (probe_models.cat.entries) |*e| e.llm = null;
         selection.selectLlm(&probe_cfg, &probe_models.cat, "/elsewhere/qwen3.5_9b_uncensored_int8_convrot.safetensors");

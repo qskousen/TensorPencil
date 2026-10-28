@@ -149,6 +149,26 @@ const bnd = tp.models.boundary;
 const pipeline = tp.pipeline;
 const Tokenizer = tp.tokenizer.Tokenizer;
 const Gguf = tp.Gguf;
+const Container = tp.Container;
+const model_file = tp.llm.model_file;
+
+/// Qwen3.5 from either container: llama.cpp's names in a GGUF, HF's in safetensors.
+fn loadQwen35(arena: std.mem.Allocator, file: *const Container) !qwen35.Model {
+    return switch (file.*) {
+        .gguf => |*g| qwen35.Model.load(arena, g),
+        .safetensors => qwen35.Model.loadHf(arena, file.store()),
+    };
+}
+
+/// The GGUF behind an architecture that only loads from one. `model_file.arch`
+/// names no other architecture for a safetensors file, so this is unreachable
+/// from `Session.init`; it errors rather than asserts so a new arm cannot crash.
+fn ggufOf(file: *const Container) !*const Gguf {
+    return switch (file.*) {
+        .gguf => |*g| g,
+        .safetensors => error.NotAChatModel,
+    };
+}
 
 /// Upper bound on the auto-sized KV window when the caller passes no explicit
 /// `max_context` (mirrors the tp-llm CLI). A model can advertise a very large
@@ -647,7 +667,7 @@ pub const Session = struct {
     model_name: []const u8 = "",
 
     // Load-once state (backed by the caller's arena; must outlive the session).
-    gguf: Gguf,
+    file: Container,
     arch: Arch,
     tok: Tokenizer,
     dev: device.Device,
@@ -886,14 +906,11 @@ pub const Session = struct {
         const base = std.Io.Dir.path.basename(cfg.model_path);
         self.model_name = try arena.dupe(u8, base[0 .. std.mem.findScalarLast(u8, base, '.') orelse base.len]);
 
-        self.gguf = Gguf.open(arena, io, cfg.model_path) catch |err| return switch (err) {
-            error.InvalidMagic => error.ChatModelNotGguf,
-            else => err,
-        };
-        errdefer self.gguf.deinit();
-        const arch_str = self.gguf.getStr("general.architecture") orelse "";
+        self.file = try Container.open(arena, io, cfg.model_path);
+        errdefer self.file.deinit();
+        const arch_str = model_file.arch(&self.file) orelse return error.NotAChatModel;
 
-        self.tok = try Tokenizer.initFromGguf(arena, &self.gguf);
+        self.tok = try model_file.tokenizer(arena, &self.file);
         errdefer self.tok.deinit();
         chat.applyTokenizer(&self.tok);
 
@@ -942,7 +959,7 @@ pub const Session = struct {
         // model instead of a fixed 16384. CUDA grows KV lazily, so this bounds
         // the max without paying the VRAM up front.
         const max_context = cfg.max_context orelse
-            @min(@as(usize, @intCast(self.gguf.contextLength() orelse default_trained_context)), auto_context_cap);
+            @min(model_file.trainedContext(&self.file) orelse default_trained_context, auto_context_cap);
 
         // Interactive session: grow from a small floor toward the full window.
         // The floor is `kv_cache.initial_context`, NOT a literal: this used to
@@ -971,35 +988,35 @@ pub const Session = struct {
         // per-encode and never stay resident under the LLM.
         if (self.dev == .vulkan) {
             if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
-                self.arch = .{ .qwen3_vk = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
+                self.arch = .{ .qwen3_vk = .{ .lm = try qwen3.CausalLM.load(arena, self.file.store()), .model = undefined } };
                 const a = &self.arch.qwen3_vk;
                 errdefer a.lm.deinit();
                 if (self.mmproj_gguf != null)
                     std.log.warn("mmproj configured, but this text-only model has no vision — disabled", .{});
                 a.model = try qwen3_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
             } else if (std.mem.eql(u8, arch_str, "qwen35")) {
-                self.arch = .{ .qwen35_vk = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
+                self.arch = .{ .qwen35_vk = .{ .lm = try loadQwen35(arena, &self.file), .model = undefined } };
                 const a = &self.arch.qwen35_vk;
                 errdefer a.lm.deinit();
                 if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
                 errdefer if (a.vit) |*v| v.deinit();
                 a.model = try qwen35_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
             } else if (std.mem.eql(u8, arch_str, "gemma3")) {
-                self.arch = .{ .gemma3_vk = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
+                self.arch = .{ .gemma3_vk = .{ .lm = try gemma3.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
                 const a = &self.arch.gemma3_vk;
                 errdefer a.lm.deinit();
                 if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
                 errdefer if (a.vit) |*v| v.deinit();
                 a.model = try gemma3_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
             } else if (std.mem.eql(u8, arch_str, "gemma4")) {
-                self.arch = .{ .gemma4_vk = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
+                self.arch = .{ .gemma4_vk = .{ .lm = try gemma4.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
                 const a = &self.arch.gemma4_vk;
                 errdefer a.lm.deinit();
                 try self.loadGemma4Vision(arena, a);
                 errdefer if (a.vit) |*v| v.deinit();
                 a.model = try gemma4_gpu.VulkanLM.init(gpa, self.dev.vulkan, &a.lm, cap);
             } else if (std.mem.eql(u8, arch_str, "k2-horizon")) {
-                self.arch = .{ .k2_horizon_vk = .{ .lm = try k2.Model.load(arena, &self.gguf), .model = undefined } };
+                self.arch = .{ .k2_horizon_vk = .{ .lm = try k2.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
                 const a = &self.arch.k2_horizon_vk;
                 errdefer a.lm.deinit();
                 if (self.mmproj_gguf != null)
@@ -1012,7 +1029,7 @@ pub const Session = struct {
         } else if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
             // The plain llama/Mistral family reuses the qwen3 stack (qwen3.zig
             // un-permutes q/k at load, skips QK-norm); qwen3_cuda runs both.
-            self.arch = .{ .qwen3 = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
+            self.arch = .{ .qwen3 = .{ .lm = try qwen3.CausalLM.load(arena, self.file.store()), .model = undefined } };
             const a = &self.arch.qwen3;
             errdefer a.lm.deinit();
             // qwen3 / llama here are text-only: no mmproj/vision tower.
@@ -1020,28 +1037,28 @@ pub const Session = struct {
                 std.log.warn("mmproj configured, but this text-only model has no vision — disabled", .{});
             a.model = try qwen3_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap, @min(512, cap.max));
         } else if (std.mem.eql(u8, arch_str, "qwen35")) {
-            self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
+            self.arch = .{ .qwen35 = .{ .lm = try loadQwen35(arena, &self.file), .model = undefined } };
             const a = &self.arch.qwen35;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try qwen35_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "k2-horizon")) {
-            self.arch = .{ .k2_horizon = .{ .lm = try k2.Model.load(arena, &self.gguf), .model = undefined } };
+            self.arch = .{ .k2_horizon = .{ .lm = try k2.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
             const a = &self.arch.k2_horizon;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf != null)
                 std.log.warn("mmproj configured, but K2 Horizon is text-only — disabled", .{});
             a.model = try k2_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma3")) {
-            self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
+            self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
             const a = &self.arch.gemma3;
             errdefer a.lm.deinit();
             if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma3_cuda.CudaLM.init(gpa, self.dev.cuda, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma4")) {
-            self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
+            self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, try ggufOf(&self.file)), .model = undefined } };
             const a = &self.arch.gemma4;
             errdefer a.lm.deinit();
             // Size the LLM's image-prefill scratch + LOCAL KV ring for the vision
@@ -1066,8 +1083,8 @@ pub const Session = struct {
         // Read weight bytes from the checkpoint FILE rather than faulting the
         // mapping (no-op unless read_mode is .pread). Registered BEFORE
         // warmWeights below, which is what actually pulls them in.
-        self.dev.useFileReads(&self.gguf);
-        if (self.mmproj_gguf) |*mg| self.dev.useFileReads(mg);
+        self.dev.useFileReads(tp.llm.session.containerReader(&self.file));
+        if (self.mmproj_gguf) |*mg| self.dev.useFileReads(tp.llm.session.ggufReader(mg));
 
         // Upload the weights NOW, while the UI is still showing "Loading...".
         // `Backend.cachedWeight` is lazy, so without this the one-time
@@ -1243,7 +1260,7 @@ pub const Session = struct {
         else if (cfg.qwen35_fixed_template and self.arch.family() == .qwen35)
             (chat_template.ChatTemplate.qwen35Fixed(arena) catch null)
         else
-            (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch |err| blk: {
+            (model_file.template(arena, &self.file) catch |err| blk: {
                 std.log.warn("chat template unusable ({t}); hand glue, no tool declarations", .{err});
                 break :blk null;
             });
@@ -1812,7 +1829,7 @@ pub const Session = struct {
         switch (self.arch) {
             inline else => |*a| a.lm.deinit(),
         }
-        self.gguf.deinit();
+        self.file.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -1854,7 +1871,7 @@ pub const Session = struct {
     /// the controls otherwise light up for a Qwen, or for a QAT Gemma 4 whose q4_0
     /// linears have no noised kernels, and silently do nothing.
     pub fn weightNoiseSupported(self: *const Session) bool {
-        return device.weightNoiseSupported(self.dev.backendKind(), &self.gguf);
+        return device.weightNoiseSupported(self.dev.backendKind(), &self.file);
     }
 
     /// Current context length in tokens (KV rows used).
@@ -3563,20 +3580,26 @@ test "Message variants: regenerate bookkeeping keeps older takes" {
 // A tool call is REPORTED, never rendered here: the client places it, so the
 // picture can be drawn on whichever host is free. Anything queued or recorded
 // on this side would pin it to the machine holding the chat.
-test "a chat model that is not GGUF fails with its own error, which the GUI explains" {
+test "a file with no chat model in it fails with the error the GUI explains" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "te.safetensors", .data = "\x10\x00\x00\x00\x00\x00\x00\x00{\"a\":1}         xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" });
+    // A valid safetensors file holding one unrelated tensor.
+    const header = "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var bytes: [8 + header.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], header.len, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    @memset(bytes[8 + header.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "vae.safetensors", .data = &bytes });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(io, &buf);
-    const path = try std.mem.print(buf[dir_len..], "/te.safetensors", .{});
+    const path = try std.mem.print(buf[dir_len..], "/vae.safetensors", .{});
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const noWake = struct {
         fn f() void {}
     }.f;
-    try std.testing.expectError(error.ChatModelNotGguf, Session.init(arena.allocator(), std.testing.allocator, io, noWake, .{ .model_path = buf[0 .. dir_len + path.len] }));
+    try std.testing.expectError(error.NotAChatModel, Session.init(arena.allocator(), std.testing.allocator, io, noWake, .{ .model_path = buf[0 .. dir_len + path.len] }));
 }
 
 test "an image tool call is parsed and nothing is queued for it" {

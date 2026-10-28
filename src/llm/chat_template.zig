@@ -230,6 +230,10 @@ pub const ChatTemplate = struct {
         return fromSource(gpa, qwen35_fixed_src);
     }
 
+    pub fn qwen3Embedded(gpa: std.mem.Allocator) !ChatTemplate {
+        return fromSource(gpa, jinja.qwen3_template);
+    }
+
     pub fn deinit(self: *ChatTemplate) void {
         self.tmpl.deinit();
     }

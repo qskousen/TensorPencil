@@ -210,6 +210,19 @@
   `tp-llm --reasoning-markers`): a fine-tune whose markers are in NEITHER
   `known_reasoning` nor the flag still falls back to the family guess, and tp-gui has
   no override field, so a GUI user cannot answer for such a model
+- safetensors chat models (`llm/model_file.zig`), what is left:
+  - vision: an HF Qwen3.5 file carries its own `model.visual.*` tower, which nothing reads;
+    only a separate mmproj GGUF gives it eyes.
+  - the embedding table stays resident at the file's width (bf16, 2 GB for Qwen3.5 9B
+    against 0.8 GB for the Q6_K GGUF's), though a decode step reads one row of it.
+  - the HF file's MTP layers (`mtp.*`) are unused.
+  - qwen3 is recognized only as a `qwen3.Config.detect` preset (theta is in no tensor), so
+    an 8B/14B/32B Qwen3 safetensors is not offered; qwen35 sizes are labelled only for the
+    two `model_file.sizeLabel` verified (9B, 27B).
+  - Vulkan's dense fp8 GEMV (`gemv_partial`, `WCode.f8`) still runs one k a pass; the int8
+    arm went from 131 to 67 us a linear at 8 k a pass. Unmeasured for fp8.
+  - `act_rot_direct` (17 us a call on the 3090, 12% of a Vulkan int8 decode) could compute
+    four outputs a thread from one read of x.
 - serve: the privacy hardening the canary suite does NOT cover: a `Content` type whose
   formatters print a length (so logging a prompt is a compile error rather than a review
   question), a `-Dprivacy-audit` build refusing `{any}` under `serve/`, and a runtime

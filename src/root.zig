@@ -58,6 +58,7 @@ pub const SafeTensors = safetensors.SafeTensors;
 pub const TensorView = safetensors.TensorView;
 pub const Gguf = gguf.Gguf;
 pub const WeightStore = weights.WeightStore;
+pub const Container = @import("tp_core").container.Container;
 
 test {
     _ = dtype;

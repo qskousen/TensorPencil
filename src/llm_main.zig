@@ -394,7 +394,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Container chosen by extension: .gguf or safetensors.
-    var st = try ModelFile.open(arena, io, path);
+    var st = try ModelFile.openNamed(arena, io, path);
     defer st.deinit();
 
     // Default context ceiling: the model's trained context length (growth
@@ -427,9 +427,7 @@ pub fn main(init: std.process.Init) !void {
     // Architecture dispatch: qwen35 (hybrid DeltaNet) has its own model and
     // steppers (cpu / zig-cuda / cuda), and no speculative decoding (the
     // recurrent state cannot roll back past rejected drafts).
-    if (st == .gguf and st.gguf.getStr("general.architecture") != null and
-        std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "qwen35"))
-    {
+    if (llm.model_file.arch(&st) != null and std.mem.eql(u8, llm.model_file.arch(&st).?, "qwen35")) {
         if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
             try stdout.writeAll("speculative decoding is not supported for qwen35 models (recurrent state cannot roll back)\n");
             try stdout.flush();
@@ -452,7 +450,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArgument;
             }
         }
-        return runQwen35(arena, gpa, io, &st.gguf, backend, vram_budget, cpu_split, dynamic_offload, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
+        return runQwen35(arena, gpa, io, &st, backend, vram_budget, cpu_split, dynamic_offload, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
     }
 
     if (st == .gguf and st.gguf.getStr("general.architecture") != null and
@@ -568,7 +566,7 @@ fn runQwen3(
     };
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
-    if (st.* == .gguf) setupChatTemplate(arena, &st.gguf, &tok, system);
+    setupFileChatTemplate(arena, st, &tok, system, null);
 
     // Draft model for speculative decoding (same tokenizer family; its own KV
     // cache and stepper). Implies spec decoding. The mapped checkpoint must
@@ -583,7 +581,7 @@ fn runQwen3(
             try stdout.flush();
             return error.InvalidArgument;
         }
-        draft_st = try ModelFile.open(arena, io, dp);
+        draft_st = try ModelFile.openNamed(arena, io, dp);
         draft_lm = try qwen3.CausalLM.load(arena, draft_st.?.store());
         if (opts.spec_k == 0) opts.spec_k = 4;
     }
@@ -648,7 +646,7 @@ fn runQwen3(
         vk_ctx = ctx;
         if (max_context_arg == null) {
             const free = ctx.liveVram();
-            const weight_est: u64 = if (st.mapping()) |m| m.len else 0;
+            const weight_est: u64 = if (st.store().mapping()) |m| m.len else 0;
             const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(lm.cfg, 1, opts.kv_dtype);
             const avail = free -| weight_est -| (2 << 30); // activations + freqs + margin
             const trained = @min(trainedContext(st), auto_context_cap);
@@ -677,7 +675,7 @@ fn runQwen3(
     defer if (be_cuda) |b| b.deinit();
     // Read weight bytes from the checkpoint FILE rather than faulting the
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
-    if (st.* == .gguf) llm.session.useFileReads(be_cuda, &st.gguf);
+    if (be_cuda) |be| be.ctx.addWeightReader(llm.session.containerReader(st));
 
     const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
     const driver: Qwen3Driver = .{
@@ -876,16 +874,22 @@ const Boundary = struct { q: usize, snap: []u8 };
 /// arena). No-op-safe: a model without a template leaves `active` null and the
 /// hand glue runs. `bos` is the decoded BOS string the template emits.
 fn setupChatTemplate(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8) void {
-    setupChatTemplateEx(arena, g, tok, system, null);
+    setupChatTemplateWith(arena, llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null, tok, system);
 }
 
-/// As `setupChatTemplate`, but `override_src` (when non-null) replaces the
-/// model's embedded template, used by the `--canonical-template` override.
-fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8, override_src: ?[]const u8) void {
-    llm.chat_template.active = if (override_src) |src|
+/// `setupChatTemplate` for either container: the file's own template, or the
+/// embedded one for a safetensors model's family. `override_src` (when non-null)
+/// replaces it, used by the `--canonical-template` override.
+fn setupFileChatTemplate(arena: std.mem.Allocator, file: *const ModelFile, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8, override_src: ?[]const u8) void {
+    const ct = if (override_src) |src|
         (llm.chat_template.ChatTemplate.fromSource(arena, src) catch null)
     else
-        (llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null);
+        (llm.model_file.template(arena, file) catch null);
+    setupChatTemplateWith(arena, ct, tok, system);
+}
+
+fn setupChatTemplateWith(arena: std.mem.Allocator, ct: ?llm.chat_template.ChatTemplate, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8) void {
+    llm.chat_template.active = ct;
     // What the model's own template says its thought markers are, which outranks the
     // per-family guess (see `chat.reasoning`).
     llm.chat.observeReasoning(if (llm.chat_template.active) |t| t.src else null);
@@ -1739,7 +1743,7 @@ fn runQwen35(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     io: Io,
-    g: *const TensorPencil.Gguf,
+    file: *const ModelFile,
     backend: BackendKind,
     vram_budget: u64,
     cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
@@ -1754,12 +1758,15 @@ fn runQwen35(
     stdout: *Io.Writer,
 ) !void {
     const qwen35 = TensorPencil.models.qwen35;
-    var lm = try qwen35.Model.load(arena, g);
+    var lm = switch (file.*) {
+        .gguf => |*g| try qwen35.Model.load(arena, g),
+        .safetensors => try qwen35.Model.loadHf(arena, file.store()),
+    };
     defer lm.deinit();
-    var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
+    var tok = try llm.model_file.tokenizer(arena, file);
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
-    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_template) llm.chat_template.ChatTemplate.qwen35_fixed_src else null);
+    setupFileChatTemplate(arena, file, &tok, system, if (g_canonical_template) llm.chat_template.ChatTemplate.qwen35_fixed_src else null);
 
     // Hybrid CPU/GPU layer split (--cpu-layers / --offload-grow): CUDA-only,
     // needs a budget as the VRAM ceiling, and text-only (the CPU path uses
@@ -1800,7 +1807,7 @@ fn runQwen35(
     if (be_cuda) |be| llm.session.configureCuda(be, profile);
     // Read weight bytes from the checkpoint FILE rather than faulting the
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
-    llm.session.useFileReads(be_cuda, g);
+    if (be_cuda) |be| be.ctx.addWeightReader(llm.session.containerReader(file));
     // Vulkan context up front: the LLM and a one-shot --image's tower run on it.
     const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
     defer if (vk_ctx) |c| c.deinit();
@@ -2271,7 +2278,11 @@ fn runGemma4(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma4);
-    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_template) llm.chat_template.ChatTemplate.gemma4_canonical_src else null);
+    const ct: ?llm.chat_template.ChatTemplate = if (g_canonical_template)
+        llm.chat_template.ChatTemplate.fromSource(arena, llm.chat_template.ChatTemplate.gemma4_canonical_src) catch null
+    else
+        llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null;
+    setupChatTemplateWith(arena, ct, &tok, system);
 
     // CUDA backend created up front so the vision embedder can encode
     // device-side (the LLM claims VRAM after). Null on cpu. A 0 budget pins the
@@ -2451,14 +2462,9 @@ fn runGemma4(
 /// limits a session; pass --max-context to raise it.
 const auto_context_cap: usize = 128 << 10;
 
-/// The model's trained context length (`<arch>.context_length`), when the
-/// container records one. Safetensors checkpoints carry no metadata, fall
-/// back to the native Qwen3 window.
+/// The model's trained context length, falling back to the native Qwen3 window.
 fn trainedContext(st: *const ModelFile) usize {
-    switch (st.*) {
-        .gguf => |*g| return @intCast(g.contextLength() orelse 32768),
-        .safetensors => return 32768,
-    }
+    return llm.model_file.trainedContext(st) orelse 32768;
 }
 
 /// KV-cache sizing for a session: the ceiling is the old fixed capacity
@@ -2477,45 +2483,8 @@ fn capacityPlan(opts: llm.engine.Options, prompt: ?[]const u8, n_prompt: usize, 
 
 const BackendKind = llm.session.BackendKind;
 
-/// A checkpoint opened from disk, container chosen by file extension
-/// (".gguf" or safetensors otherwise).
-const ModelFile = union(enum) {
-    safetensors: TensorPencil.SafeTensors,
-    gguf: TensorPencil.Gguf,
-
-    fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
-        // A run names a model, an mmproj and sometimes a draft model, so a bare
-        // `error.FileNotFound` does not say which one was wrong.
-        return openUnnamed(gpa, io, path) catch |err| {
-            std.log.err("cannot open {s}: {t}", .{ path, err });
-            return err;
-        };
-    }
-
-    fn openUnnamed(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
-        if (std.ascii.endsWithIgnoreCase(path, ".gguf"))
-            return .{ .gguf = try TensorPencil.Gguf.open(gpa, io, path) };
-        return .{ .safetensors = try TensorPencil.SafeTensors.open(gpa, io, path) };
-    }
-
-    fn store(self: *const ModelFile) TensorPencil.WeightStore {
-        return switch (self.*) {
-            .safetensors => |*s| .{ .safetensors = s },
-            .gguf => |*g| .{ .gguf = g },
-        };
-    }
-
-    fn mapping(self: *const ModelFile) ?[]align(std.heap.page_size_min) const u8 {
-        return self.store().mapping();
-    }
-
-    fn deinit(self: *ModelFile) void {
-        switch (self.*) {
-            .safetensors => |*s| s.deinit(),
-            .gguf => |*g| g.deinit(),
-        }
-    }
-};
+/// A checkpoint opened from disk, either format, picked by its magic.
+const ModelFile = TensorPencil.Container;
 
 fn nextArg(args: []const [:0]const u8, i: *usize) ![]const u8 {
     i.* += 1;

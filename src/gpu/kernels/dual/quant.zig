@@ -1088,6 +1088,100 @@ inline fn intRowRot(e: Env, comptime bits: u32, comptime out: RowOut) void {
     }
 }
 
+/// f32 activation rows in a, rotated into an integer convrot weight's basis (groups
+/// of 256) and written to b, so `gemvI8Row` can read the weight as stored. The
+/// Hadamard is symmetric, so this is the weight-side rotation `intRowRot` applies to
+/// a row. u0 = threads = elements / 16; same lane layout and PTX-only shuffles.
+pub inline fn actRotF32(e: Env) void {
+    if (k.is_ptx) {
+        const t = e.gid();
+        const live = t < e.u(0);
+        const tt = if (live) t else 0;
+        var v: [16]f32 = undefined;
+        inline for (0..4) |wi| {
+            const q = e.ld4(.a, tt * 16 + @as(u32, wi) * 4);
+            inline for (0..4) |j| v[wi * 4 + j] = q[j];
+        }
+        rot.radix16(&v);
+        inline for (.{ 1, 4 }) |m| {
+            inline for (0..16) |j| {
+                const x1 = k.sgXor(v[j], m);
+                const x2 = k.sgXor(v[j], 2 * m);
+                const x3 = k.sgXor(v[j], 3 * m);
+                v[j] = rot.bfly4(v[j], x1, x2, x3);
+            }
+        }
+        if (!live) return;
+        inline for (0..16) |j| e.st(.b, t * 16 + @as(u32, j), v[j] * (1.0 / 16.0));
+    }
+}
+
+/// `actRotF32` with no cross-lane exchange, so it runs on both backends: one thread an
+/// output element, summing its whole group. `radix16`'s butterfly negates input j of
+/// output i once for every base-4 digit where i ^ j is 3, so the sign is that count's
+/// parity. Reads the group 256 times where the butterfly reads it once, which a
+/// one-row decode can afford and `rotate_fwht`'s one thread a group cannot.
+/// a = x, b = the rotated rows; u0 = elements, a multiple of 256.
+pub inline fn actRotDirect(e: Env) void {
+    const i = k.elem(e) orelse return;
+    const base = i & ~@as(u32, 255);
+    const r = i & 255;
+    var acc: [4]f32 = @splat(0);
+    var j: u32 = 0;
+    while (j < 256) : (j += 4) {
+        inline for (0..4) |tt| {
+            const t: u32 = tt;
+            const v = r ^ (j + t);
+            const m = v & (v >> 1) & 0x55;
+            const odd = (m ^ (m >> 2) ^ (m >> 4) ^ (m >> 6)) & 1;
+            const x = e.ld(.a, base + j + t);
+            acc[tt] += if (odd != 0) -x else x;
+        }
+    }
+    e.st(.b, i, ((acc[0] + acc[1]) + (acc[2] + acc[3])) * (1.0 / 16.0));
+}
+
+/// An int8 convrot weight's GEMV: `y[u2 + row] = scale[row] * dot(Q[row], x)` with the
+/// int8 rows in a, the activation in b (rotated by `actRotF32` when the weight is),
+/// y in c and the per-row scales in d. u0 = rows, u1 = cols (a multiple of 16). Two
+/// rows a subgroup, as `gemvQ2`, so each lane loads its slice of x once for both.
+pub inline fn gemvI8Row(e: Env) void {
+    const rows = e.u(0);
+    const cols = e.u(1);
+    const units = cols / 16;
+    const row_words = cols / 4;
+    const lane = e.sgLane();
+    const lanes = e.sgSize();
+    var row = 2 * k.sgGlobal(e);
+    const step = 2 * k.sgTotal(e);
+    while (row < rows) : (row += step) {
+        const pair = row + 1 < rows;
+        const base0 = row * row_words;
+        const base1 = base0 + row_words;
+        var acc0: f32 = 0;
+        var acc1: f32 = 0;
+        var g = lane;
+        while (g < units) : (g += lanes) {
+            var xs: [4][4]f32 = undefined;
+            inline for (0..4) |wi| xs[wi] = e.ld4(.b, g * 16 + @as(u32, wi) * 4);
+            inline for (0..4) |wi| {
+                const w0 = e.ldW(.a, base0 + g * 4 + @as(u32, wi));
+                inline for (0..4) |bi| acc0 += i8f(w0 >> @intCast(bi * 8)) * xs[wi][bi];
+            }
+            if (pair) inline for (0..4) |wi| {
+                const w1 = e.ldW(.a, base1 + g * 4 + @as(u32, wi));
+                inline for (0..4) |bi| acc1 += i8f(w1 >> @intCast(bi * 8)) * xs[wi][bi];
+            };
+        }
+        const t0 = k.sgSum(acc0);
+        if (lane == 0) e.st(.c, e.u(2) + row, t0 * e.ld(.d, row));
+        if (pair) {
+            const t1 = k.sgSum(acc1);
+            if (lane == 0) e.st(.c, e.u(2) + row + 1, t1 * e.ld(.d, row + 1));
+        }
+    }
+}
+
 pub inline fn i8RowRotF32(e: Env) void {
     intRowRot(e, 8, .f32);
 }

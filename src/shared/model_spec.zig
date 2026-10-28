@@ -297,8 +297,9 @@ pub fn previewFits(store: tp.weights.WeightStore, fam: Family) bool {
 /// Mixed into the index version, a rule change empties the cache instead.
 ///
 /// Covers this file, which holds the width and depth checks, the pipeline's
-/// probe table, and the two LoRA modules a LoRA's placement is read through
-/// (`lora.zig`'s spellings, `lora_sd.sdFits`). NOT `pipeline.detectFamily` or
+/// probe table, the two LoRA modules a LoRA's placement is read through
+/// (`lora.zig`'s spellings, `lora_sd.sdFits`) and `llm/model_file.zig`, which
+/// decides what a safetensors chat model is. NOT `pipeline.detectFamily` or
 /// the GGUF metadata `catalog.probe` reads for a chat model;
 /// `catalog.index_version` is the hand bump for those.
 pub const rules_fingerprint: u32 = blk: {
@@ -307,6 +308,7 @@ pub const rules_fingerprint: u32 = blk: {
     h.update(@embedFile("model_spec.zig"));
     h.update(std.mem.asBytes(&tp.models.lora.source_fingerprint));
     h.update(std.mem.asBytes(&tp.models.lora_sd.source_fingerprint));
+    h.update(std.mem.asBytes(&tp.llm.model_file.source_fingerprint));
     for (std.enums.values(Family)) |fam| {
         h.update(@tagName(fam));
         for (std.enums.values(Component)) |comp| {

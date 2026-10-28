@@ -10,7 +10,7 @@ kernels, the GPU backends, the offload logic, or the whole thing:
 
 | Module | Layer | Depends on |
 |---|---|---|
-| `tp_core` | dtypes, tensors, checkpoint parsing (safetensors/GGUF), quant **quantize + dequant**, tokenizer, K/V cache, sampler | — (pure Zig) |
+| `tp_core` | dtypes, tensors, checkpoint parsing (safetensors/GGUF, and `container.Container` opening either by magic), quant **quantize + dequant**, tokenizer, K/V cache, sampler | — (pure Zig) |
 | `tp_ops` | CPU numeric kernels: `matmul` (GEMM), `attention`, `rope`, `norm`, `act`, `convrot` | `tp_core` |
 | `tp_gpu` | GPU backends: Vulkan + embedded SPIR-V kernels, CUDA driver-API PTX | `tp_core`, `tp_ops` |
 | `tp_runtime` | offload/scheduling: the VRAM arbiter, the CPU/GPU residency planner, and the per-sequence context swap | — (pure Zig) |

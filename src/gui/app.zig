@@ -2287,8 +2287,8 @@ fn renderNoModel() void {
             var msg: [320]u8 = undefined;
             const text = if (std.mem.eql(u8, err, "MmprojNotVisionTower"))
                 "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
-            else if (std.mem.eql(u8, err, "ChatModelNotGguf"))
-                "The chat model file is not a GGUF file. Chat runs GGUF models (the format llama.cpp uses); a .safetensors file is usually an image model or a text encoder for one.\n\nIn Settings, pick a .gguf chat model, or add the folder that holds yours."
+            else if (std.mem.eql(u8, err, "NotAChatModel"))
+                "The chat model file is not a chat model this build can run. Chat runs GGUF models, and Qwen 3 or Qwen 3.5 .safetensors files that kept their output head; a text encoder exported without it cannot write text.\n\nIn Settings, pick another chat model, or add the folder that holds yours."
             else
                 (std.mem.print(&msg, "Failed to load the model: {s}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
             fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = .{ .color = style.C.text } });

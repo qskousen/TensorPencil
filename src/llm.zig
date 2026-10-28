@@ -12,6 +12,7 @@ pub const kv_cache = @import("tp_core").kv_cache;
 pub const session = @import("llm/session.zig");
 pub const device = @import("llm/device.zig");
 pub const stepper = @import("llm/stepper.zig");
+pub const model_file = @import("llm/model_file.zig");
 
 test {
     _ = chat;
@@ -25,4 +26,5 @@ test {
     _ = session;
     _ = device;
     _ = stepper;
+    _ = model_file;
 }

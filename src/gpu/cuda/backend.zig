@@ -396,6 +396,8 @@ pub const Backend = struct {
     fp8_w16: DeviceBuffer = .{},
     /// The W·A32 weight-only GEMM's f32 weight (`intRowF32`).
     wo_w32: DeviceBuffer = .{},
+    /// One activation row rotated into an int8 convrot weight's basis (`opI8Gemv`).
+    rot_act: DeviceBuffer = .{},
     fp8_a16: DeviceBuffer = .{},
     /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
     q8_act: DeviceBuffer = .{},
@@ -865,6 +867,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.iq_tbl);
         self.tensorDestroy(&self.fp8_w16);
         self.tensorDestroy(&self.wo_w32);
+        self.tensorDestroy(&self.rot_act);
         self.tensorDestroy(&self.fp8_a16);
         self.tensorDestroy(&self.q8_act);
         self.tensorDestroy(&self.pen_wire);
@@ -3540,6 +3543,27 @@ pub const Backend = struct {
     pub fn reserveWo(self: *Backend, rows: usize, cols: usize, m: usize) Error!void {
         try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
         if (m != 0) try self.ensureDeviceBuffer(&self.fp8_a16, self.bf16Rows(m) * cols * 2);
+    }
+
+    /// int8 convrot linear over ONE f32 activation row: the row rotated into the weight's
+    /// basis, then a GEMV over the int8 rows as stored. Reads the weight once at int8
+    /// width, where the weight-only GEMMs expand all of it to 16 or 32 bits per call.
+    pub fn opI8Gemv(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, rotate: bool) Error!void {
+        std.debug.assert(cols % @as(usize, if (rotate) 256 else 16) == 0);
+        const w_db = try self.cachedWeight(w_bytes);
+        const s_db = try self.cachedWeight(std.mem.sliceAsBytes(row_scale));
+        var xa = x;
+        if (rotate) {
+            self.ptic();
+            try self.ensureDeviceBuffer(&self.rot_act, cols * 4);
+            const n = cols / 16;
+            try self.dualElems("act_rot_f32", x, self.rot_act, null, null, .{ @intCast(n), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, n);
+            self.ptoc(.elt);
+            xa = self.rot_act;
+        }
+        self.ptic();
+        defer self.ptoc(.matmul);
+        try self.dualRows("gemv_i8row", w_db, xa, y, s_db, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, (rows + 1) / 2);
     }
 
     /// int8 convrot linear, weight-only: the weight expands to bf16 per GEMM and stays

@@ -16,6 +16,7 @@ const cuda = @import("tp_gpu").cuda;
 const gpu_context = @import("tp_gpu").context;
 const kv_cache = @import("tp_core").kv_cache;
 const gguf_mod = @import("tp_core").gguf;
+const Container = @import("tp_core").container.Container;
 const chat = @import("chat.zig");
 const engine = @import("engine.zig");
 const tokenizer = @import("tp_core").tokenizer;
@@ -256,6 +257,19 @@ pub fn configureCuda(b: *cuda.Backend, profile: bool) void {
 pub fn useFileReads(be: ?*cuda.Backend, g: *const gguf_mod.Gguf) void {
     const b = be orelse return;
     b.ctx.addWeightReader(ggufReader(g));
+}
+
+/// A weight reader serving `c`'s tensor bytes from its file.
+pub fn containerReader(c: *const Container) gpu_context.WeightReader {
+    return .{
+        .ctx = @constCast(c),
+        .read = struct {
+            fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
+                const cc: *const Container = @ptrCast(@alignCast(ctx));
+                return cc.readTo(dst, src);
+            }
+        }.read,
+    };
 }
 
 /// A weight reader serving `g`'s tensor bytes from its file.

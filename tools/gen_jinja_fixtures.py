@@ -16,7 +16,11 @@ existing goldens would quietly move the goalposts for the whole suite.
 
 Needs jinja2 (e.g. /home/qt/genai/ai-toolkit/venv/bin/python).
 
-    python3 tools/gen_jinja_fixtures.py <model.gguf | template.jinja> <template-name>
+    python3 tools/gen_jinja_fixtures.py <model.gguf | template.jinja> <template-name> [--text-only]
+
+`--text-only` is for a template with no image or Bonsai-style variants (Qwen3's
+own): it skips the image cases and the two variant checks, and checks instead
+that thinking on and off render differently and that the tools reach the prompt.
 """
 
 import json
@@ -159,7 +163,7 @@ TOOL_CALL_ARGS = {
 }
 
 
-def cases_for(name):
+def cases_for(name, vision=True):
     base = {"bos_token": "", "add_generation_prompt": True}
     out = []
 
@@ -209,6 +213,8 @@ def cases_for(name):
         tools=TOOLS,
     )
 
+    if not vision:
+        return out
     # Vision: the content-list form, which drives the render_content macro.
     add(
         "img_text",
@@ -241,9 +247,11 @@ def env():
 
 
 def main():
-    if len(sys.argv) != 3:
+    args = [a for a in sys.argv[1:] if a != "--text-only"]
+    text_only = len(args) != len(sys.argv) - 1
+    if len(args) != 2:
         raise SystemExit(__doc__)
-    src_path, name = Path(sys.argv[1]), sys.argv[2]
+    src_path, name = Path(args[0]), args[1]
 
     if src_path.suffix == ".jinja":
         tmpl_src = src_path.read_text()
@@ -270,7 +278,7 @@ def main():
     data["cases"] = [c for c in data["cases"] if c["template"] != name]
     t = e.from_string(tmpl_src)
     added = 0
-    for c in cases_for(name):
+    for c in cases_for(name, vision=not text_only):
         c["expected"] = t.render(**c["context"])
         data["cases"].append(c)
         added += 1
@@ -280,6 +288,14 @@ def main():
     # default where the official Qwen 3.6 one drops them); what the corpus must
     # do is tell the settings apart at all.
     by_key = {c["key"]: c["expected"] for c in data["cases"]}
+    if text_only:
+        if by_key[f"{name}__user_only__think_on"] == by_key[f"{name}__user_only__think_off"]:
+            raise SystemExit(f"no teeth: {name} renders the same with thinking on and off")
+        if "get_weather" not in by_key[f"{name}__tools_decl"]:
+            raise SystemExit(f"no teeth: {name} drops the tool declarations")
+        FIXTURES.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
+        print(f"wrote {added} '{name}' cases to {FIXTURES.relative_to(REPO)} ({len(data['cases'])} total)")
+        return
     distinguished = False
     for tag in ("", "think_tag_"):
         on, off, absent = (by_key[f"{name}__{tag}preserve_thinking_{k}"] for k in ("true", "false", "absent"))

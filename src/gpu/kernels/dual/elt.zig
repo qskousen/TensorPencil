@@ -1194,7 +1194,10 @@ pub inline fn gemvCombine(e: Env) void {
     var sum: f32 = 0;
     var ch: u32 = 0;
     while (ch < e.u(1)) : (ch += 1) sum += e.ld(.a, ch * e.u(0) + col);
-    e.st(.d, e.u(2) + col, sum * e.f(0));
+    var v = sum * e.f(0);
+    // u3 != 0: b holds a scale per output row (an int8 weight's).
+    if (e.u(3) != 0) v *= e.ld(.b, col);
+    e.st(.d, e.u(2) + col, v);
 }
 
 /// `gemvCombine` for u4 inputs: d[u2 + i*u3 + col] = f0 * sum_ch a[(ch*4 + i)*rows

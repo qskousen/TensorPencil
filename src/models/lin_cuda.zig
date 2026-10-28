@@ -435,6 +435,9 @@ pub const Caps = struct {
     pub fn gemvF32(_: Caps) bool {
         return false;
     }
+    pub fn i8Gemv(_: Caps) bool {
+        return true;
+    }
     pub fn f32Rows(_: Caps, _: Weight, _: usize) bool {
         return false;
     }
@@ -456,6 +459,8 @@ pub const Caps = struct {
             // in two bases.
             .blockq_i8, .blockq_i4 => if (rot != blockq_rotate and (lin.any(lins, .i8) or lin.any(lins, .i4) or lin.any(lins, .w4a8))) .blockq_basis else null,
             .nvfp4 => if (!dual_lin.gemmShape(w)) .nvfp4_shape else null,
+            // The activation rotates in groups of 256; the GEMV reads 16 a lane.
+            .gemv_i8 => if (w.cols % @as(usize, if (rot) 256 else 16) != 0) .int_shape else null,
             else => null,
         };
     }
@@ -622,6 +627,10 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
             try be.opGemvQuantDualF32(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols);
             folded = bias == null;
         },
+        .gemv_i8 => {
+            try be.opI8Gemv(y, x, w.bytes, w.row_scale.?, w.rows, w.cols, o.rot);
+            folded = bias == null;
+        },
         .gemv_q8 => {
             try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols);
             folded = bias == null;
@@ -712,6 +721,7 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
         },
         .i8_wo, .i4_wo, .i8_wo16, .i4_wo16, .svdq_wo, .svdq_wo16 => try be.reserveWo(w.rows, w.cols, 0),
         .i8_wo32, .i4_wo32, .svdq_wo32 => try be.reserveWo32(w.rows, w.cols),
+        .gemv_i8 => try be.ensureDeviceBuffer(&be.rot_act, w.cols * 4),
         .w4a8_wo32 => {
             w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols));
             try be.reserveWo32(w.rows, w.cols);

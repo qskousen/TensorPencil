@@ -2973,121 +2973,29 @@ pub fn planSchedule(
     return .{ .texts = uniq.items, .at = at };
 }
 
-/// A checkpoint container, which may be either format, used for every component
-/// that can arrive as its own file (denoiser, text encoder, VAE).
-///
-/// ggufy emits both, int4/int8 cluster formats as safetensors, the ggml block
-/// quants as GGUF, and until this existed only the safetensors half could be
-/// loaded, so the GGUF half of the quantization work could not be run or measured
-/// at all. `dit.DiT.load` takes a `WeightStore`, so the only thing missing was
-/// opening the file.
-/// `Context.WeightReader` over an optional side-file container, the encoder/VAE
-/// twin of `Container.weightReader`, which it now simply delegates to. See
-/// `SafeTensors.readTo`.
-fn storeReader(opt: *?Container) ?cuda.Context.WeightReader {
-    const c = if (opt.*) |*v| v else return null;
-    return c.weightReader();
+/// The checkpoint file every component (denoiser, text encoder, VAE) is opened
+/// as, either format.
+pub const Container = @import("tp_core").container.Container;
+
+/// A `Context.WeightReader` serving `c`'s tensor bytes from its file rather than
+/// faulting the (multi-GB, read-once) mapping; see `SafeTensors.readTo` for why
+/// that matters under host memory pressure.
+fn weightReader(c: *const Container) cuda.Context.WeightReader {
+    return .{
+        .ctx = @constCast(c),
+        .read = struct {
+            fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
+                const cc: *const Container = @ptrCast(@alignCast(ctx));
+                return cc.readTo(dst, src);
+            }
+        }.read,
+    };
 }
 
-pub const Container = union(enum) {
-    safetensors: safetensors.SafeTensors,
-    gguf: gguf_mod.Gguf,
-
-    /// A `Context.WeightReader` over this container, or null when it cannot serve
-    /// one. Lets the CUDA staging path pull weight bytes with positional reads
-    /// instead of faulting the (multi-GB, read-once) checkpoint mapping, see
-    /// `SafeTensors.readTo` for why that matters under host memory pressure.
-    ///
-    /// GGUF returns null, so a GGUF DiT faults its own mapping instead. That is now
-    /// reachable (a q4_k DiT runs on CUDA), but it does not bite: q4_k krea2 is 8.8 GB
-    /// and stays wholly pinned, so nothing streams. A block quant big enough to stream
-    /// is what would make this worth wiring.
-    pub fn weightReader(self: *Container) ?cuda.Context.WeightReader {
-        return switch (self.*) {
-            .safetensors => |*st| .{
-                .ctx = st,
-                .read = struct {
-                    fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
-                        const s2: *const safetensors.SafeTensors = @ptrCast(@alignCast(ctx));
-                        return s2.readTo(dst, src);
-                    }
-                }.read,
-            },
-            .gguf => null,
-        };
-    }
-
-    /// Open by content, not extension: a leading `GGUF` magic picks the GGUF
-    /// reader, anything else the safetensors one. Sniffing rather than trusting the
-    /// name because the failure mode of guessing wrong is a baffling error from the
-    /// other parser, handing a GGUF to the safetensors reader reports
-    /// `InvalidHeader`, which says nothing about what actually happened.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
-        return openIn(gpa, io, std.Io.Dir.cwd(), path);
-    }
-
-    pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Container {
-        if (try isGgufIn(io, dir, path)) return .{ .gguf = try gguf_mod.Gguf.openIn(gpa, io, dir, path) };
-        return .{ .safetensors = try safetensors.SafeTensors.openIn(gpa, io, dir, path) };
-    }
-
-    /// `open`, naming the file if it fails. A run opens several checkpoints, so a
-    /// bare `error.FileNotFound` does not say which one the user got wrong. Used
-    /// wherever the path came from the user; a speculative open of a defaulted
-    /// path stays on `open`, where a miss is expected and not reported.
-    pub fn openNamed(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
-        return open(gpa, io, path) catch |err| {
-            std.log.err("cannot open {s}: {t}", .{ path, err });
-            return err;
-        };
-    }
-
-    fn isGgufIn(io: std.Io, dir: std.Io.Dir, path: []const u8) !bool {
-        var magic: [4]u8 = undefined;
-        const f = try dir.openFile(io, path, .{ .mode = .read_only });
-        defer f.close(io);
-        const n = try f.readPositionalAll(io, &magic, 0);
-        if (n < magic.len) return error.CheckpointTooSmall;
-        return std.mem.eql(u8, &magic, "GGUF");
-    }
-
-    pub fn deinit(self: *Container) void {
-        switch (self.*) {
-            .safetensors => |*st| st.deinit(),
-            .gguf => |*g| g.deinit(),
-        }
-    }
-
-    /// A store view. Takes a pointer because the containers hold interior
-    /// pointers into their own mappings; the `Session` keeps this at a stable
-    /// address for exactly that reason.
-    pub fn store(self: *const Container) weights_mod.WeightStore {
-        return switch (self.*) {
-            .safetensors => |*st| .{ .safetensors = st },
-            .gguf => |*g| .{ .gguf = g },
-        };
-    }
-
-    /// Tensor-data bytes, what the VRAM pinning policy sizes itself against.
-    /// Declared, not mapped, so it is right on a header-only open too.
-    pub fn payloadLen(self: *const Container) usize {
-        return switch (self.*) {
-            .safetensors => |*st| st.payload_len,
-            .gguf => |*g| g.payload_len,
-        };
-    }
-
-    /// `open`, but reading only the header: what a folder scan uses (see
-    /// `SafeTensors.openHeader`). Tensors have shapes and dtypes and no bytes.
-    pub fn openHeader(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
-        return openHeaderIn(gpa, io, std.Io.Dir.cwd(), path);
-    }
-
-    pub fn openHeaderIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Container {
-        if (try isGgufIn(io, dir, path)) return .{ .gguf = try gguf_mod.Gguf.openHeaderIn(gpa, io, dir, path) };
-        return .{ .safetensors = try safetensors.SafeTensors.openHeaderIn(gpa, io, dir, path) };
-    }
-};
+/// `weightReader` over an optional side-file container.
+fn storeReader(opt: *?Container) ?cuda.Context.WeightReader {
+    return if (opt.*) |*c| weightReader(c) else null;
+}
 
 /// A reusable text-to-image pipeline. `init` creates the backend and loads the
 /// text encoder, DiT, and VAE ONCE (their safetensors mappings stay open for the
@@ -5551,12 +5459,12 @@ pub const Session = struct {
             // `readTo`, so `--mmap mmap` turns the whole thing off.
             switch (self.models) {
                 .krea2 => |*m| {
-                    if (m.dit_st.weightReader()) |wr| b.ctx.addWeightReader(wr);
+                    b.ctx.addWeightReader(weightReader(&m.dit_st));
                     if (storeReader(&m.enc_st)) |wr| b.ctx.addWeightReader(wr);
                     if (storeReader(&m.vae_st)) |wr| b.ctx.addWeightReader(wr);
                 },
                 .zimage => |*m| {
-                    if (m.dit_st.weightReader()) |wr| b.ctx.addWeightReader(wr);
+                    b.ctx.addWeightReader(weightReader(&m.dit_st));
                     if (storeReader(&m.enc_st)) |wr| b.ctx.addWeightReader(wr);
                     if (storeReader(&m.vae_st)) |wr| b.ctx.addWeightReader(wr);
                 },

@@ -886,13 +886,13 @@ pub const Driver = struct {
         return self.think_probe_valid and self.think_probe_effort;
     }
 
-    /// Read the configured GGUF's architecture and map it to reasoning support.
+    /// Read the configured model's architecture and map it to reasoning support.
     /// Any failure (missing/unreadable file, unknown arch) -> false.
     fn probeThinking(self: *Driver, path: []const u8) bool {
         self.think_probe_effort = false;
-        var gg = tp.Gguf.openHeader(self.gpa, self.io, path) catch return false;
-        defer gg.deinit();
-        const arch = gg.getStr("general.architecture") orelse return false;
+        var file = tp.Container.openHeader(self.gpa, self.io, path) catch return false;
+        defer file.deinit();
+        const arch = tp.llm.model_file.arch(&file) orelse return false;
         const fam = tp.llm.chat.familyForArch(arch) orelse return false;
         self.think_probe_effort = tp.llm.chat.familySupportsReasoningEffort(fam);
         return tp.llm.chat.familySupportsThinking(fam);
@@ -929,15 +929,15 @@ pub const Driver = struct {
     }
 
     fn probeWeightNoise(self: *Driver, path: []const u8) bool {
-        var gg = tp.Gguf.openHeader(self.gpa, self.io, path) catch return false;
-        defer gg.deinit();
+        var file = tp.Container.openHeader(self.gpa, self.io, path) catch return false;
+        defer file.deinit();
         const kind: ?tp.llm.device.Kind = switch (pipeline_map.toPipelineBackend(self.settings.llm_backend)) {
             .zig_cuda => .zig_cuda,
             .cuda => .cuda,
             .vulkan => .vulkan,
             .cpu => null,
         };
-        return tp.llm.device.weightNoiseSupported(kind, &gg);
+        return tp.llm.device.weightNoiseSupported(kind, &file);
     }
 
     // ── Diffusion engine VRAM coordinator ─────────────────────────────────────

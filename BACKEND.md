@@ -763,6 +763,11 @@ The LLM architectures `tp-llm` and tp-gui chat run, per backend.
   host). CUDA routed GEMMs: grouped q8 GEMV up to 256 rows (q6_k only), else
   `hgemm_experts` (`TP_K2_EXPERT_GEMM=mmq|gemv` selects). Prompts use the model's own
   template; tools go through it and `<ifm|tool_call>` is parsed by `llm/tool_call.zig`.
+- **Safetensors chat models** (`llm/model_file.zig`): qwen35, and qwen3 in the
+  configurations `qwen3.Config.detect` knows (RoPE theta is in no tensor), from an HF or
+  ComfyUI export that kept its `lm_head` (or ties it, qwen3 below 8B). The embedded
+  tokenizers and templates stand in for the GGUF's; the gated `tokenizes a chat exactly`
+  tests pin them to the GGUF's ids. The other archs, and every vision tower, are GGUF only.
 - **gemma3** is GGUF block-quant only. Vulkan runs 256-row chunks, the local layers' KV
   ring sized window plus one chunk, and an image prefilled as one batch.
 - **gemma4** config is metadata-driven (12B Q4_0 48L, 31B mixed Q4_K/Q6_K 60L load with no
@@ -797,6 +802,7 @@ stepper `prep`s an activation once per group of linears sharing it (q/k/v, gate/
 | any block quant, `rows % 128 != 0` or `cols % 256 != 0` | f32 GEMV | grouped if tileable, else per-row f32 GEMV | same |
 | bf16 | `gemv_bf16` | `gemv_bf16n`, 4 rows per launch | `opGemmBf16` (Ampere+) / f16 GEMM |
 | fp8 | `gemv_fp8` | `gemv_fp8n` | `opMatmulFp8` |
+| int8 convrot | `gemv_i8row` over the activation rotated by `act_rot_f32` | weight-only (`i8_wo`) | same |
 | f16 / f32 | f16 GEMV / f32 GEMM | GEMM | GEMM |
 
 - The dequant-f16, bf16 and fp8 GEMMs take any row count (`hgemmPadN` pads a weight off the
@@ -807,6 +813,13 @@ stepper `prep`s an activation once per group of linears sharing it (q/k/v, gate/
 - **On Vulkan a block quant has one route**: decode is the dual row GEMV over the raw weight
   (`opGemvQuantDual`), a batch the coop dequant GEMM (`opMatmulCoopQuant`), both reading the
   same resident copy. A row that is not whole blocks goes to the GEMM.
+- **int8 convrot decode reads the weight as stored**: the activation row is rotated into the
+  weight's basis (H is symmetric) instead of expanding the weight to 16 bits per call. On
+  Vulkan the GEMV is the k-split `gemv_partial` over the k-major copy the weight-only GEMM
+  already holds (one resident copy, per-row scale in `gemv_combine`), the rotation
+  `act_rot_direct` (one thread an element; `rotate_fwht` leaves a one-row decode 16
+  threads), once per `linearGroup`. Qwen3.5 9B int8 on the 3090: CUDA 16.8 -> 67 tok/s,
+  Vulkan 7.5 -> 40, the Q6_K GGUF's rate per byte on each.
 - **Vulkan `OpSDot` decode** where the device has `VK_KHR_shader_integer_dot_product`
   (`Context.has_int_dot`, `lin_gpu.Caps.dualQ8`): `gemv_dual_<fmt>_sdot` at one row,
   `gemv4_dual_<fmt>_sdot` for a 2-4 row spec verify, each row bit-identical to decode.

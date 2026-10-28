@@ -23,6 +23,7 @@ pub const rawtty = @import("rawtty.zig");
 pub const safetensors = @import("safetensors.zig");
 pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
+pub const container = @import("container.zig");
 pub const torch_rng = @import("torch_rng.zig");
 /// NVIDIA's Philox, the generator A1111 draws its noise from, unlike ComfyUI's CPU one.
 pub const philox_rng = @import("philox_rng.zig");
@@ -78,6 +79,7 @@ test {
     _ = safetensors;
     _ = gguf;
     _ = weights;
+    _ = container;
     _ = torch_rng;
     _ = philox_rng;
     _ = noise;

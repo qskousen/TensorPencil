@@ -49,6 +49,9 @@ pub const Route = enum {
     gemv_f32n,
     /// A skinny f32 weight (a router), one subgroup a row over every activation row.
     gemv_f32_rows,
+    /// An int8 convrot weight against one activation row, rotated into the weight's
+    /// basis instead of expanding the weight: decode reads each weight byte once.
+    gemv_i8,
     /// Integer convrot and NVFP4. `_wo` expands the weight to bf16 per call against
     /// the unquantized activation (`IntGemm.weight_only`).
     i8,
@@ -372,7 +375,10 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
     std.debug.assert(m >= 1);
     switch (lin.kindOf(w.dtype)) {
         .blockq => return if (pol.gemv) blockQGemv(C, caps, w, m, pol) else blockQBatch(C, caps, w, pol),
-        .i8 => return intRoute(C, caps, pol, .i8, .{ .i8_wo, .i8_wo16, .i8_wo32 }),
+        .i8 => return if (pol.gemv and m == 1 and caps.i8Gemv())
+            .gemv_i8
+        else
+            intRoute(C, caps, pol, .i8, .{ .i8_wo, .i8_wo16, .i8_wo32 }),
         .i4 => return if (caps.i4Native())
             intRoute(C, caps, pol, .i4, .{ .i4_wo, .i4_wo16, .i4_wo32 })
         else if (pol.int8 != .w8a8)

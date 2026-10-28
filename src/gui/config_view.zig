@@ -82,6 +82,11 @@ const gguf_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "GGUF models", .pattern = "gguf" },
     .{ .name = "All files", .pattern = "*" },
 };
+/// A chat model is a GGUF or a Qwen safetensors export (`llm/model_file.zig`).
+const llm_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "Chat models", .pattern = "gguf;safetensors" },
+    .{ .name = "All files", .pattern = "*" },
+};
 /// Any component that can arrive as its own file, the primary checkpoint, and the
 /// text encoders. `pipeline.Container` opens all of them by MAGIC, not by extension,
 /// so the picker must not hide GGUFs. A default filter that omits a format the
@@ -1598,7 +1603,7 @@ fn llmRows(cfg: *config.Config) void {
     // Architecture: the classes, the current one named. An unknown file shows as
     // itself so nothing pretends to know what it is.
     var labels = arena.alloc([]const u8, classes.len + 1) catch return;
-    var cur_label: []const u8 = if (classes.len == 0) "none found: no .gguf chat model in your model folders" else "none";
+    var cur_label: []const u8 = if (classes.len == 0) "none found: no chat model in your model folders" else "none";
     for (classes, 0..) |c, i| {
         labels[i] = if (c.supported) c.label else arena.print("{s} (unsupported)", .{c.label}) catch c.label;
         if (cur) |e| if (std.mem.eql(u8, e.llm.?.class, c.label)) {
@@ -1633,7 +1638,7 @@ fn llmRows(cfg: *config.Config) void {
     files.append(arena, other_file) catch return;
     notes.append(arena, "") catch return;
     if (notedRow("llm/file", "Model file", file_label, files.items, notes.items, cur == null and cfg.llm_model.opt() != null)) |i| {
-        if (i == file_paths.items.len) openFileDialog(.llm, &gguf_sdl, &cfg.llm_model) else selection.selectLlm(cfg, cat, file_paths.items[i]);
+        if (i == file_paths.items.len) openFileDialog(.llm, &llm_sdl, &cfg.llm_model) else selection.selectLlm(cfg, cat, file_paths.items[i]);
     }
 
     // Vision tower, for an architecture that takes one.

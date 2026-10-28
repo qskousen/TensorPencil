@@ -792,12 +792,14 @@ pub const CausalLM = struct {
             return error.ShapeMismatch;
         const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
 
+        // An HF export keeps the head at the root, beside `model.`, not under the
+        // language tower's prefix. With none, the head is tied to the embedding.
         var head = embed;
-        if (store.get(try std.mem.print(&buf, "{s}lm_head.weight", .{cfg.prefix}))) |hv| {
-            const hshape = hv.info.shape.slice();
-            if (hshape.len != 2 or hshape[0] != cfg.vocab or hshape[1] != cfg.hidden)
-                return error.ShapeMismatch;
-            head = Weight.init(hv.bytes, hv.info.dtype, cfg.vocab, cfg.hidden);
+        for ([_][]const u8{ "", cfg.prefix }) |at| {
+            const name = try std.mem.print(&buf, "{s}lm_head.weight", .{at});
+            if (store.get(name) == null) continue;
+            head = try loadWeightNamed(alloc, store, name, cfg.vocab, cfg.hidden);
+            break;
         }
 
         const layers = try loadLayersCfg(alloc, store, cfg, cfg.n_layers);

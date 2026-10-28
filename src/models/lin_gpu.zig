@@ -193,6 +193,9 @@ pub const Caps = struct {
     pub fn gemvF32(_: Caps) bool {
         return true;
     }
+    pub fn i8Gemv(_: Caps) bool {
+        return true;
+    }
     /// The k-split GEMV fills a quarter-row of threads a chunk, which a 100-row router
     /// leaves idle (44 us at one row), and the f32 GEMM tiles waste it (1 ms at 19).
     pub fn f32Rows(_: Caps, w: Weight, m: usize) bool {
@@ -218,6 +221,8 @@ pub const Caps = struct {
             .i8_wo, .i8_wo16, .i8_wo32 => if (w.cols % @as(usize, if (rot) 256 else 4) != 0) .int_shape else null,
             .i4_wo, .i4_wo16, .i4_wo32 => if (!rot) .int4_unrotated else if (w.cols % 256 != 0) .int_shape else null,
             .w4a8_wo, .w4a8_wo16, .w4a8_wo32 => if (w.cols % 256 != 0) .int_shape else null,
+            // The activation rotates in groups of 256; the k-split GEMV reads four rows a word.
+            .gemv_i8 => if (w.rows % 4 != 0 or (rot and w.cols % 256 != 0)) .int_shape else null,
             else => null,
         };
     }
@@ -800,6 +805,17 @@ pub const Lin = struct {
     pub fn linearGroup(self: *const Lin, p: Plan, ys: []const Buf, x: Buf, ws: []const Weight) !void {
         std.debug.assert(ys.len == ws.len and ws.len <= self.partials.len);
         const ctx = self.ctx;
+        // int8 convrot weights over one row: the row rotated once for all of them.
+        var int8 = x.dt == .f32 and p.lora == null;
+        for (ws) |w| int8 = int8 and self.routeAt(p, w, 1) == .gemv_i8 and w.bytes.len <= max_binding and w.convrot == ws[0].convrot;
+        if (int8) {
+            const xr = if (ws[0].convrot != 0) try ctx.opRotateRow(x, ws[0].cols) else x;
+            ctx.independent(ws.len);
+            for (ws, 0..) |w, i| try ctx.opGemvPartial(xr, self.partials[i], w.bytes, .i8, w.rows, w.cols, self.nchunk);
+            ctx.independent(ws.len);
+            for (ys, ws, 0..) |y, w, i| try ctx.opI8Combine(y, 0, self.partials[i], w.row_scale.?, w.rows, self.nchunk);
+            return;
+        }
         var dense = true;
         var block = true;
         for (ws) |w| switch (self.routeAt(p, w, 1) orelse return error.UnsupportedDType) {
@@ -939,6 +955,11 @@ pub const Lin = struct {
                 try self.gemv(r, y, o.y_off, x, m, w);
                 folded = o.bias == null;
             },
+            .gemv_i8 => {
+                const xr = if (w.convrot != 0) try ctx.opRotateRow(x, w.cols) else x;
+                try self.gemv(r, y, o.y_off, xr, m, w);
+                folded = o.bias == null;
+            },
             .gemv_f32_rows => {
                 try ctx.opGemvRowsF32(y, o.y_off, x, w.bytes, w.rows, w.cols, m, w.scale);
                 folded = o.bias == null;
@@ -971,6 +992,8 @@ pub const Lin = struct {
             const wb = w.bytes[r0 * row_bytes ..][0 .. n * row_bytes];
             switch (r) {
                 .gemv_dual => try ctx.opGemvQuantDual(w.dtype, y, y_off + r0, x, wb, w.scale, n, w.cols),
+                // `x` is already rotated into the weight's basis.
+                .gemv_i8 => try ctx.opI8Gemv(y, y_off + r0, x, self.partials[0], wb, w.row_scale.?[r0..][0..n], n, w.cols, self.nchunk),
                 // The q8 routes read the activation `prep` staged, not `x`.
                 .gemv_dual_q8 => try ctx.opGemvQuantDualQ8(w.dtype, y, y_off + r0, wb, w.scale, n, w.cols),
                 .gemv_dualn_q8 => {

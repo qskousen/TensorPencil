@@ -159,7 +159,7 @@ export fn attn_causal_batched() callconv(abi.kernel) void {
 //   transposed layout of the matmul kernels: element (k, col) at
 //   k*w_stride + col; rows must be a multiple of 4. a = W (raw words through
 //   the f32 view), b = x, d = partials [ch][rows]. u0 = (rows/4)*nchunk,
-//   u1 = cols, u2 = nchunk, u3 = w_stride, u4 = is_f8, u5 = rows.
+//   u1 = cols, u2 = nchunk, u3 = w_stride, u4 = WCode, u5 = rows.
 export fn gemv_partial() callconv(abi.kernel) void {
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
@@ -174,6 +174,31 @@ export fn gemv_partial() callconv(abi.kernel) void {
             const xv = b.data[k];
             inline for (0..4) |j| {
                 sums[j] += e4m3ToF32((word >> (8 * j)) & 0xFF) * xv;
+            }
+        }
+    } else if (pc.u4 == 3) { // int8: as fp8, unscaled (the combine scales per row)
+        // Eight k a pass, so each thread has eight loads in flight.
+        while (k + 7 * pc.u2 < pc.u1) : (k += 8 * pc.u2) {
+            var words: [8]u32 = undefined;
+            var xs: [8]f32 = undefined;
+            inline for (0..8) |t| {
+                const kk = k + @as(u32, t) * pc.u2;
+                words[t] = @bitCast(a.data[(kk * pc.u3 + col0) / 4]);
+                xs[t] = b.data[kk];
+            }
+            inline for (0..8) |t| {
+                inline for (0..4) |j| {
+                    const q: i32 = @as(i32, @bitCast(words[t] << (24 - 8 * j))) >> 24;
+                    sums[j] += @as(f32, @floatFromInt(q)) * xs[t];
+                }
+            }
+        }
+        while (k < pc.u1) : (k += pc.u2) {
+            const word: u32 = @bitCast(a.data[(k * pc.u3 + col0) / 4]);
+            const xv = b.data[k];
+            inline for (0..4) |j| {
+                const q: i32 = @as(i32, @bitCast(word << (24 - 8 * j))) >> 24;
+                sums[j] += @as(f32, @floatFromInt(q)) * xv;
             }
         }
     } else if (pc.u4 == 2) { // bf16: one u32 = 2 columns (col0 even, stride even)

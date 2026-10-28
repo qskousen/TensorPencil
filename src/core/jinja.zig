@@ -176,6 +176,11 @@ pub const gemma4_canonical_template: []const u8 = @embedFile("assets/jinja/gemma
 /// jinja2 (fixtures).
 pub const qwen35_fixed_template: []const u8 = @embedFile("assets/jinja/qwen35_fixed.jinja");
 
+/// Qwen3's own chat template, taken from Qwen3-4B's GGUF (Apache-2.0), for a Qwen3
+/// safetensors export, which carries no template. Verified byte-exact vs jinja2
+/// (fixtures).
+pub const qwen3_template: []const u8 = @embedFile("assets/jinja/qwen3.jinja");
+
 pub const Template = struct {
     arena: std.heap.ArenaAllocator,
     nodes: []Node,

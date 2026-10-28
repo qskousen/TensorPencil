@@ -6,6 +6,8 @@ const std = @import("std");
 const cuda = @import("tp_gpu").cuda;
 const vk = @import("tp_gpu").context;
 const gguf_mod = @import("tp_core").gguf;
+const Container = @import("tp_core").container.Container;
+const gpu_context = @import("tp_gpu").context;
 const session = @import("session.zig");
 
 pub const MemTag = @import("tp_gpu").mem_tag.MemTag;
@@ -16,8 +18,12 @@ pub const WeightNoise = @import("tp_gpu").weight_noise.WeightNoise;
 pub const Kind = enum { zig_cuda, cuda, vulkan };
 
 /// Whether weight noise would reach this checkpoint's weights on a `kind` device; null
-/// is the CPU, whose steppers draw none.
-pub fn weightNoiseSupported(kind: ?Kind, gg: *const gguf_mod.Gguf) bool {
+/// is the CPU, whose steppers draw none. Only GGUF block quants have noised kernels.
+pub fn weightNoiseSupported(kind: ?Kind, c: *const Container) bool {
+    const gg = switch (c.*) {
+        .gguf => |*g| g,
+        .safetensors => return false,
+    };
     return switch (kind orelse return false) {
         .zig_cuda, .cuda => session.weightNoiseSupportedFor(gg, cuda.Backend.weightNoiseSupported),
         .vulkan => session.weightNoiseSupportedFor(gg, vk.Context.weightNoiseSupported),
@@ -131,11 +137,12 @@ pub const Device = union(enum) {
         };
     }
 
-    /// Read weight bytes from the checkpoint file rather than faulting its mapping.
-    pub fn useFileReads(d: Device, g: *const gguf_mod.Gguf) void {
+    /// Read weight bytes from the checkpoint file through `wr` rather than faulting
+    /// its mapping (`session.containerReader`, `session.ggufReader`).
+    pub fn useFileReads(d: Device, wr: gpu_context.WeightReader) void {
         switch (d) {
-            .cuda => |be| session.useFileReads(be, g),
-            .vulkan => |ctx| ctx.addWeightReader(session.ggufReader(g)),
+            .cuda => |be| be.ctx.addWeightReader(wr),
+            .vulkan => |ctx| ctx.addWeightReader(wr),
         }
     }
 };

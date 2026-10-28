@@ -711,6 +711,14 @@ pub fn probe(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []c
         }
     }
 
+    // An HF export of a chat model (a ComfyUI text encoder that kept its head).
+    // It is usually also a text encoder for some image family, found below.
+    if (c == .safetensors) if (tp.llm.model_file.arch(&c)) |arch| {
+        const d = tp.llm.model_file.hfDims(store).?;
+        const label = tp.llm.model_file.sizeLabel(arch, d) orelse try paramLabel(a, store);
+        e.llm = try llmEntry(a, arch, d.width, d.blocks, label);
+    };
+
     if (pipeline.detectFamily(store)) |fam| {
         e.ckpt = .{ .family = fam, .contents = model_spec.scan(store, fam) };
     } else |_| {}
@@ -766,6 +774,10 @@ fn llmInfo(a: std.mem.Allocator, g: *const tp.gguf.Gguf, store: tp.weights.Weigh
     const width = g.getUint(archKey(&kbuf, arch, "embedding_length")) orelse 0;
     const blocks = g.getUint(archKey(&kbuf, arch, "block_count")) orelse 0;
     const size_label: []const u8 = if (g.getStr("general.size_label")) |s| try sizeLabel(a, s) else try paramLabel(a, store);
+    return llmEntry(a, arch, width, blocks, size_label);
+}
+
+fn llmEntry(a: std.mem.Allocator, arch: []const u8, width: usize, blocks: usize, size_label: []const u8) !Llm {
     const label = chat.archLabel(arch);
     return .{
         .arch = try a.dupe(u8, arch),
