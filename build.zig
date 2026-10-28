@@ -355,7 +355,7 @@ pub fn build(b: *std.Build) !void {
     // The tp-serve protocol layer: wire types, certificates, framing. Below every
     // layer (they all carry its types) and free of known-folders, so its tests
     // ride in the fast `test` step.
-    // This build's identity, `0.1.0 (v0.1.0-3-g45259f6-dirty)`: what tp-serve tells a
+    // This build's identity, `v0.1.1-3-g45259f6-dirty`: what tp-serve tells a
     // client in `hello` and every exe prints for `--version`. Stamped on every build,
     // since a commit moves it without touching a source file.
     const stamp_exe = b.addExecutable(.{
@@ -368,7 +368,6 @@ pub fn build(b: *std.Build) !void {
     });
     const stamp = b.addRunArtifact(stamp_exe);
     stamp.has_side_effects = true;
-    stamp.addArg(@import("build.zig.zon").version);
     stamp.addDirectoryArg(b.path("."));
     const version_mod = b.createModule(.{ .root_source_file = stamp.captureStdOut(.{ .basename = "version.zig" }) });
     exe.root_module.addImport("version", version_mod);

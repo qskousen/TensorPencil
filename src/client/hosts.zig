@@ -2728,8 +2728,8 @@ test "a connect says when the local host was already running, and when any host 
     h.connectNotices(h.local(), own, false);
     try check(&h, &.{.{ .tone = .info, .has = "already running" }});
     // An older daemon found running: both.
-    h.connectNotices(h.local(), "0.1.0 (v0.1.0)", false);
-    try check(&h, &.{ .{ .tone = .info, .has = "0.1.0 (v0.1.0)" }, .{ .tone = .warn, .has = "local runs tp-serve 0.1.0 (v0.1.0)" } });
+    h.connectNotices(h.local(), "v0.1.0", false);
+    try check(&h, &.{ .{ .tone = .info, .has = "v0.1.0" }, .{ .tone = .warn, .has = "local runs tp-serve v0.1.0" } });
     // A remote host is always one that was running; only its build is news.
     h.connectNotices(b, own, false);
     try check(&h, &.{});
