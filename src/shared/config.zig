@@ -928,17 +928,6 @@ pub const Config = struct {
     /// DiT); `pipeline.resolveComponent` works out which, and `text_encoder` / `vae`
     /// below fill in or override whatever it does not carry.
     diffusion_model: PathBuf = .{},
-    /// MEASURED peak resident VRAM of the diffusion pipeline (bytes), plus the DiT
-    /// path it was measured against. Persisted so the FIRST image of a session
-    /// sizes the LLM's eviction by what the pipeline actually costs rather than by
-    /// what its checkpoints weigh, the file-size bootstrap is only for a model
-    /// that has never run here. Ignored when the key no longer matches.
-    diff_peak_resident: u64 = 0,
-    /// Hash of the DiT path the figure was measured against, NOT the path itself:
-    /// `Config` is already ~150 KB by value and `std.json`'s recursive parse
-    /// overflows the stack as it grows (hence `parseJsonBigStack`), so another
-    /// 4 KB `PathBuf` for what is only an equality check is not worth it.
-    diff_peak_key: u64 = 0,
     /// OPTIONAL conditioner / decoder overrides. Empty means "whatever the primary
     /// checkpoint carries"; a set path is an *explicit* request that wins even over
     /// a bundled copy (the CLI's `--text-encoder` / `--vae` precedence, mapped onto
@@ -2044,8 +2033,8 @@ pub const Config = struct {
 /// the engine reads means adding its name here, or the engine never sees it.
 pub const host_fields = [_][]const u8{
     "llm_model",                 "vision_tower",              "diffusion_model",
-    "diff_peak_resident",        "diff_peak_key",             "text_encoder",
-    "text_encoder_2",            "vae",                       "taesd",
+    "text_encoder",              "text_encoder_2",            "vae",
+    "taesd",
     "loras",                     "steps",                     "width",
     "height",                    "sampler",                   "scheduler",
     "prompt_syntax",             "emphasis",                  "compat",
@@ -2089,12 +2078,6 @@ pub fn hostSettings(cfg: *const Config) HostSettings {
 
 pub fn applyHost(cfg: *Config, h: *const HostSettings) void {
     inline for (host_fields) |name| @field(cfg, name) = @field(h, name);
-}
-
-/// Key a measured-residency figure to the model it was measured on, so a changed
-/// checkpoint invalidates it. Hash rather than path, see `diff_peak_key`.
-pub fn modelKey(path: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, path);
 }
 
 /// Clean an entry name (preset or system prompt) for storage/lookup: trim
@@ -3191,8 +3174,6 @@ test "HostSettings carries every host field and none of the client's" {
     cfg.llm_model.set("/h/llm.gguf");
     cfg.vision_tower.set("/h/tower.gguf");
     cfg.diffusion_model.set("/h/dit.safetensors");
-    cfg.diff_peak_resident = 123;
-    cfg.diff_peak_key = 77;
     cfg.text_encoder.set("/h/te.safetensors");
     cfg.text_encoder_2.set("/h/te2.safetensors");
     cfg.vae.set("/h/vae.safetensors");

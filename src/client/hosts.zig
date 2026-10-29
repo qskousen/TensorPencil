@@ -1238,17 +1238,13 @@ pub const Hosts = struct {
     }
 
     /// The render the settings and these dimensions describe. `vram_need` is
-    /// the measured peak when the settings hold one for this very model, else
-    /// the checkpoint's size.
+    /// the checkpoint's size, what the catalog knows of it.
     pub fn jobFor(self: *Hosts, cfg: *const config.Config, width: u32, height: u32, steps: u32) sched.Job {
         var j: sched.Job = .{ .mpx = megapixels(width, height), .steps = steps };
         const ref = cfg.diffusion_model.opt() orelse return j;
         const e = self.local().mirror.catalog.resolve(ref) orelse return j;
         if (e.ckpt) |c| j.family = @tagName(c.family);
-        j.vram_need = if (cfg.diff_peak_resident > 0 and cfg.diff_peak_key == config.modelKey(ref))
-            cfg.diff_peak_resident
-        else
-            e.size;
+        j.vram_need = e.size;
         return j;
     }
 

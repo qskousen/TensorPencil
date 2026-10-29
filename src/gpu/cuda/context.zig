@@ -108,6 +108,8 @@ pub const Context = struct {
     clock_khz: c_int = 0,
 
     device_used: usize = 0,
+    /// High-water of `device_used` since `resetUsedPeak`, what one stage really reached.
+    device_used_peak: usize = 0,
 
     /// Per-component device-byte attribution (MEASURED, for the GUI VRAM meter).
     /// Only maintained when `track_tags` is set (diffusion backend) so the LLM
@@ -625,6 +627,7 @@ const FillPool = struct {
         if (r == cu.CUDA_ERROR_OUT_OF_MEMORY) return error.DeviceOutOfMemory;
         try self.check(r, "cuMemAlloc");
         self.device_used += bytes;
+        self.device_used_peak = @max(self.device_used_peak, self.device_used);
         if (self.track_tags) self.mem_tag_used[@backingInt(self.mem_tag)] += bytes;
         return .{ .ptr = ptr, .bytes = bytes, .tag = self.mem_tag };
     }
@@ -731,6 +734,7 @@ const FillPool = struct {
         }};
         try self.check(self.api.cuMemSetAccess.?(base + offset, size, &desc, 1), "cuMemSetAccess");
         self.device_used += size;
+        self.device_used_peak = @max(self.device_used_peak, self.device_used);
         // Without this the KV cache is the one big allocation NOT in the tag
         // breakdown: it bypasses `alloc`, so its bytes would sit inside
         // `device_used` under no tag at all and read as unattributed overhead.

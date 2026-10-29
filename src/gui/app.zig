@@ -278,7 +278,6 @@ fn pumpHost() void {
     const now = std.Io.Clock.real.now(g_io).nanoseconds;
     for (g_hosts.slots.items) |slot| {
         slot.mirror.pollFetches(now, slot, hosts.Slot.postCtx);
-        if (slot.mirror.takeDiffPeak()) |u| persistDiffPeak(u.peak, u.key);
         if (slot.mirror.takeErr()) |e| {
             std.log.warn("host {s}: {t}: {s}", .{ slot.name, e.code, e.text });
             if (e.text.len > 0) toast.post(.err, "{s}: {s}", .{ slot.name, e.text });
@@ -474,17 +473,6 @@ fn attachFromMirror(im: *const mirror.Image) void {
 fn clearStaged() void {
     for (g_staged.items) |st| g_gpa.free(st.rgba);
     g_staged.clearRetainingCapacity();
-}
-
-/// Persist the diffusion pipeline's measured peak residency, so the NEXT run's
-/// first image plans against a measurement instead of the file-size bootstrap.
-fn persistDiffPeak(peak: u64, key: u64) void {
-    g_config.diff_peak_resident = peak;
-    g_config.diff_peak_key = key;
-    g_config_baseline.diff_peak_resident = peak;
-    g_config_baseline.diff_peak_key = key;
-    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err|
-        std.log.warn("[vram] could not persist measured diffusion peak: {t}", .{err});
 }
 
 /// on_change: fired every drag-motion frame. The meter already mutated that

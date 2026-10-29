@@ -1576,6 +1576,8 @@ pub const Context = struct {
     device_heap: u32 = 0,
     /// Bytes we hold in buffers created through createBuffer.
     device_used: u64 = 0,
+    /// High-water of `device_used` since `resetUsedPeak`, what one stage really reached.
+    device_used_peak: u64 = 0,
     /// Per-component device-byte attribution (MEASURED, for the GUI VRAM meter);
     /// only maintained when `track_tags` is set (diffusion backend). `mem_tag` is
     /// applied to new device buffers; the pipeline sets it around each phase.
@@ -3348,6 +3350,7 @@ pub const Context = struct {
                 var db = db_raw;
                 db.tag = self.mem_tag;
                 self.device_used += size;
+                self.device_used_peak = @max(self.device_used_peak, self.device_used);
                 self.max_alloc_bytes = @max(self.max_alloc_bytes, size);
                 if (self.track_tags) self.mem_tag_used[@backingInt(self.mem_tag)] += size;
                 return db;
@@ -7162,6 +7165,13 @@ pub const Context = struct {
         return self.budgetHeadroom();
     }
 
+    /// High-water of `deviceUsed` since `resetUsedPeak`.
+    pub fn usedPeak(self: *const Context) u64 {
+        return self.device_used_peak;
+    }
+    pub fn resetUsedPeak(self: *Context) void {
+        self.device_used_peak = self.device_used;
+    }
     pub fn deviceUsed(self: *const Context) u64 {
         return self.device_used;
     }

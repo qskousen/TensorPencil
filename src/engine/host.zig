@@ -932,7 +932,6 @@ pub const Host = struct {
         self.emitCompletions();
         self.emitImages();
         self.emitTelemetry();
-        if (self.drv.takePeakUpdate()) |u| self.emit(.{ .diff_peak = .{ .peak = u.peak, .key = u.key } });
         if (self.drv.takeDiffNotice()) |text| {
             defer self.gpa.free(text);
             self.emit(.{ .notice = .{ .tone = .info, .text = text } });
@@ -1212,7 +1211,7 @@ pub const Host = struct {
             t.diff_dit = b.dit;
             t.diff_latent = b.latent;
             t.diff_vae = b.vae;
-            t.diff_off = d.offloadBytes();
+            t.diff_off = d.streamedBytes();
         }
         if (self.drv.uiSession()) |s| {
             t.llm_used = s.dev.deviceUsed();

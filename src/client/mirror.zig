@@ -291,7 +291,6 @@ pub const Call = struct {
 
 pub const HostErr = struct { code: wire.ErrCode, text: []u8 };
 pub const HostNotice = struct { tone: wire.Tone, text: []u8 };
-pub const PeakUpdate = struct { peak: u64, key: u64 };
 
 pub const Mirror = struct {
     gpa: std.mem.Allocator,
@@ -312,8 +311,6 @@ pub const Mirror = struct {
     /// The last informational notice, until the consumer takes it. One slot, as
     /// for `last_err`: the notices this carries are seconds apart at least.
     last_notice: ?HostNotice = null,
-    /// A grown diffusion peak to persist, until the consumer takes it.
-    diff_peak: ?PeakUpdate = null,
     /// Longest side a preview is fetched at (0 = full size). A view sets it to
     /// what it draws, so a 200 px tile does not move a 4 MiB frame.
     preview_max_edge: u32 = 0,
@@ -709,7 +706,6 @@ pub const Mirror = struct {
                 self.telemetry = t;
                 self.telemetry_seq += 1;
             },
-            .diff_peak => |p| self.diff_peak = .{ .peak = p.peak, .key = p.key },
             .err => |e| {
                 log.warn("host error {t}: {s}", .{ e.code, e.text });
                 if (self.last_err) |old| gpa.free(old.text);
@@ -865,11 +861,6 @@ pub const Mirror = struct {
         return n;
     }
 
-    pub fn takeDiffPeak(self: *Mirror) ?PeakUpdate {
-        const p = self.diff_peak orelse return null;
-        self.diff_peak = null;
-        return p;
-    }
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1287,6 +1278,4 @@ test "state strings are owned copies and errors are taken once" {
     defer testing.allocator.free(e.text);
     try testing.expectEqual(wire.ErrCode.no_model, e.code);
     try testing.expect(m.takeErr() == null);
-    try feed(&m, .{ .diff_peak = .{ .peak = 5, .key = 9 } });
-    try testing.expectEqual(@as(u64, 9), m.takeDiffPeak().?.key);
 }

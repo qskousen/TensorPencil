@@ -3998,7 +3998,7 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     defer cond.deinit(gpa);
     // Without it nothing pins, and a denoiser that does not fit beside the encoder
     // re-streams on every forward: the profile then times the transfer.
-    sess.armDenoiserResidency();
+    sess.armDenoiserResidency(null);
     const sigmas = try sess.schedule(gpa, 8, opts.shift);
     defer gpa.free(sigmas);
     const ds = sess.spatialDownscale();
@@ -12208,7 +12208,7 @@ fn loraSidecarBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: 
 
     var cond = try sess.encode(arena, opts.prompt, .{});
     defer cond.deinit(arena);
-    sess.armDenoiserResidency();
+    sess.armDenoiserResidency(null);
     const sigmas = try sess.schedule(arena, opts.steps, opts.shift);
     const ds = sess.spatialDownscale();
     const lat_h = size / ds;

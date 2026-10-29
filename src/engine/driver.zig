@@ -306,9 +306,6 @@ pub const Driver = struct {
     last_replan_ns: i96 = 0,
     /// The configured checkpoint's family, from the FILE (see `configuredFamily`).
     family_cache: ?model_spec.Cache = null,
-    /// A measured diffusion peak that grew past what `settings` recorded. The
-    /// owner takes it (`takePeakUpdate`) and persists it; the engine keeps no disk.
-    peak_update: ?u64 = null,
 
     /// In-place, because worker callbacks capture `self`. Panics on a second
     /// instance in the process.
@@ -972,37 +969,14 @@ pub const Driver = struct {
             defer self.session_mu.unlock(self.io);
             self.arbiter.diff_active = false;
         }
-        self.recordDiffPeak();
         self.applyMeterPolicy();
     }
 
-    /// Record the diffusion pipeline's measured peak residency when it grows, on
-    /// the queue-drain edge (once per batch, not per frame), so the NEXT session's
-    /// first image plans against a measurement instead of the file-size bootstrap.
-    /// The owner persists it (`takePeakUpdate`).
-    fn recordDiffPeak(self: *Driver) void {
-        const d = if (self.diffuser) |*x| x else return;
-        const peak = d.peakResident();
-        if (peak <= self.settings.diff_peak_resident) return;
-        const model = self.settings.diffusion_model.opt() orelse return;
-        self.settings.diff_peak_resident = peak;
-        self.settings.diff_peak_key = config.modelKey(model);
-        self.peak_update = peak;
-        log.info("[vram] measured diffusion peak {d} MiB (supersedes the checkpoint-size estimate)", .{peak >> 20});
-    }
-
-    /// A grown diffusion peak since the last call, with its model key, or null.
     /// A notice the diffusion worker left for the host to put on screen. Caller
     /// frees. See `diffuser.Diffuser.takeNotice`.
     pub fn takeDiffNotice(self: *Driver) ?[]u8 {
         if (self.diffuser) |*d| return d.takeNotice();
         return null;
-    }
-
-    pub fn takePeakUpdate(self: *Driver) ?struct { peak: u64, key: u64 } {
-        const p = self.peak_update orelse return null;
-        self.peak_update = null;
-        return .{ .peak = p, .key = self.settings.diff_peak_key };
     }
 
     fn vcBudget(ctx: *anyopaque) u64 {
@@ -1268,16 +1242,6 @@ pub const Driver = struct {
             // likely to be the one that does not fit.
             defer self.applyDiffusionOnlyPolicy();
             self.diffuser.?.seedBase(@truncate(@as(u96, @bitCast(std.Io.Clock.real.now(self.io).nanoseconds))));
-            // Carry the previously MEASURED peak residency across sessions, so the
-            // first image of a run sizes the LLM's eviction by what this pipeline
-            // actually costs instead of by what its checkpoints weigh. Keyed on the
-            // DiT path: a different model invalidates the figure.
-            if (c.diff_peak_resident != 0) {
-                if (c.diffusion_model.opt()) |m| {
-                    if (config.modelKey(m) == c.diff_peak_key)
-                        self.diffuser.?.seedPeakResident(c.diff_peak_resident);
-                }
-            }
             // Register the image model as an arbiter participant so a growing LLM can
             // reclaim its idle residency. The participant borrows the engine;
             // `freeDiffuser` drops it before teardown. `diff_mu` because the LLM's

@@ -654,9 +654,11 @@ pub const Diffuser = struct {
     /// both participants have the same shape (and a future step-boundary poll is a
     /// fill-in, not a re-architecture).
     control: tp.vram.ControlPoint = .{},
-    /// High-water of MEASURED resident bytes, across generations. Supersedes the
-    /// checkpoint-file estimate in `vpDemand` as soon as one image has run.
-    peak_resident: std.atomic.Value(u64) = .init(0),
+    /// `pipeline.coldResidencyNeed` for the configured files, what `vpDemand`
+    /// answers while no pipeline is loaded. Refreshed by `requestPaths`; 0 until
+    /// the first one, or when the files could not be read, which the arbiter
+    /// treats as "size unknown" and falls back to the queue's entitlement.
+    cold_need: std.atomic.Value(u64) = .init(0),
 
     /// Why the last model LOAD failed, so the UI can say what went wrong instead
     /// of showing a bare "failed" per image. Stored as `@intFromError` (0 = no
@@ -1158,14 +1160,7 @@ pub const Diffuser = struct {
     /// Device VRAM (bytes) the resident diffusion model actually holds; 0 when
     /// none is loaded.
     pub fn vramBytes(self: *Diffuser) u64 {
-        const v = if (self.session.load(.acquire)) |s| s.deviceUsed() else 0;
-        // High-water it HERE rather than in the arbiter's `usage` hook: the arbiter
-        // only samples on plan events, and there is no plan event between "pipeline
-        // loaded" and "queue drained", so it would record the pre-load 0 and miss
-        // the peak entirely. The status bar samples this every 500 ms throughout a
-        // generation, which is what actually catches it.
-        self.notePeak(v);
-        return v;
+        return if (self.session.load(.acquire)) |s| s.deviceUsed() else 0;
     }
 
     /// MEASURED per-component VRAM breakdown (TE / DiT / VAE / latent) for the
@@ -1179,36 +1174,15 @@ pub const Diffuser = struct {
     }
 
     pub fn vramBreakdown(self: *Diffuser) VramBreakdown {
-        const b: VramBreakdown = if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
-        // Same high-water as `vramBytes`, because THIS is the accessor the status
-        // bar polls every 500 ms, and that poll is the only thing sampling us
-        // mid-generation, i.e. the only thing that ever sees the peak. Recording it
-        // only in `vramBytes` left the figure at its pre-load 0.
-        self.notePeak(b.total());
-        return b;
+        return if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
     }
 
-    /// Pipeline bytes NOT on the card: what this model held when it last ran
-    /// unconstrained, minus what it holds now. Those weights live in host RAM and
-    /// re-upload over PCIe as each step touches them, which is what makes a
-    /// squeezed image model slow. 0 while fully resident, and 0 before the first
-    /// image (nothing has been measured to compare against).
-    ///
-    /// Deliberately the same two numbers the arbiter plans with (`vpDemand` minus
-    /// `vpUsage`), not a second estimate: the bar then shows what the policy
-    /// believes, so a figure that looks wrong on screen is the planner being
-    /// wrong, not the display disagreeing with it. Inherits `vpDemand`'s limit,
-    /// the peak is a high-water, so an image model that has ONLY ever run
-    /// squeezed reads 0 until a roomier image teaches it better.
-    pub fn offloadBytes(self: *Diffuser) u64 {
-        if (self.session.load(.acquire) == null) return 0; // unloaded, not offloaded
-        return self.peak_resident.load(.monotonic) -| self.vramBytes();
-    }
-
-    /// High-water the measured resident footprint. Called from every residency
-    /// accessor so the peak is caught wherever it happens to be observed.
-    fn notePeak(self: *Diffuser, v: u64) void {
-        if (v > self.peak_resident.load(.monotonic)) self.peak_resident.store(v, .monotonic);
+    /// Denoiser bytes NOT pinned on the card: what re-uploads over PCIe as each
+    /// step touches it, which is what makes a squeezed image model slow. 0 while
+    /// fully resident and 0 with nothing loaded. The pipeline's own count, so a
+    /// figure that looks wrong on screen is the pin that is wrong.
+    pub fn streamedBytes(self: *Diffuser) u64 {
+        return if (self.session.load(.acquire)) |s| s.streamedDenoiserBytes() else 0;
     }
 
     /// Free resident diffusion weights to fit `budget` bytes, the GUI VRAM
@@ -1268,32 +1242,25 @@ pub const Diffuser = struct {
         const self = fromCtx(ctx);
         if (!self.res_mu.tryLock()) return 0;
         defer self.res_mu.unlock(self.io);
-        return self.vramBytes(); // high-waters `peak_resident` internally
+        return self.vramBytes();
     }
-    /// Footprint if nothing contended.
-    ///
-    /// MEASURED once an image has run: the high-water of `vramBytes()`. The
-    /// checkpoint-file-size estimate below is only a bootstrap for the very first
-    /// image, and it is a poor one, it counts bytes that never become resident
-    /// (the pipeline drops the text encoder when the DiT working set won't fit
-    /// alongside it). Measured on krea2: files 18961 MiB vs 13052 MiB actually
-    /// resident, and since the arbiter turns this number into the LLM's eviction
-    /// target, those 6 GiB of phantom demand pushed ~20 extra layers to the host
-    /// for memory the image model never used.
-    ///
-    /// Still nonzero before the first load, deliberately: a diffuser that read as
-    /// "wants nothing" would let the LLM plan to keep the whole card and then have
-    /// nowhere to load into. `Participant.demand` maxes this with live usage, so an
-    /// under-estimate can never shrink below what is actually resident.
+    /// Footprint if nothing contended: what the pipeline computes it needs to
+    /// render the next image at the current size without streaming
+    /// (`pipeline.Session.residencyNeed`), or the same formula over the files'
+    /// headers while nothing is loaded. Computed, never a high-water of what it
+    /// held: an image model only ever holds what it was last allowed, so a
+    /// measurement there is the previous ceiling handed back as the next demand.
     fn vpDemand(ctx: *anyopaque) u64 {
         const self = fromCtx(ctx);
-        const peak = self.peak_resident.load(.monotonic);
-        return if (peak != 0) peak else self.estimateResidentBytes();
+        if (!self.res_mu.tryLock()) return self.cold_need.load(.monotonic); // see `vpUsage`
+        defer self.res_mu.unlock(self.io);
+        if (self.session.load(.acquire)) |s| return s.residencyNeed(self.opts.width, self.opts.height).total();
+        return self.cold_need.load(.monotonic);
     }
-    /// No standing transient reservation. The pipeline sizes each stage against
-    /// live free VRAM and has its own reclaim ladder (`vcReclaim` -> tiling ->
-    /// CPU), so room it needs above its residency it asks for at the time. The
-    /// LLM cannot do that, which is why only the LLM reports headroom.
+    /// Nothing above `demand`: the room a forward takes is inside it (the pipeline's
+    /// pin reserve and its measured working set), and what a decode needs beyond
+    /// that it asks for at the time through its own reclaim ladder. The LLM cannot
+    /// do that, which is why only the LLM reports headroom.
     fn vpHeadroom(_: *anyopaque) u64 {
         return 0;
     }
@@ -1346,65 +1313,18 @@ pub const Diffuser = struct {
         return .{ .ctx = self, .control = &self.control, .vtable = &vp_vtable };
     }
 
-    /// Bootstrap estimate of the pipeline's PEAK resident footprint, for a model
-    /// no image has run on yet. Superseded by `peak_resident` the moment one has.
-    ///
-    /// Deliberately EXCLUDES the text encoder. It is the largest checkpoint on
-    /// disk here (4999 MiB) but is transient by construction, it encodes the
-    /// prompt once and its weights are then droppable, so at the actual peak it
-    /// holds 52 MiB. Counting it made the estimate 18961 MiB against a measured
-    /// 13055, and since the arbiter turns this into the LLM's eviction target
-    /// those 5.9 GiB of phantom demand evicted every layer on the first image.
-    /// DiT + VAE gives 13961, within ~900 MiB of the truth.
-    ///
-    /// Erring LOW is the right direction: an under-estimate means the LLM keeps
-    /// more and the pipeline reclaims reactively (`vcReclaim` / the OOM ladder),
-    /// whereas an over-estimate is an eviction that was never needed.
-    /// A BUNDLED checkpoint therefore over-counts by its text encoder, which the
-    /// separate-file case deliberately excludes: the file size is all we have, and
-    /// it cannot be broken down per component without parsing the header. Erring
-    /// high here is the wrong direction (it over-evicts the LLM on the first
-    /// image), but it self-corrects after one generation, `peak_resident`
-    /// supersedes this the moment a real measurement exists.
-    pub fn estimateResidentBytes(self: *Diffuser) u64 {
-        // Foreign thread: the paths are `requestPaths`'s to replace, so they are
-        // copied out under the lock and statted outside it. Declining rather
-        // than blocking is this engine's rule for a foreign caller, and erring
-        // low is the safe direction (see above).
-        var buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
-        var paths: [2][]const u8 = .{ "", "" };
-        {
-            if (!self.res_mu.tryLock()) return 0;
-            defer self.res_mu.unlock(self.io);
-            // An unset override contributes nothing (its component is inside the
-            // primary checkpoint, already counted).
-            for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path }, 0..) |p, i| {
-                if (p.len == 0 or p.len > buf[i].len) continue;
-                @memcpy(buf[i][0..p.len], p);
-                paths[i] = buf[i][0..p.len];
-            }
-        }
-        var total: u64 = 0;
-        for (paths) |p| {
-            if (p.len == 0) continue;
-            const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
-            total += st.size;
-        }
-        return total;
-    }
-
-    /// Seed the measured high-water from a previous session (see
-    /// `Config.diff_peak_resident`). Ignored if a bigger figure is already known.
-    pub fn seedPeakResident(self: *Diffuser, bytes: u64) void {
-        if (bytes > self.peak_resident.load(.monotonic)) self.peak_resident.store(bytes, .monotonic);
-    }
-
-    /// The measured peak, for persisting. 0 when no image has run yet. Samples
-    /// once more on the way out so a caller at the drain edge still records
-    /// something even if nothing polled us during the generation.
-    pub fn peakResident(self: *Diffuser) u64 {
-        self.notePeak(self.vramBytes());
-        return self.peak_resident.load(.monotonic);
+    /// Recompute `cold_need` for the configured files. Engine thread, outside
+    /// `res_mu`: it reads two headers, and a foreign reader that finds the lock
+    /// taken answers 0 for the whole of that.
+    fn refreshColdNeed(self: *Diffuser) void {
+        const need = pipeline.coldResidencyNeed(self.gpa, self.io, self.opts.dit_path, self.opts.vae_path) catch |err| {
+            std.log.warn("[vram] diffusion need unknown until the model loads ({t} reading its headers)", .{err});
+            self.cold_need.store(0, .monotonic);
+            return;
+        };
+        self.cold_need.store(need.total(), .monotonic);
+        var buf: [96]u8 = undefined;
+        std.log.info("[vram] diffusion predicted (cold): {s}", .{need.render(&buf)});
     }
 
     /// Update the default generation params (from settings). Only touched when
@@ -1485,8 +1405,8 @@ pub const Diffuser = struct {
     /// a text encoder, with no type error to catch it.
     pub fn requestPaths(self: *Diffuser, want: ModelConfig, taew: ?[]const u8) void {
         {
-            // Under `res_mu`: `estimateResidentBytes` reads these same slices
-            // from the LLM's worker thread. The arena is reset only when the
+            // Under `res_mu`: `vpDemand` reads these same slices from the
+            // LLM's worker thread. The arena is reset only when the
             // queue is idle — a running worker holds `opts.taew_path` and, for
             // an image with no snapshot, its paths, for the whole render — so a
             // switch made mid-render costs a few hundred bytes until the next
@@ -1518,6 +1438,7 @@ pub const Diffuser = struct {
             self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
         }
         self.dropStaleSession(); // takes `res_mu` itself
+        self.refreshColdNeed();
     }
 
     /// Free the resident pipeline when it's loaded for a config the current
@@ -2067,6 +1988,47 @@ test "loadError/loadedFamily round-trip through their atomic encodings" {
         d.loaded_family.store(@as(u8, @backingInt(fam)) + 1, .release);
         try std.testing.expectEqual(@as(?pipeline.Family, fam), d.loadedFamily());
     }
+}
+
+// The arbiter plans the LLM's eviction against this figure before any pipeline
+// exists, so it has to be the need computed from the files' headers, never their
+// sizes, and an unreadable file has to read as unknown rather than as a stale one.
+test "cold demand is the computed need from the files' headers, and unknown when they cannot be read" {
+    const nop = struct {
+        fn f() void {}
+    }.f;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var buf: [8 + header.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], header.len, .little);
+    @memcpy(buf[8..][0..header.len], header);
+    @memset(buf[8 + header.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dit.safetensors", .data = &buf });
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const path = try std.Io.Dir.path.join(gpa, &.{ dir_path, "dit.safetensors" });
+    defer gpa.free(path);
+
+    var d = Diffuser.init(gpa, io, nop, .{ .dit_path = "" }, VramCoordinator.none);
+    defer d.deinit();
+    try std.testing.expectEqual(@as(u64, 0), d.participant().demand());
+    const cfg: ModelConfig = .{ .dit_path = path, .vae_path = "", .text_encoder_path = "", .text_encoder_2_path = "", .backend = .zig_cuda, .vae_decode = .auto };
+    d.requestPaths(cfg, null);
+    const need = try pipeline.coldResidencyNeed(gpa, io, path, "");
+    errdefer std.debug.print("need {d} demand {d}\n", .{ need.total(), d.participant().demand() });
+    try std.testing.expectEqual(need.total(), d.participant().demand());
+    // The payload, not the file (8 + header + payload bytes), plus the reserve.
+    try std.testing.expectEqual(@as(u64, 4), need.weights);
+    try std.testing.expect(need.scratch > buf.len);
+
+    var missing = cfg;
+    missing.dit_path = "/nonexistent/dit.safetensors";
+    std.testing.log_level = .err; // the missing file is warned about; a passing test prints nothing
+    d.requestPaths(missing, null);
+    try std.testing.expectEqual(@as(u64, 0), d.participant().demand());
 }
 
 // The failure reason has to survive the trip from the worker thread to the tile

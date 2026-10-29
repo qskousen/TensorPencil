@@ -553,9 +553,6 @@ pub const Event = union(enum) {
         bad_folders: u32 = 0,
         json: []const u8 = "",
     },
-    /// The image pipeline measured a bigger peak than the settings recorded.
-    /// The client persists it against the model key; the host keeps no disk.
-    diff_peak: struct { peak: u64 = 0, key: u64 = 0 },
     err: struct { code: ErrCode = .internal, text: []const u8 = "" },
     /// Something worth saying that is not a failure: a host-side wait the user
     /// would otherwise read as a hang. The client shows it and keeps nothing.

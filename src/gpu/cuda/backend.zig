@@ -248,6 +248,11 @@ pub const WeightNoise = @import("../weight_noise.zig").WeightNoise;
 /// `dual-cuda-test` measures the two.
 pub var rms_dual: bool = true;
 
+/// Attention scratch (S+P) a backend starts with. Public because the pipeline's
+/// cold residency estimate has to assume the same reserve the pin site keeps
+/// under its budget (`armDenoiserResidency`), before any backend exists.
+pub const default_attn_scratch_budget: usize = 2 << 30;
+
 pub const Backend = struct {
     ctx: *Context,
     gpa: std.mem.Allocator,
@@ -614,7 +619,7 @@ pub const Backend = struct {
     /// the extra softmax S reads (the Vulkan-parity win). Off = the materialized
     /// softmax_row_f16 -> P -> hgemm_batched path (kept as the A/B reference).
     attn_fused: bool = true,
-    attn_scratch_budget: usize = 2 << 30, // 2 GiB for S+P
+    attn_scratch_budget: usize = default_attn_scratch_budget,
 
     // eltwise module cache: PTX string pointer -> function.
     elt_fns: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
@@ -1245,6 +1250,14 @@ pub const Backend = struct {
 
     pub fn deviceUsed(self: *Backend) u64 {
         return self.ctx.device_used;
+    }
+
+    /// High-water of `deviceUsed` since `resetUsedPeak`.
+    pub fn usedPeak(self: *Backend) u64 {
+        return self.ctx.device_used_peak;
+    }
+    pub fn resetUsedPeak(self: *Backend) void {
+        self.ctx.device_used_peak = self.ctx.device_used;
     }
 
     /// Bytes held by UNPINNED cached weights, i.e. VRAM that will free itself

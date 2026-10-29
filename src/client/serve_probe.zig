@@ -1,4 +1,5 @@
 //! `zig build serve-probe -- --config <file> [--message <text>] [--image <prompt>]
+//! [--then-image <prompt>]
 //! [--complete <idea> [--think] [--cancel]] [--kill-mid-turn [<deltas>]] [--timeout <s>]
 //! [--socket <path>]`: what
 //! `driver-probe` does, through a tp-serve process over the socket. Without
@@ -38,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg_path: ?[]const u8 = null;
     var message: ?[]const u8 = null;
     var image: ?[]const u8 = null;
+    var then_image: ?[]const u8 = null;
     var socket: ?[]const u8 = null;
     var kill_after: ?u32 = null;
     var idea: ?[]const u8 = null;
@@ -55,6 +57,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--image") and i + 1 < args.len) {
             i += 1;
             image = args[i];
+        } else if (std.mem.eql(u8, args[i], "--then-image") and i + 1 < args.len) {
+            // Enqueued once the completion is answered: the studio's Expand flow,
+            // where a render waits for the prompt the chat model writes.
+            i += 1;
+            then_image = args[i];
         } else if (std.mem.eql(u8, args[i], "--socket") and i + 1 < args.len) {
             i += 1;
             socket = args[i];
@@ -83,6 +90,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("serve-probe: --config is required (never the real settings file)\n", .{});
         return error.BadArgs;
     };
+    if (then_image != null and (idea == null or image != null)) {
+        std.debug.print("serve-probe: --then-image needs --complete and excludes --image\n", .{});
+        return error.BadArgs;
+    }
     if (idea != null and kill_after != null) {
         std.debug.print("serve-probe: --complete and --kill-mid-turn are separate runs\n", .{});
         return error.BadArgs;
@@ -132,15 +143,20 @@ pub fn main(init: std.process.Init) !void {
     var hold_message = idea != null and message != null;
     var cancel_pending = cancel;
     if (message) |m| if (!hold_message) remote.postRequest(.{ .chat_submit = .{ .text = m } });
-    if (image) |p| remote.postRequest(.{ .img_enqueue = .{
-        .client_ref = 1,
-        .prompt = p,
-        .width = @intCast(cfg.width),
-        .height = @intCast(cfg.height),
-        .steps = @intCast(cfg.steps),
-        .seed = 1234,
-        .from_studio = true,
-    } });
+    const enqueue = struct {
+        fn f(r: *Remote, c: *const config.Config, p: []const u8) void {
+            r.postRequest(.{ .img_enqueue = .{
+                .client_ref = 1,
+                .prompt = p,
+                .width = @intCast(c.width),
+                .height = @intCast(c.height),
+                .steps = @intCast(c.steps),
+                .seed = 1234,
+                .from_studio = true,
+            } });
+        }
+    }.f;
+    if (image) |p| enqueue(remote, &cfg, p);
 
     // The client's copy of the host, as tp-gui keeps one; what a reconnect
     // hands back.
@@ -149,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
 
     var want_turn = message != null;
     var want_completion = idea != null;
-    var want_image = image != null;
+    var want_image = image != null or then_image != null;
     var image_id: wire.ImageId = 0;
     var want_pixels = false;
     var failed = false;
@@ -218,6 +234,10 @@ pub fn main(init: std.process.Init) !void {
                         },
                         .llm_completion => |c| if (c.ref == complete_ref) {
                             want_completion = false;
+                            if (then_image) |p| {
+                                try out.writeAll("{\"probe\":\"prompt written; enqueueing the render\"}\n");
+                                enqueue(remote, &cfg, p);
+                            }
                             if (cancel) {
                                 if (!std.mem.eql(u8, c.err, "Stopped")) failed = true;
                             } else if (c.err.len > 0 or c.text.len == 0) failed = true;

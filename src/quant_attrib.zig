@@ -244,7 +244,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
     // Reference: the dense model's own trajectory, through the same Mix path every arm takes.
     try mix.select(gpa, &.{});
     try sess.replaceDenoiser(mix.store());
-    sess.armDenoiserResidency();
+    sess.armDenoiserResidency(null);
     const snaps = try arena.alloc(Snapshot, opts.prompts.len * opts.steps);
     {
         const x = try gpa.alloc(f32, lat_len);
@@ -277,7 +277,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, opts: Options) !void
         fn f(s: *pipeline.Session, g: std.mem.Allocator, a: std.mem.Allocator, m: *Mix, layers: []const []const u8, prompts: []const []const u8, c: []pipeline.Cond, sn: []const Snapshot, sg: []const f32, sh: pipeline.LatentShape) ![]Point {
             try m.select(g, layers);
             try s.replaceDenoiser(m.store());
-            s.armDenoiserResidency();
+            s.armDenoiserResidency(null);
             const pts = try a.alloc(Point, sn.len);
             const v = try g.alloc(f32, sh.elems());
             defer g.free(v);

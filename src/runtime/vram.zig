@@ -332,8 +332,8 @@ pub const Participant = struct {
         /// fails, so nothing reactive fires either. How many layers strand is
         /// `transient / bytes-per-layer`, which on a 1-bit 27B (~60 MiB/layer)
         /// against a ~1 GiB image-prefill buffer is most of the back half of the
-        /// model, running on the CPU. Diffusion reports 0: it has its own reclaim
-        /// ladder and re-uploads per image.
+        /// model, running on the CPU. Diffusion reports 0: its pin reserve is
+        /// inside its demand, and the rest it asks for at the time.
         headroom: *const fn (ctx: *anyopaque) u64,
         /// Bytes that cannot be evicted (LLM: committed KV; diffusion: its whole
         /// working set while an image is in flight, since mid-image eviction
@@ -567,15 +567,15 @@ pub const Arbiter = struct {
         // share whether or not we can size the image model yet, this is the whole
         // meaning of the split handle. Floored rather than measured because at the
         // queue-start edge the pipeline is not loaded (`usage` is 0) and the
-        // estimate behind `demand` reads checkpoint file sizes, which can fail; a
+        // need behind `demand` is read from checkpoint headers, which can fail; a
         // demand of 0 there would read as "no contention" and leave the LLM holding
         // the entire card for the image model to load into.
         // An IDLE image model demands only what it is actually holding. Its
-        // `demand` is an estimate from CHECKPOINT FILE SIZES, which is right when
-        // a queue is about to load the pipeline and badly wrong otherwise: a
-        // merely-configured diffuser reported ~17 GiB it did not hold, every plan
-        // read as contended, and arm (4) then computed `d = limit - the LLM's
-        // need` and `l = limit - d`, pinning its ceiling to EXACTLY that need.
+        // `demand` is what the NEXT image needs, which is right when a queue is
+        // about to load the pipeline and badly wrong otherwise: a merely-configured
+        // diffuser reported ~17 GiB it did not hold, every plan read as contended,
+        // and arm (4) then computed `d = limit - the LLM's need` and
+        // `l = limit - d`, pinning its ceiling to EXACTLY that need.
         // With no headroom above demand the first transient prefill allocation
         // (measured: a 1.1 GiB dequant buffer) had nowhere to go and OOM'd, which
         // offloaded layers, which is the eviction churn this whole path exists to
@@ -588,7 +588,11 @@ pub const Arbiter = struct {
         // complement so a queue that hasn't loaded yet still reads as contention;
         // but where we hand diffusion only its need (arm 3), inflating it would
         // evict far more of the LLM than the image model will ever use. Fall back
-        // to the entitlement when the estimate is genuinely unavailable.
+        // to the entitlement when the need is genuinely unavailable. Everything
+        // arm 3 does rides on that need being computed, not measured: an image
+        // model only ever holds what it was last allowed, so a high-water of its
+        // usage hands the previous ceiling back as the next demand and the LLM
+        // keeps the difference while the denoiser streams.
         const d_want: u64 = if (d_raw != 0) d_raw else d_dem;
 
         const l_busy = if (self.llm) |p| p.busy() else false;
@@ -917,11 +921,11 @@ pub const Arbiter = struct {
     /// leaves once the LLM is at its planned target, so it agrees with what
     /// `rebalance` is driving the LLM toward. One formula, not two: reading the LLM's
     /// live usage in one place and its planned share in another makes them disagree.
-    /// Deliberately the *allowance* rather than `plan.diffusion`,
-    /// diffusion's own `demand` is an estimate from file sizes, and an estimate
-    /// that undershoots the real resident size would pin part of the image model
-    /// and stream the rest. Floored so a tiny allowance still streams rather than
-    /// reading as the AUTO sentinel.
+    /// Deliberately the *allowance* rather than `plan.diffusion`: an allowance
+    /// that undershoots the real resident size pins part of the image model and
+    /// streams the rest, and the room the LLM does not need is the most there is
+    /// to give. Floored so a tiny allowance still streams rather than reading as
+    /// the AUTO sentinel.
     ///
     /// With no plan (`limit == 0`: `setBudgets` never ran because there is no LLM
     /// session for the meter policy to resolve against, i.e. pure image-studio
