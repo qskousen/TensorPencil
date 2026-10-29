@@ -4348,13 +4348,67 @@ pub fn residencyNeedFrom(dit_payload: u64, vae_payload: u64, reserve: u64, worki
 pub fn coldResidencyNeed(gpa: std.mem.Allocator, io: std.Io, dit_path: []const u8, vae_path: []const u8) !vram.Bytes {
     var dit = try Container.openHeader(gpa, io, dit_path);
     defer dit.deinit();
+    const dit_payload: u64 = if (detectFamily(dit.store())) |fam| denoiserBytesIn(&dit, fam) else |_| dit.payloadLen();
     var vae_payload: u64 = 0;
     if (vae_path.len > 0) {
         var v = try Container.openHeader(gpa, io, vae_path);
         defer v.deinit();
         vae_payload = v.payloadLen();
     }
-    return residencyNeedFrom(dit.payloadLen(), vae_payload, cuda.backend.default_attn_scratch_budget + reserve_margin, 0);
+    return residencyNeedFrom(dit_payload, vae_payload, cuda.backend.default_attn_scratch_budget + reserve_margin, 0);
+}
+
+/// The denoiser's tensor bytes in `st`: those under the first of the family's
+/// denoiser prefixes whose probe answers, or the whole payload when none does.
+fn denoiserBytesIn(st: *const Container, fam: Family) usize {
+    const own = componentPayloadLen(st.store(), fam, .denoiser);
+    return if (own == 0) st.payloadLen() else @intCast(own);
+}
+
+/// Tensor-data bytes of `comp` inside `store`, under the first of the family's
+/// prefixes whose probe is present. 0 when no prefix answers.
+fn componentPayloadLen(store: weights_mod.WeightStore, fam: Family, comp: Component) u64 {
+    const spec = componentSpec(fam, comp) catch return 0;
+    var buf: [256]u8 = undefined;
+    const prefix: []const u8 = outer: for (spec.prefixes) |p| {
+        for (spec.probes) |probe| {
+            const full = std.mem.print(&buf, "{s}{s}", .{ p, probe }) catch continue;
+            if (store.get(full) != null) break :outer p;
+        }
+    } else return 0;
+    var total: u64 = 0;
+    for (store.names()) |n| if (std.mem.startsWith(u8, n, prefix)) {
+        if (store.get(n)) |v| {
+            // An f32 weight lives on the device as its 16-bit GEMM operand copy;
+            // counting the file's bytes read an f32 SD1.5 as half streamed.
+            const bytes = v.info.end - v.info.start;
+            total += if (v.info.dtype == .f32) bytes / 2 else bytes;
+        }
+    };
+    return total;
+}
+
+test "componentPayloadLen counts the denoiser's tensors alone in a bundled checkpoint" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An LDM-style bundle: the UNet stem (SD1.5's probe) beside a VAE tensor.
+    const header = "{\"model.diffusion_model.input_blocks.0.0.weight\":{\"dtype\":\"F32\",\"shape\":[3],\"data_offsets\":[0,12]}," ++
+        "\"model.diffusion_model.out.2.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[12,20]}," ++
+        "\"first_stage_model.decoder.conv_in.weight\":{\"dtype\":\"F32\",\"shape\":[5],\"data_offsets\":[20,40]}}";
+    var buf: [8 + header.len + 40]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], header.len, .little);
+    @memcpy(buf[8..][0..header.len], header);
+    @memset(buf[8 + header.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bundle.safetensors", .data = &buf });
+    var c = try Container.openHeaderIn(std.testing.allocator, io, tmp.dir, "bundle.safetensors");
+    defer c.deinit();
+    // f32 tensors count at their 16-bit device size: 20 file bytes read as 10.
+    try std.testing.expectEqual(@as(u64, 10), componentPayloadLen(c.store(), .sd15, .denoiser));
+    try std.testing.expectEqual(@as(u64, 10), componentPayloadLen(c.store(), .sd15, .decoder));
+    try std.testing.expectEqual(@as(u64, 0), componentPayloadLen(c.store(), .krea2, .denoiser)); // no krea2 probe here
+    try std.testing.expectEqual(@as(usize, 10), denoiserBytesIn(&c, .sd15));
+    try std.testing.expectEqual(@as(usize, 40), denoiserBytesIn(&c, .krea2)); // the whole file when nothing answers
 }
 
 /// Payload bytes of a model set's side container named `field`, whatever type
@@ -4426,6 +4480,10 @@ pub const Session = struct {
     /// VRAM arbiter reads them from other threads (`residencyNeed`).
     ws_key: std.atomic.Value(u64) = .init(0),
     ws_bytes: std.atomic.Value(u64) = .init(0),
+    /// Weight bytes re-uploaded during the last sampling step after the first,
+    /// what streaming costs each step. 0 before step 2 and on Vulkan, which keeps
+    /// no upload count.
+    step_upload: std.atomic.Value(u64) = .init(0),
     /// Where each component came from, recorded by `resolve` at load. A defaulted
     /// side path the checkpoint overrode is not what ran, so metadata asks this.
     sources: Sources = .initFill(.none),
@@ -5100,18 +5158,15 @@ pub const Session = struct {
     }
 
     /// Payload bytes of the denoiser's container, for the VRAM meter.
+    /// The denoiser's own tensor bytes in its container: a bundled checkpoint
+    /// carries the encoder and decoder beside it, and counting those pinned the
+    /// whole file against the peer and read as streaming on the meter.
     fn denoiserPayloadLen(self: *const Session) usize {
-        return switch (self.models) {
-            .krea2 => |*m| m.dit_st.payloadLen(),
-            .zimage => |*m| m.dit_st.payloadLen(),
-            .anima => |*m| m.dit_st.payloadLen(),
-            .minimax_h3 => |*m| m.dit_st.payloadLen(),
-            .sensenova => |*m| m.dit_st.payloadLen(),
-            .mageflow => |*m| m.dit_st.payloadLen(),
-            .moss_image => |*m| m.dit_st.payloadLen(),
-            .qwen_image21 => |*m| m.dit_st.payloadLen(),
-            .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
+        const st: *const Container = switch (self.models) {
+            .sd15, .sdxl => |*m| &m.unet_st,
+            inline else => |*m| &m.dit_st,
         };
+        return denoiserBytesIn(st, self.family());
     }
 
     /// Tensor-data bytes of the decoder's own file; 0 when it came out of the
@@ -5142,22 +5197,24 @@ pub const Session = struct {
         return residencyNeedFrom(self.denoiserPayloadLen(), self.decoderPayloadLen(), self.pinReserve(), ws);
     }
 
-    /// What it holds, in `residencyNeed`'s terms: the weight cache (pinned and
-    /// streamed) and everything else.
+    /// What it holds, in `residencyNeed`'s terms: the weights it keeps (pinned)
+    /// and everything else but the opportunistic cache, which the need excludes
+    /// by design and which stays only while nothing wants the room.
     pub fn residencyHave(self: *const Session) vram.Bytes {
-        const used = self.deviceUsed();
-        const w = self.cachedWeightBytes();
-        return .{ .weights = w, .scratch = used -| w };
+        const pinned = if (self.cu_be) |b| b.pinnedWeightBytes() else if (self.gpu_ctx) |c| c.pinnedWeightBytes() else 0;
+        return .{ .weights = pinned, .scratch = self.deviceUsed() -| self.cachedWeightBytes() };
     }
 
-    /// Denoiser bytes NOT cached on the device, what re-uploads as a step touches
-    /// it. 0 with nothing loaded. The cache is pinned denoiser bytes plus the
-    /// unpinned entries, which are mostly denoiser too once sampling starts (the
-    /// encoder and decoder are small beside it), so this reads a little low while
-    /// those are resident, never high.
+    /// Weight bytes the last sampling step re-uploaded, what streaming costs per
+    /// step. Measured, not derived from the cache: a payload byte the cache does
+    /// not hold may be one no step reads, and one of those read 1.5 GB of a
+    /// krea2 as "streamed" while the steps ran at the free card's speed.
     pub fn streamedDenoiserBytes(self: *const Session) u64 {
-        if (self.cu_be == null and self.gpu_ctx == null) return 0;
-        return self.denoiserPayloadLen() -| self.cachedWeightBytes();
+        return self.step_upload.load(.acquire);
+    }
+
+    fn weightUploads(self: *const Session) u64 {
+        return if (self.cu_be) |b| b.weightUploadBytes() else 0;
     }
 
     fn cachedWeightBytes(self: *const Session) u64 {
@@ -8228,25 +8285,27 @@ pub const Session = struct {
         }
     }
 
-    /// After the first step the working set is measured, and a budget sized before
-    /// it existed can be short of keeping the whole denoiser cached: the physical
-    /// pin floor refused the last pins once the activations took the reserve, and
-    /// the cache evicts what it then streams. Ask the peer once for the difference
-    /// so the remaining steps run without re-uploads. The next image at this size
-    /// plans with the measurement and needs no asking.
+    /// After the second step the working set is measured and what step 2
+    /// re-uploaded is known, and a budget sized before either existed can be
+    /// short of keeping the whole denoiser cached: the physical pin floor refused
+    /// the last first-touch pins once the activations took the reserve, and what
+    /// it refused streams. Ask the peer once for the difference so the remaining
+    /// steps run without re-uploads. The next image at this size plans with the
+    /// measurement and needs no asking.
     fn topUpDenoiserResidency(self: *Session, reclaim: ?Reclaim, working_set: u64) void {
         const b = self.cu_be orelse return;
         if (b.min_weights or b.budget_override == 0) return;
         const r = reclaim orelse return;
         const want = self.denoiserPayloadLen() + working_set + reserve_margin;
-        if (b.budget_override >= want) return;
-        const short = want - b.budget_override;
+        const streamed = self.streamedDenoiserBytes();
+        const short = @max(want -| b.budget_override, if (streamed > 0) streamed + reserve_margin else 0);
+        if (short == 0) return;
         const got = r.call(r.ctx, short);
         b.bindThread(); // the peer's rung binds its own context
         if (got == 0) return;
         b.budget_override += got;
-        std.log.info("[diff-vram] working set {d}MB measured after step 1, {d}MB short of keeping the denoiser cached: the peer yielded {d}MB -> budget {d}MB", .{
-            working_set >> 20, short >> 20, got >> 20, b.budget_override >> 20,
+        std.log.info("[diff-vram] after step 2: working set {d}MB, {d}MB re-uploaded in the step, {d}MB short of keeping the denoiser cached: the peer yielded {d}MB -> budget {d}MB", .{
+            working_set >> 20, streamed >> 20, short >> 20, got >> 20, b.budget_override >> 20,
         });
     }
 
@@ -10741,6 +10800,7 @@ pub const Session = struct {
             const preview_active = opts.on_step != null and (opts.preview or opts.preview_live != null);
             // Peak of the per-image working set over the steps (see `ws_bytes`).
             var ws_peak: u64 = 0;
+            self.step_upload.store(0, .release);
 
             // Scratch for the per-step latent2rgb preview (latent resolution RGB8).
             const preview_scratch: ?[]u8 = if (preview_active)
@@ -10853,6 +10913,7 @@ pub const Session = struct {
                     },
                 };
                 const start = std.Io.Clock.real.now(io);
+                const uploads_before = self.weightUploads();
                 try den.predictAt(gpa, v, x, sigmas[i], i, opts.cancel);
                 step_model.step = i;
                 try stepper.step(x, v, sigmas, i, .{ .ctx = &step_model, .predictFn = StepModel.predict });
@@ -10865,7 +10926,9 @@ pub const Session = struct {
                 // sampler one.
                 traceStep(i, v, x);
                 ws_peak = @max(ws_peak, self.liveWorkingSet());
-                if (i == 0) self.topUpDenoiserResidency(opts.reclaim, ws_peak);
+                // Step 1 uploads everything once; from step 2 an upload is a re-upload.
+                if (i >= 1) self.step_upload.store(self.weightUploads() - uploads_before, .release);
+                if (i == 1) self.topUpDenoiserResidency(opts.reclaim, ws_peak);
                 if (opts.on_step) |p| {
                     // Live-preview decode allocations (taew weights + scratch) are
                     // working memory, not DiT.
@@ -10944,10 +11007,14 @@ pub const Session = struct {
                     bd.te >> 20, bd.dit >> 20, bd.latent >> 20, bd.vae >> 20, bd.total() >> 20,
                 });
                 // Less the decoder, which loads for the decode and is not expected
-                // here; with it the line would always read "not fully loaded".
+                // here; with it the line would always read "not fully loaded". The
+                // scratch term is a reserve, not a forecast: a working set under it
+                // is the reserve doing its job, only one past it is a wrong number.
+                const have = self.residencyHave();
                 var at_peak = need;
                 at_peak.weights -|= self.decoderPayloadLen();
-                vram.logResidency("diffusion", at_peak, self.residencyHave());
+                at_peak.scratch = @min(at_peak.scratch, have.scratch);
+                vram.logResidency("diffusion", at_peak, have);
             }
         }
 

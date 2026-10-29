@@ -184,6 +184,17 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocat
 /// A/B switch for the mid-block attention (see `Dev.attnCore`). `zimage-cuda-test` runs both.
 pub var force_naive_attn: bool = false;
 
+/// `TP_SDVAE_TRACE`: after each stage of a decode, sync, download the activation
+/// and log how much of it is non-finite. Read once; a diagnostic, never on by
+/// default, since it serializes the walk and copies every activation out.
+var trace_stages: ?bool = null;
+fn tracing() bool {
+    if (trace_stages) |t| return t;
+    const t = std.c.getenv("TP_SDVAE_TRACE") != null;
+    trace_stages = t;
+    return t;
+}
+
 /// `sd_vae_dev`'s and `wan_vae_dev`'s ops on this backend.
 const Dev = struct {
     be: *Backend,
@@ -231,6 +242,30 @@ const Dev = struct {
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
         if (force_naive_attn) return d.be.attn(b.aq, b.ak, b.av, b.ao, n, n, 1, 1, ch, scale, false);
         try d.be.opAttnTC(b.aq, b.ak, b.av, b.ao, n, 1, 1, ch, scale);
+    }
+
+    /// See `tracing`. Ends the batch to read the buffer, then reopens it.
+    pub fn probe(d: Dev, label: []const u8, buf: Buf, n: usize) !void {
+        if (!tracing()) return;
+        try d.be.endBatch();
+        defer d.be.beginBatch() catch {};
+        const esz = buf.dt.bytes();
+        const raw = try std.heap.page_allocator.alloc(u8, n * esz);
+        defer std.heap.page_allocator.free(raw);
+        try d.be.tensorDownload(buf.slice(0, n * esz), raw);
+        var bad: usize = 0;
+        var mag: f32 = 0;
+        for (0..n) |i| {
+            const v: f32 = switch (buf.dt) {
+                .f32 => std.mem.bytesAsSlice(f32, raw)[i],
+                .f16 => @floatCast(std.mem.bytesAsSlice(f16, raw)[i]),
+                .bf16 => @bitCast(@as(u32, std.mem.bytesAsSlice(u16, raw)[i]) << 16),
+            };
+            if (!std.math.isFinite(v)) bad += 1 else mag = @max(mag, @abs(v));
+        }
+        std.log.info("[sdvae-trace] {s:<9} {d} non-finite of {d}, max |v| {d:.2}{s}", .{
+            label, bad, n, mag, if (bad != 0) "  <-- FIRST NON-FINITE STAGE" else "",
+        });
     }
 
     /// The O(seq²) attention scratch sits at the START (the mid-block runs at latent

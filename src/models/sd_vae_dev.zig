@@ -45,13 +45,17 @@ pub fn body(d: anytype, dec: *const sd_vae.Decoder, lat_h: usize, lat_w: usize, 
     } else {
         try d.conv(&b.x, &b.stage, h, w, dec.conv_in, .stride1, 1.0);
     }
+    try probe(d, "conv_in", b.x, h * w * ch);
 
     try resnet(d, h, w, dec.mid1);
+    try probe(d, "mid1", b.x, h * w * ch);
     try attn(d, h, w, dec.mid_attn);
+    try probe(d, "mid_attn", b.x, h * w * ch);
     try resnet(d, h, w, dec.mid2);
+    try probe(d, "mid2", b.x, h * w * ch);
     try d.midDone();
 
-    for (dec.levels) |level| {
+    for (dec.levels, 0..) |level, li| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         for (level.blocks) |blk| {
             try resnet(d, h, w, blk);
@@ -64,12 +68,24 @@ pub fn body(d: anytype, dec: *const sd_vae.Decoder, lat_h: usize, lat_w: usize, 
             h *= 2;
             w *= 2;
         }
+        try probe(d, level_names[@min(li, level_names.len - 1)], b.x, h * w * ch);
     }
 
     try d.groupNorm(&b.t, &b.x, h * w, ch, dec.norm_out, true);
+    try probe(d, "norm_out", b.t, h * w * ch);
     // The head writes RGB back into the f32 staging buffer; the host wants f32.
     try d.conv(&b.stage, &b.t, h, w, dec.conv_out, .stride1, 1.0);
+    try probe(d, "conv_out", b.stage, h * w * 3);
     return .{ h, w };
+}
+
+const level_names = [_][]const u8{ "level0", "level1", "level2", "level3", "level4" };
+
+/// A device adapter that can look at a buffer mid-walk gets to, after each stage:
+/// the one way to learn which stage first went non-finite on a decode that only
+/// fails one run in several.
+inline fn probe(d: anytype, label: []const u8, buf: anytype, n: usize) !void {
+    if (@hasDecl(@TypeOf(d), "probe")) try d.probe(label, buf, n);
 }
 
 /// A resnet over `bufs.x` in place (the result swapped back into `x`). `u` carries both
@@ -78,15 +94,21 @@ fn resnet(d: anytype, h: usize, w: usize, r: sd_vae.Resnet) !void {
     const b = d.bufs;
     const n = h * w;
     try d.groupNorm(&b.t, &b.x, n, r.in_ch, r.norm1, true);
+    try probe(d, "r.norm1", b.t, n * r.in_ch);
     try d.conv(&b.u, &b.t, h, w, r.conv1, .stride1, 1.0);
+    try probe(d, "r.conv1", b.u, n * r.out_ch);
     try d.groupNorm(&b.t, &b.u, n, r.out_ch, r.norm2, true);
+    try probe(d, "r.norm2", b.t, n * r.out_ch);
     try d.conv(&b.u, &b.t, h, w, r.conv2, .stride1, 1.0);
+    try probe(d, "r.conv2", b.u, n * r.out_ch);
     if (r.nin) |nin| {
         try convResidual(d, &b.t, &b.x, h, w, nin, .stride1);
+        try probe(d, "r.nin", b.t, n * r.out_ch);
         try d.add(b.u, b.t, n * r.out_ch);
     } else {
         try d.add(b.u, b.x, n * r.out_ch);
     }
+    try probe(d, "r.add", b.u, n * r.out_ch);
     std.mem.swap(@TypeOf(b.x), &b.x, &b.u);
 }
 

@@ -362,6 +362,8 @@ pub const Backend = struct {
     /// without this credit the headroom loop would evict the entire unpinned
     /// cache (including just-prefetched weights) on every upload.
     pending_free_bytes: u64 = 0,
+    /// See `weightUploadBytes`.
+    weight_upload_bytes: u64 = 0,
     /// Recycled streamed-weight buffers by exact size (async path). Streamed
     /// decode cycles the same handful of weight sizes every token, and
     /// cuMemAlloc/cuMemFree cost ~0.3-1 ms each under an active DMA queue,
@@ -1052,6 +1054,7 @@ pub const Backend = struct {
         }
         self.pf_gen += 1;
         const gen = self.pf_gen;
+        self.weight_upload_bytes += bytes.len;
         self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes, .db = db, .ev = ev, .gen = gen };
         self.pf_head.store(head + 1, .release); // publish the slot to the thread
         self.pfWakeWorker(); // unpark the prefetch thread if it was blocked on an empty ring
@@ -1250,6 +1253,13 @@ pub const Backend = struct {
 
     pub fn deviceUsed(self: *Backend) u64 {
         return self.ctx.device_used;
+    }
+
+    /// Host-to-device weight bytes this backend has uploaded so far, prefetched or
+    /// on a miss. A step's difference is what re-streamed during it, which no
+    /// cache count can say: a weight that is not cached may be one nobody reads.
+    pub fn weightUploadBytes(self: *const Backend) u64 {
+        return self.weight_upload_bytes;
     }
 
     /// High-water of `deviceUsed` since `resetUsedPeak`.
@@ -2256,6 +2266,7 @@ pub const Backend = struct {
         // upload. The staging ring is used ONLY by the prefetch thread, so the main
         // thread never touches it here (no race).
         self.reserveForWeights(bytes.len);
+        self.weight_upload_bytes += bytes.len;
         const pin = self.pinNew(bytes.len);
         // Refund the pin claim if the alloc/upload below fails: an OOM-retry
         // loop (forward -> offload -> retry) otherwise re-claims the same weight

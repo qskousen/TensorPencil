@@ -1,5 +1,5 @@
 //! `zig build serve-probe -- --config <file> [--message <text>] [--image <prompt>]
-//! [--then-image <prompt>]
+//! [--then-image <prompt>] [--again] [--linger <s>]
 //! [--complete <idea> [--think] [--cancel]] [--kill-mid-turn [<deltas>]] [--timeout <s>]
 //! [--socket <path>]`: what
 //! `driver-probe` does, through a tp-serve process over the socket. Without
@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
     var message: ?[]const u8 = null;
     var image: ?[]const u8 = null;
     var then_image: ?[]const u8 = null;
+    var again = false;
+    var linger_s: u32 = 0;
     var socket: ?[]const u8 = null;
     var kill_after: ?u32 = null;
     var idea: ?[]const u8 = null;
@@ -57,6 +59,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--image") and i + 1 < args.len) {
             i += 1;
             image = args[i];
+        } else if (std.mem.eql(u8, args[i], "--again")) {
+            // The completion once more after the render, timed: whether the chat
+            // model got its layers back.
+            again = true;
+        } else if (std.mem.eql(u8, args[i], "--linger") and i + 1 < args.len) {
+            i += 1;
+            linger_s = std.fmt.parseInt(u32, args[i], 10) catch 0;
         } else if (std.mem.eql(u8, args[i], "--then-image") and i + 1 < args.len) {
             // Enqueued once the completion is answered: the studio's Expand flow,
             // where a render waits for the prompt the chat model writes.
@@ -131,14 +140,22 @@ pub fn main(init: std.process.Init) !void {
     remote.postRequest(.{ .settings = .{ .json = settings_json } });
     remote.postRequest(.snapshot);
     const complete_ref: u64 = 7;
-    if (idea) |text| remote.postRequest(.{ .llm_complete = .{
-        .ref = complete_ref,
-        .system = "You write prompts for an image model. Expand the idea you are given into one vivid image prompt of two or three sentences. Reply with the prompt only.",
-        .user = text,
-        .think = think,
-        .seed = 7,
-        .max_tokens = if (think) 1536 else 256,
-    } });
+    const again_ref: u64 = 8;
+    const complete = struct {
+        fn f(r: *Remote, ref: u64, text: []const u8, thk: bool) void {
+            r.postRequest(.{ .llm_complete = .{
+                .ref = ref,
+                .system = "You write prompts for an image model. Expand the idea you are given into one vivid image prompt of two or three sentences. Reply with the prompt only.",
+                .user = text,
+                .think = thk,
+                .seed = 7,
+                .max_tokens = if (thk) 1536 else 256,
+            } });
+        }
+    }.f;
+    if (idea) |text| complete(remote, complete_ref, text, think);
+    var complete_t0 = Io.Clock.real.now(io).nanoseconds;
+    var again_t0: i96 = 0;
     // Behind a completion, the message waits for it to start (see the module doc).
     var hold_message = idea != null and message != null;
     var cancel_pending = cancel;
@@ -165,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
 
     var want_turn = message != null;
     var want_completion = idea != null;
+    var want_again = again and idea != null;
     var want_image = image != null or then_image != null;
     var image_id: wire.ImageId = 0;
     var want_pixels = false;
@@ -178,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
     defer frames.deinit(gpa);
     const deadline = Io.Clock.real.now(io).nanoseconds + @as(i96, @intCast(timeout_s)) * std.time.ns_per_s;
 
-    while (want_turn or want_image or want_pixels or want_completion) {
+    while (want_turn or want_image or want_pixels or want_completion or want_again) {
         if (Io.Clock.real.now(io).nanoseconds > deadline) {
             try out.writeAll("{\"probe\":\"timeout\"}\n");
             try out.flush();
@@ -221,6 +239,9 @@ pub fn main(init: std.process.Init) !void {
                         .turn_end => want_turn = false,
                         .err => failed = true,
                         .state => |st| if (st.completing) {
+                            // Timed from the moment the host took it, not from the
+                            // post, which waits behind the model load.
+                            if (want_completion and complete_t0 == 0) complete_t0 = Io.Clock.real.now(io).nanoseconds;
                             if (cancel_pending) {
                                 cancel_pending = false;
                                 try out.writeAll("{\"probe\":\"cancelling the completion\"}\n");
@@ -232,8 +253,13 @@ pub fn main(init: std.process.Init) !void {
                                 remote.postRequest(.{ .chat_submit = .{ .text = message.? } });
                             }
                         },
-                        .llm_completion => |c| if (c.ref == complete_ref) {
+                        .llm_completion => |c| if (c.ref == again_ref) {
+                            want_again = false;
+                            try out.print("{{\"probe\":\"second completion in {d} ms\"}}\n", .{@divTrunc(Io.Clock.real.now(io).nanoseconds - again_t0, std.time.ns_per_ms)});
+                            if (c.err.len > 0 or c.text.len == 0) failed = true;
+                        } else if (c.ref == complete_ref) {
                             want_completion = false;
+                            try out.print("{{\"probe\":\"first completion in {d} ms\"}}\n", .{@divTrunc(Io.Clock.real.now(io).nanoseconds - complete_t0, std.time.ns_per_ms)});
                             if (then_image) |p| {
                                 try out.writeAll("{\"probe\":\"prompt written; enqueueing the render\"}\n");
                                 enqueue(remote, &cfg, p);
@@ -278,12 +304,35 @@ pub fn main(init: std.process.Init) !void {
                     try out.print("{{\"bin\":{{\"kind\":\"{t}\",\"id\":{d},\"rev\":{d},\"w\":{d},\"h\":{d},\"len\":{d}}}}}\n", .{
                         b.hdr.kind, b.hdr.id, b.hdr.rev, b.hdr.w, b.hdr.h, b.payload.len,
                     });
-                    if (b.hdr.kind == .image_rgba and b.hdr.id == image_id) want_pixels = false;
+                    if (b.hdr.kind == .image_rgba and b.hdr.id == image_id) {
+                        want_pixels = false;
+                        if (want_again) {
+                            again_t0 = Io.Clock.real.now(io).nanoseconds;
+                            complete(remote, again_ref, idea.?, think);
+                        }
+                    }
                 },
             }
         }
         try out.flush();
         Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .real) catch {};
+    }
+    // Keep draining: what the host does once the work is over (the chat model
+    // taking its layers back) is part of what a run shows.
+    if (linger_s > 0) {
+        const until = Io.Clock.real.now(io).nanoseconds + @as(i96, linger_s) * std.time.ns_per_s;
+        while (Io.Clock.real.now(io).nanoseconds < until) {
+            remote.take(&frames);
+            for (frames.items) |f| {
+                defer f.deinit(gpa);
+                if (f == .text) {
+                    try out.writeAll(f.text);
+                    try out.writeByte('\n');
+                }
+            }
+            try out.flush();
+            Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .real) catch {};
+        }
     }
     if (kill_after != null) {
         // Two turns on the second host's transcript: the adopted one, cut where

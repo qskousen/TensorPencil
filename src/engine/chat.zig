@@ -1626,6 +1626,18 @@ pub const Session = struct {
                         dir,               target >> 20,     before.n_cpu,   after.n_cpu, after.n_layers,
                         before.device_mib, after.device_mib, after.free_mib,
                     });
+                    // A promote re-creates a layer's K/V and leaves its weights to the
+                    // next forward, which then pays the upload, from the file's mapping
+                    // through page faults, in the middle of the user's turn: 15 s on
+                    // a 31B whose 50 layers an image had borrowed. Idle time is free,
+                    // so pay it here, sequentially, right after the promote.
+                    if (after.n_cpu < before.n_cpu and !self.busy()) {
+                        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
+                        a.model.warmWeights();
+                        std.log.info("[vram] LLM warmed the promoted layers' weights in {d} ms", .{
+                            @divTrunc(std.Io.Clock.real.now(self.io).nanoseconds - t0, std.time.ns_per_ms),
+                        });
+                    }
                     // An offload wave that STILL ends over target means the
                     // ceiling is below the un-evictable minimum (KV + embeddings
                     // + head + scratch), every layer was migrated chasing it.

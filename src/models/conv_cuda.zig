@@ -117,11 +117,17 @@ pub fn conv2d(
     // upsample convolutions need the resample fused into the gather, which no
     // convolution op can do.
     //
+    // Only a 16-bit chain: cuDNN writes its output at the operand width, so an
+    // f32 chain's convolution would accumulate in f32 and leave through f16. The
+    // SDXL VAE's level-3 conv2 reaches 6.5e4 on some latents, past f16, and the
+    // decode came out all-NaN with no error, at 704x704 and up on most latents and
+    // at 512x512 on one. The banded GEMM writes `dst` at its own width.
+    //
     // An activation capture stays banded too: the GEMM this convolution is
     // equivalent to reads the [n][9*ci] patch, and that matrix is what the probe
     // has to see. cuDNN never builds it, so probing here would file per-column
     // statistics `9*ci` wide over a `ci`-wide activation.
-    if (be.kernels == .libs and mode == .stride1 and act_div == 1.0 and ops.matmul.probe == null) {
+    if (be.kernels == .libs and mode == .stride1 and act_div == 1.0 and ops.matmul.probe == null and dst.dt != .f32) {
         return be.opConvCudnnW16(dst.*, 0, src.*, h, w, try convW16(be, cv, op), cv.co, cv.ci, cb);
     }
 

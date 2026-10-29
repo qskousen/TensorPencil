@@ -200,6 +200,31 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             if (std.mem.eql(u8, a, "libs")) libs = true else ckpt = a;
         }
         try sdCudaTest(arena, io, stdout, ckpt, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "sd-vae-repeat")) {
+        // `sd-vae-repeat <ckpt> [libs] [--reps N] [--same] [--sizes HxW,HxW]`: the
+        // device decode of one latent size over and over in one process, counting
+        // non-finite outcomes. For a decode that fails one run in several, which
+        // one CPU-referenced pass can only ever see once.
+        var ckpt: []const u8 = TensorPencil.model_root ++ "/checkpoints/sdxl/dreamshaperXL10_alpha2Xl10.safetensors";
+        var libs = false;
+        var reps: usize = 20;
+        var same = false;
+        var sizes: []const u8 = "64x64";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) {
+                libs = true;
+            } else if (std.mem.eql(u8, args[i], "--same")) {
+                same = true;
+            } else if (std.mem.eql(u8, args[i], "--reps") and i + 1 < args.len) {
+                i += 1;
+                reps = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--sizes") and i + 1 < args.len) {
+                i += 1;
+                sizes = args[i];
+            } else ckpt = args[i];
+        }
+        try sdVaeRepeat(arena, io, stdout, ckpt, libs, reps, same, sizes);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "te-test")) {
         var path: []const u8 = TensorPencil.model_root ++ "/text_encoders/Qwen3-4B-Q4_K_M.gguf";
         var ref: []const u8 = "";
@@ -1965,6 +1990,63 @@ fn cudaFp8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 ///
 /// Every check is against the CPU op, on random data, and the command exits with
 /// an error if any fails, so it is usable as a gate.
+/// See the `sd-vae-repeat` command. Every rep's latent is its own draw unless
+/// `same`, which isolates the device from the input.
+fn sdVaeRepeat(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool, reps: usize, same: bool, sizes: []const u8) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const sd_vae = TensorPencil.models.sd_vae;
+    const sd_vae_cuda = TensorPencil.models.sd_vae_cuda;
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    var st = try TensorPencil.SafeTensors.open(arena, io, ckpt);
+    defer st.deinit();
+    const store: TensorPencil.weights.WeightStore = .{ .safetensors = &st };
+    const family = TensorPencil.pipeline.detectFamily(store) catch .sd15;
+    var dec = try sd_vae.Decoder.load(arena, store, if (family == .sdxl) sd_vae.sdxl else sd_vae.sd15, "first_stage_model.");
+    defer dec.deinit();
+    try stdout.print("== sd-vae-repeat {t} ({t}, act {s}) x{d}{s} ==\n", .{ family, be.kernels, if (test_act) |a| @tagName(a) else "default", reps, if (same) ", same latent" else "" });
+    try stdout.flush();
+    const gpa = std.heap.page_allocator;
+    var bad_total: usize = 0;
+    var it = std.mem.splitScalar(u8, sizes, ',');
+    while (it.next()) |sz| {
+        const x = std.mem.findScalar(u8, sz, 'x') orelse return error.InvalidArgs;
+        const lat_h = try std.fmt.parseInt(usize, sz[0..x], 10);
+        const lat_w = try std.fmt.parseInt(usize, sz[x + 1 ..], 10);
+        const z = try gpa.alloc(f32, lat_h * lat_w * 4);
+        defer gpa.free(z);
+        var bad_reps: usize = 0;
+        for (0..reps) |r| {
+            if (r == 0 or !same) {
+                var prng = std.Random.DefaultPrng.init(4242 + r);
+                const rnd = prng.random();
+                for (z) |*v| v.* = rnd.floatNorm(f32) / 0.13025;
+            }
+            const t0 = Io.Clock.real.now(io).nanoseconds;
+            const got = try sd_vae_cuda.decode(&dec, be, gpa, z, lat_h, lat_w, null, test_act);
+            defer gpa.free(got);
+            var bad: usize = 0;
+            var mag: f32 = 0;
+            for (got) |v| {
+                if (!std.math.isFinite(v)) bad += 1 else mag = @max(mag, @abs(v));
+            }
+            const ms = @divTrunc(Io.Clock.real.now(io).nanoseconds - t0, std.time.ns_per_ms);
+            try stdout.print("{d}x{d} rep {d:>3}: {d} non-finite of {d}, max |v| {d:.2}, {d} ms{s}\n", .{
+                lat_h, lat_w, r, bad, got.len, mag, ms, if (bad != 0) "  <-- NON-FINITE" else "",
+            });
+            try stdout.flush();
+            if (bad != 0) bad_reps += 1;
+        }
+        try stdout.print("{d}x{d}: {d} of {d} reps non-finite\n", .{ lat_h, lat_w, bad_reps, reps });
+        bad_total += bad_reps;
+    }
+    try stdout.print("{s}\n", .{if (bad_total == 0) "all finite" else "NON-FINITE DECODES SEEN"});
+    try stdout.flush();
+}
+
 fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const ops = TensorPencil.ops;
@@ -2514,6 +2596,46 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 try rep.check(name, want, got, if (mag > 1.0) 1e-2 else 5e-3);
             }
         }
+    }
+
+    // --- an f32-chain conv whose output passes f16 ---------------------------
+    // The SDXL VAE's level-3 conv2 reaches 6.5e4 on some latents. On the libs arm
+    // cuDNN's output tensor is f16, so a chain that is f32 end to end still lost
+    // those values to inf there; `conv2d` keeps an f32 chain on the GEMM that
+    // writes f32. Small, so the CPU reference is cheap; the weights are scaled so
+    // the outputs land around 1e5.
+    {
+        const h: usize = 16;
+        const w: usize = 16;
+        const ci: usize = 256;
+        const co: usize = 128;
+        // Its own draws: the cases after this one keep the latents they have
+        // always had, and a case that moved the shared stream once turned a
+        // passing 64x64 decode into the failing one that found this bug.
+        var own_prng = std.Random.DefaultPrng.init(65504);
+        const own = own_prng.random();
+        const torch_w = try arena.alloc(f32, co * ci * 9);
+        for (torch_w) |*x| x.* = own.floatNorm(f32) * 16.0;
+        const bias = try arena.alloc(f32, co);
+        for (bias) |*x| x.* = own.floatNorm(f32);
+        const packed_w = try ops.conv.packWeight(arena, torch_w, co, ci, 3);
+        const in = try arena.alloc(f32, h * w * ci);
+        for (in) |*x| x.* = own.floatNorm(f32) * 50.0;
+        try up(be, &a_d, in);
+        try be.ensureDeviceBuffer(&b_d, h * w * co * 4);
+        var patch: Buf = .{};
+        defer be.tensorDestroy(&patch);
+        const cv: TensorPencil.ops.conv.Conv2d = .{ .w = .{ .krsc = packed_w }, .b = bias, .co = co, .ci = ci, .k = 3, .stride = 1, .pad = 1 };
+        try conv_cuda.conv2d(be, &patch, &b_d, &a_d, h, w, cv, .stride1, null, 1.0);
+        const got = try arena.alloc(f32, h * w * co);
+        try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
+        const want = try arena.alloc(f32, h * w * co);
+        try ops.conv.conv2d(io, arena, want, in, h, w, cv);
+        var peak: f32 = 0;
+        for (want) |v| peak = @max(peak, @abs(v));
+        var name_buf: [80]u8 = undefined;
+        const name = try std.mem.print(&name_buf, "conv 3x3 f32 chain, outputs to {d:.0} (past f16)", .{peak});
+        try rep.check(name, want, got, 5e-3);
     }
 
     // --- convolution at all three sampling modes -----------------------------
