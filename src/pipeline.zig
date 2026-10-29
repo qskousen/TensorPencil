@@ -2146,6 +2146,29 @@ const reclaim_chunk: u64 = 1 << 30; // 1 GiB
 /// to ~1 TiB, far past any card, it's a stall backstop, not a real bound.
 const max_reclaim_rounds: usize = 16;
 
+/// The GPU tiling to retry once nothing more can be freed: half the side, half of
+/// that overlapping, since a small tile sees little context near its edges
+/// (Qwen-Image 2.1 at 32² tiles: an overlap of 8 left 0.5% of pixels over 8 levels
+/// off along the seams, 16 left 0.15%). Its 1 MP tile alone needs 4.4 GB, so
+/// without this a resident chat model sends it to the CPU. Null below `min_tile_px`.
+fn smallerTiles(p: vae_tiled.Params) ?vae_tiled.Params {
+    const tile = p.tile / 2;
+    if (tile * p.scale < min_tile_px) return null;
+    return .{ .scale = p.scale, .tile = tile, .overlap = tile / 2 };
+}
+const min_tile_px = 256;
+
+test "smallerTiles halves to a 256-pixel side, half of each tile overlapping" {
+    const q = smallerTiles(.{ .scale = 16, .tile = 64, .overlap = 8 }).?;
+    try std.testing.expectEqual(vae_tiled.Params{ .scale = 16, .tile = 32, .overlap = 16 }, q);
+    const q2 = smallerTiles(q).?;
+    try std.testing.expectEqual(@as(usize, 16), q2.tile);
+    try std.testing.expect(smallerTiles(q2) == null);
+    // An 8x decoder's default 128 steps twice, to 32 (256 pixels).
+    try std.testing.expectEqual(@as(usize, 32), smallerTiles(smallerTiles(.{}).?).?.tile);
+    try std.testing.expect(smallerTiles(smallerTiles(smallerTiles(.{}).?).?) == null);
+}
+
 /// Whether a GPU VAE-decode error is one we recover from by freeing VRAM and/or
 /// stepping down the fallback ladder (whole-image -> reclaim+retry -> GPU tiling ->
 /// CPU tiling), rather than failing the whole image. VRAM exhaustion surfaces as
@@ -10100,17 +10123,22 @@ pub const Session = struct {
                 // after the denoiser is evicted a tile easily fits, and it's far faster
                 // than the CPU floor below.
                 {
+                    var tiles = tp;
                     var round: usize = 0;
                     while (round < max_reclaim_rounds) : (round += 1) {
-                        try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call))) |p| {
+                        try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tiles.tile});
+                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tiles, wt, Whole.call))) |p| {
                             return p;
                         } else |err| if (err == error.GpuDecodeNonFinite) {
                             try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
                             if (!cpu_on_nonfinite) return error.GpuDecodeNonFinite;
                             break :gpu;
                         } else if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling ran out of VRAM ({t}) → freeing VRAM\n", .{err});
-                        if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> CPU
+                        if (try freeSome(b, o.reclaim, progress, io, want) == 0) {
+                            tiles = smallerTiles(tiles) orelse break; // nothing left -> CPU
+                            round = 0;
+                            continue;
+                        }
                         want *|= 2;
                     }
                 }
@@ -10176,11 +10204,12 @@ pub const Session = struct {
                 }
                 // Phase 2: GPU tiling (bounded) with the same incremental eviction.
                 {
+                    var tiles = tp;
                     var wnt: u64 = reclaim_chunk;
                     var round: usize = 0;
                     while (round < max_reclaim_rounds) : (round += 1) {
-                        try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
-                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call))) |p| {
+                        try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tiles.tile});
+                        if (finiteDecode(gpa, vae_tiled.decode(gpa, io, x, lat_h, lat_w, tiles, wt, Whole.call))) |p| {
                             return p;
                         } else |err| if (err == error.GpuDecodeNonFinite) {
                             try note(progress, "vae decode: non-finite output (overflow at this activation dtype)\n", .{});
@@ -10195,7 +10224,11 @@ pub const Session = struct {
                         };
                         const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
                         try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
-                        if (got == 0) break; // nothing left -> CPU
+                        if (got == 0) {
+                            tiles = smallerTiles(tiles) orelse break; // nothing left -> CPU
+                            round = 0;
+                            continue;
+                        }
                         wnt *|= 2;
                     }
                 }
