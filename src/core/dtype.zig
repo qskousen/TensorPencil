@@ -285,6 +285,26 @@ pub inline fn f8e4m3ToF32(byte: u8) f32 {
     return f8_e4m3_to_f32_table[byte];
 }
 
+/// f32 to fp8-e4m3fn, nearest with ties to the even code, saturating at +-448: the
+/// rounding of PTX's `cvt.rn.satfinite.e4m3x2.f32`. NaN is not expected.
+pub fn f32ToF8E4M3(v: f32) u8 {
+    const a = @min(@abs(v), 448.0);
+    // Positive codes 0x00..0x7e increase with their value: find the last at or below `a`.
+    var lo: u8 = 0;
+    var hi: u8 = 0x7e;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        if (f8_e4m3_to_f32_table[mid] <= a) lo = mid else hi = mid - 1;
+    }
+    var code = lo;
+    if (code < 0x7e) {
+        const below = a - f8_e4m3_to_f32_table[code];
+        const above = f8_e4m3_to_f32_table[code + 1] - a;
+        if (above < below or (above == below and code & 1 == 1)) code += 1;
+    }
+    return if (v < 0 and code != 0) code | 0x80 else code;
+}
+
 pub inline fn bf16ToF32(bits: u16) f32 {
     return @bitCast(@as(u32, bits) << 16);
 }
@@ -578,4 +598,21 @@ test "f16 conversion" {
     try std.testing.expectEqual(@as(f32, 1.0), f16ToF32(0x3c00));
     try std.testing.expectEqual(@as(f32, -0.5), f16ToF32(0xb800));
     try std.testing.expectEqual(@as(f32, 65504.0), f16ToF32(0x7bff)); // max f16
+}
+
+test "f32ToF8E4M3 rounds to nearest even and saturates" {
+    for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        if (c & 0x7f == 0x7f or c == 0x80) continue; // NaN, and -0 encodes as +0
+        try std.testing.expectEqual(c, f32ToF8E4M3(f8e4m3ToF32(c)));
+    }
+    // Halfway between codes 1 and 2 (the subnormals 2^-9 and 2^-8) goes to the even 2.
+    try std.testing.expectEqual(@as(u8, 0x02), f32ToF8E4M3(1.5 * 0x1p-9));
+    // Halfway between 2 and 3 goes to the even 2.
+    try std.testing.expectEqual(@as(u8, 0x02), f32ToF8E4M3(2.5 * 0x1p-9));
+    // 1.0625 sits halfway between 1.0 (0x38) and 1.125 (0x39): even is 0x38.
+    try std.testing.expectEqual(@as(u8, 0x38), f32ToF8E4M3(1.0625));
+    try std.testing.expectEqual(@as(u8, 0x39), f32ToF8E4M3(1.07));
+    try std.testing.expectEqual(@as(u8, 0x7e), f32ToF8E4M3(1e6));
+    try std.testing.expectEqual(@as(u8, 0xfe), f32ToF8E4M3(-1e6));
 }

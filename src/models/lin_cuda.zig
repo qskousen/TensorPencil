@@ -83,7 +83,13 @@ pub var lora_i8_a: bool = true;
 pub const Plan = dual_lin.Plan;
 pub const Use = dual_lin.Use;
 
-/// The route `w` takes at `m` rows under `p`.
+/// The route `w` takes at `m` rows under `p` on `be`'s device.
+pub fn routeOn(be: *const Backend, p: Plan, w: Weight, m: usize) ?Route {
+    return dual_lin.routeOf(Caps, Caps.of(be), w, m, p.policy());
+}
+
+/// `routeOn` for a device with no capability past the baseline: the route every CUDA
+/// device takes, which is what `check` holds the shapes against.
 pub fn routeAt(p: Plan, w: Weight, m: usize) ?Route {
     return dual_lin.routeOf(Caps, .{}, w, m, p.policy());
 }
@@ -91,12 +97,13 @@ pub fn routeAt(p: Plan, w: Weight, m: usize) ?Route {
 /// What the route for `w` at `m` rows does to its activation, for a device check's CPU
 /// reference (`ops.matmul.act_quant`). The integer convrot routes only: a block-quant
 /// int8 decode also re-quantizes the weight, which this does not model.
-pub fn actQuant(_: *Backend, p: Plan, w: Weight, m: usize) ops.matmul.ActQuant {
-    const r = routeAt(p, w, m) orelse return .{};
+pub fn actQuant(be: *Backend, p: Plan, w: Weight, m: usize) ops.matmul.ActQuant {
+    const r = routeOn(be, p, w, m) orelse return .{};
     return switch (r) {
         .i8, .i4_i8, .w4a8 => .{ .bits = 8, .rotate = p.rot },
         .i4 => .{ .bits = 4, .rotate = p.rot },
         .svdq => .{ .bits = 8, .regrid = true },
+        .fp8_w8a8 => .{ .bits = 8, .fp8 = true },
         else => .{},
     };
 }
@@ -126,11 +133,12 @@ pub fn activationIs4Bit(pol: BlockQGemm, dt: DType) bool {
     return dt == .i4 or (dt.isBlockQuant() and routeOf(.{ .bytes = &.{}, .dtype = dt, .rows = 128, .cols = 1024 }, pol) == .blockq_i4);
 }
 
-/// Whether route `r` reads and writes 16-bit activations (f16 or bf16): the int8 prep
-/// and its GEMMs do, and so do the `h16_*` routes; every other route is f32 on both sides.
+/// Whether route `r` reads and writes 16-bit activations (f16 or bf16) on either arm:
+/// the int8 prep and its GEMMs do, and so do `opGemm16`'s (`h16_*`, fp8); every other
+/// route is f32 on both sides.
 pub fn routeTakes16(r: Route) bool {
     return switch (r) {
-        .i8, .w4a8, .blockq_i8, .h16_f32, .h16_f16, .h16_bf16 => true,
+        .i8, .w4a8, .blockq_i8, .h16_f32, .h16_f16, .h16_bf16, .gemm_fp8, .gemm_fp8_bf16, .fp8_w8a8 => true,
         else => false,
     };
 }
@@ -194,7 +202,7 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
     var widen = false;
     var smooth: ?[]const f32 = null;
     for (group) |w| {
-        const r = routeAt(p, w, m) orelse return error.UnsupportedDType;
+        const r = routeOn(be, p, w, m) orelse return error.UnsupportedDType;
         std.debug.assert(w.cols == cols);
         if (r == .svdq) {
             // One smoothed activation serves the group: views of one fused tensor share
@@ -206,7 +214,7 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
             };
             smooth = s;
         }
-        if (x.dt != .f32 and !typedOn(be, r)) widen = true;
+        if (x.dt != .f32 and !routeTakes16(r)) widen = true;
         const k = r.prep();
         if (k == .none) continue;
         if (r == .blockq_i8 or r == .blockq_i4) bq = true;
@@ -229,12 +237,17 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
         try be.opCast(x, x32, m * cols, 0);
         g.x32 = x32;
     }
-    // The int8 prep reads a 16-bit `x` where `typedOn` says; the rest read f32.
+    // The int8 and e4m3 preps read `x` at its own dtype; the rest read f32.
     const xf = g.x32 orelse x;
     switch (want) {
         .none => {},
         .i8 => {
-            try be.opI8PrepR(if (be.kernels == .libs) x else xf, m, cols, if (bq) blockq_rotate else p.rot);
+            try be.opI8PrepR(x, m, cols, if (bq) blockq_rotate else p.rot);
+            serial_int +%= 1;
+            g.serial = serial_int;
+        },
+        .f8 => {
+            try be.opF8Prep(x, m, cols);
             serial_int +%= 1;
             g.serial = serial_int;
         },
@@ -278,22 +291,22 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
 /// tile), and `x` must have `align(m, 4)` rows of backing store on the dense grouped
 /// GEMVs (they read 4 rows and predicate the outputs).
 pub fn gemm(be: *Backend, p: Plan, g: Group, y: Buf, w: Weight, bias: ?[]const f32) !void {
-    const r = routeAt(p, w, g.m) orelse return error.UnsupportedDType;
+    const r = routeOn(be, p, w, g.m) orelse return error.UnsupportedDType;
     std.debug.assert(w.cols == g.cols);
     // A prepped route needs the scratch this group wrote, and nothing since.
     switch (r.prep()) {
         .none => {},
-        .i8, .i4, .svdq => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
+        .i8, .i4, .svdq, .f8 => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
         .q8 => std.debug.assert((g.prep == .q8 or g.prep == .mmq) and g.serial == serial_q8),
         .mmq => std.debug.assert(g.prep == .mmq and g.serial == serial_q8),
     }
-    const typed = typedOn(be, r);
+    const typed = routeTakes16(r);
     const x = if (typed) g.x else g.x32 orelse g.x;
     std.debug.assert(x.dt == .f32 or typed);
     const o = Opts{ .rot = p.rot, .bq_rotate = blockq_rotate, .layout_rows = g.layout_rows };
     const split = split_bias and bias != null;
-    // A route that writes only f32 fills a plane `y` takes a narrowing copy of; the int8
-    // and dequant GEMMs store whole 128-row tiles, so it holds that many.
+    // A route that writes only f32 fills a plane `y` takes a narrowing copy of; the
+    // dequant GEMMs store whole 128-row tiles, so it holds that many.
     const ys = if (y.dt == .f32 or typed) y else blk: {
         try be.ensureDeviceBuffer(&be.lin_y32, std.mem.alignForward(usize, g.m, 128) * w.rows * 4);
         break :blk be.lin_y32.as(.f32);
@@ -312,20 +325,11 @@ pub fn towerLinear(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]c
     var p = Plan.tower;
     p.rot = w.convrot != 0;
     p.lora = stack;
-    if (routeAt(p, w, m) == null) {
+    if (routeOn(be, p, w, m) == null) {
         std.log.err("lin_cuda: {s} is {t}, which no tower route here takes", .{ w.tag orelse "<untagged>", w.dtype });
         return error.UnsupportedDType;
     }
     return linear(be, p, y, x, m, w, bias);
-}
-
-/// Whether route `r` reads and writes 16-bit activations as they are on this arm: the
-/// 16-bit GEMMs on both (`opGemm16`), the int8 preps only on the vendor one.
-fn typedOn(be: *const Backend, r: Route) bool {
-    return switch (r) {
-        .h16_f32, .h16_f16, .h16_bf16 => true,
-        else => be.kernels == .libs and routeTakes16(r),
-    };
 }
 
 /// `prep` and `gemm` for one linear on its own.
@@ -336,6 +340,15 @@ pub fn linear(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, bias: 
 
 /// The CUDA backend's capabilities, as `dual_lin.routeOf` asks for them.
 pub const Caps = struct {
+    fp8_mma: bool = false,
+
+    pub fn of(be: *const Backend) Caps {
+        return .{ .fp8_mma = be.hasFp8Mma() };
+    }
+    /// The e4m3 prep and `opF8Gemm`: 128-row GEMM tiles, 256-column prep words.
+    pub fn fp8Mma(c: Caps, w: Weight) bool {
+        return c.fp8_mma and w.rows % 128 == 0 and w.cols % 256 == 0;
+    }
     pub fn quantKernel(_: Caps, dt: DType) bool {
         return Backend.quantKernelSupported(dt);
     }
@@ -450,7 +463,8 @@ pub const Caps = struct {
             .i8, .i4 => if (w.rows % 128 != 0 or w.cols % 256 != 0) return .int_shape,
             // No rotation, so no 256-wide groups; Nunchaku's packing tiles 128 both ways.
             .svdq => if (w.rows % 128 != 0 or w.cols % 128 != 0) return .int_shape,
-            .mmq, .none, .q8 => {},
+            // `fp8Mma` holds the e4m3 route's shape before routing picks it.
+            .mmq, .none, .q8, .f8 => {},
         }
         return switch (r) {
             // `opI4Prep` always rotates and has no unrotated build.
@@ -480,10 +494,10 @@ pub const Opts = struct {
 
 /// `y[m][w.rows] = x[m][w.cols] @ Wᵀ (+ bias)` on route `r`, the bias in the GEMM's
 /// epilogue where the route's kernel takes one and in a second pass where it does not
-/// (fp8, the f16 block-quant decode, MMQ, the GEMVs).
+/// (the f16 block-quant decode, MMQ, the GEMVs).
 ///
 /// A route whose prep is not `.none` reads the activation the prep staged, not `x`, and
-/// the int8 / MMQ / dequant GEMMs write `align(m, 128)` rows of `y`.
+/// the MMQ and dequant GEMMs write `align(m, 128)` rows of `y`.
 pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, w: dual_lin.Weight, bias: ?[]const f32) !void {
     if (bias) |b| std.debug.assert(b.len >= w.rows);
     if (r.prep() == .none) try probeInput(be, x, m, w);
@@ -508,11 +522,8 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias)
         else
             try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zb),
-        .gemm_fp8 => {
-            try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols);
-            folded = bias == null;
-        },
-        .gemm_fp8_bf16 => try be.opMatmulFp8Bf16(y, x, m, w.bytes, w.scale, w.rows, w.cols, zb),
+        .gemm_fp8 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols, zb, Backend.operand16(x, y)),
+        .gemm_fp8_bf16 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols, zb, .bf16),
         .h16_f32 => if (w.rows >= dual_lin.h16_min_co or x.dt != .f32 or y.dt != .f32)
             try be.opConvF16Scaled(y, 0, x, m, w.bytes, w.rows, w.cols, zb, 1.0)
         else
@@ -548,6 +559,7 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
             folded = bias == null;
         },
         .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
+        .fp8_w8a8 => try be.opF8Gemm(y, w.bytes, w.scale, w.rows, bias),
         .svdq => {
             const sq = w.svdq.?;
             try be.opI8GemmSvdq(y, w.bytes, sq.scales, sq.i8_mul, sq.codes == .fp4, w.row_scale.?, w.rows, w.cols, bias);
@@ -693,7 +705,7 @@ pub fn probeInput(be: *Backend, x: Buf, m: usize, w: anytype) !void {
 /// Whether route `r` takes a bias array even for a linear that has none.
 fn readsZeroBias(r: dual_lin.Route) bool {
     return switch (r) {
-        .gemm_bf16, .gemm_fp8_bf16, .h16_f32, .h16_f16, .h16_bf16, .i8_wo, .i4_wo, .w4a8_wo, .i8_wo16, .i4_wo16, .w4a8_wo16, .svdq_wo, .svdq_wo16, .nvfp4, .blockq_bf16 => true,
+        .gemm_bf16, .gemm_fp8, .gemm_fp8_bf16, .h16_f32, .h16_f16, .h16_bf16, .i8_wo, .i4_wo, .w4a8_wo, .i8_wo16, .i4_wo16, .w4a8_wo16, .svdq_wo, .svdq_wo16, .nvfp4, .blockq_bf16 => true,
         else => false,
     };
 }
@@ -898,7 +910,7 @@ fn doraBase(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, d: lora_
     q.blockq = .f16;
     q.lora = null;
     q.gemv = false;
-    const r = routeAt(q, w, m) orelse return error.UnsupportedDType;
+    const r = routeOn(be, q, w, m) orelse return error.UnsupportedDType;
     if (r.prep() != .none) return error.UnsupportedDType;
     const xd = try lora_cuda.inPlane(be, m * w.cols * 4, .f32);
     try be.opDoraCols(xd, x, ratio, m, w.cols);
@@ -1250,4 +1262,25 @@ test "a prep is shared by the group and a stale one is caught" {
     try std.testing.expectEqual(Prep.none, Route.blockq_f16.prep());
     try std.testing.expectEqual(Prep.q8, Route.gemv_q8n.prep());
     try std.testing.expectEqual(Prep.mmq, Route.blockq_mmq.prep());
+}
+
+test "fp8 takes the fp8 tensor cores only when asked, on a device with them, at a shape they tile" {
+    const w = fake(.f8_e4m3, 6144, 6144);
+    const w8a8: dual_lin.Policy = .{ .fp8 = .w8a8 };
+    const has: Caps = .{ .fp8_mma = true };
+    try std.testing.expectEqual(@as(?Route, .fp8_w8a8), dual_lin.routeOf(Caps, has, w, 4096, w8a8));
+    try std.testing.expectEqual(@as(?Route, .gemm_fp8), dual_lin.routeOf(Caps, .{}, w, 4096, w8a8));
+    try std.testing.expectEqual(@as(?Route, .gemm_fp8), dual_lin.routeOf(Caps, has, w, 4096, .{}));
+    try std.testing.expectEqual(@as(?Route, .gemm_fp8), dual_lin.routeOf(Caps, has, fake(.f8_e4m3, 6144, 6100), 4096, w8a8));
+    try std.testing.expectEqual(dual_lin.Prep.f8, Route.fp8_w8a8.prep());
+}
+
+test "only a denoiser trunk's plan follows the fp8 dial" {
+    const w = fake(.f8_e4m3, 6144, 6144);
+    const was = dual_lin.trunk_fp8;
+    defer dual_lin.trunk_fp8 = was;
+    dual_lin.trunk_fp8 = .w8a8;
+    try std.testing.expectEqual(dual_lin.Fp8Gemm.w8a8, check(&.{w}, .{ .blockq = blockq_gemm }).ok.fp8);
+    try std.testing.expectEqual(dual_lin.Fp8Gemm.weight_only, check(&.{w}, Use.encoder(encoder_gemm)).ok.fp8);
+    try std.testing.expectEqual(dual_lin.Fp8Gemm.weight_only, check(&.{w}, Use.llm(512)).ok.fp8);
 }

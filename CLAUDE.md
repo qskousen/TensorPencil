@@ -256,6 +256,8 @@ tensor names (`detectFamily`), never from a flag.
 | `mageflow` | `models/mageflow.zig` | Qwen3-VL 4B | Mage-VAE or Flux 2's |
 | `moss_image` | `models/moss_image.zig` | Qwen3.5 9B (HF) | Mage-Flow's |
 | `qwen_image21` | `models/qwen_image21.zig` | Qwen3-VL 8B | Wan 2.2 layout, RGBA |
+| `fibo2` | `models/fibo2.zig` | Qwen3-VL 4B, 15 taps | Flux 2's (either codec) |
+| `fibo` (1.5) | `models/fibo.zig` | SmolLM3 3B, every state | Wan 2.2 TI2V |
 
 Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the matrix):
 
@@ -280,7 +282,8 @@ Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the
   A1111's and Civitai's own field names, never invented ones (`pipeline.appendExtraParams`).
   A reader re-renders from that block, so a hardcoded field there is a wrong answer.
 - Where ComfyUI is not the right reference, the family's module doc says so (Qwen-Image
-  2.1 samples on diffusers' schedule; MOSS-Image's ComfyUI render uses int8 attention).
+  2.1 samples on diffusers' schedule; MOSS-Image's ComfyUI render uses int8 attention;
+  ComfyUI has no Fibo 1.5, whose reference is diffusers' pipeline).
 
 ## Checkpoints
 

@@ -106,8 +106,8 @@ pub const Workspace = struct {
     up_d: Buf = .{},
     scale_d: Buf = .{},
     patch_d: Buf = .{},
-    /// Head-PADDED attention operands, allocated only when the backend's P@V
-    /// tile is wider than this VAE's 64-dim head. See `attnHd`.
+    /// Head-PADDED attention operands, allocated only when `Backend.attnWidth`
+    /// widens this VAE's 64-dim head.
     qp_d: Buf = .{},
     kp_d: Buf = .{},
     vp_d: Buf = .{},
@@ -131,7 +131,7 @@ pub const Workspace = struct {
         // Both LayerScale vectors of every block, uploaded once per window.
         ws.scale_d = try be.tensorCreate(dec.blocks.len * 2 * cfg.dim * 4);
         ws.patch_d = try be.tensorCreate(grid * cfg.patchDim() * 4);
-        const hp = attnHd(be, cfg.head_dim);
+        const hp = be.attnWidth(cfg.head_dim);
         if (hp != cfg.head_dim) {
             const n = seq * cfg.heads * hp * 4;
             ws.qp_d = try be.tensorCreate(n);
@@ -148,23 +148,11 @@ pub const Workspace = struct {
     }
 };
 
-/// Head width the tensor-core attention runs at.
-///
-/// The hand-PTX P@V GEMM tiles at 128 and launches `grid.x = hd / 128`, so a
-/// 64-dim head gives a ZERO-sized grid and a launch error, not a wrong answer.
-/// This VAE is 32 heads of 64 where every DiT here is 128, so it is the first
-/// diffusion trunk to need the SD family's head padding. `.libs` (cuDNN) attends
-/// at the true width and needs none.
-fn attnHd(be: *const Backend, hd: usize) usize {
-    if (be.kernels == .libs) return hd;
-    return std.mem.alignForward(usize, hd, 128);
-}
-
 /// Force the f32 online-softmax attention instead of the tensor-core path.
 ///
-/// The tensor-core path stores its scores in f16 whichever of its two variants
-/// runs, and this VAE attends over thousands of keys at a 2048-wide dim, which is
-/// where f16's 65504 ceiling starts to bite. This is the A/B for that.
+/// This VAE attends over thousands of keys at a 2048-wide dim, where f16 scores
+/// would meet f16's 65504 ceiling; `flash_attn` keeps them in f32 registers, the
+/// three-pass pipeline stores them f16. This is the A/B for that.
 pub var force_naive_attn: bool = false;
 
 /// Report the residual stream's and the FFN product's magnitude per block (`TP_VAE_MAG`).
@@ -187,7 +175,7 @@ fn attentionAt(be: *Backend, ws: *Workspace, seq: usize, heads: usize, hd: usize
     if (force_naive_attn) {
         return be.attn(ws.q_d, ws.k_d, ws.v_d, ws.ao_d, seq, seq, heads, heads, hd, scale, false);
     }
-    const hp = attnHd(be, hd);
+    const hp = be.attnWidth(hd);
     if (hp == hd) return be.opAttnTC(ws.q_d, ws.k_d, ws.v_d, ws.ao_d, seq, heads, heads, hd, scale);
     inline for (.{ .{ "q_d", "qp_d" }, .{ "k_d", "kp_d" }, .{ "v_d", "vp_d" } }) |pair| {
         try be.opHeadPad(@field(ws, pair[1]), @field(ws, pair[0]), seq, heads, hp, hd, heads * hd, 0);

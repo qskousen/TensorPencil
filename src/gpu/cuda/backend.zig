@@ -248,6 +248,19 @@ pub const WeightNoise = @import("../weight_noise.zig").WeightNoise;
 /// `dual-cuda-test` measures the two.
 pub var rms_dual: bool = true;
 
+/// A/B knob for attention: true sends f32 operands `flash_attn` takes to the three-pass
+/// scores / softmax-stats / P@V pipeline instead, at the head widths that pipeline runs
+/// (multiples of 128), so neither `attnWidth` nor `attnReads16` moves under it.
+pub var force_tc_attn: bool = false;
+
+/// A/B knob: `attnReads16` false off the library backend, so callers store attention
+/// operands f32. Read when a caller sizes its buffers.
+pub var force_attn_f32_operands: bool = false;
+
+/// DIAGNOSTIC: `hgemmInto` stores an f32 plane and compacts it in a second pass, the
+/// arithmetic its fused store must match bit for bit (`lin-cuda-test`).
+pub var split_hgemm_epilogue: bool = false;
+
 /// Attention scratch (S+P) a backend starts with. Public because the pipeline's
 /// cold residency estimate has to assume the same reserve the pin site keeps
 /// under its budget (`armDenoiserResidency`), before any backend exists.
@@ -528,12 +541,19 @@ pub const Backend = struct {
     cudnn_v16: DeviceBuffer = .{},
     cudnn_o16: DeviceBuffer = .{},
     cudnn_ws: DeviceBuffer = .{},
+    // f16 copies of f32 Q/K/V for `flash_attn`, which reads 16-bit operands.
+    fa_q16: DeviceBuffer = .{},
+    fa_k16: DeviceBuffer = .{},
+    fa_v16: DeviceBuffer = .{},
+    // `flash_attn` per (hd, in dtype, out dtype); modules live in `elt_mods`.
+    fa_fns: std.AutoHashMapUnmanaged(u32, cu.CUfunction) = .empty,
 
     // cached PTX modules / functions.
     prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty, // keyed by cols
     prep_owned: std.ArrayList(ctxmod.Module) = .empty,
-    fused_mod: ?ctxmod.Module = null,
-    fused_fn: cu.CUfunction = null,
+    /// The hand-PTX GEMMs with the rescale fused, per `kernels.IgemmKind` and output dtype.
+    fused_mods: [3]std.EnumArray(Dt, ?ctxmod.Module) = @splat(.initFill(null)),
+    fused_fns: [3]std.EnumArray(Dt, cu.CUfunction) = @splat(.initFill(null)),
     // irescale (s32 acc * act_scale[row] * weight_scale[col]) for the cuBLASLt int8
     // path (.libs mode), one per output dtype.
     irescale_mods: [3]?ctxmod.Module = @splat(null),
@@ -562,8 +582,6 @@ pub const Backend = struct {
     // int4 (W4A4) variants: prep quantizes to s4 and the GEMM is m16n8k64.s4.
     i4_prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
     i4_prep_owned: std.ArrayList(ctxmod.Module) = .empty,
-    i4_fused_mod: ?ctxmod.Module = null,
-    i4_fused_fn: cu.CUfunction = null,
     mm_mod: ?ctxmod.Module = null,
     mm_fn: cu.CUfunction = null,
     hgemm_mod: ?ctxmod.Module = null,
@@ -602,6 +620,9 @@ pub const Backend = struct {
     attn_g_group: usize = 0,
     hgemm_bf16_mod: ?ctxmod.Module = null, // native bf16 MMA (dense bf16 DiT)
     hgemm_bf16_fn: cu.CUfunction = null,
+    /// `hgemm_epi` per operand (f16, bf16) and output dtype.
+    hgemm_epi_mods: [2]std.EnumArray(Dt, ?ctxmod.Module) = @splat(.initFill(null)),
+    hgemm_epi_fns: [2]std.EnumArray(Dt, cu.CUfunction) = @splat(.initFill(null)),
     hgemm_b_mod: ?ctxmod.Module = null,
     hgemm_b_fn: cu.CUfunction = null,
     hgemm_bc16_mod: ?ctxmod.Module = null,
@@ -730,7 +751,7 @@ pub const Backend = struct {
         // NEUTRAL vs cuBLASLt+irescale (cuDNN's int8 matmul is ~0.22 s/step slower
         // than cuBLASLt IMMA, exactly canceling the irescale round-trip it removes).
         // cuBLASLt IMMA is the more-proven path; the fused graph stays dormant +
-        // documented (MatmulDequantPlan, cuda-libs-i8fused-test).7.
+        // documented (MatmulDequantPlan, cuda-libs-i8fused-test).
         self.use_fused_i8 = false;
 
         var lt = cublaslt.Api.load() catch return error.CudaError;
@@ -844,8 +865,7 @@ pub const Backend = struct {
         self.i4_prep_mods.deinit(self.gpa);
         for (self.i4_prep_owned.items) |m| m.unload(self.ctx);
         self.i4_prep_owned.deinit(self.gpa);
-        if (self.i4_fused_mod) |m| m.unload(self.ctx);
-        if (self.fused_mod) |m| m.unload(self.ctx);
+        for (&self.fused_mods) |*mods| for (&mods.values) |m| if (m) |mm| mm.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_x_mod) |m| m.unload(self.ctx);
@@ -861,6 +881,7 @@ pub const Backend = struct {
         if (self.gdn_chunk_mod) |m| m.unload(self.ctx);
         if (self.attn_g_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bf16_mod) |m| m.unload(self.ctx);
+        for (&self.hgemm_epi_mods) |*mods| for (&mods.values) |m| if (m) |mm| mm.unload(self.ctx);
         if (self.hgemm_b_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bc16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_ao_mod) |m| m.unload(self.ctx);
@@ -868,6 +889,7 @@ pub const Backend = struct {
         for (self.elt_mods.items) |m| m.unload(self.ctx);
         self.elt_mods.deinit(self.gpa);
         self.elt_fns.deinit(self.gpa);
+        self.fa_fns.deinit(self.gpa);
         if (self.dual_mod) |m| m.unload(self.ctx);
         self.dual_fns.deinit(self.gpa);
         self.tensorDestroy(&self.fp8_lut);
@@ -904,6 +926,9 @@ pub const Backend = struct {
         self.tensorDestroy(&self.cudnn_v16);
         self.tensorDestroy(&self.cudnn_o16);
         self.tensorDestroy(&self.cudnn_ws);
+        self.tensorDestroy(&self.fa_q16);
+        self.tensorDestroy(&self.fa_k16);
+        self.tensorDestroy(&self.fa_v16);
         for (self.irescale_mods) |mm| if (mm) |m| m.unload(self.ctx);
         self.tensorDestroy(&self.attn_qh);
         self.tensorDestroy(&self.attn_kh);
@@ -2365,16 +2390,17 @@ pub const Backend = struct {
 
     // ---- int8 GEMM pair -----------------------------------------------------
 
-    fn prepFn(self: *Backend, cols: usize, in_dt: Dt, rotate: bool, stage_global: bool) Error!cu.CUfunction {
+    fn prepFn(self: *Backend, cols: usize, in_dt: Dt, q: kernels.PrepOut, rotate: bool, stage_global: bool) Error!cu.CUfunction {
         const key = cols | (@as(usize, @backingInt(in_dt)) << 43) |
             (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
-            (if (stage_global) @as(usize, 1) << 42 else 0); // variants keyed separately
+            (if (stage_global) @as(usize, 1) << 42 else 0) |
+            (@as(usize, @intFromEnum(q)) << 46); // variants keyed separately
         if (self.prep_mods.get(key)) |f| return f;
         // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_dt, .none, 0, rotate, stage_global) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, q, in_dt, .none, 0, rotate, stage_global) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -2383,22 +2409,48 @@ pub const Backend = struct {
         };
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
-        const f = mod.getFunction(self.ctx, if (rotate) "iprep" else "iprep_nr") catch return error.CudaError;
+        const f = mod.getFunction(self.ctx, if (q == .e4m3) "f8prep" else if (rotate) "iprep" else "iprep_nr") catch return error.CudaError;
         self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols, stage_global)) catch return error.CudaError;
         self.prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.prep_mods.put(self.gpa, key, f) catch return error.OutOfMemory;
         return f;
     }
 
-    fn fusedFn(self: *Backend) Error!cu.CUfunction {
-        if (self.fused_mod != null) return self.fused_fn;
-        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 8, true) catch return error.OutOfMemory;
+    /// The fused GEMM of `kind` storing `out`.
+    fn fusedFn(self: *Backend, kind: kernels.IgemmKind, out: Dt) Error!cu.CUfunction {
+        const slot = @intFromEnum(kind);
+        if (self.fused_mods[slot].get(out) != null) return self.fused_fns[slot].get(out);
+        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, kind, true, out) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
-        self.fused_fn = mod.getFunction(self.ctx, "igemm_pipe_fused") catch return error.CudaError;
-        self.fused_mod = mod;
-        self.logOccupancy("igemm_pipe_fused", self.fused_fn, mmq_pipe_threads);
-        return self.fused_fn;
+        const name = switch (kind) {
+            .s8 => "igemm_pipe_fused",
+            .s4 => "i4gemm_pipe_fused",
+            .e4m3 => "f8gemm_pipe_fused",
+        };
+        const f = mod.getFunction(self.ctx, name) catch return error.CudaError;
+        self.fused_mods[slot].set(out, mod);
+        self.fused_fns[slot].set(out, f);
+        if (out == .f32 and kind != .s4) self.logOccupancy(name, f, mmq_pipe_threads);
+        return f;
+    }
+
+    /// One launch of a fused GEMM against the prepped activation: `ws_db` per-column
+    /// scales, or `wsc` for the kinds that take one scalar.
+    fn launchFused(self: *Backend, kind: kernels.IgemmKind, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: ?DeviceBuffer, wsc: f32, rows: usize, bias_ptr: u64) Error!void {
+        const f = try self.fusedFn(kind, y.dt);
+        var pa = self.i8_x.ptr();
+        var pb = w_db.ptr();
+        var pc = y.ptr();
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(self.i8_cols);
+        var pas = self.i8_scale.ptr();
+        var pws: u64 = if (ws_db) |b| b.ptr() else 0;
+        var pbias = bias_ptr;
+        var pm: u32 = @intCast(self.i8_m);
+        var pwsc = wsc;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc) };
+        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
     fn matmulFn(self: *Backend) Error!cu.CUfunction {
@@ -2453,6 +2505,42 @@ pub const Backend = struct {
     /// Native bf16 tensor-core GEMM (dense bf16 DiT): same tiling as hgemmFn but
     /// the MMA consumes bf16 A/B directly (f32 accumulate), no f16 round trip.
     /// Ampere+ (sm_80) only; callers must gate on cc_major >= 8.
+    fn hgemmEpiFn(self: *Backend, op: Dt, out: Dt) Error!cu.CUfunction {
+        const slot = @intFromBool(op == .bf16);
+        if (self.hgemm_epi_mods[slot].get(out) != null) return self.hgemm_epi_fns[slot].get(out);
+        const ptx = kernels.buildHgemmEpi(self.gpa, op == .bf16, out) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        const f = mod.getFunction(self.ctx, "hgemm_epi") catch return error.CudaError;
+        self.hgemm_epi_mods[slot].set(out, mod);
+        self.hgemm_epi_fns[slot].set(out, f);
+        return f;
+    }
+
+    /// `dst[m][co]` (from element `dst_off`) = `a16[m_pad][k_pad]` @ `w16[co_pad][k_pad]`ᵀ
+    /// * `mul` + bias, on the hand tensor-core GEMM with the store fused.
+    fn hgemmInto(self: *Backend, dst: DeviceBuffer, dst_off: usize, a16: DeviceBuffer, w16: DeviceBuffer, m: usize, m_pad: usize, co: usize, co_pad: usize, k_pad: usize, bias: []const f32, mul: f32, op: Dt) Error!void {
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        if (split_hgemm_epilogue) {
+            try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+            try self.launchHgemm(if (op == .bf16) try self.hgemmBf16Fn() else try self.hgemmFn(), a16, w16, self.conv_c, m_pad, co_pad, k_pad);
+            const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off), 0, 0, 0 };
+            return self.dualElemsAt("bias_compact", dst.dt, self.conv_c, b_db, null, dst, u_bc, .{ mul, 0 }, m * co);
+        }
+        const f = try self.hgemmEpiFn(op, dst.dt);
+        var pa = a16.ptr();
+        var pb = w16.ptr();
+        var pc = dst.ptr() + @as(u64, dst_off * dst.dt.bytes());
+        var pn: u32 = @intCast(co_pad);
+        var pk: u32 = @intCast(k_pad);
+        var pbias = b_db.ptr();
+        var pm: u32 = @intCast(m);
+        var pco: u32 = @intCast(co);
+        var pmul = mul;
+        var params = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pco), @ptrCast(&pmul) };
+        self.ctx.launch(f, .{ @intCast(co_pad / 128), @intCast(m_pad / 128), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
     fn hgemmBf16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bf16_mod != null) return self.hgemm_bf16_fn;
         const ptx = kernels.buildHgemm(self.gpa, false, false, false, true, true, false) catch return error.OutOfMemory;
@@ -2547,39 +2635,10 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ @intCast((rows + 63) / 64), @intCast((m + 63) / 64), 1 }, .{ 16, 16, 1 }, 0, &pg) catch return error.CudaError;
     }
 
-    /// fp8-e4m3 GEMM: y[m][rows] f32 = x[m][cols] f32 @ Wᵀ, W fp8-e4m3 [rows][cols]
-    /// with a per-tensor `scale`. The fp8 weight streams through the cache; it is
-    /// decoded to an f16 scratch (dequant_fp8_f16, scale folded), the activations
-    /// are converted to f16 with the m->128 pad zeroed, and the validated f16
-    /// buildHgemm produces the f32 output. cols must be a multiple of 32.
-    /// (No y_off / bias, the text encoder writes each GEMM to its own buffer.)
-    pub fn opMatmulFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
-        self.ptic();
-        defer self.ptoc(.matmul);
-        if (self.fp8_lut.buf == .null_handle) {
-            self.fp8_lut = try self.tensorCreate(256 * 4);
-            try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
-        }
-        const w_db = try self.cachedWeight(w_bytes); // fp8 bytes, streams via the cache
-        const mpad = std.mem.alignForward(usize, m, 128);
-        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
-        try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
-        try self.dualPairs("dequant_fp8_f16", w_db, self.fp8_w16, self.fp8_lut, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
-        try self.cvtF32ToH16(x, self.fp8_a16, mpad * cols, m * cols);
-        // C[mpad][rows] = A[mpad][cols] @ B[rows][cols]ᵀ  (m=mpad, n=rows, k=cols)
-        if (self.kernels == .libs) {
-            try self.ltMatmulF16(y, self.fp8_w16, self.fp8_a16, rows, mpad, cols);
-        } else {
-            const f_hg = try self.hgemmFn();
-            if (rows % 128 != 0) return self.hgemmPadN(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, mpad, rows, cols, null);
-            try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
-        }
-    }
-
-    /// `opMatmulFp8` in bf16, with a per-column bias: the weight decodes to bf16
-    /// (exact, e4m3 fits bf16) and the activation is staged as bf16, for activations
-    /// past f16's range.
-    pub fn opMatmulFp8Bf16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, bias: []const f32) Error!void {
+    /// fp8-e4m3 GEMM: `y[m][rows] = x[m][cols] @ (W * scale)ᵀ + bias`, `x` and `y` at
+    /// their own dtypes. The weight decodes per call into an `op` scratch (exact in bf16;
+    /// f16 holds e4m3 times a typical scale) and runs `opGemm16`.
+    pub fn opMatmulFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, bias: []const f32, op: Dt) Error!void {
         if (self.fp8_lut.buf == .null_handle) {
             self.fp8_lut = try self.tensorCreate(256 * 4);
             try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
@@ -2589,17 +2648,19 @@ pub const Backend = struct {
             self.ptic();
             defer self.ptoc(.dequant);
             try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
-            try self.dualPairs("dequant_fp8_bf16", w_db, self.fp8_w16, self.fp8_lut, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
+            const u = [7]u32{ @intCast(rows * cols), 0, 0, 0, 0, 0, 0 };
+            if (op == .bf16)
+                try self.dualPairs("dequant_fp8_bf16", w_db, self.fp8_w16, self.fp8_lut, null, u, .{ scale, 0 }, rows * cols)
+            else
+                try self.dualPairs("dequant_fp8_f16", w_db, self.fp8_w16, self.fp8_lut, null, u, .{ scale, 0 }, rows * cols);
         }
-        self.ptic();
-        defer self.ptoc(.matmul);
-        try self.gemmBf16X(y, x, m, self.fp8_w16, rows, cols, bias);
+        try self.opGemm16(y, 0, x, m, self.fp8_w16.as(op), rows, cols, bias, 1.0, op);
     }
 
     /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
     ///
     /// Structurally the fp8 path above: the 4-bit weight streams through the cache, is
-    /// decoded to an f16 scratch, and the validated f16 GEMM produces f32. Weight-only
+    /// decoded to a 16-bit scratch, and a 16-bit GEMM produces f32. Weight-only
     /// quantization, which is what NVFP4 is on anything below Blackwell, its tensor
     /// cores are sm_100+, and ComfyUI itself falls back to exactly this shape (its log
     /// calls it "emulated ops"): keep the weight 4-bit resident, dequantize per call.
@@ -2670,11 +2731,6 @@ pub const Backend = struct {
         // first `[10240, 3840]` MLP weight at m=288/mpad=384, i.e. 3.9 MB past the end of
         // a workspace sized `m*rows`. It stages into the padded `conv_c` and compacts,
         // exactly as `opGemmBf16` does for the same reason.
-        //
-        // `opMatmulFp8` above still writes `y` directly and therefore carries the same
-        // requirement on its callers implicitly ("the text encoder writes each GEMM to its
-        // own buffer"); its zimage/anima `.f8_e4m3` arms have never been exercised. Worth
-        // fixing the same way if an fp8 checkpoint for either ever shows up.
         const f_hg = try self.hgemmBf16Fn();
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         if (rows % 128 != 0) return self.hgemmPadN(f_hg, self.fp8_a16, self.fp8_w16, y, m, mpad, rows, cols, b_db);
@@ -4296,23 +4352,23 @@ pub const Backend = struct {
         const co_pad = std.mem.alignForward(usize, co, 128);
         const k_pad = std.mem.alignForward(usize, k, 32);
         const m_pad = std.mem.alignForward(usize, m, 128);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        // The WEIGHT is never scaled: it is the activation that overflows.
-        try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
         try self.pad2dTo(op, src, self.conv_a16, m_pad * k_pad, k_pad, m, k, 0, 1.0 / act_div);
-        if (self.kernels == .libs) {
-            if (op == .bf16) {
-                try self.ltMatmulBf16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
-            } else {
-                try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
-            }
+        // The WEIGHT is never scaled: it is the activation that overflows. One already
+        // on the tile is read in place.
+        const wt = if (co_pad == co and k_pad == k) w16 else blk: {
+            try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+            try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
+            break :blk self.conv_w16;
+        };
+        if (self.kernels != .libs) return self.hgemmInto(dst, dst_off_elems, self.conv_a16, wt, m, m_pad, co, co_pad, k_pad, bias, act_div, op);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+        if (op == .bf16) {
+            try self.ltMatmulBf16(self.conv_c, wt, self.conv_a16, co_pad, m_pad, k_pad);
         } else {
-            const f_hg = if (op == .bf16) try self.hgemmBf16Fn() else try self.hgemmFn();
-            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+            try self.ltMatmulF16(self.conv_c, wt, self.conv_a16, co_pad, m_pad, k_pad);
         }
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0, 0 };
         try self.dualElemsAt("bias_compact", dst.dt, self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
     }
@@ -4342,14 +4398,12 @@ pub const Backend = struct {
         }
         if (lt) return self.ltGemmHalfBias(dst, dst_off_elems, self.conv_a16.as(op), w16, bias, m, co, k, act_div, op);
         const co_pad = std.mem.alignForward(usize, co, 128);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
-        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
-        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
-        try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
-        const f_hg = if (op == .bf16) try self.hgemmBf16Fn() else try self.hgemmFn();
-        try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
-        const u_bc = [7]u32{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0, 0 };
-        try self.dualElemsAt("bias_compact", dst.dt, self.conv_c, b_db, null, dst, u_bc, .{ act_div, 0 }, m * co);
+        const wt = if (co_pad == co and k_pad == k) w16 else blk: {
+            try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+            try self.pad2dTo(op, w16, self.conv_w16, co_pad * k_pad, k_pad, co, k, 0, 1.0);
+            break :blk self.conv_w16;
+        };
+        try self.hgemmInto(dst, dst_off_elems, self.conv_a16, wt, m, m_pad, co, co_pad, k_pad, bias, act_div, op);
     }
 
     /// The operand width `opConvGemm16` gathers a `k`-wide patch into for a `dst`.
@@ -4740,11 +4794,10 @@ pub const Backend = struct {
         const yc = self.conv_c;
         switch (op) {
             .f16 => try self.dualElemsAt("bias_add", dst.dt, yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co),
-            else => {
-                std.debug.assert(dst.dt != .f16);
-                if (dst.dt == .bf16) {
-                    try self.dualElems("bias_add_bf16", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
-                } else try self.dualElems("bias_add_bf16_f32", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co);
+            else => switch (dst.dt) {
+                .bf16 => try self.dualElems("bias_add_bf16", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co),
+                .f16 => try self.dualElems("bias_add_bf16_f16", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co),
+                .f32 => try self.dualElems("bias_add_bf16_f32", yc, b_db, dst, null, u_b, .{ 0, 0 }, n * co),
             },
         }
     }
@@ -5082,7 +5135,8 @@ pub const Backend = struct {
         try self.ltMatmulI8(self.i8_acc, w_db, self.i8_x, rows, m, k);
         if (bench_skip_rescale) return; // DIAGNOSTIC: measure irescale's batched cost
         const f = try self.irescaleFn(y.dt);
-        const total = m * rows;
+        // The GEMM runs the padded rows; `y` takes only the real ones.
+        const total = self.i8_m * rows;
         var pacc = self.i8_acc.ptr();
         var py = y.ptr();
         var pas = self.i8_scale.ptr();
@@ -5129,6 +5183,22 @@ pub const Backend = struct {
 
     /// Reads `x` at its own dtype.
     pub fn opI8PrepR(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, rotate: bool) Error!void {
+        return self.prepRows(x, m, cols, .s8, rotate);
+    }
+
+    /// `opI8Prep` to e4m3 at one scale per row, unrotated, for `opF8Gemm`. Needs
+    /// `hasFp8Mma`.
+    pub fn opF8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+        std.debug.assert(self.hasFp8Mma());
+        return self.prepRows(x, m, cols, .e4m3, false);
+    }
+
+    /// Whether this device has the fp8 tensor cores (`kernels.fp8_need`).
+    pub fn hasFp8Mma(self: *const Backend) bool {
+        return @as(u32, @intCast(self.ctx.cc_major * 10 + self.ctx.cc_minor)) >= kernels.fp8_need.sm;
+    }
+
+    fn prepRows(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, q: kernels.PrepOut, rotate: bool) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
         const mpad = std.mem.alignForward(usize, m, 128);
@@ -5151,7 +5221,7 @@ pub const Backend = struct {
         const stage_global = force_global_prep or
             kernels.prepNeedsGlobalStage(cols, @intCast(@max(self.ctx.shared_optin_max, 0)));
         if (stage_global) try self.ensureDeviceBuffer(&self.i8_rot, mpad * cols * 4);
-        const f = try self.prepFn(cols, x.dt, rotate, stage_global);
+        const f = try self.prepFn(cols, x.dt, q, rotate, stage_global);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
@@ -5187,7 +5257,7 @@ pub const Backend = struct {
     fn bqPrepFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_prep_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, .f32, block, 0, rotate, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, 0, rotate, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("block-quant prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -5220,7 +5290,7 @@ pub const Backend = struct {
     fn bqDecFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_dec_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, .f32, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const nm = if (bits == 4)
@@ -5481,19 +5551,20 @@ pub const Backend = struct {
         const bias_ptr = try self.epilogueBias(bias, rows);
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(y.dt == .f32 or self.kernels == .libs); // 16-bit output only on the cuBLASLt/irescale path
         if (self.kernels == .libs) return self.opI8GemmLibs(y, w_db, ws_db, rows, bias_ptr);
-        const f = try self.fusedFn();
-        var pa = self.i8_x.ptr();
-        var pb = w_db.ptr();
-        var pc = y.ptr();
-        var pn: u32 = @intCast(rows);
-        var pk: u32 = @intCast(self.i8_cols);
-        var pas = self.i8_scale.ptr();
-        var pws = ws_db.ptr();
-        var pbias = bias_ptr;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias) };
-        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
+        return self.launchFused(.s8, y, w_db, ws_db, 1.0, rows, bias_ptr);
+    }
+
+    /// fp8 e4m3 GEMM against the last `opF8Prep`: y = prepped @ Wᵀ * act_scale[row] *
+    /// `scale` (+ bias), the weight read as stored. Both arms run the hand kernel.
+    pub fn opF8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, bias: ?[]const f32) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        self.hold(w_db);
+        defer self.unhold();
+        const bias_ptr = try self.epilogueBias(bias, rows);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        return self.launchFused(.e4m3, y, w_db, null, scale, rows, bias_ptr);
     }
 
     // ---- int4 (W4A4) GEMM pair ----------------------------------------------
@@ -5504,7 +5575,7 @@ pub const Backend = struct {
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 4, .f32, .none, 0, true, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, .s4, .f32, .none, 0, true, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -5518,16 +5589,6 @@ pub const Backend = struct {
         self.i4_prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.i4_prep_mods.put(self.gpa, cols, f) catch return error.OutOfMemory;
         return f;
-    }
-
-    fn i4fusedFn(self: *Backend) Error!cu.CUfunction {
-        if (self.i4_fused_mod != null) return self.i4_fused_fn;
-        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 4, true) catch return error.OutOfMemory;
-        defer self.gpa.free(ptx);
-        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
-        self.i4_fused_fn = mod.getFunction(self.ctx, "i4gemm_pipe_fused") catch return error.CudaError;
-        self.i4_fused_mod = mod;
-        return self.i4_fused_fn;
     }
 
     /// int4 (W4A4) analogue of opI8Prep: rotate + per-row dynamic quantize
@@ -5582,17 +5643,7 @@ pub const Backend = struct {
         const bias_ptr = try self.epilogueBias(bias, rows);
         self.ptic();
         defer self.ptoc(.matmul);
-        const f = try self.i4fusedFn();
-        var pa = self.i8_x.ptr();
-        var pb = w_db.ptr();
-        var pc = y.ptr();
-        var pn: u32 = @intCast(rows);
-        var pk: u32 = @intCast(self.i8_cols);
-        var pas = self.i8_scale.ptr();
-        var pws = ws_db.ptr();
-        var pbias = bias_ptr;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias) };
-        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
+        return self.launchFused(.s4, y, w_db, ws_db, 1.0, rows, bias_ptr);
     }
 
     // ---- eltwise / attention (correctness-first f32 kernels) ----------------
@@ -6073,7 +6124,8 @@ pub const Backend = struct {
     pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
-        std.debug.assert(seq_q <= seq_kv);
+        // Causal rows line up with the LAST `seq_q` keys; a non-causal call reads all of them.
+        std.debug.assert(!causal or seq_q <= seq_kv);
         if (hd > 512) return error.UnsupportedWidth;
         const f = try self.eltFn(elt.attn_ptx, "attn");
         try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq_q), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), @intCast(seq_kv) }, .{ scale, 0 }, seq_q * n_heads);
@@ -6487,8 +6539,7 @@ pub const Backend = struct {
     /// under `.libs`, the hand-PTX rectangular pipeline otherwise. The rectangular
     /// analogue of `opAttnTC`, and the entry point a model should call.
     ///
-    /// `opAttnTCRect` needs `hd` to be a multiple of its 128-wide P@V tile, so a
-    /// narrower head (SD's 64) is zero-padded up to one; cuDNN takes any width.
+    /// A head width neither cuDNN nor `flash_attn` takes is zero-padded to `attnWidth`.
     pub fn opAttnCross(
         self: *Backend,
         q: DeviceBuffer,
@@ -6506,7 +6557,7 @@ pub const Backend = struct {
             defer self.ptoc(.attn);
             return self.opAttnCudnn(q, k, v, out, seq_q, seq_kv, heads, heads, hd, scale);
         }
-        const hp = std.mem.alignForward(usize, hd, 128);
+        const hp = self.attnWidth(hd);
         if (hp == hd) return self.opAttnTCRect(q, k, v, out, seq_q, seq_kv, heads, heads, hd, scale);
 
         const stride = heads * hd;
@@ -6594,18 +6645,24 @@ pub const Backend = struct {
         try self.dualElems("im2col", src, null, null, patch, .{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0), 0 }, .{ if (up) 1.0 else 0.0, 0 }, total);
     }
 
-    /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale*Q*Kᵀ)*V. Q/K/V are
-    /// the interleaved [seq][*][hd] f32 tensors from rope; heads are gathered to
-    /// contiguous f16 (V transposed to [hd][mpad]), run through hgemm->softmax->hgemm
-    /// on tensor cores, and scattered back. GQA: Q head h reads KV head h/group.
-    /// Dispatches to the head-batched path (grid.z fills the GPU) or the per-head
-    /// loop reference.
+    /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale*Q*Kᵀ)*V over the
+    /// interleaved [seq][*][hd] tensors from rope; Q head h reads KV head h/group.
+    /// cuDNN's SDPA under `.libs`; otherwise the fused `flash_attn` wherever
+    /// `flashTakes` (head width 64 or 128), else the three-pass pipeline: heads
+    /// gathered to padded f16, hgemm -> softmax -> hgemm, scattered back. That pipeline
+    /// reads and writes f32 only, whatever the buffers' dtype tag says.
     pub fn opAttnTC(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         if (self.kernels == .libs) {
             self.ptic();
             defer self.ptoc(.attn);
             return self.opAttnCudnn(q, k, v, out, seq, seq, n_heads, kv_heads, hd, scale);
         }
+        if (flashTakes(q, k, v, out, hd, n_heads, kv_heads)) {
+            self.ptic();
+            defer self.ptoc(.attn);
+            return self.attnFlash(q, k, v, out, seq, seq, n_heads, kv_heads, hd, scale, no_causal);
+        }
+        try threePassTakes(q, k, v, out);
         // Single-head goes to the flash path at EVERY size, not just when the
         // plane is large. That was the old gate, and it is the wrong axis: the
         // batched path stores the scores in f16, and the one caller with a
@@ -6721,6 +6778,7 @@ pub const Backend = struct {
     /// per-head launch count collapses to ~7*(n_heads/G). G is capped so the
     /// scores+probs scratch fits `attn_scratch_budget`.
     fn opAttnTCBatched(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        std.debug.assert(hd % 128 == 0); // see `attnWidth`
         const mpad = std.mem.alignForward(usize, seq, 128);
         const group = n_heads / kv_heads;
         const fused = self.attn_fused;
@@ -6853,6 +6911,13 @@ pub const Backend = struct {
         scale: f32,
         cbase: u32,
     ) Error!void {
+        if (flashTakes(q, k, v, out, hd, n_heads, kv_heads)) {
+            self.ptic();
+            defer self.ptoc(.attn);
+            return self.attnFlash(q, k, v, out, seq_q, seq_kv, n_heads, kv_heads, hd, scale, cbase);
+        }
+        try threePassTakes(q, k, v, out);
+        std.debug.assert(hd % 128 == 0); // see `attnWidth`
         const qpad = std.mem.alignForward(usize, seq_q, 128);
         const kpad = std.mem.alignForward(usize, seq_kv, 128);
         const group = n_heads / kv_heads;
@@ -6988,6 +7053,88 @@ pub const Backend = struct {
             }
             try self.dualElems("scatter_head", self.attn_oh, out, null, null, .{ seq32, nh32, h32, hd32, seq32 * hd32, 0, 0 }, .{ 0, 0 }, seq * hd);
         }
+    }
+
+    /// The head width to hand `opAttnTC` / `opAttnCross` for a true width `hd`: `hd`
+    /// where cuDNN or `flash_attn` attends at it, else the next multiple of the
+    /// three-pass pipeline's 128-wide P@V tile, zero-padded by the caller
+    /// (`opHeadPad`; exact, the extra columns add nothing).
+    pub fn attnWidth(self: *const Backend, hd: usize) usize {
+        if (self.kernels == .libs or kernels.flashAttnHd(hd)) return hd;
+        return std.mem.alignForward(usize, hd, 128);
+    }
+
+    /// Whether `opAttnTC` / `opAttnCross` read 16-bit Q/K/V/O at this shape in place,
+    /// which is what lets a caller store them 16-bit. 16-byte aligned, at one dtype.
+    pub fn attnReads16(self: *const Backend, hd: usize, n_heads: usize, kv_heads: usize) bool {
+        return self.kernels == .libs or (!force_attn_f32_operands and kernels.flashAttnHd(hd) and n_heads % kv_heads == 0);
+    }
+
+    /// Whether `attnFlash` takes this call. 16-bit operands are read in place by
+    /// 16-byte cp.async, f32 ones are staged into buffers that are aligned anyway.
+    fn flashTakes(q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, hd: usize, n_heads: usize, kv_heads: usize) bool {
+        if (!kernels.flashAttnHd(hd) or n_heads % kv_heads != 0) return false;
+        if (q.dt != k.dt or k.dt != v.dt) return false;
+        if (q.dt == .f32 and force_tc_attn and hd % 128 == 0) return false;
+        if (q.dt != .f32) for ([_]DeviceBuffer{ q, k, v }) |x| if (x.ptr() % 16 != 0) return false;
+        return out.ptr() % 8 == 0;
+    }
+
+    /// The three-pass pipeline reads and writes f32 whatever the dtype tag says.
+    fn threePassTakes(q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer) Error!void {
+        for ([_]DeviceBuffer{ q, k, v, out }) |x| if (x.dt != .f32) return error.UnsupportedDtype;
+    }
+
+    /// `flash_attn` over interleaved `[seq][heads][hd]` Q/K/V into `out` at its own
+    /// dtype. f32 operands are staged to f16 first, as every tensor-core path here does.
+    fn attnFlash(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, cbase: u32) Error!void {
+        var q16 = q;
+        var k16 = k;
+        var v16 = v;
+        if (q.dt == .f32) {
+            const qn = seq_q * n_heads * hd;
+            const kn = seq_kv * kv_heads * hd;
+            try self.ensureDeviceBuffer(&self.fa_q16, qn * 2);
+            try self.ensureDeviceBuffer(&self.fa_k16, kn * 2);
+            try self.ensureDeviceBuffer(&self.fa_v16, kn * 2);
+            q16 = self.fa_q16.as(.f16);
+            k16 = self.fa_k16.as(.f16);
+            v16 = self.fa_v16.as(.f16);
+            try self.cvtF32ToH16(q, q16, qn, qn);
+            try self.cvtF32ToH16(k, k16, kn, kn);
+            try self.cvtF32ToH16(v, v16, kn, kn);
+        }
+        const f = try self.flashFn(hd, q16.dt, out.dt);
+        var pq = q16.ptr();
+        var pk = k16.ptr();
+        var pv = v16.ptr();
+        var po = out.ptr();
+        var psq: u32 = @intCast(seq_q);
+        var pskv: u32 = @intCast(seq_kv);
+        var pqs: u32 = @intCast(n_heads * hd);
+        var pkvs: u32 = @intCast(kv_heads * hd);
+        var pgrp: u32 = @intCast(n_heads / kv_heads);
+        var psl2: f32 = scale * std.math.log2e;
+        var pcb = cbase;
+        var params = [_]?*anyopaque{
+            @ptrCast(&pq),   @ptrCast(&pk),   @ptrCast(&pv),  @ptrCast(&po),
+            @ptrCast(&psq),  @ptrCast(&pskv), @ptrCast(&pqs), @ptrCast(&pkvs),
+            @ptrCast(&pgrp), @ptrCast(&psl2), @ptrCast(&pcb),
+        };
+        const blocks = (seq_q + kernels.flash_bm - 1) / kernels.flash_bm;
+        self.ctx.launch(f, .{ @intCast(blocks), @intCast(n_heads), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    fn flashFn(self: *Backend, hd: usize, in_dt: Dt, out_dt: Dt) Error!cu.CUfunction {
+        const key: u32 = @as(u32, @intCast(hd)) | @as(u32, @backingInt(in_dt)) << 16 | @as(u32, @backingInt(out_dt)) << 20;
+        if (self.fa_fns.get(key)) |f| return f;
+        const ptx = kernels.buildFlashAttn(self.gpa, hd, in_dt, out_dt) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        const f = mod.getFunction(self.ctx, "flash_attn") catch return error.CudaError;
+        self.elt_mods.append(self.gpa, mod) catch return error.OutOfMemory;
+        self.fa_fns.put(self.gpa, key, f) catch return error.OutOfMemory;
+        return f;
     }
 
     /// Per-head attention reference (A/B against the batched path). Scratch reused

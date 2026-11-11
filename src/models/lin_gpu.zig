@@ -184,6 +184,10 @@ pub const Caps = struct {
     pub fn fp8F32(_: Caps) bool {
         return true;
     }
+    /// No fp8 tensor-core path on Vulkan yet.
+    pub fn fp8Mma(_: Caps, _: Weight) bool {
+        return false;
+    }
     pub fn groupedTakes(_: Caps, w: Weight) bool {
         return w.rows % 8 == 0;
     }
@@ -521,7 +525,7 @@ pub const Lin = struct {
                     want = .svdq;
                 },
                 // `Caps` never routes to the other preps.
-                .i4, .mmq => return error.UnsupportedDType,
+                .i4, .mmq, .f8 => return error.UnsupportedDType,
             }
         }
         var g = Group{ .x = x, .m = m, .cols = cols, .prep = want, .serial = 0 };
@@ -965,7 +969,7 @@ pub const Lin = struct {
                 folded = o.bias == null;
             },
             // Routes for kernels this backend lacks; `Caps` never chooses them.
-            .gemm_fp8_bf16, .gemv_f16, .i4, .blockq_i8, .blockq_i4, .blockq_mmq, .gemv_q, .gemv_q8, .gemv_q8n, .gemv_q8batch => return error.UnsupportedDType,
+            .gemm_fp8_bf16, .gemv_f16, .i4, .blockq_i8, .blockq_i4, .blockq_mmq, .gemv_q, .gemv_q8, .gemv_q8n, .gemv_q8batch, .fp8_w8a8 => return error.UnsupportedDType,
         }
         if (folded) return;
         std.debug.assert(o.y_off == 0);

@@ -429,6 +429,7 @@ pub const entries = [_]Entry{
     .{ .name = "bias_add_bf16", .wg = elem_wg },
     .{ .name = "conv_w_bf16", .wg = elem_wg },
     .{ .name = "bias_add_bf16_f32", .wg = elem_wg },
+    .{ .name = "bias_add_bf16_f16", .wg = elem_wg },
     .{ .name = "scale_i32_f16", .wg = elem_wg },
     .{ .name = "scale_i32_bf16", .wg = elem_wg },
     .{ .name = "copy_f16", .wg = elem_wg },

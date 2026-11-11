@@ -239,7 +239,9 @@ const none: Buf = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
 /// unquantized); `use_f16` false keeps every narrowing route off f16, which on this
 /// backend means the f32-activation kernels.
 fn encoderUse(use_f16: bool) lin_gpu.Use {
-    return .{ .blockq = .f16, .act16 = if (use_f16) .f16 else .bf16, .int8 = lin_gpu.dual_lin.encoderInt8() };
+    var use = lin_gpu.Use.encoder(.f16);
+    use.act16 = if (use_f16) .f16 else .bf16;
+    return use;
 }
 
 /// Whether this context can run the encoder's weights at all, every linear by its own

@@ -54,15 +54,6 @@ const Config = sd_unet.Config;
 /// the two kernels partition the reduction differently and always did.
 const gn_chunks: usize = 32;
 
-
-/// The head width the hand-PTX attention tiles its P@V GEMM in.
-///
-/// `launchHgemmB` launches `grid.x = n / 128` with `n = head_dim`, so a
-/// narrower head asks for a zero-sized grid (`CUDA_ERROR_INVALID_VALUE`) and a
-/// non-multiple silently computes only part of the head. Every SD head width
-/// trips one or the other: 40, 64 and 80 the former, 160 the latter.
-const pv_tile: usize = 128;
-
 pub const SampleMode = dev.SampleMode;
 
 /// The dtype this UNet's activations are stored at on this backend: `UNet.act`, else
@@ -361,7 +352,7 @@ pub const Workspace = struct {
         gated.* = @max(gated.*, np * ch * 4);
         const heads = cfg.headsAt(ch);
         const hd = ch / heads;
-        const hp = attnHd(be, hd);
+        const hp = be.attnWidth(hd);
         if (hp != hd) padded.* = @max(padded.*, n * heads * hp * 4);
     }
 
@@ -494,25 +485,14 @@ fn attnScale(hd: usize) f32 {
     return 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 }
 
-
-
-
-
-/// The head width the attention actually runs at: the true one under cuDNN, the
-/// next multiple of the P@V tile under hand-PTX. See `pv_tile`.
-pub fn attnHd(be: *const Backend, hd: usize) usize {
-    if (be.kernels == .libs) return hd;
-    return std.mem.alignForward(usize, hd, pv_tile);
-}
-
-/// Self-attention over the latent positions, padding the head width when the
-/// backend's P@V GEMM needs it (`attnHd`).
+/// Self-attention over the latent positions, padding the head width where the
+/// backend attends at a wider one (`Backend.attnWidth`).
 ///
 /// `pub` for `sd-cuda-test`: the hand-PTX kernels have no unit test (the test
 /// binary brings up no CUDA context), so the validation command drives them
 /// directly rather than only through a whole render.
 pub fn selfAttn(be: *Backend, ws: *Workspace, n: usize, heads: usize, hd: usize, scale: f32) !void {
-    const hp = attnHd(be, hd);
+    const hp = be.attnWidth(hd);
     if (hp == hd) {
         return be.opAttnTC(ws.q, ws.k, ws.v, ws.ao, n, heads, heads, hd, scale);
     }

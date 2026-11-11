@@ -93,10 +93,14 @@ pub fn encode(d: anytype, enc: *const qwen3.TextEncoder, gpa: std.mem.Allocator,
 
         try d.rmsNorm(b.x, b.normed, layer.input_norm, seq, hidden, eps);
         try d.gemms(b.normed, seq, hidden, &.{ layer.q, layer.k, layer.v }, &.{ b.q, b.k, b.v });
-        try d.rmsNorm(b.q, b.q, layer.q_norm, seq * c.n_heads, hd, eps);
-        try d.rmsNorm(b.k, b.k, layer.k_norm, seq * c.n_kv_heads, hd, eps);
-        try d.rope(b.q, seq, c.n_heads);
-        try d.rope(b.k, seq, c.n_kv_heads);
+        if (c.qk_norm) {
+            try d.rmsNorm(b.q, b.q, layer.q_norm, seq * c.n_heads, hd, eps);
+            try d.rmsNorm(b.k, b.k, layer.k_norm, seq * c.n_kv_heads, hd, eps);
+        }
+        if (c.ropeAt(l)) {
+            try d.rope(b.q, seq, c.n_heads);
+            try d.rope(b.k, seq, c.n_kv_heads);
+        }
         try d.attention(seq);
         try d.gemms(b.attn, seq, c.qDim(), &.{layer.o}, &.{b.t});
         try d.add(b.x, b.t, seq * hidden);

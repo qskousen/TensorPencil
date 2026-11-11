@@ -63,7 +63,7 @@ const patch_band_bytes: usize = 64 << 20;
 /// conditioning policy, both of which keep the activation unquantized.
 const gen_use: lin_gpu.Use = .{ .blockq = .auto };
 fn prefixUse() lin_gpu.Use {
-    return .{ .blockq = .f16, .int8 = lin_gpu.dual_lin.encoderInt8() };
+    return lin_gpu.Use.encoder(.f16);
 }
 
 /// The generation stream's linear plan, without a LoRA.

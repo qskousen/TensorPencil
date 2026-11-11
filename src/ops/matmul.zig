@@ -317,7 +317,7 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
 /// What a device's integer GEMM does to the activation before it: rotated when
 /// `rotate`, then quantized per row to `bits` (0: left alone).
 /// `regrid`: the weight too as the device runs it, an svdq weight on its per-row int8 grid.
-pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false, regrid: bool = false };
+pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false, regrid: bool = false, fp8: bool = false };
 
 /// A device check's reference: called per linear, so the CPU carries the activation
 /// quantization of the route the device takes for that weight, and the check measures
@@ -326,9 +326,18 @@ pub const ActQuantHook = struct { ctx: *const anyopaque, of: *const fn (ctx: *co
 pub var act_quant: ?ActQuantHook = null;
 
 /// `row` as the device's prep leaves it: scale `max(absmax / qmax, 1e-12)`, round half
-/// away, the device's clamp, dequantized and rotated back.
+/// away (to the nearest e4m3, ties even, for `fp8`), the device's clamp, dequantized and
+/// rotated back.
 pub fn emulateActQuant(row: []f32, q: ActQuant) void {
     std.debug.assert(q.bits == 8 or q.bits == 4);
+    if (q.fp8) {
+        std.debug.assert(!q.rotate);
+        var amax: f32 = 0;
+        for (row) |v| amax = @max(amax, @abs(v));
+        const s = @max(amax / 448.0, 1e-12);
+        for (row) |*v| v.* = dtypes.f8e4m3ToF32(dtypes.f32ToF8E4M3(v.* / s)) * s;
+        return;
+    }
     if (q.rotate) convrot_mod.rotate(row);
     const qmax: f32 = if (q.bits == 8) 127 else 7;
     const qmin: f32 = if (q.bits == 8) -127 else -8;

@@ -1,5 +1,6 @@
 //! Wan VAE decoder (the Krea 2 VAE), specialized for still images. Also reads the
-//! Wan 2.2 layout at temporal kernel 1 that Qwen-Image 2.1 ships (`loadNested`).
+//! Wan 2.2 layout (`loadNested`): Qwen-Image 2.1's at temporal kernel 1, and the TI2V
+//! VAE Fibo 1.5 decodes with, whose head emits 2x2 patches (`patch`).
 //!
 //! With a single frame (T=1) and no feature cache, every causal 3D conv in
 //! ComfyUI's reference (`comfy/ldm/wan/vae.py`) sees only zero padding in
@@ -133,7 +134,10 @@ pub const Decoder = struct {
     mid_res2: ResBlock,
     ups: []Layer,
     head_norm: []const f32,
-    head_conv: Conv2d, // 96 -> 3, or 4 (RGBA) on Qwen-Image 2.1
+    head_conv: Conv2d, // 96 -> 3, or 4 (RGBA) on Qwen-Image 2.1, or 12 (patch 2 RGB)
+    /// Pixels per head output cell along each axis: the head's channels are
+    /// `(c, r, q)` with `r` the column offset and `q` the row offset (`pixels`).
+    patch: usize = 1,
 
     /// Every convolution in the decoder. Caller frees the list.
     pub fn convList(self: *Decoder, gpa: std.mem.Allocator) ![]*Conv2d {
@@ -267,11 +271,16 @@ pub const Decoder = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
+        // A 3-tap temporal kernel sees a single frame only through its last tap, as
+        // in the Wan 2.1 layout.
         const c1 = (store.get("decoder.conv1.weight") orelse return error.MissingTensor).info.shape.slice();
-        if (c1.len != 5 or c1[2] != 1) return error.UnsupportedVae;
+        if (c1.len != 5) return error.UnsupportedVae;
         const z = c1[1];
         const head = (store.get("decoder.head.2.weight") orelse return error.MissingTensor).info.shape.slice();
         if (head.len != 5) return error.ShapeMismatch;
+        const patch: usize = if (head[0] > 4) 2 else 1;
+        const pix = head[0] / (patch * patch);
+        if (pix * patch * patch != head[0] or (pix != 3 and pix != 4)) return error.UnsupportedVae;
 
         var ups: std.ArrayList(Layer) = .empty;
         var c = c1[0];
@@ -324,6 +333,7 @@ pub const Decoder = struct {
             .ups = ups_owned,
             .head_norm = head_norm,
             .head_conv = head_conv,
+            .patch = patch,
         };
     }
 
@@ -333,7 +343,32 @@ pub const Decoder = struct {
 
     /// 3, or 4 for an RGBA decoder.
     pub fn outChannels(self: *const Decoder) usize {
+        return self.head_conv.co / (self.patch * self.patch);
+    }
+
+    /// What the head writes per cell: `outChannels() * patch^2`.
+    pub fn headChannels(self: *const Decoder) usize {
         return self.head_conv.co;
+    }
+
+    /// The head's channel-last rows `[h * w][headChannels()]` as planar pixels
+    /// `[outChannels()][patch * h][patch * w]`. Caller frees.
+    pub fn pixels(self: *const Decoder, gpa: std.mem.Allocator, rows: []const f32, h: usize, w: usize) ![]f32 {
+        const p = self.patch;
+        const hc = self.headChannels();
+        std.debug.assert(rows.len == h * w * hc);
+        if (p == 1) return rowsToPlanar(gpa, rows, hc, h * w);
+        const oc = self.outChannels();
+        const ow = w * p;
+        const plane = h * p * ow;
+        const out = try gpa.alloc(f32, oc * plane);
+        for (0..h) |y| for (0..w) |x| {
+            const cell = rows[(y * w + x) * hc ..][0..hc];
+            for (0..oc) |c| for (0..p) |r| for (0..p) |q| {
+                out[c * plane + (y * p + q) * ow + x * p + r] = cell[(c * p + r) * p + q];
+            };
+        };
+        return out;
     }
 
     /// Elements the largest `.save` keeps, 0 for a decoder without stage shortcuts.
@@ -355,7 +390,7 @@ pub const Decoder = struct {
 
     /// Pixels per latent pixel along each axis.
     pub fn scale(self: *const Decoder) usize {
-        var s: usize = 1;
+        var s: usize = self.patch;
         for (self.ups) |l| if (l == .up) {
             s *= 2;
         };
@@ -473,7 +508,7 @@ pub const Decoder = struct {
         x = try self.applyConv(io, gpa, x, h, w, self.head_conv);
 
         defer gpa.free(x);
-        return rowsToPlanar(gpa, x, self.outChannels(), h * w);
+        return self.pixels(gpa, x, h, w);
     }
 
     /// conv2d that frees the input (on error too) and returns a fresh output.
@@ -948,4 +983,32 @@ test "nearest2x" {
     const out = try nearest2x(gpa, &in, 2, 2, 1);
     defer gpa.free(out);
     try std.testing.expectEqualSlices(f32, &.{ 1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4 }, out);
+}
+
+test "the Wan 2.2 TI2V decoder matches ComfyUI's on one frame" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var st = try SafeTensors.initFromSlice(gpa, @embedFile("assets/wan22_ti2v_vae.safetensors"));
+    defer st.deinit();
+    var dec = try Decoder.load(gpa, .{ .safetensors = &st });
+    defer dec.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dec.patch);
+    try std.testing.expectEqual(@as(usize, 3), dec.outChannels());
+    try std.testing.expectEqual(@as(usize, 16), dec.scale());
+    const z = try (try st.require("test.z")).toF32Alloc(gpa);
+    defer gpa.free(z);
+    const want = try (try st.require("test.pixels")).toF32Alloc(gpa);
+    defer gpa.free(want);
+    const got = try dec.decode(io, gpa, z, 3, 5, null);
+    defer gpa.free(got);
+    try std.testing.expectEqual(want.len, got.len);
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |w, g| {
+        num += @as(f64, w - g) * (w - g);
+        den += @as(f64, w) * w;
+    }
+    const rel = @sqrt(num / den);
+    errdefer std.debug.print("TI2V decode rel L2 {e}\n", .{rel});
+    try std.testing.expect(rel < 1e-5);
 }

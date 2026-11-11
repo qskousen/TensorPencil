@@ -103,6 +103,13 @@ pub const Config = struct {
     /// RMSNorm epsilon (qwen3 = 1e-6; Mistral-Nemo = 1e-5). Read from
     /// `<arch>.attention.layer_norm_rms_epsilon` for GGUF checkpoints.
     rms_eps: f32 = rms_eps,
+    /// Every `nope_every`-th layer (counting from 1) skips RoPE, SmolLM3's
+    /// `no_rope_layer_interval`; 0 ropes every layer. Only the text encoders read it.
+    nope_every: usize = 0,
+
+    pub fn ropeAt(self: Config, layer: usize) bool {
+        return self.nope_every == 0 or (layer + 1) % self.nope_every != 0;
+    }
 
     pub fn qDim(self: Config) usize {
         return self.n_heads * head_dim;
@@ -110,6 +117,21 @@ pub const Config = struct {
     pub fn kvDim(self: Config) usize {
         return self.n_kv_heads * head_dim;
     }
+
+    /// SmolLM3-3B, Fibo 1.5's encoder: Llama-shaped (no QK norm, GQA 16/4) with no
+    /// RoPE on every fourth layer, Llama 3's vocabulary.
+    pub const smollm3_3b: Config = .{
+        .n_layers = 36,
+        .hidden = 2048,
+        .n_heads = 16,
+        .n_kv_heads = 4,
+        .intermediate = 11008,
+        .rope_theta = 5000000.0,
+        .prefix = "model.",
+        .vocab = 128256,
+        .qk_norm = false,
+        .nope_every = 4,
+    };
 
     /// The Krea 2 text-encoder checkpoint: Qwen3-VL-4B.
     pub const vl_4b: Config = .{
@@ -369,6 +391,18 @@ pub const mageflow_taps = [_]usize{Config.vl_4b.n_layers};
 /// Qwen-Image 2.1 reads Mage-Flow's tap on the 8B body, with the final norm NOT applied.
 pub const qwen_image21_taps = [_]usize{Config.vl_8b.n_layers};
 
+/// Fibo 2.0 reads fifteen states of the 4B body, none past layer 35, so the final norm
+/// is never reached; `fibo2_text` arranges them into the DiT's six bundles.
+pub const fibo2_taps = [_]usize{ 5, 7, 9, 11, 13, 16, 18, 20, 22, 24, 27, 29, 31, 33, 35 };
+
+/// Fibo 1.5 reads every state transformers returns: the embeddings, each layer's
+/// output, and the last one after the final norm.
+pub const fibo_taps = blk: {
+    var t: [Config.smollm3_3b.n_layers + 1]usize = undefined;
+    for (&t, 0..) |*v, i| v.* = i;
+    break :blk t;
+};
+
 /// Which conditioning stack a `TextEncoder` produces.
 ///
 /// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
@@ -399,14 +433,19 @@ pub const Variant = enum {
     /// Qwen-Image 2.1: Qwen3-VL-8B, the last layer's output WITHOUT the final norm
     /// (transformers 4.57's `hidden_states[-1]`, which Qwen tuned against).
     qwen_image21,
+    /// Fibo 2.0: krea2's Qwen3-VL-4B body, a fifteen-state tap stack. See `fibo2_text`.
+    fibo2,
+    /// Fibo 1.5: SmolLM3-3B, every hidden state. See `fibo_text`.
+    fibo,
 
     pub fn config(self: Variant) Config {
         return switch (self) {
-            .krea2, .mageflow => Config.vl_4b,
+            .krea2, .mageflow, .fibo2 => Config.vl_4b,
             .qwen_image21 => Config.vl_8b,
             .zimage => Config.qwen3_4b,
             .anima => Config.qwen3_0_6b,
             .minimax_h3 => Config.qwen3vl_32b_h3,
+            .fibo => Config.smollm3_3b,
         };
     }
 
@@ -418,6 +457,8 @@ pub const Variant = enum {
             .minimax_h3 => &minimax_h3_taps,
             .mageflow => &mageflow_taps,
             .qwen_image21 => &qwen_image21_taps,
+            .fibo2 => &fibo2_taps,
+            .fibo => &fibo_taps,
         };
     }
 
@@ -438,8 +479,8 @@ pub const Variant = enum {
     /// the converse).
     pub fn appliesFinalNorm(self: Variant) bool {
         return switch (self) {
-            .krea2, .zimage, .minimax_h3, .qwen_image21 => false,
-            .anima, .mageflow => true,
+            .krea2, .zimage, .minimax_h3, .qwen_image21, .fibo2 => false,
+            .anima, .mageflow, .fibo => true,
         };
     }
 };
@@ -708,6 +749,14 @@ pub const TextEncoder = struct {
 
         var scratch = try Scratch.init(gpa, seq, self.cfg);
         defer scratch.deinit(gpa);
+        // A NoPE layer rotates by zero, which is exact.
+        var still: ?ops.rope.Freqs = null;
+        defer if (still) |*f| f.deinit(gpa);
+        if (self.cfg.nope_every != 0) {
+            still = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, self.cfg.rope_theta);
+            @memset(still.?.cos, 1);
+            @memset(still.?.sin, 0);
+        }
 
         const dims = dimsFor(self.cfg);
         var tap_idx: usize = 0;
@@ -738,7 +787,11 @@ pub const TextEncoder = struct {
             }
             if (l >= self.layers.len) break;
             // Encoder: full-sequence, no persistent KV cache.
-            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, self.cfg.rms_eps, {}, 0, 0, false, &scratch);
+            const f = if (self.cfg.ropeAt(l)) freqs else still.?;
+            if (self.cfg.qk_norm)
+                try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, f, self.cfg.rms_eps, {}, 0, 0, false, &scratch)
+            else
+                try transformer.layerForward(transformer.llama_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, f, self.cfg.rms_eps, {}, 0, 0, false, &scratch);
 
             // DeepStack: the vision tower's per-layer features, added at image
             // rows AFTER this layer. Collected from deep ViT blocks and injected

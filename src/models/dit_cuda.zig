@@ -320,14 +320,17 @@ fn prefetchBlock(be: *Backend, blk: anytype) void {
     }
 }
 
-/// The dtype the block activations are stored at when `want` is asked for. Only cuDNN's
-/// attention reads 16-bit operands (the hand-PTX arm and `use_tc_attn = false` read
-/// f32), and an activation capture reads what the f32 stream holds. A 16-bit stream with
-/// f32 attention operands was measured on zig-cuda and does not pay: neutral on fp8 and
-/// bf16, 2-4% slower on int8, whose hand-PTX GEMM stores only f32.
-pub fn streamDtFor(be: *const Backend, want: Dt) Dt {
-    if (want == .f32 or ops.matmul.probe != null or be.kernels != .libs or !use_tc_attn) return .f32;
-    return want;
+/// The dtype the block activations are stored at when `want` is asked for. Off the
+/// vendor arm a 16-bit stream needs an attention that reads it and every trunk linear on
+/// a route that does (`lin_cuda.takes16`); one that casts around each GEMM, fp8's, costs
+/// more than the stream saves. `use_tc_attn = false` reads f32, and an activation
+/// capture reads what the f32 stream holds.
+pub fn streamDtFor(be: *const Backend, model: *const DiT, want: Dt) Dt {
+    if (want == .f32 or ops.matmul.probe != null or !use_tc_attn) return .f32;
+    if (be.kernels == .libs) return want;
+    if (!be.attnReads16(hd, heads, kv_heads)) return .f32;
+    const p = lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "dit cuda") catch return .f32;
+    return if (lin_cuda.takes16(p, model.device_lins)) want else .f32;
 }
 
 /// Per-run device scratch shared across sampler steps (and both CFG sessions):

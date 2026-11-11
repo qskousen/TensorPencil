@@ -52,7 +52,7 @@ pub const Builder = struct {
     owned: std.ArrayList([]u8) = .empty,
     /// Owned register-name slices handed out by regs(), freed on deinit.
     owned_slices: std.ArrayList([][]const u8) = .empty,
-    /// Owned label strings.
+    /// Registers declared per class.
     counts: [5]u32 = .{ 0, 0, 0, 0, 0 },
     label_next: u32 = 0,
     /// Optional PTX performance-tuning directives for the entry (`.maxntid`,
@@ -64,9 +64,17 @@ pub const Builder = struct {
     /// `.minnctapersm` is how you say so: it makes ptxas fit a target number of blocks
     /// per SM and spill whatever that costs.
     tuning: []const u8 = "",
+    /// The newest target and ISA an instruction in this module needs; the header
+    /// takes the higher of this and the build's baseline.
+    need: Need = .{},
 
     pub fn init(gpa: std.mem.Allocator) Builder {
         return .{ .gpa = gpa };
+    }
+
+    /// Raise this module's target to what an instruction it emits needs.
+    pub fn requires(self: *Builder, n: Need) void {
+        self.need = self.need.max(n);
     }
 
     pub fn deinit(self: *Builder) void {
@@ -165,7 +173,7 @@ pub const Builder = struct {
         const w = &out;
         const g = self.gpa;
 
-        try w.appendSlice(g, preamble);
+        try writeHeader(w, g, self.need);
         if (shared_decls.len != 0) {
             try w.appendSlice(g, shared_decls);
             try w.append(g, '\n');
@@ -203,6 +211,32 @@ pub const target = std.fmt.comptimePrint("sm_{d}", .{build_options.cuda_sm});
 /// The three header lines every hand-authored module starts with.
 pub const preamble = std.fmt.comptimePrint(".version {s}\n.target {s}\n.address_size 64\n", .{ version, target });
 
+/// What a module's instructions require of the device and the JIT: compute capability
+/// as `major * 10 + minor`, the PTX ISA as `major * 10 + minor`, and whether it uses an
+/// arch-specific (`sm_XXXa`) instruction, which runs on that exact capability only.
+/// The backend builds a module only for a device its `Caps` say can run it.
+pub const Need = struct {
+    sm: u32 = 0,
+    isa: u32 = 0,
+    arch_specific: bool = false,
+
+    pub fn max(a: Need, b: Need) Need {
+        return .{ .sm = @max(a.sm, b.sm), .isa = @max(a.isa, b.isa), .arch_specific = a.arch_specific or b.arch_specific };
+    }
+};
+
+const baseline: Need = .{ .sm = build_options.cuda_sm, .isa = parseIsa(build_options.ptx_isa) };
+
+fn parseIsa(comptime s: []const u8) u32 {
+    const dot = std.mem.findScalar(u8, s, '.').?;
+    return (std.fmt.parseInt(u32, s[0..dot], 10) catch unreachable) * 10 + (std.fmt.parseInt(u32, s[dot + 1 ..], 10) catch unreachable);
+}
+
+fn writeHeader(w: *std.ArrayList(u8), g: std.mem.Allocator, need: Need) !void {
+    const n = need.max(baseline);
+    try w.print(g, ".version {d}.{d}\n.target sm_{d}{s}\n.address_size 64\n", .{ n.isa / 10, n.isa % 10, n.sm, if (n.arch_specific) "a" else "" });
+}
+
 test "ptx builder emits a valid vector-add module" {
     const gpa = std.testing.allocator;
     var b = Builder.init(gpa);
@@ -225,4 +259,22 @@ test "ptx builder emits a valid vector-add module" {
     try std.testing.expect(std.mem.find(u8, mod, ".reg .b32 %r<1>;") != null);
     try std.testing.expect(std.mem.find(u8, mod, ".reg .pred %p<1>;") != null);
     try std.testing.expect(std.mem.endsWith(u8, mod, "\tret;\n}\n"));
+}
+
+test "a module's header is the baseline unless an instruction raises it" {
+    const gpa = std.testing.allocator;
+    var plain = Builder.init(gpa);
+    defer plain.deinit();
+    const m0 = try plain.build("k", "", "");
+    defer gpa.free(m0);
+    try std.testing.expect(std.mem.startsWith(u8, m0, preamble));
+
+    var raised = Builder.init(gpa);
+    defer raised.deinit();
+    raised.requires(.{ .sm = 89, .isa = 78 });
+    raised.requires(.{ .sm = 120, .isa = 87, .arch_specific = true });
+    raised.requires(.{ .sm = 89, .isa = 84 });
+    const m1 = try raised.build("k", "", "");
+    defer gpa.free(m1);
+    try std.testing.expect(std.mem.startsWith(u8, m1, ".version 8.7\n.target sm_120a\n.address_size 64\n"));
 }

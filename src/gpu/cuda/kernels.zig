@@ -566,16 +566,21 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
 /// double-buffered so the next slab loads while the current one computes.
 /// K_STEP is a parameter: 64 -> 32 KB shared (no opt-in); 128 -> 64 KB (needs
 /// cuFuncSetAttribute opt-in, the >48 KB lever). Requires m%128==0, n%128==0,
-/// k%K_STEP==0. Entry `igemm_pipe`.
-pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: usize, use_ldmatrix: bool) ![:0]u8 {
-    std.debug.assert(bits == 8 or bits == 4);
+/// k%K_STEP==0. Entry `igemm_pipe`. A fused build stores `out` for rows below `p_m`
+/// only, an unfused one the raw s32 accumulators of every row.
+pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, kind: IgemmKind, use_ldmatrix: bool, out: Dt) ![:0]u8 {
+    std.debug.assert(out == .f32 or fuse);
+    std.debug.assert(kind != .e4m3 or fuse);
+    const bits = kind.bits();
+    const ob: usize = if (fuse) out.bytes() else 4;
     // s8: one m16n8k32 per 32-byte substep (32 k). s4: one m16n8k64 per 32-byte
     // substep (64 k). Staging/tile math is byte-based and identical; only the
     // mma opcode and the global row byte-stride (k vs k/2) differ.
-    const mma_op = if (bits == 8)
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32"
-    else
-        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32";
+    const mma_op = switch (kind) {
+        .s8 => "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32",
+        .s4 => "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32",
+        .e4m3 => "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32",
+    };
     const BM = 128;
     const MT = 4;
     const NT = 8;
@@ -909,7 +914,7 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_col0 });
     try b.linef("shl.b32 {s}, {s}, 1;", .{ r_tmp, r_tf });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_tmp });
-    try b.linef("mul.wide.u32 {s}, {s}, 32;", .{ rd_8n4, r_n });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_8n4, r_n, 8 * ob });
     const r_row_mi = try b.reg(.b32);
     const r_idx = try b.reg(.b32);
     const rd_cp = try b.reg(.b64);
@@ -920,6 +925,13 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const f_ws0 = try b.reg(.f32);
     const f_ws1 = try b.reg(.f32);
     const f_y = try b.reg(.f32);
+    const f_y1 = try b.reg(.f32);
+    const r_pk = try b.reg(.b32);
+    const r_m = try b.reg(.b32);
+    const r_row8 = try b.reg(.b32);
+    const p_row0 = try b.reg(.pred);
+    const p_row8 = try b.reg(.pred);
+    if (fuse) try b.linef("ld.param.u32 {s}, [p_m];", .{r_m});
     const f_b0 = try b.reg(.f32);
     const f_b1 = try b.reg(.f32);
     const rd_sc = try b.reg(.b64);
@@ -933,13 +945,16 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sc, rd_as, rd_sc });
             try b.linef("ld.global.f32 {s}, [{s}];", .{ f_as0, rd_sc });
             try b.linef("ld.global.f32 {s}, [{s}+32];", .{ f_as8, rd_sc });
+            try b.linef("add.u32 {s}, {s}, 8;", .{ r_row8, r_row_mi });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_row0, r_row_mi, r_m });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_row8, r_row8, r_m });
         }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
             const a = acc[(mi2 * NT + nj) * 4 ..][0..4];
             try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ r_idx, r_row_mi, r_n, r_ccol });
             try b.linef("add.u32 {s}, {s}, {d};", .{ r_idx, r_idx, nj * 8 });
-            try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_cp, r_idx });
+            try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_cp, r_idx, ob });
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp, rd_c, rd_cp });
             if (!fuse) {
                 try b.linef("st.global.u32 [{s}], {s};", .{ rd_cp, a[0] });
@@ -953,32 +968,39 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
                 try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_sc, r_idx });
                 try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bsc, rd_bias, rd_sc });
                 try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sc, rd_ws, rd_sc });
-                try b.linef("ld.global.f32 {s}, [{s}];", .{ f_ws0, rd_sc });
-                try b.linef("ld.global.f32 {s}, [{s}+4];", .{ f_ws1, rd_sc });
+                if (kind == .e4m3) {
+                    try b.linef("ld.param.f32 {s}, [p_wsc];", .{f_ws0});
+                    try b.linef("mov.f32 {s}, {s};", .{ f_ws1, f_ws0 });
+                } else {
+                    try b.linef("ld.global.f32 {s}, [{s}];", .{ f_ws0, rd_sc });
+                    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ f_ws1, rd_sc });
+                }
                 try b.linef("@{s} ld.global.f32 {s}, [{s}];", .{ p_bias, f_b0, rd_bsc });
                 try b.linef("@{s} ld.global.f32 {s}, [{s}+4];", .{ p_bias, f_b1, rd_bsc });
-                // y = f32(acc) * act_scale[row] * weight_scale[col]
-                try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[0] });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as0 });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws0 });
-                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b0 });
-                try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp, f_y });
-                try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[1] });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as0 });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws1 });
-                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b1 });
-                try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp, f_y });
+                // y = f32(acc) * act_scale[row] * weight_scale[col], two columns a store
+                const pairs = [2]struct { acc: [2][]const u8, as: []const u8, at: []const u8, row: []const u8 }{
+                    .{ .acc = .{ a[0], a[1] }, .as = f_as0, .at = rd_cp, .row = p_row0 },
+                    .{ .acc = .{ a[2], a[3] }, .as = f_as8, .at = rd_cp2, .row = p_row8 },
+                };
                 try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp2, rd_cp, rd_8n4 });
-                try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[2] });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as8 });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws0 });
-                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b0 });
-                try b.linef("st.global.f32 [{s}], {s};", .{ rd_cp2, f_y });
-                try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ f_y, a[3] });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_as8 });
-                try b.linef("mul.f32 {s}, {s}, {s};", .{ f_y, f_y, f_ws1 });
-                try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, f_y, f_y, f_b1 });
-                try b.linef("st.global.f32 [{s}+4], {s};", .{ rd_cp2, f_y });
+                for (pairs) |pr| {
+                    inline for (.{ f_y, f_y1 }, .{ f_ws0, f_ws1 }, .{ f_b0, f_b1 }, 0..) |fy, fw, fb, c| {
+                        if (kind == .e4m3)
+                            try b.linef("mov.b32 {s}, {s};", .{ fy, pr.acc[c] })
+                        else
+                            try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fy, pr.acc[c] });
+                        try b.linef("mul.f32 {s}, {s}, {s};", .{ fy, fy, pr.as });
+                        try b.linef("mul.f32 {s}, {s}, {s};", .{ fy, fy, fw });
+                        try b.linef("@{s} add.rn.f32 {s}, {s}, {s};", .{ p_bias, fy, fy, fb });
+                    }
+                    if (out == .f32) {
+                        try b.linef("@{s} st.global.f32 [{s}], {s};", .{ pr.row, pr.at, f_y });
+                        try b.linef("@{s} st.global.f32 [{s}+4], {s};", .{ pr.row, pr.at, f_y1 });
+                    } else {
+                        try b.linef("cvt.rn.{s}x2.f32 {s}, {s}, {s};", .{ if (out == .bf16) "bf16" else "f16", r_pk, f_y1, f_y });
+                        try b.linef("@{s} st.global.b32 [{s}], {s};", .{ pr.row, pr.at, r_pk });
+                    }
+                }
             }
         }
     }
@@ -986,15 +1008,45 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
     const params = if (fuse)
-        "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias"
+        "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias,\n    .param .u32 p_m,\n    .param .f32 p_wsc"
     else
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k";
-    const entry = if (bits == 8)
-        (if (fuse) "igemm_pipe_fused" else "igemm_pipe")
-    else
-        (if (fuse) "i4gemm_pipe_fused" else "i4gemm_pipe");
+    const entry = switch (kind) {
+        .s8 => if (fuse) "igemm_pipe_fused" else "igemm_pipe",
+        .s4 => if (fuse) "i4gemm_pipe_fused" else "i4gemm_pipe",
+        .e4m3 => "f8gemm_pipe_fused",
+    };
+    if (kind == .e4m3) b.requires(fp8_need);
     return b.build(entry, params, shared_decl);
 }
+
+/// What `buildPrep` quantizes a row to.
+pub const PrepOut = enum {
+    s8,
+    s4,
+    e4m3,
+
+    pub fn bits(q: PrepOut) usize {
+        return if (q == .s4) 4 else 8;
+    }
+};
+
+/// The operand both sides of `buildIgemmPipe`'s MMA take. The 8-bit kinds share one
+/// fragment layout, so they differ only in the opcode and the accumulator's type.
+pub const IgemmKind = enum {
+    s8,
+    s4,
+    /// fp8 e4m3 against e4m3, f32 accumulators, a scalar weight scale (`p_wsc`).
+    e4m3,
+
+    pub fn bits(k: IgemmKind) usize {
+        return if (k == .s4) 4 else 8;
+    }
+};
+
+/// What the fp8 MMA and conversions need: sm_89's tensor cores and the ISA that added
+/// e4m3 to `mma`.
+pub const fp8_need: ptx.Need = .{ .sm = 89, .isa = 84 };
 
 /// A packed weight format `buildPrep`'s load stage can decode, so the rotate +
 /// per-row-quantize tail is shared with the activation prep. `none` is the activation
@@ -1033,14 +1085,27 @@ pub const PrepBlock = enum {
     }
 };
 
+/// FWHT butterfly iterations each of the 256 threads runs per pass, for a
+/// `cols`-wide activation row.
+///
+/// Rounded UP. Truncating here does not fail, it silently leaves the tail of
+/// every row in its UNROTATED basis, which is a wrong GEMM with no error and no
+/// assert; see the note at the call site. Exposed so the property can be tested
+/// without a device.
+pub fn prepButterflyIters(cols: usize) usize {
+    const nbut = (cols / 256) * 64;
+    return (nbut + 255) / 256;
+}
+
 /// Fused activation prep, one block (256 threads) per row: load x[row] into
 /// dynamic shared f32, radix-4 FWHT per 256-group (bit-identical to
 /// convrot.rotate, each butterfly output is a fixed 4-input sum, so the
 /// parallel order matches the serial CPU order exactly), /16 normalize +
 /// per-row abs-max, dynamic scale = max(absmax/maxq, 1e-12), then round-half-away
-/// quantize + pack. `bits` selects the output format: 8 -> int8, 4 s8/u32,
-/// entry `iprep`, clamp [-128,127]; 4 -> int4, 8 s4/u32, entry `i4prep`, clamp
-/// [-8,7]. Packed row is [m][cols/(32/bits)] u32. Uses >48 KB dynamic shared for
+/// quantize + pack. `q` selects the output: s8 (4 a u32, entry `iprep`, clamp
+/// [-128,127]), s4 (8 a u32, entry `i4prep`, clamp [-8,7]) or e4m3 (4 a u32, entry
+/// `f8prep`, scale absmax/448, round-to-nearest-even, unrotated only). Packed row is
+/// [m][cols/(32/bits)] u32. Uses >48 KB dynamic shared for
 /// cols=16384 (the Vulkan path was forced to f16 there by the 48 KB cap; here
 /// f32 rotation is exact). Requires cols%256==0, (cols/256)%4==0 (FWHT) and
 /// (cols/(32/bits))%256==0 (pack). block 256, grid (m,1,1).
@@ -1062,21 +1127,11 @@ pub const PrepBlock = enum {
 /// Turning it off is only sound if BOTH sides skip it: the rotation is orthogonal and
 /// cancels between weight and activation, so dropping it from both is exact arithmetic,
 /// just a worse grid fit.
-/// FWHT butterfly iterations each of the 256 threads runs per pass, for a
-/// `cols`-wide activation row.
-///
-/// Rounded UP. Truncating here does not fail, it silently leaves the tail of
-/// every row in its UNROTATED basis, which is a wrong GEMM with no error and no
-/// assert; see the note at the call site. Exposed so the property can be tested
-/// without a device.
-pub fn prepButterflyIters(cols: usize) usize {
-    const nbut = (cols / 256) * 64;
-    return (nbut + 255) / 256;
-}
-
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_dt: Dt, block: PrepBlock, chunk: usize, rotate: bool, stage_global: bool) ![:0]u8 {
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, q: PrepOut, in_dt: Dt, block: PrepBlock, chunk: usize, rotate: bool, stage_global: bool) ![:0]u8 {
     const bq = block != .none; // a packed weight input, whatever its format
-    std.debug.assert(bits == 8 or bits == 4);
+    const bits = q.bits();
+    const fp8 = q == .e4m3;
+    std.debug.assert(!fp8 or (!bq and !rotate));
     std.debug.assert(!bq or in_dt == .f32);
     std.debug.assert(!bq or cols % 256 == 0);
     std.debug.assert(chunk == 0 or (bq and cols % chunk == 0 and chunk % 1024 == 0));
@@ -1090,7 +1145,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_dt: Dt, 
     const maxq: i32 = (@as(i32, 1) << @intCast(bits - 1)) - 1; // 127 / 7
     const minq: i32 = -(@as(i32, 1) << @intCast(bits - 1)); // -128 / -8
     const elt_mask: u32 = (@as(u32, 1) << @intCast(bits)) - 1; // 0xFF / 0xF
-    const maxq_hex: u32 = @bitCast(@as(f32, @floatFromInt(maxq))); // 127.0 / 7.0 bits
+    const maxq_hex: u32 = if (fp8) 0x43E00000 else @bitCast(@as(f32, @floatFromInt(maxq))); // 448.0 / 127.0 / 7.0
     const ngroups = work / 256;
     // Butterflies per FWHT pass, and how many each of the 256 threads takes,
     // ROUNDED UP.
@@ -1611,8 +1666,20 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_dt: Dt, 
                 try b.linef("shl.b32 {s}, {s}, 2;", .{ r_esha, r_ecol }); // byte = col*4
                 try b.linef("add.u32 {s}, {s}, {s};", .{ r_esha, r_esha, r_smem });
             }
+            if (fp8) {
+                // Two e4m3 pairs: cvt puts its first source in the high byte.
+                const f = try b.regs(.f32, 4);
+                const h = try b.regs(.b16, 2);
+                for (0..4) |e| {
+                    try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, f[e], r_esha, e * 4 });
+                    try b.linef("div.rn.f32 {s}, {s}, {s};", .{ f[e], f[e], fsc });
+                }
+                try b.linef("cvt.rn.satfinite.e4m3x2.f32 {s}, {s}, {s};", .{ h[0], f[1], f[0] });
+                try b.linef("cvt.rn.satfinite.e4m3x2.f32 {s}, {s}, {s};", .{ h[1], f[3], f[2] });
+                try b.linef("mov.b32 {s}, {{{s}, {s}}};", .{ r_out, h[0], h[1] });
+            }
             var kk: usize = 0;
-            while (kk < per_word) : (kk += 1) {
+            while (kk < per_word and !fp8) : (kk += 1) {
                 try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fv, r_esha, kk * 4 });
                 try b.linef("div.rn.f32 {s}, {s}, {s};", .{ fr, fv, fsc });
                 try b.linef("copysign.f32 {s}, {s}, 0f3F000000;", .{ fh, fr }); // copysign(0.5, r)
@@ -1636,12 +1703,13 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_dt: Dt, 
         }
     }
 
+    if (fp8) b.requires(fp8_need);
     return b.build(
         if (bq and chunk != 0)
             (if (bits == 4) (if (rotate) "bqdec4" else "bqdec4_nr") else if (rotate) "bqdec" else "bqdec_nr")
         else if (bq)
             (if (bits == 4) (if (rotate) "bqprep4" else "bqprep4_nr") else if (rotate) "bqprep" else "bqprep_nr")
-        else if (bits == 8) (if (rotate) "iprep" else "iprep_nr") else "i4prep",
+        else if (fp8) "f8prep" else if (bits == 8) (if (rotate) "iprep" else "iprep_nr") else "i4prep",
         if (stage_global)
             "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s,\n    .param .u64 p_rot"
         else
@@ -1780,7 +1848,15 @@ pub fn irescalePtx(comptime out: Dt) [:0]const u8 {
 ///     in [0,1], so only the LOAD and A's pointer arithmetic change, and the MMA is
 ///     untouched. B keeps its f16 stride, hence the separate A registers below.
 pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool) ![:0]u8 {
-    return buildHgemmMode(alloc, batched, c_f16, attnout, bf16, use_ldmatrix, a_f32, false);
+    return buildHgemmMode(alloc, batched, c_f16, attnout, bf16, use_ldmatrix, a_f32, false, null);
+}
+
+/// `hgemm` with the epilogue a linear wants: `C[m][co] = acc * p_scale + p_bias[col]`
+/// stored at `out` into a tight row stride `p_co`, rows below `p_m` and columns below
+/// `p_co` only, so the caller's buffer needs no padding. The grid still covers
+/// `[m_pad][n]` and A/B are still padded to the tile. Entry `hgemm_epi`.
+pub fn buildHgemmEpi(alloc: std.mem.Allocator, bf16: bool, out: Dt) ![:0]u8 {
+    return buildHgemmMode(alloc, false, false, false, bf16, true, false, false, out);
 }
 
 /// Grouped f16 GEMM for routed experts: grid.y indexes a table of 128-row
@@ -1790,7 +1866,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
 /// but never stored), and C rows are stored only below `count`. Entry
 /// `hgemm_experts`; params are hgemm's plus `p_groups`.
 pub fn buildHgemmExperts(alloc: std.mem.Allocator) ![:0]u8 {
-    return buildHgemmMode(alloc, false, false, false, false, true, false, true);
+    return buildHgemmMode(alloc, false, false, false, false, true, false, true, null);
 }
 
 /// Pack one `hgemm_experts` tile: expert < 256, 1 <= count <= 128, offset < 65536.
@@ -1799,9 +1875,10 @@ pub fn hgemmGroup(expert: usize, count: usize, offset: usize) u32 {
     return @as(u32, @intCast(expert)) | (@as(u32, @intCast(count - 1)) << 8) | (@as(u32, @intCast(offset)) << 16);
 }
 
-fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool, experts: bool) ![:0]u8 {
+fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool, experts: bool, epi: ?Dt) ![:0]u8 {
     std.debug.assert(!a_f32 or attnout);
     std.debug.assert(!experts or (!batched and !attnout and !c_f16));
+    std.debug.assert(epi == null or (!batched and !attnout and !c_f16 and !experts));
     const BM = 128;
     const KSTEP = 32;
     const MT = 4;
@@ -2231,6 +2308,7 @@ fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     defer if (experts) alloc.free(g_lo);
     const g_hi = if (experts) try alloc.print("@{s} ", .{p_hi}) else "";
     defer if (experts) alloc.free(g_hi);
+    if (epi) |od| return hgemmEpiStore(alloc, &b, od, acc, r_crow, r_ccol, rd_c, SH_BYTES);
     var mi2: usize = 0;
     while (mi2 < MT) : (mi2 += 1) {
         try b.linef("add.u32 {s}, {s}, {d};", .{ r_row_mi, r_crow, mi2 * 16 });
@@ -2286,6 +2364,527 @@ fn buildHgemmMode(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
             "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_groups"
         else
             "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k",
+        shared_decl,
+    );
+}
+
+/// `buildHgemmEpi`'s C store, from the warp's first C row and column on.
+fn hgemmEpiStore(alloc: std.mem.Allocator, b: *ptx.Builder, out: Dt, acc: []const []const u8, r_crow: []const u8, r_ccol: []const u8, rd_c: []const u8, sh_bytes: usize) ![:0]u8 {
+    const MT = 4;
+    const NT = 8;
+    const elem = out.bytes();
+    const rd_bias = try b.reg(.b64);
+    const r_m = try b.reg(.b32);
+    const r_co = try b.reg(.b32);
+    const f_mul = try b.reg(.f32);
+    try b.linef("ld.param.u64 {s}, [p_bias];", .{rd_bias});
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_bias, rd_bias });
+    try b.linef("ld.param.u32 {s}, [p_m];", .{r_m});
+    try b.linef("ld.param.u32 {s}, [p_co];", .{r_co});
+    try b.linef("ld.param.f32 {s}, [p_scale];", .{f_mul});
+    const rd_8r = try b.reg(.b64);
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_8r, r_co, 8 * elem });
+    const r_row = try b.reg(.b32);
+    const r_row8 = try b.reg(.b32);
+    const r_col = try b.reg(.b32);
+    const r_col1 = try b.reg(.b32);
+    const r_idx = try b.reg(.b32);
+    const rd_cp = try b.reg(.b64);
+    const rd_cp8 = try b.reg(.b64);
+    const rd_bp = try b.reg(.b64);
+    const p_r = try b.regs(.pred, 2);
+    const p_c = try b.regs(.pred, 2);
+    const p_st = try b.regs(.pred, 4);
+    const f_b = try b.regs(.f32, 2);
+    const f_v = try b.reg(.f32);
+    const r_h = try b.reg(.b16);
+    var mi2: usize = 0;
+    while (mi2 < MT) : (mi2 += 1) {
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_row, r_crow, mi2 * 16 });
+        try b.linef("add.u32 {s}, {s}, 8;", .{ r_row8, r_row });
+        try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_r[0], r_row, r_m });
+        try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_r[1], r_row8, r_m });
+        var nj: usize = 0;
+        while (nj < NT) : (nj += 1) {
+            const a = acc[(mi2 * NT + nj) * 4 ..][0..4];
+            try b.linef("add.u32 {s}, {s}, {d};", .{ r_col, r_ccol, nj * 8 });
+            try b.linef("add.u32 {s}, {s}, 1;", .{ r_col1, r_col });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_c[0], r_col, r_co });
+            try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_c[1], r_col1, r_co });
+            for (0..2) |ri| for (0..2) |ci| try b.linef("and.pred {s}, {s}, {s};", .{ p_st[ri * 2 + ci], p_r[ri], p_c[ci] });
+            try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_bp, r_col });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bp, rd_bias, rd_bp });
+            try b.linef("mov.f32 {s}, 0f00000000;", .{f_b[0]});
+            try b.linef("mov.f32 {s}, 0f00000000;", .{f_b[1]});
+            try b.linef("@{s} ld.global.f32 {s}, [{s}];", .{ p_c[0], f_b[0], rd_bp });
+            try b.linef("@{s} ld.global.f32 {s}, [{s}+4];", .{ p_c[1], f_b[1], rd_bp });
+            try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ r_idx, r_row, r_co, r_col });
+            try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_cp, r_idx, elem });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp, rd_c, rd_cp });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rd_cp8, rd_cp, rd_8r });
+            // acc[0..1] are row r, columns c and c+1; acc[2..3] are row r+8.
+            for (0..4) |e| {
+                const at = if (e < 2) rd_cp else rd_cp8;
+                const off = (e % 2) * elem;
+                // Two roundings, not an fma: `bias_compact`'s arithmetic, to the bit.
+                try b.linef("mul.rn.f32 {s}, {s}, {s};", .{ f_v, a[e], f_mul });
+                try b.linef("add.rn.f32 {s}, {s}, {s};", .{ f_v, f_v, f_b[e % 2] });
+                switch (out) {
+                    .f32 => try b.linef("@{s} st.global.f32 [{s}+{d}], {s};", .{ p_st[e], at, off, f_v }),
+                    .f16, .bf16 => {
+                        try b.linef("cvt.rn.{s}.f32 {s}, {s};", .{ if (out == .bf16) "bf16" else "f16", r_h, f_v });
+                        try b.linef("@{s} st.global.b16 [{s}+{d}], {s};", .{ p_st[e], at, off, r_h });
+                    },
+                }
+            }
+        }
+    }
+    const shared_decl = try alloc.print(".shared .align 16 .b8 smem[{d}];", .{sh_bytes});
+    defer alloc.free(shared_decl);
+    return b.build("hgemm_epi", "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_bias,\n    .param .u32 p_m,\n    .param .u32 p_co,\n    .param .f32 p_scale", shared_decl);
+}
+
+/// Query rows per `flash_attn` block (grid.x = ceil(seq_q / flash_bm)).
+pub const flash_bm = 64;
+
+/// Head widths `buildFlashAttn` takes: the swizzle needs at least 8 16-byte chunks
+/// per row, and past 128 the score, Q and O fragments no longer fit in registers.
+pub fn flashAttnHd(hd: usize) bool {
+    return hd == 64 or hd == 128;
+}
+
+/// Fused tensor-core attention, FA2-style. A block of 4 warps owns `flash_bm` query
+/// rows of one head (16 per warp) and streams K/V through shared memory in 64-row
+/// tiles; scores, the online-softmax max/sum and O stay in f32 registers, so nothing
+/// the size of seq_q x seq_kv is ever written. Q/K/V are read in place from
+/// `[seq][heads][hd]` at `in_dt` (f16 or bf16, also the MMA type) and O is written in
+/// place at `out_dt`. Rows of key `j` for query `q` are kept when `j < min(seq_kv, q +
+/// cbase)`; GQA head `h` reads KV head `h / group`.
+///
+/// Pipeline: K of tile j+1 loads (cp.async) during tile j's softmax and P@V, V of
+/// tile j+1 during tile j+1's Q@K. Shared rows are 16-byte chunks XOR-swizzled by
+/// `row & 7`, identically on the cp.async store and every ldmatrix read.
+///
+/// Entry `flash_attn`, grid (ceil(seq_q / flash_bm), n_heads), 128 threads. Params:
+/// q, k, v, o pointers; seq_q, seq_kv; Q/O and K/V row strides in elements; group;
+/// scale * log2(e); cbase.
+pub fn buildFlashAttn(alloc: std.mem.Allocator, hd: usize, in_dt: Dt, out_dt: Dt) ![:0]u8 {
+    std.debug.assert(flashAttnHd(hd) and in_dt != .f32);
+    const BM = flash_bm;
+    const BN = 64;
+    const ROWB = hd * 2;
+    const CH = hd / 8;
+    const STEP = 128 / CH; // tile rows one pass of the block's cp.async covers
+    const NIT = BM * CH / 128; // cp.async per thread per tile (BM == BN)
+    const KT = hd / 16; // k-steps of Q@K^T
+    const NS = BN / 8; // score n-tiles per warp
+    const ND = hd / 8; // output n-tiles per warp
+    const K_OFF = BM * ROWB;
+    const V_OFF = K_OFF + BN * ROWB;
+    const SH = V_OFF + BN * ROWB;
+    const ty = if (in_dt == .bf16) "bf16" else "f16";
+    const oel: usize = out_dt.bytes();
+
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+    b.tuning = ".maxntid 128, 1, 1";
+
+    const rd_q = try b.reg(.b64);
+    const rd_k = try b.reg(.b64);
+    const rd_v = try b.reg(.b64);
+    const rd_o = try b.reg(.b64);
+    const r_sq = try b.reg(.b32);
+    const r_skv = try b.reg(.b32);
+    const r_qs = try b.reg(.b32);
+    const r_kvs = try b.reg(.b32);
+    const r_grp = try b.reg(.b32);
+    const f_sl2 = try b.reg(.f32);
+    const r_cb = try b.reg(.b32);
+    inline for (.{ .{ rd_q, "p_q" }, .{ rd_k, "p_k" }, .{ rd_v, "p_v" }, .{ rd_o, "p_o" } }) |p| {
+        try b.linef("ld.param.u64 {s}, [{s}];", .{ p[0], p[1] });
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ p[0], p[0] });
+    }
+    inline for (.{ .{ r_sq, "p_sq" }, .{ r_skv, "p_skv" }, .{ r_qs, "p_qs" }, .{ r_kvs, "p_kvs" }, .{ r_grp, "p_grp" }, .{ r_cb, "p_cb" } }) |p|
+        try b.linef("ld.param.u32 {s}, [{s}];", .{ p[0], p[1] });
+    try b.linef("ld.param.f32 {s}, [p_sl2];", .{f_sl2});
+
+    const r_t = try b.reg(.b32);
+    const r_lane = try b.reg(.b32);
+    const r_warp = try b.reg(.b32);
+    const r_gid = try b.reg(.b32);
+    const r_tf = try b.reg(.b32);
+    const r_h = try b.reg(.b32);
+    const r_q0 = try b.reg(.b32);
+    const r_tmp = try b.reg(.b32);
+    const r_tmp2 = try b.reg(.b32);
+    const rd_tmp = try b.reg(.b64);
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_warp, r_t });
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
+    try b.linef("mov.u32 {s}, %ctaid.y;", .{r_h});
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_q0});
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_q0, r_q0, BM });
+
+    // Head bases: Q/O at head h, K/V at h / group.
+    const rd_qh = try b.reg(.b64);
+    const rd_kh = try b.reg(.b64);
+    const rd_vh = try b.reg(.b64);
+    const rd_oh = try b.reg(.b64);
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_h, hd * 2 });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qh, rd_q, rd_tmp });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_h, hd * oel });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_oh, rd_o, rd_tmp });
+    try b.linef("div.u32 {s}, {s}, {s};", .{ r_tmp, r_h, r_grp });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_tmp, hd * 2 });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_kh, rd_k, rd_tmp });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_vh, rd_v, rd_tmp });
+
+    // Loader: thread t copies chunk t % CH of tile rows t / CH + i * STEP. STEP is a
+    // multiple of 8, so the swizzle `chunk ^ (row & 7)` is the same for every i.
+    const r_smem = try b.reg(.b32);
+    const r_lr0 = try b.reg(.b32);
+    const r_lc = try b.reg(.b32);
+    const r_lsw = try b.reg(.b32);
+    try b.linef("mov.u32 {s}, smem;", .{r_smem});
+    try b.linef("shr.u32 {s}, {s}, {d};", .{ r_lr0, r_t, std.math.log2_int(usize, CH) });
+    try b.linef("and.b32 {s}, {s}, {d};", .{ r_lc, r_t, CH - 1 });
+    try b.linef("and.b32 {s}, {s}, 7;", .{ r_tmp, r_lr0 });
+    try b.linef("xor.b32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_lc });
+    try b.linef("shl.b32 {s}, {s}, 4;", .{ r_tmp, r_tmp });
+    try b.linef("mad.lo.u32 {s}, {s}, {d}, {s};", .{ r_lsw, r_lr0, ROWB, r_tmp });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_lsw, r_lsw, r_smem });
+    // Global byte offset of (row r0, chunk c) and of STEP rows, per stride.
+    const rd_lq = try b.reg(.b64);
+    const rd_lkv = try b.reg(.b64);
+    const rd_stq = try b.reg(.b64);
+    const rd_stkv = try b.reg(.b64);
+    const rd_tkv = try b.reg(.b64);
+    const rd_cc = try b.reg(.b64);
+    try b.linef("mul.wide.u32 {s}, {s}, 16;", .{ rd_cc, r_lc });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_lq, r_lr0, r_qs });
+    try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_lq, rd_lq });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_lq, rd_lq, rd_cc });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_lkv, r_lr0, r_kvs });
+    try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_lkv, rd_lkv });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_lkv, rd_lkv, rd_cc });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_stq, r_qs, STEP * 2 });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_stkv, r_kvs, STEP * 2 });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tkv, r_kvs, BN * 2 });
+
+    const Load = struct {
+        bb: *ptx.Builder,
+        rr: []const u8,
+        sz: []const u8,
+        cur: []const u8,
+        src: []const u8,
+        p: []const u8,
+        nit: usize,
+        rows: usize,
+        rowb: usize,
+
+        /// cp.async one tile: rows `row` + i * `rows` of `ptr` (+ i * `step`) into
+        /// shared `dst`, zero-filling rows at or past `lim`, which read `safe` instead.
+        fn emit(l: @This(), dst: []const u8, ptr: []const u8, row: []const u8, lim: []const u8, step: []const u8, safe: []const u8) !void {
+            try l.bb.linef("mov.b64 {s}, {s};", .{ l.cur, ptr });
+            for (0..l.nit) |i| {
+                try l.bb.linef("add.u32 {s}, {s}, {d};", .{ l.rr, row, i * l.rows });
+                try l.bb.linef("setp.lt.u32 {s}, {s}, {s};", .{ l.p, l.rr, lim });
+                try l.bb.linef("selp.u32 {s}, 16, 0, {s};", .{ l.sz, l.p });
+                try l.bb.linef("selp.b64 {s}, {s}, {s}, {s};", .{ l.src, l.cur, safe, l.p });
+                try l.bb.linef("cp.async.cg.shared.global [{s}+{d}], [{s}], 16, {s};", .{ dst, i * l.rows * l.rowb, l.src, l.sz });
+                if (i + 1 < l.nit) try l.bb.linef("add.s64 {s}, {s}, {s};", .{ l.cur, l.cur, step });
+            }
+        }
+    };
+    const ld: Load = .{
+        .bb = &b,
+        .rr = try b.reg(.b32),
+        .sz = try b.reg(.b32),
+        .cur = try b.reg(.b64),
+        .src = try b.reg(.b64),
+        .p = try b.reg(.pred),
+        .nit = NIT,
+        .rows = STEP,
+        .rowb = ROWB,
+    };
+
+    // Q tile and K/V tile 0.
+    const r_dq = try b.reg(.b32);
+    const r_dk = try b.reg(.b32);
+    const r_dv = try b.reg(.b32);
+    const rd_kp = try b.reg(.b64);
+    const rd_vp = try b.reg(.b64);
+    const r_krow = try b.reg(.b32);
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_dk, r_lsw, K_OFF });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_dv, r_lsw, V_OFF });
+    try b.linef("mov.u32 {s}, {s};", .{ r_dq, r_lsw });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_tmp, r_q0, r_qs });
+    try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_tmp, rd_tmp });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_tmp, rd_tmp, rd_lq });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_tmp, rd_tmp, rd_qh });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_q0, r_lr0 });
+    try ld.emit(r_dq, rd_tmp, r_tmp, r_sq, rd_stq, rd_qh);
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_kp, rd_kh, rd_lkv });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_vp, rd_vh, rd_lkv });
+    try b.linef("mov.u32 {s}, {s};", .{ r_krow, r_lr0 });
+    try ld.emit(r_dk, rd_kp, r_krow, r_skv, rd_stkv, rd_kh);
+    try b.line("cp.async.commit_group;");
+    try ld.emit(r_dv, rd_vp, r_krow, r_skv, rd_stkv, rd_vh);
+    try b.line("cp.async.commit_group;");
+
+    // ldmatrix lane bases. Q (A, x4) and V (B, x4.trans) address row (lane&7) +
+    // ((lane>>3)&1)*8 at chunk +(lane>>4); K (B, x4) row (lane&7) + ((lane>>4)&1)*8
+    // at chunk +((lane>>3)&1). Every one of these rows has row&7 == lane&7.
+    const r_l7 = try b.reg(.b32);
+    const r_b3 = try b.reg(.b32);
+    const r_b4 = try b.reg(.b32);
+    const r_yq = try b.reg(.b32); // swizzled chunk byte offset for Q and V
+    const r_yk = try b.reg(.b32); // ... for K
+    const r_qa = try b.reg(.b32);
+    const r_ka = try b.reg(.b32);
+    const r_va = try b.reg(.b32);
+    try b.linef("and.b32 {s}, {s}, 7;", .{ r_l7, r_lane });
+    try b.linef("bfe.u32 {s}, {s}, 3, 1;", .{ r_b3, r_lane });
+    try b.linef("bfe.u32 {s}, {s}, 4, 1;", .{ r_b4, r_lane });
+    try b.linef("xor.b32 {s}, {s}, {s};", .{ r_yq, r_b4, r_l7 });
+    try b.linef("shl.b32 {s}, {s}, 4;", .{ r_yq, r_yq });
+    try b.linef("xor.b32 {s}, {s}, {s};", .{ r_yk, r_b3, r_l7 });
+    try b.linef("shl.b32 {s}, {s}, 4;", .{ r_yk, r_yk });
+    // Q/V row = l7 + b3*8; K row = l7 + b4*8.
+    try b.linef("mad.lo.u32 {s}, {s}, 8, {s};", .{ r_tmp, r_b3, r_l7 });
+    try b.linef("mad.lo.u32 {s}, {s}, {d}, {s};", .{ r_va, r_tmp, ROWB, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_va, r_va, V_OFF });
+    try b.linef("mad.lo.u32 {s}, {s}, 16, {s};", .{ r_tmp2, r_warp, r_tmp });
+    try b.linef("mad.lo.u32 {s}, {s}, {d}, {s};", .{ r_qa, r_tmp2, ROWB, r_smem });
+    try b.linef("mad.lo.u32 {s}, {s}, 8, {s};", .{ r_tmp, r_b4, r_l7 });
+    try b.linef("mad.lo.u32 {s}, {s}, {d}, {s};", .{ r_ka, r_tmp, ROWB, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ka, r_ka, K_OFF });
+
+    // Q fragments, once.
+    const qa = try b.regs(.b32, KT * 4);
+    try b.line("cp.async.wait_group 1;");
+    try b.line("bar.sync 0;");
+    for (0..KT) |kk| {
+        try b.linef("xor.b32 {s}, {s}, {d};", .{ r_tmp, r_yq, kk * 32 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_qa });
+        try b.linef("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ qa[kk * 4], qa[kk * 4 + 1], qa[kk * 4 + 2], qa[kk * 4 + 3], r_tmp });
+    }
+
+    // Row state: rows A = q0 + warp*16 + gid and B = A + 8.
+    const r_qA = try b.reg(.b32);
+    const r_limA = try b.reg(.b32);
+    const r_limB = try b.reg(.b32);
+    const r_blim = try b.reg(.b32);
+    const r_ntile = try b.reg(.b32);
+    try b.linef("mad.lo.u32 {s}, {s}, 16, {s};", .{ r_qA, r_warp, r_gid });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_qA, r_qA, r_q0 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_limA, r_qA, r_cb });
+    try b.linef("min.u32 {s}, {s}, {s};", .{ r_limA, r_limA, r_skv });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_limB, r_qA, r_cb });
+    try b.linef("add.u32 {s}, {s}, 8;", .{ r_limB, r_limB });
+    try b.linef("min.u32 {s}, {s}, {s};", .{ r_limB, r_limB, r_skv });
+    // The block's first row has the smallest limit, its last row the largest.
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_blim, r_q0, r_cb });
+    try b.linef("min.u32 {s}, {s}, {s};", .{ r_blim, r_blim, r_skv });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ntile, r_q0, r_cb });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ntile, r_ntile, BM - 1 });
+    try b.linef("min.u32 {s}, {s}, {s};", .{ r_ntile, r_ntile, r_skv });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ntile, r_ntile, BN - 1 });
+    try b.linef("shr.u32 {s}, {s}, {d};", .{ r_ntile, r_ntile, std.math.log2_int(usize, BN) });
+
+    const sacc = try b.regs(.f32, NS * 4);
+    const oacc = try b.regs(.f32, ND * 4);
+    const pa = try b.regs(.b32, BN / 16 * 4);
+    const kb = try b.regs(.b32, 4);
+    const f_mA = try b.reg(.f32);
+    const f_mB = try b.reg(.f32);
+    const f_lA = try b.reg(.f32);
+    const f_lB = try b.reg(.f32);
+    const f_tA = try b.reg(.f32);
+    const f_tB = try b.reg(.f32);
+    const f_aA = try b.reg(.f32);
+    const f_aB = try b.reg(.f32);
+    const f_x = try b.reg(.f32);
+    const f_nsl2 = try b.reg(.f32);
+    const f_ninf = try b.reg(.f32);
+    for (oacc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
+    try b.linef("mov.f32 {s}, 0fFF800000;", .{f_ninf});
+    try b.linef("mov.f32 {s}, {s};", .{ f_mA, f_ninf });
+    try b.linef("mov.f32 {s}, {s};", .{ f_mB, f_ninf });
+    try b.linef("mov.f32 {s}, 0f00000000;", .{f_lA});
+    try b.linef("mov.f32 {s}, 0f00000000;", .{f_lB});
+    try b.linef("neg.f32 {s}, {s};", .{ f_nsl2, f_sl2 });
+
+    const r_j = try b.reg(.b32);
+    const r_kv0 = try b.reg(.b32);
+    const r_dA = try b.reg(.b32);
+    const r_dB = try b.reg(.b32);
+    const p_more = try b.reg(.pred);
+    const p_m = try b.reg(.pred);
+    try b.linef("mov.u32 {s}, 0;", .{r_j});
+    try b.linef("mov.u32 {s}, 0;", .{r_kv0});
+
+    try b.label("FA_LOOP");
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_tmp, r_j });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_more, r_tmp, r_ntile });
+    try b.line("cp.async.wait_group 1;");
+    try b.line("bar.sync 0;");
+
+    // S = Q @ K^T for this warp's 16 rows x 64 keys.
+    for (sacc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
+    for (0..KT) |kk| {
+        try b.linef("xor.b32 {s}, {s}, {d};", .{ r_tmp, r_yk, kk * 32 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_ka });
+        for (0..BN / 16) |np| {
+            try b.linef("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ kb[0], kb[1], kb[2], kb[3], r_tmp, np * 16 * ROWB });
+            for (0..2) |half| {
+                const a = sacc[(np * 2 + half) * 4 ..][0..4];
+                try b.linef("mma.sync.aligned.m16n8k16.row.col.f32.{s}.{s}.f32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    ty,             ty,
+                    a[0],           a[1],
+                    a[2],           a[3],
+                    qa[kk * 4],     qa[kk * 4 + 1],
+                    qa[kk * 4 + 2], qa[kk * 4 + 3],
+                    kb[half * 2],   kb[half * 2 + 1],
+                    a[0],           a[1],
+                    a[2],           a[3],
+                });
+            }
+        }
+    }
+    // Every warp is done with K: load the next tile's into it.
+    try b.line("bar.sync 0;");
+    try b.linef("@!{s} bra FA_NOK;", .{p_more});
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_kp, rd_kp, rd_tkv });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_krow, r_krow, BN });
+    try ld.emit(r_dk, rd_kp, r_krow, r_skv, rd_stkv, rd_kh);
+    try b.label("FA_NOK");
+    try b.line("cp.async.commit_group;");
+
+    // Mask keys past each row's limit, only on a tile that reaches one.
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_tmp, r_kv0, BN });
+    try b.linef("setp.le.u32 {s}, {s}, {s};", .{ p_m, r_tmp, r_blim });
+    try b.linef("@{s} bra FA_NOMASK;", .{p_m});
+    try b.linef("mad.lo.u32 {s}, {s}, 2, {s};", .{ r_tmp, r_tf, r_kv0 });
+    try b.linef("sub.s32 {s}, {s}, {s};", .{ r_dA, r_limA, r_tmp });
+    try b.linef("sub.s32 {s}, {s}, {s};", .{ r_dB, r_limB, r_tmp });
+    for (0..NS) |nt| for (0..4) |e| {
+        const col = nt * 8 + (e & 1);
+        try b.linef("setp.gt.s32 {s}, {s}, {d};", .{ p_m, if (e < 2) r_dA else r_dB, col });
+        try b.linef("selp.f32 {s}, {s}, {s}, {s};", .{ sacc[nt * 4 + e], sacc[nt * 4 + e], f_ninf, p_m });
+    };
+    try b.label("FA_NOMASK");
+
+    // Online softmax on raw scores; exp2 folds in scale * log2(e).
+    try b.linef("max.f32 {s}, {s}, {s};", .{ f_tA, sacc[0], sacc[1] });
+    try b.linef("max.f32 {s}, {s}, {s};", .{ f_tB, sacc[2], sacc[3] });
+    for (1..NS) |nt| {
+        try b.linef("max.f32 {s}, {s}, {s}; max.f32 {s}, {s}, {s};", .{ f_tA, f_tA, sacc[nt * 4], f_tA, f_tA, sacc[nt * 4 + 1] });
+        try b.linef("max.f32 {s}, {s}, {s}; max.f32 {s}, {s}, {s};", .{ f_tB, f_tB, sacc[nt * 4 + 2], f_tB, f_tB, sacc[nt * 4 + 3] });
+    }
+    for ([_]usize{ 1, 2 }) |d| for ([_][]const u8{ f_tA, f_tB }) |f| {
+        try b.linef("mov.b32 {s}, {s}; shfl.sync.bfly.b32 {s}, {s}, {d}, 0x1f, 0xffffffff; mov.b32 {s}, {s}; max.f32 {s}, {s}, {s};", .{ r_tmp, f, r_tmp, r_tmp, d, f_x, r_tmp, f, f, f_x });
+    };
+    for ([_][3][]const u8{ .{ f_mA, f_tA, f_aA }, .{ f_mB, f_tB, f_aB } }) |s| {
+        // t = new max; alpha = exp2((m_old - t) * sl2), 0 on the first tile.
+        try b.linef("max.f32 {s}, {s}, {s};", .{ s[1], s[0], s[1] });
+        try b.linef("sub.f32 {s}, {s}, {s};", .{ s[2], s[0], s[1] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ s[2], s[2], f_sl2 });
+        try b.linef("ex2.approx.ftz.f32 {s}, {s};", .{ s[2], s[2] });
+        try b.linef("mov.f32 {s}, {s};", .{ s[0], s[1] });
+        // reuse t as -max * sl2
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ s[1], s[1], f_nsl2 });
+    }
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ f_lA, f_lA, f_aA });
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ f_lB, f_lB, f_aB });
+    for (0..NS) |nt| for (0..4) |e| {
+        const s = sacc[nt * 4 + e];
+        try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ s, s, f_sl2, if (e < 2) f_tA else f_tB });
+        try b.linef("ex2.approx.ftz.f32 {s}, {s};", .{ s, s });
+        try b.linef("add.f32 {s}, {s}, {s};", .{ if (e < 2) f_lA else f_lB, if (e < 2) f_lA else f_lB, s });
+    };
+    for (0..ND) |dt| for (0..4) |e|
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ oacc[dt * 4 + e], oacc[dt * 4 + e], if (e < 2) f_aA else f_aB });
+    // P as the A operand of P@V: the m16n8 C layout of two score tiles is the
+    // m16n8k16 A layout of one 16-key step.
+    for (0..BN / 16) |kk| for (0..4) |r| {
+        const st = sacc[(kk * 2 + r / 2) * 4 + (r % 2) * 2 ..][0..2];
+        try b.linef("cvt.rn.{s}x2.f32 {s}, {s}, {s};", .{ ty, pa[kk * 4 + r], st[1], st[0] });
+    };
+
+    // O += P @ V once V is in.
+    try b.line("cp.async.wait_group 1;");
+    try b.line("bar.sync 0;");
+    for (0..hd / 16) |dp| {
+        try b.linef("xor.b32 {s}, {s}, {d};", .{ r_tmp, r_yq, dp * 32 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_va });
+        for (0..BN / 16) |kk| {
+            try b.linef("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ kb[0], kb[1], kb[2], kb[3], r_tmp, kk * 16 * ROWB });
+            for (0..2) |half| {
+                const a = oacc[(dp * 2 + half) * 4 ..][0..4];
+                try b.linef("mma.sync.aligned.m16n8k16.row.col.f32.{s}.{s}.f32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    ty,             ty,
+                    a[0],           a[1],
+                    a[2],           a[3],
+                    pa[kk * 4],     pa[kk * 4 + 1],
+                    pa[kk * 4 + 2], pa[kk * 4 + 3],
+                    kb[half * 2],   kb[half * 2 + 1],
+                    a[0],           a[1],
+                    a[2],           a[3],
+                });
+            }
+        }
+    }
+    try b.line("bar.sync 0;");
+    try b.linef("@!{s} bra FA_NOV;", .{p_more});
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_vp, rd_vp, rd_tkv });
+    try ld.emit(r_dv, rd_vp, r_krow, r_skv, rd_stkv, rd_vh);
+    try b.label("FA_NOV");
+    try b.line("cp.async.commit_group;");
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_kv0, r_kv0, BN });
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_j, r_j });
+    try b.linef("@{s} bra FA_LOOP;", .{p_more});
+
+    // Normalize by the row sums and store the rows inside seq_q.
+    for ([_][]const u8{ f_lA, f_lB }) |f| for ([_]usize{ 1, 2 }) |d| {
+        try b.linef("mov.b32 {s}, {s}; shfl.sync.bfly.b32 {s}, {s}, {d}, 0x1f, 0xffffffff; mov.b32 {s}, {s}; add.f32 {s}, {s}, {s};", .{ r_tmp, f, r_tmp, r_tmp, d, f_x, r_tmp, f, f, f_x });
+    };
+    try b.linef("rcp.rn.f32 {s}, {s};", .{ f_lA, f_lA });
+    try b.linef("rcp.rn.f32 {s}, {s};", .{ f_lB, f_lB });
+    const rd_oA = try b.reg(.b64);
+    const rd_oB = try b.reg(.b64);
+    const p_A = try b.reg(.pred);
+    const p_B = try b.reg(.pred);
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, 0;", .{ r_tmp, r_qA, r_qs });
+    try b.linef("mad.lo.u32 {s}, {s}, 2, {s};", .{ r_tmp, r_tf, r_tmp });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_tmp, oel });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_oA, rd_oh, rd_tmp });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_qs, 8 * oel });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_oB, rd_oA, rd_tmp });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_A, r_qA, r_sq });
+    try b.linef("add.u32 {s}, {s}, 8;", .{ r_tmp, r_qA });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p_B, r_tmp, r_sq });
+    for (0..ND) |dt| for (0..2) |row| {
+        const o = oacc[dt * 4 + row * 2 ..][0..2];
+        const inv = if (row == 0) f_lA else f_lB;
+        const pr = if (row == 0) p_A else p_B;
+        const base = if (row == 0) rd_oA else rd_oB;
+        try b.linef("mul.f32 {s}, {s}, {s}; mul.f32 {s}, {s}, {s};", .{ o[0], o[0], inv, o[1], o[1], inv });
+        if (out_dt == .f32) {
+            try b.linef("@{s} st.global.v2.f32 [{s}+{d}], {{{s}, {s}}};", .{ pr, base, dt * 8 * 4, o[0], o[1] });
+        } else {
+            try b.linef("cvt.rn.{s}x2.f32 {s}, {s}, {s};", .{ if (out_dt == .bf16) "bf16" else "f16", r_tmp, o[1], o[0] });
+            try b.linef("@{s} st.global.b32 [{s}+{d}], {s};", .{ pr, base, dt * 8 * 2, r_tmp });
+        }
+    };
+
+    const shared_decl = try alloc.print(".shared .align 128 .b8 smem[{d}];", .{SH});
+    defer alloc.free(shared_decl);
+    return b.build(
+        "flash_attn",
+        "    .param .u64 p_q,\n    .param .u64 p_k,\n    .param .u64 p_v,\n    .param .u64 p_o,\n    .param .u32 p_sq,\n    .param .u32 p_skv,\n    .param .u32 p_qs,\n    .param .u32 p_kvs,\n    .param .u32 p_grp,\n    .param .f32 p_sl2,\n    .param .u32 p_cb",
         shared_decl,
     );
 }
@@ -2731,14 +3330,14 @@ pub fn i8GemmTest(ctx: *Context, stdout: anytype) !void {
     var mod1 = try ctx.loadModule(smem_ptx);
     defer mod1.unload(ctx);
     const f_smem = try mod1.getFunction(ctx, "igemm_smem");
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, false);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, .s8, false, .f32);
     defer gpa.free(pipe_ptx);
     var mod2 = try ctx.loadModule(pipe_ptx);
     defer mod2.unload(ctx);
     const f_pipe = try mod2.getFunction(ctx, "igemm_pipe");
     // ldmatrix fragment-load variant (warp-cooperative frag loads; must stay
     // bit-exact vs the plain ld.shared path, same math, different load path).
-    const pipe_lm_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
+    const pipe_lm_ptx = try buildIgemmPipe(gpa, 64, false, .s8, true, .f32);
     defer gpa.free(pipe_lm_ptx);
     var mod_lm = try ctx.loadModule(pipe_lm_ptx);
     defer mod_lm.unload(ctx);
@@ -2950,7 +3549,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 
     // Performant fused s4 GEMM (rescale folded into the C-store), the path
     // dit_cuda's opI4Gemm uses. Requires m%128, rows%128, cols%128.
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, true, 4, true);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, true, .s4, true, .f32);
     defer gpa.free(pipe_ptx);
     var gmod = try ctx.loadModule(pipe_ptx);
     defer gmod.unload(ctx);
@@ -2970,7 +3569,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 4, .f32, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, .s4, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3025,7 +3624,9 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var pas2 = as_d.ptr;
         var pws2 = ws_d.ptr;
         var no_bias: u64 = 0;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas2), @ptrCast(&pws2), @ptrCast(&no_bias) };
+        var pm: u32 = @intCast(m);
+        var wsc_one: f32 = 1.0;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas2), @ptrCast(&pws2), @ptrCast(&no_bias), @ptrCast(&pm), @ptrCast(&wsc_one) };
         try ctx.launch(f_gemm, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pg);
 
         const yg = try gpa.alloc(u8, m * rows * 4);
@@ -3085,7 +3686,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const convrot = @import("tp_ops").convrot;
 
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, .s8, true, .f32);
     defer gpa.free(pipe_ptx);
     var gmod = try ctx.loadModule(pipe_ptx);
     defer gmod.unload(ctx);
@@ -3097,7 +3698,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 
     // Stage-A fused GEMM: rescale folded into the C-store (no s32 acc buffer,
     // no separate rescale pass), output f32 y directly.
-    const fused_ptx = try buildIgemmPipe(gpa, 64, true, 8, true);
+    const fused_ptx = try buildIgemmPipe(gpa, 64, true, .s8, true, .f32);
     defer gpa.free(fused_ptx);
     var fmod = try ctx.loadModule(fused_ptx);
     defer fmod.unload(ctx);
@@ -3118,7 +3719,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 8, .f32, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, .s8, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3236,7 +3837,9 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var fk2: u32 = @intCast(cols);
         var fas = as_d.ptr;
         var fws = ws_d.ptr;
-        var pf = [_]?*anyopaque{ @ptrCast(&fa2), @ptrCast(&fb2), @ptrCast(&fc2), @ptrCast(&fn2), @ptrCast(&fk2), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias) };
+        var fm2: u32 = @intCast(m);
+        var fwsc: f32 = 1.0;
+        var pf = [_]?*anyopaque{ @ptrCast(&fa2), @ptrCast(&fb2), @ptrCast(&fc2), @ptrCast(&fn2), @ptrCast(&fk2), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias), @ptrCast(&fm2), @ptrCast(&fwsc) };
         try ctx.launch(f_fused, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pf);
         try ctx.download(y_d, yg);
         var num_fused: f64 = 0;
@@ -3292,7 +3895,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols, 8, .f32, .none, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, cols, .s8, .f32, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3338,7 +3941,9 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         // fused GEMM params (rescale in C-store; writes y_d directly)
         var fas = as_d.ptr;
         var fws = ws_d.ptr;
-        var pfz = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&ry), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias) };
+        var pmz: u32 = @intCast(m);
+        var wscz: f32 = 1.0;
+        var pfz = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&ry), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&fas), @ptrCast(&fws), @ptrCast(&no_bias), @ptrCast(&pmz), @ptrCast(&wscz) };
         const gg = [3]u32{ @intCast(rows / 128), @intCast(m / 128), 1 };
         const gb = [3]u32{ 128, 1, 1 };
 
@@ -7137,14 +7742,14 @@ pub fn blockQDecodeTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         defer ctx.free(&ds);
 
         const shb = prepSharedBytes(c.cols, false);
-        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, .f32, c.blk, 0, true, false);
+        const prep_ptx = try buildPrep(gpa, c.cols, if (c.bits == 4) .s4 else .s8, .f32, c.blk, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, if (c.bits == 4) "bqprep4" else "bqprep");
         try ctx.setMaxDynamicShared(f_prep, shb);
 
-        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, .f32, c.blk, chunk, true, false);
+        const dec_ptx = try buildPrep(gpa, c.cols, if (c.bits == 4) .s4 else .s8, .f32, c.blk, chunk, true, false);
         defer gpa.free(dec_ptx);
         var dmod = try ctx.loadModule(dec_ptx);
         defer dmod.unload(ctx);
@@ -7259,9 +7864,9 @@ test "the prep's global row staging is a drop-in for the shared one" {
     var prev_shared: usize = 0;
     for ([_]usize{ 1024, 5120, 8192, 25600 }) |cols| {
         errdefer std.debug.print("cols {d}\n", .{cols});
-        const shared = try buildPrep(ta, cols, 8, .f32, .none, 0, true, false);
+        const shared = try buildPrep(ta, cols, .s8, .f32, .none, 0, true, false);
         defer ta.free(shared);
-        const global = try buildPrep(ta, cols, 8, .f32, .none, 0, true, true);
+        const global = try buildPrep(ta, cols, .s8, .f32, .none, 0, true, true);
         defer ta.free(global);
 
         // The extra parameter exists on one and not the other.
@@ -7288,4 +7893,21 @@ test "the prep's global row staging is a drop-in for the shared one" {
         const s_gl = std.mem.count(u8, shared, "global.f32");
         try std.testing.expectEqual(s_sh - g_sh, g_gl - s_gl);
     }
+}
+
+test "flash attention builds at every head width and dtype it accepts" {
+    // The 128-wide kernel's three tiles must fit the 48 KiB of static shared a
+    // launch gets without opting in, or the module would load and every launch fail.
+    const ta = std.testing.allocator;
+    for ([_]usize{ 64, 128 }) |hd| for ([_]Dt{ .f16, .bf16 }) |in_dt| for ([_]Dt{ .f32, .f16, .bf16 }) |out_dt| {
+        errdefer std.debug.print("hd {d} in {t} out {t}\n", .{ hd, in_dt, out_dt });
+        const s = try buildFlashAttn(ta, hd, in_dt, out_dt);
+        defer ta.free(s);
+        const decl = std.mem.find(u8, s, "smem[") orelse return error.TestUnexpectedResult;
+        const end = std.mem.findScalarPos(u8, s, decl, ']') orelse return error.TestUnexpectedResult;
+        try std.testing.expect(try std.fmt.parseInt(usize, s[decl + 5 .. end], 10) <= 48 * 1024);
+        // Q@K and P@V: (hd/16 * 4 + 4 * hd/16) ldmatrix steps, two MMAs each.
+        try std.testing.expectEqual(hd / 16 * 4 * 2 * 2, std.mem.count(u8, s, "mma.sync"));
+    };
+    try std.testing.expect(!flashAttnHd(80) and !flashAttnHd(256));
 }

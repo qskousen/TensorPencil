@@ -26,11 +26,13 @@ fn nbuf(ctx: *gpu.Context, w: []const f32) !Buf {
 
 /// A conditioning is computed once and steers every step, so block quants stay on the
 /// f16 expansion.
-const encoder_use: lin_gpu.Use = .{ .blockq = .f16 };
+fn encoderUse() lin_gpu.Use {
+    return lin_gpu.Use.encoder(.f16);
+}
 
 /// Whether this context can run the tower and its LoRA stack.
 pub fn supported(ctx: *gpu.Context, enc: *const clip_text.TextEncoder) bool {
-    return lin_gpu.runs(ctx, enc.device_lins, encoder_use, enc.lora, "clip_text_gpu");
+    return lin_gpu.runs(ctx, enc.device_lins, encoderUse(), enc.lora, "clip_text_gpu");
 }
 
 /// `clip_text_dev.encodePrompt` on this backend, the residual, the norm outputs and the
@@ -76,7 +78,7 @@ const Dev = struct {
         d.total = total;
         errdefer d.teardown();
         d.lin = try lin_gpu.Lin.init(d.gpa, d.ctx, lin_gpu.maxRows(enc.device_lins), 0, 0);
-        d.plan = try lin_gpu.plan(d.ctx, enc.device_lins, encoder_use, "clip_text_gpu");
+        d.plan = try lin_gpu.plan(d.ctx, enc.device_lins, encoderUse(), "clip_text_gpu");
         if (d.act == .f16) d.plan.dense = .f16;
         if (enc.lora) |st| {
             d.plan.lora = st;

@@ -207,10 +207,10 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, ctx: *Context, gpa: std.mem.Alloca
     try ctx.endBatch();
 
     const n = ext[0] * ext[1];
-    const rgb = try gpa.alloc(f32, n * oc);
+    const rgb = try gpa.alloc(f32, n * dec.headChannels());
     defer gpa.free(rgb);
     try ctx.tensorDownload(try ctx.view(bufs.stage, 0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
-    return wan_vae.rowsToPlanar(gpa, rgb, oc, n);
+    return dec.pixels(gpa, rgb, ext[0], ext[1]);
 }
 
 /// The mid-block attention's scratch for `n` positions of a `c`-wide head: f32

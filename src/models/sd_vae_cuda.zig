@@ -175,10 +175,10 @@ pub fn decodeWan(dec: *const wan_vae.Decoder, be: *Backend, gpa: std.mem.Allocat
     try be.endBatch();
 
     const n = ext[0] * ext[1];
-    const rgb = try gpa.alloc(f32, n * oc);
+    const rgb = try gpa.alloc(f32, n * dec.headChannels());
     defer gpa.free(rgb);
     try be.tensorDownload(bufs.stage.slice(0, rgb.len * 4), std.mem.sliceAsBytes(rgb));
-    return wan_vae.rowsToPlanar(gpa, rgb, oc, n);
+    return dec.pixels(gpa, rgb, ext[0], ext[1]);
 }
 
 /// A/B switch for the mid-block attention (see `Dev.attnCore`). `zimage-cuda-test` runs both.

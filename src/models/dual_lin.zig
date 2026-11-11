@@ -99,6 +99,9 @@ pub const Route = enum {
     gemv_dualn,
     /// `gemv_dualn` against the q8_1 activation, each row bit-identical to `gemv_dual_q8`.
     gemv_dualn_q8,
+    /// fp8 e4m3 against an e4m3 activation at one scale per row, on fp8 tensor cores
+    /// (`Policy.fp8`). The weight is multiplied as stored.
+    fp8_w8a8,
 
     pub fn prep(r: Route) Prep {
         return switch (r) {
@@ -107,14 +110,16 @@ pub const Route = enum {
             .blockq_mmq => .mmq,
             .svdq => .svdq,
             .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8, .gemv_dualn_q8 => .q8,
+            .fp8_w8a8 => .f8,
             else => .none,
         };
     }
 };
 
 /// What a route reads besides the weight: only `x`, the int8 or int4 convrot
-/// activation, the MMQ tile's q8_1 one, the GEMVs' q8 one, or SVDQuant's smoothed int8.
-pub const Prep = enum { none, i8, i4, mmq, q8, svdq };
+/// activation, the MMQ tile's q8_1 one, the GEMVs' q8 one, SVDQuant's smoothed int8,
+/// or the e4m3 one.
+pub const Prep = enum { none, i8, i4, mmq, q8, svdq, f8 };
 
 /// Which GEMM a GGUF block-quant weight takes as a batch. A caller's choice: a DiT and a
 /// text encoder want different trades from the same file.
@@ -143,6 +148,12 @@ pub const BlockQGemm = enum { auto, int8, int4, bf16, f16, mmq, llm };
 /// through a true-f32 GEMM (no TF32), the range and the precision both, at f32's speed.
 pub const IntGemm = enum { w8a8, weight_only, weight_only_f16, weight_only_f32 };
 
+/// What an fp8 weight multiplies against where the device has fp8 tensor cores.
+/// `weight_only` expands it per call against the unquantized activation (every device);
+/// `w8a8` quantizes the activation to e4m3 at one scale per row and multiplies the
+/// weight as stored, which reads it at one byte and skips the expansion.
+pub const Fp8Gemm = enum { weight_only, w8a8 };
+
 /// How every conditioning pass (the CLIP towers, the Qwen3 text encoders, SenseNova's
 /// prompt pass) runs an integer convrot weight, `--te-int-gemm`, on both backends.
 /// Weight-only by default for `lin_cuda.encoder_gemm`'s reason, and because a prompt's
@@ -160,6 +171,11 @@ pub var encoder_int8_dial: IntGemm = .w8a8;
 /// How a denoiser trunk's integer convrot weights run, for a plan whose `Use` names none;
 /// `pipeline.Session` sets it from the denoiser's dial before building one.
 pub var trunk_int8: IntGemm = .w8a8;
+
+/// How a denoiser trunk's fp8 weights run, for a plan whose `Use` names none. W8A8 by
+/// default: on a device with fp8 tensor cores it is ~2.3x faster, and its activation
+/// error is smaller than the fp8 weight's own; elsewhere it falls back to weight-only.
+pub var trunk_fp8: Fp8Gemm = .w8a8;
 
 pub fn encoderInt8() IntGemm {
     return encoder_int8 orelse encoder_int8_dial;
@@ -182,6 +198,7 @@ pub const Policy = struct {
     gemv: bool = false,
     blockq: BlockQGemm = .auto,
     int8: IntGemm = .w8a8,
+    fp8: Fp8Gemm = .weight_only,
     dense: DenseCompute = .native,
     act16: Act16 = .f16,
     /// DIAGNOSTICS of the GEMV policy. `decode_dp4a = false` sends block-quant decode
@@ -230,6 +247,8 @@ pub const Plan = struct {
     /// The integer convrot weights' GEMM. Set after `plan`, like `lora`: every shape
     /// `check` accepts for the quantized-activation routes runs weight-only too.
     int8: IntGemm = .w8a8,
+    /// The fp8 weights' GEMM where the device has fp8 tensor cores.
+    fp8: Fp8Gemm = .weight_only,
     /// How dense weights compute. Set after `plan` by the family.
     dense: DenseCompute = .native,
     /// The 16-bit width a route that narrows the f32 activation stages it in. `bf16` for
@@ -248,7 +267,7 @@ pub const Plan = struct {
 
     /// The routing policy, with the GEMV diagnostics as currently set.
     pub fn policy(p: Plan) Policy {
-        return .{ .gemv = p.gemv, .blockq = p.blockq, .int8 = p.int8, .dense = p.dense, .act16 = p.act16, .decode_dp4a = decode_dp4a, .force = force, .dual_decode = dual_decode };
+        return .{ .gemv = p.gemv, .blockq = p.blockq, .int8 = p.int8, .fp8 = p.fp8, .dense = p.dense, .act16 = p.act16, .decode_dp4a = decode_dp4a, .force = force, .dual_decode = dual_decode };
     }
 };
 
@@ -259,13 +278,21 @@ pub const Use = struct {
     gemv: bool = false,
     /// Null takes `trunk_int8`, the denoiser's activation dial.
     int8: ?IntGemm = null,
+    /// Null takes `trunk_fp8`.
+    fp8: ?Fp8Gemm = null,
     act16: Act16 = .f16,
     max_rows: usize = 1,
 
     /// An LLM stepper's: integer convrot weights weight-only (they need no prep, and a
-    /// prompt's activations carry the outliers per-token int8 cannot hold).
+    /// prompt's activations carry the outliers per-token int8 cannot hold), fp8 likewise.
     pub fn llm(max_rows: usize) Use {
-        return .{ .blockq = .llm, .gemv = true, .int8 = .weight_only, .max_rows = max_rows };
+        return .{ .blockq = .llm, .gemv = true, .int8 = .weight_only, .fp8 = .weight_only, .max_rows = max_rows };
+    }
+
+    /// A conditioning pass's: integer weights take the conditioning dial, fp8 runs
+    /// weight-only (fp8 W8A8 is measured on denoiser trunks only).
+    pub fn encoder(blockq: BlockQGemm) Use {
+        return .{ .blockq = blockq, .int8 = encoderInt8(), .fp8 = .weight_only };
     }
 };
 
@@ -282,7 +309,7 @@ pub const Verdict = union(enum) { ok: Plan, refused: Refusal };
 /// a shape is the backend's answer (`caps.refuse`).
 pub fn check(comptime C: type, caps: C, lins: []const Weight, use: Use) Verdict {
     const rot = lin.convrot(lins) orelse return .{ .refused = .{ .why = .mixed_convrot } };
-    const p = Plan{ .rot = rot, .blockq = use.blockq, .gemv = use.gemv, .int8 = use.int8 orelse trunk_int8, .act16 = use.act16 };
+    const p = Plan{ .rot = rot, .blockq = use.blockq, .gemv = use.gemv, .int8 = use.int8 orelse trunk_int8, .fp8 = use.fp8 orelse trunk_fp8, .act16 = use.act16 };
     const pol = p.policy();
     for (lins) |w| {
         const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows, .cols = w.cols };
@@ -463,6 +490,7 @@ fn woRoute(comptime C: type, caps: C, pol: Policy, wo: [3]Route) ?Route {
 /// fp8 as a batch: staged at the width `Act16` asks for, or against the f32 activation
 /// where the backend cannot stage it so.
 fn fp8Route(comptime C: type, caps: C, w: Weight, pol: Policy) ?Route {
+    if (pol.fp8 == .w8a8 and caps.fp8Mma(w)) return .fp8_w8a8;
     if (pol.act16 == .bf16) return if (caps.fp8Bf16()) .gemm_fp8_bf16 else if (caps.fp8F32()) .gemm_fp8_f32 else null;
     if (caps.fp8Gemm(w)) return .gemm_fp8;
     return if (caps.fp8F32()) .gemm_fp8_f32 else null;

@@ -109,7 +109,7 @@ pub const EncDev = struct {
             var arena = std.heap.ArenaAllocator.init(d.gpa);
             defer arena.deinit();
             const lins = try d.enc.deviceLins(arena.allocator());
-            const p = lin_cuda.withInt8(try lin_cuda.plan(lins, .{ .blockq = lin_cuda.encoder_gemm }, "qwen3 cuda encoder"), d.be, lin_cuda.dual_lin.encoderInt8());
+            const p = lin_cuda.withInt8(try lin_cuda.plan(lins, lin_cuda.Use.encoder(lin_cuda.encoder_gemm), "qwen3 cuda encoder"), d.be, lin_cuda.dual_lin.encoderInt8());
             // Before the batch: a scratch grown mid-batch frees memory queued kernels
             // still read (the weight-only route's bf16 weight copy faulted on a 32B).
             try lin_cuda.presize(d.be, p, lins);
@@ -227,7 +227,7 @@ pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const lins = enc.deviceLins(arena.allocator()) catch return false;
-    return lin_cuda.check(lins, .{ .blockq = lin_cuda.encoder_gemm }) == .ok;
+    return lin_cuda.check(lins, lin_cuda.Use.encoder(lin_cuda.encoder_gemm)) == .ok;
 }
 
 /// Queue one layer's weights for async upload so they land while the previous layer

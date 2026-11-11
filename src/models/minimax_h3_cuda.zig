@@ -109,7 +109,7 @@ pub const Workspace = struct {
     v_d: Buf = .{},
     attn_d: Buf = .{},
     /// The attention out-projection for one query band. Its own buffer, not a
-    /// view into `t1_d`: `opI8Gemm` writes its row count ROUNDED UP to 128, so a
+    /// view into `t1_d`: a dequant GEMM writes its row count ROUNDED UP to 128, so a
     /// band-offset view would clobber the next band's still-needed normalized
     /// rows, and the last band would run off the end.
     ao_d: Buf = .{},
@@ -117,12 +117,12 @@ pub const Workspace = struct {
     /// Only allocated when `kv_bf16`.
     qb_d: Buf = .{},
     ob_d: Buf = .{},
-    /// K and V are stored as bf16 and handed to cuDNN AS the operands, so the
+    /// K and V are stored as bf16 and handed to the attention AS its operands, so the
     /// conversion staging that an f32 stream needs does not exist: that staging
     /// is another full copy of both, 2.62 GB at 15 s of 768x1152 on top of the
     /// 2.62 GB the f32 originals cost. bf16, not f16, because H3's V is unnormed and
-    /// outgrows f16 on a real conditioning while a synthetic one stays green. Off on
-    /// the hand-PTX arm, which has no bf16 attention, and under `force_naive_attn`.
+    /// outgrows f16 on a real conditioning while a synthetic one stays green. Off where
+    /// the attention reads f32 only (`attnReads16`) and under `force_naive_attn`.
     kv_bf16: bool = false,
     gate_d: Buf = .{},
     up_d: Buf = .{},
@@ -164,7 +164,7 @@ pub const Workspace = struct {
         ws.t1_d = try be.tensorCreate(tband * cfg.hidden * act.bytes());
         ws.t1_d.dt = act;
         const aband = padRows(@min(attn_band, seq));
-        ws.kv_bf16 = be.kernels == .libs and !force_naive_attn;
+        ws.kv_bf16 = be.attnReads16(cfg.head_dim, cfg.n_heads, cfg.n_heads) and !force_naive_attn;
         const kvw: usize = if (ws.kv_bf16) 2 else 4;
         ws.q_d = try be.tensorCreate(aband * inner * 4);
         ws.k_d = try be.tensorCreate(mpad * inner * kvw);

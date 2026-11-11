@@ -20,6 +20,10 @@ const qwen25_dropped_merges = @embedFile("assets/qwen_tokenizer/qwen25_dropped_m
 /// Qwen3.5's own 248k vocabulary (ComfyUI's `qwen35_tokenizer`).
 const qwen35_vocab_json = @embedFile("assets/qwen35_tokenizer/vocab.json");
 const qwen35_merges_txt = @embedFile("assets/qwen35_tokenizer/merges.txt");
+const llama3_vocab_json = @embedFile("assets/llama3_tokenizer/vocab.json");
+const llama3_merges_txt = @embedFile("assets/llama3_tokenizer/merges.txt");
+/// `[[id, text], ...]`: SmolLM3's 256 added tokens over the Llama 3 vocabulary.
+const llama3_added_json = @embedFile("assets/llama3_tokenizer/added_tokens.json");
 
 pub const pad_token: u32 = 151643; // <|endoftext|>
 pub const im_start: u32 = 151644;
@@ -194,7 +198,8 @@ fn isTekLo(cp: u21) bool {
 /// Pretokenizer regex variant (tokenizer.ggml.pre). qwen35 differs from
 /// qwen2 in two places: letter runs are [\p{L}\p{M}]+ (combining marks join
 /// the run) and the punctuation class also excludes \p{M}.
-pub const Pretok = enum { qwen2, qwen35, k2_horizon, tekken };
+/// llama3 is qwen2's regex with digits in runs of up to three, as K2 has them.
+pub const Pretok = enum { qwen2, qwen35, k2_horizon, tekken, llama3 };
 
 /// Tokenizer algorithm. `bpe` is GPT-2 byte-level BPE (Qwen family);
 /// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma 3, Llama);
@@ -268,6 +273,9 @@ pub const Tokenizer = struct {
     /// back-scan. `spm_scores` holds per-id log-scores; `spm_text_id` holds the
     /// ▁-escaped piece -> id map used for lattice lookups.
     unigram_max_piece: usize = 0,
+    /// Raw bytes -> id, set for a vocabulary with HF's `ignore_merges`: a pretoken that
+    /// is itself an entry is emitted whole, which merging does not always reach.
+    whole: ?std.StringHashMapUnmanaged(u32) = null,
 
     pub fn init(gpa: std.mem.Allocator) !Tokenizer {
         return initVariant(gpa, .qwen3);
@@ -292,6 +300,34 @@ pub const Tokenizer = struct {
         t.pad = 248044;
         t.newline = t.byte_id['\n'];
         return t;
+    }
+
+    /// The Llama 3 vocabulary with SmolLM3's added tokens, as HF's fast tokenizer reads
+    /// SmolLM3's `tokenizer.json`: no normalizer, `ignore_merges`, and nothing added
+    /// around the text (no BOS).
+    pub fn initLlama3(gpa: std.mem.Allocator) !Tokenizer {
+        var t = try initFrom(gpa, llama3_vocab_json, llama3_merges_txt, null);
+        errdefer t.deinit();
+        const alloc = t.arena.allocator();
+        t.nfc = false;
+        t.pretok = .llama3;
+        t.whole = try wholeMap(alloc, t.id_to_bytes);
+        const added = try std.json.parseFromSliceLeaky([]const struct { u32, []const u8 }, alloc, llama3_added_json, .{});
+        const sp = try alloc.alloc(Special, added.len);
+        for (sp, added) |*o, a| o.* = .{ .text = a[1], .id = a[0] };
+        t.specials = &.{};
+        try t.addSpecials(sp);
+        t.turn_end = 128012; // <|im_end|>
+        t.pad = 128004; // <|finetune_right_pad_id|>
+        t.newline = t.byte_id['\n'];
+        return t;
+    }
+
+    fn wholeMap(alloc: std.mem.Allocator, id_to_bytes: []const []const u8) !std.StringHashMapUnmanaged(u32) {
+        var m: std.StringHashMapUnmanaged(u32) = .empty;
+        try m.ensureTotalCapacity(alloc, @intCast(id_to_bytes.len));
+        for (id_to_bytes, 0..) |b, id| m.putAssumeCapacity(b, @intCast(id));
+        return m;
     }
 
     pub const MergeSet = enum { qwen3, qwen25 };
@@ -1192,9 +1228,9 @@ pub const Tokenizer = struct {
             return j;
         }
 
-        // K2 groups one to three digits; Qwen emits one digit at a time.
+        // K2 and Llama 3 group one to three digits; Qwen emits one digit at a time.
         if (isNumber(c0)) {
-            if (pretok != .k2_horizon) return i + 1;
+            if (pretok != .k2_horizon and pretok != .llama3) return i + 1;
             var j = i + 1;
             while (j < n and j - i < 3 and isNumber(cps[j])) j += 1;
             return j;
@@ -1308,6 +1344,7 @@ pub const Tokenizer = struct {
 
     /// Byte-level BPE of one pretoken; appends ids to `out`.
     fn bpe(self: *const Tokenizer, gpa: std.mem.Allocator, bytes: []const u8, symbols: *std.ArrayList(u32), out: *std.ArrayList(u32)) !void {
+        if (self.whole) |w| if (w.get(bytes)) |id| return out.append(gpa, id);
         symbols.clearRetainingCapacity();
         try symbols.ensureUnusedCapacity(gpa, bytes.len);
         for (bytes) |b| symbols.appendAssumeCapacity(self.byte_id[b]);
@@ -2029,4 +2066,20 @@ test "decode round trips" {
     const round = try tok.decodeAlloc(gpa, out.items);
     defer gpa.free(round);
     try std.testing.expectEqualStrings(text, round);
+}
+
+test "the Llama 3 tokenizer matches HF tokenizers on SmolLM3's tokenizer.json" {
+    const gpa = std.testing.allocator;
+    var tok = try Tokenizer.initLlama3(gpa);
+    defer tok.deinit();
+    const Case = struct { text: []const u8, ids: []const u32 };
+    const cases = try std.json.parseFromSlice([]const Case, gpa, @embedFile("assets/llama3_tokenizer_fixtures.json"), .{});
+    defer cases.deinit();
+    for (cases.value) |c| {
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(gpa);
+        try tok.encode(gpa, c.text, &got);
+        errdefer std.debug.print("text: {s}\n", .{c.text});
+        try std.testing.expectEqualSlices(u32, c.ids, got.items);
+    }
 }

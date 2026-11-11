@@ -946,6 +946,7 @@ const bodies = .{
     .{ "bias_add_bf16", At2(elt.biasAdd, .bf16, .bf16).run },
     .{ "conv_w_bf16", At(elt.convW16, .bf16).run },
     .{ "bias_add_bf16_f32", At2(elt.biasAdd, .bf16, .f32).run },
+    .{ "bias_add_bf16_f16", At2(elt.biasAdd, .bf16, .f16).run },
     .{ "scale_i32_f16", At(elt.scaleI32, .f16).run },
     .{ "scale_i32_bf16", At(elt.scaleI32, .bf16).run },
     .{ "copy_f16", At2(elt.copy, .f16, .f16).run },

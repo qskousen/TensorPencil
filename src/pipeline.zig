@@ -78,6 +78,16 @@ const mageflow_dev = @import("tp_models").models.mageflow_dev;
 const mageflow = @import("tp_models").models.mageflow;
 const moss_image = @import("tp_models").models.moss_image;
 const moss_image_text = @import("tp_models").models.moss_image_text;
+const fibo = @import("tp_models").models.fibo;
+const fibo_text = @import("tp_models").models.fibo_text;
+const fibo_dev = @import("tp_models").models.fibo_dev;
+const fibo_cuda = @import("tp_models").models.fibo_cuda;
+const fibo_gpu = @import("tp_models").models.fibo_gpu;
+const fibo2 = @import("tp_models").models.fibo2;
+const fibo2_text = @import("tp_models").models.fibo2_text;
+const fibo2_dev = @import("tp_models").models.fibo2_dev;
+const fibo2_cuda = @import("tp_models").models.fibo2_cuda;
+const fibo2_gpu = @import("tp_models").models.fibo2_gpu;
 const mageflow_text = @import("tp_models").models.mageflow_text;
 const mage_vae = @import("tp_models").models.mage_vae;
 const mageflow_cuda = @import("tp_models").models.mageflow_cuda;
@@ -354,6 +364,9 @@ pub const Options = struct {
     te_act: ?Act = null,
     dit_act: ?Act = null,
     vae_act: ?Act = null,
+    /// How the denoiser's fp8 weights multiply on a device with fp8 tensor cores
+    /// (`--dit-fp8-gemm`). Elsewhere they always run weight-only.
+    dit_fp8_gemm: lin_cuda.dual_lin.Fp8Gemm = .w8a8,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
     /// A hard ceiling: an allocation past it is refused, not merely discouraged.
@@ -896,9 +909,9 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
         // SenseNova joins them by table rather than by template: its schedule is
         // the same `discrete_flow` shift, and ComfyUI's own workflow leaves the
         // KSampler on `normal`, which over a flow table IS `simple`.
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image => .simple,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .fibo2 => .simple,
         // diffusers' schedule, which ComfyUI does not reproduce (see `DiffusersFlow`).
-        .qwen_image21 => .reference,
+        .qwen_image21, .fibo => .reference,
         .sd15, .sdxl => .normal,
     };
 }
@@ -1708,7 +1721,7 @@ pub const CondNoise = struct {
     pub fn concatSupported(f: Family) bool {
         return switch (f) {
             .krea2, .sd15, .sdxl, .mageflow, .moss_image, .minimax_h3, .qwen_image21 => true,
-            .zimage, .anima, .sensenova => false,
+            .zimage, .anima, .sensenova, .fibo2, .fibo => false,
         };
     }
 
@@ -2420,6 +2433,27 @@ pub const Denoiser = struct {
     mf_refs: []const mageflow.Ref = &.{},
     zi_cap_pos: ?[]f32 = null,
     zi_cap_neg: ?[]f32 = null,
+    /// Fibo 2.0's per-conditioning half (gist tokens, the injection blocks' K and V),
+    /// one per branch: it depends on the text alone.
+    /// Fibo 1.5's context and per-block encoder states, one per branch.
+    fb15_pos: ?fibo_text.Context = null,
+    fb15_neg: ?fibo_text.Context = null,
+    fb15_text: [2]usize = .{ 0, 0 },
+    fb15_cu: ?fibo_cuda.Session = null,
+    fb15_cu_neg: ?fibo_cuda.Session = null,
+    fb15_cu_ws: ?fibo_cuda.Workspace = null,
+    fb15_vk: ?fibo_gpu.Session = null,
+    fb15_vk_neg: ?fibo_gpu.Session = null,
+    fb15_vk_ws: ?fibo_gpu.Workspace = null,
+    fb_pre: ?fibo2.Prefix = null,
+    fb_pre_neg: ?fibo2.Prefix = null,
+    /// Fibo 2.0's device sessions, which hold the same prefix on the device.
+    fb_cu: ?fibo2_cuda.Session = null,
+    fb_cu_neg: ?fibo2_cuda.Session = null,
+    fb_cu_ws: ?fibo2_cuda.Workspace = null,
+    fb_vk: ?fibo2_gpu.Session = null,
+    fb_vk_neg: ?fibo2_gpu.Session = null,
+    fb_vk_ws: ?fibo2_gpu.Workspace = null,
     /// Padded caption length, i.e. how many rows of the joint sequence the text half
     /// occupies. The image half starts here.
     zi_cap_padded: usize = 0,
@@ -2497,6 +2531,22 @@ pub const Denoiser = struct {
         if (self.sd_eps) |b| gpa.free(b);
         if (self.zi_cap_pos) |b| gpa.free(b);
         if (self.zi_cap_neg) |b| gpa.free(b);
+        if (self.fb15_pos) |*c| c.deinit(gpa);
+        if (self.fb15_neg) |*c| c.deinit(gpa);
+        if (self.fb15_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.fb15_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.fb15_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.fb15_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.fb15_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.fb15_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.fb_pre) |*p| p.deinit(gpa);
+        if (self.fb_pre_neg) |*p| p.deinit(gpa);
+        if (self.fb_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.fb_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.fb_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.fb_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.fb_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.fb_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
         if (self.zi_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.zi_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.zi_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
@@ -2627,6 +2677,8 @@ pub const Denoiser = struct {
             .mageflow => return self.predictMageFlow(gpa, v_out, latent, sigma, cancel),
             .moss_image => return self.predictMossImage(gpa, v_out, latent, sigma, cancel),
             .qwen_image21 => return self.predictQwenImage21(gpa, v_out, latent, sigma, cancel),
+            .fibo2 => return self.predictFibo2(gpa, v_out, latent, sigma, cancel),
+            .fibo => return self.predictFibo(gpa, v_out, latent, sigma, cancel),
             .minimax_h3 => unreachable, // `denoiser` refuses H3; a clip runs `ClipDenoiser`.
             .krea2 => {},
         }
@@ -2784,6 +2836,81 @@ pub const Denoiser = struct {
         const v_neg = self.v_neg.?;
         const cn = self.cond_neg.?;
         try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, cn.data, cn.seq, &.{}, cancel);
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    fn predictFibo(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const dit = &s.models.fibo.dit;
+        std.debug.assert(v_out.len == dit.cfg.channels * self.lat_h * self.lat_w and latent.len == v_out.len);
+        if (self.fb15_cu) |*cu| {
+            const b = s.cu_be.?;
+            try fibo_cuda.forward(dit, b, cu, &self.fb15_cu_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try fibo_cuda.forward(dit, b, &self.fb15_cu_neg.?, &self.fb15_cu_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        if (self.fb15_vk) |*vk| {
+            const c = s.gpu_ctx.?;
+            try fibo_gpu.forward(dit, c, vk, &self.fb15_vk_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try fibo_gpu.forward(dit, c, &self.fb15_vk_neg.?, &self.fb15_vk_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        const p = self.fb15_pos.?;
+        try dit.forward(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, p.ehs, p.layers, self.fb15_text[0], cancel);
+        if (self.cfg == 1.0) return;
+        const v_neg = self.v_neg.?;
+        const n = self.fb15_neg.?;
+        try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, n.ehs, n.layers, self.fb15_text[1], cancel);
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    fn predictFibo2(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const dit = &s.models.fibo2.dit;
+        std.debug.assert(v_out.len == dit.cfg.channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+        if (self.fb_cu) |*cu| {
+            const b = s.cu_be.?;
+            try fibo2_cuda.forward(dit, b, cu, &self.fb_cu_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try fibo2_cuda.forward(dit, b, &self.fb_cu_neg.?, &self.fb_cu_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        if (self.fb_vk) |*vk| {
+            const c = s.gpu_ctx.?;
+            try fibo2_gpu.forward(dit, c, vk, &self.fb_vk_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg_d = self.v_neg.?;
+            try fibo2_gpu.forward(dit, c, &self.fb_vk_neg.?, &self.fb_vk_ws.?, s.io, gpa, v_neg_d, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg_d, self.cfg);
+            return;
+        }
+        try dit.predict(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, &self.fb_pre.?, cancel);
+        if (self.cfg == 1.0) return;
+        const v_neg = self.v_neg.?;
+        try dit.predict(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, &self.fb_pre_neg.?, cancel);
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
@@ -3278,6 +3405,22 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{ mage_vae.probe, sd_vae.packed_latent_probe } },
             .conditioner2, .decoder2 => error.NoSuchComponent,
         },
+        // Fibo 1.5: SmolLM3 (a Llama-shaped file at `model.`, which the probe's GQA
+        // width does not separate from other Llamas; `model_spec` checks the hidden size)
+        // and the Wan 2.2 layout's VAE.
+        .fibo => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "transformer.", "" }, .probes = &.{fibo.probes[0]} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{"model.layers.0.self_attn.k_proj.weight"} },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{qwen_image21.vae_probe} },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
+        },
+        // Fibo 2.0 reads krea2's Qwen3-VL-4B file and either codec for Mage-Flow's latent.
+        .fibo2 => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{fibo2.probe} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "model.embed_tokens.weight", "embed_tokens.weight" } },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{ mage_vae.probe, sd_vae.packed_latent_probe } },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
+        },
         // Qwen-Image 2.1's encoder is a Qwen3-VL like krea2's, at 8B, which width
         // and depth separate. The decoder probe is the Wan 2.2 layout's nested stage,
         // which no Wan 2.1 export has.
@@ -3516,7 +3659,8 @@ fn reportResolve(
 /// families whose encoder is not a Qwen3.
 fn encoderConfigFor(fam: Family) ?qwen3.Config {
     return switch (fam) {
-        .krea2, .mageflow => qwen3.Config.vl_4b,
+        .krea2, .mageflow, .fibo2 => qwen3.Config.vl_4b,
+        .fibo => qwen3.Config.smollm3_3b,
         .qwen_image21 => qwen3.Config.vl_8b,
         .zimage => qwen3.Config.qwen3_4b,
         .anima => qwen3.Config.qwen3_0_6b,
@@ -3590,6 +3734,16 @@ pub const Family = enum {
     /// schedule, not ComfyUI's, with the flux shift resolved per render from the
     /// target's token count. See `models/qwen_image21.zig`.
     qwen_image21,
+    /// Fibo 2.0 (Bria), a 44-block single-stream DiT on Mage-Flow's latent (Flux 2's 128
+    /// channels at 16x), patch 1. Krea2's Qwen3-VL-4B, read at fifteen layers, feeds a
+    /// Perceiver whose gist tokens lead the sequence and five cross-attending injection
+    /// blocks; a JSON caption is rewritten before encoding. See `models/fibo2.zig`.
+    fibo2,
+    /// Fibo 1.5 (Bria FIBO 1.x), a Flux-style MMDiT (8 double, 38 single blocks) on the
+    /// Wan 2.2 TI2V VAE's 48-channel latent at 16x, patch 1, conditioned on every hidden
+    /// state of SmolLM3-3B over the raw prompt. Sampled on diffusers' schedule (ComfyUI
+    /// has no model for it). See `models/fibo.zig`.
+    fibo,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -3603,7 +3757,7 @@ pub const Family = enum {
     /// before drawing the control.
     pub fn supportsLora(self: Family) bool {
         return switch (self) {
-            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21, .sd15, .sdxl => true,
+            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo, .sd15, .sdxl => true,
         };
     }
 
@@ -3618,7 +3772,7 @@ pub const Family = enum {
             // rounds to `tokenPx` instead. Mage-Flow is patch 1: a token IS a
             // latent cell, so there is nothing to pack and no parity to keep.
             // MOSS-Image is patch 1 on the same latent.
-            .sd15, .sdxl, .sensenova, .mageflow, .moss_image => false,
+            .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .fibo2, .fibo => false,
         };
     }
 
@@ -3627,7 +3781,7 @@ pub const Family = enum {
     pub fn conditionsFromDenoiser(self: Family) bool {
         return switch (self) {
             .sensenova => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow, .minimax_h3, .moss_image, .qwen_image21 => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow, .minimax_h3, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 
@@ -3636,7 +3790,7 @@ pub const Family = enum {
     pub fn isVideo(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21 => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 
@@ -3645,7 +3799,7 @@ pub const Family = enum {
     pub fn hasAudio(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21 => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 };
@@ -3845,6 +3999,33 @@ pub const MossImageModels = struct {
     vae_view: ?*weights_mod.Prefixed,
 };
 
+/// Fibo 2.0: three separate files. The encoder is krea2's Qwen3-VL-4B checkpoint at
+/// Fibo's fifteen taps, the decoder either codec for Mage-Flow's latent.
+pub const Fibo2Models = struct {
+    tok: tokenizer_mod.Tokenizer,
+    enc_st: ?Container,
+    enc: qwen3.TextEncoder,
+    dit_st: Container,
+    dit: fibo2.DiT,
+    vae_st: ?Container,
+    vae: MageFlowVae,
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+};
+
+/// Fibo 1.5: three files (DiT, SmolLM3-3B, the Wan 2.2 TI2V VAE).
+pub const FiboModels = struct {
+    tok: tokenizer_mod.Tokenizer,
+    enc_st: ?Container,
+    enc: qwen3.TextEncoder,
+    dit_st: Container,
+    dit: fibo.DiT,
+    vae_st: ?Container,
+    vae: wan_vae.Decoder,
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+};
+
 /// Qwen-Image 2.1: three separate files (DiT, Qwen3-VL-8B, the RGBA Wan 2.2 VAE).
 pub const QwenImage21Models = struct {
     tok: tokenizer_mod.Tokenizer,
@@ -3964,6 +4145,8 @@ pub const Models = union(Family) {
     mageflow: MageFlowModels,
     moss_image: MossImageModels,
     qwen_image21: QwenImage21Models,
+    fibo2: Fibo2Models,
+    fibo: FiboModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -4066,6 +4249,23 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const b = std.mem.print(&b2, "{s}" ++ moss_image.probe2, .{pfx}) catch continue;
         if (store.get(a) != null and store.get(b) != null) return .moss_image;
     }
+    // Fibo 1.5, ggufy's test: three tensors only this architecture has.
+    pfx: for ((componentSpec(.fibo, .denoiser) catch unreachable).prefixes) |pfx| {
+        for (fibo.probes) |probe| {
+            var b: [128]u8 = undefined;
+            const name = std.mem.print(&b, "{s}{s}", .{ pfx, probe }) catch continue :pfx;
+            if (store.get(name) == null) continue :pfx;
+        }
+        return .fibo;
+    }
+    // Fibo 2.0, ComfyUI's test less the spelling: the gist queries and the final linear.
+    for ((componentSpec(.fibo2, .denoiser) catch unreachable).prefixes) |pfx| {
+        var b1: [96]u8 = undefined;
+        var b2: [96]u8 = undefined;
+        const a = std.mem.print(&b1, "{s}" ++ fibo2.probe, .{pfx}) catch continue;
+        const b = std.mem.print(&b2, "{s}final_layer.linear.weight", .{pfx}) catch continue;
+        if (store.get(a) != null and store.get(b) != null) return .fibo2;
+    }
     // Qwen-Image 2.1, ComfyUI's test: all five of its tensors.
     pfx: for ((componentSpec(.qwen_image21, .denoiser) catch unreachable).prefixes) |pfx| {
         for (qwen_image21.probes) |probe| {
@@ -4083,7 +4283,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
     };
 }
 
@@ -4136,6 +4336,16 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
             .decoder => "models/vae/flux2-vae.safetensors",
             else => "",
         },
+        .fibo => switch (comp) {
+            .conditioner => "models/text_encoders/smollm3_3b_fibo15_bf16.safetensors",
+            .decoder => "models/vae/wan2.2_vae.safetensors",
+            else => "",
+        },
+        .fibo2 => switch (comp) {
+            .conditioner => "models/text_encoders/qwen3vl_4b_bf16.safetensors",
+            .decoder => "models/vae/flux2-vae.safetensors",
+            else => "",
+        },
         .qwen_image21 => switch (comp) {
             .conditioner => "models/text_encoders/qwen3vl_8b_fp8_scaled.safetensors",
             .decoder => "models/vae/qwen_image_2.1_vae_bf16.safetensors",
@@ -4149,6 +4359,8 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
 pub const mageflow_shift: f32 = 6.0;
 /// ComfyUI's `MOSSImage.sampling_settings.shift`.
 pub const moss_image_shift: f32 = 5.0;
+/// ComfyUI's `Fibo2.sampling_settings.shift`, a flux mu: a plain shift of e^1.15 = 3.16.
+pub const fibo2_shift: f32 = 1.15;
 /// A tensor only a Qwen3.5's DeltaNet layers carry.
 const qwen35_te_probe = "model.language_model.layers.0.linear_attn.A_log";
 
@@ -4206,6 +4418,10 @@ pub fn familySigmaTable(fam: Family, ladder: []const f32, shift: f32) sampler.Si
         // `ModelSamplingFlux`: the shift IS diffusers' mu, which `resolvedShift`
         // reads off the target's size, so every scheduler moves with resolution.
         .qwen_image21 => .{ .flux = shift },
+        // `ModelSamplingFlux` too, at a fixed mu: ComfyUI does not resolve it per size.
+        .fibo2 => .{ .flux = shift },
+        // diffusers' exponential time shift, which is `ModelSamplingFlux`'s, mu from size.
+        .fibo => .{ .flux = shift },
         .sd15, .sdxl => .{ .discrete = ladder },
     };
 }
@@ -4218,6 +4434,7 @@ pub fn familySchedule(gpa: std.mem.Allocator, fam: Family, ladder: []const f32, 
         // `shift` is the mu, resolved from the target by `resolvedShift`.
         .reference => switch (fam) {
             .qwen_image21 => (sm.DiffusersFlow{}).buildAt(gpa, steps, shift, lat_h * lat_w),
+            .fibo => fibo.flow.buildAt(gpa, steps, shift, lat_h * lat_w),
             else => error.SchedulerUnsupported,
         },
         // The release's own list: the step count is the list's.
@@ -4254,7 +4471,8 @@ pub fn stepLevels(gpa: std.mem.Allocator, fam: Family, width: usize, height: usi
         .sd15, .sdxl => sd_vae.spatial_scale,
         .minimax_h3 => minimax_h3.spatial_downscale,
         .sensenova => sensenova.spatial_scale,
-        .mageflow, .moss_image, .qwen_image21 => mage_vae.spatial_scale,
+        .mageflow, .moss_image, .qwen_image21, .fibo2 => mage_vae.spatial_scale,
+        .fibo => fibo.spatial_scale,
     };
     const lat_h = height / ds;
     const lat_w = width / ds;
@@ -4283,6 +4501,8 @@ pub fn defaultShift(fam: Family) f32 {
         // family's here.
         .mageflow => mageflow_shift,
         .moss_image => moss_image_shift,
+        .fibo2 => fibo2_shift,
+        .fibo => @floatCast(fibo.flow.mu(64 * 64)),
         // diffusers' mu at 1024x1024 (ComfyUI's fixed 0.69). A render resolves its
         // own from the target's size, see `defaultShiftAt`.
         .qwen_image21 => @floatCast((sampler.schedule_mod.DiffusersFlow{}).mu(64 * 64)),
@@ -4295,6 +4515,7 @@ pub fn defaultShift(fam: Family) f32 {
 pub fn defaultShiftAt(fam: Family, lat_h: usize, lat_w: usize) f32 {
     return switch (fam) {
         .qwen_image21 => @floatCast((sampler.schedule_mod.DiffusersFlow{}).mu(lat_h * lat_w)),
+        .fibo => @floatCast(fibo.flow.mu(lat_h * lat_w)),
         else => defaultShift(fam),
     };
 }
@@ -4308,7 +4529,7 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // hidden state, so there is no fixed token window to interpolate a weight
         // in. Its presentation is not even chat-templated, it is raw prompt text
         // with vision blocks spliced in, so there is nothing to anchor against.
-        .krea2, .zimage, .minimax_h3, .mageflow, .qwen_image21 => qwen3.TextEncoder.supports_prompt_weights,
+        .krea2, .zimage, .minimax_h3, .mageflow, .qwen_image21, .fibo2, .fibo => qwen3.TextEncoder.supports_prompt_weights,
         // True, where the other Qwen3-conditioned families are false, and the
         // difference is structural rather than a judgement call. krea2 and Z-Image
         // weight the *encoder's* tap states, which have no fixed token window to
@@ -4492,6 +4713,8 @@ pub const Session = struct {
     /// public stages itself (ggufy's ladder, the GUI's per-image config) gets the same
     /// behaviour without threading it through four stage signatures.
     compat: CompatConfig = .{},
+    /// `Options.dit_fp8_gemm`, kept like `compat`.
+    fp8_gemm: lin_cuda.dual_lin.Fp8Gemm = .w8a8,
 
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -4540,6 +4763,8 @@ pub const Session = struct {
             .mageflow => |*m| m.dit.device_lins,
             .moss_image => |*m| m.dit.device_lins,
             .qwen_image21 => |*m| m.dit.device_lins,
+            .fibo2 => |*m| m.dit.device_lins,
+            .fibo => |*m| m.dit.device_lins,
             .sensenova => |*m| m.dit.device_lins,
             .sd15, .sdxl => |*m| m.unet.device_lins,
             .minimax_h3 => &.{},
@@ -4573,6 +4798,8 @@ pub const Session = struct {
                 // f16 over ComfyUI's bf16: one forward 1.4e-3 against f32 where bf16 is
                 // 9.5e-3, at the same speed; `auto` widens on a non-finite step.
                 .krea2 => .f16,
+                // Finite at 1024², and as close to ComfyUI's own render as f32.
+                .fibo2 => .f16,
                 // f16 only where its range fits unaided: SenseNova and H3 run f16 only
                 // through a scaled residual (`streamDiv`), so they stay f32 unless asked.
                 else => .f32,
@@ -4585,7 +4812,7 @@ pub const Session = struct {
                 .minimax_h3 => .f16,
                 .sd15, .sdxl => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
                 .zimage => |*m| if (m.vae.cfg.act_f16) .f16 else .f32,
-                inline .mageflow, .moss_image => |*m| switch (m.vae) {
+                inline .mageflow, .moss_image, .fibo2 => |*m| switch (m.vae) {
                     .anchor => |*v| if (v.cfg.act_f16) .f16 else .f32,
                     // Every narrowed buffer stays under 210 on real renders; the
                     // per-pixel residual, which reaches 3e4, stays f32 at every width.
@@ -4614,13 +4841,13 @@ pub const Session = struct {
         if (self.cu_be == null and self.gpu_ctx == null) return null;
         return switch (comp) {
             .encoder => switch (self.models) {
-                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21 => |*m| m.enc.integerKind(),
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| m.enc.integerKind(),
                 .moss_image => |*m| m.enc.integerKind(),
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.clip.device_lins) orelse if (m.clip_g) |*g| models_lin.integerKind(g.device_lins) else null,
                 .sensenova => |*m| models_lin.integerKind(m.dit.prefix_lins),
             },
             .denoiser => switch (self.models) {
-                inline .krea2, .zimage, .anima, .mageflow, .moss_image, .sensenova, .minimax_h3, .qwen_image21 => |*m| models_lin.integerKind(m.dit.device_lins),
+                inline .krea2, .zimage, .anima, .mageflow, .moss_image, .sensenova, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| models_lin.integerKind(m.dit.device_lins),
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.unet.device_lins),
             },
             .vae => null,
@@ -4655,7 +4882,7 @@ pub const Session = struct {
                         return sd_unet_gpu.streamDtFor(gc, want);
                 },
                 .krea2 => |*m| {
-                    if (self.cu_be) |b| return dit_cuda.streamDtFor(b, want);
+                    if (self.cu_be) |b| return dit_cuda.streamDtFor(b, &m.dit, want);
                     if (self.gpu_ctx) |gc| if (dit_gpu.supported(gc, &m.dit)) return dit_gpu.streamDtFor(want);
                 },
                 .zimage => |*m| {
@@ -4686,6 +4913,14 @@ pub const Session = struct {
                     if (self.cu_be != null and qwen_image21_cuda.supported(self.gpa, &m.dit)) return qwen_image21_dev.streamDtFor(want);
                     if (self.gpu_ctx) |gc| if (qwen_image21_gpu.supported(gc, &m.dit)) return qwen_image21_dev.streamDtFor(want);
                 },
+                .fibo => |*m| {
+                    if (self.cu_be != null and fibo_cuda.supported(self.gpa, &m.dit)) return fibo_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (fibo_gpu.supported(gc, &m.dit)) return fibo_dev.streamDtFor(want);
+                },
+                .fibo2 => |*m| {
+                    if (self.cu_be != null and fibo2_cuda.supported(self.gpa, &m.dit)) return fibo2_dev.streamDtFor(want);
+                    if (self.gpu_ctx) |gc| if (fibo2_gpu.supported(gc, &m.dit)) return fibo2_dev.streamDtFor(want);
+                },
             },
             .vae => switch (self.models) {
                 .sd15, .sdxl, .zimage, .krea2, .anima => if (self.cu_be != null or self.gpu_ctx != null) return want,
@@ -4693,7 +4928,7 @@ pub const Session = struct {
                     if (self.cu_be != null and minimax_h3_vae_cuda.supported(&m.vae)) return want;
                     if (self.gpu_ctx != null and minimax_h3_vae_gpu.supported(&m.vae)) return want;
                 },
-                inline .mageflow, .moss_image => |*m| switch (m.vae) {
+                inline .mageflow, .moss_image, .fibo2 => |*m| switch (m.vae) {
                     .anchor => if (self.cu_be != null or self.gpu_ctx != null) return want,
                     .distilled => |*v| {
                         if (self.cu_be != null and mage_vae_cuda.supported(v)) return want;
@@ -4706,7 +4941,7 @@ pub const Session = struct {
             .encoder => switch (self.models) {
                 // The Qwen3 walk stores its residual, norms and FFN planes at any width
                 // on both backends; the CPU encode is f32.
-                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21 => |*m| {
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| {
                     if (self.cu_be != null) {
                         if (qwen3_cuda.supportsWeights(&m.enc)) return want;
                     } else if (self.gpu_ctx) |gc| if (qwen3_gpu.supportsWeights(gc, &m.enc)) return want;
@@ -4824,13 +5059,14 @@ pub const Session = struct {
         return switch (self.models) {
             .mageflow => |*m| &m.vae,
             .moss_image => |*m| &m.vae,
+            .fibo2 => |*m| &m.vae,
             else => null,
         };
     }
 
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => null,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -4849,6 +5085,8 @@ pub const Session = struct {
             .mageflow => |*m| m.dit_st.store(),
             .moss_image => |*m| m.dit_st.store(),
             .qwen_image21 => |*m| m.dit_st.store(),
+            .fibo2 => |*m| m.dit_st.store(),
+            .fibo => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
@@ -4943,6 +5181,8 @@ pub const Session = struct {
             .mageflow => |*m| m.dit.lora = null,
             .moss_image => |*m| m.dit.lora = null,
             .qwen_image21 => |*m| m.dit.lora = null,
+            .fibo2 => |*m| m.dit.lora = null,
+            .fibo => |*m| m.dit.lora = null,
             .sd15, .sdxl => |*m| {
                 m.unet.lora = null;
                 m.clip.lora = null;
@@ -5108,7 +5348,7 @@ pub const Session = struct {
                 return n;
             },
             // Each walks every linear it runs; the int8 A is for the device trunk.
-            inline .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21 => |*m| {
+            inline .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => |*m| {
                 const n = try m.dit.attachLora(self.gpa, stack);
                 if (self.cu_be != null) try lin_cuda.quantizeLora(self.gpa, stack, m.dit.device_lins, lin_cuda.blockq_gemm, .w8a8);
                 return n;
@@ -5254,6 +5494,7 @@ pub const Session = struct {
         self.gpa = gpa;
         self.io = io;
         self.compat = opts.compatConfig();
+        self.fp8_gemm = opts.dit_fp8_gemm;
         self.backend = opts.backend;
         self.gpu_ctx = null;
         self.cu_be = null;
@@ -5457,6 +5698,54 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .mageflow = m };
             },
+            .fibo2 => {
+                var m: Fibo2Models = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try fibo2.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                m.tok = try tokenizer_mod.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+                const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
+                m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .fibo2);
+                errdefer m.enc.deinit();
+                if (m.enc.cfg.hidden * fibo2_text.bundle_layers[0].len != m.dit.cfg.cap_dim or m.dit.cfg.nInject() + 1 != fibo2_text.bundle_layers.len) {
+                    std.log.err("fibo2: the text encoder makes {d} bundles of {d}, the DiT reads {d} of {d}", .{ fibo2_text.bundle_layers.len, m.enc.cfg.hidden * 3, m.dit.cfg.nInject() + 1, m.dit.cfg.cap_dim });
+                    return error.ShapeMismatch;
+                }
+
+                const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
+                m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = if (vae_r.store.get(mage_vae.probe) != null)
+                    .{ .distilled = try mage_vae.MageVae.load(gpa, vae_r.store, "") }
+                else
+                    .{ .anchor = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux2, "") };
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .fibo2 = m };
+            },
             .moss_image => {
                 var m: MossImageModels = .{
                     .enc_st = null,
@@ -5501,6 +5790,56 @@ pub const Session = struct {
                     .{ .anchor = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux2, "") };
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .moss_image = m };
+            },
+            .fibo => {
+                var m: FiboModels = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try fibo.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                m.tok = try tokenizer_mod.Tokenizer.initLlama3(gpa);
+                errdefer m.tok.deinit();
+                const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
+                m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try self.resolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .fibo);
+                errdefer m.enc.deinit();
+                if (m.enc.cfg.hidden != m.dit.cfg.te_dim or 2 * m.enc.cfg.hidden != m.dit.cfg.joint_dim) {
+                    std.log.err("fibo: the text encoder is {d} wide, the DiT reads {d} and {d}", .{ m.enc.cfg.hidden, m.dit.cfg.te_dim, m.dit.cfg.joint_dim });
+                    return error.ShapeMismatch;
+                }
+
+                const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
+                m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try self.resolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = try wan_vae.Decoder.load(gpa, vae_r.store);
+                if (m.vae.latentChannels() != m.dit.cfg.channels or m.vae.scale() != fibo.spatial_scale) {
+                    m.vae.deinit();
+                    std.log.err("fibo: the VAE takes {d} channels at {d}x, the DiT makes {d} at 16x", .{ m.vae.latentChannels(), m.vae.scale(), m.dit.cfg.channels });
+                    return error.ShapeMismatch;
+                }
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .fibo = m };
             },
             .qwen_image21 => {
                 var m: QwenImage21Models = .{
@@ -5736,7 +6075,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
                 };
             },
             // One file, one model: the prompt is encoded by the trunk's own
@@ -5871,6 +6210,8 @@ pub const Session = struct {
             .sensenova => |*m| swapDit(&m.dit, try sensenova.Model.load(self.gpa, store, sensenova.u15_8b)),
             .mageflow => |*m| swapDit(&m.dit, try mageflow.DiT.load(self.gpa, store)),
             .moss_image => |*m| swapDit(&m.dit, try moss_image.DiT.load(self.gpa, store)),
+            .fibo2 => |*m| swapDit(&m.dit, try fibo2.DiT.load(self.gpa, store)),
+            .fibo => |*m| swapDit(&m.dit, try fibo.DiT.load(self.gpa, store)),
             .qwen_image21 => |*m| swapDit(&m.dit, try qwen_image21.DiT.load(self.gpa, store)),
         }
     }
@@ -6050,6 +6391,32 @@ pub const Session = struct {
                 m.tok.deinit();
             },
             .zimage => |*m| {
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
+            .fibo => |*m| {
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
+            .fibo2 => |*m| {
                 m.vae.deinit();
                 m.dit.deinit();
                 m.enc.deinit();
@@ -6254,7 +6621,7 @@ pub const Session = struct {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
-            .krea2, .zimage, .anima, .minimax_h3, .mageflow, .moss_image, .qwen_image21 => sampler.scaleInitialNoise(x, sigma0),
+            .krea2, .zimage, .anima, .minimax_h3, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => sampler.scaleInitialNoise(x, sigma0),
             // The one family whose initial noise is not unit variance. Leaving the
             // scale out does not soften the image, it renders noise.
             .sensenova => {
@@ -6279,7 +6646,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => .flow,
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -6321,6 +6688,8 @@ pub const Session = struct {
             .mageflow => mageflow.channels,
             .moss_image => |*m| m.dit.cfg.channels,
             .qwen_image21 => |*m| m.dit.cfg.out_ch,
+            .fibo2 => |*m| m.dit.cfg.channels,
+            .fibo => |*m| m.dit.cfg.channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -6756,6 +7125,9 @@ pub const Session = struct {
             .mageflow => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .moss_image => |*m| .{ .rows = c.seq, .segs = 1, .w = m.enc.hidden() },
             .qwen_image21 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            // One segment per bundle slot: a tapped state can appear in two bundles.
+            .fibo2 => |*m| .{ .rows = c.seq, .segs = fibo2_text.bundle_index.len, .w = m.enc.cfg.hidden },
+            .fibo => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .zimage => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .minimax_h3 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             // The adapter's rows, pad rows included: they are attended to, so they
@@ -6802,8 +7174,9 @@ pub const Session = struct {
             // extent renders.
             .sensenova => sensenova.spatial_scale,
             // 16, and it is the VAE's patch: one latent cell is one 16x16 tile.
-            .mageflow, .moss_image => mage_vae.spatial_scale,
+            .mageflow, .moss_image, .fibo2 => mage_vae.spatial_scale,
             .qwen_image21 => |*m| m.vae.scale(),
+            .fibo => |*m| m.vae.scale(),
         };
     }
 
@@ -6874,7 +7247,8 @@ pub const Session = struct {
             // Not an approximation: the canvas IS the image, so the preview is the
             // decode.
             .sensenova => sensenova.canvasToRgb(rgb_out, z, h * w),
-            .mageflow, .moss_image => mage_vae.latentPreviewInto(rgb_out, z, h, w),
+            .mageflow, .moss_image, .fibo2 => mage_vae.latentPreviewInto(rgb_out, z, h, w),
+            .fibo => fibo.latentPreviewInto(rgb_out, z, h, w),
             .qwen_image21 => qwen_image21.latentPreviewInto(rgb_out, z, h, w),
             .sd15 => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
             .sdxl => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
@@ -7235,6 +7609,13 @@ pub const Session = struct {
                 return .{ .data = data, .seq = seq };
             },
             .mageflow => |*m| return self.encodeMageFlow(gpa, m, text, o),
+            .fibo2 => |*m| return self.encodeFibo2(gpa, m, text, o),
+            .fibo => |*m| {
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(gpa);
+                try fibo_text.buildIds(&m.tok, gpa, text, &ids);
+                return .{ .data = try self.runQwen3(gpa, &m.enc, ids.items, o), .seq = ids.items.len };
+            },
             .qwen_image21 => |*m| {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(gpa);
@@ -7709,6 +8090,7 @@ pub const Session = struct {
         level: ?f32,
     ) !Denoiser {
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
+        lin_cuda.dual_lin.trunk_fp8 = self.fp8_gemm;
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
         // Not built yet: H3's sampler steps a TWO-STREAM latent
@@ -7916,6 +8298,73 @@ pub const Session = struct {
                     std.log.warn("MOSS-Image: this checkpoint's weight dtype has no Vulkan GEMM path; the trunk runs on the CPU.", .{});
                 }
             }
+            return d;
+        }
+
+        if (self.family() == .fibo) {
+            const m = &self.models.fibo;
+            const blocks = m.dit.cfg.blocks();
+            const states = m.enc.tapCount();
+            // Cond and uncond run unpadded: padding the shorter text, as diffusers
+            // batches them, only adds rows its own mask hides.
+            d.fb15_pos = try fibo_text.Context.init(gpa, cond_pos.data, cond_pos.seq, states, m.enc.cfg.hidden, blocks);
+            d.fb15_text[0] = cond_pos.seq;
+            if (use_cfg) {
+                d.v_neg = try gpa.alloc(f32, m.dit.cfg.channels * lat_h * lat_w);
+                d.fb15_neg = try fibo_text.Context.init(gpa, cond_neg.?.data, cond_neg.?.seq, states, m.enc.cfg.hidden, blocks);
+                d.fb15_text[1] = cond_neg.?.seq;
+            }
+            const text_cap = @max(d.fb15_text[0], d.fb15_text[1]);
+            const act = self.actFor(.denoiser);
+            if (self.cu_be) |b| {
+                if (fibo_cuda.supported(gpa, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.fb15_cu = try fibo_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, d.fb15_pos.?, d.fb15_text[0], sigmas, act);
+                    if (d.fb15_neg) |n| d.fb15_cu_neg = try fibo_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, n, d.fb15_text[1], sigmas, act);
+                    d.fb15_cu_ws = try fibo_cuda.Workspace.init(b, &m.dit, lat_h * lat_w, text_cap, act);
+                } else std.log.warn("Fibo 1.5: this checkpoint's weight dtype has no CUDA GEMM path; the trunk runs on the CPU.", .{});
+            } else if (self.gpu_ctx) |gc| {
+                if (fibo_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.fb15_vk = try fibo_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, d.fb15_pos.?, d.fb15_text[0], sigmas, act);
+                    if (d.fb15_neg) |n| d.fb15_vk_neg = try fibo_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, n, d.fb15_text[1], sigmas, act);
+                    d.fb15_vk_ws = try fibo_gpu.Workspace.init(gc, &m.dit, lat_h * lat_w, text_cap, act);
+                } else std.log.warn("Fibo 1.5: this checkpoint's weight dtype has no Vulkan path (or the device has no tensor cores); the trunk runs on the CPU.", .{});
+            }
+            return d;
+        }
+
+        if (self.family() == .fibo2) {
+            const m = &self.models.fibo2;
+            // Cond and uncond run separately: the gist count follows each text's own length.
+            const neg: ?Cond = if (use_cfg) cond_neg.? else null;
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, m.dit.cfg.channels * lat_h * lat_w);
+            const text_cap = @max(cond_pos.seq, if (neg) |cn| cn.seq else 0);
+            if (self.cu_be) |b| {
+                if (fibo2_cuda.supported(gpa, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.fb_cu = try fibo2_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, null);
+                    if (neg) |cn| d.fb_cu_neg = try fibo2_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cn.data, cn.seq, sigmas, null);
+                    d.fb_cu_ws = try fibo2_cuda.Workspace.init(b, &m.dit, lat_h * lat_w, self.actFor(.denoiser));
+                    return d;
+                }
+                std.log.warn("Fibo 2.0: this checkpoint's weight dtype has no CUDA GEMM path; the trunk runs on the CPU.", .{});
+            } else if (self.gpu_ctx) |gc| {
+                if (fibo2_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.fb_vk = try fibo2_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, null);
+                    if (neg) |cn| d.fb_vk_neg = try fibo2_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn.data, cn.seq, sigmas, null);
+                    d.fb_vk_ws = try fibo2_gpu.Workspace.init(gc, &m.dit, lat_h * lat_w, text_cap, self.actFor(.denoiser));
+                    return d;
+                }
+                std.log.warn("Fibo 2.0: this checkpoint's weight dtype has no Vulkan path (or the device has no tensor cores); the trunk runs on the CPU.", .{});
+            }
+            d.fb_pre = try m.dit.prefix(self.io, gpa, cond_pos.data, cond_pos.seq);
+            if (neg) |cn| d.fb_pre_neg = try m.dit.prefix(self.io, gpa, cn.data, cn.seq);
             return d;
         }
 
@@ -8730,6 +9179,7 @@ pub const Session = struct {
             return error.LoraScheduleUnsupported;
         };
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
+        lin_cuda.dual_lin.trunk_fp8 = self.fp8_gemm;
         const m = &self.models.minimax_h3;
         const audio = shape.audio orelse return error.FamilyIsNotVideo;
 
@@ -9657,6 +10107,33 @@ pub const Session = struct {
     /// Mage-Flow's conditioning, text-only or with reference pictures.
     /// `mageflow_text.prepare` owns the presentation; this adds the encode and
     /// the prefix strip.
+    /// Fibo 2.0: the prompt as ComfyUI's tokenizer rewrites it (`fibo2_text`), the
+    /// whole templated sequence through the fifteen taps, then the six bundles.
+    fn encodeFibo2(self: *Session, gpa: std.mem.Allocator, m: *Fibo2Models, text: []const u8, o: EncodeOptions) !Cond {
+        const prepared = switch (o.prompt_type) {
+            .negative => try fibo2_text.negative(gpa, text),
+            .positive => blk: {
+                const p = try fibo2_text.prepare(gpa, text, false);
+                defer {
+                    for (p.draws) |d| gpa.free(d);
+                    gpa.free(p.draws);
+                }
+                // ComfyUI shows Qwen3-VL a drawing of each string below sigma 0.9; this
+                // conditions every step on the base caption.
+                if (p.draws.len > 0) std.log.warn("fibo2: the caption's text_render strings are not drawn for the encoder; text rendering follows the caption alone", .{});
+                break :blk p.text;
+            },
+        };
+        defer gpa.free(prepared);
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(gpa);
+        try m.tok.encode(gpa, prepared, &ids);
+        const taps = try self.runQwen3(gpa, &m.enc, ids.items, o);
+        defer gpa.free(taps);
+        const data = try fibo2_text.bundles(gpa, taps, ids.items.len, m.enc.cfg.hidden);
+        return .{ .data = data, .seq = ids.items.len };
+    }
+
     fn encodeMageFlow(self: *Session, gpa: std.mem.Allocator, m: *MageFlowModels, text: []const u8, o: EncodeOptions) !Cond {
         const imgs = o.mf_ref_images;
         var refs: []mageflow_text.RefImage = &.{};
@@ -10271,6 +10748,29 @@ pub const Session = struct {
             };
         }
 
+        // Fibo 1.5: the Wan 2.2 TI2V VAE on the same ladder, at its own latent statistics.
+        if (self.family() == .fibo) {
+            const vae = &self.models.fibo.vae;
+            const c = fibo.channels;
+            if (latent.len != c * lat_h * lat_w) return error.LatentSizeMismatch;
+            self.setMemTag(.vae);
+            const x = try gpa.dupe(f32, latent);
+            defer gpa.free(x);
+            const plane = lat_h * lat_w;
+            for (0..c) |ch| for (x[ch * plane ..][0..plane]) |*val| {
+                val.* = val.* * fibo.latents_std[ch] + fibo.latents_mean[ch];
+            };
+            try note(progress, "decoding latent...\n", .{});
+            const dec_start = std.Io.Clock.real.now(io);
+            const planar = try self.decodeDialed(vae, x, lat_h, lat_w, o, progress);
+            defer gpa.free(planar);
+            try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
+            const width = lat_w * vae.scale();
+            const height = lat_h * vae.scale();
+            if (planar.len != 3 * width * height) return error.LatentSizeMismatch;
+            return .{ .rgb = try image.planarF32ToRgb8(gpa, planar, width, height), .width = width, .height = height };
+        }
+
         // The Wan 2.2 layout at 16x, on the same ladder, but its own latent format
         // and an alpha plane: a transparent render is the point of the RGBA decoder.
         if (self.family() == .qwen_image21) {
@@ -10624,6 +11124,7 @@ pub const Session = struct {
         if (opts.steps < 1) return error.NoSteps;
         // Per-render, not per-session: the GUI snapshots a config per queued image.
         self.compat = opts.compatConfig();
+        self.fp8_gemm = opts.dit_fp8_gemm;
         // Per family, not `/ 8`: SenseNova generates in pixel space, so its
         // "latent" is the canvas at full resolution.
         const px_per_lat = self.spatialDownscale();
@@ -11144,7 +11645,8 @@ test "the live preview follows the family's own latent format" {
             .anima => anima.latent_channels,
             .minimax_h3 => minimax_h3.latent_channels,
             .sensenova => sensenova.latent_channels,
-            .mageflow, .moss_image => mageflow.channels,
+            .mageflow, .moss_image, .fibo2 => mageflow.channels,
+            .fibo => fibo.channels,
             .qwen_image21 => qwen_image21.latent_channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };

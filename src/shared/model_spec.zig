@@ -134,8 +134,10 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
         // Embedding tables are [vocab][hidden]; CLIP's probe is a norm, [hidden].
         .conditioner => switch (fam) {
             // Mage-Flow reads krea2's Qwen3-VL-4B file, at a different tap.
-            .krea2, .mageflow => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
+            .krea2, .mageflow, .fibo2 => dims.len == 2 and dims[1] == models.qwen3.Config.vl_4b.hidden,
             .qwen_image21 => dims.len == 2 and dims[1] == models.qwen3.Config.vl_8b.hidden,
+            // The probe is a k projection, `[kv_dim][hidden]`.
+            .fibo => dims.len == 2 and dims[1] == models.qwen3.Config.smollm3_3b.hidden and dims[0] == models.qwen3.Config.smollm3_3b.kvDim(),
             .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
             .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
             .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
@@ -160,10 +162,10 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             // `[2 * latent_channels][hidden][1][1]` (mean and logvar stacked), or
             // the Flux2 anchor's fold BatchNorm, a bare `[latent_channels]` whose
             // width is what separates it from any other `AutoencoderKL`.
-            .mageflow, .moss_image => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
+            .mageflow, .moss_image, .fibo2 => (dims.len == 4 and dims[0] == 2 * models.mage_vae.latent_channels) or
                 (dims.len == 1 and dims[0] == models.mage_vae.latent_channels),
             // The nested stage's norm: `storeFits` checks the latent width.
-            .qwen_image21 => dims.len == 4,
+            .qwen_image21, .fibo => dims.len == 4,
             // `decoder.conv1.weight` is [inner][z][t][3][3]; the Qwen-Image 2.1 and
             // Wan 2.2 VAEs carry it too, at 64 and 48 channels.
             .krea2, .anima => dims.len == 5 and dims[1] == models.wan_vae.latent_channels,
@@ -182,15 +184,16 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
 pub fn storeFits(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
     const v = probeView(store, fam, comp) orelse return false;
     if (!componentFits(v, fam, comp)) return false;
-    if (fam == .qwen_image21 and comp == .decoder) {
-        // The Wan 2.2 video VAE has the same nesting at 48 channels and a 3-tap time
-        // axis; the loader takes only 64 at temporal kernel 1.
+    if ((fam == .qwen_image21 or fam == .fibo) and comp == .decoder) {
+        // Both are the Wan 2.2 nesting, told apart by the latent width: Qwen-Image 2.1's
+        // RGBA VAE at 64, the TI2V video VAE Fibo 1.5 decodes with at 48.
         const root = v.info.name[0 .. std.mem.find(u8, v.info.name, "decoder.") orelse return false];
         var buf: [256]u8 = undefined;
         const name = std.mem.print(&buf, "{s}decoder.conv1.weight", .{root}) catch return false;
         const c = store.get(name) orelse return false;
         const cd = c.info.shape.slice();
-        return cd.len == 5 and cd[1] == tp.models.qwen_image21.latent_channels and cd[2] == 1;
+        const z: usize = if (fam == .fibo) tp.models.fibo.channels else tp.models.qwen_image21.latent_channels;
+        return cd.len == 5 and cd[1] == z;
     }
     if (comp != .conditioner) return true;
     if (fam == .moss_image) {
@@ -265,8 +268,9 @@ fn layerNormExists(store: tp.weights.WeightStore, root: []const u8, layer: usize
 fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
     const C = tp.models.qwen3.Config;
     return switch (fam) {
-        .krea2, .mageflow => C.vl_4b,
+        .krea2, .mageflow, .fibo2 => C.vl_4b,
         .qwen_image21 => C.vl_8b,
+        .fibo => C.smollm3_3b,
         .zimage => C.qwen3_4b,
         .anima => C.qwen3_0_6b,
         .minimax_h3 => C.qwen3vl_32b_h3,
@@ -488,6 +492,8 @@ fn loraSpec(fam: Family) ?LoraSpec {
             .layers = m.qwen_image21.n_blocks,
             .prefixes = m.qwen_image21.loraKeys(true).prefixes,
         },
+        .fibo2 => .{ .probe = "layers.0.attention.to_q", .in_dim = m.fibo2.release.dim, .out_dim = m.fibo2.release.dim, .layers = m.fibo2.release.n_layers },
+        .fibo => .{ .probe = "transformer_blocks.0.attn.to_q", .in_dim = m.fibo.release.dim, .out_dim = m.fibo.release.dim, .layers = m.fibo.release.n_double },
         .sd15, .sdxl, .minimax_h3 => null,
     };
 }
@@ -656,6 +662,26 @@ pub fn traits(fam: Family) Traits {
             .width = 1024,
             .height = 1024,
             .steps = 30,
+            .cfg = 5.0,
+        },
+        // Bria's own recommendation (diffusers' pipeline): 50 steps, cfg 5, 1024².
+        .fibo => .{
+            .label = "Fibo 1.5 (MMDiT)",
+            .short = "Fibo 1.5",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 50,
+            .cfg = 5.0,
+        },
+        // Bria's own recommendation and ComfyUI's template: 50 steps, cfg 5, ~1 MP.
+        .fibo2 => .{
+            .label = "Fibo 2.0 (single-stream DiT)",
+            .short = "Fibo 2.0",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 50,
             .cfg = 5.0,
         },
         // ComfyUI's `image_moss_image_t2i` template: 1024x1024, 25 steps, cfg 2.5,

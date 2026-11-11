@@ -251,6 +251,11 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
                 dump = args[i];
             } else if (std.mem.eql(u8, args[i], "--krea2")) {
                 variant = .krea2;
+            } else if (std.mem.eql(u8, args[i], "--fibo2")) {
+                variant = .fibo2;
+            } else if (std.mem.eql(u8, args[i], "--fibo")) {
+                // SmolLM3: no QK norm, no RoPE on every fourth layer.
+                variant = .fibo;
             } else if (std.mem.eql(u8, args[i], "--anima")) {
                 // The variant decides the CONFIG (0.6B: 28 layers, hidden 1024),
                 // so a 0.6B encoder under the default `.zimage` variant is a
@@ -390,6 +395,52 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             } else ckpt = args[i];
         }
         try zimageCudaTest(arena, io, stdout, ckpt, vae, libs, layers, lat_arg, cap_arg, sigma_arg, lora);
+    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "fibo-cuda-test") or std.mem.eql(u8, args[1], "fibo-vk-test"))) {
+        var ax: FiboAxes = .{ .ckpt = TensorPencil.model_root ++ "/diffusion_models/fibo/fibo15_bf16.safetensors" };
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) ax.libs = true //
+            else if (std.mem.eql(u8, args[i], "--double") and i + 1 < args.len) {
+                i += 1;
+                ax.double = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--single") and i + 1 < args.len) {
+                i += 1;
+                ax.single = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                ax.lat = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--text") and i + 1 < args.len) {
+                i += 1;
+                ax.text = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                ax.sigma = try std.fmt.parseFloat(f32, args[i]);
+            } else ax.ckpt = args[i];
+        }
+        if (std.mem.eql(u8, args[1], "fibo-cuda-test")) try fiboCudaTest(arena, io, stdout, ax) else try fiboVkTest(arena, io, stdout, ax);
+    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "fibo2-cuda-test") or std.mem.eql(u8, args[1], "fibo2-vk-test"))) {
+        var ax: Fibo2Axes = .{ .ckpt = TensorPencil.model_root ++ "/diffusion_models/fibo/fibo2_dev_bf16.safetensors" };
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) ax.libs = true //
+            else if (std.mem.eql(u8, args[i], "--layers") and i + 1 < args.len) {
+                i += 1;
+                ax.layers = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--lat") and i + 1 < args.len) {
+                i += 1;
+                ax.lat = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--text") and i + 1 < args.len) {
+                i += 1;
+                ax.text = try std.fmt.parseInt(usize, args[i], 10);
+            } else if (std.mem.eql(u8, args[i], "--sigma") and i + 1 < args.len) {
+                i += 1;
+                ax.sigma = try std.fmt.parseFloat(f32, args[i]);
+            } else if (std.mem.eql(u8, args[i], "--dequant-at-load") and i + 1 < args.len) {
+                i += 1;
+                TensorPencil.models.lin.dequant_at_load = std.meta.stringToEnum(@TypeOf(TensorPencil.models.lin.dequant_at_load), args[i]) orelse return error.InvalidArgs;
+            } else ax.ckpt = args[i];
+        }
+        if (std.mem.eql(u8, args[1], "fibo2-cuda-test")) try fibo2CudaTest(arena, io, stdout, ax) else try fibo2VkTest(arena, io, stdout, ax);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "mage-vae-vk-test")) {
         var vae: []const u8 = TensorPencil.model_root ++ "/vae/mage_flow_vae_bf16.safetensors";
         // Two rows of three windows, the last of each padded.
@@ -726,6 +777,8 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
         try cudaTxtFusionTest(arena, io, stdout, path, seq_txt);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-cmp")) {
         try cudaAttnCmp(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-flash-attn-test")) {
+        try cudaFlashAttnTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "--bench"));
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-stream-test")) {
         const path = if (args.len >= 3) args[2] else TensorPencil.model_root ++ "/diffusion_models/krea2/animosity_krea2Ver10-INT8_CONVROT.safetensors";
         const lat: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 32) else 32;
@@ -1081,6 +1134,13 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\                         (int8 at f16 is W8A16, at f32 W8A32), and fails
             \\                         instead of widening. A dtype a component's
             \\                         kernels on this backend do not take runs at f32
+            \\      --dit-fp8-gemm w8a8  how an fp8 denoiser multiplies where the GPU
+            \\                         has fp8 tensor cores (sm_89+, cuda backends):
+            \\                         w8a8 quantizes the activation to fp8 (one scale
+            \\                         per row) and reads the weight as stored;
+            \\                         weight_only expands each weight per call against
+            \\                         the unquantized activation, slower and a little
+            \\                         closer to bf16. Other GPUs: weight_only
             \\      --text-encoder <path>  text-encoder checkpoint (qwen3 for krea2,
             \\                         CLIP-L for the SD family)
             \\      --text-encoder-2 <path>  SDXL's second text encoder (OpenCLIP
@@ -1114,7 +1174,7 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\      check the CUDA SD kernels against the CPU ops they reproduce
             \\      ("libs" runs the cuBLASLt/cuDNN arm, whose attention path
             \\      differs); exits non-zero if any check fails
-            \\  TensorPencil te-test [<encoder>] [--ref <encoder>] [--krea2|--anima]
+            \\  TensorPencil te-test [<encoder>] [--ref <encoder>] [--krea2|--anima|--fibo|--fibo2]
             \\      check a Qwen3 text encoder on every GPU backend against its
             \\      own CPU forward (kernel check), and optionally against a
             \\      second encoder (quantization check). Accepts .gguf
@@ -1180,6 +1240,17 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\        joint sequence, and the one with its own projections),
             \\        --refs how many reference images the edit path appends, and
             \\        --sigma the activation magnitude
+            \\  TensorPencil fibo-cuda-test | fibo-vk-test [<fibo 1.5 ckpt>] [libs]
+            \\      [--double N] [--single N] [--lat N] [--text N] [--sigma S]
+            \\      check the Fibo 1.5 device forward against the CPU forward on real
+            \\      weights, on both attention paths, at a depth (default 2 double and
+            \\      4 single blocks), latent size, text length and sigma
+            \\  TensorPencil fibo2-cuda-test | fibo2-vk-test [<fibo2 ckpt>] [libs]
+            \\      [--layers N] [--lat N] [--text N] [--sigma S]
+            \\      check the Fibo 2.0 device forward (prefix pass included) against
+            \\      the CPU forward on real weights, on both attention paths, at a
+            \\      trunk depth (default 8), latent size, text length (which sets the
+            \\      gist count: 300 takes it past 256) and sigma; non-zero on failure
             \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
             \\      check zimage_cuda's device forward against the CPU forward on
             \\      real weights, on both attention paths; non-zero if any fails
@@ -1953,7 +2024,7 @@ fn cudaFp8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
         try be.tensorUpload(xd, std.mem.sliceAsBytes(x));
         var yd = try be.tensorCreate(mpad * rows * 4);
         defer be.tensorDestroy(&yd);
-        try be.opMatmulFp8(yd, xd, m, w, scale, rows, cols);
+        try be.opMatmulFp8(yd, xd, m, w, scale, rows, cols, try be.zeroBias(rows), .f16);
         try be.endBatch();
         const y = try arena.alloc(f32, mpad * rows);
         try be.tensorDownload(yd, std.mem.sliceAsBytes(y));
@@ -2484,8 +2555,8 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
 
     // --- self-attention at every SD head width -------------------------------
     // 40/80/160 are SD1.5's three attending levels, 64 is SDXL's. Under cuDNN all
-    // four run at the true width; under hand-PTX the narrow ones pad to 128 and
-    // 160 pads to 256, so this is where `attnHd` gets exercised.
+    // four run at the true width; under hand-PTX 64 runs at its own width, 40 and 80
+    // pad to 128 and 160 to 256, so this is where `Backend.attnWidth` gets exercised.
     {
         const n = 300;
         const cases = [_]struct { hd: usize, heads: usize }{
@@ -2514,7 +2585,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             try up(be, &ws.k, k);
             try up(be, &ws.v, v);
             try be.ensureDeviceBuffer(&ws.ao, n * dim * 4);
-            const hp = sd_unet_cuda.attnHd(be, cse.hd);
+            const hp = be.attnWidth(cse.hd);
             if (hp != cse.hd) {
                 inline for (.{ "qp", "kp", "vp", "op" }) |f| {
                     try be.ensureDeviceBuffer(&@field(ws, f), n * cse.heads * hp * 4);
@@ -2809,7 +2880,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21 => &.{},
+            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -3012,7 +3083,8 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
         "wings of layered blue floral petals, soft teals and pale pinks, clean precise " ++
         "vector lines, two dark navy hummingbird silhouettes, restricted harmonious palette.";
 
-    var tok = try tokenizer.Tokenizer.init(arena);
+    // SmolLM3's vocabulary is Llama 3's, smaller than Qwen's.
+    var tok = try if (variant == .fibo) tokenizer.Tokenizer.initLlama3(arena) else tokenizer.Tokenizer.init(arena);
     defer tok.deinit();
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(arena);
@@ -4037,28 +4109,34 @@ fn mageflowBench(
     try stdout.print("  {s:<7} {d:>8.1} ms  (sync-per-op sum, upper bound)\n", .{ "total", tot });
 }
 
-/// `diffusion-profile <ckpt> [--text-encoder P] [--text-encoder-2 P] [--vae P]
-/// [--size N] [--reps N] [--lora P] [--backend B] [--dit-act D]
-/// [--ab split-bias|act:D|perturb|prep3|convpatch|fullbar] [--dump P]`: one denoiser forward of any family,
+/// `diffusion-profile <ckpt> [--text-encoder P] [--text-encoder-2 P] [--vae P] [--vae-2 P]
+/// [--size N] [--frames N] [--reps N] [--lora P] [--backend B] [--dit-act D] [--dit-fp8-gemm M]
+/// [--ab split-bias|act:D|perturb|prep3|convpatch|fullbar|tcattn|attn32|fp8] [--dump P]`: one denoiser forward of any family,
 /// through the same `Session` a render uses. The batched best-of-N is the steady-state
 /// s/step; on CUDA the sync-per-op pass after it attributes the time, so its total is an
 /// upper bound and only the ratios between rows mean anything. `--ab split-bias`
 /// alternates each rep with a forward that adds every bias in a separate pass, an
 /// interleaved A/B of the epilogue fold; `--ab act:D` with a second denoiser whose dial
-/// is D; `--ab perturb` with the same denoiser on a latent nudged by 1e-5, the floor a
+/// is D, `--ab attn32` with one built under f32 attention operands, `--ab fp8` with one
+/// whose fp8 weights run W8A8; `--ab perturb` with the same denoiser on a latent nudged by 1e-5, the floor a
 /// dtype A/B is read against (krea2 fp8 512²: 5.4e-4 on cuda, 7.2e-3 on Vulkan). `--dump`
-/// writes both arms' velocities, raw f32, for comparing across backends.
+/// writes both arms' velocities, raw f32, for comparing across backends. `--frames`
+/// profiles a video family's clip denoiser at that length.
 fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
     const pipeline = TensorPencil.pipeline;
     const cuda = TensorPencil.gpu.cuda;
     var opts: pipeline.Options = .{ .prompt = "a red fox sitting on a mossy rock in a misty pine forest, morning light", .dit_path = args[0], .backend = .cuda, .preview = false };
     var size: usize = 1024;
+    var frames: usize = 1;
     var reps: usize = 5;
     var loras: std.ArrayList(pipeline.LoraSpec) = .empty;
     var ab_split = false;
     // A second arm of the same denoiser with one global switch flipped.
     var toggle: ?struct { flag: *bool, what: []const u8 } = null;
     var ab_act: ?pipeline.Act = null;
+    // A second denoiser built with one global switch set, for switches a workspace reads.
+    var build_toggle: ?struct { flag: *bool, what: []const u8 } = null;
+    var ab_fp8 = false;
     var dump: ?[]const u8 = null;
     var ab_perturb = false;
     var i: usize = 1;
@@ -4073,16 +4151,23 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
         } else if (std.mem.eql(u8, args[i], "--vae")) {
             opts.vae_path = v;
             opts.explicit_vae = true;
+        } else if (std.mem.eql(u8, args[i], "--vae-2")) {
+            opts.vae_2_path = v;
+            opts.explicit_vae_2 = true;
         } else if (std.mem.eql(u8, args[i], "--size")) {
             size = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, args[i], "--reps")) {
             reps = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, args[i], "--frames")) {
+            frames = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, args[i], "--lora")) {
             try loras.append(arena, .{ .path = v });
         } else if (std.mem.eql(u8, args[i], "--backend")) {
             opts.backend = pipeline.Backend.fromStr(v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--dit-act")) {
             opts.dit_act = std.meta.stringToEnum(pipeline.Act, v) orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, args[i], "--dit-fp8-gemm")) {
+            opts.dit_fp8_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp8Gemm, v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--dump")) {
             dump = v;
         } else if (std.mem.eql(u8, args[i], "--ab")) {
@@ -4097,6 +4182,14 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             } else if (std.mem.eql(u8, v, "convpatch")) {
                 // Vulkan's 3x3 conv gathered into the GEMM operand against the f32 patch.
                 toggle = .{ .flag = &TensorPencil.gpu.dual_table.force_conv_patch, .what = "f32 conv patch" };
+            } else if (std.mem.eql(u8, v, "tcattn")) {
+                // zig-cuda's fused attention against the three-pass pipeline it replaced.
+                toggle = .{ .flag = &cuda.backend.force_tc_attn, .what = "three-pass attention" };
+            } else if (std.mem.eql(u8, v, "fp8")) {
+                ab_fp8 = true;
+            } else if (std.mem.eql(u8, v, "attn32")) {
+                // zig-cuda attention operands stored 16-bit against f32.
+                build_toggle = .{ .flag = &cuda.backend.force_attn_f32_operands, .what = "f32 attention operands" };
             } else if (std.mem.eql(u8, v, "perturb")) {
                 // DIAGNOSTIC: the same denoiser on a latent nudged by 1e-5, the floor a
                 // dtype A/B is read against.
@@ -4116,26 +4209,47 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     if (ab_split and sess.cu_be == null) return error.NoCudaBackend;
     sess.setDials(opts.te_act, opts.dit_act, opts.vae_act);
 
-    var cond = try sess.encode(gpa, opts.prompt, .{});
-    defer cond.deinit(gpa);
-    // Without it nothing pins, and a denoiser that does not fit beside the encoder
-    // re-streams on every forward: the profile then times the transfer.
-    sess.armDenoiserResidency(null);
-    const sigmas = try sess.schedule(gpa, 8, opts.shift);
-    defer gpa.free(sigmas);
     const ds = sess.spatialDownscale();
     const lat_h = size / ds;
     const lat_w = size / ds;
-    const n = sess.latentChannels() * lat_h * lat_w;
-    var den = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
+    const shape = try sess.latentShape(size, size, frames);
+    const clip: ?ProfileDen.Clip = if (sess.family().isVideo()) .{ .shape = shape, .shifts = sess.clipShifts(.{ .prompt = opts.prompt }) } else null;
+    var cond = try sess.encode(gpa, opts.prompt, .{ .h3_target_frames = sess.pixelFrames(shape) });
+    defer cond.deinit(gpa);
+    if (clip != null) if (sess.cu_be) |b| {
+        // As `generateClip` does: a clip's workspace dwarfs the encoder's scratch.
+        b.freeAttnScratch();
+        b.freeConvScratch();
+        _ = b.evictUnpinned();
+    };
+    // Without it nothing pins, and a denoiser that does not fit beside the encoder
+    // re-streams on every forward: the profile then times the transfer. A clip arms
+    // after its denoiser, whose workspace is sized by the packed sequence.
+    if (clip == null) sess.armDenoiserResidency(null);
+    const sigmas = try sess.schedule(gpa, 8, if (clip) |c| c.shifts.video else opts.shift);
+    defer gpa.free(sigmas);
+    const n = shape.elems();
+    var den = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
     defer den.deinit(gpa);
+    if (clip != null) sess.armDenoiserResidency(null);
     const act_a = sess.actFor(.denoiser);
     // The second arm's dtype is fixed when its denoiser is built, so both live at once.
-    var den_b: ?pipeline.Denoiser = null;
+    var den_b: ?ProfileDen = null;
     defer if (den_b) |*db| db.deinit(gpa);
     if (ab_act) |a| {
         sess.setDials(opts.te_act, a, opts.vae_act);
-        den_b = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas);
+        den_b = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
+    }
+    if (build_toggle) |t| {
+        t.flag.* = true;
+        defer t.flag.* = false;
+        den_b = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
+    }
+    if (ab_fp8) {
+        const was = sess.fp8_gemm;
+        sess.fp8_gemm = if (was == .w8a8) .weight_only else .w8a8;
+        defer sess.fp8_gemm = was;
+        den_b = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
     }
     const act_b = sess.actFor(.denoiser);
     const x = try gpa.alloc(f32, n);
@@ -4158,11 +4272,11 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     // Two warm forwards: the first uploads every weight (and compiles the other arm's
     // kernels).
     for (0..2) |_| {
-        try den.predict(gpa, v, x, sigmas[1], null);
-        if (den_b) |*db| try db.predict(gpa, v_b, x, sigmas[1], null);
+        try den.predict(gpa, v, x, sigmas[1]);
+        if (den_b) |*db| try db.predict(gpa, v_b, x, sigmas[1]);
         if (toggle) |t| {
             t.flag.* = true;
-            try den.predict(gpa, v_b, x, sigmas[1], null);
+            try den.predict(gpa, v_b, x, sigmas[1]);
             t.flag.* = false;
         }
     }
@@ -4177,7 +4291,7 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             lin_cuda.split_bias = ab_split and arm == 1;
             if (toggle) |t| t.flag.* = arm == 1;
             const t0 = std.Io.Clock.awake.now(io).nanoseconds;
-            if (arm == 1 and den_b != null) try den_b.?.predict(gpa, v_b, x, sigmas[1], null) else if (arm == 1 and ab_perturb) try den.predict(gpa, v_b, x_b, sigmas[1], null) else if (arm == 1 and toggle != null) try den.predict(gpa, v_b, x, sigmas[1], null) else try den.predict(gpa, v, x, sigmas[1], null);
+            if (arm == 1 and den_b != null) try den_b.?.predict(gpa, v_b, x, sigmas[1]) else if (arm == 1 and ab_perturb) try den.predict(gpa, v_b, x_b, sigmas[1]) else if (arm == 1 and toggle != null) try den.predict(gpa, v_b, x, sigmas[1]) else try den.predict(gpa, v, x, sigmas[1]);
             best[arm] = @min(best[arm], @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e6);
         }
     }
@@ -4207,7 +4321,10 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             se += (a - b) * (a - b);
             ss += a * a;
         }
-        try stdout.print("  denoiser {t}: {d:.1} ms ({d:.1}% vs the first), velocity rel L2 vs {t} {e:.3}\n", .{ act_b, best[1], 100 * (best[1] - best[0]) / best[0], act_a, @sqrt(se / ss) });
+        if (build_toggle != null or ab_fp8)
+            try stdout.print("  {s}: {d:.1} ms, the default path saves {d:.1}% (velocity rel L2 between them {e:.2})\n", .{ if (build_toggle) |t| t.what else if (sess.fp8_gemm == .w8a8) "fp8 weight-only" else "fp8 w8a8", best[1], 100 * (best[1] - best[0]) / best[1], @sqrt(se / ss) })
+        else
+            try stdout.print("  denoiser {t}: {d:.1} ms ({d:.1}% vs the first), velocity rel L2 vs {t} {e:.3}\n", .{ act_b, best[1], 100 * (best[1] - best[0]) / best[0], act_a, @sqrt(se / ss) });
     }
     if (ab_split) {
         try stdout.print("  bias in a separate pass: {d:.1} ms, the fold saves {d:.1}%\n", .{ best[1], 100 * (best[1] - best[0]) / best[1] });
@@ -4215,9 +4332,9 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
         // for bit; an f16 one rounds once fewer.
         const v_split = try gpa.alloc(f32, n);
         defer gpa.free(v_split);
-        try den.predict(gpa, v, x, sigmas[1], null);
+        try den.predict(gpa, v, x, sigmas[1]);
         lin_cuda.split_bias = true;
-        try den.predict(gpa, v_split, x, sigmas[1], null);
+        try den.predict(gpa, v_split, x, sigmas[1]);
         lin_cuda.split_bias = false;
         var differ: usize = 0;
         var max_d: f32 = 0;
@@ -4233,7 +4350,7 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     const be = sess.cu_be orelse return stdout.flush();
     be.profile = true;
     be.prof.reset();
-    try den.predict(gpa, v, x, sigmas[1], null);
+    try den.predict(gpa, v, x, sigmas[1]);
     be.profile = false;
     var tot: f64 = 0;
     inline for (comptime std.enums.values(cuda.Backend.ProfCat)) |cat| tot += be.prof.ms[@backingInt(cat)];
@@ -4245,6 +4362,33 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     try stdout.print("  {s:<12} {d:>8.1} ms  (sync-per-op sum, upper bound)\n", .{ "total", tot });
     try stdout.flush();
 }
+
+/// A still-image or a clip denoiser, whichever the family runs.
+const ProfileDen = union(enum) {
+    img: TensorPencil.pipeline.Denoiser,
+    clip: TensorPencil.pipeline.Session.ClipDenoiser,
+
+    const pipeline = TensorPencil.pipeline;
+    const Clip = struct { shape: pipeline.LatentShape, shifts: TensorPencil.models.minimax_h3.Shifts };
+
+    fn init(sess: *pipeline.Session, gpa: std.mem.Allocator, cond: pipeline.Cond, clip: ?Clip, lat_h: usize, lat_w: usize, sigmas: []const f32) !ProfileDen {
+        if (clip) |c| return .{ .clip = try sess.clipDenoiser(gpa, cond, c.shape, c.shifts) };
+        return .{ .img = try sess.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, sigmas) };
+    }
+
+    fn predict(d: *ProfileDen, gpa: std.mem.Allocator, v: []f32, x: []const f32, sigma: f32) !void {
+        switch (d.*) {
+            .img => |*i| try i.predict(gpa, v, x, sigma, null),
+            .clip => |*c| try c.predict(gpa, v, x, sigma),
+        }
+    }
+
+    fn deinit(d: *ProfileDen, gpa: std.mem.Allocator) void {
+        switch (d.*) {
+            inline else => |*i| i.deinit(gpa),
+        }
+    }
+};
 
 fn nsMs(ns: i128) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -5102,6 +5246,254 @@ fn mossImageChecks(
 
 /// `--lora <file> [--strength s]` on a device check.
 const TestLoraArg = struct { path: []const u8 = "", strength: f32 = 1 };
+
+const FiboAxes = struct {
+    ckpt: []const u8,
+    libs: bool = false,
+    double: usize = 2,
+    single: usize = 4,
+    lat: usize = 16,
+    text: usize = 40,
+    sigma: f32 = 0.75,
+};
+
+/// The CPU reference for a Fibo 1.5 device check, as `Fibo2Case` is for 2.0.
+const FiboCase = struct {
+    model: TensorPencil.models.fibo.DiT,
+    ctx: TensorPencil.models.fibo_text.Context,
+    x: []f32,
+    want: []f32,
+
+    fn init(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: FiboAxes) !?FiboCase {
+        const fibo = TensorPencil.models.fibo;
+        std.Io.Dir.cwd().access(io, ax.ckpt, .{}) catch {
+            try stdout.print("needs a Fibo 1.5 checkpoint ({s})\n", .{ax.ckpt});
+            return null;
+        };
+        var ck = try TensorPencil.pipeline.Container.open(arena, io, ax.ckpt);
+        const model = try fibo.DiT.loadDepth(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store()), ax.double, ax.single);
+        const cfg = model.cfg;
+        try stdout.print("{d} double + {d} single blocks, latent {d}x{d}, {d} text tokens, sigma {d}\n", .{ cfg.n_double, cfg.n_single, ax.lat, ax.lat, ax.text, ax.sigma });
+        var prng = std.Random.DefaultPrng.init(13);
+        const rnd = prng.random();
+        const ehs = try arena.alloc(f32, ax.text * cfg.joint_dim);
+        for (ehs) |*v| v.* = rnd.floatNorm(f32);
+        const layers = try arena.alloc(f32, cfg.blocks() * ax.text * cfg.te_dim);
+        for (layers) |*v| v.* = rnd.floatNorm(f32);
+        const x = try arena.alloc(f32, cfg.channels * ax.lat * ax.lat);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const want = try arena.alloc(f32, x.len);
+        const prev = TensorPencil.ops.matmul.exact_activations;
+        TensorPencil.ops.matmul.exact_activations = true;
+        defer TensorPencil.ops.matmul.exact_activations = prev;
+        try model.forward(io, arena, want, x, ax.lat, ax.lat, ax.sigma, ehs, layers, ax.text, null);
+        return .{ .model = model, .ctx = .{ .ehs = ehs, .layers = layers }, .x = x, .want = want };
+    }
+
+    fn report(c: *const FiboCase, stdout: *Io.Writer, what: []const u8, got: []const f32) !bool {
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var bad: usize = 0;
+        for (c.want, got) |e, a| {
+            if (!std.math.isFinite(a)) bad += 1;
+            num += (@as(f64, e) - a) * (@as(f64, e) - a);
+            den += @as(f64, e) * e;
+        }
+        const rel = if (den == 0) 0 else @sqrt(num / den);
+        const tol = checkTol(if (c.model.cfg.blocks() <= 8) 2e-3 else 5e-2);
+        const ok = bad == 0 and rel < tol;
+        try stdout.print("forward vs CPU ({s:<10})  rel L2 {e:.4}  {s}{s}\n", .{ what, rel, if (ok) "ok" else "FAILED", if (bad != 0) " (non-finite output)" else "" });
+        return !ok;
+    }
+};
+
+fn fiboCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: FiboAxes) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const fibo_cuda = TensorPencil.models.fibo_cuda;
+    try stdout.print("== fibo-cuda-test ==\n", .{});
+    var c = (try FiboCase.init(arena, io, stdout, ax)) orelse return;
+    var be = (if (ax.libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+    if (!fibo_cuda.supported(arena, &c.model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+    var failures: usize = 0;
+    const saved = .{ fibo_cuda.force_attn_f32, fibo_cuda.force_weight_only };
+    defer fibo_cuda.force_attn_f32 = saved[0];
+    defer fibo_cuda.force_weight_only = saved[1];
+    fibo_cuda.force_weight_only = true;
+    const act = TensorPencil.models.fibo_dev.streamDtFor(testAct());
+    for ([_]bool{ false, true }) |naive| {
+        fibo_cuda.force_attn_f32 = naive;
+        var sess = try fibo_cuda.Session.init(arena, io, be, &c.model, ax.lat, ax.lat, c.ctx, ax.text, &.{ ax.sigma, 0 }, act);
+        defer sess.deinit(arena, be);
+        var ws = try fibo_cuda.Workspace.init(be, &c.model, ax.lat * ax.lat, ax.text, act);
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, c.x.len);
+        try fibo_cuda.forward(&c.model, be, &sess, &ws, io, arena, got, c.x, ax.sigma, null);
+        if (try c.report(stdout, if (naive) "f32 attn" else "opAttnTC", got)) failures += 1;
+    }
+    try summarize(stdout, failures);
+}
+
+fn fiboVkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: FiboAxes) !void {
+    const fibo_gpu = TensorPencil.models.fibo_gpu;
+    try stdout.print("== fibo-vk-test ==\n", .{});
+    var c = (try FiboCase.init(arena, io, stdout, ax)) orelse return;
+    const ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("vulkan device: {s}\n", .{ctx.deviceName()});
+    if (!fibo_gpu.supported(ctx, &c.model)) {
+        try stdout.print("checkpoint dtype unsupported on this device, or no tensor cores\n", .{});
+        return;
+    }
+    var failures: usize = 0;
+    const saved = fibo_gpu.force_attn_f32;
+    defer fibo_gpu.force_attn_f32 = saved;
+    const act = TensorPencil.models.fibo_dev.streamDtFor(testAct());
+    for ([_]bool{ false, true }) |naive| {
+        fibo_gpu.force_attn_f32 = naive;
+        var sess = try fibo_gpu.Session.init(arena, io, ctx, &c.model, ax.lat, ax.lat, c.ctx, ax.text, &.{ ax.sigma, 0 }, act);
+        defer sess.deinit(arena, ctx);
+        var ws = try fibo_gpu.Workspace.init(ctx, &c.model, ax.lat * ax.lat, ax.text, act);
+        defer ws.deinit(ctx);
+        const got = try arena.alloc(f32, c.x.len);
+        try fibo_gpu.forward(&c.model, ctx, &sess, &ws, io, arena, got, c.x, ax.sigma, null);
+        if (try c.report(stdout, if (naive) "f32 attn" else "tensor", got)) failures += 1;
+    }
+    try summarize(stdout, failures);
+}
+
+const Fibo2Axes = struct {
+    ckpt: []const u8,
+    libs: bool = false,
+    layers: usize = 8,
+    lat: usize = 16,
+    text: usize = 40,
+    sigma: f32 = 0.75,
+};
+
+/// The CPU reference for a Fibo 2.0 device check: the model at the asked depth, a random
+/// conditioning and latent, and the CPU velocity.
+const Fibo2Case = struct {
+    model: TensorPencil.models.fibo2.DiT,
+    ctx: []f32,
+    x: []f32,
+    want: []f32,
+
+    fn init(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: Fibo2Axes) !?Fibo2Case {
+        const fibo2 = TensorPencil.models.fibo2;
+        std.Io.Dir.cwd().access(io, ax.ckpt, .{}) catch {
+            try stdout.print("needs a Fibo 2.0 checkpoint ({s})\n", .{ax.ckpt});
+            return null;
+        };
+        var ck = try TensorPencil.pipeline.Container.open(arena, io, ax.ckpt);
+        const model = try fibo2.DiT.loadDepth(arena, try TensorPencil.pipeline.denoiserStoreIn(arena, ck.store()), ax.layers);
+        const cfg = model.cfg;
+        try stdout.print("trunk depth {d} ({d} injections), latent {d}x{d}, {d} text tokens -> {d} gists, sigma {d}\n", .{ cfg.n_layers, cfg.nInject(), ax.lat, ax.lat, ax.text, cfg.gistCount(ax.text), ax.sigma });
+        var prng = std.Random.DefaultPrng.init(11);
+        const rnd = prng.random();
+        const ctx = try arena.alloc(f32, ax.text * cfg.ctxDim());
+        for (ctx) |*v| v.* = rnd.floatNorm(f32);
+        const x = try arena.alloc(f32, cfg.channels * ax.lat * ax.lat);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const want = try arena.alloc(f32, x.len);
+        const prev = TensorPencil.ops.matmul.exact_activations;
+        TensorPencil.ops.matmul.exact_activations = true;
+        defer TensorPencil.ops.matmul.exact_activations = prev;
+        try model.forward(io, arena, want, x, ax.lat, ax.lat, ax.sigma, ctx, ax.text, null);
+        return .{ .model = model, .ctx = ctx, .x = x, .want = want };
+    }
+
+    /// One device result against the CPU's; returns whether it failed.
+    fn report(c: *const Fibo2Case, stdout: *Io.Writer, what: []const u8, got: []const f32) !bool {
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var bad: usize = 0;
+        for (c.want, got) |e, a| {
+            if (!std.math.isFinite(a)) bad += 1;
+            num += (@as(f64, e) - a) * (@as(f64, e) - a);
+            den += @as(f64, e) * e;
+        }
+        const rel = if (den == 0) 0 else @sqrt(num / den);
+        // Tensor-core GEMMs against the CPU's f32, compounding with depth as Z-Image's do.
+        const tol = checkTol(if (c.model.layers.len <= 8) 2e-3 else 5e-2);
+        const ok = bad == 0 and rel < tol;
+        try stdout.print("forward vs CPU ({s:<10})  rel L2 {e:.4}  {s}{s}\n", .{ what, rel, if (ok) "ok" else "FAILED", if (bad != 0) " (non-finite output)" else "" });
+        return !ok;
+    }
+};
+
+fn fibo2VkTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: Fibo2Axes) !void {
+    const fibo2_gpu = TensorPencil.models.fibo2_gpu;
+    try stdout.print("== fibo2-vk-test ==\n", .{});
+    var c = (try Fibo2Case.init(arena, io, stdout, ax)) orelse return;
+    const ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("vulkan device: {s}\n", .{ctx.deviceName()});
+    if (!fibo2_gpu.supported(ctx, &c.model)) {
+        try stdout.print("checkpoint dtype unsupported on this device, or no tensor cores\n", .{});
+        return;
+    }
+    var failures: usize = 0;
+    const saved = fibo2_gpu.force_attn_f32;
+    defer fibo2_gpu.force_attn_f32 = saved;
+    for ([_]bool{ false, true }) |naive| {
+        fibo2_gpu.force_attn_f32 = naive;
+        var sess = try fibo2_gpu.Session.init(arena, io, ctx, &c.model, ax.lat, ax.lat, c.ctx, ax.text, &.{ ax.sigma, 0 }, null);
+        defer sess.deinit(arena, ctx);
+        var ws = try fibo2_gpu.Workspace.init(ctx, &c.model, ax.lat * ax.lat, ax.text, TensorPencil.models.fibo2_dev.streamDtFor(testAct()));
+        defer ws.deinit(ctx);
+        const got = try arena.alloc(f32, c.x.len);
+        try fibo2_gpu.forward(&c.model, ctx, &sess, &ws, io, arena, got, c.x, ax.sigma, null);
+        if (try c.report(stdout, if (naive) "f32 attn" else "tensor", got)) failures += 1;
+    }
+    try summarize(stdout, failures);
+}
+
+fn fibo2CudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ax: Fibo2Axes) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const fibo2_cuda = TensorPencil.models.fibo2_cuda;
+    try stdout.print("== fibo2-cuda-test ==\n", .{});
+    var c = (try Fibo2Case.init(arena, io, stdout, ax)) orelse return;
+    var be = (if (ax.libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+    if (!fibo2_cuda.supported(arena, &c.model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+    var failures: usize = 0;
+    const saved = .{ fibo2_cuda.force_attn_f32, fibo2_cuda.force_weight_only };
+    defer fibo2_cuda.force_attn_f32 = saved[0];
+    defer fibo2_cuda.force_weight_only = saved[1];
+    fibo2_cuda.force_weight_only = true;
+    for ([_]bool{ false, true }) |naive| {
+        fibo2_cuda.force_attn_f32 = naive;
+        var sess = try fibo2_cuda.Session.init(arena, io, be, &c.model, ax.lat, ax.lat, c.ctx, ax.text, &.{ ax.sigma, 0 }, null);
+        defer sess.deinit(arena, be);
+        var ws = try fibo2_cuda.Workspace.init(be, &c.model, ax.lat * ax.lat, TensorPencil.models.fibo2_dev.streamDtFor(testAct()));
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, c.x.len);
+        try fibo2_cuda.forward(&c.model, be, &sess, &ws, io, arena, got, c.x, ax.sigma, null);
+        if (try c.report(stdout, if (naive) "f32 attn" else "opAttnTC", got)) failures += 1;
+    }
+    try summarize(stdout, failures);
+}
 
 fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, vae_path: []const u8, libs: bool, layers: usize, lat_arg: usize, cap_arg: usize, sigma_arg: f32, lora: TestLoraArg) !void {
     const cuda = TensorPencil.gpu.cuda;
@@ -7351,12 +7743,14 @@ fn wanVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize, v
     var dec = try wan_vae.Decoder.load(arena, .{ .safetensors = &st });
     defer dec.deinit();
 
-    // The latent at its own format's statistics: Wan 2.1's 16 channels, or Qwen-Image
-    // 2.1's 64 for the Wan 2.2 layout.
+    // The latent at its own format's statistics: Wan 2.1's 16 channels, Qwen-Image 2.1's
+    // 64, or the TI2V VAE's 48 (Fibo 1.5's).
     const qi = TensorPencil.models.qwen_image21;
+    const fb = TensorPencil.models.fibo;
     const zc = dec.latentChannels();
-    const mean: []const f32 = if (zc == qi.latent_channels) &qi.latents_mean else &wan_vae.latents_mean;
-    const sdev: []const f32 = if (zc == qi.latent_channels) &qi.latents_std else &wan_vae.latents_std;
+    const mean: []const f32 = if (zc == qi.latent_channels) &qi.latents_mean else if (zc == fb.channels) &fb.latents_mean else &wan_vae.latents_mean;
+    const sdev: []const f32 = if (zc == qi.latent_channels) &qi.latents_std else if (zc == fb.channels) &fb.latents_std else &wan_vae.latents_std;
+    if (mean.len != zc) return error.ShapeMismatch;
     var prng = std.Random.DefaultPrng.init(7);
     const z = try arena.alloc(f32, zc * plane);
     for (z, 0..) |*v, i| v.* = prng.random().floatNorm(f32) * sdev[i / plane] + mean[i / plane];
@@ -7559,6 +7953,214 @@ fn cudaTxtFusionTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path:
     try stdout.print("cuda txtfusion: {d:.3} s (best of 3)\n", .{best / 1000.0});
     try stdout.print("cuda-vs-cpu: max_err={d:.5} rel RMSE={d:.5} (max|v|={d:.1})\n", .{ max_err, @sqrt(num / den), max_val });
     try stdout.flush();
+}
+
+/// `cuda-flash-attn-test [--bench]`: the fused `flash_attn` kernel against the CPU
+/// attention on dtype-rounded inputs, beside the three-pass pipeline it replaces,
+/// over the shapes its callers reach: tile-edge lengths, rectangular, GQA, causal,
+/// both head widths, every in/out dtype and large logits. `--bench` adds an
+/// interleaved ABBA timing of the two paths at diffusion shapes.
+fn cudaFlashAttnTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, bench: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const Dt = TensorPencil.gpu.dual_table.Dt;
+    const dtype = TensorPencil.dtype;
+    const ops = TensorPencil.ops;
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    defer cuda.backend.force_tc_attn = false;
+    try stdout.print("cuda device: {s}\n", .{be.deviceName()});
+
+    const Case = struct { sq: usize, skv: usize, h: usize, kvh: usize, hd: usize, pos0: ?usize = null, in: Dt, out: Dt, sd: f32 = 1 };
+    const cases = [_]Case{
+        .{ .sq = 1, .skv = 1, .h = 2, .kvh = 2, .hd = 128, .in = .f16, .out = .f16 },
+        .{ .sq = 64, .skv = 64, .h = 4, .kvh = 4, .hd = 128, .in = .f16, .out = .f16 },
+        .{ .sq = 65, .skv = 63, .h = 4, .kvh = 4, .hd = 128, .in = .f16, .out = .f32 },
+        .{ .sq = 300, .skv = 77, .h = 4, .kvh = 4, .hd = 64, .in = .f16, .out = .f32 },
+        .{ .sq = 520, .skv = 520, .h = 8, .kvh = 2, .hd = 128, .in = .bf16, .out = .bf16 },
+        .{ .sq = 777, .skv = 1029, .h = 3, .kvh = 3, .hd = 128, .in = .bf16, .out = .f32, .sd = 0.3 },
+        .{ .sq = 1000, .skv = 1000, .h = 4, .kvh = 4, .hd = 128, .in = .f32, .out = .f32, .sd = 3 },
+        .{ .sq = 256, .skv = 256, .h = 2, .kvh = 2, .hd = 128, .in = .f16, .out = .f16, .sd = 8 },
+        .{ .sq = 200, .skv = 237, .h = 4, .kvh = 1, .hd = 128, .pos0 = 37, .in = .f16, .out = .f16 },
+        .{ .sq = 130, .skv = 130, .h = 2, .kvh = 2, .hd = 64, .pos0 = 0, .in = .f32, .out = .f32 },
+        .{ .sq = 129, .skv = 129, .h = 2, .kvh = 2, .hd = 128, .pos0 = 0, .in = .bf16, .out = .f16 },
+        .{ .sq = 65, .skv = 63, .h = 4, .kvh = 4, .hd = 128, .in = .f32, .out = .f32 },
+        .{ .sq = 520, .skv = 520, .h = 8, .kvh = 2, .hd = 128, .in = .f32, .out = .f32 },
+        .{ .sq = 200, .skv = 237, .h = 4, .kvh = 1, .hd = 128, .pos0 = 37, .in = .f32, .out = .f32 },
+    };
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    var failures: usize = 0;
+    for (cases) |c| {
+        const qn = c.sq * c.h * c.hd;
+        const kn = c.skv * c.kvh * c.hd;
+        const host = try arena.alloc(f32, qn + 2 * kn);
+        for (host) |*x| {
+            const r = rnd.floatNorm(f32) * c.sd;
+            x.* = switch (c.in) {
+                .f32 => r,
+                .f16 => @floatCast(@as(f16, @floatCast(r))),
+                .bf16 => dtype.bf16ToF32(dtype.f32ToBf16(r)),
+            };
+        }
+        const q = host[0..qn];
+        const k = host[qn..][0..kn];
+        const v = host[qn + kn ..][0..kn];
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        const want = try arena.alloc(f32, qn);
+        try ops.attention.attention(io, arena, want, q, k, v, .{
+            .seq_q = c.sq,
+            .seq_kv = c.skv,
+            .n_heads = c.h,
+            .n_kv_heads = c.kvh,
+            .head_dim = c.hd,
+            .causal = c.pos0 != null,
+            .scale = scale,
+        });
+
+        const bytes = try arena.alloc(u8, host.len * c.in.bytes());
+        for (host, 0..) |x, i| switch (c.in) {
+            .f32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(x), .little),
+            .f16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(x))), .little),
+            .bf16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], dtype.f32ToBf16(x), .little),
+        };
+        var dev = try be.tensorCreate(bytes.len);
+        defer be.tensorDestroy(&dev);
+        try be.tensorUpload(dev, bytes);
+        const eb = c.in.bytes();
+        const qd = dev.as(c.in);
+        const kd = dev.viewBytes(qn * eb).as(c.in);
+        const vd = dev.viewBytes((qn + kn) * eb).as(c.in);
+        var od = try be.tensorCreate(qn * c.out.bytes());
+        defer be.tensorDestroy(&od);
+        const o = od.as(c.out);
+
+        // The three-pass pipeline reads f32 only and its P@V tile is 128 wide.
+        const arms: usize = if (c.in == .f32 and c.out == .f32 and c.hd % 128 == 0) 2 else 1;
+        var rel: [2]f64 = .{ 0, 0 };
+        var bad: [2]usize = .{ 0, 0 };
+        for (0..arms) |arm| {
+            cuda.backend.force_tc_attn = arm == 1;
+            if (c.pos0) |p0| {
+                try be.opAttnTCCausal(qd, kd, vd, o, c.sq, c.skv, c.h, c.kvh, c.hd, scale, p0);
+            } else try be.opAttnTCRect(qd, kd, vd, o, c.sq, c.skv, c.h, c.kvh, c.hd, scale);
+            try be.endBatch();
+            const raw = try arena.alloc(u8, qn * c.out.bytes());
+            try be.tensorDownload(o, raw);
+            var num: f64 = 0;
+            var den: f64 = 0;
+            for (want, 0..) |e, i| {
+                const g: f32 = switch (c.out) {
+                    .f32 => @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little)),
+                    .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)))),
+                    .bf16 => dtype.bf16ToF32(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)),
+                };
+                if (!std.math.isFinite(g)) bad[arm] += 1;
+                num += (@as(f64, e) - g) * (@as(f64, e) - g);
+                den += @as(f64, e) * e;
+            }
+            rel[arm] = @sqrt(num / den);
+        }
+        cuda.backend.force_tc_attn = false;
+        // P and O round to the operand dtype; bf16 keeps 8 bits of mantissa to f16's 11.
+        const tol: f64 = if (c.in == .bf16 or c.out == .bf16) 1.5e-2 else 3e-3;
+        const ok = bad[0] == 0 and rel[0] < tol;
+        if (!ok) failures += 1;
+        try stdout.print("  {d:>4}q x {d:>4}kv  h {d}/{d} hd {d:>3} {s:<7} {t:>4}->{t:<4} sd {d:<3}  fused {e:.3}", .{
+            c.sq, c.skv, c.h, c.kvh, c.hd, if (c.pos0 != null) "causal" else "", c.in, c.out, c.sd, rel[0],
+        });
+        if (arms == 2) try stdout.print("  three-pass {e:.3}{s}", .{ rel[1], if (bad[1] != 0) " (non-finite)" else "" });
+        try stdout.print("  {s}{s}\n", .{ if (ok) "ok" else "FAILED", if (bad[0] != 0) " (non-finite)" else "" });
+    }
+
+    if (bench) {
+        // cuDNN's fused SDPA on its own context, the `--backend cuda` arm.
+        const lb: ?*cuda.Backend = cuda.Backend.initLibs(arena) catch null;
+        defer if (lb) |l| l.deinit();
+        const names = [3][]const u8{ "fused", "three-pass", "cuDNN" };
+        const shapes = [_]struct { name: []const u8, seq: usize, h: usize }{
+            .{ .name = "fibo2 1024^2", .seq = 4352, .h = 28 },
+            .{ .name = "zimage 1024^2", .seq = 4224, .h = 30 },
+            .{ .name = "24 heads 2048^2", .seq = 16384, .h = 24 },
+        };
+        // SDXL's 64-wide heads: the fused kernel at their width against the 128-wide
+        // padded operands the three-pass pipeline needed (the pad copies not counted).
+        {
+            const seq = 4096;
+            const h = 10;
+            var bufs: [2]cuda.backend.DeviceBuffer = undefined;
+            for (&bufs, [2]usize{ 64, 128 }) |*bb, hd| {
+                const host = try arena.alloc(f32, 3 * seq * h * hd);
+                for (host) |*x| x.* = rnd.floatNorm(f32);
+                bb.* = try be.tensorCreate(4 * seq * h * hd * 4);
+                try be.tensorUpload(bb.*, std.mem.sliceAsBytes(host));
+            }
+            defer for (&bufs) |*bb| be.tensorDestroy(bb);
+            var best: [2]f64 = @splat(std.math.inf(f64));
+            for (0..9) |rep| for (0..2) |slot| {
+                const arm = if (rep % 2 == 0) slot else 1 - slot;
+                const hd: usize = if (arm == 0) 64 else 128;
+                const n = seq * h * hd;
+                const bb = bufs[arm];
+                const t0 = std.Io.Clock.real.now(io);
+                for (0..5) |_| try be.opAttnTC(bb, bb.viewF32(n), bb.viewF32(2 * n), bb.viewF32(3 * n), seq, h, h, hd, 0.125);
+                try be.endBatch();
+                const t1 = std.Io.Clock.real.now(io);
+                if (rep != 0) best[arm] = @min(best[arm], @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 5e6);
+            };
+            try stdout.print("\nsdxl 1024^2 (4096 x 10 heads): fused at hd 64 {d:.2} ms, padded to 128 {d:.2} ms\n", .{ best[0], best[1] });
+        }
+        try stdout.print("\nf32 in and out, arms interleaved in alternating order, best of 8, 5 calls per timing\n", .{});
+        for (shapes) |sh| {
+            const n = sh.seq * sh.h * 128;
+            const host = try arena.alloc(f32, 3 * n);
+            for (host) |*x| x.* = rnd.floatNorm(f32);
+            var bufs: [2]cuda.backend.DeviceBuffer = .{ .{}, .{} };
+            const bes = [2]?*cuda.Backend{ be, lb };
+            defer for (bes, &bufs) |x, *bb| if (x) |xb| xb.tensorDestroy(bb);
+            for (bes, &bufs) |x, *bb| if (x) |xb| {
+                bb.* = try xb.tensorCreate(6 * n * 4);
+                try xb.tensorUpload(bb.*, std.mem.sliceAsBytes(host));
+            };
+            const arms: usize = if (lb != null) 3 else 2;
+            var best: [3]f64 = @splat(std.math.inf(f64));
+            for (0..9) |rep| for (0..arms) |slot| {
+                const arm = if (rep % 2 == 0) slot else arms - 1 - slot;
+                const xb = if (arm == 2) lb.? else be;
+                const buf = bufs[if (arm == 2) 1 else 0];
+                const o = buf.viewF32((3 + arm) * n);
+                cuda.backend.force_tc_attn = arm == 1;
+                try xb.opAttnTC(buf, buf.viewF32(n), buf.viewF32(2 * n), o, sh.seq, sh.h, sh.h, 128, 0.088388);
+                try xb.endBatch();
+                const t0 = std.Io.Clock.real.now(io);
+                for (0..5) |_| try xb.opAttnTC(buf, buf.viewF32(n), buf.viewF32(2 * n), o, sh.seq, sh.h, sh.h, 128, 0.088388);
+                try xb.endBatch();
+                const t1 = std.Io.Clock.real.now(io);
+                // the first round warms each arm's scratch and plans
+                if (rep != 0) best[arm] = @min(best[arm], @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 5e6);
+            };
+            cuda.backend.force_tc_attn = false;
+            // Every arm against the three-pass one on the same inputs: the timed calls
+            // did the whole job.
+            const got = try arena.alloc(f32, 3 * n);
+            try be.tensorDownload(bufs[0].viewF32(3 * n), std.mem.sliceAsBytes(got[0 .. 2 * n]));
+            if (lb) |l| try l.tensorDownload(bufs[1].viewF32(5 * n), std.mem.sliceAsBytes(got[2 * n ..]));
+            const flop = 4.0 * @as(f64, @floatFromInt(sh.seq * sh.seq * sh.h * 128));
+            try stdout.print("  {s}\n", .{sh.name});
+            for (0..arms) |arm| {
+                var num: f64 = 0;
+                var den: f64 = 0;
+                for (got[arm * n ..][0..n], got[n..][0..n]) |x, t| {
+                    num += (@as(f64, x) - t) * (@as(f64, x) - t);
+                    den += @as(f64, t) * t;
+                }
+                try stdout.print("    {s:<10} {d:7.2} ms  {d:5.1} TFLOP/s  vs three-pass {e:.2}\n", .{ names[arm], best[arm], flop / best[arm] / 1e9, @sqrt(num / den) });
+            }
+        }
+    }
+    try summarize(stdout, failures);
 }
 
 fn cudaAttnCmp(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
@@ -7787,7 +8389,7 @@ fn dumpPtx(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, which: []const 
         return;
     }
     const eq = std.mem.eql;
-    const ptx = if (eq(u8, which, "mmq_pipe_q4_k")) try kern.buildMmqPipeQ4K(arena, .q4_k) else if (eq(u8, which, "mmq_pipe_q5_k")) try kern.buildMmqPipeQ4K(arena, .q5_k) else if (eq(u8, which, "mmq_pipe_q6_k")) try kern.buildMmqPipeQ6K(arena) else if (eq(u8, which, "mmq_pipe_q1_0")) try kern.buildMmqPipeQ1_0(arena) else if (eq(u8, which, "mmq_pipe_q8_0")) try kern.buildMmqPipeQ8_0(arena) else if (eq(u8, which, "mmq_q4_k")) try kern.buildMmqQ4K(arena, 16, 4) else if (eq(u8, which, "igemm_pipe_fused")) try kern.buildIgemmPipe(arena, 64, true, 8, true) else if (eq(u8, which, "hgemm")) try kern.buildHgemm(arena, false, false, false, false, true, false) else {
+    const ptx = if (eq(u8, which, "mmq_pipe_q4_k")) try kern.buildMmqPipeQ4K(arena, .q4_k) else if (eq(u8, which, "mmq_pipe_q5_k")) try kern.buildMmqPipeQ4K(arena, .q5_k) else if (eq(u8, which, "mmq_pipe_q6_k")) try kern.buildMmqPipeQ6K(arena) else if (eq(u8, which, "mmq_pipe_q1_0")) try kern.buildMmqPipeQ1_0(arena) else if (eq(u8, which, "mmq_pipe_q8_0")) try kern.buildMmqPipeQ8_0(arena) else if (eq(u8, which, "mmq_q4_k")) try kern.buildMmqQ4K(arena, 16, 4) else if (eq(u8, which, "igemm_pipe_fused")) try kern.buildIgemmPipe(arena, 64, true, .s8, true, .f32) else if (eq(u8, which, "hgemm")) try kern.buildHgemm(arena, false, false, false, false, true, false) else {
         try stdout.print("unknown kernel '{s}'\n  kernels: {s}\n", .{ which, known });
         return;
     };
@@ -7975,7 +8577,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     try stdout.print("cuda device: {s} (kernels: {s})\n", .{ be.deviceName(), if (use_libs) "cuBLASLt/cuDNN libs" else "hand-PTX" });
     var sess = try dit_cuda.Session.init(arena, io, be, &model, lat, lat, cond, seq_txt);
     defer sess.deinit(be);
-    var ws = try dit_cuda.Workspace.init(be, lat, lat, seq_txt, TensorPencil.models.dit_cuda.streamDtFor(be, testAct()));
+    var ws = try dit_cuda.Workspace.init(be, lat, lat, seq_txt, TensorPencil.models.dit_cuda.streamDtFor(be, &model, testAct()));
     defer ws.deinit(be);
     if (use_loop) be.attn_batched = false;
     const out_cuda = try arena.alloc(f32, x.len);
@@ -8323,6 +8925,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 return error.InvalidArgs;
             };
             if (std.mem.eql(u8, flag, "--te-act")) opts.te_act = a else if (std.mem.eql(u8, flag, "--vae-act")) opts.vae_act = a else opts.dit_act = a;
+        } else if (std.mem.eql(u8, flag, "--dit-fp8-gemm")) {
+            opts.dit_fp8_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp8Gemm, val) orelse {
+                try stdout.print("unknown --dit-fp8-gemm '{s}' (expected: weight_only, w8a8)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--inject-nonfinite")) {
             // DIAGNOSTIC: <component>:<dtype>, exercises the precision fallback.
             const colon = std.mem.findScalar(u8, val, ':') orelse return error.InvalidArgs;
@@ -11169,7 +11776,7 @@ fn linTestScore(stdout: *Io.Writer, name: []const u8, label: []const u8, r: Tens
     const cpu_rel = @sqrt(c_num / c_den);
     const cpu_tol: f64 = switch (r.prep()) {
         .i4 => 0.3,
-        .i8, .mmq, .q8, .svdq => 0.05,
+        .i8, .mmq, .q8, .svdq, .f8 => 0.05,
         .none => 0.02,
     };
     const ok = bias_rel <= 1e-4 + store_tol and cpu_rel <= cpu_tol + store_tol;
@@ -11691,7 +12298,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
 
     // Each weight under every plan that changes its route. The LLM plan's route also
     // moves with the row count: a GEMV at one row, a grouped one for a few, a GEMM beyond.
-    const Arm = struct { label: []const u8, pol: lin_cuda.BlockQGemm = .auto, int8: lin_cuda.IntGemm = .w8a8, dense: lin_cuda.DenseCompute = .native, act16: @TypeOf(@as(lin_cuda.Plan, undefined).act16) = .f16, llm_m: usize = 0, input: cuda.backend.Dt = .f32, store: cuda.backend.Dt = .f32 };
+    const Arm = struct { label: []const u8, pol: lin_cuda.BlockQGemm = .auto, int8: lin_cuda.IntGemm = .w8a8, dense: lin_cuda.DenseCompute = .native, act16: @TypeOf(@as(lin_cuda.Plan, undefined).act16) = .f16, llm_m: usize = 0, input: cuda.backend.Dt = .f32, store: cuda.backend.Dt = .f32, fp8: lin_cuda.dual_lin.Fp8Gemm = .weight_only };
     const arms = [_]Arm{
         .{ .label = "llm m=1", .llm_m = 1 },
         .{ .label = "llm m=3", .llm_m = 3 },
@@ -11719,6 +12326,10 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
         .{ .label = "y f16", .store = .f16 },
         .{ .label = "y bf16", .store = .bf16 },
         .{ .label = "llm m=1 x f16", .llm_m = 1, .input = .f16 },
+        // fp8 tensor cores where the device has them (the weight-only route elsewhere).
+        .{ .label = "fp8 w8a8", .fp8 = .w8a8 },
+        .{ .label = "fp8 w8a8 y f16", .fp8 = .w8a8, .store = .f16 },
+        .{ .label = "fp8 w8a8 bf16", .fp8 = .w8a8, .input = .bf16, .store = .bf16 },
     };
 
     var xd = try be.tensorCreate(mpad * cols * 4);
@@ -11762,10 +12373,11 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             var p = lin_cuda.plan(&.{c.w}, use, "lin-cuda-test") catch continue;
             if (arm.llm_m == 0) {
                 p = lin_cuda.withInt8(p, be, arm.int8);
+                p.fp8 = arm.fp8;
                 p.dense = arm.dense;
                 p.act16 = arm.act16;
             }
-            const r = lin_cuda.routeAt(p, c.w, mm) orelse continue;
+            const r = lin_cuda.routeOn(be, p, c.w, mm) orelse continue;
             // One row per distinct route, shape and arm of the f16 dense dispatch.
             const key = @as(u64, @backingInt(arm.input)) << 42 | @as(u64, @backingInt(arm.store)) << 40 | @as(u64, @backingInt(r)) << 16 | @as(u64, @intFromBool(n != rows)) << 15 | @as(u64, @intFromBool(c.w.convrot != 0)) << 14 | @as(u64, @backingInt(c.w.dtype)) << 2 | @as(u64, @intFromBool(arm.act16 == .bf16)) << 1 | @intFromBool(arm.dense == .f16) | @as(u64, wi) << 48;
             if ((try seen.getOrPut(arena, key)).found_existing) continue;
@@ -11774,15 +12386,66 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             try lin_cuda.presizeRows(be, p, &.{c.w}, mm);
             const xin = if (arm.input == .f32) xd else xd16[@intFromBool(arm.input == .bf16)];
             const yout = if (arm.store == .f32) yd else yd16.as(arm.store);
+            var past_m: usize = 0;
             for ([2]?[]const f32{ null, bias }, [2][]f32{ y0, y1 }) |b, dst| {
+                if (arm.store != .f32) {
+                    @memset(y16, 0xab);
+                    try be.tensorUpload(yd16, y16);
+                }
                 const g = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
                 try lin_cuda.gemm(be, p, g, yout, c.w, b);
                 if (arm.store == .f32) {
                     try be.tensorDownload(yd, std.mem.sliceAsBytes(dst));
                 } else {
                     try be.tensorDownload(yd16, y16);
+                    for (y16[mm * n * 2 ..]) |byte| past_m += @intFromBool(byte != 0xab);
                     if (arm.store == .f16) dtype.f16ToF32Row(y16, dst, 1.0) else dtype.bf16ToF32Row(y16, dst, 1.0);
                 }
+            }
+            if (past_m != 0) {
+                try stdout.print("{s:<14} {s:<17} {t:<12} wrote {d} bytes past row {d}  FAIL\n", .{ c.name, arm.label, r, past_m, mm });
+                failures += 1;
+            }
+            // The hand GEMM's fused store against its f32 plane and compact pass.
+            {
+                const ybytes = mm * n * arm.store.bytes();
+                var raw: [2][]u8 = undefined;
+                for (&raw, [2]bool{ false, true }) |*dst, split| {
+                    cuda.backend.split_hgemm_epilogue = split;
+                    defer cuda.backend.split_hgemm_epilogue = false;
+                    const g = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
+                    try lin_cuda.gemm(be, p, g, yout, c.w, bias);
+                    dst.* = try arena.alloc(u8, ybytes);
+                    try be.tensorDownload(yout, dst.*);
+                }
+                if (!std.mem.eql(u8, raw[0], raw[1])) {
+                    try stdout.print("{s:<14} {s:<17} {t:<12} fused hgemm store differs from the split one  FAIL\n", .{ c.name, arm.label, r });
+                    failures += 1;
+                }
+            }
+            // An int8 GEMM's 16-bit store is its f32 store rounded once, so the two agree
+            // bit for bit; so is the hand fp8 GEMM's where both run one operand width
+            // (`gemm_fp8` follows the destination). cuBLASLt's 16-bit D kernels are its own.
+            const fp8_hand = !libs and ((r == .gemm_fp8 and arm.store == .f16) or r == .gemm_fp8_bf16);
+            if (arm.input == .f32 and arm.store != .f32 and lin_cuda.routeTakes16(r) and (r.prep() == .i8 or r.prep() == .f8 or fp8_hand)) {
+                const g = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
+                try lin_cuda.gemm(be, p, g, yd, c.w, null);
+                try be.tensorDownload(yd, std.mem.sliceAsBytes(y1));
+                const rounded = try arena.alloc(u8, mm * n * 2);
+                if (arm.store == .f16) dtype.f32ToF16Row(y1[0 .. mm * n], rounded) else dtype.f32ToBf16Row(y1[0 .. mm * n], rounded);
+                const g2 = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
+                try lin_cuda.gemm(be, p, g2, yout, c.w, null);
+                try be.tensorDownload(yd16, y16);
+                var differ: usize = 0;
+                for (std.mem.bytesAsSlice(u16, rounded), std.mem.bytesAsSlice(u16, y16[0 .. mm * n * 2])) |a, bb| differ += @intFromBool(a != bb);
+                const ok = differ == 0;
+                if (!ok) failures += 1;
+                try stdout.print("{s:<14} {s:<17} {t:<12} 16-bit store vs f32 store rounded: {d} of {d} differ  {s}\n", .{ c.name, arm.label, r, differ, mm * n, if (ok) "ok" else "FAIL" });
+                // y1 holds the bias arm's output for the score below.
+                const gb = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
+                try lin_cuda.gemm(be, p, gb, yout, c.w, bias);
+                try be.tensorDownload(yd16, y16);
+                if (arm.store == .f16) dtype.f16ToF32Row(y16, y1, 1.0) else dtype.bf16ToF32Row(y16, y1, 1.0);
             }
             const tolOf = struct {
                 fn f(dt: cuda.backend.Dt) f64 {
@@ -11842,8 +12505,17 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
                 repacked.w = .{ .krsc = try torch.materialize(arena) };
                 try ops.conv.conv2d(io, gpa, cwant, xin, ch, ch, torch);
                 for ([2]Conv2d{ torch, repacked }, [2][]const u8{ "torch", "krsc" }) |cv, order| {
+                    cuda.backend.split_hgemm_epilogue = true;
+                    try conv_cuda.conv2d(be, &patch, &cy, &cx, ch, ch, cv, .stride1, null, 1.0);
+                    cuda.backend.split_hgemm_epilogue = false;
+                    const split = try arena.dupe(f32, cgot);
+                    try be.tensorDownload(cy, std.mem.sliceAsBytes(split));
                     try conv_cuda.conv2d(be, &patch, &cy, &cx, ch, ch, cv, .stride1, null, 1.0);
                     try be.tensorDownload(cy, std.mem.sliceAsBytes(cgot));
+                    if (!std.mem.eql(f32, split, cgot)) {
+                        failures += 1;
+                        try stdout.print("conv {d}x{d} {s:<5} {s:<5}  fused hgemm store differs from the split one  FAIL\n", .{ k, k, fm.name, order });
+                    }
                     const rel = relL2f(cwant, cgot);
                     const ok = rel <= 2e-3;
                     if (!ok) failures += 1;
@@ -11855,6 +12527,8 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
 
     // The conv gathered straight into the GEMM operand against the f32 patch: both
     // hand the GEMM the same 16-bit values, so any differing byte is a gather defect.
+    // On the vendor arm a stride-1 conv takes cuDNN on both paths, so it is also held
+    // against the CPU conv.
     {
         const dual_table = TensorPencil.gpu.dual_table;
         const Conv2d = ops.conv.Conv2d;
@@ -11866,6 +12540,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
         defer be.tensorDestroy(&patch);
         var cases: usize = 0;
         var differ: usize = 0;
+        var off_cpu: usize = 0;
         for ([_]usize{ 32, 12 }) |ci| {
             const wt = try arena.alloc(f32, co * ci * 9);
             for (wt) |*v| v.* = rnd.floatNorm(f32) * 0.1;
@@ -11877,6 +12552,9 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             defer be.tensorDestroy(&x32);
             try be.tensorUpload(x32, std.mem.sliceAsBytes(xin));
             const cv: Conv2d = .{ .w = .{ .krsc = wt }, .b = cb, .co = co, .ci = ci, .k = 3, .pad = 1 };
+            const cpu = try arena.alloc(f32, h * w * co);
+            try ops.conv.conv2d(io, gpa, cpu, xin, h, w, cv);
+            const got = try arena.alloc(f32, h * w * co);
             for ([_]cuda.backend.Dt{ .f32, .f16, .bf16 }) |sdt| {
                 var src = x32;
                 var x16: cuda.backend.DeviceBuffer = .{};
@@ -11921,11 +12599,25 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
                         differ += 1;
                         try stdout.print("conv gather ci {d} src {t} dst {t} div {d} {t}: DIFFERS from the f32 patch\n", .{ ci, sdt, ddt, div, mode });
                     }
+                    if (mode == .stride1) {
+                        switch (ddt) {
+                            .f32 => @memcpy(got, std.mem.bytesAsSlice(f32, outs[0])),
+                            .f16 => dtype.f16ToF32Row(outs[0], got, 1.0),
+                            .bf16 => dtype.bf16ToF32Row(outs[0], got, 1.0),
+                        }
+                        const rel = relL2f(cpu, got);
+                        const tol: f64 = if (sdt == .bf16 or ddt == .bf16) 2e-2 else 5e-3;
+                        if (!(rel <= tol)) {
+                            off_cpu += 1;
+                            try stdout.print("conv gather ci {d} src {t} dst {t} div {d}: vs cpu {e:.3} > {e:.0}  FAIL\n", .{ ci, sdt, ddt, div, rel, tol });
+                        }
+                    }
                 };
             }
         }
-        failures += differ;
+        failures += differ + off_cpu;
         try stdout.print("conv gather vs f32 patch: {d} of {d} cases bit-identical  {s}\n", .{ cases - differ, cases, if (differ == 0) "ok" else "FAIL" });
+        try stdout.print("conv stride 1 vs cpu: {d} off  {s}\n", .{ off_cpu, if (off_cpu == 0) "ok" else "FAIL" });
     }
 
     try stdout.print("{s}\n", .{if (failures == 0) "OK" else "FAILED"});

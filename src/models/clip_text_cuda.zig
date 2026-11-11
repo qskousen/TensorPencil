@@ -29,7 +29,7 @@ const clen = clip_tok.context_length;
 /// The tower's plan: the encoders' block-quant and integer routes, dense weights on
 /// the f16 tensor cores, and its LoRA stack, applied inside `lin_cuda.run`.
 pub fn planFor(be: *const Backend, enc: *const clip_text.TextEncoder) !lin_cuda.Plan {
-    var p = lin_cuda.withInt8(try lin_cuda.plan(enc.device_lins, .{ .blockq = lin_cuda.encoder_gemm }, "clip_text cuda"), be, lin_cuda.dual_lin.encoderInt8());
+    var p = lin_cuda.withInt8(try lin_cuda.plan(enc.device_lins, lin_cuda.Use.encoder(lin_cuda.encoder_gemm), "clip_text cuda"), be, lin_cuda.dual_lin.encoderInt8());
     p.dense = .f16;
     p.lora = enc.lora;
     return p;

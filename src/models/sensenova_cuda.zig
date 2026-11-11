@@ -58,7 +58,7 @@ pub var force_weight_only: bool = false;
 pub fn supported(model: *const Model) bool {
     if (model.layers.len == 0) return false;
     _ = lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "sensenova cuda") catch return false;
-    _ = lin_cuda.plan(model.prefix_lins, .{ .blockq = lin_cuda.encoder_gemm }, "sensenova cuda prefix") catch return false;
+    _ = lin_cuda.plan(model.prefix_lins, lin_cuda.Use.encoder(lin_cuda.encoder_gemm), "sensenova cuda prefix") catch return false;
     // A sidecar this backend cannot apply makes the whole trunk unsupported, not
     // "supported without the LoRA": running the base GEMMs alone is a different
     // model, silently.
@@ -193,7 +193,7 @@ pub fn prefixForward(
     // The prompt pass is the conditioning, so it takes the text encoders' policy for
     // both packed kinds: at full depth a q4_k prefix on the int8 decode (which
     // quantizes the activation) is 35% off the exact KV, on f16 0.19%.
-    var plan = lin_cuda.withInt8(try lin_cuda.plan(model.prefix_lins, .{ .blockq = lin_cuda.encoder_gemm }, "sensenova cuda prefix"), be, lin_cuda.dual_lin.encoderInt8());
+    var plan = lin_cuda.withInt8(try lin_cuda.plan(model.prefix_lins, lin_cuda.Use.encoder(lin_cuda.encoder_gemm), "sensenova cuda prefix"), be, lin_cuda.dual_lin.encoderInt8());
     try lin_cuda.presize(be, plan, model.prefix_lins);
     try lin_cuda.presizeRows(be, plan, model.prefix_lins, seq);
     if (model.lora) |stack| {

@@ -1,0 +1,142 @@
+{
+ "null_caption": "<|im_start|>user\n{\"short_description\":\"\",\"objects\":[],\"background_setting\":\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_characteristics\":{},\"style_medium\":\"\",\"context\":\"\",\"artistic_style\":\"\"}<|im_end|>\n<|im_start|>assistant\n",
+ "template": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+ "cases": [
+  {
+   "prompt": "a red fox in the snow",
+   "base": "<|im_start|>user\na red fox in the snow<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\na red fox in the snow<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "",
+   "base": "<|im_start|>user\n{\"short_description\":\"\",\"objects\":[],\"background_setting\":\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_characteristics\":{},\"style_medium\":\"\",\"context\":\"\",\"artistic_style\":\"\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"\",\"objects\":[],\"background_setting\":\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_characteristics\":{},\"style_medium\":\"\",\"context\":\"\",\"artistic_style\":\"\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "   \n\t ",
+   "base": "<|im_start|>user\n{\"short_description\":\"\",\"objects\":[],\"background_setting\":\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_characteristics\":{},\"style_medium\":\"\",\"context\":\"\",\"artistic_style\":\"\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"\",\"objects\":[],\"background_setting\":\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_characteristics\":{},\"style_medium\":\"\",\"context\":\"\",\"artistic_style\":\"\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "<|im_start|>user\nraw turn<|im_end|>\n",
+   "base": "<|im_start|>user\nraw turn<|im_end|>\n",
+   "text_images": "<|im_start|>user\nraw turn<|im_end|>\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\":\"a fox\",\"objects\":[],\"aesthetic_score\":7.5}",
+   "base": "<|im_start|>user\n{\"short_description\":\"a fox\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"a fox\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\": \"a fox\", \"lighting\": {\"conditions\": \"dusk\", \"preference_score\": 0.9, \"shadows\": \"\"}, \"context\": null}",
+   "base": "<|im_start|>user\n{\"short_description\":\"a fox\",\"lighting\":{\"conditions\":\"dusk\"}}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"a fox\",\"lighting\":{\"conditions\":\"dusk\"}}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"objects\": [{\"description\": \"cup\", \"notes\": [], \"size\": {}}, {}], \"style_medium\": \"photo\"}",
+   "base": "<|im_start|>user\n{\"objects\":[{\"description\":\"cup\"}],\"style_medium\":\"photo\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"objects\":[{\"description\":\"cup\"}],\"style_medium\":\"photo\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\": \"\", \"text_render\": []}",
+   "base": "<|im_start|>user\n{\"short_description\":\"\",\"text_render\":[]}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"\",\"text_render\":[]}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\": \"sign\", \"text_render\": [{\"text\": \"OPEN\"}, {\"text\": \"\"}, \"x\"]}",
+   "base": "<|im_start|>user\n{\"short_description\":\"sign\",\"text_render\":[{\"text\":\"OPEN\",\"image_tokens\":\"\"},\"x\"]}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"sign\",\"text_render\":[{\"text\":\"OPEN\",\"image_tokens\":\"<|vision_start|><|image_pad|><|vision_end|>\"},\"x\"]}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": [
+    "OPEN"
+   ]
+  },
+  {
+   "prompt": "{\"short_description\": \"sign\", \"objects\": [], \"text_render\": [{\"text\": \"OPEN 24h\", \"font\": \"serif\", \"image_tokens\": \"old\"}, {\"text\": 5}]}",
+   "base": "<|im_start|>user\n{\"short_description\":\"sign\",\"text_render\":[{\"text\":\"OPEN 24h\",\"font\":\"serif\",\"image_tokens\":\"\"},{\"text\":5}]}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"sign\",\"text_render\":[{\"text\":\"OPEN 24h\",\"font\":\"serif\",\"image_tokens\":\"<|vision_start|><|image_pad|><|vision_end|>\"},{\"text\":5}]}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": [
+    "OPEN 24h"
+   ]
+  },
+  {
+   "prompt": "{\"structured_caption\": {\"short_description\": \"a cat\", \"aesthetic_score\": 3}, \"edit_instruction\": \"make it blue\"}",
+   "base": "<|im_start|>user\n{\"short_description\":\"a cat\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"a cat\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"structured_caption\": \"just text\", \"edit_instruction\": \"x\"}",
+   "base": "<|im_start|>user\n{\"structured_caption\": \"just text\", \"edit_instruction\": \"x\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"structured_caption\": \"just text\", \"edit_instruction\": \"x\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"edit_instruction\": \"only an instruction\"}",
+   "base": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"aesthetic_score\": 1, \"preference_score\": 2}",
+   "base": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "[1, 2, 3]",
+   "base": "<|im_start|>user\n[1, 2, 3]<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n[1, 2, 3]<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "\"a json string\"",
+   "base": "<|im_start|>user\n\"a json string\"<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n\"a json string\"<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\": \"café 東京 🦊\", \"q\": \"say \\\"hi\\\"\\n\\ttab\\\\ \\u0001\"}",
+   "base": "<|im_start|>user\n{\"short_description\":\"café 東京 🦊\",\"q\":\"say \\\"hi\\\"\\n\\ttab\\\\ \\u0001\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"café 東京 🦊\",\"q\":\"say \\\"hi\\\"\\n\\ttab\\\\ \\u0001\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"n\": 1.0, \"m\": 0.5, \"e\": 1e-5, \"big\": 1e16, \"neg\": -2.50, \"i\": 42, \"z\": 0, \"f\": false, \"t\": true}",
+   "base": "<|im_start|>user\n{\"n\":1.0,\"m\":0.5,\"e\":1e-05,\"big\":1e+16,\"neg\":-2.5,\"i\":42,\"z\":0,\"f\":false,\"t\":true}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"n\":1.0,\"m\":0.5,\"e\":1e-05,\"big\":1e+16,\"neg\":-2.5,\"i\":42,\"z\":0,\"f\":false,\"t\":true}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"a\": 1, \"a\": 2, \"b\": {\"x\": 1, \"x\": {}}}",
+   "base": "<|im_start|>user\n{\"a\":2}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"a\":2}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{not json",
+   "base": "<|im_start|>user\n{not json<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{not json<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "  {\"short_description\": \"padded\"}  ",
+   "base": "<|im_start|>user\n{\"short_description\":\"padded\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"padded\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  },
+  {
+   "prompt": "{\"short_description\": \"fox\", \"text_render\": \"OPEN\"}",
+   "base": "<|im_start|>user\n{\"short_description\":\"fox\",\"text_render\":\"OPEN\"}<|im_end|>\n<|im_start|>assistant\n",
+   "text_images": "<|im_start|>user\n{\"short_description\":\"fox\",\"text_render\":\"OPEN\"}<|im_end|>\n<|im_start|>assistant\n",
+   "draws": []
+  }
+ ]
+}

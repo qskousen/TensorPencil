@@ -31,11 +31,11 @@ services:
       # device and --backend vulkan sees an empty machine.
       - /etc/vulkan/icd.d:/etc/vulkan/icd.d:ro
       - /etc/vulkan/implicit_layer.d:/etc/vulkan/implicit_layer.d:ro
-      # Checkpoints. A named volume, not a bind under /opt: root is a 100 GB LV
-      # and single checkpoints run past 20 GB, while the volume root is the
-      # 900 GB disk. Writable: a client pushes models to a remote host's
-      # incoming folder, and gated tests self-skip when a file is absent.
-      - tensorpencil-models:/models
+      # Checkpoints: the named volume, or a host path in MODELS where the root
+      # filesystem has room for them. Writable: a client pushes models to a
+      # remote host's incoming folder, and gated tests self-skip when a file is
+      # absent.
+      - ${MODELS:-tensorpencil-models}:/models
       # tp-serve mints its certificate and token into a state dir; losing it
       # invalidates every pairing string already handed out.
       - ${STATE:-/opt/tensorpencil/state}:/state

@@ -18,6 +18,22 @@
     GEMV bit for bit under 0.17) costs ~2.3% on that path (`vk-gemv-bench` f32 column).
   - `forEntry` cuts are built from a whole-module copy per kernel at load (5.9 MB
     mmaps, extra kernel time at setup); cutting from one shared parse would save it.
+- zig-cuda's fused attention (`kernels.buildFlashAttn`, `cuda-flash-attn-test [--bench]`),
+  what is left. Each item is unmeasured:
+  - Head widths past 128 still take the three-pass pipeline (SD1.5's 160, padded to 256)
+    or the f32-band `opAttnTCFlash` (every VAE mid-block's single 512-wide head). A
+    variant that splits the head across warps, or keeps O in shared, would cover them.
+  - Krea2's f16 MLP chain under an f32 stream (`mlpPlan`, `chain16`) is still
+    `.libs`-only, though the int8 GEMMs now write f16 on both arms.
+  - zig-cuda fp8 decodes each weight to 16-bit per GEMM (Krea2 1024²: `dequant` 110 ms of
+    a 2.5 s forward, 4.6%) and then runs the f16 GEMM at twice int8's matmul time. Keeping
+    the decoded copy for pinned weights would trade 2x their VRAM for the 110 ms; unmeasured.
+  - The diffusion pin reserve (`attn_scratch_budget` + margin, `[diff-vram] reserve=`)
+    was sized for the three-pass scores plane, which `flash_attn` never allocates; the
+    VAE's 512-wide head still uses that scratch. Sizing it from the path that runs would
+    pin ~2 GB more weights on a card that cannot hold the whole model.
+  - LLM prefill on zig-cuda keeps its own causal attention; `opAttnTCCausal` is the
+    fused kernel's causal entry.
 - weight dispatch (`dual_lin`, `lin_cuda` / `lin_gpu`, `conv_cuda` / `conv_gpu`), what is left:
   - the SD LoRA sidecar costs +12-16% per step on SDXL; ~9.5 ms/step of B side on SD1.5
     768² is not yet attributed between its GEMM, the `lo` bf16 pass and launch count.
@@ -118,12 +134,25 @@
   splitting a wide row across subgroups needs a cross-subgroup reduce. MEASURED, so
   don't retry it as-is at one row: a subgroup-per-row `normWide` is 32 lanes on one
   multiprocessor and costs 6% of decode (30.9 -> 29.0 tok/s, 8B q8_0)
-- cuda: the PTX targets ONE compute capability (`-Dcuda-sm` / `-Dptx-isa`, default 86,
-  applied to every PTX module at once). Forward JIT onto sm_89/90/120 should work and is
-  UNVERIFIED; anything below sm_80 cannot run the hand kernels at all (cp.async,
-  mma.m16n8k32), and a kernel needing an instruction an older target lacks would still
-  have to be written by hand. A startup check against `cc_major` that says so, rather
-  than a JIT log, is the missing piece
+- cuda: a module's PTX target is the baseline (`-Dcuda-sm` / `-Dptx-isa`, default 86 / 8.0)
+  raised by what its instructions need (`ptx.Builder.requires`), and the backend builds
+  one only where `lin_cuda.Caps.of` says the device runs it (fp8 MMA: sm_89+). Anything
+  below sm_80 still cannot run the hand kernels at all (cp.async, mma.m16n8k32); a startup
+  check against `cc_major` that says so, rather than a JIT log, is missing
+- fp8 W8A8 for text encoders, to make it their default too: `Use.encoder` pins fp8 to
+  weight-only because W8A8 is unmeasured on a conditioning pass. Measure on an sm_89+ card
+  (gen) with an fp8 encoder (Krea2's Qwen3-VL 4B fp8, CLIP, the SenseNova prefix): the
+  conditioning against the bf16 encoder's (`cond-diff`) under each mode, against the
+  perturb floor, then a render A/B. Watch for the outlier channels that made int8 W8A8 lose
+  conditioning (SenseNova, H3's 32B encoder); e4m3's range may hold them where per-token
+  int8 could not. If it holds, a `--te-fp8-gemm` dial beside `--te-int-gemm`
+- fp8 W8A8 is the denoiser default on sm_89+ (`--dit-fp8-gemm weight_only` opts out); text
+  encoders and LLMs keep fp8 weight-only, unmeasured there. Measured on a PRO 6000, Krea2 Turbo 1024²: zig-cuda 816 -> 352 ms a forward, the cuDNN arm 585 -> 357;
+  velocity vs the bf16 source 0.118 weight-only, 0.108 W8A8 (noise floor 5.7e-2 against
+  weight-only's 1.5e-3); render vs bf16 30.8 dB weight-only, 29.5 dB W8A8. The int8 convrot
+  file of the same model measures 0.027 and 34.4 dB at the same speed. Next on Blackwell:
+  NVFP4 native (block-scaled `mma` on sm_120a, or cuBLAS on the cuDNN arm), and W4A8 with
+  fp4 weights against fp8 activations
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
   "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL
@@ -270,12 +299,6 @@
 - lora: `textxl` (SDXL, old diffusers `processor.to_k_lora` spelling) loads its UNet
   half; whether its `text_encoder.*.lora_linear_layer` keys reach CLIP is unchecked
   (its conditioning moved by nothing measurable)
-- zig-cuda: the hand-PTX int8 GEMM (`opI8GemmDevWs`, `fusedFn`) stores only f32, and
-  `lin_cuda.typedOn` widens a 16-bit activation before its prep even though `opI8PrepR`
-  reads either width. So a 16-bit stream costs an int8 linear a widen and a cast: krea2
-  int8 at f16 storage measured 2-4% slower than f32 on zig-cuda, which is why its stream
-  stays f32 there. A 16-bit epilogue store plus a typed prep read would make it pay, on
-  every int8 family (the SD UNet's int8 checkpoints too)
 - sensenova: the 64x64 canvas in the device tests carries ~25x the 96x40 case's
   device-vs-CPU error at the same depth, on BOTH arms and with the same reference
   magnitude, so it is neither a backend nor a small denominator (the printed control row
@@ -397,6 +420,31 @@
   5. `effectiveAct(.encoder)` still answers f32 for MOSS: the Qwen3.5 encode runs on the
      device (`runQwen35`) at whatever `CudaLM`/`VulkanLM` store, which was never read off.
      The PNG's activation field says f32 regardless.
+- Fibo 2.0, what support left open:
+  1. Text-render captions. A `text_render` entry with text is drawn (Pillow's built-in
+     Aileron at 20 px, black on white) and shown to Qwen3-VL through its vision tower,
+     and that conditioning replaces the base caption below sigma 0.9. Today every step
+     takes the base caption, with a warning. Needs the drawing, the 4B tower
+     (`minimax_h3_vit` runs Mage-Flow's), and a per-step conditioning switch.
+  2. Editing and Edit Turbo: reference latents (Flux 2 VAE ENCODE, which only Mage-VAE
+     has here) on rope planes after the image's, t = 0 modulation of their rows in the
+     refiner too, and the vision tower for the instruction. The turbo LoRA in
+     Comfy-Org's repack is untested.
+  3. Speed, one forward at 1024² (cfg runs two; ComfyUI ~1.26 s each): 1.40 s on `cuda`
+     (GEMMs ~67 TFLOPS, at the 3090's dense peak; cuDNN attention 223 ms), 1.71 s on
+     `zig-cuda`, the default: matmul 1222 ms, attention 200, elementwise 111. Of the
+     matmul, `hgemm` itself is ~950 ms (cuBLASLt's whole matmul is 940) and ~110 ms is
+     `pad_bf16` + `bias_compact` staging around every GEMM: the engine-wide lever is a
+     GEMM that reads the 16-bit stream and writes it back directly. The host final layer
+     is 23 ms and the finite check plus download 28 ms per forward.
+  4. Sharded diffusers folders (`transformer/*-0000N-of-0000M.safetensors`) do not load;
+     a single file (Comfy-Org's repack, a ggufy GGUF) does.
+- Fibo 1.5, what support left open:
+  1. Fibo Edit 1.5 (`briaai/Fibo-Edit-1.5-*`) is not supported.
+  2. Sharded diffusers folders, as for 2.0; the CLI wants the merged single files.
+  3. LoRA on either Fibo untested against a real LoRA file.
+  4. Stream width: f32 by default; bf16 renders but was not judged against the
+     perturbation floor (`diffusion-profile --ab`), and f16 was not tried.
 - Qwen-Image 2.1, what support left open:
   1. Reference editing. The CPU DiT takes `Ref`s spliced at a slot (the toy fixture pins
      it); missing are the 2.2-layout VAE ENCODER (alpha padded at 1.0 as ComfyUI does),

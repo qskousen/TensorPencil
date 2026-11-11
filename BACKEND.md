@@ -93,7 +93,10 @@ Single-stream DiT over a Qwen3-VL-4B conditioning, Wan 2.1 VAE.
 - **DiT activation default is f16** (`Session.defaultAct`), not ComfyUI's bf16.
 - The stream follows the dial on cuda and Vulkan (`dit_cuda.streamDtFor`, `dit_gpu.streamDtFor`):
   residual, norm outputs and `wo` / `down` outputs at f16 or bf16; the attention block runs f16
-  under either 16-bit stream. **zig-cuda keeps the stream f32.**
+  under either 16-bit stream. **On zig-cuda the stream is 16-bit only where every trunk linear
+  reads and writes it** (`lin_cuda.takes16`): int8, W4A8 and block-quant int8 (the hand-PTX
+  `igemm_pipe_fused` stores f16/bf16), fp8 and the dense 16-bit routes (`opGemm16`, whose hand
+  arm stores through `hgemm_epi`). NVFP4, SVDQuant and the weight-only routes cast.
 - Vulkan's fp8 cooperative GEMM accumulates in f16 (`coopmat.coop_acc_h16`). A staged fp8 group
   stores f16 output from f16 accumulators only when the caller asks (`lin_gpu.Out.acc16`), which
   krea2 does under the f32 stream only.
@@ -133,11 +136,11 @@ asks. Kernels compute in f32 and per-channel parameters stay f32; only the big b
 | backend | how it attends |
 |---|---|
 | **cuda** | cuDNN fused SDPA at the true width, self and cross (`opAttnCross` → rectangular SDPA) |
-| **zig-cuda** | zero-padded to a multiple of 128 (`opAttnTCRect` for cross) |
+| **zig-cuda** | 64 at its own width through the fused `flash_attn`; 40/80 zero-padded to 128 (also `flash_attn`), 160 to 256 (the three-pass pipeline). `Backend.attnWidth` decides |
 | **vulkan** | zero-padded to 128; hd 160 uses the scalar kernel |
 
-The padding is exact. The 128 limit is the P@V GEMM's head tile (`coopmat.buildGemmAttnOut`,
-`launchHgemmB`).
+The padding is exact. The 128 multiple is the three-pass P@V GEMM's head tile
+(`coopmat.buildGemmAttnOut`, `launchHgemmB`); `flash_attn` takes 64 and 128.
 
 - **CLIP batches over prompt chunks** on the device; the empty-prompt `z_empty` rides as one more
   item, cached per tower.
@@ -228,7 +231,7 @@ Cosmos-Predict2 trunk conditioned through a T5-indexed LLM adapter over Qwen3-0.
 |---|---|---|
 | `ln_mod` | `kernels/dual/rows.zig` | fused weightless LayerNorm + AdaLN modulation, one subgroup per row on both arms. Two-pass variance, matching `ops.norm.layerNormUnit` |
 | `pmdplane` (push word 7) | `coopmat.buildFlashAttn` | rectangular q × kv flash attention. `s_stride` is K's row stride and the j bound; the MD table is indexed by query row. **0 means "= s_stride"** (square callers) |
-| `opAttnTCRect` | `cuda/backend.zig` | `opAttnTCBatched` with the two sequence lengths separate |
+| `opAttnTCRect` | `cuda/backend.zig` | `flash_attn` at head width 64 or 128, else `opAttnTCBatched` with the two sequence lengths separate |
 
 **Per-weight quantization and the int8 prep** (every family):
 - ⚠️ **Quantization kind is resolved per weight** (`lin_cuda.routeOf`, `lin_cuda.prep` per shared
@@ -268,6 +271,9 @@ VIDEO_PLAN.md is the roadmap; the conventions live in the `minimax_h3*` module h
   the dial's width, deltas and MLP planes f32. An f16 residual is stored divided by 256 with every
   RMSNorm reading it at `eps / 65536`. The clip path takes the dials (`ClipOptions`,
   `generate-clip --dit-act`) and reruns one dtype wider on a non-finite step.
+- Trunk K/V are stored bf16 and read in place wherever the attention takes 16-bit operands
+  (`Backend.attnReads16`: cuDNN, and `flash_attn` on zig-cuda), 2 bytes per element against an
+  f32 copy plus its f16 staging. Q and the output narrow per band.
 - **Video VAE default is f16**; QKV through the attention output stay f32. A non-finite window
   reruns only the video decode wider (`Session.decodeClip`).
 - ⚠️ **The audio VAE runs f32 GEMMs, never tensor cores** (`opMatmulF32Lt`, `COMPUTE_32F`, not
@@ -442,6 +448,64 @@ Gates: `qwen-image21-cuda-test` / `qwen-image21-vk-test` (`--layers`, `--lat`, `
 `--sigma`, a checkpoint path; two sigmas on one session, so the second reads the cached
 prefix), `wan-vae-test <qwen vae>`.
 
+
+### 2N. Fibo 2.0 (single-stream DiT with a Perceiver and cross-attention, Qwen3-VL-4B, Flux 2's latent)
+
+44 Z-Image-style blocks plus 2 refiner blocks at 3584, patch 1 on Flux 2's 128-channel
+latent (either codec). The text never enters the sequence: a Perceiver squeezes bundle 0
+into 256-512 gist tokens that lead it, and five blocks cross-attend to their own bundle.
+The device arms run the Perceiver and the injection blocks' K/V once per conditioning
+(f32) and keep them; gist rows are modulated at t = 0. Silent conventions: `fibo2.zig`'s
+and `fibo2_text.zig`'s headers. ComfyUI is the reference (`tools/render_fibo2_ref.py`).
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Prompt** (JSON caption rewritten as training saw it) | ✅ | host | host | host | `fibo2_text.prepare` |
+| **Text encoder** (Qwen3-VL-4B, 15 taps, unit RMS, bf16) | ✅ | ✅ | ✅ | ✅ | `qwen3.Variant.fibo2`, `fibo2_text.bundles` |
+| **Perceiver + cross K/V** (once per conditioning) | ✅ | ✅ | ✅ | ✅ | `fibo2_dev.prefix` |
+| **DiT** (44 + 2 blocks) | ✅ all dtypes | ✅ every format `lin_gpu` routes, tensor cores required | ✅ | ✅ | `fibo2{,_dev,_gpu,_cuda}.zig`; ComfyUI's fused `qkv` / `to_kv` / `w13` and diffusers' split names both load |
+| **VAE decode** | ✅ | ✅ | ✅ | ✅ | Mage-Flow's, `pipeline.MageFlowVae` |
+| **LoRA sidecar** | ✅ | ✅ | ✅ | ✅ | §2J; diffusers names onto fused tensors (`lora_keys_fused`); no real LoRA run yet |
+
+- ⚠️ Captions with `text_render` text condition on the base caption at every step (a
+  warning says so); ComfyUI switches to drawn text images below sigma 0.9.
+- Render A/B, 1024², 30 steps, cfg 5, seed 42, bf16 file: 36.1 dB against ComfyUI's own
+  render (f32 stream), 36.1 at f16 (the default), 35.9 at bf16. One forward: 1.40 s on
+  `cuda`, 1.71 s on `zig-cuda` (3.51 s/step), against ComfyUI's ~1.26 (TODO.md has the
+  breakdown).
+
+Gates: `fibo2-cuda-test` / `fibo2-vk-test` (`--layers`, `--lat`, `--text` (300 takes the
+gist count past 256), `--sigma`), `te-test --fibo2`, the toy forward fixture, the prompt
+corpus and the gated real-encoder test.
+
+### 2O. Fibo 1.5 (Flux-style MMDiT, SmolLM3-3B, Wan 2.2 TI2V VAE)
+
+8 double-stream and 38 single-stream blocks at 3072, patch 1 on the TI2V VAE's 48
+channels at 16x. Each block overwrites the second half of the text stream's channels with
+its own projection of one SmolLM3 hidden state; the device arms precompute all 46
+projections per conditioning and write them in with a channel concat. ComfyUI has no
+model for it: the reference is diffusers' `BriaFiboPipeline` (`tools/render_fibo_ref.py`),
+including its dynamic-shift schedule (`fibo.flow`). Silent conventions: `fibo.zig`'s and
+`fibo_text.zig`'s headers.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Tokenizer** (Llama 3 BPE, `ignore_merges`, no BOS) | ✅ | host | host | host | `Tokenizer.initLlama3` |
+| **Text encoder** (SmolLM3-3B, every state, no RoPE on every 4th layer) | ✅ | ✅ | ✅ | ✅ | `qwen3.Variant.fibo` (`Config.nope_every`) |
+| **DiT** (8 + 38 blocks) | ✅ all dtypes | ✅ every format `lin_gpu` routes, tensor cores required | ✅ | ✅ | `fibo{,_dev,_gpu,_cuda}.zig` |
+| **VAE decode** (Wan 2.2 TI2V, 3-tap kernels at one frame, patch-2 head) | ✅ | ✅ f32 | ✅ f32 | ✅ f32 | `wan_vae.loadNested`, `Decoder.pixels` |
+| **LoRA sidecar** | ✅ | ✅ | ✅ | ✅ | §2J; no real LoRA run yet |
+
+- Render A/B, 1024², 30 steps, cfg 5, seed 42: 18.9 dB against diffusers' own render,
+  which is this model's precision floor rather than a mismatch: our own f32 and bf16
+  renders are 20.0 dB apart (same composition, detail moves). The reference also embeds
+  a bf16-rounded timestep. 3.33 s/step on CUDA, f32 stream (the default).
+- The TI2V VAE is finite at f16 (`wan-vae-test`), unlike Qwen-Image 2.1's; the
+  pipeline still decodes it at f32.
+
+Gates: `fibo-cuda-test` / `fibo-vk-test` (`--double`, `--single`, `--lat`, `--text`,
+`--sigma`), `te-test --fibo`, `wan-vae-test 12 <Wan2.2_VAE>`, the toy forward fixture, the
+tokenizer corpus, the TI2V decode fixture and the gated real-encoder test.
 ### 2I. DiT block weight-dtype support
 
 The CUDA columns hold for every family: one dispatcher, `lin_cuda`, routes each block
@@ -529,7 +593,7 @@ weight-only f32 exact), `cuda-bqdec-test`, `te-test --gguf-gemm <route>`, `vk-wo
 
 | family | cpu | vulkan | zig-cuda | cuda |
 |---|---|---|---|---|
-| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `moss_image`, `qwen_image21`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
+| `sensenova`, `minimax_h3`, `krea2`, `zimage`, `anima`, `mageflow`, `moss_image`, `qwen_image21`, `fibo2`, `fibo`, `sd15`, `sdxl` | ✅ | ✅ | ✅ | ✅ |
 
 Adapter forms (one reader, `lora_adapter.parse`; the same apply on every backend):
 
@@ -671,7 +735,7 @@ Gates: `zig build test` (SenseNova's layout offsets pinned against
 |---|---|---|---|---|---|
 | **GEMM / linear** | `ops/matmul.zig` | `opMatmul`/`opMatmulCoop*` | hand hgemm/igemm/i4gemm | cuBLASLt | see §7 |
 | **Conv2d** (patch gather + GEMM, fused 2× upsample) | ✅ f32 | ✅ f16-TC (co≥96) / f32 | ✅ | ✅ (cuDNN NHWC conv for stride-1 3×3; gather for stride-2 and upsample) | f32 weights; f16 TC wide-co; f16 or bf16 activation storage either side |
-| **Attention** (DiT GQA 48/12, hd128) | f32 | f16 two-pass TC (+flash), `models/attn_gpu.zig` | `opAttnTC` | f16 TC | f16 scores |
+| **Attention** (DiT GQA 48/12, hd128) | f32 | f16 two-pass TC (+flash), `models/attn_gpu.zig` | `opAttnTC`: fused `flash_attn` (`kernels.buildFlashAttn`) at hd 64/128, f32 scores in registers | cuDNN SDPA | f16/bf16 operands |
 | **VAE mid-block attn** | f32 | f32 scores plane, query-banded | TC flash, f32 scores band | cuDNN SDPA | see below |
 | RMSNorm + AdaLN modulate | ✅ | `rms_apply_mod`/`modulate` or `rms_mod` (dual) | `rms_mod` (dual) | ↤ | f32 (+h16) |
 | Weighted RMSNorm (Q/K, sandwich) | ✅ | `rmsnorm` (dual, subgroup per row) | `rmsnorm` (dual); hand `qk_rmsnorm_par` for <64 rows at ≥1024 wide | ↤ | f32/f16 |
@@ -1071,8 +1135,8 @@ path; GGUF `q*` are the **LLM** path.
 | **f32** | ✅ | ✅ scalar / VAE→f16 coop | ✅ fallback | ⤷ via f16/bf16 | dtype-aware GEMM, f32 accumulate |
 | **f16** | ✅ vectorized Zig | ✅ f16 coopmat | ✅ `buildHgemm` m16n8k16, `gemv_f16` | ✅ cuBLASLt `R_16F` | tensor-core coop / mma |
 | **bf16** | ✅ | ✅ native bf16 coopmat + f16 fallback | ✅ bf16 mma (Ampere+) | ✅ cuBLASLt `R_16BF` | native bf16 where the device has it |
-| **fp8-e4m3** | ✅ (LUT) | ✅ `pipe_f8` → f16 coop | ✅ `gemv_fp8`, `dequant_fp8_f16` | ✅ dequant→f16 | 1-byte weights, dequant in kernel; ComfyUI's scaled fp8 (rank-0 `weight_scale`) multiplied into every GEMM |
-| **int8 (+convrot)** | ✅ | ✅ s8→s32 tensor cores | ✅ m16n8k32 s8 IMMA | ✅ cuBLASLt `R_8I`/`COMPUTE_32I` | W8A8, Hadamard un-rotate at dequant |
+| **fp8-e4m3** | ✅ (LUT) | ✅ `pipe_f8` → f16 coop | ✅ `gemv_fp8`; `dequant_fp8_{f16,bf16}` → `opGemm16`; sm_89+ W8A8 on fp8 tensor cores (`f8prep` + `f8gemm_pipe_fused`; the denoiser default, `--dit-fp8-gemm weight_only` opts out) | ✅ dequant→f16; sm_89+ W8A8 the same hand kernels | 1-byte weights, dequant in kernel; ComfyUI's scaled fp8 (rank-0 `weight_scale`) multiplied into every GEMM |
+| **int8 (+convrot)** | ✅ | ✅ s8→s32 tensor cores | ✅ m16n8k32 s8 IMMA, f32/f16/bf16 out | ✅ cuBLASLt `R_8I`/`COMPUTE_32I` | W8A8, Hadamard un-rotate at dequant. The prep reads, and the rescale epilogue writes, the activation's own width on both CUDA arms, `m` rows only |
 | **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) | ✅ hand-PTX (no cuBLASLt s4) | nibble-packed 2/byte |
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; decodes to int8 per GEMM, then the int8 convrot GEMM (`ops/w4a8.zig`) |
 | **w6a8** (`w6a8_int8`) | ✅ | ✅ `w6a8_decode_t` | ✅ `w6a8_decode` | ✅ ditto | 6-bit uniform `(q − 32)·s_rel`, nibble plane then top-2-bit plane, `I8 [rows, 3·cols/4]`; same routes as w4a8 |
@@ -1094,6 +1158,14 @@ path; GGUF `q*` are the **LLM** path.
 
 - **GGUF block quants on GPU decode inside the GEMV**, never expanded to VRAM. The `cuda` arm
   dequants to f16 for the prefill GEMM. cuBLASLt/cuDNN never read block quants.
+- **CUDA kernels by compute capability**: a hand-PTX module's header is the build baseline
+  raised by its instructions (`ptx.Builder.requires`; fp8 MMA and e4m3 conversion need sm_89 /
+  ISA 8.4), and routing asks the device (`lin_cuda.Caps.of`) before choosing a route whose
+  kernels need more. Everything else stays at the baseline and runs on newer cards by JIT.
+- **fp8 W8A8 quantizes the activation to e4m3 at one scale per row** (absmax / 448, round to
+  nearest even, no rotation). Denoiser trunks only (`dual_lin.trunk_fp8`); `Use.encoder` and
+  `Use.llm` pin fp8 to weight-only. Checked against the CPU fed the same e4m3 activation (`lin-cuda-test`,
+  ~6e-7). Its run-to-run noise is ~3x int8 convrot's: e4m3 keeps 3 mantissa bits everywhere.
 - **convrot** (`src/ops/convrot.zig`): `cols` must be a multiple of 256 (i4 also even).
 - ⚠️ **The packed 4-bit formats share one loader** (`models/quant_weight.zig`) and all store
   `[rows, cols/2]`, the int4-convrot shape, so each is detected by its sidecar (`_scale_2` for
