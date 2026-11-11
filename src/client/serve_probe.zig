@@ -1,5 +1,5 @@
 //! `zig build serve-probe -- --config <file> [--message <text>] [--image <prompt>]
-//! [--then-image <prompt>] [--again] [--linger <s>]
+//! [--then-image <prompt>] [--again] [--linger <s>] [--complete-at-step <n>]
 //! [--complete <idea> [--think] [--cancel]] [--kill-mid-turn [<deltas>]] [--timeout <s>]
 //! [--socket <path>]`: what
 //! `driver-probe` does, through a tp-serve process over the socket. Without
@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var image: ?[]const u8 = null;
     var then_image: ?[]const u8 = null;
     var again = false;
+    var complete_at_step: u32 = 0;
     var linger_s: u32 = 0;
     var socket: ?[]const u8 = null;
     var kill_after: ?u32 = null;
@@ -59,6 +60,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--image") and i + 1 < args.len) {
             i += 1;
             image = args[i];
+        } else if (std.mem.eql(u8, args[i], "--complete-at-step") and i + 1 < args.len) {
+            // Post the completion once the render reaches step n: a prompt
+            // arriving while an image is sampling, the studio's next batch.
+            i += 1;
+            complete_at_step = std.fmt.parseInt(u32, args[i], 10) catch 0;
         } else if (std.mem.eql(u8, args[i], "--again")) {
             // The completion once more after the render, timed: whether the chat
             // model got its layers back.
@@ -153,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
             } });
         }
     }.f;
-    if (idea) |text| complete(remote, complete_ref, text, think);
+    if (idea) |text| if (complete_at_step == 0) complete(remote, complete_ref, text, think);
     var complete_t0 = Io.Clock.real.now(io).nanoseconds;
     var again_t0: i96 = 0;
     // Behind a completion, the message waits for it to start (see the module doc).
@@ -284,6 +290,12 @@ pub fn main(init: std.process.Init) !void {
                         },
                         .img => |im| if (im.client_ref == 1) {
                             image_id = im.id;
+                            if (complete_at_step != 0 and im.step >= complete_at_step and im.status == .generating) {
+                                try out.print("{{\"probe\":\"render at step {d}; posting the completion\"}}\n", .{im.step});
+                                complete_t0 = Io.Clock.real.now(io).nanoseconds;
+                                complete(remote, complete_ref, idea.?, think);
+                                complete_at_step = 0;
+                            }
                             switch (im.status) {
                                 .done => if (want_image) {
                                     want_image = false;

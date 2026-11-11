@@ -3,8 +3,10 @@
 //! One writer, the frame thread. Chat is pinned to one host. New images join
 //! THIS client's queue (`Asked`) and are handed out as hosts free up, one in
 //! flight per host; a request naming an image goes to the host that minted
-//! it. An Expand job waits in that queue until the chat host has written the
-//! prompts of its whole batch (`expand`). Connects run on their own threads,
+//! it. An Expand job's prompts are items of the same queue that always land on
+//! the chat host, so a batch's renders wait for its prompts and a later batch's
+//! prompts wait behind the renders ahead of them on that host's card (`expand`,
+//! `dispatch`). Connects run on their own threads,
 //! and a host that cannot be reached is retried on a widening backoff for as
 //! long as the client runs. Only an entry that cannot name an endpoint is given
 //! up on.
@@ -224,7 +226,6 @@ pub const Hosts = struct {
     /// What a connect learned that the user should read once (`connectNotices`).
     notices: std.ArrayList(Notice) = .empty,
     /// Prompts being written for Expand mode, oldest first (see `expand`).
-    prompts: std.ArrayList(Prompt) = .empty,
     next_batch: u64 = 0,
     /// Scratch for draining a host's finished completions.
     completed: std.ArrayList(mirror.Completed) = .empty,
@@ -249,8 +250,6 @@ pub const Hosts = struct {
         self.slots.deinit(self.gpa);
         for (self.notices.items) |n| self.gpa.free(n.text);
         self.notices.deinit(self.gpa);
-        for (self.prompts.items) |*p| p.free(self.gpa);
-        self.prompts.deinit(self.gpa);
         self.completed.deinit(self.gpa);
         self.gpa.free(self.last_expansion);
     }
@@ -867,6 +866,10 @@ pub const Hosts = struct {
     fn requeueUnlisted(self: *Hosts, s: *Slot) void {
         for (self.asked.items) |*a| {
             if (a.waiting or a.gone or a.at != s.id) continue;
+            if (a.kind == .prompt) {
+                self.requeuePrompt(a);
+                continue;
+            }
             if (s.mirror.byClientRef(a.ref) != null) continue;
             a.waiting = true;
             log.info("queue: {s} never took a render; back in the queue", .{s.name});
@@ -910,6 +913,10 @@ pub const Hosts = struct {
     fn releasePlaced(self: *Hosts, s: *Slot) void {
         for (self.asked.items) |*a| {
             if (a.waiting or a.gone or a.at != s.id) continue;
+            if (a.kind == .prompt) {
+                self.requeuePrompt(a);
+                continue;
+            }
             const over = if (s.mirror.byRef(a.ref)) |im| switch (im.status()) {
                 .done, .canceled => true,
                 else => false,
@@ -1138,7 +1145,6 @@ pub const Hosts = struct {
         // Place first, then report: an image has no id until a host takes it.
         defer self.reportModelImages(cfg);
         defer self.dispatch(cfg);
-        defer self.syncPrompts();
         const local_seq = self.local().mirror.catalog_seq;
         const now = Io.Clock.awake.now(self.io).nanoseconds;
         const can_render = self.canRenderAnywhere(cfg);
@@ -1330,7 +1336,7 @@ pub const Hosts = struct {
     fn unseen(self: *Hosts, s: *Slot) u32 {
         var n: u32 = 0;
         for (self.asked.items) |*a| {
-            if (a.waiting or a.gone or a.at != s.id) continue;
+            if (a.waiting or a.gone or a.at != s.id or a.kind != .render) continue;
             if (s.mirror.byClientRef(a.ref) == null) n += 1;
         }
         return n;
@@ -1415,6 +1421,35 @@ pub const Hosts = struct {
         /// Expand mode: the renders asked for together, none of which goes out
         /// before every prompt among them is written.
         batch: u64 = 0,
+        /// A prompt the chat host writes for its batch's renders, rather than a
+        /// render. Queued like one, placed on the chat host only, and removed
+        /// once answered; its `ref` is every waiting render's `prompt_ref`.
+        kind: Kind = .render,
+        job: ?PromptJob = null,
+        /// The chat host's `reconnects` when a prompt was sent: a host that has
+        /// dropped since may never answer, so the ask is made again.
+        sent_reconnects: u32 = 0,
+
+        pub const Kind = enum { render, prompt };
+
+        /// What a prompt item asks of the chat model. Strings are gpa-owned.
+        pub const PromptJob = struct {
+            prefix: []u8,
+            suffix: []u8,
+            system: []u8,
+            idea: []u8,
+            think: bool,
+            effort: wire.Effort,
+            seed: u64,
+            max_tokens: u32,
+
+            fn free(self: *PromptJob, gpa: std.mem.Allocator) void {
+                gpa.free(self.prefix);
+                gpa.free(self.suffix);
+                gpa.free(self.system);
+                gpa.free(self.idea);
+            }
+        };
 
         fn was(self: *const Asked, id: HostId) bool {
             for (self.tried[0..self.n_tried]) |t| if (t == id) return true;
@@ -1435,6 +1470,7 @@ pub const Hosts = struct {
                 gpa.free(l.schedule);
             }
             gpa.free(self.req.loras);
+            if (self.job) |*j| j.free(gpa);
         }
     };
 
@@ -1457,7 +1493,7 @@ pub const Hosts = struct {
         var i = self.asked.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.asked.items[i].waiting) continue;
+            if (self.asked.items[i].waiting or self.asked.items[i].kind == .prompt) continue;
             kept += 1;
             if (kept > asked_keep) {
                 var old = self.asked.orderedRemove(i);
@@ -1588,10 +1624,17 @@ pub const Hosts = struct {
     /// job there, so the rest of the queue spreads to the others. A job nobody
     /// can take is skipped, not blocking.
     pub fn dispatch(self: *Hosts, cfg: *const config.Config) void {
+        const chat = self.chatSlot();
+        self.followChat(chat);
         var held: [config.max_hosts + 1]HostId = undefined;
         var n_held: usize = 0;
         for (self.asked.items) |*a| {
-            if (!a.waiting or self.writing(a)) continue;
+            if (!a.waiting) continue;
+            if (a.kind == .prompt) {
+                if (chat.up() and chat.mirror.spokeOnce() and !self.renderAhead(a, chat)) self.handPromptTo(a, chat);
+                continue;
+            }
+            if (self.writing(a)) continue;
             const target = self.pick(cfg, a, held[0..n_held]) orelse continue;
             if (self.hasRoom(target)) {
                 self.handTo(a, target);
@@ -1610,6 +1653,90 @@ pub const Hosts = struct {
         log.info("queue: {s} took a render", .{target.name});
     }
 
+    fn handPromptTo(self: *Hosts, a: *Asked, chat: *Slot) void {
+        _ = self;
+        const j = a.job.?;
+        a.waiting = false;
+        a.at = chat.id;
+        a.sent_reconnects = chat.reconnects;
+        chat.post(.{ .llm_complete = .{
+            .ref = a.ref,
+            .system = j.system,
+            .user = j.idea,
+            .think = j.think,
+            .effort = j.effort,
+            .seed = j.seed,
+            .max_tokens = j.max_tokens,
+        } });
+    }
+
+    /// A placed prompt whose host has dropped since, or is no longer the chat
+    /// host, is stopped there and asked again under a new ref, so a late answer
+    /// to the old ask matches nothing.
+    fn followChat(self: *Hosts, chat: *Slot) void {
+        for (self.asked.items) |*a| {
+            if (a.kind != .prompt or a.waiting or a.gone) continue;
+            const at = self.slotOf(a.at);
+            const lost = at == null or at.?.reconnects != a.sent_reconnects or a.at != chat.id;
+            if (!lost) continue;
+            if (at) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = a.ref } });
+            self.requeuePrompt(a);
+        }
+    }
+
+    fn requeuePrompt(self: *Hosts, a: *Asked) void {
+        const fresh = self.mintRef();
+        for (self.asked.items) |*r| if (r.prompt_ref == a.ref) {
+            r.prompt_ref = fresh;
+        };
+        a.ref = fresh;
+        a.req.client_ref = fresh;
+        a.waiting = true;
+        a.at = 0;
+    }
+
+    /// A render queued ahead of `p` that still has to run on the chat host's
+    /// card: one not placed yet, where that host renders at all, or one placed
+    /// there and not over, or anything the host itself is rendering. The
+    /// batches go in order on one card; prompts overlap renders only on a host
+    /// of their own.
+    fn renderAhead(self: *Hosts, p: *const Asked, chat: *Slot) bool {
+        const st = &chat.mirror.state;
+        if (st.diff_busy or st.pending_images > 0) return true;
+        for (self.asked.items) |*a| {
+            if (a == p) break;
+            // Its own batch's renders wait for it, not the other way round.
+            if (a.kind != .render or a.gone or (a.batch != 0 and a.batch == p.batch)) continue;
+            if (a.waiting) {
+                if (st.diff_present) return true;
+                continue;
+            }
+            if (a.at != chat.id) continue;
+            const over = if (chat.mirror.byRef(a.ref)) |im| switch (im.status()) {
+                .done, .failed, .canceled => true,
+                else => false,
+            } else false;
+            if (!over) return true;
+        }
+        return false;
+    }
+
+    /// Prompts placed at `s` and not yet answered.
+    fn promptsAt(self: *Hosts, s: *Slot) u32 {
+        var n: u32 = 0;
+        for (self.asked.items) |*a| {
+            if (a.kind == .prompt and !a.waiting and !a.gone and a.at == s.id) n += 1;
+        }
+        return n;
+    }
+
+    /// Prompt items in the queue, waiting or being written.
+    pub fn promptCount(self: *Hosts) usize {
+        var n: usize = 0;
+        for (self.asked.items) |*a| n += @intFromBool(a.kind == .prompt);
+        return n;
+    }
+
     /// The best host for `a` among those that have not failed it, busy or not.
     fn pick(self: *Hosts, cfg: *const config.Config, a: *const Asked, held: []const HostId) ?*Slot {
         return self.placeExcluding(cfg, a.req, a.tried[0..a.n_tried], held);
@@ -1621,7 +1748,8 @@ pub const Hosts = struct {
         const st = &s.mirror.state;
         if (!s.up() or !s.mirror.spokeOnce()) return false;
         if (!st.diff_present or st.diff_paused) return false;
-        return st.pending_images + @intFromBool(st.diff_busy) + self.unseen(s) < depth_per_host;
+        // A prompt being written there holds the card like a render does.
+        return st.pending_images + @intFromBool(st.diff_busy) + self.unseen(s) + self.promptsAt(s) < depth_per_host;
     }
 
     /// Why a waiting render has not gone anywhere yet. A job held for the host
@@ -1662,12 +1790,12 @@ pub const Hosts = struct {
         return n;
     }
 
-    /// Jobs no host has taken yet, in queue order.
+    /// Renders no host has taken yet, in queue order.
     pub fn waiting(self: *Hosts, out: []*const Asked) []*const Asked {
         var n: usize = 0;
         for (self.asked.items) |*a| {
             if (n == out.len) break;
-            if (!a.waiting) continue;
+            if (!a.waiting or a.kind != .render) continue;
             out[n] = a;
             n += 1;
         }
@@ -1687,14 +1815,16 @@ pub const Hosts = struct {
     fn dropAllWaiting(self: *Hosts) void {
         var i: usize = 0;
         while (i < self.asked.items.len) {
-            if (!self.asked.items[i].waiting) {
+            const a = &self.asked.items[i];
+            const prompt = a.kind == .prompt and !a.gone;
+            if (!a.waiting and !prompt) {
                 i += 1;
                 continue;
             }
+            if (prompt and !a.waiting) if (self.slotOf(a.at)) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = a.ref } });
             var gone = self.asked.orderedRemove(i);
             gone.free(self.gpa);
         }
-        while (self.prompts.items.len > 0) self.cancelPrompt(0);
     }
 
     // ── Expand mode ───────────────────────────────────────────────────────────
@@ -1717,44 +1847,22 @@ pub const Hosts = struct {
         max_tokens: u32 = 1024,
     };
 
-    /// One prompt being written: the request as sent, and where to put the
-    /// answer. Kept whole so a host that goes away is simply asked again.
-    pub const Prompt = struct {
-        /// The `llm_complete` ref it was last sent under, which is also every
-        /// waiting render's `prompt_ref`. Re-minted on each send, so a late
-        /// answer to an abandoned send matches nothing.
-        ref: u64,
-        prefix: []u8,
-        suffix: []u8,
-        system: []u8,
-        idea: []u8,
-        think: bool,
-        effort: wire.Effort,
-        seed: u64,
-        max_tokens: u32,
-        /// The host it was sent to, and that host's `reconnects` then: a host
-        /// that has dropped since may never answer.
-        sent: ?struct { host: HostId, reconnects: u32 } = null,
-
-        fn free(self: *Prompt, gpa: std.mem.Allocator) void {
-            gpa.free(self.prefix);
-            gpa.free(self.suffix);
-            gpa.free(self.system);
-            gpa.free(self.idea);
-        }
-    };
-
     /// Queue `e.count` renders whose prompt the chat model writes from `e.idea`.
-    /// They wait in this client's queue, named by the idea, until every prompt
-    /// of the batch is written, then go out like any other render. Answers the
-    /// batch number, 0 when nothing could be queued.
+    /// Each prompt is an item of the queue ahead of its renders, placed on the
+    /// chat host once the renders ahead of it there are over; the renders wait,
+    /// named by the idea, until every prompt of the batch is written, then go
+    /// out like any other render. Answers the batch number, 0 when nothing could
+    /// be queued.
     pub fn expand(self: *Hosts, cfg: *const config.Config, e: Expand) u64 {
         if (e.count == 0) return 0;
         self.next_batch += 1;
         const batch = self.next_batch;
         var prompt_ref: u64 = 0;
         for (0..e.count) |i| {
-            if (i == 0 or !e.shared) prompt_ref = self.addPrompt(e) orelse break;
+            if (i == 0 or !e.shared) {
+                prompt_ref = self.rememberPrompt(e) orelse break;
+                self.askedOf(prompt_ref).?.batch = batch;
+            }
             var req = e.recipe;
             req.prompt = e.idea;
             if (req.seed != 0) req.seed +%= i;
@@ -1766,17 +1874,18 @@ pub const Hosts = struct {
             a.prompt_ref = prompt_ref;
             a.batch = batch;
         }
-        self.syncPrompts();
         self.dispatch(cfg);
         return if (self.inBatch(batch)) batch else 0;
     }
 
-    fn addPrompt(self: *Hosts, e: Expand) ?u64 {
+    /// A prompt item for `e`, queued at the end. Its ref, or null when memory
+    /// ran out.
+    fn rememberPrompt(self: *Hosts, e: Expand) ?u64 {
         var seed: [8]u8 = undefined;
         self.io.random(&seed);
-        var p: Prompt = .{
-            .ref = self.mintRef(),
-            .prefix = self.gpa.dupe(u8, e.prefix) catch return null,
+        const gpa = self.gpa;
+        var job: Asked.PromptJob = .{
+            .prefix = "",
             .suffix = "",
             .system = "",
             .idea = "",
@@ -1785,16 +1894,37 @@ pub const Hosts = struct {
             .seed = std.mem.readInt(u64, &seed, .little),
             .max_tokens = e.max_tokens,
         };
-        p.suffix = self.gpa.dupe(u8, e.suffix) catch return self.freePrompt(&p);
-        p.system = self.gpa.dupe(u8, e.system) catch return self.freePrompt(&p);
-        p.idea = self.gpa.dupe(u8, e.idea) catch return self.freePrompt(&p);
-        self.prompts.append(self.gpa, p) catch return self.freePrompt(&p);
-        return p.ref;
-    }
-
-    fn freePrompt(self: *Hosts, p: *Prompt) ?u64 {
-        p.free(self.gpa);
-        return null;
+        var ok = false;
+        defer if (!ok) {
+            gpa.free(job.prefix);
+            gpa.free(job.suffix);
+            gpa.free(job.system);
+            gpa.free(job.idea);
+        };
+        job.prefix = gpa.dupe(u8, e.prefix) catch return null;
+        job.suffix = gpa.dupe(u8, e.suffix) catch return null;
+        job.system = gpa.dupe(u8, e.system) catch return null;
+        job.idea = gpa.dupe(u8, e.idea) catch return null;
+        const ref = self.mintRef();
+        var a: Asked = .{ .ref = ref, .req = .{ .client_ref = ref, .prompt = "", .negative = "" }, .kind = .prompt, .job = job };
+        a.req.prompt = gpa.dupe(u8, "") catch return null;
+        a.req.negative = gpa.dupe(u8, "") catch {
+            gpa.free(a.req.prompt);
+            return null;
+        };
+        a.req.loras = gpa.alloc(wire.LoraSpec, 0) catch {
+            gpa.free(a.req.prompt);
+            gpa.free(a.req.negative);
+            return null;
+        };
+        self.asked.append(gpa, a) catch {
+            gpa.free(a.req.prompt);
+            gpa.free(a.req.negative);
+            gpa.free(a.req.loras);
+            return null;
+        };
+        ok = true;
+        return ref;
     }
 
     fn mintRef(self: *Hosts) u64 {
@@ -1815,38 +1945,6 @@ pub const Hosts = struct {
         return false;
     }
 
-    /// Send every prompt not yet asked of the chat host, and ask again where the
-    /// host it went to has dropped since, or is no longer the chat host. A
-    /// re-ask goes under a new ref, so the abandoned send answers nothing.
-    fn syncPrompts(self: *Hosts) void {
-        const target = self.chatSlot();
-        for (self.prompts.items) |*p| {
-            if (p.sent) |sent| {
-                const at = self.slotOf(sent.host);
-                const lost = at == null or at.?.reconnects != sent.reconnects or sent.host != target.id;
-                if (!lost) continue;
-                if (at) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = p.ref } });
-                p.sent = null;
-                const fresh = self.mintRef();
-                for (self.asked.items) |*a| if (a.prompt_ref == p.ref) {
-                    a.prompt_ref = fresh;
-                };
-                p.ref = fresh;
-            }
-            if (!target.up() or !target.mirror.spokeOnce()) continue;
-            target.post(.{ .llm_complete = .{
-                .ref = p.ref,
-                .system = p.system,
-                .user = p.idea,
-                .think = p.think,
-                .effort = p.effort,
-                .seed = p.seed,
-                .max_tokens = p.max_tokens,
-            } });
-            p.sent = .{ .host = target.id, .reconnects = target.reconnects };
-        }
-    }
-
     /// The prompts `s` has answered: each becomes the prompt of every render
     /// waiting on it. A failed or empty answer drops those renders and says why.
     fn takeAnswers(self: *Hosts, s: *Slot) void {
@@ -1856,13 +1954,14 @@ pub const Hosts = struct {
             self.completed.clearRetainingCapacity();
         }
         for (self.completed.items) |*c| {
-            const i = for (self.prompts.items, 0..) |*p, i| {
-                if (p.ref == c.ref) break i;
+            const i = for (self.asked.items, 0..) |*a, i| {
+                if (a.kind == .prompt and a.ref == c.ref) break i;
             } else continue;
-            var p = self.prompts.orderedRemove(i);
+            var p = self.asked.orderedRemove(i);
             defer p.free(self.gpa);
+            const job = p.job.?;
             const joined: ?[]u8 = if (c.err.len == 0 and expand_text.cleanAnswer(c.text).len > 0)
-                expand_text.join(self.gpa, p.prefix, c.text, p.suffix) catch null
+                expand_text.join(self.gpa, job.prefix, c.text, job.suffix) catch null
             else
                 null;
             defer if (joined) |j| self.gpa.free(j);
@@ -1895,17 +1994,17 @@ pub const Hosts = struct {
         }
     }
 
-    /// Stop writing a prompt no waiting render needs any more.
+    /// Drop a prompt no waiting render needs any more, stopping it at its host
+    /// where it is being written.
     fn dropPromptIfUnwanted(self: *Hosts, ref: u64) void {
         for (self.asked.items) |*a| if (a.prompt_ref == ref) return;
-        for (self.prompts.items, 0..) |*p, i| if (p.ref == ref) return self.cancelPrompt(i);
-    }
-
-    fn cancelPrompt(self: *Hosts, i: usize) void {
-        var p = self.prompts.orderedRemove(i);
-        defer p.free(self.gpa);
-        const sent = p.sent orelse return;
-        if (self.slotOf(sent.host)) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = p.ref } });
+        for (self.asked.items, 0..) |*a, i| {
+            if (a.kind != .prompt or a.ref != ref) continue;
+            if (!a.waiting) if (self.slotOf(a.at)) |s| if (s.up()) s.post(.{ .llm_complete_cancel = .{ .ref = a.ref } });
+            var gone = self.asked.orderedRemove(i);
+            gone.free(self.gpa);
+            return;
+        }
     }
 
     /// Move a waiting job before `before`, or to the end of the waiting run.
@@ -3505,7 +3604,7 @@ test "an expanded batch waits until every prompt is written, then renders prefix
     try testing.expectEqual(@as(usize, 1), left.len);
     try testing.expectEqualStrings("oil painting\na lantern on a hill\ngolden hour", left[0].req.prompt);
     try testing.expectEqual(@as(u64, 101), left[0].req.seed);
-    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+    try testing.expectEqual(@as(usize, 0), h.promptCount());
 }
 
 test "a shared prompt is written once for the whole batch" {
@@ -3518,7 +3617,7 @@ test "a shared prompt is written once for the whole batch" {
     defer ra.outbox.deinit(testing.allocator);
     const a = expandHost(&h, &ra);
     defer a.remote = null;
-    a.mirror.state.diff_busy = true; // hold the renders, to read them back
+    a.mirror.state.diff_paused = true; // hold the renders, to read them back
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
@@ -3563,19 +3662,19 @@ test "stopping a render that waits for its prompt stops that prompt, unless anot
     _ = h.expand(&cfg, shared);
     h.post(&cfg, .{ .img_cancel = .{ .image = h.waiting(&buf)[0].ref } });
     try testing.expectEqual(@as(usize, 0), (try sentOf(&ra, ar, .llm_complete_cancel)).len);
-    try testing.expectEqual(@as(usize, 1), h.prompts.items.len);
+    try testing.expectEqual(@as(usize, 1), h.promptCount());
     // Its last render gone, it is stopped at the host.
     h.post(&cfg, .{ .img_cancel = .{ .image = h.waiting(&buf)[0].ref } });
     const stops = try sentOf(&ra, ar, .llm_complete_cancel);
     try testing.expectEqual(@as(usize, 1), stops.len);
     try testing.expectEqual((try sentOf(&ra, ar, .llm_complete))[0].llm_complete.ref, stops[0].llm_complete_cancel.ref);
-    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+    try testing.expectEqual(@as(usize, 0), h.promptCount());
 
     // Stop all takes every prompt with it.
     _ = h.expand(&cfg, test_expand);
     h.post(&cfg, .img_cancel_all);
     try testing.expectEqual(@as(usize, 3), (try sentOf(&ra, ar, .llm_complete_cancel)).len);
-    try testing.expectEqual(@as(usize, 0), h.prompts.items.len);
+    try testing.expectEqual(@as(usize, 0), h.promptCount());
     try testing.expectEqual(@as(usize, 0), h.waiting(&buf).len);
 }
 
@@ -3597,8 +3696,14 @@ test "a prompt that fails drops its renders and says why; a stopped one says not
     one.count = 1;
     _ = h.expand(&cfg, one);
     _ = h.expand(&cfg, one);
+    // The second batch's prompt waits for the first batch's render to be over.
+    try testing.expectEqual(@as(usize, 1), (try sentOf(&ra, arena.allocator(), .llm_complete)).len);
+    const first = (try sentOf(&ra, arena.allocator(), .llm_complete))[0].llm_complete.ref;
+    try feedEvent(a, .{ .llm_completion = .{ .ref = first, .err = "NoModel" } });
+    h.takeAnswers(a);
+    h.dispatch(&cfg);
     const asks = try sentOf(&ra, arena.allocator(), .llm_complete);
-    try feedEvent(a, .{ .llm_completion = .{ .ref = asks[0].llm_complete.ref, .err = "NoModel" } });
+    try testing.expectEqual(@as(usize, 2), asks.len);
     try feedEvent(a, .{ .llm_completion = .{ .ref = asks[1].llm_complete.ref, .err = "Stopped" } });
     h.takeAnswers(a);
     try testing.expectEqual(@as(usize, 0), h.waiting(&buf).len);
@@ -3633,8 +3738,7 @@ test "a prompt is asked again when its host has dropped since, or the chat has m
     b.remote = &rb;
     defer b.remote = null;
     ready(b);
-    a.mirror.state.diff_busy = true;
-    b.mirror.state.diff_busy = true;
+    b.mirror.state.diff_paused = true; // holds renders, not prompts
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -3647,7 +3751,7 @@ test "a prompt is asked again when its host has dropped since, or the chat has m
 
     // The chat host came back after a loss: its answer may be gone with the link.
     a.reconnects += 1;
-    h.syncPrompts();
+    h.dispatch(&cfg);
     const again = try sentOf(&ra, ar, .llm_complete);
     try testing.expectEqual(@as(usize, 2), again.len);
     const second = again[1].llm_complete.ref;
@@ -3657,7 +3761,7 @@ test "a prompt is asked again when its host has dropped since, or the chat has m
 
     // The chat moves: the prompt follows it.
     h.chat = b.id;
-    h.syncPrompts();
+    h.dispatch(&cfg);
     const on_b = try sentOf(&rb, ar, .llm_complete);
     try testing.expectEqual(@as(usize, 1), on_b.len);
     const third = on_b[0].llm_complete.ref;
@@ -3670,4 +3774,73 @@ test "a prompt is asked again when its host has dropped since, or the chat has m
     try feedEvent(b, .{ .llm_completion = .{ .ref = third, .text = "a knight" } });
     h.takeAnswers(b);
     try testing.expectEqualStrings("oil painting\na knight\ngolden hour", h.waiting(&buf)[0].req.prompt);
+}
+
+test "a later batch's prompts wait behind the renders ahead of them on the chat host, and not on a host of their own" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var h = try newHosts(&env);
+    defer h.deinit();
+    var cfg: config.Config = .{};
+    var ra = fakeRemote();
+    defer ra.outbox.deinit(testing.allocator);
+    const a = expandHost(&h, &ra);
+    defer a.remote = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var buf: [8]*const Hosts.Asked = undefined;
+
+    // One card: batch 1's render is placed, then batch 2 is queued. Its prompt
+    // stays in the queue until that render is over, then goes to the chat host.
+    var one = test_expand;
+    one.count = 1;
+    _ = h.expand(&cfg, one);
+    const p1 = (try sentOf(&ra, ar, .llm_complete))[0].llm_complete.ref;
+    try feedEvent(a, .{ .llm_completion = .{ .ref = p1, .text = "a knight" } });
+    h.takeAnswers(a);
+    h.dispatch(&cfg);
+    const sent = try sentOf(&ra, ar, .img_enqueue);
+    try testing.expectEqual(@as(usize, 1), sent.len);
+    const r1 = sent[0].img_enqueue.client_ref;
+    try feedEvent(a, .{ .img = .{ .id = 77, .client_ref = r1, .status = .generating } });
+
+    _ = h.expand(&cfg, one);
+    h.dispatch(&cfg);
+    try testing.expectEqual(@as(usize, 1), (try sentOf(&ra, ar, .llm_complete)).len);
+    try testing.expectEqual(@as(usize, 1), h.promptCount());
+    try testing.expectEqual(Hosts.Wait.writing, h.waitReason(&cfg, h.waiting(&buf)[0]));
+
+    try feedEvent(a, .{ .img = .{ .id = 77, .client_ref = r1, .status = .done } });
+    h.dispatch(&cfg);
+    const asks = try sentOf(&ra, ar, .llm_complete);
+    try testing.expectEqual(@as(usize, 2), asks.len);
+    // And its render waits for the prompt, not the other way round.
+    try testing.expectEqual(@as(usize, 1), (try sentOf(&ra, ar, .img_enqueue)).len);
+
+    // A chat host with no image engine beside a render host: the prompt goes
+    // out while the earlier render is still running elsewhere.
+    var h2 = try newHosts(&env);
+    defer h2.deinit();
+    var rc = fakeRemote();
+    var rd = fakeRemote();
+    defer rc.outbox.deinit(testing.allocator);
+    defer rd.outbox.deinit(testing.allocator);
+    const c = h2.local();
+    c.remote = &rc;
+    defer c.remote = null;
+    c.mirror.state_seen = true; // up, spoke, renders nothing
+    const d = try h2.addSlot("d", .{});
+    d.remote = &rd;
+    defer d.remote = null;
+    ready(d);
+    _ = h2.expand(&cfg, one);
+    const q1 = (try sentOf(&rc, ar, .llm_complete))[0].llm_complete.ref;
+    try feedEvent(c, .{ .llm_completion = .{ .ref = q1, .text = "a lantern" } });
+    h2.takeAnswers(c);
+    h2.dispatch(&cfg);
+    try testing.expectEqual(@as(usize, 1), (try sentOf(&rd, ar, .img_enqueue)).len);
+    d.mirror.state.diff_busy = true;
+    _ = h2.expand(&cfg, one);
+    try testing.expectEqual(@as(usize, 2), (try sentOf(&rc, ar, .llm_complete)).len);
 }
