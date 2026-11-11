@@ -978,17 +978,18 @@ pooling heads run on the host.
 | Encoder | cpu | vulkan | zig-cuda | cuda | Files | Reference |
 |---|---|---|---|---|---|---|
 | Snowflake Arctic Embed M v2.0 | ✅ | ✅ | ✅ | ✅ | `embed_snowflake{,_dev,_gpu,_cuda}.zig` | ONNX |
-| EmbeddingGemma 300M | ✅ | ✅ | ✅ | ✅ | `embed_gemma{,_dev,_gpu,_cuda}.zig` | ONNX |
+| EmbeddingGemma 300M | ✅ | ✅ | ✅ | ✅ | `embed_gemma{,_dev,_gpu,_cuda}.zig` | ONNX; past the window, sentence-transformers (`tools/gen_embeddinggemma_long.py`) |
 | **EmbeddingGemma 2**, text | ✅ | ✅ | ✅ | ✅ | `embed_gemma2{,_dev,_gpu,_cuda}.zig` | sentence-transformers (`tools/gen_embeddinggemma2.py`) |
 | **EmbeddingGemma 2**, image | ✅ | ✅ | ✅ | ✅ | + `gemma4v_vit*` | (`tools/gen_embeddinggemma2_image.py`) |
 | SigLIP2 ViT-B-16 text / visual | ✅ | ✅ | ✅ | ✅ | `embed_siglip{,_dev,_gpu,_cuda}.zig` | ONNX |
 
-- Attention: Snowflake, EmbeddingGemma 300M and SigLIP2 run the one-thread-per-row
-  `attn_batched` kernel (heads up to 512). EmbeddingGemma 2 runs `attn_bounded` (`dual/`,
+- Attention: Snowflake and SigLIP2 run the one-thread-per-row `attn_batched` kernel
+  (heads up to 512). Both EmbeddingGemmas run `attn_bounded` (`dual/`,
   both arms): one subgroup per (row, head, key chunk) over the row's `[start | end)` from a
   table at the scratch's tail, then `attn_merge`. The table carries both the item bounds
   of a ragged batch and the bidirectional sliding window (`Ragged.boundsInto`). On a
-  284-row image body it is 0.42 ms a layer against `attn_batched`'s 24.5.
+  284-row image body it is 0.42 ms a layer against `attn_batched`'s 24.5. At 2048 rows
+  it is a decode kernel doing an encoder's job: 90% of EmbeddingGemma 300M's CUDA time.
 - The Gemma 4 vision tower's Vulkan attention runs `attn_gpu`'s tensor-core path with
   heads zero-padded to 128 (`opAttnBounded` without tensor cores), like CUDA's: 1.7 s ->
   84 ms on a 2520-patch image. On the 31B gate it moves Vulkan's min token cosine from

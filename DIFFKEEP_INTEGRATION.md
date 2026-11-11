@@ -236,13 +236,12 @@ on the eval corpus before committing.
 
 - **Backends:** CPU / Vulkan / CUDA all work (per-encoder `backend` arg). CPU is
   fine for indexing; build ReleaseFast either way.
-- **EmbeddingGemma asserts sequence length ≤ 512 tokens** (post-framing). Its local
-  layers use a 512 sliding window that TP currently runs as full attention (correct
-  for ≤512). Truncate longer inputs, or file a TP request for the long-doc path.
-  Snowflake's own limit is 512 tokens (XLM-R), so cap inputs at 512 either way.
+- **EmbeddingGemma takes up to `models.embed_gemma.max_seq` (2048) tokens** post-framing,
+  role prefix and `<bos>`/`<eos>` included; past it, `error.SequenceTooLong`. Snowflake's
+  own limit is 512 tokens (XLM-R).
 - **Output is already L2-normalized** — do not normalize again (DiffKeep's
   `sim = 1 - d²/2` under sqlite-vec L2 relies on unit vectors).
-- **No batch API** yet — loop per text/image (threads for parallelism).
+- **Batches:** `embedTextBatch` / `embedImageBatch` run one forward over the batch.
 - **SigLIP2 text** caps at a 64-token window (right-padded) per SigLIP; pass ≤ ~60
   content tokens + `<eos>`. **SigLIP2 visual** is fixed 224×224 → 196 patches; keep
   DiffKeep's libvips preprocessing (`/255`, mean/std 0.5, CHW) unchanged.

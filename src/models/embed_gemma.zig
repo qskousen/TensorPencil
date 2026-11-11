@@ -16,10 +16,10 @@
 //! bare HF names with no `model.` prefix in this sentence-transformers export, so
 //! `loader.*` matches directly.
 //!
-//! EmbeddingGemma's local layers use a 512 sliding window, but at seq <= 512 a window is
-//! indistinguishable from full attention, so every layer runs with the full
-//! bidirectional mask (window 0) and only the RoPE base alternates per layer. Inputs
-//! past 512 tokens would need a bidirectional sliding window, which is not implemented.
+//! The local layers attend bidirectionally to keys within `window_radius` (256) positions
+//! either side, not 512: transformers turns a bidirectional config's `sliding_window`
+//! of 512 into an exclusive bound of 257 (`tools/gen_embeddinggemma_long.py` checks
+//! it). Global layers see the whole input.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -55,6 +55,11 @@ pub const config_300m: Config = .{
     .swa_pattern = 6,
 };
 
+/// Longest framed input (`<bos> ... <eos>`), the model's `max_position_embeddings`.
+pub const max_seq: usize = 2048;
+/// A local layer's query attends keys with `|q - k| <= window_radius`.
+pub const window_radius: usize = config_300m.sliding_window / 2;
+
 /// Output embedding dimension (post-projection).
 pub const embed_dim: usize = 768;
 /// Hidden width of the projection head's first dense layer.
@@ -88,6 +93,21 @@ fn indexedNormVec(alloc: std.mem.Allocator, store: WeightStore, comptime prefix:
     const v = try loader.indexedVector(alloc, store, prefix, i, suffix, len);
     for (v) |*e| e.* += 1.0;
     return v;
+}
+
+/// Layer `l`'s dimensions; a bidirectional pass reads `sliding_window` as the radius.
+fn dims(l: usize) transformer.Dims {
+    const cfg = config_300m;
+    return .{
+        .hidden = cfg.hidden,
+        .n_heads = cfg.n_heads,
+        .n_kv = cfg.n_kv_heads,
+        .head_dim = cfg.head_dim,
+        .q_dim = cfg.qDim(),
+        .kv_dim = cfg.kvDim(),
+        .intermediate = cfg.intermediate,
+        .sliding_window = if (cfg.isGlobal(l)) 0 else window_radius,
+    };
 }
 
 pub const Model = struct {
@@ -178,9 +198,7 @@ pub const Model = struct {
         const seq = ids.len;
         std.debug.assert(seq > 0);
         std.debug.assert(out.len == seq * cfg.hidden);
-        // TODO: seq > sliding_window would need a bidirectional sliding window;
-        // for now every layer uses the full (window-free) bidirectional mask.
-        std.debug.assert(seq <= cfg.sliding_window);
+        if (seq > max_seq) return error.SequenceTooLong;
 
         const x = try gpa.alloc(f32, seq * cfg.hidden);
         defer gpa.free(x);
@@ -197,19 +215,8 @@ pub const Model = struct {
         defer s.deinit(gpa);
 
         for (self.layers, 0..) |*layer, l| {
-            const global = cfg.isGlobal(l);
-            const dims: transformer.Dims = .{
-                .hidden = cfg.hidden,
-                .n_heads = cfg.n_heads,
-                .n_kv = cfg.n_kv_heads,
-                .head_dim = cfg.head_dim,
-                .q_dim = cfg.qDim(),
-                .kv_dim = cfg.kvDim(),
-                .intermediate = cfg.intermediate,
-                .sliding_window = 0, // full bidirectional (valid for seq <= window)
-            };
-            const freqs = if (global) fg else fl;
-            try transformer.layerForward(transformer.gemma3_spec, .fresh, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, {}, l, 0, true, &s);
+            const freqs = if (cfg.isGlobal(l)) fg else fl;
+            try transformer.layerForward(transformer.gemma3_spec, .fresh, io, gpa, layer, x, seq, dims(l), freqs, cfg.rms_eps, {}, l, 0, true, &s);
         }
 
         ops.norm.rmsNorm(out, x, self.final_norm, cfg.rms_eps);
@@ -233,11 +240,12 @@ pub const Model = struct {
 
         const row_off = try a.alloc(usize, b + 1);
         row_off[0] = 0;
-        var max_seq: usize = 0;
+        var longest: usize = 0;
         for (ids_list, 0..) |ids, i| {
-            std.debug.assert(ids.len > 0 and ids.len <= cfg.sliding_window);
+            std.debug.assert(ids.len > 0);
+            if (ids.len > max_seq) return error.SequenceTooLong;
             row_off[i + 1] = row_off[i] + ids.len;
-            max_seq = @max(max_seq, ids.len);
+            longest = @max(longest, ids.len);
         }
         const total = row_off[b];
 
@@ -246,27 +254,17 @@ pub const Model = struct {
         const scale = cfg.embedScale();
         for (x) |*v| v.* *= scale;
 
-        var fg = try ops.rope.rotateHalfFreqs(gpa, max_seq, cfg.head_dim, cfg.rope_theta);
+        var fg = try ops.rope.rotateHalfFreqs(gpa, longest, cfg.head_dim, cfg.rope_theta);
         defer fg.deinit(gpa);
-        var fl = try ops.rope.rotateHalfFreqs(gpa, max_seq, cfg.head_dim, cfg.rope_theta_local);
+        var fl = try ops.rope.rotateHalfFreqs(gpa, longest, cfg.head_dim, cfg.rope_theta_local);
         defer fl.deinit(gpa);
 
         var s = try gemma3.Scratch.init(gpa, total, cfg);
         defer s.deinit(gpa);
 
         for (self.layers, 0..) |*layer, l| {
-            const dims: transformer.Dims = .{
-                .hidden = cfg.hidden,
-                .n_heads = cfg.n_heads,
-                .n_kv = cfg.n_kv_heads,
-                .head_dim = cfg.head_dim,
-                .q_dim = cfg.qDim(),
-                .kv_dim = cfg.kvDim(),
-                .intermediate = cfg.intermediate,
-                .sliding_window = 0, // full bidirectional (valid for seq <= window)
-            };
             const freqs = if (cfg.isGlobal(l)) fg else fl;
-            try transformer.layerForwardBatchedFresh(transformer.gemma3_spec, io, gpa, layer, x, row_off, dims, freqs, cfg.rms_eps, true, &s);
+            try transformer.layerForwardBatchedFresh(transformer.gemma3_spec, io, gpa, layer, x, row_off, dims(l), freqs, cfg.rms_eps, true, &s);
         }
 
         // final norm (per row) -> per-item head.
@@ -327,16 +325,102 @@ pub const Model = struct {
 
 // --- tests -----------------------------------------------------------------
 
-fn cosine(a: []const f32, b: []const f32) f32 {
-    var dot: f32 = 0;
-    var na: f32 = 0;
-    var nb: f32 = 0;
+pub const test_dir = "../DiffKeep/Models/embeddinggemma-300m";
+const test_gate = @import("../test_gate.zig");
+
+pub fn cosine(a: []const f32, b: []const f32) f32 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
     for (a, b) |x, y| {
         dot += x * y;
         na += x * x;
         nb += y * y;
     }
-    return dot / (@sqrt(na) * @sqrt(nb));
+    return @floatCast(dot / @sqrt(na * nb));
+}
+
+/// A case from `tools/gen_embeddinggemma_long.py`: `wide` and `nowindow` are what a
+/// port with a window one too wide, or none, would produce.
+pub const LongCase = struct { name: []const u8, ids: []u32, vec: []f32, wide: []f32, nowindow: []f32 };
+
+pub fn loadLongReference(arena: std.mem.Allocator, io: std.Io) ![]LongCase {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/embeddinggemma_long_ref.json", arena, .limited(4 * 1024 * 1024));
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    var cases: std.ArrayList(LongCase) = .empty;
+    var it = root.object.iterator();
+    while (it.next()) |e| {
+        const o = e.value_ptr.object;
+        const ids_j = o.get("ids").?.array.items;
+        const ids = try arena.alloc(u32, ids_j.len);
+        for (ids, ids_j) |*d, v| d.* = @intCast(v.integer);
+        try cases.append(arena, .{
+            .name = e.key_ptr.*,
+            .ids = ids,
+            .vec = try floats(arena, o.get("vec").?.array.items),
+            .wide = try floats(arena, o.get("vec_wide").?.array.items),
+            .nowindow = try floats(arena, o.get("vec_nowindow").?.array.items),
+        });
+    }
+    return cases.items;
+}
+
+fn floats(arena: std.mem.Allocator, items: []const std.json.Value) ![]f32 {
+    const out = try arena.alloc(f32, items.len);
+    for (out, items) |*d, v| d.* = @floatCast(v.float);
+    return out;
+}
+
+/// `got` must be within `min_cos` of the reference and closer to it than to either
+/// wrong-window vector.
+pub fn expectLong(c: LongCase, got: []const f32, min_cos: f32) !void {
+    const cos = cosine(got, c.vec);
+    const cos_wide = cosine(got, c.wide);
+    const cos_nw = cosine(got, c.nowindow);
+    errdefer std.debug.print("{s} ({d} tokens): cosine {d}, to the wide window {d}, to no window {d}\n", .{ c.name, c.ids.len, cos, cos_wide, cos_nw });
+    try std.testing.expect(cos >= min_cos);
+    try std.testing.expect(cos > cos_wide and cos > cos_nw);
+}
+
+test "embeddinggemma matches sentence-transformers past the window" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try test_gate.requireModelFile(io, test_dir ++ "/model.safetensors");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cases = try loadLongReference(arena.allocator(), io);
+    var model = try Model.open(gpa, io, test_dir);
+    defer model.deinit();
+
+    var out: [embed_dim]f32 = undefined;
+    for (cases) |c| {
+        try model.embed(io, gpa, c.ids, &out);
+        try expectLong(c, &out, 0.999999);
+    }
+
+    // A ragged batch of every case and a short item, against the reference.
+    const short = [_]u32{ 2, 23391, 1902, 1 };
+    var short_vec: [embed_dim]f32 = undefined;
+    try model.embed(io, gpa, &short, &short_vec);
+    const ids_list = try arena.allocator().alloc([]const u32, cases.len + 1);
+    const outs = try arena.allocator().alloc([]f32, cases.len + 1);
+    for (cases, ids_list[1..], outs[1..]) |c, *ids, *o| {
+        ids.* = c.ids;
+        o.* = try arena.allocator().alloc(f32, embed_dim);
+    }
+    ids_list[0] = &short;
+    outs[0] = try arena.allocator().alloc(f32, embed_dim);
+    try model.embedBatch(io, gpa, ids_list, outs);
+    for (cases, outs[1..]) |c, o| try expectLong(c, o, 0.999999);
+    const cos_short = cosine(&short_vec, outs[0]);
+    errdefer std.debug.print("short item batched with long ones: cosine {d}\n", .{cos_short});
+    try std.testing.expect(cos_short >= 0.999999);
+
+    const over = try gpa.alloc(u32, max_seq + 1);
+    defer gpa.free(over);
+    @memset(over, 2);
+    try std.testing.expectError(error.SequenceTooLong, model.embed(io, gpa, over, &out));
+    try std.testing.expectError(error.SequenceTooLong, model.embedBatch(io, gpa, &.{ &short, over }, outs[0..2]));
 }
 
 // Numeric parity vs the onnx-community EmbeddingGemma ONNX (reference vectors in
@@ -345,7 +429,7 @@ fn cosine(a: []const f32, b: []const f32) f32 {
 test "embeddinggemma matches ONNX reference" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
 
     const ref_bytes = std.Io.Dir.cwd().readFileAlloc(io, "testdata/embeddinggemma_ref_vectors.json", gpa, .limited(4 * 1024 * 1024)) catch return error.SkipZigTest;
@@ -387,7 +471,7 @@ test "embeddinggemma matches ONNX reference" {
 test "embeddinggemma embedBatch matches per-item" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
 
     var model = try Model.open(gpa, io, dir);

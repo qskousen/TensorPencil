@@ -4,9 +4,12 @@
 //!
 //! A bidirectional Gemma-3 body: RMSNorms whose weights already carry the +1 (folded at
 //! load), per-head QK-norm, two rope tables (global every 6th layer, local otherwise),
-//! GQA, the four-norm sandwich and a tanh GeGLU (inside the device parity floor). The
-//! sliding window runs as full attention, which is exact for the `seq <= window` the
-//! model asserts. No GEMM here has a bias.
+//! GQA, the four-norm sandwich and a tanh GeGLU (inside the device parity floor). No
+//! GEMM here has a bias.
+//!
+//! Attention is `attentionRows` over a bounds table at the attention scratch's tail:
+//! words `[0, 2n)` hold each row's whole item, `[2n, 4n)` the same clipped to the local
+//! layers' `window_radius`.
 
 const std = @import("std");
 const ops = @import("tp_ops");
@@ -26,7 +29,7 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
     const inter = cfg.intermediate;
     const eps = cfg.rms_eps;
     std.debug.assert(outs.len == ids_list.len and ids_list.len > 0);
-    for (ids_list) |ids| std.debug.assert(ids.len <= cfg.sliding_window);
+    for (ids_list) |ids| if (ids.len > eg.max_seq) return error.SequenceTooLong;
 
     var rg = try tower.Ragged.init(gpa, ids_list);
     defer rg.deinit(gpa);
@@ -40,7 +43,8 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
     for (x_host) |*v| v.* *= scale;
 
     defer d.done();
-    var tables: [2]@TypeOf(d).Buffer = undefined;
+    const Buf = @TypeOf(d).Buffer;
+    var tables: [2]Buf = undefined;
     var n_tables: usize = 0;
     defer for (tables[0..n_tables]) |*b| d.release(b);
     for ([2]f64{ cfg.rope_theta, cfg.rope_theta_local }) |theta| {
@@ -49,7 +53,18 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
         tables[n_tables] = try d.table(f32, t);
         n_tables += 1;
     }
-    var bufs: [9]@TypeOf(d).Buffer = undefined;
+    const nsplit = tower.attnSplit(total, heads, rg.longest);
+    const partials = total * heads * nsplit * (hd + 2);
+    var scratch = try d.alloc(partials + 4 * total);
+    defer d.release(&scratch);
+    {
+        const bd = try gpa.alloc(u32, 4 * total);
+        defer gpa.free(bd);
+        rg.boundsInto(bd[0 .. 2 * total], 0);
+        rg.boundsInto(bd[2 * total ..], eg.window_radius);
+        try d.uploadWordsAt(scratch, partials, bd);
+    }
+    var bufs: [9]Buf = undefined;
     var made: usize = 0;
     defer for (bufs[0..made]) |*b| d.release(b);
     for ([_]usize{ w, w, qd, kvd, kvd, qd, inter, inter, w }) |cols| {
@@ -57,14 +72,6 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
         made += 1;
     }
     const x, const normed, const q, const k, const v, const attn, const gate, const up, const t = bufs;
-    var bounds: ?@TypeOf(d).Buffer = null;
-    defer if (bounds) |*b| d.release(b);
-    if (rg.items() > 1) {
-        const bd = try rg.bounds(gpa);
-        defer gpa.free(bd);
-        bounds = try d.table(u32, bd);
-        d.bindAttention(q, k, v, attn, bounds.?);
-    }
 
     try d.upload(x, x_host);
     try d.beginBatch();
@@ -72,7 +79,8 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
     const half = hd / 2;
     const sin_off = rg.longest * half;
     for (cpu.layers, 0..) |*l, li| {
-        const freqs = if (cfg.isGlobal(li)) tables[0] else tables[1];
+        const global = cfg.isGlobal(li);
+        const freqs = if (global) tables[0] else tables[1];
         try d.rmsNorm(x, normed, l.input_norm, total, w, eps);
         try d.linear(q, normed, total, Weight.init(l.q.bytes, .f32, qd, w), null);
         try d.linear(k, normed, total, Weight.init(l.k.bytes, .f32, kvd, w), null);
@@ -83,7 +91,8 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
             try d.rope(q, freqs, rg.off[i], rg.len(i), heads, qd, half, sin_off);
             try d.rope(k, freqs, rg.off[i], rg.len(i), kvh, kvd, half, sin_off);
         }
-        try d.attention(q, k, v, attn, total, bounds, 0, heads, kvh, hd, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
+        const bounds_off = partials + if (global) 0 else 2 * total;
+        try d.attentionRows(q, k, v, attn, scratch, bounds_off, total, heads, kvh, hd, nsplit, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
         try d.linear(t, attn, total, Weight.init(l.o.bytes, .f32, w, qd), null);
         // The sandwich: the post-attention norm runs BEFORE the residual add.
         try d.rmsNorm(t, t, l.post_attn_norm, total, w, eps);
@@ -106,3 +115,44 @@ pub fn embed(d: anytype, cpu: *const eg.Model, io: std.Io, gpa: std.mem.Allocato
         try cpu.head(io, gpa, x_host[rg.off[i] * w ..][0 .. rg.len(i) * w], out);
     }
 }
+
+/// Device check shared by the Vulkan and CUDA tests: each long fixture case alone,
+/// then all of them in one ragged batch with a short item, against the reference.
+pub fn testLongAgainstReference(comptime Dev: type, handle: anytype) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = try eg.loadLongReference(a, io);
+    var cpu = try eg.Model.open(gpa, io, eg.test_dir);
+    defer cpu.deinit();
+    const d = Dev.init(&cpu);
+
+    var out: [eg.embed_dim]f32 = undefined;
+    for (cases) |c| {
+        try d.embed(handle, io, gpa, c.ids, &out);
+        try eg.expectLong(c, &out, min_cos);
+    }
+
+    const short = [_]u32{ 2, 23391, 1902, 1 };
+    var short_cpu: [eg.embed_dim]f32 = undefined;
+    try cpu.embed(io, gpa, &short, &short_cpu);
+    const ids_list = try a.alloc([]const u32, cases.len + 1);
+    const outs = try a.alloc([]f32, cases.len + 1);
+    ids_list[0] = &short;
+    for (cases, ids_list[1..]) |c, *ids| ids.* = c.ids;
+    for (outs) |*o| o.* = try a.alloc(f32, eg.embed_dim);
+    try d.embedBatch(handle, io, gpa, ids_list, outs);
+    for (cases, outs[1..]) |c, o| try eg.expectLong(c, o, min_cos);
+    const cos_short = eg.cosine(&short_cpu, outs[0]);
+    errdefer std.debug.print("short item batched with long ones: device vs cpu cosine {d}\n", .{cos_short});
+    try std.testing.expect(cos_short >= min_cos);
+
+    const over = try gpa.alloc(u32, eg.max_seq + 1);
+    defer gpa.free(over);
+    @memset(over, 2);
+    try std.testing.expectError(error.SequenceTooLong, d.embed(handle, io, gpa, over, &out));
+}
+
+const min_cos = 0.999999;

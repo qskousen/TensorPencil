@@ -519,15 +519,19 @@ test "the certificate in a pairing string decodes to the DER it was made from" {
     try std.testing.expectEqualSlices(u8, &der, try t.certDer(&out));
 }
 
+/// A socket path in `tmp`, relative to the working directory: the absolute path of a
+/// deep checkout passes the 108-byte socket path limit.
+fn tmpSocketPath(a: std.mem.Allocator, tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, name });
+}
+
 // What tp-serve's shutdown relies on, unix, loopback and a TCP listener on every address.
 test "wake brings a thread blocked in accept back" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(dir);
-    const path = try std.Io.Dir.path.join(a, &.{ dir, "wake.sock" });
+    const path = try tmpSocketPath(a, &tmp, "wake.sock");
     defer a.free(path);
     const Waiter = struct {
         done: std.atomic.Value(bool) = .init(false),
@@ -572,9 +576,7 @@ test "a unix socket with nothing at its path is FileNotFound" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
-    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(dir);
-    const path = try std.Io.Dir.path.join(a, &.{ dir, "nobody.sock" });
+    const path = try tmpSocketPath(a, &tmp, "nobody.sock");
     defer a.free(path);
     try std.testing.expectError(error.FileNotFound, connect(a, io, .{ .unix = path }));
 }

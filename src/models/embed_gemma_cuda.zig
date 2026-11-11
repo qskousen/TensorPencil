@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("tp_gpu").cuda;
 const eg = @import("embed_gemma.zig");
 const embed_gemma_dev = @import("embed_gemma_dev.zig");
+const test_gate = @import("../test_gate.zig");
 const tower_cuda = @import("tower_cuda.zig");
 
 const Backend = cuda.Backend;
@@ -31,7 +32,7 @@ pub const ModelCuda = struct {
 test "embeddinggemma CUDA matches CPU" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = eg.test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -69,7 +70,7 @@ test "embeddinggemma CUDA matches CPU" {
 test "embeddinggemma CUDA embedBatch matches per-item" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = eg.test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -95,4 +96,12 @@ test "embeddinggemma CUDA embedBatch matches per-item" {
         errdefer std.debug.print("item {d}: max abs diff {d}\n", .{ i, maxad });
         try std.testing.expect(maxad < 1e-3);
     }
+}
+
+test "embeddinggemma CUDA matches sentence-transformers past the window" {
+    const gpa = std.testing.allocator;
+    try test_gate.requireModelFile(std.testing.io, eg.test_dir ++ "/model.safetensors");
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    try embed_gemma_dev.testLongAgainstReference(ModelCuda, be);
 }

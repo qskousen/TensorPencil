@@ -5,6 +5,7 @@ const lin_gpu = @import("lin_gpu.zig");
 const gpu = @import("tp_gpu").context;
 const eg = @import("embed_gemma.zig");
 const embed_gemma_dev = @import("embed_gemma_dev.zig");
+const test_gate = @import("../test_gate.zig");
 const tower_gpu = @import("tower_gpu.zig");
 
 pub const ModelGpu = struct {
@@ -32,7 +33,7 @@ pub const ModelGpu = struct {
 test "embeddinggemma Vulkan matches CPU" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = eg.test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
     const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
@@ -63,7 +64,7 @@ test "embeddinggemma Vulkan matches CPU" {
 test "embeddinggemma Vulkan embedBatch matches per-item" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    const dir = eg.test_dir;
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
     const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
@@ -89,4 +90,12 @@ test "embeddinggemma Vulkan embedBatch matches per-item" {
         errdefer std.debug.print("item {d}: max abs diff {d}\n", .{ i, maxad });
         try std.testing.expect(maxad < 1e-4);
     }
+}
+
+test "embeddinggemma Vulkan matches sentence-transformers past the window" {
+    const gpa = std.testing.allocator;
+    try test_gate.requireModelFile(std.testing.io, eg.test_dir ++ "/model.safetensors");
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    try embed_gemma_dev.testLongAgainstReference(ModelGpu, ctx);
 }

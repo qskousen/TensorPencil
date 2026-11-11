@@ -479,9 +479,11 @@
     resize, both from llama.cpp. On EmbeddingGemma 2's tower, quick GELU in place of
     transformers' tanh drops the worst soft token to cosine 0.9934; the 31B tower has not
     been compared with transformers. Settle it against a transformers Gemma 4 run.
-  - EmbeddingGemma 300M (`embed_gemma.zig`) still asserts `seq <= 512` for its window. The
-    `radius` path EmbeddingGemma 2 uses would lift it, once Gemma 3's own bidirectional
-    window rule in transformers is confirmed to be `|q - k| <= w` as well.
+- `attn_bounded` (both EmbeddingGemmas' device attention) is a flash-decoding kernel, one
+  subgroup per query row and a subgroup reduce per key. At 2048 tokens it is 90% of
+  EmbeddingGemma 300M's device time (8.6 ms a layer on the 3090, ~0.5 TFLOPS) and a batch
+  of 8 is slower per item than one. A tiled encoder kernel (key blocks in shared memory,
+  per-row `[start, end)` bounds kept) on both arms is the lever.
 - `anima.zig`'s "the Anima adapter and DiT match ComfyUI on a real checkpoint" leaks one
   1,647,358-byte allocation (no stack trace) at HEAD too, which fails the `-Dintegration`
   step with every test green. Not yet traced.

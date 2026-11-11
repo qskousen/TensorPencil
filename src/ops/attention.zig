@@ -71,8 +71,11 @@ pub fn attention(
     q: []const f32,
     k: []const f32,
     v: []const f32,
-    p: Params,
+    params: Params,
 ) Error!void {
+    // A radius that reaches every key is no window, and must not cost the GEMM path.
+    var p = params;
+    if (p.radius + 1 >= p.seq_kv) p.radius = 0;
     const hd = p.head_dim;
     // Ring layers store `ring` rows instead of the full seq_kv (row = pos%ring).
     const kv_rows = if (p.ring != 0) p.ring else p.seq_kv;
