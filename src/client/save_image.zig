@@ -61,6 +61,8 @@ pub fn paramsAlloc(gpa: std.mem.Allocator, info: *const wire.ImageInfo, w: usize
         // Borrows `steer_scratch`, which outlives this call.
         .cond_steers = opts.cond_noise.steers,
         .loras = loras.items,
+        // This client's build: it is what writes the file.
+        .version = @import("serve").version,
     });
 }
 
@@ -471,6 +473,27 @@ test "a scheduled LoRA gets its own field, and an unscheduled stack none" {
         defer gpa.free(out);
         try std.testing.expect(std.mem.find(u8, out, "Lora schedules") == null);
     }
+}
+
+test "the block names the build that wrote it, before the Civitai hashes" {
+    const gpa = std.testing.allocator;
+    const text = "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 3, Size: 8x8, Model: m, Prompt syntax: ComfyUI";
+    const out = try tp.pipeline.appendExtraParams(gpa, try gpa.dupe(u8, text), .{
+        .model_hash = "0123456789",
+        .version = "v0.1.1-3-g45259f6",
+    });
+    defer gpa.free(out);
+    errdefer std.debug.print("{s}\n", .{out});
+    try std.testing.expect(std.mem.endsWith(u8, out, ", Version: TensorPencil v0.1.1-3-g45259f6, Hashes: {\"model\":\"0123456789\"}"));
+    try std.testing.expectEqual(@as(?u64, 3), parseA1111Params(out).seed);
+
+    // The GUI's saver fills it in from its own build.
+    const info: wire.ImageInfo = .{ .prompt = "p", .req_steps = 1 };
+    const p = try paramsAlloc(gpa, &info, 8, 8);
+    defer gpa.free(p);
+    const want = try gpa.print(", Version: TensorPencil {s}", .{@import("serve").version});
+    defer gpa.free(want);
+    try std.testing.expect(std.mem.find(u8, p, want) != null);
 }
 
 test "an empty Resources leaves the block byte-identical" {

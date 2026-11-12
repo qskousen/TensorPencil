@@ -4573,6 +4573,7 @@ fn renderParams(
         .cond_noise_negative = if (opts.cond_noise.on() and opts.cond_noise.neg_scale != 0) opts.cond_noise.neg_scale else null,
         .cond_steers = opts.cond_noise.steers,
         .loras = loras.items,
+        .version = @import("version").string,
     });
 }
 
@@ -10519,7 +10520,8 @@ fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args
         opts.compat,
         opts.compatConfig(),
     );
-    const params = try pipeline.appendClipParams(gpa, params_base, sess.clipShifts(clip_opts));
+    const params_clip = try pipeline.appendClipParams(gpa, params_base, sess.clipShifts(clip_opts));
+    const params = try pipeline.appendExtraParams(gpa, params_clip, .{ .version = @import("version").string });
     defer gpa.free(params);
     const params_z = try gpa.dupeSentinel(u8, params, 0);
     defer gpa.free(params_z);

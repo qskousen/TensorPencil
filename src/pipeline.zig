@@ -1101,6 +1101,10 @@ pub const Extras = struct {
     /// shape A1111 already uses for `Lora hashes`, because the count varies.
     cond_steers: []const CondNoise.Steer = &.{},
     loras: []const LoraRecord = &.{},
+    /// The build that wrote the block, written as `Version: TensorPencil <version>`
+    /// the way A1111 and Forge name themselves. Readers tell the generator apart by
+    /// it. The library has no `version` module, so the executables fill this in.
+    version: []const u8 = "",
 };
 
 /// Append `r` to a `buildA1111Params` block, freeing `base`.
@@ -1180,8 +1184,10 @@ pub fn appendExtraParams(gpa: std.mem.Allocator, base: []u8, r: Extras) ![]u8 {
         }
     }
 
-    // Civitai's resource map. Keys are kind-prefixed (`lora:<name>`); the model
-    // and VAE use their bare kind.
+    if (r.version.len > 0) try out.print(gpa, ", Version: TensorPencil {s}", .{r.version});
+
+    // Civitai's resource map, last as Civitai writes it. Keys are kind-prefixed
+    // (`lora:<name>`); the model and VAE use their bare kind.
     var n: usize = 0;
     var j: std.ArrayList(u8) = .empty;
     defer j.deinit(gpa);
