@@ -317,7 +317,9 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
 /// What a device's integer GEMM does to the activation before it: rotated when
 /// `rotate`, then quantized per row to `bits` (0: left alone).
 /// `regrid`: the weight too as the device runs it, an svdq weight on its per-row int8 grid.
-pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false, regrid: bool = false, fp8: bool = false };
+/// `nvfp4` quantizes the activation to NVFP4 (`ops.nvfp4.quantizeActRow`); `w_e4m3`
+/// multiplies an NVFP4 weight as its e4m3 decode (`ops.nvfp4.decodeE4m3`).
+pub const ActQuant = struct { bits: u4 = 0, rotate: bool = false, regrid: bool = false, fp8: bool = false, nvfp4: bool = false, w_e4m3: bool = false };
 
 /// A device check's reference: called per linear, so the CPU carries the activation
 /// quantization of the route the device takes for that weight, and the check measures
@@ -327,9 +329,10 @@ pub var act_quant: ?ActQuantHook = null;
 
 /// `row` as the device's prep leaves it: scale `max(absmax / qmax, 1e-12)`, round half
 /// away (to the nearest e4m3, ties even, for `fp8`), the device's clamp, dequantized and
-/// rotated back.
+/// rotated back. NVFP4 is `ops.nvfp4.emulateActRow`.
 pub fn emulateActQuant(row: []f32, q: ActQuant) void {
     std.debug.assert(q.bits == 8 or q.bits == 4);
+    std.debug.assert(!q.nvfp4);
     if (q.fp8) {
         std.debug.assert(!q.rotate);
         var amax: f32 = 0;
@@ -370,14 +373,15 @@ pub fn matmul(
                 if (inv_smooth) |s| for (row, s) |*v, f| {
                     v.* *= f;
                 };
-                emulateActQuant(row, q);
+                if (q.nvfp4) try nvfp4_mod.emulateActRow(gpa, row) else emulateActQuant(row, q);
                 if (inv_smooth) |s| for (row, s) |*v, f| {
                     v.* /= f;
                 };
             }
-            if (q.regrid) {
-                const wr = try svdqRegridF32(gpa, w);
+            if (q.regrid or q.w_e4m3) {
+                const wr = if (q.regrid) try svdqRegridF32(gpa, w) else try gpa.alloc(f32, w.rows * w.cols);
                 defer gpa.free(wr);
+                if (q.w_e4m3) nvfp4_mod.decodeE4m3(wr, w.bytes, w.nvfp4.?.*, w.rows, w.cols);
                 try matmulExact(io, gpa, y, xq, m, Weight.fromF32(wr, w.rows, w.cols), bias);
             } else try matmulExact(io, gpa, y, xq, m, w, bias);
             if (w.svdq) |sq| try svdqLowrank(io, gpa, y, x, m, w, sq.*);

@@ -12,6 +12,7 @@ const std = @import("std");
 const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const kernels = @import("kernels.zig");
+const n_igemm_kinds = @typeInfo(kernels.IgemmKind).@"enum".field_names.len;
 const sage = @import("sage.zig");
 const elt = @import("elt.zig");
 const dual_ptx = @embedFile("dual_ptx");
@@ -269,6 +270,9 @@ pub var force_tc_attn: bool = false;
 /// operands f32. Read when a caller sizes its buffers.
 pub var force_attn_f32_operands: bool = false;
 
+/// A/B knob: int4 convrot runs W4A4 on the s4 `mma` whatever the device's s4 rate.
+pub var force_s4_mma: bool = false;
+
 /// DIAGNOSTIC: `hgemmInto` stores an f32 plane and compacts it in a second pass, the
 /// arithmetic its fused store must match bit for bit (`lin-cuda-test`).
 pub var split_hgemm_epilogue: bool = false;
@@ -489,6 +493,11 @@ pub const Backend = struct {
     // model's widest weight, reused by every GEMM. Keeping it transient is the whole
     // reason the format costs 4 bits per weight here instead of 8, see opI8GemmW4A8.
     w4a8_i8: DeviceBuffer = .{},
+    /// The NVFP4 prep's block-scale words (`kernels.nvf4ScaleBytes` over the padded
+    /// rows), its codes going to `i8_x` and its row scales to `i8_scale`.
+    f4_sa: DeviceBuffer = .{},
+    /// An NVFP4 weight's block-scale words for the `nvf4` GEMM, rebuilt each call.
+    f4_sb: DeviceBuffer = .{},
     /// A block-quant weight decoded to convrot int8, for `opI8GemmBlockQ`. ONE buffer
     /// serves every linear in turn, which is the whole point: the packed weight stays
     /// resident and never expands in VRAM.
@@ -579,8 +588,11 @@ pub const Backend = struct {
     prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty, // keyed by cols
     prep_owned: std.ArrayList(ctxmod.Module) = .empty,
     /// The hand-PTX GEMMs with the rescale fused, per `kernels.IgemmKind` and output dtype.
-    fused_mods: [3]std.EnumArray(Dt, ?ctxmod.Module) = @splat(.initFill(null)),
-    fused_fns: [3]std.EnumArray(Dt, cu.CUfunction) = @splat(.initFill(null)),
+    fused_mods: [n_igemm_kinds]std.EnumArray(Dt, ?ctxmod.Module) = @splat(.initFill(null)),
+    fused_fns: [n_igemm_kinds]std.EnumArray(Dt, cu.CUfunction) = @splat(.initFill(null)),
+    /// The NVFP4 activation prep, per input dtype.
+    f4prep_mods: std.EnumArray(Dt, ?ctxmod.Module) = .initFill(null),
+    f4prep_fns: std.EnumArray(Dt, cu.CUfunction) = .initFill(null),
     // irescale (s32 acc * act_scale[row] * weight_scale[col]) for the cuBLASLt int8
     // path (.libs mode), one per output dtype.
     irescale_mods: [3]?ctxmod.Module = @splat(null),
@@ -894,6 +906,7 @@ pub const Backend = struct {
         for (self.i4_prep_owned.items) |m| m.unload(self.ctx);
         self.i4_prep_owned.deinit(self.gpa);
         for (&self.fused_mods) |*mods| for (&mods.values) |m| if (m) |mm| mm.unload(self.ctx);
+        for (&self.f4prep_mods.values) |m| if (m) |mm| mm.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_x_mod) |m| m.unload(self.ctx);
@@ -941,6 +954,8 @@ pub const Backend = struct {
         self.tensorDestroy(&self.i8_scale);
         self.tensorDestroy(&self.i8_acc);
         self.tensorDestroy(&self.w4a8_i8);
+        self.tensorDestroy(&self.f4_sa);
+        self.tensorDestroy(&self.f4_sb);
         self.tensorDestroy(&self.bq_i8);
         self.tensorDestroy(&self.lora_lo);
         self.tensorDestroy(&self.lora_hi);
@@ -2460,6 +2475,7 @@ pub const Backend = struct {
             .s8 => "igemm_pipe_fused",
             .s4 => "i4gemm_pipe_fused",
             .e4m3 => "f8gemm_pipe_fused",
+            .nvf4 => "f4gemm_pipe_fused",
         };
         const f = mod.getFunction(self.ctx, name) catch return error.CudaError;
         self.fused_mods[slot].set(out, mod);
@@ -2469,7 +2485,8 @@ pub const Backend = struct {
     }
 
     /// One launch of a fused GEMM against the prepped activation: `ws_db` per-column
-    /// scales, or `wsc` for the kinds that take one scalar.
+    /// scales, or `wsc` for the kinds that take one scalar. `nvf4` also reads `f4_sa`
+    /// and `f4_sb`.
     fn launchFused(self: *Backend, kind: kernels.IgemmKind, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: ?DeviceBuffer, wsc: f32, rows: usize, bias_ptr: u64) Error!void {
         const f = try self.fusedFn(kind, y.dt);
         var pa = self.i8_x.ptr();
@@ -2482,8 +2499,11 @@ pub const Backend = struct {
         var pbias = bias_ptr;
         var pm: u32 = @intCast(self.i8_m);
         var pwsc = wsc;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc), @ptrCast(&pc), @ptrCast(&pc), @ptrCast(&pn) };
-        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
+        var psa = self.f4_sa.ptr();
+        var psb = self.f4_sb.ptr();
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc), @ptrCast(&pc), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&psa), @ptrCast(&psb) };
+        const np: usize = if (kind == .nvf4) pg.len else pg.len - 2;
+        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, pg[0..np]) catch return error.CudaError;
     }
 
     fn matmulFn(self: *Backend) Error!cu.CUfunction {
@@ -5284,6 +5304,92 @@ pub const Backend = struct {
         return self.prepRows(x, null, m, cols, .e4m3, false);
     }
 
+    /// NVFP4 W4A4: quantize `x[m][cols]` to NVFP4 for `opF4Gemm`, the codes into `i8_x`,
+    /// the per-row scales into `i8_scale` and the block scales into `f4_sa`. Needs
+    /// `hasFp4Mma` and cols % 128 == 0. The pad rows' codes and scales are left as they
+    /// were: the GEMM computes those rows and stores none of them.
+    pub fn opF4Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+        std.debug.assert(self.hasFp4Mma() and cols % 128 == 0);
+        self.ptic();
+        defer self.ptoc(.prep);
+        const mpad = std.mem.alignForward(usize, m, 128);
+        try self.ensureDeviceBuffer(&self.i8_x, mpad * cols / 2);
+        try self.ensureDeviceBuffer(&self.i8_scale, mpad * 4);
+        try self.ensureDeviceBuffer(&self.f4_sa, kernels.nvf4ScaleBytes(mpad, cols));
+        const f = try self.f4PrepFn(x.dt);
+        var px = x.ptr();
+        var pq = self.i8_x.ptr();
+        var psc = self.f4_sa.ptr();
+        var ps = self.i8_scale.ptr();
+        var pcols: u32 = @intCast(cols);
+        var pmpad: u32 = @intCast(mpad);
+        var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&psc), @ptrCast(&ps), @ptrCast(&pcols), @ptrCast(&pmpad) };
+        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, 0, &pp) catch return error.CudaError;
+        self.i8_m = m;
+        self.i8_mpad = mpad;
+        self.i8_cols = cols;
+    }
+
+    fn f4PrepFn(self: *Backend, dt: Dt) Error!cu.CUfunction {
+        if (self.f4prep_mods.get(dt) != null) return self.f4prep_fns.get(dt);
+        const src = kernels.buildNvf4Prep(self.gpa, dt) catch return error.OutOfMemory;
+        defer self.gpa.free(src);
+        var mod = self.ctx.loadModule(src) catch return error.CudaError;
+        const f = mod.getFunction(self.ctx, "f4prep") catch return error.CudaError;
+        self.f4prep_mods.set(dt, mod);
+        self.f4prep_fns.set(dt, f);
+        return f;
+    }
+
+    /// NVFP4 W4A4 GEMM against the last `opF4Prep`, on the block-scaled fp4 mma:
+    /// `y = sum_blocks(scale_a * scale_w * codes_a . codes_w) * act_scale[row] * global
+    /// (+ bias)`. `scales` are the unswizzled `[rows][cols/16]` bytes.
+    pub fn opF4Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, scales: []const u8, global: f32, rows: usize, bias: ?[]const f32) Error!void {
+        const cols = self.i8_cols;
+        std.debug.assert(w_bytes.len == rows * cols / 2 and scales.len == rows * cols / 16);
+        const w_db = try self.cachedWeight(w_bytes);
+        self.hold(w_db);
+        defer self.unhold();
+        {
+            self.ptic();
+            defer self.ptoc(.prep);
+            const s_db = try self.cachedWeight(scales);
+            try self.ensureDeviceBuffer(&self.f4_sb, kernels.nvf4ScaleBytes(rows, cols));
+            const words = rows * cols / kernels.nvf4_word_k;
+            try self.dualElems("nvfp4_scale_words", s_db, self.f4_sb, null, null, .{ @intCast(words), @intCast(rows), @intCast(cols / kernels.nvf4_word_k), 0, 0, 0, 0 }, .{ 0, 0 }, words);
+        }
+        const bias_ptr = try self.epilogueBias(bias, rows);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        return self.launchFused(.nvf4, y, w_db, null, global, rows, bias_ptr);
+    }
+
+    /// NVFP4 W4A8: the weight decoded to e4m3 (`ops.nvfp4.Levels.e4m3v`, `table`) this
+    /// call, then the fp8 GEMM against the last `opF8Prep` at `scale`, which is
+    /// `Levels.e4m3_unit * global`.
+    pub fn opF8GemmNvfp4(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, scales: []const u8, table: []const u8, scale: f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        std.debug.assert(w_bytes.len == rows * cols / 2 and scales.len == rows * cols / 16 and table.len == 256 * 16);
+        {
+            self.ptic();
+            defer self.ptoc(.prep);
+            const w_db = try self.cachedWeight(w_bytes);
+            const s_db = try self.cachedWeight(scales);
+            const t_db = try self.cachedWeight(table);
+            try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
+            const threads = rows * cols / 8;
+            try self.dualElems("nvfp4_e4m3", w_db, self.w4a8_i8, s_db, t_db, .{ @intCast(threads), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+        }
+        const bias_ptr = try self.epilogueBias(bias, rows);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        return self.launchFused(.e4m3, y, self.w4a8_i8, null, scale, rows, bias_ptr);
+    }
+
+    /// Whether this device has the block-scaled fp4 mma (`kernels.fp4_need`).
+    pub fn hasFp4Mma(self: *const Backend) bool {
+        return self.ctx.cc_major == 12;
+    }
+
     /// Whether this device has the fp8 tensor cores (`kernels.fp8_need`).
     pub fn hasFp8Mma(self: *const Backend) bool {
         return @as(u32, @intCast(self.ctx.cc_major * 10 + self.ctx.cc_minor)) >= kernels.fp8_need.sm;
@@ -5625,6 +5731,28 @@ pub const Backend = struct {
             try self.dualElems("svdq_decode", c_db, self.w4a8_i8, s_db, i_db, .{ @intCast(threads), @intCast(cols), 0, @intFromBool(fp4), 0, 0, 0 }, .{ 0, 0 }, threads);
         }
         return self.opI8GemmDev(y, self.w4a8_i8, row_scale, rows, bias);
+    }
+
+    /// The int8 GEMM over an int4 convrot weight decoded into `w4a8_i8` this call: W4A8
+    /// arithmetic for a device whose s4 `mma` is slower than its s8 one, the packed form
+    /// still the resident one.
+    pub fn opI8GemmI4(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, row_scale: []const f32, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        {
+            self.ptic();
+            defer self.ptoc(.prep);
+            std.debug.assert(w_bytes.len == rows * cols / 2 and cols % 8 == 0);
+            const w_db = try self.cachedWeight(w_bytes);
+            try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
+            const threads = rows * cols / 8;
+            try self.dualElems("i4_decode", w_db, self.w4a8_i8, null, null, .{ @intCast(threads), 0, 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+        }
+        return self.opI8GemmDev(y, self.w4a8_i8, row_scale, rows, bias);
+    }
+
+    /// Whether this device's s4 tensor-core `mma` beats its s8 one: Ampere and Ada run it
+    /// at twice the rate; sm_120 emulates it at an eighth (`cuda-i4-test` prints both).
+    pub fn hasFastS4Mma(self: *const Backend) bool {
+        return force_s4_mma or self.ctx.cc_major == 8;
     }
 
     /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here, the raw

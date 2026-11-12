@@ -1415,6 +1415,52 @@ pub inline fn w6a8Decode(e: Env) void {
     e.stW(.b, t, p0[0] | (p0[1] << 8) | (p1[0] << 16) | (p1[1] << 24));
 }
 
+/// A nibble-packed int4 convrot weight to row-major int8 `[rows][cols]` (the CUDA layout),
+/// eight columns a thread. The low nibble is the even column; the per-row scale stays with
+/// the GEMM. a = packed `[rows][cols/2]`, b = int8 out. u0 = rows*cols/8.
+pub inline fn i4Decode(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const w = e.ldW(.a, t);
+    var out: [2]u32 = .{ 0, 0 };
+    inline for (0..8) |i| {
+        const nib = (w >> (4 * i)) & 0xF;
+        const s8 = ((nib ^ 8) -% 8) & 0xFF;
+        out[i / 4] |= s8 << (8 * (i % 4));
+    }
+    e.stW(.b, 2 * t, out[0]);
+    e.stW(.b, 2 * t + 1, out[1]);
+}
+
+/// An NVFP4 weight as e4m3 codes for the fp8 GEMM, `out[e] = table[scale(e)][code(e)]`
+/// with `table` the host's `ops.nvfp4.Levels.e4m3v`, so it does no arithmetic. A thread
+/// owns 8 elements, one packed word, HIGH nibble first, inside one 16-element block.
+/// a = packed u32 `[rows*cols/8]`, b = e4m3 out, c = unswizzled block scales,
+/// d = table `[256][16]`. u0 = rows*cols/8.
+pub inline fn nvfp4ToE4m3(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const w = e.ldW(.a, t);
+    const row = e.byte(.c, t >> 1) * 16;
+    var out: [2]u32 = .{ 0, 0 };
+    inline for (0..4) |j| {
+        const hi = e.byte(.d, row + ((w >> (8 * j + 4)) & 0xF));
+        const lo = e.byte(.d, row + ((w >> (8 * j)) & 0xF));
+        out[j / 2] |= (hi | lo << 8) << (16 * (j % 2));
+    }
+    e.stW(.b, 2 * t, out[0]);
+    e.stW(.b, 2 * t + 1, out[1]);
+}
+
+/// The `nvf4` GEMM's weight scale words from the unswizzled `[rows][cols/16]` bytes: a
+/// transpose of u32 words to `[cols/64][rows]`. a = scales, b = words.
+/// u0 = rows * cols/64, u1 = rows, u2 = cols/64.
+pub inline fn nvfp4ScaleWords(e: Env) void {
+    const t = k.elem(e) orelse return;
+    const rows = e.u(1);
+    const g = t / rows;
+    const r = t - g * rows;
+    e.stW(.b, t, e.ldW(.a, r * e.u(2) + g));
+}
+
 /// `w6a8Decode` into the k-major layout Vulkan's int8 GEMM reads, from inputs the
 /// weight upload already byte-transposed (see `w4a8_decode_t` in eltwise.zig, whose
 /// layout this keeps): a = packed `[3*cols/4][stride]`, c = s_rel `[cols/group][stride]`,

@@ -182,18 +182,18 @@
   velocity vs the bf16 source 0.118 weight-only, 0.108 W8A8 (noise floor 5.7e-2 against
   weight-only's 1.5e-3); render vs bf16 30.8 dB weight-only, 29.5 dB W8A8. The int8 convrot
   file of the same model measures 0.027 and 34.4 dB at the same speed
-- int4 convrot W4A4 is ~8x slower in the GEMM on sm_120 than int8 (the s4 `mma` is emulated
-  there, `cuda-i4-test` rates). Route int4 to the W4A8 decode (`i4_i8`, what Vulkan runs) on
-  any device whose s4 rate is not above its s8 rate: a `lin_cuda.Caps` bit from the compute
-  capability (native s4 on sm_80-89 only), then render A/B on gen
-- fp4 on Blackwell's fp4 tensor cores: NVFP4 (and SVDQuant fp4) weights read at 4 bits
-  instead of decoding to bf16 every GEMM. Routes, each its own `dual_lin` route gated by a
-  `lin_cuda.Caps` bit and opt-in until measured like fp8 W8A8: W4A4 (activation quantized to
-  E2M1 with per-16 fp8 scales, block-scaled `mma` on sm_120a, `ptx.Builder.requires` with
-  `arch_specific`) and W4A8 (fp4 weight against an e4m3 activation, reusing `f8prep`). The
-  cuDNN arm can take cuBLASLt's block-scaled fp4 GEMM instead. Measure on gen with Krea2
-  Turbo's NVFP4 file (Comfy-Org/Krea-2): speed against the bf16 decode, velocity and render
-  against the bf16 file, and the perturb floor. MXFP4/MXFP8 files are unread
+- int4 convrot on sm_8x still runs W4A4, whose arithmetic adds about as much velocity
+  error as the int4 weight itself (Krea2 Turbo on the PRO 6000: 0.21 vs the weight's 0.23,
+  W4A8 adds 0.018). Measure the 3090's W4A4 against `i4_i8` there for speed and error
+  (`diffusion-profile --ab s4` needs the inverse knob) and decide whether W4A8 should be
+  the default everywhere. GGUF `--dit-gguf-gemm int4` (`blockq_i4`) is still the s4 GEMM
+  on every card, slow on sm_120
+- NVFP4 on Blackwell: W4A4 is the denoiser default, W4A8 and weight-only by `--dit-fp4-gemm`.
+  Open: the nvf4 GEMM
+  reaches 1.64x s8 of the mma's 2x, so profile its scale loads (12 global u32 per k64 step)
+  against staging them through shared; SVDQuant fp4 on the same mma; cuBLASLt's block-scaled
+  fp4 GEMM for the `cuda` arm; text encoders under W4A8/W4A4; MXFP4/MXFP8 files are unread
+  (MXFP4 would take `kind::mxf8f6f4` with ue8m0 scales for a true fp4 x e4m3 W4A8)
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
   "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL
@@ -528,3 +528,25 @@
 - `anima.zig`'s "the Anima adapter and DiT match ComfyUI on a real checkpoint" leaks one
   1,647,358-byte allocation (no stack trace) at HEAD too, which fails the `-Dintegration`
   step with every test green. Not yet traced.
+- LiveGrid, a tp-gui mode for seeing how parameters change a model's output: one prompt,
+  N axes, a render per cell, the grid filling in live as cells finish. A1111's X/Y/Z plot
+  is the prior art; this one is N-dimensional, live, and can grow after it is made.
+  - An axis is a parameter plus its values: a numeric range and step (cfg, steps, shift,
+    denoise, a LoRA's strength) or a list (sampler, scheduler, seeds, LoRAs, a prompt
+    search-and-replace). Everything not on an axis is fixed from the studio's settings,
+    seed included, so a cell differs from its neighbour only in what the axes say.
+  - A cell is keyed by its full parameter set, not its grid position, so editing the grid
+    (add an axis, extend or refine a range, drop a value) keeps every finished cell.
+    Adding an axis files the existing cells under that axis's current value; the GUI
+    has to show which one.
+  - Cells go through the existing queue and placement (`client/sched.zig`), so a grid
+    spreads across hosts. Fill order matters for a live view: coarse to fine (corners,
+    then midpoints) shows the whole picture early, rather than row by row.
+  - Display: two axes form the visible grid, the rest are sliders or arrow keys that step
+    through slices, and any axis can be swapped onto the grid. A cell opens in the
+    viewer and the studio like any other render, and its saved PNG records its own
+    parameters.
+  - Before it starts, show the cell count and an estimated time from measured s/step;
+    three axes of ten values each is 1000 renders.
+  - Persist a grid (its definition plus references to its images) so it can be
+    reopened and extended later.

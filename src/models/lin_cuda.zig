@@ -104,6 +104,8 @@ pub fn actQuant(be: *Backend, p: Plan, w: Weight, m: usize) ops.matmul.ActQuant 
         .i4 => .{ .bits = 4, .rotate = p.rot },
         .svdq => .{ .bits = 8, .regrid = true },
         .fp8_w8a8 => .{ .bits = 8, .fp8 = true },
+        .nvfp4_f8 => .{ .bits = 8, .fp8 = true, .w_e4m3 = true },
+        .nvfp4_mma => .{ .bits = 4, .nvfp4 = true },
         else => .{},
     };
 }
@@ -138,22 +140,22 @@ pub fn activationIs4Bit(pol: BlockQGemm, dt: DType) bool {
 /// route is f32 on both sides.
 pub fn routeTakes16(r: Route) bool {
     return switch (r) {
-        .i8, .w4a8, .blockq_i8, .h16_f32, .h16_f16, .h16_bf16, .gemm_fp8, .gemm_fp8_bf16, .fp8_w8a8 => true,
+        .i8, .i4_i8, .w4a8, .blockq_i8, .h16_f32, .h16_f16, .h16_bf16, .gemm_fp8, .gemm_fp8_bf16, .fp8_w8a8, .nvfp4_f8, .nvfp4_mma => true,
         else => false,
     };
 }
 
 /// Whether every weight here can sit in a 16-bit activation chain, which a family
 /// asks once to decide its activation storage.
-pub fn takes16(p: Plan, ws: []const Weight) bool {
-    for (ws) |w| if (!routeTakes16(route(p, w) orelse return false)) return false;
+pub fn takes16(be: *const Backend, p: Plan, ws: []const Weight) bool {
+    for (ws) |w| if (!routeTakes16(routeOn(be, p, w, 1) orelse return false)) return false;
     return true;
 }
 
 /// Whether every weight here runs on the int8 prep, which is what lets a caller chain
 /// them through 16-bit activations.
-pub fn allI8(p: Plan, ws: []const Weight) bool {
-    for (ws) |w| if ((route(p, w) orelse return false).prep() != .i8) return false;
+pub fn allI8(be: *const Backend, p: Plan, ws: []const Weight) bool {
+    for (ws) |w| if ((routeOn(be, p, w, 1) orelse return false).prep() != .i8) return false;
     return true;
 }
 
@@ -237,7 +239,7 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
         try be.opCast(x, x32, m * cols, 0);
         g.x32 = x32;
     }
-    // The int8 and e4m3 preps read `x` at its own dtype; the rest read f32.
+    // The int8, e4m3 and NVFP4 preps read `x` at its own dtype; the rest read f32.
     const xf = g.x32 orelse x;
     switch (want) {
         .none => {},
@@ -248,6 +250,11 @@ pub fn prep(be: *Backend, p: Plan, x: Buf, m: usize, cols: usize, group: []const
         },
         .f8 => {
             try be.opF8Prep(x, m, cols);
+            serial_int +%= 1;
+            g.serial = serial_int;
+        },
+        .f4 => {
+            try be.opF4Prep(x, m, cols);
             serial_int +%= 1;
             g.serial = serial_int;
         },
@@ -296,7 +303,7 @@ pub fn gemm(be: *Backend, p: Plan, g: Group, y: Buf, w: Weight, bias: ?[]const f
     // A prepped route needs the scratch this group wrote, and nothing since.
     switch (r.prep()) {
         .none => {},
-        .i8, .i4, .svdq, .f8 => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
+        .i8, .i4, .svdq, .f8, .f4 => std.debug.assert(g.prep == r.prep() and g.serial == serial_int),
         .q8 => std.debug.assert((g.prep == .q8 or g.prep == .mmq) and g.serial == serial_q8),
         .mmq => std.debug.assert(g.prep == .mmq and g.serial == serial_q8),
     }
@@ -389,13 +396,20 @@ pub fn linearSiluMul(be: *Backend, p: Plan, y: Buf, gate: Buf, up: Buf, m: usize
 /// The CUDA backend's capabilities, as `dual_lin.routeOf` asks for them.
 pub const Caps = struct {
     fp8_mma: bool = false,
+    /// The s4 `mma` beats the s8 one; without it int4 decodes to int8 per GEMM.
+    s4_mma: bool = true,
+    fp4_mma: bool = false,
 
     pub fn of(be: *const Backend) Caps {
-        return .{ .fp8_mma = be.hasFp8Mma() };
+        return .{ .fp8_mma = be.hasFp8Mma(), .s4_mma = be.hasFastS4Mma(), .fp4_mma = be.hasFp4Mma() };
     }
     /// The e4m3 prep and `opF8Gemm`: 128-row GEMM tiles, 256-column prep words.
     pub fn fp8Mma(c: Caps, w: Weight) bool {
         return c.fp8_mma and w.rows % 128 == 0 and w.cols % 256 == 0;
+    }
+    /// `opF4Prep` and `opF4Gemm`: 128-row GEMM tiles over 128-column slabs.
+    pub fn fp4Mma(c: Caps, w: Weight) bool {
+        return c.fp4_mma and w.rows % 128 == 0 and w.cols % 128 == 0;
     }
     pub fn quantKernel(_: Caps, dt: DType) bool {
         return Backend.quantKernelSupported(dt);
@@ -444,11 +458,11 @@ pub const Caps = struct {
     pub fn i8Gemm(_: Caps) bool {
         return true;
     }
-    pub fn i4Native(_: Caps) bool {
-        return true;
+    pub fn i4Native(c: Caps) bool {
+        return c.s4_mma;
     }
     pub fn i4Decode(_: Caps) bool {
-        return false;
+        return true;
     }
     pub fn w4a8(_: Caps) bool {
         return true;
@@ -512,7 +526,7 @@ pub const Caps = struct {
             // No rotation, so no 256-wide groups; Nunchaku's packing tiles 128 both ways.
             .svdq => if (w.rows % 128 != 0 or w.cols % 128 != 0) return .int_shape,
             // `fp8Mma` holds the e4m3 route's shape before routing picks it.
-            .mmq, .none, .q8, .f8 => {},
+            .mmq, .none, .q8, .f8, .f4 => {},
         }
         return switch (r) {
             // `opI4Prep` always rotates and has no unrotated build.
@@ -555,7 +569,7 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
     var folded = true;
     switch (r) {
         // Routes for kernels this backend lacks; `Caps` never chooses them.
-        .gemm_fp8_f32, .gemv_f32, .gemv_f32n, .gemv_f32_rows, .i4_i8, .gemv_dualn, .gemv_dualn_q8 => return error.UnsupportedDType,
+        .gemm_fp8_f32, .gemv_f32, .gemv_f32n, .gemv_f32_rows, .gemv_dualn, .gemv_dualn_q8 => return error.UnsupportedDType,
         .gemm_f32 => if (w.scale == 1)
             be.opMatmulF32Lt(y, x, m, w.bytes, w.rows, w.cols, bias) catch |err| switch (err) {
                 error.UnsupportedKernelArm => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, bias),
@@ -608,6 +622,15 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
         },
         .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
         .fp8_w8a8 => try be.opF8Gemm(y, w.bytes, w.scale, w.rows, bias),
+        .nvfp4_f8 => {
+            const meta = w.nvfp4.?;
+            const lv = meta.levels;
+            try be.opF8GemmNvfp4(y, w.bytes, meta.scales, std.mem.asBytes(&lv.e4m3v), ops.nvfp4.Levels.e4m3_unit * lv.global, w.rows, w.cols, bias);
+        },
+        .nvfp4_mma => {
+            const meta = w.nvfp4.?;
+            try be.opF4Gemm(y, w.bytes, meta.scales, meta.levels.global, w.rows, bias);
+        },
         .svdq => {
             const sq = w.svdq.?;
             try be.opI8GemmSvdq(y, w.bytes, sq.scales, sq.i8_mul, sq.codes == .fp4, w.row_scale.?, w.rows, w.cols, bias);
@@ -635,6 +658,7 @@ pub fn exec(be: *Backend, r: dual_lin.Route, o: Opts, y: Buf, x: Buf, m: usize, 
             try be.opI8GemmW4A8(y, w.bytes, meta.s_rel, meta.levelBytes(), w.row_scale.?, w.rows, w.cols, meta.group_size, bias);
         },
         .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows, bias),
+        .i4_i8 => try be.opI8GemmI4(y, w.bytes, w.row_scale.?, w.rows, w.cols, bias),
         // Expanded to bf16 per call, rotated back into the checkpoint's basis, against
         // the f32 activation.
         .i8_wo => try be.opI8GemmWo(y, x, m, w.bytes, w.row_scale.?, w.rows, w.cols, o.rot, zb),
@@ -766,14 +790,15 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
     var w4: usize = 0;
     // The zero bias at its widest before any forward: growing it syncs the stream.
     var zb: usize = 0;
-    for (lins) |w| if (route(p, w)) |r| if (readsZeroBias(r)) {
+    for (lins) |w| if (routeOn(be, p, w, 1)) |r| if (readsZeroBias(r)) {
         zb = @max(zb, w.rows);
     };
     if (zb != 0) _ = try be.zeroBias(zb);
-    for (lins) |w| switch (route(p, w) orelse continue) {
+    for (lins) |w| switch (routeOn(be, p, w, 1) orelse continue) {
         .blockq_i8 => bq = @max(bq, Backend.blockQScratchBytes(w.rows, w.cols)),
         .blockq_i4 => bq = @max(bq, Backend.blockQScratchBytesI4(w.rows, w.cols)),
-        .w4a8, .svdq => w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols)),
+        .w4a8, .svdq, .i4_i8, .nvfp4_f8 => w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols)),
+        .nvfp4_mma => try be.ensureDeviceBuffer(&be.f4_sb, cuda.kernels.nvf4ScaleBytes(w.rows, w.cols)),
         // Grown per linear, never shrunk, so the loop leaves the widest.
         .w4a8_wo, .w4a8_wo16 => {
             w4 = @max(w4, Backend.w4a8ScratchBytes(w.rows, w.cols));
@@ -795,7 +820,7 @@ pub fn presize(be: *Backend, p: Plan, lins: []const Weight) !void {
 /// `presize` for the scratch that scales with the activation: the weight-only
 /// routes' bf16 copy of it. `max_rows` as in `presizeLora`.
 pub fn presizeRows(be: *Backend, p: Plan, lins: []const Weight, max_rows: usize) !void {
-    for (lins) |w| switch (route(p, w) orelse continue) {
+    for (lins) |w| switch (routeOn(be, p, w, 1) orelse continue) {
         .i8_wo, .i4_wo, .w4a8_wo, .svdq_wo => try be.reserveWo(w.rows, w.cols, max_rows),
         else => {},
     };
@@ -1080,7 +1105,6 @@ test "weight-only routes an integer convrot weight to its bf16 twin and nothing 
     try std.testing.expectEqual(@as(?Route, .gemm_bf16), route(p, dense));
     // No int8 prep is staged, which is what keeps a LoRA hit here on the bf16 A GEMM.
     try std.testing.expectEqual(Prep.none, route(p, q).?.prep());
-    try std.testing.expect(!allI8(p, &.{q}));
 }
 
 // The weight-only decode run on the host through the helpers its dual kernels call:
@@ -1321,6 +1345,40 @@ test "fp8 takes the fp8 tensor cores only when asked, on a device with them, at 
     try std.testing.expectEqual(@as(?Route, .gemm_fp8), dual_lin.routeOf(Caps, has, w, 4096, .{}));
     try std.testing.expectEqual(@as(?Route, .gemm_fp8), dual_lin.routeOf(Caps, has, fake(.f8_e4m3, 6144, 6100), 4096, w8a8));
     try std.testing.expectEqual(dual_lin.Prep.f8, Route.fp8_w8a8.prep());
+}
+
+test "NVFP4 follows the fp4 dial down to what the device has" {
+    const w = fake(.nvfp4, 3072, 3072);
+    const both: Caps = .{ .fp8_mma = true, .fp4_mma = true };
+    const fp8_only: Caps = .{ .fp8_mma = true };
+    const w4a4: dual_lin.Policy = .{ .fp4 = .w4a4 };
+    const w4a8: dual_lin.Policy = .{ .fp4 = .w4a8 };
+    try std.testing.expectEqual(@as(?Route, .nvfp4), dual_lin.routeOf(Caps, both, w, 4096, .{}));
+    try std.testing.expectEqual(@as(?Route, .nvfp4_mma), dual_lin.routeOf(Caps, both, w, 4096, w4a4));
+    try std.testing.expectEqual(@as(?Route, .nvfp4_f8), dual_lin.routeOf(Caps, both, w, 4096, w4a8));
+    try std.testing.expectEqual(@as(?Route, .nvfp4_f8), dual_lin.routeOf(Caps, fp8_only, w, 4096, w4a4));
+    try std.testing.expectEqual(@as(?Route, .nvfp4), dual_lin.routeOf(Caps, .{}, w, 4096, w4a4));
+    // The fp8 prep needs 256-column words, the fp4 GEMM 128-column slabs.
+    try std.testing.expectEqual(@as(?Route, .nvfp4_mma), dual_lin.routeOf(Caps, both, fake(.nvfp4, 3072, 3200), 4096, w4a4));
+    try std.testing.expectEqual(@as(?Route, .nvfp4), dual_lin.routeOf(Caps, both, fake(.nvfp4, 3072, 3200), 4096, w4a8));
+    try std.testing.expectEqual(dual_lin.Prep.f4, Route.nvfp4_mma.prep());
+    try std.testing.expectEqual(dual_lin.Prep.f8, Route.nvfp4_f8.prep());
+}
+
+test "a denoiser trunk runs NVFP4 W4A4 by default and nothing else follows the fp4 dial" {
+    const w = fake(.nvfp4, 3072, 3072);
+    try std.testing.expectEqual(dual_lin.Fp4Gemm.w4a4, check(&.{w}, .{ .blockq = blockq_gemm }).ok.fp4);
+    try std.testing.expectEqual(dual_lin.Fp4Gemm.weight_only, check(&.{w}, Use.encoder(encoder_gemm)).ok.fp4);
+    try std.testing.expectEqual(dual_lin.Fp4Gemm.weight_only, check(&.{w}, Use.llm(512)).ok.fp4);
+}
+
+test "int4 decodes to the int8 GEMM on a device whose s4 mma is slow" {
+    const w = fake(.i4, 6144, 6144);
+    const pol: dual_lin.Policy = .{};
+    try std.testing.expectEqual(@as(?Route, .i4), dual_lin.routeOf(Caps, .{}, w, 4096, pol));
+    try std.testing.expectEqual(@as(?Route, .i4_i8), dual_lin.routeOf(Caps, .{ .s4_mma = false }, w, 4096, pol));
+    try std.testing.expect(routeTakes16(.i4_i8));
+    try std.testing.expectEqual(dual_lin.Prep.i8, Route.i4_i8.prep());
 }
 
 test "only a denoiser trunk's plan follows the fp8 dial" {

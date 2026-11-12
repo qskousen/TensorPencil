@@ -72,6 +72,11 @@ pub const Route = enum {
     i4_wo32,
     w4a8_wo32,
     nvfp4,
+    /// NVFP4 against an NVFP4 activation on the block-scaled fp4 tensor cores (W4A4,
+    /// `Fp4Gemm.w4a4`), and NVFP4 decoded to e4m3 per call against the e4m3 prep (W4A8,
+    /// `Fp4Gemm.w4a8`).
+    nvfp4_mma,
+    nvfp4_f8,
     /// Nunchaku SVDQuant decoded to int8 per call against its own prep: the activation
     /// smoothed, then the int8 prep unrotated (`ops/svdq.zig`). The `_wo` twins expand
     /// it exactly against the unquantized activation, at bf16, f16 or f32.
@@ -110,7 +115,8 @@ pub const Route = enum {
             .blockq_mmq => .mmq,
             .svdq => .svdq,
             .gemv_q8, .gemv_q8n, .gemv_q8batch, .gemv_dual_q8, .gemv_dualn_q8 => .q8,
-            .fp8_w8a8 => .f8,
+            .fp8_w8a8, .nvfp4_f8 => .f8,
+            .nvfp4_mma => .f4,
             else => .none,
         };
     }
@@ -118,8 +124,8 @@ pub const Route = enum {
 
 /// What a route reads besides the weight: only `x`, the int8 or int4 convrot
 /// activation, the MMQ tile's q8_1 one, the GEMVs' q8 one, SVDQuant's smoothed int8,
-/// or the e4m3 one.
-pub const Prep = enum { none, i8, i4, mmq, q8, svdq, f8 };
+/// the e4m3 one, or the NVFP4 one.
+pub const Prep = enum { none, i8, i4, mmq, q8, svdq, f8, f4 };
 
 /// Which GEMM a GGUF block-quant weight takes as a batch. A caller's choice: a DiT and a
 /// text encoder want different trades from the same file.
@@ -154,6 +160,13 @@ pub const IntGemm = enum { w8a8, weight_only, weight_only_f16, weight_only_f32 }
 /// weight as stored, which reads it at one byte and skips the expansion.
 pub const Fp8Gemm = enum { weight_only, w8a8 };
 
+/// What an NVFP4 weight multiplies against. `weight_only` expands it to bf16 per call
+/// against the unquantized activation (every device); `w4a8` decodes it to e4m3 per call
+/// against the e4m3 activation, on fp8 tensor cores; `w4a4` quantizes the activation to
+/// NVFP4 for the block-scaled fp4 tensor cores, which is ComfyUI's arithmetic on
+/// Blackwell. Each falls back to the next where the device lacks it.
+pub const Fp4Gemm = enum { weight_only, w4a8, w4a4 };
+
 /// How every conditioning pass (the CLIP towers, the Qwen3 text encoders, SenseNova's
 /// prompt pass) runs an integer convrot weight, `--te-int-gemm`, on both backends.
 /// Weight-only by default for `lin_cuda.encoder_gemm`'s reason, and because a prompt's
@@ -177,6 +190,11 @@ pub var trunk_int8: IntGemm = .w8a8;
 /// error is smaller than the fp8 weight's own; elsewhere it falls back to weight-only.
 pub var trunk_fp8: Fp8Gemm = .w8a8;
 
+/// How a denoiser trunk's NVFP4 weights run, for a plan whose `Use` names none. W4A4 by
+/// default, ComfyUI's arithmetic on Blackwell and 3.5x the bf16 decode there; elsewhere
+/// it falls back to W4A8, then weight-only.
+pub var trunk_fp4: Fp4Gemm = .w4a4;
+
 pub fn encoderInt8() IntGemm {
     return encoder_int8 orelse encoder_int8_dial;
 }
@@ -199,6 +217,7 @@ pub const Policy = struct {
     blockq: BlockQGemm = .auto,
     int8: IntGemm = .w8a8,
     fp8: Fp8Gemm = .weight_only,
+    fp4: Fp4Gemm = .weight_only,
     dense: DenseCompute = .native,
     act16: Act16 = .f16,
     /// DIAGNOSTICS of the GEMV policy. `decode_dp4a = false` sends block-quant decode
@@ -249,6 +268,8 @@ pub const Plan = struct {
     int8: IntGemm = .w8a8,
     /// The fp8 weights' GEMM where the device has fp8 tensor cores.
     fp8: Fp8Gemm = .weight_only,
+    /// The NVFP4 weights' GEMM.
+    fp4: Fp4Gemm = .weight_only,
     /// How dense weights compute. Set after `plan` by the family.
     dense: DenseCompute = .native,
     /// The 16-bit width a route that narrows the f32 activation stages it in. `bf16` for
@@ -267,7 +288,7 @@ pub const Plan = struct {
 
     /// The routing policy, with the GEMV diagnostics as currently set.
     pub fn policy(p: Plan) Policy {
-        return .{ .gemv = p.gemv, .blockq = p.blockq, .int8 = p.int8, .fp8 = p.fp8, .dense = p.dense, .act16 = p.act16, .decode_dp4a = decode_dp4a, .force = force, .dual_decode = dual_decode };
+        return .{ .gemv = p.gemv, .blockq = p.blockq, .int8 = p.int8, .fp8 = p.fp8, .fp4 = p.fp4, .dense = p.dense, .act16 = p.act16, .decode_dp4a = decode_dp4a, .force = force, .dual_decode = dual_decode };
     }
 };
 
@@ -280,19 +301,21 @@ pub const Use = struct {
     int8: ?IntGemm = null,
     /// Null takes `trunk_fp8`.
     fp8: ?Fp8Gemm = null,
+    /// Null takes `trunk_fp4`.
+    fp4: ?Fp4Gemm = null,
     act16: Act16 = .f16,
     max_rows: usize = 1,
 
     /// An LLM stepper's: integer convrot weights weight-only (they need no prep, and a
     /// prompt's activations carry the outliers per-token int8 cannot hold), fp8 likewise.
     pub fn llm(max_rows: usize) Use {
-        return .{ .blockq = .llm, .gemv = true, .int8 = .weight_only, .fp8 = .weight_only, .max_rows = max_rows };
+        return .{ .blockq = .llm, .gemv = true, .int8 = .weight_only, .fp8 = .weight_only, .fp4 = .weight_only, .max_rows = max_rows };
     }
 
-    /// A conditioning pass's: integer weights take the conditioning dial, fp8 runs
-    /// weight-only (fp8 W8A8 is measured on denoiser trunks only).
+    /// A conditioning pass's: integer weights take the conditioning dial, fp8 and NVFP4
+    /// run weight-only (their quantized activations are measured on denoiser trunks only).
     pub fn encoder(blockq: BlockQGemm) Use {
-        return .{ .blockq = blockq, .int8 = encoderInt8(), .fp8 = .weight_only };
+        return .{ .blockq = blockq, .int8 = encoderInt8(), .fp8 = .weight_only, .fp4 = .weight_only };
     }
 };
 
@@ -309,7 +332,7 @@ pub const Verdict = union(enum) { ok: Plan, refused: Refusal };
 /// a shape is the backend's answer (`caps.refuse`).
 pub fn check(comptime C: type, caps: C, lins: []const Weight, use: Use) Verdict {
     const rot = lin.convrot(lins) orelse return .{ .refused = .{ .why = .mixed_convrot } };
-    const p = Plan{ .rot = rot, .blockq = use.blockq, .gemv = use.gemv, .int8 = use.int8 orelse trunk_int8, .fp8 = use.fp8 orelse trunk_fp8, .act16 = use.act16 };
+    const p = Plan{ .rot = rot, .blockq = use.blockq, .gemv = use.gemv, .int8 = use.int8 orelse trunk_int8, .fp8 = use.fp8 orelse trunk_fp8, .fp4 = use.fp4 orelse trunk_fp4, .act16 = use.act16 };
     const pol = p.policy();
     for (lins) |w| {
         const bad = Refusal{ .why = undefined, .tag = w.tag orelse "<untagged>", .dtype = w.dtype, .rows = w.rows, .cols = w.cols };
@@ -395,7 +418,7 @@ pub fn gemmShape(w: Weight) bool {
 /// dp4a GEMVs (`q8Batch`, `q8N`) and the dual row GEMV (`dualOnly`, `dual`, `dualQ8`, `dualN`).
 /// Integer convrot: the int8 GEMM (`i8Gemm`), native int4 (`i4Native`) or an int4
 /// decode to int8 (`i4Decode`), W4A8 (`w4a8`), weight-only twins (`intWeightOnly`),
-/// NVFP4 (`nvfp4`). Dense: the 16-bit GEMMs (`denseGemm`, `denseGemmTakes`), the f16
+/// NVFP4 (`nvfp4`, `fp4Mma`, and `fp8Mma` for its e4m3 decode). Dense: the 16-bit GEMMs (`denseGemm`, `denseGemmTakes`), the f16
 /// dense arm (`h16`), fp8 (`fp8Gemm`, `fp8Bf16`, `fp8F32`), the grouped GEMVs
 /// (`groupedTakes`) and the 16-bit and f32 GEMVs (`gemvF16`, `gemvF32`).
 pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Route {
@@ -412,7 +435,7 @@ pub fn routeOf(comptime C: type, caps: C, w: Weight, m: usize, pol: Policy) ?Rou
             woRoute(C, caps, pol, .{ .i4_wo, .i4_wo16, .i4_wo32 })
         else if (caps.i4Decode() and caps.i8Gemm()) .i4_i8 else null,
         .w4a8 => return if (caps.w4a8()) intRoute(C, caps, pol, .w4a8, .{ .w4a8_wo, .w4a8_wo16, .w4a8_wo32 }) else null,
-        .nvfp4 => return if (caps.nvfp4()) .nvfp4 else null,
+        .nvfp4 => return nvfp4Route(C, caps, w, pol),
         .svdq => return if (!caps.svdq()) null else intRoute(C, caps, pol, .svdq, .{ .svdq_wo, .svdq_wo16, .svdq_wo32 }),
         .other => return null,
         else => {},
@@ -489,6 +512,13 @@ fn woRoute(comptime C: type, caps: C, pol: Policy, wo: [3]Route) ?Route {
 
 /// fp8 as a batch: staged at the width `Act16` asks for, or against the f32 activation
 /// where the backend cannot stage it so.
+/// An NVFP4 weight under `pol.fp4`, each mode falling back to the next one down.
+fn nvfp4Route(comptime C: type, caps: C, w: Weight, pol: Policy) ?Route {
+    if (pol.fp4 == .w4a4 and caps.fp4Mma(w)) return .nvfp4_mma;
+    if (pol.fp4 != .weight_only and caps.fp8Mma(w)) return .nvfp4_f8;
+    return if (caps.nvfp4()) .nvfp4 else null;
+}
+
 fn fp8Route(comptime C: type, caps: C, w: Weight, pol: Policy) ?Route {
     if (pol.fp8 == .w8a8 and caps.fp8Mma(w)) return .fp8_w8a8;
     if (pol.act16 == .bf16) return if (caps.fp8Bf16()) .gemm_fp8_bf16 else if (caps.fp8F32()) .gemm_fp8_f32 else null;

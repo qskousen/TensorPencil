@@ -551,7 +551,7 @@ tensor name at session build.
 | **fp8-e4m3** | ✅ | ✅ (coop) | ✅ stream+dequant¹ | ✅ stream+dequant¹ |
 | **int8-convrot** | ✅ | ✅ | ✅ | ✅ (+f16 MLP²) |
 | **int8-tensorwise (no convrot)** | ✅ | ✅ | ✅ | ✅ (+f16 MLP²) |
-| **int4-convrot** | ✅ | ✅ (decodes to int8: W4A8, `i4_i8`) | ✅ W4A4 | ✅ W4A4 |
+| **int4-convrot** | ✅ | ✅ (decodes to int8: W4A8, `i4_i8`) | ✅ W4A4 on sm_80-89, else W4A8 (`i4_i8`) | ✅ same |
 | **w4a8** | ✅ | ✅ | ✅ | ✅ |
 | **int8 / int4 / w4a8, weight-only** | ❌ | ✅ (`opMatmulCoopIntWo`) | ✅ →bf16 / →f16 / →f32 | ✅ →bf16 / →f16 / →f32 |
 | **nvfp4** | ✅ | ✅ | ✅ | ✅ |
@@ -783,7 +783,7 @@ Gates: `zig build test` (SenseNova's layout offsets pinned against
 | 3x3 patch into 16-bit operand | | `im2col_h16`/`im2col_bf16` (`opConvCoop`) | `opConvGemm16` | ↤ | f16/bf16 |
 | nearest-2× upsample | explicit | fused into im2col | fused into im2col | ↤ | — |
 | convrot (Hadamard un-rotate) | `ops/convrot.zig` | `rotate`/`rotate_fwht` | `buildPrep` | ↤ | int8/int4, group 256 |
-| 4-bit decode | `ops/{w4a8,nvfp4,svdq}.zig` | `w4a8_decode_t`/`nvfp4_decode_t`/`i4_decode_t`/`svdq_decode_t`/`svdq_unpack*` | `w4a8_decode`/`nvfp4_decode` PTX, `svdq_decode`/`svdq_unpack*` dual | ↤ | per GEMM into scratch |
+| 4-bit decode | `ops/{w4a8,nvfp4,svdq}.zig` | `w4a8_decode_t`/`nvfp4_decode_t`/`i4_decode_t`/`svdq_decode_t`/`svdq_unpack*` | `w4a8_decode`/`nvfp4_decode` PTX, `svdq_decode`/`svdq_unpack*`/`i4_decode`/`nvfp4_e4m3`/`nvfp4_scale_words` dual | ↤ | per GEMM into scratch |
 
 `↤` = `cuda` reuses zig-cuda's hand-PTX kernel (only batched GEMM and prefill attention
 differ).
@@ -1171,10 +1171,10 @@ path; GGUF `q*` are the **LLM** path.
 | **bf16** | ✅ | ✅ native bf16 coopmat + f16 fallback | ✅ bf16 mma (Ampere+) | ✅ cuBLASLt `R_16BF` | native bf16 where the device has it |
 | **fp8-e4m3** | ✅ (LUT) | ✅ `pipe_f8` → f16 coop | ✅ `gemv_fp8`; `dequant_fp8_{f16,bf16}` → `opGemm16`; sm_89+ W8A8 on fp8 tensor cores (`f8prep` + `f8gemm_pipe_fused`; the denoiser default, `--dit-fp8-gemm weight_only` opts out) | ✅ dequant→f16; sm_89+ W8A8 the same hand kernels | 1-byte weights, dequant in kernel; ComfyUI's scaled fp8 (rank-0 `weight_scale`) multiplied into every GEMM |
 | **int8 (+convrot)** | ✅ | ✅ s8→s32 tensor cores | ✅ m16n8k32 s8 IMMA, f32/f16/bf16 out | ✅ cuBLASLt `R_8I`/`COMPUTE_32I` | W8A8, Hadamard un-rotate at dequant. The prep reads, and the rescale epilogue writes, the activation's own width on both CUDA arms, `m` rows only |
-| **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) | ✅ hand-PTX (no cuBLASLt s4) | nibble-packed 2/byte |
+| **int4 (+convrot)** | ✅ | ✅ decode→int8 per GEMM | ✅ m16n8k64 s4 IMMA (W4A4) on sm_80-89; elsewhere `i4_decode` → int8 GEMM (W4A8) | ✅ same (no cuBLASLt s4) | nibble-packed 2/byte |
 | **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; decodes to int8 per GEMM, then the int8 convrot GEMM (`ops/w4a8.zig`) |
 | **w6a8** (`w6a8_int8`) | ✅ | ✅ `w6a8_decode_t` | ✅ `w6a8_decode` | ✅ ditto | 6-bit uniform `(q − 32)·s_rel`, nibble plane then top-2-bit plane, `I8 [rows, 3·cols/4]`; same routes as w4a8 |
-| **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | E2M1 + fp8 per-16 scale + per-tensor scale; decodes to bf16 per GEMM, then the bf16 GEMM. Weight-only (`ops/nvfp4.zig`) |
+| **nvfp4** (E2M1) | ✅ | ✅ | ✅ weight-only; sm_89+ W4A8 (`nvfp4_e4m3` decode + `f8prep` + `f8gemm_pipe_fused`); sm_120 family W4A4 (`f4prep` + `f4gemm_pipe_fused`, block-scaled fp4 `mma`) | ✅ the same hand kernels | E2M1 + fp8 per-16 scale + per-tensor scale (`ops/nvfp4.zig`). Weight-only decodes to bf16 per GEMM, then the bf16 GEMM; `--dit-fp4-gemm w4a8\|w4a4` picks between them on a denoiser trunk, `w4a4` by default |
 | **svdq4** (Nunchaku SVDQuant int4 / fp4) | ✅ | ✅ | ✅ | ✅ | 4-bit codes in Nunchaku's MMA tile order (int4, or E2M1 with an fp8 per-16 micro-scale and a per-row `wcscales * wtscale`) + bf16 per-64 scale for int4 + per-input smoothing + rank-32 low-rank branch (`ops/svdq.zig`). W8A8: the activation times `1/smooth`, the unrotated int8 prep, the weight decoded per GEMM to int8 on a per-row grid. Weight-only (bf16/f16/f32): the exact weight expanded per GEMM. The low-rank branch runs on the raw activation through the LoRA sidecar's GEMMs, in true f32 on the f32 route |
 | **GGUF q4_0** | ✅ ggml | ✅ `gemv_dual_q4_0` | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_dual_q8_0` | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
@@ -1199,10 +1199,26 @@ path; GGUF `q*` are the **LLM** path.
 - ⚠️ **sm_120 has no native int4 tensor cores**: the s4 `mma` is correct there but runs at
   0.13x the s8 rate (RTX PRO 6000, fused GEMM 7680x6144x6144: s8 658 TOPS, s4 83, e4m3 642;
   the 3090 runs s4 at 2.3x s8). `cuda-i4-test` prints these rates for the card it runs on.
+  Off sm_8x int4 convrot decodes to int8 per GEMM (`Backend.hasFastS4Mma`, route `i4_i8`):
+  Krea2 Turbo 1024² on the PRO 6000, 1489 -> 349 ms a forward, and the W4A8 arithmetic adds
+  1.8e-2 to the int4 weight's own 0.23 velocity error against bf16 where W4A4 adds 0.21.
+  `diffusion-profile --ab s4` A/Bs the two.
 - **fp8 W8A8 quantizes the activation to e4m3 at one scale per row** (absmax / 448, round to
   nearest even, no rotation). Denoiser trunks only (`dual_lin.trunk_fp8`); `Use.encoder` and
   `Use.llm` pin fp8 to weight-only. Checked against the CPU fed the same e4m3 activation (`lin-cuda-test`,
   ~6e-7). Its run-to-run noise is ~3x int8 convrot's: e4m3 keeps 3 mantissa bits everywhere.
+- **NVFP4 has three CUDA arithmetics** (`dual_lin.Fp4Gemm`, `--dit-fp4-gemm`, W4A4 by default
+  on denoiser trunks, weight-only for encoders and LLMs; each falls back to the next where
+  the device lacks it). Weight-only expands to bf16.
+  W4A8 decodes the weight to e4m3 at `E2M1 * block / 8` (`Levels.e4m3v`, exact for E2M1 0.5, 1,
+  2 and 4) against the e4m3 prep; there is no fp4 x e4m3 `mma` with per-16 e4m3 scales, only
+  MXFP's per-32 ue8m0. W4A4 quantizes the activation to NVFP4 (per-row `absmax / 2688`, per-16
+  e4m3 scale, `ops.nvfp4.quantizeActRow`) for `kind::mxf4nvf4.block_scale.scale_vec::4X` on
+  the `sm_120f` target; the block scales go to the GEMM as `[k/64][rows]` words. Both match the
+  CPU fed the same quantization to ~5e-7 (`lin-cuda-test`). Fused GEMM 7680x6144x6144 on the
+  RTX PRO 6000: nvf4 1157 TOPS, 1.64x s8. Krea2 Turbo 1024² a forward: weight-only 849 ms,
+  W4A8 372, W4A4 242 (int8 convrot 341). Velocity against the CPU at 512² (the bf16 file's
+  own device path reads 0.102): weight-only 0.053, W4A8 0.093, W4A4 0.133.
 - **convrot** (`src/ops/convrot.zig`): `cols` must be a multiple of 256 (i4 also even).
 - ⚠️ **The packed 4-bit formats share one loader** (`models/quant_weight.zig`) and all store
   `[rows, cols/2]`, the int4-convrot shape, so each is detected by its sidecar (`_scale_2` for

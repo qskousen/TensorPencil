@@ -22,7 +22,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-pub const RegClass = enum { b32, b64, f32, b16, pred };
+pub const RegClass = enum { b32, b64, f32, b16, pred, b8 };
 
 fn prefix(c: RegClass) []const u8 {
     return switch (c) {
@@ -31,6 +31,7 @@ fn prefix(c: RegClass) []const u8 {
         .f32 => "%f",
         .b16 => "%rs",
         .pred => "%p",
+        .b8 => "%c",
     };
 }
 
@@ -41,6 +42,7 @@ fn decl(c: RegClass) []const u8 {
         .f32 => ".f32",
         .b16 => ".b16",
         .pred => ".pred",
+        .b8 => ".b8",
     };
 }
 
@@ -53,7 +55,7 @@ pub const Builder = struct {
     /// Owned register-name slices handed out by regs(), freed on deinit.
     owned_slices: std.ArrayList([][]const u8) = .empty,
     /// Registers declared per class.
-    counts: [5]u32 = .{ 0, 0, 0, 0, 0 },
+    counts: [@typeInfo(RegClass).@"enum".field_names.len]u32 = @splat(0),
     label_next: u32 = 0,
     /// Optional PTX performance-tuning directives for the entry (`.maxntid`,
     /// `.minnctapersm`, `.maxnreg`), emitted between the parameter list and the body.
@@ -188,7 +190,7 @@ pub const Builder = struct {
         try w.appendSlice(g, "{\n");
 
         // Register-file declarations (skip empty classes).
-        inline for ([_]RegClass{ .pred, .b16, .b32, .b64, .f32 }) |c| {
+        inline for ([_]RegClass{ .pred, .b8, .b16, .b32, .b64, .f32 }) |c| {
             const n = self.counts[@backingInt(c)];
             if (n != 0) try w.print(g, "\t.reg {s} {s}<{d}>;\n", .{ decl(c), prefix(c), n });
         }
@@ -212,16 +214,20 @@ pub const target = std.fmt.comptimePrint("sm_{d}", .{build_options.cuda_sm});
 pub const preamble = std.fmt.comptimePrint(".version {s}\n.target {s}\n.address_size 64\n", .{ version, target });
 
 /// What a module's instructions require of the device and the JIT: compute capability
-/// as `major * 10 + minor`, the PTX ISA as `major * 10 + minor`, and whether it uses an
-/// arch-specific (`sm_XXXa`) instruction, which runs on that exact capability only.
-/// The backend builds a module only for a device its `Caps` say can run it.
+/// as `major * 10 + minor`, the PTX ISA as `major * 10 + minor`, and which target
+/// variant the instructions exist under. The backend builds a module only for a device
+/// its `Caps` say can run it.
 pub const Need = struct {
     sm: u32 = 0,
     isa: u32 = 0,
-    arch_specific: bool = false,
+    variant: Variant = .portable,
+
+    /// `family` (`sm_XXXf`) runs on every device of that major capability at or above
+    /// `sm`; `arch` (`sm_XXXa`) on that exact capability only.
+    pub const Variant = enum { portable, family, arch };
 
     pub fn max(a: Need, b: Need) Need {
-        return .{ .sm = @max(a.sm, b.sm), .isa = @max(a.isa, b.isa), .arch_specific = a.arch_specific or b.arch_specific };
+        return .{ .sm = @max(a.sm, b.sm), .isa = @max(a.isa, b.isa), .variant = @fromBackingInt(@intCast(@max(@backingInt(a.variant), @backingInt(b.variant)))) };
     }
 };
 
@@ -234,7 +240,12 @@ fn parseIsa(comptime s: []const u8) u32 {
 
 fn writeHeader(w: *std.ArrayList(u8), g: std.mem.Allocator, need: Need) !void {
     const n = need.max(baseline);
-    try w.print(g, ".version {d}.{d}\n.target sm_{d}{s}\n.address_size 64\n", .{ n.isa / 10, n.isa % 10, n.sm, if (n.arch_specific) "a" else "" });
+    const suffix = switch (n.variant) {
+        .portable => "",
+        .family => "f",
+        .arch => "a",
+    };
+    try w.print(g, ".version {d}.{d}\n.target sm_{d}{s}\n.address_size 64\n", .{ n.isa / 10, n.isa % 10, n.sm, suffix });
 }
 
 test "ptx builder emits a valid vector-add module" {
@@ -272,9 +283,10 @@ test "a module's header is the baseline unless an instruction raises it" {
     var raised = Builder.init(gpa);
     defer raised.deinit();
     raised.requires(.{ .sm = 89, .isa = 78 });
-    raised.requires(.{ .sm = 120, .isa = 87, .arch_specific = true });
+    raised.requires(.{ .sm = 120, .isa = 88, .variant = .family });
+    raised.requires(.{ .sm = 120, .isa = 87, .variant = .arch });
     raised.requires(.{ .sm = 89, .isa = 84 });
     const m1 = try raised.build("k", "", "");
     defer gpa.free(m1);
-    try std.testing.expect(std.mem.startsWith(u8, m1, ".version 8.7\n.target sm_120a\n.address_size 64\n"));
+    try std.testing.expect(std.mem.startsWith(u8, m1, ".version 8.8\n.target sm_120a\n.address_size 64\n"));
 }

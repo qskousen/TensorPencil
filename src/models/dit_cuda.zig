@@ -330,7 +330,7 @@ pub fn streamDtFor(be: *const Backend, model: *const DiT, want: Dt) Dt {
     if (be.kernels == .libs) return want;
     if (!be.attnReads16(hd, heads, kv_heads)) return .f32;
     const p = lin_cuda.plan(model.device_lins, .{ .blockq = lin_cuda.blockq_gemm }, "dit cuda") catch return .f32;
-    return if (lin_cuda.takes16(p, model.device_lins)) want else .f32;
+    return if (lin_cuda.takes16(be, p, model.device_lins)) want else .f32;
 }
 
 /// Per-run device scratch shared across sampler steps (and both CFG sessions):
@@ -472,7 +472,7 @@ const Dev = struct {
     pub fn mlpPlan(d: Dev, blk: *const dit.Block, _: usize) !dit_dev.MlpPlan(DeviceBuffer) {
         const ws = d.ws;
         const lins = [_]Weight{ blk.mlp.gate, blk.mlp.up, blk.mlp.down };
-        const chain16 = d.be.kernels == .libs and lin_cuda.allI8(d.sess.plan, &lins) and !patched(d.sess.plan, &lins);
+        const chain16 = d.be.kernels == .libs and lin_cuda.allI8(d.be, d.sess.plan, &lins) and !patched(d.sess.plan, &lins);
         const mdt: Dt = if (ws.act != .f32) ws.act else if (chain16) .f16 else .f32;
         return .{ .tile = mlp_tile, .stage = null, .mg = ws.mg_d.as(mdt), .mu = ws.mu_d.as(mdt), .down_stage = null, .down_out = ws.t1_d };
     }

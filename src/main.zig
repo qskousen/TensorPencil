@@ -1174,6 +1174,12 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\                         weight_only expands each weight per call against
             \\                         the unquantized activation, slower and a little
             \\                         closer to bf16. Other GPUs: weight_only
+            \\      --dit-fp4-gemm w4a4  how an NVFP4 denoiser multiplies:
+            \\                         weight_only expands each weight to bf16 per call;
+            \\                         w4a8 decodes it to fp8 against an fp8 activation
+            \\                         (sm_89+); w4a4 quantizes the activation to NVFP4
+            \\                         for the fp4 tensor cores (sm_120+), falling back
+            \\                         to w4a8, then weight_only, on older GPUs
             \\      --text-encoder <path>  text-encoder checkpoint (qwen3 for krea2,
             \\                         CLIP-L for the SD family)
             \\      --text-encoder-2 <path>  SDXL's second text encoder (OpenCLIP
@@ -4815,14 +4821,15 @@ fn mageflowBench(
 
 /// `diffusion-profile <ckpt> [--text-encoder P] [--text-encoder-2 P] [--vae P] [--vae-2 P]
 /// [--size N] [--frames N] [--reps N] [--lora P] [--backend B] [--dit-act D] [--dit-fp8-gemm M]
-/// [--ab split-bias|act:D|perturb|prep3|convpatch|fullbar|tcattn|attn32|fp8|silu|scalarprep|hostmod] [--dump P]`: one denoiser forward of any family,
+/// [--dit-fp4-gemm M] [--ab split-bias|act:D|perturb|prep3|convpatch|fullbar|tcattn|attn32|fp8|fp4:M|s4|silu|scalarprep|hostmod]
+/// [--dump P]`: one denoiser forward of any family,
 /// through the same `Session` a render uses. The batched best-of-N is the steady-state
 /// s/step; on CUDA the sync-per-op pass after it attributes the time, but its rows can
 /// fall below the real kernel time, so take a breakdown that matters from nsys. `--ab split-bias`
 /// alternates each rep with a forward that adds every bias in a separate pass, an
 /// interleaved A/B of the epilogue fold; `--ab act:D` with a second denoiser whose dial
 /// is D, `--ab attn32` with one built under f32 attention operands, `--ab fp8` with one
-/// whose fp8 weights run W8A8; `--ab perturb` with the same denoiser on a latent nudged by 1e-5, the floor a
+/// whose fp8 weights run W8A8, `--ab fp4:M` with one whose NVFP4 weights run M; `--ab perturb` with the same denoiser on a latent nudged by 1e-5, the floor a
 /// dtype A/B is read against (krea2 fp8 512²: 5.4e-4 on cuda, 7.2e-3 on Vulkan). `--dump`
 /// writes both arms' velocities, raw f32, for comparing across backends. `--frames`
 /// profiles a video family's clip denoiser at that length.
@@ -4839,8 +4846,10 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     var toggle: ?struct { flag: *bool, what: []const u8 } = null;
     var ab_act: ?pipeline.Act = null;
     // A second denoiser built with one global switch set, for switches a workspace reads.
-    var build_toggle: ?struct { flag: *bool, what: []const u8 } = null;
+    // `live` also sets it around that denoiser's forwards, for a switch routing reads too.
+    var build_toggle: ?struct { flag: *bool, what: []const u8, live: bool = false } = null;
     var ab_fp8 = false;
+    var ab_fp4: ?TensorPencil.models.lin_cuda.dual_lin.Fp4Gemm = null;
     var dump: ?[]const u8 = null;
     var ab_perturb = false;
     var i: usize = 1;
@@ -4872,6 +4881,8 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             opts.dit_act = std.meta.stringToEnum(pipeline.Act, v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--dit-fp8-gemm")) {
             opts.dit_fp8_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp8Gemm, v) orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, args[i], "--dit-fp4-gemm")) {
+            opts.dit_fp4_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp4Gemm, v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--dump")) {
             dump = v;
         } else if (std.mem.eql(u8, args[i], "--ab")) {
@@ -4900,6 +4911,12 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
                 toggle = .{ .flag = &cuda.backend.Backend.force_scalar_prep, .what = "scalar prep loads" };
             } else if (std.mem.eql(u8, v, "fp8")) {
                 ab_fp8 = true;
+            } else if (std.mem.startsWith(u8, v, "fp4:")) {
+                ab_fp4 = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp4Gemm, v[4..]) orelse return error.InvalidArgs;
+            } else if (std.mem.eql(u8, v, "s4")) {
+                // int4 convrot on the s4 tensor cores against its int8 decode, on a
+                // card that takes the decode.
+                build_toggle = .{ .flag = &cuda.backend.force_s4_mma, .what = "native s4 W4A4", .live = true };
             } else if (std.mem.eql(u8, v, "attn32")) {
                 // zig-cuda attention operands stored 16-bit against f32.
                 build_toggle = .{ .flag = &cuda.backend.force_attn_f32_operands, .what = "f32 attention operands" };
@@ -4964,6 +4981,12 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
         defer sess.fp8_gemm = was;
         den_b = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
     }
+    if (ab_fp4) |mode| {
+        const was = sess.fp4_gemm;
+        sess.fp4_gemm = mode;
+        defer sess.fp4_gemm = was;
+        den_b = try ProfileDen.init(sess, gpa, cond, clip, lat_h, lat_w, sigmas);
+    }
     const act_b = sess.actFor(.denoiser);
     const x = try gpa.alloc(f32, n);
     defer gpa.free(x);
@@ -4986,7 +5009,7 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
     // kernels).
     for (0..2) |_| {
         try den.predict(gpa, v, x, sigmas[1]);
-        if (den_b) |*db| try db.predict(gpa, v_b, x, sigmas[1]);
+        if (den_b) |*db| try predictLive(build_toggle, db, gpa, v_b, x, sigmas[1]);
         if (toggle) |t| {
             t.flag.* = true;
             try den.predict(gpa, v_b, x, sigmas[1]);
@@ -5004,7 +5027,7 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             lin_cuda.split_bias = ab_split and arm == 1;
             if (toggle) |t| t.flag.* = arm == 1;
             const t0 = std.Io.Clock.awake.now(io).nanoseconds;
-            if (arm == 1 and den_b != null) try den_b.?.predict(gpa, v_b, x, sigmas[1]) else if (arm == 1 and ab_perturb) try den.predict(gpa, v_b, x_b, sigmas[1]) else if (arm == 1 and toggle != null) try den.predict(gpa, v_b, x, sigmas[1]) else try den.predict(gpa, v, x, sigmas[1]);
+            if (arm == 1 and den_b != null) try predictLive(build_toggle, &den_b.?, gpa, v_b, x, sigmas[1]) else if (arm == 1 and ab_perturb) try den.predict(gpa, v_b, x_b, sigmas[1]) else if (arm == 1 and toggle != null) try den.predict(gpa, v_b, x, sigmas[1]) else try den.predict(gpa, v, x, sigmas[1]);
             best[arm] = @min(best[arm], @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1e6);
         }
     }
@@ -5034,7 +5057,9 @@ fn diffusionProfile(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: 
             se += (a - b) * (a - b);
             ss += a * a;
         }
-        if (build_toggle != null or ab_fp8)
+        if (ab_fp4) |mode|
+            try stdout.print("  fp4 {t}: {d:.1} ms against fp4 {t}'s {d:.1} ms ({d:.1}%), velocity rel L2 between them {e:.2}\n", .{ mode, best[1], sess.fp4_gemm, best[0], 100 * (best[1] - best[0]) / best[0], @sqrt(se / ss) })
+        else if (build_toggle != null or ab_fp8)
             try stdout.print("  {s}: {d:.1} ms, the default path saves {d:.1}% (velocity rel L2 between them {e:.2})\n", .{ if (build_toggle) |t| t.what else if (sess.fp8_gemm == .w8a8) "fp8 weight-only" else "fp8 w8a8", best[1], 100 * (best[1] - best[0]) / best[1], @sqrt(se / ss) })
         else
             try stdout.print("  denoiser {t}: {d:.1} ms ({d:.1}% vs the first), velocity rel L2 vs {t} {e:.3}\n", .{ act_b, best[1], 100 * (best[1] - best[0]) / best[0], act_a, @sqrt(se / ss) });
@@ -5102,6 +5127,15 @@ const ProfileDen = union(enum) {
         }
     }
 };
+
+/// `d.predict` with a live build toggle's switch set for the call.
+fn predictLive(toggle: anytype, d: *ProfileDen, gpa: std.mem.Allocator, v: []f32, x: []const f32, sigma: f32) !void {
+    const t = toggle orelse return d.predict(gpa, v, x, sigma);
+    if (!t.live) return d.predict(gpa, v, x, sigma);
+    t.flag.* = true;
+    defer t.flag.* = false;
+    return d.predict(gpa, v, x, sigma);
+}
 
 fn nsMs(ns: i128) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -9630,6 +9664,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 try stdout.print("unknown --dit-fp8-gemm '{s}' (expected: weight_only, w8a8)\n", .{val});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, flag, "--dit-fp4-gemm")) {
+            opts.dit_fp4_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp4Gemm, val) orelse {
+                try stdout.print("unknown --dit-fp4-gemm '{s}' (expected: weight_only, w4a8, w4a4)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--inject-nonfinite")) {
             // DIAGNOSTIC: <component>:<dtype>, exercises the precision fallback.
             const colon = std.mem.findScalar(u8, val, ':') orelse return error.InvalidArgs;
@@ -12176,7 +12215,7 @@ const LoraVkDev = struct {
 };
 
 /// `velocity-diff <ckpt> [--text-encoder P] [--text-encoder-2 P] [--vae P] [--size N]
-/// [--backend cuda|zig-cuda|vulkan] [--lora P] [--lora-bf16-a] [--dit-act D]
+/// [--backend cuda|zig-cuda|vulkan] [--lora P] [--lora-bf16-a] [--dit-act D] [--dit-fp4-gemm M]
 /// [--cpu-round-residual f16|bf16]`: one denoiser forward on the CPU and one on the
 /// device, from ONE conditioning (encoded on the CPU) and one latent, so the rel L2
 /// is the denoiser's alone. Run the dense checkpoint first: that is the floor a
@@ -12219,6 +12258,8 @@ fn velocityDiff(io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
             device = pipeline.Backend.fromStr(v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--dit-act")) {
             dit_act = std.meta.stringToEnum(pipeline.Act, v) orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, args[i], "--dit-fp4-gemm")) {
+            opts.dit_fp4_gemm = std.meta.stringToEnum(TensorPencil.models.lin_cuda.dual_lin.Fp4Gemm, v) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, args[i], "--cpu-round-residual")) {
             TensorPencil.models.dit.round_residual = std.meta.stringToEnum(@TypeOf(TensorPencil.models.dit.round_residual.?), v) orelse return error.InvalidArgs;
         } else return error.InvalidArgs;
@@ -12504,6 +12545,8 @@ fn linTestScore(stdout: *Io.Writer, name: []const u8, label: []const u8, r: Tens
     const cpu_rel = @sqrt(c_num / c_den);
     const cpu_tol: f64 = switch (r.prep()) {
         .i4 => 0.3,
+        // NVFP4's activation is coarser than int8's per-row grid, finer than int4's.
+        .f4 => 0.15,
         .i8, .mmq, .q8, .svdq, .f8 => 0.05,
         .none => 0.02,
     };
@@ -13026,7 +13069,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
 
     // Each weight under every plan that changes its route. The LLM plan's route also
     // moves with the row count: a GEMV at one row, a grouped one for a few, a GEMM beyond.
-    const Arm = struct { label: []const u8, pol: lin_cuda.BlockQGemm = .auto, int8: lin_cuda.IntGemm = .w8a8, dense: lin_cuda.DenseCompute = .native, act16: @TypeOf(@as(lin_cuda.Plan, undefined).act16) = .f16, llm_m: usize = 0, input: cuda.backend.Dt = .f32, store: cuda.backend.Dt = .f32, fp8: lin_cuda.dual_lin.Fp8Gemm = .weight_only };
+    const Arm = struct { label: []const u8, pol: lin_cuda.BlockQGemm = .auto, int8: lin_cuda.IntGemm = .w8a8, dense: lin_cuda.DenseCompute = .native, act16: @TypeOf(@as(lin_cuda.Plan, undefined).act16) = .f16, llm_m: usize = 0, input: cuda.backend.Dt = .f32, store: cuda.backend.Dt = .f32, fp8: lin_cuda.dual_lin.Fp8Gemm = .weight_only, fp4: lin_cuda.dual_lin.Fp4Gemm = .weight_only };
     const arms = [_]Arm{
         .{ .label = "llm m=1", .llm_m = 1 },
         .{ .label = "llm m=3", .llm_m = 3 },
@@ -13058,6 +13101,12 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
         .{ .label = "fp8 w8a8", .fp8 = .w8a8 },
         .{ .label = "fp8 w8a8 y f16", .fp8 = .w8a8, .store = .f16 },
         .{ .label = "fp8 w8a8 bf16", .fp8 = .w8a8, .input = .bf16, .store = .bf16 },
+        // NVFP4 on fp8 or fp4 tensor cores, each falling back where the device lacks them.
+        .{ .label = "fp4 w4a8", .fp4 = .w4a8 },
+        .{ .label = "fp4 w4a4", .fp4 = .w4a4 },
+        .{ .label = "fp4 w4a4 y f16", .fp4 = .w4a4, .store = .f16 },
+        .{ .label = "fp4 w4a4 bf16", .fp4 = .w4a4, .input = .bf16, .store = .bf16 },
+        .{ .label = "fp4 w4a8 bf16", .fp4 = .w4a8, .input = .bf16, .store = .bf16 },
     };
 
     var xd = try be.tensorCreate(mpad * cols * 4);
@@ -13102,6 +13151,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             if (arm.llm_m == 0) {
                 p = lin_cuda.withInt8(p, be, arm.int8);
                 p.fp8 = arm.fp8;
+                p.fp4 = arm.fp4;
                 p.dense = arm.dense;
                 p.act16 = arm.act16;
             }
@@ -13155,7 +13205,7 @@ fn linCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool)
             // bit for bit; so is the hand fp8 GEMM's where both run one operand width
             // (`gemm_fp8` follows the destination). cuBLASLt's 16-bit D kernels are its own.
             const fp8_hand = !libs and ((r == .gemm_fp8 and arm.store == .f16) or r == .gemm_fp8_bf16);
-            if (arm.input == .f32 and arm.store != .f32 and lin_cuda.routeTakes16(r) and (r.prep() == .i8 or r.prep() == .f8 or fp8_hand)) {
+            if (arm.input == .f32 and arm.store != .f32 and lin_cuda.routeTakes16(r) and (r.prep() == .i8 or r.prep() == .f8 or r.prep() == .f4 or fp8_hand)) {
                 const g = try lin_cuda.prep(be, p, xin, mm, cols, &.{c.w});
                 try lin_cuda.gemm(be, p, g, yd, c.w, null);
                 try be.tensorDownload(yd, std.mem.sliceAsBytes(y1));

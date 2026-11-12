@@ -2,19 +2,18 @@
 //!
 //! A layer ships `weight` (U8 [rows, cols/2], two E2M1 codes per byte), `weight_scale`
 //! (F8_E4M3, one per 16 elements, swizzled), `weight_scale_2` (F32 per-tensor scalar)
-//! and `input_scale` (F32, a static activation scale, Blackwell-only and unused here).
-//! It decodes as:
+//! and `input_scale` (F32, a static activation scale; unused here, the activation
+//! quantization below takes its scale per row). It decodes as:
 //!
 //!     total[row, blk] = weight_scale_2 * fp8(block_scale[row, blk])
 //!     value           = E2M1[nibble] * total[row, blk]
 //!
-//! Weight-only below Blackwell, matching ComfyUI:
-//! NVFP4's tensor cores are sm_100+, and on an older card `pick_operations` moves the
-//! format to what its log calls emulated ops, dequantizing the weight to the compute
-//! dtype per call before a normal GEMM. The weight stays 4-bit resident. Here
-//! `Weight.dtype == .nvfp4` keeps the packed bytes and each consumer decodes on demand:
-//! the CPU GEMM into its f32 panel, the GPU backends into a scratch feeding the existing
-//! tensor-core GEMM.
+//! `Weight.dtype == .nvfp4` keeps the packed bytes resident and each consumer decodes on
+//! demand: the CPU GEMM into its f32 panel, the GPU backends into a scratch feeding a
+//! 16-bit tensor-core GEMM (weight-only, ComfyUI's "emulated ops" below Blackwell). CUDA
+//! also has W4A8, the weight decoded to e4m3 (`Levels.e4m3v`) against an e4m3 activation,
+//! and W4A4, the activation quantized to NVFP4 (`quantizeActRow`) for the block-scaled
+//! fp4 mma, which is ComfyUI's arithmetic on Blackwell.
 //!
 //! Three conventions differ from every other 4-bit format here, and each is a silent
 //! wrong answer rather than an error:
@@ -78,6 +77,14 @@ pub const Levels = struct {
     /// The same values as bf16 bit patterns, for the GPU decode that feeds the bf16
     /// tensor-core GEMM. See the module header on why bf16 rather than f16.
     bf16v: [256][16]u16,
+    /// `E2M1 * block / 8` as e4m3 codes, the weight the fp8 GEMM multiplies at scale
+    /// `e4m3_unit * weight_scale_2`. Dividing by a power of two keeps every product with
+    /// an E2M1 of 0.5, 1, 2 or 4 exact, and `6 * 448 / 8` is inside e4m3's range.
+    e4m3v: [256][16]u8,
+    /// `weight_scale_2`.
+    global: f32,
+
+    pub const e4m3_unit: f32 = 8.0;
 
     /// `global` is `weight_scale_2`.
     ///
@@ -89,14 +96,17 @@ pub const Levels = struct {
     /// for a corrupt one, and here it is the reference's.
     pub fn init(global: f32) Levels {
         var lv: Levels = undefined;
+        lv.global = global;
         for (0..256) |b| {
             // The association: `per_tensor * block` FIRST, then `* E2M1`. The other
             // order rounds differently and is not the reference's.
-            const total = global * dtypes.f8e4m3ToF32(@intCast(b));
+            const block = dtypes.f8e4m3ToF32(@intCast(b));
+            const total = global * block;
             for (0..16) |i| {
                 const v = e2m1[i] * total;
                 lv.f32v[b][i] = v;
                 lv.bf16v[b][i] = dtypes.f32ToBf16(v);
+                lv.e4m3v[b][i] = dtypes.f32ToF8E4M3(e2m1[i] * block / e4m3_unit);
             }
         }
         return lv;
@@ -164,6 +174,76 @@ pub fn unswizzleScales(dst: []u8, src: []const u8, rows: usize, nblk: usize) voi
             dst[r * nblk + c] = if (idx < src.len) src[idx] else 0;
         }
     }
+}
+
+/// `v` as an E2M1 code: nearest, ties to the even code, saturating at +-6, the sign kept
+/// on a zero, as PTX's `cvt.rn.satfinite.e2m1x2.f32` rounds.
+pub fn e2m1Code(v: f32) u4 {
+    const a = @abs(v);
+    var code: u4 = 7;
+    for (0..7) |i| {
+        // Halfway between level i and i+1; a tie goes to the even code.
+        const mid = (e2m1[i] + e2m1[i + 1]) / 2;
+        if (a < mid or (a == mid and i % 2 == 0)) {
+            code = @intCast(i);
+            break;
+        }
+    }
+    return if (std.math.signbit(v)) code | 8 else code;
+}
+
+/// What an activation row's per-row scale divides its absmax by: the largest E2M1 times
+/// the largest e4m3, so every block scale fits.
+pub const act_row_div: f32 = 6.0 * 448.0;
+
+/// Quantize one activation row to NVFP4 as the device's `f4prep` does, in its order of
+/// operations: `g = absmax / (6 * 448)` (1 for an all-zero row), per block
+/// `scale = e4m3(block_absmax / (g * 6))`, `code = e2m1(x / (scale * g))`, every code 0
+/// where the scale is. Codes HIGH nibble first, as a weight file stores them. Returns g.
+pub fn quantizeActRow(x: []const f32, codes: []u8, scales: []u8) f32 {
+    std.debug.assert(x.len % block_size == 0 and codes.len == x.len / 2 and scales.len == x.len / block_size);
+    var amax: f32 = 0;
+    for (x) |v| amax = @max(amax, @abs(v));
+    var g = amax / act_row_div;
+    if (g == 0) g = 1;
+    const g6 = g * 6.0;
+    for (scales, 0..) |*sc, b| {
+        const blk = x[b * block_size ..][0..block_size];
+        var bmax: f32 = 0;
+        for (blk) |v| bmax = @max(bmax, @abs(v));
+        sc.* = dtypes.f32ToF8E4M3(bmax / g6);
+        const den = dtypes.f8e4m3ToF32(sc.*) * g;
+        for (0..block_size / 2) |j| {
+            const byte: u8 = if (den == 0) 0 else @as(u8, e2m1Code(blk[2 * j] / den)) << 4 | e2m1Code(blk[2 * j + 1] / den);
+            codes[b * block_size / 2 + j] = byte;
+        }
+    }
+    return g;
+}
+
+/// `row` replaced by its NVFP4 quantization, dequantized: what the W4A4 GEMM multiplies.
+pub fn emulateActRow(gpa: std.mem.Allocator, row: []f32) !void {
+    const codes = try gpa.alloc(u8, row.len / 2);
+    defer gpa.free(codes);
+    const scales = try gpa.alloc(u8, row.len / block_size);
+    defer gpa.free(scales);
+    const g = quantizeActRow(row, codes, scales);
+    for (row, 0..) |*v, k| {
+        const s = dtypes.f8e4m3ToF32(scales[k / block_size]);
+        v.* = e2m1[nibble(codes[k / 2], @intCast(k % 2))] * s * g;
+    }
+}
+
+/// The weight as the W4A8 route multiplies it: each element's `Levels.e4m3v` code at
+/// `e4m3_unit * global`. `dst` is `[rows][cols]`.
+pub fn decodeE4m3(dst: []f32, packed_bytes: []const u8, meta: Meta, rows: usize, cols: usize) void {
+    const nblk = Meta.blocks(cols);
+    const unit = Levels.e4m3_unit * meta.levels.global;
+    for (0..rows) |r| for (0..cols) |c| {
+        const code = nibble(packed_bytes[(r * cols + c) / 2], @intCast(c % 2));
+        const s = meta.scales[r * nblk + c / block_size];
+        dst[r * cols + c] = dtypes.f8e4m3ToF32(meta.levels.e4m3v[s][code]) * unit;
+    };
 }
 
 /// Sanity-check a layer's tensor sizes against each other; returns the block count.
@@ -364,4 +444,76 @@ test "the bf16 half of the level table matches the f32 half" {
             try std.testing.expectEqual(dtypes.f32ToBf16(levels.f32v[b][i]), levels.bf16v[b][i]);
         }
     }
+}
+
+test "e2m1Code rounds to nearest, ties to even, and saturates" {
+    const cases = [_]struct { v: f32, code: u4 }{
+        .{ .v = 0.0, .code = 0 },   .{ .v = 0.24, .code = 0 }, .{ .v = 0.25, .code = 0 },
+        .{ .v = 0.26, .code = 1 },  .{ .v = 0.75, .code = 2 }, .{ .v = 1.25, .code = 2 },
+        .{ .v = 1.75, .code = 4 },  .{ .v = 2.5, .code = 4 },  .{ .v = 3.5, .code = 6 },
+        .{ .v = 5.0, .code = 6 },   .{ .v = 5.01, .code = 7 }, .{ .v = 100.0, .code = 7 },
+        .{ .v = -1.5, .code = 11 }, .{ .v = -0.1, .code = 8 }, .{ .v = -9.0, .code = 15 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("e2m1Code({d}) = {d}, want {d}\n", .{ c.v, e2m1Code(c.v), c.code });
+        try std.testing.expectEqual(c.code, e2m1Code(c.v));
+    }
+    // Every level maps to its own code.
+    for (e2m1, 0..) |v, i| if (i != 8) try std.testing.expectEqual(@as(u4, @intCast(i)), e2m1Code(v));
+}
+
+test "quantizeActRow keeps every block inside its scale and the row near itself" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var x: [256]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = rnd.floatNorm(f32) * @as(f32, if (i < 16) 40 else 1);
+    x[40] = 0; // a lone zero
+    @memset(x[64..80], 0); // a zero block
+    var codes: [128]u8 = undefined;
+    var scales: [16]u8 = undefined;
+    const g = quantizeActRow(&x, &codes, &scales);
+    var amax: f32 = 0;
+    for (x) |v| amax = @max(amax, @abs(v));
+    try std.testing.expectEqual(amax / act_row_div, g);
+    try std.testing.expectEqual(@as(u8, 0), scales[4]);
+    for (codes[32..40]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    var y = x;
+    try emulateActRow(std.testing.allocator, &y);
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (x, y) |a, b| {
+        num += (a - b) * (a - b);
+        den += a * a;
+    }
+    // E2M1's half-step at the block's own scale, so the 40x block costs the rest nothing.
+    errdefer std.debug.print("rel {d}\n", .{@sqrt(num / den)});
+    try std.testing.expect(@sqrt(num / den) < 0.12);
+    for (x[16..], y[16..]) |a, b| try std.testing.expect(@abs(a - b) <= 0.5 * @abs(a) + 0.2);
+}
+
+test "an all-zero row quantizes to zeros at scale 1" {
+    const x: [32]f32 = @splat(0);
+    var codes: [16]u8 = undefined;
+    var scales: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(f32, 1), quantizeActRow(&x, &codes, &scales));
+    for (codes) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (scales) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "the e4m3 table is exact where E2M1 is a power of two and near elsewhere" {
+    const lv = try std.testing.allocator.create(Levels);
+    defer std.testing.allocator.destroy(lv);
+    lv.* = Levels.init(0.003);
+    for (0..0x7F) |b| for (0..16) |i| {
+        const want = lv.f32v[b][i];
+        const got = dtypes.f8e4m3ToF32(lv.e4m3v[b][i]) * Levels.e4m3_unit * lv.global;
+        const mag = @abs(e2m1[i]);
+        errdefer std.debug.print("scale {x} code {d}: {e} vs {e}\n", .{ b, i, got, want });
+        // A product below e4m3's normals loses bits; those blocks are 2^-11 of the largest.
+        if (dtypes.f8e4m3ToF32(@intCast(b)) * mag / Levels.e4m3_unit < 0x1p-6) continue;
+        if (mag == 0.5 or mag == 1 or mag == 2 or mag == 4)
+            try std.testing.expectEqual(want, got)
+        else
+            try std.testing.expect(@abs(got - want) <= @abs(want) * 0x1p-4);
+    };
 }

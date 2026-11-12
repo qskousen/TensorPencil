@@ -603,7 +603,7 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, kind: 
 /// tile stores the same bytes.
 pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, kind: IgemmKind, use_ldmatrix: bool, out: Dt, tile: IgemmTile) ![:0]u8 {
     std.debug.assert(out == .f32 or fuse);
-    std.debug.assert(kind != .e4m3 or fuse);
+    std.debug.assert(!kind.float() or fuse);
     const bits = kind.bits();
     const ob: usize = if (fuse) out.bytes() else 4;
     // s8: one m16n8k32 per 32-byte substep (32 k). s4: one m16n8k64 per 32-byte
@@ -613,7 +613,9 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
         .s8 => "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32",
         .s4 => "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32",
         .e4m3 => "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32",
+        .nvf4 => "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3",
     };
+    const scaled = kind == .nvf4;
     const MT = 4;
     const NT = 8;
     const WM = tile.bm / 64;
@@ -643,6 +645,10 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     // Two fragment sets: k-group g+1 loads while g's MMAs run.
     const afs = [2][]const []const u8{ try b.regs(.b32, MT * 4), try b.regs(.b32, MT * 4) };
     const bfs = [2][]const []const u8{ try b.regs(.b32, NT * 2), try b.regs(.b32, NT * 2) };
+    // nvf4's block scales, one word per fragment row, loaded with the fragments.
+    const no_regs = &[_][]const u8{};
+    const sfas = if (scaled) [2][]const []const u8{ try b.regs(.b32, MT), try b.regs(.b32, MT) } else .{ no_regs, no_regs };
+    const sfbs = if (scaled) [2][]const []const u8{ try b.regs(.b32, NT), try b.regs(.b32, NT) } else .{ no_regs, no_regs };
 
     const rd_a = try b.reg(.b64);
     const rd_b = try b.reg(.b64);
@@ -699,6 +705,39 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     try groupedTile(&b, r_row0, r_col0);
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_row0, r_row0, tile.bm });
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_col0, r_col0, tile.bn });
+
+    // nvf4: this thread's first scale word on each side, and the stride of one k64 step.
+    // A thread supplies row gid + 8*(tf&1) of an A fragment and column gid of a B one;
+    // the other fragments' words sit at immediate offsets from these.
+    const rd_sa = if (scaled) try b.reg(.b64) else "";
+    const rd_sb = if (scaled) try b.reg(.b64) else "";
+    const rd_sa_step = if (scaled) try b.reg(.b64) else "";
+    const rd_sb_step = if (scaled) try b.reg(.b64) else "";
+    if (scaled) {
+        const t = try b.regs(.b32, 2);
+        const rd_t = try b.reg(.b64);
+        try b.linef("ld.param.u64 {s}, [p_sa];", .{rd_sa});
+        try b.linef("ld.param.u64 {s}, [p_sb];", .{rd_sb});
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_sa, rd_sa });
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_sb, rd_sb });
+        try b.linef("and.b32 {s}, {s}, 1;", .{ t[0], r_tf });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ t[0], t[0] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ t[0], t[0], r_gid });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ t[1], r_wm });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ t[0], t[0], t[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ t[0], t[0], r_row0 });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_t, t[0] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sa, rd_sa, rd_t });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ t[0], r_wn });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ t[0], t[0], r_gid });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ t[0], t[0], r_col0 });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_t, t[0] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sb, rd_sb, rd_t });
+        // A's word rows are the padded activation rows, the whole grid's M extent.
+        try b.linef("mov.u32 {s}, %nctaid.y;", .{t[0]});
+        try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_sa_step, t[0], tile.bm * 4 });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_sb_step, r_n });
+    }
 
     const r_smem = try b.reg(.b32);
     try b.linef("mov.u32 {s}, smem;", .{r_smem});
@@ -841,8 +880,10 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     };
 
     const Frag = struct {
-        /// Load k-group `ks`'s A and B fragments of the stage at `r_base` into set `f`.
-        fn load(bb: *ptx.Builder, a_f: []const []const u8, b_f: []const []const u8, r_base: []const u8, ks: usize, regs: anytype) !void {
+        /// Load k-group `ks`'s A and B fragments of the stage at `r_base` into set `f`,
+        /// and for nvf4 the next k-group's scale words, which is the same k-group since
+        /// every call loads the one after the last.
+        fn load(bb: *ptx.Builder, a_f: []const []const u8, b_f: []const []const u8, sa_f: []const []const u8, sb_f: []const []const u8, r_base: []const u8, ks: usize, regs: anytype) !void {
             try bb.linef("add.u32 {s}, {s}, {s};", .{ regs.r_asl, r_base, regs.r_asl0 });
             try bb.linef("add.u32 {s}, {s}, {s};", .{ regs.r_bsl, r_base, regs.r_bsl0 });
             for (0..MT) |mi| {
@@ -873,15 +914,25 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
                     try bb.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ b_f[nj * 2 + 1], regs.r_bsl, o + 16 });
                 }
             }
+            if (sa_f.len == 0) return;
+            for (sa_f, 0..) |r, mi| try bb.linef("ld.global.u32 {s}, [{s}+{d}];", .{ r, regs.rd_sa, mi * 16 * 4 });
+            for (sb_f, 0..) |r, nj| try bb.linef("ld.global.u32 {s}, [{s}+{d}];", .{ r, regs.rd_sb, nj * 8 * 4 });
+            try bb.linef("add.s64 {s}, {s}, {s};", .{ regs.rd_sa, regs.rd_sa, regs.rd_sa_step });
+            try bb.linef("add.s64 {s}, {s}, {s};", .{ regs.rd_sb, regs.rd_sb, regs.rd_sb_step });
         }
 
-        fn mma(bb: *ptx.Builder, op: []const u8, accs: []const []const u8, a_f: []const []const u8, b_f: []const []const u8) !void {
+        fn mma(bb: *ptx.Builder, op: []const u8, accs: []const []const u8, a_f: []const []const u8, b_f: []const []const u8, sa_f: []const []const u8, sb_f: []const []const u8) !void {
             for (0..MT) |mi| for (0..NT) |nj| {
                 const a = accs[(mi * NT + nj) * 4 ..][0..4];
-                try bb.linef("{s} {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                // The byte and thread selectors are 0: each word holds this k64 step's
+                // four scales in k order, and the layout picks the supplying threads.
+                var sbuf: [64]u8 = undefined;
+                const scales = if (sa_f.len == 0) "" else try std.fmt.bufPrint(&sbuf, ", {{{s}}}, {{0, 0}}, {{{s}}}, {{0, 0}}", .{ sa_f[mi], sb_f[nj] });
+                try bb.linef("{s} {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}}{s};", .{
                     op,              a[0],            a[1],            a[2],            a[3],
                     a_f[mi * 4 + 0], a_f[mi * 4 + 1], a_f[mi * 4 + 2], a_f[mi * 4 + 3], b_f[nj * 2 + 0],
                     b_f[nj * 2 + 1], a[0],            a[1],            a[2],            a[3],
+                    scales,
                 });
             };
         }
@@ -889,6 +940,7 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     const fregs = .{
         .r_asl = r_asl, .r_bsl = r_bsl, .r_asl0 = r_asl0, .r_bsl0 = r_bsl0, .r_lda = r_lda,
         .r_lmask = r_lmask, .kstep = kstep, .ldm = use_ldmatrix,
+        .rd_sa = rd_sa, .rd_sb = rd_sb, .rd_sa_step = rd_sa_step, .rd_sb_step = rd_sb_step,
     };
 
     // ---- prologue: slabs 0 .. stages-2 into stages 0 .. stages-2 ----
@@ -905,7 +957,7 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     try b.linef("cp.async.wait_group {d};", .{tile.stages - 2});
     try b.line("bar.sync 0;");
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_buf, r_smem, r_cb });
-    try Frag.load(&b, afs[0], bfs[0], r_buf, 0, fregs);
+    try Frag.load(&b, afs[0], bfs[0], sfas[0], sfbs[0], r_buf, 0, fregs);
 
     try b.label("LOOP");
     // Slab i computes from the stage at r_cb while slab i+stages-1 stages into r_lb,
@@ -917,12 +969,12 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     for (0..KS) |ks| {
         const cur = ks % 2;
         const nxt = 1 - cur;
-        if (ks + 1 < KS) try Frag.load(&b, afs[nxt], bfs[nxt], r_buf, ks + 1, fregs);
+        if (ks + 1 < KS) try Frag.load(&b, afs[nxt], bfs[nxt], sfas[nxt], sfbs[nxt], r_buf, ks + 1, fregs);
         if (ks + 1 == KS) {
             try b.linef("add.u32 {s}, {s}, {s};", .{ r_buf, r_smem, r_cb });
-            try Frag.load(&b, afs[nxt], bfs[nxt], r_buf, 0, fregs);
+            try Frag.load(&b, afs[nxt], bfs[nxt], sfas[nxt], sfbs[nxt], r_buf, 0, fregs);
         }
-        try Frag.mma(&b, mma_op, acc, afs[cur], bfs[cur]);
+        try Frag.mma(&b, mma_op, acc, afs[cur], bfs[cur], sfas[cur], sfbs[cur]);
         if (ks + 2 == KS) {
             // Slab i+1 is visible to every thread, and every warp holds all of slab
             // i's fragments, so the next staging may overwrite its stage.
@@ -997,12 +1049,24 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
         try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_sc, r_ccol });
         try b.linef("add.s64 {s}, {s}, {s};", .{ rd_tmp, rd_bias, rd_sc });
         try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sc, rd_ws, rd_sc });
-        if (kind == .e4m3) try b.linef("ld.param.f32 {s}, [p_wsc];", .{fw[0]});
+        // The float kinds take the scalar `p_wsc`, times `p_ws[col]` where that is set.
+        const p_ws = try b.reg(.pred);
+        const f_ws = try b.regs(.f32, 2);
+        const f_wsc = try b.reg(.f32);
+        if (kind.float()) {
+            const rd_raw = try b.reg(.b64);
+            try b.linef("ld.param.f32 {s}, [p_wsc];", .{f_wsc});
+            try b.linef("ld.param.u64 {s}, [p_ws];", .{rd_raw});
+            try b.linef("setp.ne.u64 {s}, {s}, 0;", .{ p_ws, rd_raw });
+        }
         for (0..NT) |nj| {
             const w0, const w1, const b0, const b1 = .{ fw[nj * 2], fw[nj * 2 + 1], fb[nj * 2], fb[nj * 2 + 1] };
-            if (kind == .e4m3) {
-                if (nj > 0) try b.linef("mov.f32 {s}, {s};", .{ w0, fw[0] });
-                try b.linef("mov.f32 {s}, {s};", .{ w1, fw[0] });
+            if (kind.float()) {
+                try b.linef("mov.f32 {s}, {s};", .{ w0, f_wsc });
+                try b.linef("mov.f32 {s}, {s};", .{ w1, f_wsc });
+                try b.linef("@{s} ld.global.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ p_ws, f_ws[0], f_ws[1], rd_sc, nj * 32 });
+                try b.linef("@{s} mul.f32 {s}, {s}, {s};", .{ p_ws, w0, w0, f_ws[0] });
+                try b.linef("@{s} mul.f32 {s}, {s}, {s};", .{ p_ws, w1, w1, f_ws[1] });
             } else {
                 try b.linef("ld.global.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ w0, w1, rd_sc, nj * 32 });
             }
@@ -1041,7 +1105,7 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
             for (pairs) |pr| {
                 for (0..2) |c| {
                     const fy = f_y[c];
-                    if (kind == .e4m3)
+                    if (kind.float())
                         try b.linef("mov.b32 {s}, {s};", .{ fy, pr.acc[c] })
                     else
                         try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fy, pr.acc[c] });
@@ -1064,16 +1128,21 @@ pub fn buildIgemmPipeTiled(alloc: std.mem.Allocator, kstep: usize, fuse: bool, k
     else
         try alloc.print(".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
-    const params = if (fuse)
-        "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias,\n    .param .u32 p_m,\n    .param .f32 p_wsc,\n    .param .u64 p_c1,\n    .param .u64 p_c2,\n    .param .u32 p_split"
+    const fused_params = "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws,\n    .param .u64 p_bias,\n    .param .u32 p_m,\n    .param .f32 p_wsc,\n    .param .u64 p_c1,\n    .param .u64 p_c2,\n    .param .u32 p_split";
+    const params = if (scaled)
+        fused_params ++ ",\n    .param .u64 p_sa,\n    .param .u64 p_sb"
+    else if (fuse)
+        fused_params
     else
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k";
     const entry = switch (kind) {
         .s8 => if (fuse) "igemm_pipe_fused" else "igemm_pipe",
         .s4 => if (fuse) "i4gemm_pipe_fused" else "i4gemm_pipe",
         .e4m3 => "f8gemm_pipe_fused",
+        .nvf4 => "f4gemm_pipe_fused",
     };
     if (kind == .e4m3) b.requires(fp8_need);
+    if (kind == .nvf4) b.requires(fp4_need);
     return b.build(entry, params, shared_decl);
 }
 
@@ -1165,17 +1234,32 @@ pub const PrepOut = enum {
 pub const IgemmKind = enum {
     s8,
     s4,
-    /// fp8 e4m3 against e4m3, f32 accumulators, a scalar weight scale (`p_wsc`).
+    /// fp8 e4m3 against e4m3, f32 accumulators, a scalar weight scale (`p_wsc`) times
+    /// the per-column `p_ws` when that is not null.
     e4m3,
+    /// NVFP4 against NVFP4: e2m1 both sides with a ue4m3 scale per 16 elements, applied
+    /// by the block-scaled mma (`fp4_need`). The scales come as `[k/64][rows]` u32 words
+    /// (`p_sa` over the padded activation rows, `p_sb` over the weight rows), each word
+    /// one row's four block scales for one k64 step, plus one more step of padding the
+    /// last prefetch reads. Then `p_as` per row and `p_wsc`, as e4m3.
+    nvf4,
 
     pub fn bits(k: IgemmKind) usize {
-        return if (k == .s4) 4 else 8;
+        return if (k == .s4 or k == .nvf4) 4 else 8;
+    }
+
+    /// Whether the accumulators are f32 rather than s32.
+    fn float(k: IgemmKind) bool {
+        return k == .e4m3 or k == .nvf4;
     }
 };
 
 /// What the fp8 MMA and conversions need: sm_89's tensor cores and the ISA that added
 /// e4m3 to `mma`.
 pub const fp8_need: ptx.Need = .{ .sm = 89, .isa = 84 };
+
+/// What the block-scaled fp4 mma needs: the sm_120 family target, which covers sm_121.
+pub const fp4_need: ptx.Need = .{ .sm = 120, .isa = 88, .variant = .family };
 
 /// A packed weight format `buildPrep`'s load stage can decode, so the rotate +
 /// per-row-quantize tail is shared with the activation prep. `none` is the activation
@@ -1933,6 +2017,183 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, q: PrepOut, in_dt: Dt, b
         },
         ".extern .shared .align 16 .b8 smem[];",
     );
+}
+
+/// Elements the NVFP4 activation prep covers per scale word, and so the k step the
+/// `nvf4` GEMM's scale layout advances by.
+pub const nvf4_word_k = 64;
+
+/// Bytes of the `nvf4` GEMM's scale words for `rows` (padded) rows of width `cols`,
+/// including the step of padding its last prefetch reads.
+pub fn nvf4ScaleBytes(rows: usize, cols: usize) usize {
+    return (cols / nvf4_word_k + 1) * rows * 4;
+}
+
+/// NVFP4 activation quantization, one block of 256 threads per row (grid `m`), entry
+/// `f4prep`: `g = absmax / (6 * 448)` per row into `p_s`, then per 16-element block
+/// `scale = e4m3(block_absmax / (g * 6))` and `code = e2m1(x / (scale * g))`, both
+/// rounded to nearest even and saturated by the hardware conversions, which is what
+/// `ops.nvfp4.quantizeActRow` computes. Codes go to `p_q` [row][cols/2] HIGH nibble
+/// first, the weight file's order (`ops/nvfp4.zig`); the mma reads the low nibble first,
+/// but with both operands swapped alike it sums the same pairs inside each block. Scales
+/// go to `p_sc` as `nvf4` words over `p_mpad` rows. An all-zero row takes g = 1, so its
+/// block scales are 0 and its codes 0. Needs cols % 64 == 0.
+pub fn buildNvf4Prep(alloc: std.mem.Allocator, in_dt: Dt) ![:0]u8 {
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+    b.requires(fp4_need);
+    const ib = in_dt.bytes();
+
+    const rd = try b.regs(.b64, 7);
+    const rd_x, const rd_q, const rd_sc, const rd_s, const rd_row, const rd_t, const rd_u = .{ rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], rd[6] };
+    const r = try b.regs(.b32, 10);
+    const r_t, const r_row, const r_cols, const r_mpad, const r_nblk, const r_blk, const r_lane, const r_tmp, const r_w0, const r_w1 = .{ r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9] };
+    const fx = try b.regs(.f32, 16);
+    const f = try b.regs(.f32, 8);
+    const f_amax, const f_bmax, const f_g, const f_6g, const f_s, const f_sd, const f_den, const f_o = .{ f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7] };
+    const p = try b.regs(.pred, 2);
+    const hw = try b.regs(.b32, 8);
+    const h16 = try b.regs(.b16, 3);
+    const q8 = try b.regs(.b8, 8);
+
+    for ([_][]const u8{ "p_x", "p_q", "p_sc", "p_s" }, [_][]const u8{ rd_x, rd_q, rd_sc, rd_s }) |name, reg| {
+        try b.linef("ld.param.u64 {s}, [{s}];", .{ reg, name });
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ reg, reg });
+    }
+    try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
+    try b.linef("ld.param.u32 {s}, [p_mpad];", .{r_mpad});
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_row});
+    try b.linef("shr.u32 {s}, {s}, 4;", .{ r_nblk, r_cols });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_row, r_row, r_cols });
+    try b.linef("mul.lo.u64 {s}, {s}, {d};", .{ rd_row, rd_row, ib });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_row, rd_row, rd_x });
+
+    // The 16 values of block `r_blk` as f32 into `fx`.
+    const Load = struct {
+        fn emit(bb: *ptx.Builder, dt: Dt, regs: anytype) !void {
+            try bb.linef("mul.wide.u32 {s}, {s}, {d};", .{ regs.rd_t, regs.r_blk, 16 * dt.bytes() });
+            try bb.linef("add.s64 {s}, {s}, {s};", .{ regs.rd_t, regs.rd_t, regs.rd_row });
+            switch (dt) {
+                .f32 => for (0..4) |v| try bb.linef("ld.global.v4.f32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ regs.fx[4 * v], regs.fx[4 * v + 1], regs.fx[4 * v + 2], regs.fx[4 * v + 3], regs.rd_t, 16 * v }),
+                .f16, .bf16 => {
+                    for (0..2) |v| try bb.linef("ld.global.v4.b32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ regs.hw[4 * v], regs.hw[4 * v + 1], regs.hw[4 * v + 2], regs.hw[4 * v + 3], regs.rd_t, 16 * v });
+                    for (0..8) |w| {
+                        const lo, const hi = .{ regs.fx[2 * w], regs.fx[2 * w + 1] };
+                        if (dt == .f16) {
+                            try bb.linef("mov.b32 {{{s}, {s}}}, {s};", .{ regs.h16[0], regs.h16[1], regs.hw[w] });
+                            try bb.linef("cvt.f32.f16 {s}, {s};", .{ lo, regs.h16[0] });
+                            try bb.linef("cvt.f32.f16 {s}, {s};", .{ hi, regs.h16[1] });
+                        } else {
+                            try bb.linef("shl.b32 {s}, {s}, 16;", .{ regs.r_tmp, regs.hw[w] });
+                            try bb.linef("mov.b32 {s}, {s};", .{ lo, regs.r_tmp });
+                            try bb.linef("and.b32 {s}, {s}, 0xFFFF0000;", .{ regs.r_tmp, regs.hw[w] });
+                            try bb.linef("mov.b32 {s}, {s};", .{ hi, regs.r_tmp });
+                        }
+                    }
+                },
+            }
+            try bb.linef("abs.f32 {s}, {s};", .{ regs.f_bmax, regs.fx[0] });
+            for (regs.fx[1..]) |v| {
+                try bb.linef("abs.f32 {s}, {s};", .{ regs.f_o, v });
+                try bb.linef("max.f32 {s}, {s}, {s};", .{ regs.f_bmax, regs.f_bmax, regs.f_o });
+            }
+        }
+    };
+    const lregs = .{ .rd_t = rd_t, .r_blk = r_blk, .rd_row = rd_row, .fx = fx, .hw = hw, .h16 = h16, .r_tmp = r_tmp, .f_bmax = f_bmax, .f_o = f_o };
+
+    // ---- pass 1: the row's absmax ----
+    try b.linef("mov.f32 {s}, 0f00000000;", .{f_amax});
+    try b.linef("mov.u32 {s}, {s};", .{ r_blk, r_t });
+    try b.label("AMAX");
+    try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ p[0], r_blk, r_nblk });
+    try b.linef("@{s} bra AMAX_DONE;", .{p[0]});
+    try Load.emit(&b, in_dt, lregs);
+    try b.linef("max.f32 {s}, {s}, {s};", .{ f_amax, f_amax, f_bmax });
+    try b.linef("add.u32 {s}, {s}, 256;", .{ r_blk, r_blk });
+    try b.line("bra AMAX;");
+    try b.label("AMAX_DONE");
+    for ([_]u32{ 16, 8, 4, 2, 1 }) |sh| {
+        try b.linef("shfl.sync.bfly.b32 {s}, {s}, {d}, 31, 0xffffffff;", .{ f_o, f_amax, sh });
+        try b.linef("max.f32 {s}, {s}, {s};", .{ f_amax, f_amax, f_o });
+    }
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("setp.eq.u32 {s}, {s}, 0;", .{ p[0], r_lane });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_tmp, r_t });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tmp });
+    try b.linef("mov.u32 {s}, red;", .{r_w0});
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_w0 });
+    try b.linef("@{s} st.shared.f32 [{s}], {s};", .{ p[0], r_tmp, f_amax });
+    try b.line("bar.sync 0;");
+    try b.linef("ld.shared.f32 {s}, [red];", .{f_amax});
+    for (1..8) |w| {
+        try b.linef("ld.shared.f32 {s}, [red+{d}];", .{ f_o, 4 * w });
+        try b.linef("max.f32 {s}, {s}, {s};", .{ f_amax, f_amax, f_o });
+    }
+    try b.linef("div.rn.f32 {s}, {s}, 0f45280000;", .{ f_g, f_amax }); // 2688 = 6 * 448
+    try b.linef("setp.eq.f32 {s}, {s}, 0f00000000;", .{ p[0], f_g });
+    try b.linef("@{s} mov.f32 {s}, 0f3F800000;", .{ p[0], f_g });
+    try b.linef("setp.eq.u32 {s}, {s}, 0;", .{ p[0], r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_t, r_row });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_t, rd_t, rd_s });
+    try b.linef("@{s} st.global.f32 [{s}], {s};", .{ p[0], rd_t, f_g });
+    try b.linef("mul.rn.f32 {s}, {s}, 0f40C00000;", .{ f_6g, f_g });
+
+    // ---- pass 2: block scales and codes ----
+    try b.linef("mov.u32 {s}, {s};", .{ r_blk, r_t });
+    try b.label("QUANT");
+    try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ p[0], r_blk, r_nblk });
+    try b.linef("@{s} bra QUANT_DONE;", .{p[0]});
+    try Load.emit(&b, in_dt, lregs);
+    try b.linef("div.rn.f32 {s}, {s}, {s};", .{ f_s, f_bmax, f_6g });
+    // The scale is the low byte; the high one encodes 0, so the two decoded halves sum
+    // to the scale whichever half holds it.
+    try b.linef("cvt.rn.satfinite.e4m3x2.f32 {s}, 0f00000000, {s};", .{ h16[2], f_s });
+    try b.linef("cvt.rn.f16x2.e4m3x2 {s}, {s};", .{ r_tmp, h16[2] });
+    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], r_tmp });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ f_sd, h16[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ f_o, h16[1] });
+    try b.linef("add.f32 {s}, {s}, {s};", .{ f_sd, f_sd, f_o });
+    try b.linef("mul.rn.f32 {s}, {s}, {s};", .{ f_den, f_sd, f_g });
+    try b.linef("setp.eq.f32 {s}, {s}, 0f00000000;", .{ p[1], f_den });
+    try b.linef("@{s} mov.f32 {s}, 0f3F800000;", .{ p[1], f_den });
+    for (0..8) |j| {
+        try b.linef("div.rn.f32 {s}, {s}, {s};", .{ fx[2 * j], fx[2 * j], f_den });
+        try b.linef("div.rn.f32 {s}, {s}, {s};", .{ fx[2 * j + 1], fx[2 * j + 1], f_den });
+        // The first operand lands in the HIGH nibble.
+        try b.linef("cvt.rn.satfinite.e2m1x2.f32 {s}, {s}, {s};", .{ q8[j], fx[2 * j], fx[2 * j + 1] });
+    }
+    for ([_][]const u8{ r_w0, r_w1 }, 0..) |w, half| {
+        try b.linef("mov.u32 {s}, 0;", .{w});
+        for (0..4) |j| {
+            try b.linef("cvt.u32.u8 {s}, {s};", .{ r_tmp, q8[4 * half + j] });
+            try b.linef("and.b32 {s}, {s}, 255;", .{ r_tmp, r_tmp });
+            try b.linef("shl.b32 {s}, {s}, {d};", .{ r_tmp, r_tmp, 8 * j });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ w, w, r_tmp });
+        }
+        // A zero block scale leaves every code 0.
+        try b.linef("@{s} mov.u32 {s}, 0;", .{ p[1], w });
+    }
+    // codes: p_q + row * cols/2 + blk * 8
+    try b.linef("shr.u32 {s}, {s}, 1;", .{ r_tmp, r_cols });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_t, r_row, r_tmp });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_t, rd_t, rd_q });
+    try b.linef("mul.wide.u32 {s}, {s}, 8;", .{ rd_u, r_blk });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_t, rd_t, rd_u });
+    try b.linef("st.global.v2.u32 [{s}], {{{s}, {s}}};", .{ rd_t, r_w0, r_w1 });
+    // scale: p_sc + ((blk/4) * mpad + row) * 4 + blk%4
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_tmp, r_blk });
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ r_tmp, r_tmp, r_mpad, r_row });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tmp });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_lane, r_blk });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_lane });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_t, r_tmp });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_t, rd_t, rd_sc });
+    try b.linef("st.global.u8 [{s}], {s};", .{ rd_t, h16[2] });
+    try b.linef("add.u32 {s}, {s}, 256;", .{ r_blk, r_blk });
+    try b.line("bra QUANT;");
+    try b.label("QUANT_DONE");
+    return b.build("f4prep", "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_sc,\n    .param .u64 p_s,\n    .param .u32 p_cols,\n    .param .u32 p_mpad", ".shared .align 4 .b8 red[32];");
 }
 
 /// dynamic-shared byte requirement for a prep launch (bit-width-independent:
@@ -4007,10 +4268,21 @@ fn fusedKindRates(ctx: *Context, stdout: anytype) !void {
     const m: usize = 7680;
     const rows: usize = 6144;
     const cols: usize = 6144;
-    const kinds = [_]IgemmKind{ .s8, .s4, .e4m3 };
-    const n_kinds: usize = if (ctx.cc_major * 10 + ctx.cc_minor >= fp8_need.sm) 3 else 2;
-    var fns: [3]cu.CUfunction = undefined;
-    var mods: [3]ctxmod.Module = undefined;
+    const sm = ctx.cc_major * 10 + ctx.cc_minor;
+    var kinds: [4]IgemmKind = undefined;
+    var n_kinds: usize = 0;
+    for ([_]IgemmKind{ .s8, .s4, .e4m3, .nvf4 }) |kind| {
+        const ok = switch (kind) {
+            .e4m3 => sm >= fp8_need.sm,
+            .nvf4 => ctx.cc_major == 12,
+            else => true,
+        };
+        if (!ok) continue;
+        kinds[n_kinds] = kind;
+        n_kinds += 1;
+    }
+    var fns: [4]cu.CUfunction = undefined;
+    var mods: [4]ctxmod.Module = undefined;
     for (kinds[0..n_kinds], 0..) |kind, i| {
         const ptx_src = try buildIgemmPipe(gpa, 64, true, kind, true, .f32);
         defer gpa.free(ptx_src);
@@ -4019,12 +4291,14 @@ fn fusedKindRates(ctx: *Context, stdout: anytype) !void {
             .s8 => "igemm_pipe_fused",
             .s4 => "i4gemm_pipe_fused",
             .e4m3 => "f8gemm_pipe_fused",
+            .nvf4 => "f4gemm_pipe_fused",
         });
     }
     defer for (mods[0..n_kinds]) |*md| md.unload(ctx);
 
-    // Operands sized for s8; s4 reads half of each. Nonzero data, since a power-capped
-    // card clocks higher on zeros, and no byte is an e4m3 NaN (0x7f or 0xff).
+    // Operands sized for s8; the 4-bit kinds read half of each. Nonzero data, since a
+    // power-capped card clocks higher on zeros, and no byte is an e4m3 NaN (0x7f or
+    // 0xff). Every nvf4 block scale is 1.0 (0x38).
     var a_d = try ctx.alloc(m * cols);
     defer ctx.free(&a_d);
     var w_d = try ctx.alloc(rows * cols);
@@ -4035,12 +4309,18 @@ fn fusedKindRates(ctx: *Context, stdout: anytype) !void {
     defer ctx.free(&ws_d);
     var y_d = try ctx.alloc(m * rows * 4);
     defer ctx.free(&y_d);
+    var sa_d = try ctx.alloc(nvf4ScaleBytes(m, cols));
+    defer ctx.free(&sa_d);
+    var sb_d = try ctx.alloc(nvf4ScaleBytes(rows, cols));
+    defer ctx.free(&sb_d);
     try ctx.memsetD32(a_d, 0x352a1346, m * cols / 4);
     try ctx.memsetD32(w_d, 0x2b46135a, rows * cols / 4);
+    try ctx.memsetD32(sa_d, 0x38383838, nvf4ScaleBytes(m, cols) / 4);
+    try ctx.memsetD32(sb_d, 0x38383838, nvf4ScaleBytes(rows, cols) / 4);
 
     const timer = try ctx.timerCreate();
     defer ctx.timerDestroy(timer);
-    var best: [3]f32 = @splat(std.math.floatMax(f32));
+    var best: [4]f32 = @splat(std.math.floatMax(f32));
     for (0..12) |rep| for (0..n_kinds) |j| {
         const i = if (rep % 2 == 0) j else n_kinds - 1 - j;
         var pa = a_d.ptr;
@@ -4049,13 +4329,16 @@ fn fusedKindRates(ctx: *Context, stdout: anytype) !void {
         var pn: u32 = @intCast(rows);
         var pk: u32 = @intCast(cols);
         var pas = as_d.ptr;
-        var pws = ws_d.ptr;
+        var pws: u64 = if (kinds[i] == .s8 or kinds[i] == .s4) ws_d.ptr else 0;
         var no_bias: u64 = 0;
         var pm: u32 = @intCast(m);
         var wsc: f32 = 1.0;
-        var params = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&no_bias), @ptrCast(&pm), @ptrCast(&wsc), @ptrCast(&pc), @ptrCast(&pc), @ptrCast(&pn) };
+        var psa = sa_d.ptr;
+        var psb = sb_d.ptr;
+        var params = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&no_bias), @ptrCast(&pm), @ptrCast(&wsc), @ptrCast(&pc), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&psa), @ptrCast(&psb) };
+        const np: usize = if (kinds[i] == .nvf4) params.len else params.len - 2;
         try ctx.timerBegin(timer);
-        try ctx.launch(fns[i], .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &params);
+        try ctx.launch(fns[i], .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, params[0..np]);
         best[i] = @min(best[i], try ctx.timerEndMs(timer));
     };
     const ops: f64 = 2.0 * @as(f64, @floatFromInt(m * rows * cols));
@@ -8296,4 +8579,17 @@ test "flash attention builds at every head width and dtype it accepts" {
         try std.testing.expectEqual(hd / 16 * 4 * 2 * 2, std.mem.count(u8, s, "mma.sync"));
     };
     try std.testing.expect(!flashAttnHd(80) and !flashAttnHd(256));
+}
+
+test "the nvf4 GEMM and its prep target the sm_120 family" {
+    const a = std.testing.allocator;
+    const g = try buildIgemmPipe(a, 64, true, .nvf4, true, .f32);
+    defer a.free(g);
+    try std.testing.expect(std.mem.startsWith(u8, g, ".version 8.8\n.target sm_120f\n"));
+    try std.testing.expect(std.mem.find(u8, g, "kind::mxf4nvf4.block_scale.scale_vec::4X") != null);
+    inline for (.{ .f32, .f16, .bf16 }) |dt| {
+        const p = try buildNvf4Prep(a, dt);
+        defer a.free(p);
+        try std.testing.expect(std.mem.startsWith(u8, p, ".version 8.8\n.target sm_120f\n"));
+    }
 }

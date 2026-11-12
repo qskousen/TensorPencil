@@ -76,10 +76,10 @@ pub fn streamDt(be: *const Backend, u: *const sd_unet.UNet) Dt {
 /// What the stream would run as if `want` were asked for.
 pub fn streamDtFor(be: *const Backend, u: *const sd_unet.UNet, want: Dt) Dt {
     if (want == .f32 or ops.matmul.probe != null) return .f32;
-    // A route that reads only f32 activations (fp8, NVFP4, a GGUF format on a
-    // dequant route) puts the whole stream at f32.
+    // A route that reads only f32 activations (NVFP4 weight-only, int4 on a fast-s4 card, a GGUF
+    // format on a dequant route) puts the whole stream at f32.
     const p = planFor(be, u) catch return .f32;
-    return if (lin_cuda.takes16(p, u.device_lins)) want else .f32;
+    return if (lin_cuda.takes16(be, p, u.device_lins)) want else .f32;
 }
 
 /// The dispatcher plan for this UNet's linears: dense weights on the f16 tensor

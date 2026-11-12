@@ -372,6 +372,9 @@ pub const Options = struct {
     /// How the denoiser's fp8 weights multiply on a device with fp8 tensor cores
     /// (`--dit-fp8-gemm`). Elsewhere they always run weight-only.
     dit_fp8_gemm: lin_cuda.dual_lin.Fp8Gemm = .w8a8,
+    /// How the denoiser's NVFP4 weights multiply (`--dit-fp4-gemm`), each mode falling
+    /// back to the next where the device lacks it.
+    dit_fp4_gemm: lin_cuda.dual_lin.Fp4Gemm = .w4a4,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
     /// A hard ceiling: an allocation past it is refused, not merely discouraged.
@@ -4875,8 +4878,9 @@ pub const Session = struct {
     /// public stages itself (ggufy's ladder, the GUI's per-image config) gets the same
     /// behaviour without threading it through four stage signatures.
     compat: CompatConfig = .{},
-    /// `Options.dit_fp8_gemm`, kept like `compat`.
+    /// `Options.dit_fp8_gemm` and `dit_fp4_gemm`, kept like `compat`.
     fp8_gemm: lin_cuda.dual_lin.Fp8Gemm = .w8a8,
+    fp4_gemm: lin_cuda.dual_lin.Fp4Gemm = .w4a4,
 
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5656,6 +5660,7 @@ pub const Session = struct {
         self.io = io;
         self.compat = opts.compatConfig();
         self.fp8_gemm = opts.dit_fp8_gemm;
+        self.fp4_gemm = opts.dit_fp4_gemm;
         self.backend = opts.backend;
         self.gpu_ctx = null;
         self.cu_be = null;
@@ -8191,6 +8196,7 @@ pub const Session = struct {
     ) !Denoiser {
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         lin_cuda.dual_lin.trunk_fp8 = self.fp8_gemm;
+        lin_cuda.dual_lin.trunk_fp4 = self.fp4_gemm;
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null and self.family() != .minimax_h3_image) return error.CfgNeedsNegativeCond;
         // Not built yet: H3's sampler steps a TWO-STREAM latent
@@ -9286,6 +9292,7 @@ pub const Session = struct {
         };
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         lin_cuda.dual_lin.trunk_fp8 = self.fp8_gemm;
+        lin_cuda.dual_lin.trunk_fp4 = self.fp4_gemm;
         const m = &self.models.minimax_h3;
         const audio = shape.audio orelse return error.FamilyIsNotVideo;
 
@@ -11468,6 +11475,7 @@ pub const Session = struct {
         // Per-render, not per-session: the GUI snapshots a config per queued image.
         self.compat = opts.compatConfig();
         self.fp8_gemm = opts.dit_fp8_gemm;
+        self.fp4_gemm = opts.dit_fp4_gemm;
         // Per family, not `/ 8`: SenseNova generates in pixel space, so its
         // "latent" is the canvas at full resolution.
         const px_per_lat = self.spatialDownscale();
