@@ -78,6 +78,10 @@ CONFIG = dict(
 # while 150 -> 160 (up), since `round(dim / 32) * 32` is nearest, not floor. An
 # image already on the grid would leave the resize an identity and pin nothing.
 IMG_H, IMG_W = 100, 150
+# A grid PAST the 48x48 table on one axis (4 x 52 patches): the rope's table has
+# to follow the grid, not the position table. Every MiniMax-H3-Image edit
+# picture is past it (a 1024 px short edge is 64 patches).
+WIDE_H, WIDE_W = 60, 840
 
 
 def main():
@@ -136,6 +140,17 @@ def main():
     tensors["out.merged"] = merged
     for i, d in enumerate(deepstack):
         tensors["out.deepstack.%d" % i] = d
+
+    wide = torch.rand(1, WIDE_H, WIDE_W, 3, dtype=torch.float32)
+    wflat, wgrid = comfy.text_encoders.qwen_vl.process_qwen2vl_images(
+        wide, patch_size=CONFIG["patch_size"], image_mean=[0.5] * 3, image_std=[0.5] * 3)
+    assert max(int(wgrid[0][1]), int(wgrid[0][2])) > 48, wgrid
+    with torch.inference_mode():
+        wmerged, _ = vit(wflat.to(torch.float32), wgrid)
+    tensors["in.patches_wide"] = wflat
+    tensors["in.grid_wide"] = wgrid.to(torch.int32)
+    tensors["out.merged_wide"] = wmerged
+    print("  wide: [%d,%d] -> grid %s" % (WIDE_H, WIDE_W, wgrid.tolist()))
 
     # --- teeth -------------------------------------------------------------
     def rel(a, b):

@@ -40,6 +40,38 @@ pub fn copyName(comptime in: Dt, comptime out: Dt) [:0]const u8 {
     return "copy_" ++ @tagName(in) ++ "_" ++ @tagName(out);
 }
 
+/// One `norm_rope` launch (`rows.normRope`), packed the same way by both backends.
+pub const NormRope = struct {
+    /// positions * heads
+    rows: usize,
+    dim: usize,
+    heads: usize,
+    /// Pairs that rotate, `dim / 2` for a whole head; also the freq table's width.
+    pairs: usize,
+    /// Element offset of the sin half of the freq table.
+    sin_off: usize,
+    eps: f32,
+    pos0: usize = 0,
+    interleaved: bool = false,
+    scale: f32 = 1,
+
+    pub fn u(a: NormRope) [7]u32 {
+        std.debug.assert(2 * a.pairs <= a.dim);
+        return .{ @intCast(a.rows), @intCast(a.dim), @intCast(a.sin_off), @intCast(a.heads), @intCast(a.pos0), @intCast(a.pairs), @intFromBool(a.interleaved) };
+    }
+
+    pub fn f(a: NormRope) [2]f32 {
+        return .{ a.eps, a.scale };
+    }
+};
+
+/// The `norm_rope` instance from `in` to `out`; only an f32 input narrows.
+pub fn normRopeName(comptime in: Dt, comptime out: Dt) [:0]const u8 {
+    if (in == out) return typedName("norm_rope", in);
+    if (in != .f32) @compileError("norm_rope: a 16-bit input writes its own width");
+    return "norm_rope_f32_" ++ @tagName(out);
+}
+
 /// Gather every 3x3 conv's patch through an f32 buffer and a convert pass rather than
 /// straight into the GEMM operand, on both backends, for an A/B
 /// (`diffusion-profile --ab convpatch`, `wan-vae-test`).
@@ -258,7 +290,6 @@ pub const entries = [_]Entry{
     .{ .name = "im2col_bf16", .wg = elem_wg },
     .{ .name = "im2col_bf16_f16", .wg = elem_wg },
     .{ .name = "im2col_bf16_bf16", .wg = elem_wg },
-    .{ .name = "qknorm_rope", .wg = elem_wg },
     .{ .name = "l2norm_rows", .wg = row_wg, .kind = .rows },
     .{ .name = "l2norm_rows_g", .wg = row_wg, .kind = .rows },
     .{ .name = "act_steer", .wg = row_wg, .kind = .rows },
@@ -270,7 +301,11 @@ pub const entries = [_]Entry{
     .{ .name = "gdn_delta_chunk_d64", .wg = 64 },
     .{ .name = "gdn_delta_chunk_d128", .wg = 128 },
     .{ .name = "rmsnorm", .wg = row_wg, .kind = .rows },
-    .{ .name = "qk_norm_rope", .wg = row_wg, .kind = .rows },
+    .{ .name = "norm_rope", .wg = row_wg, .kind = .rows },
+    .{ .name = "norm_rope_f16", .wg = row_wg, .kind = .rows },
+    .{ .name = "norm_rope_bf16", .wg = row_wg, .kind = .rows },
+    .{ .name = "norm_rope_f32_f16", .wg = row_wg, .kind = .rows },
+    .{ .name = "norm_rope_f32_bf16", .wg = row_wg, .kind = .rows },
     .{ .name = "group_rmsnorm", .wg = row_wg, .kind = .rows },
     .{ .name = "gemv_rows_f32", .wg = row_wg, .kind = .rows },
     .{ .name = "rms_mod", .wg = row_wg, .kind = .rows },
@@ -413,8 +448,6 @@ pub const entries = [_]Entry{
     .{ .name = "gn_apply_bf16", .wg = elem_wg },
     .{ .name = "im2col_sd_f16", .wg = elem_wg },
     .{ .name = "im2col_sd_bf16", .wg = elem_wg },
-    .{ .name = "qknorm_rope_f16", .wg = elem_wg },
-    .{ .name = "qknorm_rope_bf16", .wg = elem_wg },
     .{ .name = "layernorm_f16", .wg = row_wg, .kind = .rows },
     .{ .name = "layernorm_bf16", .wg = row_wg, .kind = .rows },
     .{ .name = "layernorm_f32_f16", .wg = row_wg, .kind = .rows },
@@ -520,6 +553,9 @@ pub const entries = [_]Entry{
     .{ .name = "svdq_unpack", .wg = elem_wg },
     .{ .name = "svdq_unpack_f16", .wg = elem_wg },
     .{ .name = "svdq_unpack_bf16", .wg = elem_wg },
+    .{ .name = "adaln_table", .wg = elem_wg },
+    .{ .name = "adaln_table_f16", .wg = elem_wg },
+    .{ .name = "adaln_table_bf16", .wg = elem_wg },
 };
 
 pub fn get(comptime name: []const u8) Entry {

@@ -26,7 +26,8 @@
 //! - **`Downsample3D` reflect-pads asymmetrically `(0, 1, 0, 1)` and then strides**,
 //!   with the conv's own padding temporal-only.
 //! - **`conv_out` emits `2 * z_channels`** and `quant_conv` sits on top of it;
-//!   encode keeps the FIRST half (the mean) and discards the log-variance.
+//!   `encode` keeps the FIRST half (the mean) and discards the log-variance.
+//!   The image VAEs' references are a posterior SAMPLE instead (`encodeSample`).
 //! - **Spatial tiling is always on**, 256 px with a 64 px minimum overlap. It is
 //!   semantic, not a memory bound: a frame wider than a tile encodes tile by tile
 //!   and blends, and encoding it whole gives a different latent.
@@ -400,8 +401,9 @@ pub const VideoEncoder = struct {
         if (conv_out.out_ch != 2 * cfg.z_channels) return error.ShapeMismatch;
         const quant = try l.conv("quant_conv", .{}, 1, 0, 0, 1);
         if (quant.in_ch != 2 * cfg.z_channels or quant.out_ch != 2 * cfg.embed_dim) return error.ShapeMismatch;
-        const latents_mean = try l.vec("latents_mean", .{}, cfg.embed_dim);
-        const latents_std = try l.vec("latents_std", .{}, cfg.embed_dim);
+        if (cfg.embed_dim != vae.default_latents_mean.len) return error.ShapeMismatch;
+        const latents_mean = if (store.get("latents_mean") != null) try l.vec("latents_mean", .{}, cfg.embed_dim) else try alloc.dupe(f32, &vae.default_latents_mean);
+        const latents_std = if (store.get("latents_std") != null) try l.vec("latents_std", .{}, cfg.embed_dim) else try alloc.dupe(f32, &vae.default_latents_std);
 
         return .{
             .arena = arena,
@@ -685,6 +687,62 @@ pub fn encode(
     /// A backend's `encodeMoments`, or null for the CPU one.
     dev: ?Moments,
 ) !Vol {
+    return encodeImpl(enc, io, gpa, x, sp, dev, null);
+}
+
+/// `encode` with the latent drawn from the posterior, `mean + exp(logvar / 2) *
+/// noise`, the noise torch's CPU `randn` at `seed` over the latent's shape. This is
+/// how the image VAEs encode (the reference seeds it 42), and it is a different
+/// latent from the mean, not a noisier copy of the same one.
+pub fn encodeSample(
+    enc: *const VideoEncoder,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    x: Vol,
+    sp: vae.Spatial,
+    dev: ?Moments,
+    seed: u64,
+) !Vol {
+    return encodeImpl(enc, io, gpa, x, sp, dev, seed);
+}
+
+/// A MiniMax-H3-Image reference picture, planar `[3][h][w]` in [0, 1], to its
+/// normalized posterior latent the way `MiniMaxH3ImageConditioning` makes it: a
+/// Lanczos resize to `(out_h, out_w)` (ComfyUI's, through 8 bits, and none at
+/// all when the size already matches), then `encodeSample` at the reference's seed.
+pub fn encodeImageRef(
+    enc: *const VideoEncoder,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    rgb: []const f32,
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    sp: vae.Spatial,
+    dev: ?Moments,
+    seed: u64,
+) !Vol {
+    const px = try gpa.alloc(f32, 3 * out_h * out_w);
+    defer gpa.free(px);
+    if (out_h == h and out_w == w) {
+        @memcpy(px, rgb);
+    } else {
+        try tp_core.resample.lanczosPlanar(gpa, px, rgb, h, w, out_h, out_w);
+    }
+    for (px) |*v| v.* = v.* * 2.0 - 1.0;
+    return encodeSample(enc, io, gpa, .{ .d = px, .ch = 3, .t = 1, .h = out_h, .w = out_w }, sp, dev, seed);
+}
+
+fn encodeImpl(
+    enc: *const VideoEncoder,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    x: Vol,
+    sp: vae.Spatial,
+    dev: ?Moments,
+    sample_seed: ?u64,
+) !Vol {
     const cfg = enc.cfg;
     std.debug.assert(x.ch == cfg.in_channels);
 
@@ -709,14 +767,29 @@ pub fn encode(
         .h = moments.h,
         .w = moments.w,
     };
+    if (moments.ch != 2 * cfg.embed_dim) return error.ShapeMismatch;
     const plane = moments.h * moments.w;
+    const noise: []f32 = if (sample_seed) |seed| blk: {
+        const n = try a.alloc(f32, out.d.len);
+        tp_core.noise.randn(n, seed, .torch_cpu);
+        break :blk n;
+    } else &.{};
     for (0..cfg.embed_dim) |c| {
         const m = enc.latents_mean[c];
         const s = enc.latents_std[c];
         for (0..lat_t) |t| {
             const src = moments.d[((c * moments.t + t + t_off) * plane)..][0..plane];
             const dst = out.d[((c * lat_t + t) * plane)..][0..plane];
-            for (dst, src) |*d, v| d.* = (v - m) / s;
+            if (noise.len == 0) {
+                for (dst, src) |*d, v| d.* = (v - m) / s;
+                continue;
+            }
+            const logvar = moments.d[(((c + cfg.embed_dim) * moments.t + t + t_off) * plane)..][0..plane];
+            const eps = noise[((c * lat_t + t) * plane)..][0..plane];
+            for (dst, src, logvar, eps) |*d, v, lv, e| {
+                const sample = v + @exp(0.5 * std.math.clamp(lv, -30.0, 20.0)) * e;
+                d.* = (sample - m) / s;
+            }
         }
     }
     return out;
@@ -1086,4 +1159,16 @@ test "the encode matches the reference at a toy width" {
         errdefer std.debug.print("{s}: rel L2 {e}\n", .{ c.name, rel });
         try testing.expect(rel < 1e-5);
     }
+
+    // The image VAEs' encode: ComfyUI's `H3ImageVAE.encode` on the same toy
+    // weights, a posterior sample at the reference's seed.
+    const x = try (try st.require("in.one_frame_small")).toF32Alloc(gpa);
+    defer gpa.free(x);
+    const want = try (try st.require("out.sample_one_frame_small")).toF32Alloc(gpa);
+    defer gpa.free(want);
+    var got = try encodeSample(&enc, io, gpa, .{ .d = x, .ch = 3, .t = 1, .h = 64, .w = 64 }, sp, null, 42);
+    defer gpa.free(got.d);
+    const rel = relL2(want, got.d[0..got.elems()]);
+    errdefer std.debug.print("posterior sample: rel L2 {e}\n", .{rel});
+    try testing.expect(rel < 1e-5);
 }

@@ -102,8 +102,7 @@ pub fn body(d: anytype, model: *const dit.DiT, seq_txt: usize, n_img: usize, can
                 try d.siluStage(mp.mg, mp.mu, st, tile);
                 try d.gemms(d.prepStaged(st, tile, blk.mlp.down.cols, &.{blk.mlp.down}), &.{mp.down_out}, &.{blk.mlp.down});
             } else {
-                try d.siluMul(mp.mg, mp.mu, tile);
-                try d.linear(mp.down_out, mp.mg, tile, blk.mlp.down);
+                try d.siluMulLinear(mp.down_out, mp.mg, mp.mu, tile, blk.mlp.down);
             }
             try d.gatedAdd(xo, mp.down_out, b.mv, mb + 5 * F, tile);
         }

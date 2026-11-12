@@ -12,6 +12,7 @@ const std = @import("std");
 const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const kernels = @import("kernels.zig");
+const sage = @import("sage.zig");
 const elt = @import("elt.zig");
 const dual_ptx = @embedFile("dual_ptx");
 const dual_table = @import("../kernels/dual_table.zig");
@@ -76,6 +77,17 @@ const lt_workspace_bytes: usize = 32 << 20;
 /// DIAGNOSTIC ONLY: skip the int8 irescale pass (produces garbage output) to
 /// measure its batched cost, the ceiling on what fusing dequant could save.
 pub var bench_skip_rescale: bool = false;
+
+/// The two engines a `.libs` W8A8 GEMM can run on: cuBLASLt into the s32 scratch then
+/// `irescale`, or the hand fused kernel. Their epilogues are the same f32 operations in
+/// the same order, so they store the same bytes and the choice only moves time.
+pub const I8Route = enum { lt, hand };
+
+const I8Shape = struct { m: u32, n: u32, k: u32 };
+
+/// DIAGNOSTIC ONLY: run every `.libs` W8A8 GEMM the hand kernel can take on this
+/// route instead of the measured one.
+pub var i8_route_force: ?I8Route = null;
 
 /// DIAGNOSTIC ONLY: in `opGemmBf16`, skip the f32->bf16 activation pad and the
 /// `bias_compact` output pass, leaving only the GEMM itself (produces garbage
@@ -536,6 +548,10 @@ pub const Backend = struct {
     // the s32 accumulator never round-trips to DRAM.
     mdq_plans: std.AutoHashMapUnmanaged(u64, cudnn.MatmulDequantPlan) = .empty,
     use_fused_i8: bool = false,
+    /// The engine each W8A8 GEMM shape runs on in `.libs` mode, see `i8Route`.
+    i8_routes: std.AutoHashMapUnmanaged(I8Shape, I8Route) = .empty,
+    /// Set between `graphCaptureBegin` and `graphCaptureEnd`, where nothing may be timed.
+    capturing: bool = false,
     cudnn_q16: DeviceBuffer = .{},
     cudnn_k16: DeviceBuffer = .{},
     cudnn_v16: DeviceBuffer = .{},
@@ -547,6 +563,17 @@ pub const Backend = struct {
     fa_v16: DeviceBuffer = .{},
     // `flash_attn` per (hd, in dtype, out dtype); modules live in `elt_mods`.
     fa_fns: std.AutoHashMapUnmanaged(u32, cu.CUfunction) = .empty,
+    /// ComfyUI's int8 attention (`opSageAttn`): its kernels, and its quantized
+    /// operands, which `sage-attn-cuda-test` reads back.
+    sage_fns: std.AutoHashMapUnmanaged(u32, cu.CUfunction) = .empty,
+    sage_q8: DeviceBuffer = .{},
+    sage_k8: DeviceBuffer = .{},
+    sage_v8: DeviceBuffer = .{},
+    sage_qs: DeviceBuffer = .{},
+    sage_ks: DeviceBuffer = .{},
+    sage_vs: DeviceBuffer = .{},
+    sage_vmax: DeviceBuffer = .{},
+    sage_anchor: DeviceBuffer = .{},
 
     // cached PTX modules / functions.
     prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty, // keyed by cols
@@ -818,6 +845,7 @@ pub const Backend = struct {
             var mit = self.mdq_plans.valueIterator();
             while (mit.next()) |p| p.deinit(&L.dnn);
             self.mdq_plans.deinit(self.gpa);
+            self.i8_routes.deinit(self.gpa);
             var pit = self.lt_plans.valueIterator();
             while (pit.next()) |p| {
                 _ = L.lt.cublasLtMatmulDescDestroy(p.desc);
@@ -890,6 +918,7 @@ pub const Backend = struct {
         self.elt_mods.deinit(self.gpa);
         self.elt_fns.deinit(self.gpa);
         self.fa_fns.deinit(self.gpa);
+        self.sage_fns.deinit(self.gpa);
         if (self.dual_mod) |m| m.unload(self.ctx);
         self.dual_fns.deinit(self.gpa);
         self.tensorDestroy(&self.fp8_lut);
@@ -941,6 +970,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.xattn_kp);
         self.tensorDestroy(&self.xattn_vp);
         self.tensorDestroy(&self.xattn_op);
+        inline for (.{ "sage_q8", "sage_k8", "sage_v8", "sage_qs", "sage_ks", "sage_vs", "sage_vmax", "sage_anchor" }) |f| self.tensorDestroy(&@field(self, f));
         if (self.ptimer) |t| self.ctx.timerDestroy(t);
         self.ctx.deinit();
         self.gpa.destroy(self.ctx);
@@ -2094,6 +2124,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.xattn_kp);
         self.tensorDestroy(&self.xattn_vp);
         self.tensorDestroy(&self.xattn_op);
+        inline for (.{ "sage_q8", "sage_k8", "sage_v8", "sage_qs", "sage_ks", "sage_vs", "sage_vmax", "sage_anchor" }) |f| self.tensorDestroy(&@field(self, f));
     }
 
     /// Open a weight scope: weights cached from now on are tagged and
@@ -2390,17 +2421,19 @@ pub const Backend = struct {
 
     // ---- int8 GEMM pair -----------------------------------------------------
 
-    fn prepFn(self: *Backend, cols: usize, in_dt: Dt, q: kernels.PrepOut, rotate: bool, stage_global: bool) Error!cu.CUfunction {
+    fn prepFn(self: *Backend, cols: usize, in_dt: Dt, q: kernels.PrepOut, rotate: bool, stage_global: bool, load: kernels.PrepLoad) Error!cu.CUfunction {
         const key = cols | (@as(usize, @backingInt(in_dt)) << 43) |
             (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
             (if (stage_global) @as(usize, 1) << 42 else 0) |
-            (@as(usize, @intFromEnum(q)) << 46); // variants keyed separately
+            (@as(usize, @intFromEnum(q)) << 46) |
+            (if (load.vec) @as(usize, 1) << 50 else 0) |
+            (if (load.silu_mul) @as(usize, 1) << 51 else 0);
         if (self.prep_mods.get(key)) |f| return f;
         // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, q, in_dt, .none, 0, rotate, stage_global) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, q, in_dt, .none, 0, rotate, stage_global, load) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -2449,7 +2482,7 @@ pub const Backend = struct {
         var pbias = bias_ptr;
         var pm: u32 = @intCast(self.i8_m);
         var pwsc = wsc;
-        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc) };
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc), @ptrCast(&pc), @ptrCast(&pc), @ptrCast(&pn) };
         self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
@@ -3238,8 +3271,10 @@ pub const Backend = struct {
     fn logOccupancy(self: *Backend, name: []const u8, f: cu.CUfunction, threads: usize) void {
         if (!envSet("TP_KERNEL_INFO")) return;
         const occ = self.ctx.kernelOccupancy(f, threads) catch return;
-        std.log.info("[kernel] {s}: {d} regs, {d} B shared, {d} block(s)/SM at {d} threads ({d} warps/scheduler)", .{
-            name,                                   occ.regs, occ.shared, occ.blocks_per_sm, threads,
+        var local: c_int = 0;
+        _ = self.ctx.api.cuFuncGetAttribute(&local, cu.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f);
+        std.log.info("[kernel] {s}: {d} regs, {d} B local, {d} B shared, {d} block(s)/SM at {d} threads ({d} warps/scheduler)", .{
+            name,              occ.regs, local, occ.shared, occ.blocks_per_sm, threads,
             occ.blocks_per_sm * (threads / 32) / 4,
         });
     }
@@ -5117,10 +5152,51 @@ pub const Backend = struct {
         return p;
     }
 
-    /// cuBLASLt int8 linear: GEMM into the s32 scratch, then fused rescale to y.
-    /// With `use_fused_i8`, replaced by a single cuDNN op graph (GEMM+dequant
-    /// fused; no s32 round-trip, no separate irescale).
+    /// The `.libs` int8 linear, on the engine `i8Route` picks for its shape.
     fn opI8GemmLibs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias_ptr: u64) Error!void {
+        switch (try self.i8Route(y, w_db, ws_db, rows, bias_ptr)) {
+            .hand => return self.launchFused(.s8, y, w_db, ws_db, 1.0, rows, bias_ptr),
+            .lt => return self.opI8GemmLt(y, w_db, ws_db, rows, bias_ptr),
+        }
+    }
+
+    /// The engine for this W8A8 shape: neither wins everywhere (on a 3090 the hand
+    /// kernel is ahead at 1-4k rows, cuBLASLt plus `irescale` below and above), so the
+    /// first GEMM of each shape times both and keeps the faster. It leaves `y` as the
+    /// winner wrote it.
+    fn i8Route(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias_ptr: u64) Error!I8Route {
+        const k = self.i8_cols;
+        // the hand kernel's tiles: 128 output columns, 64-deep K slabs
+        if (rows % 128 != 0 or k % 64 != 0 or self.use_fused_i8) return .lt;
+        if (i8_route_force) |r| return r;
+        const key: I8Shape = .{ .m = @intCast(self.i8_mpad), .n = @intCast(rows), .k = @intCast(k) };
+        if (self.i8_routes.get(key)) |r| return r;
+        if (self.capturing) return .lt;
+
+        const timer = try self.ctx.timerCreate();
+        defer self.ctx.timerDestroy(timer);
+        var best: [2]f32 = @splat(std.math.inf(f32));
+        for (0..3) |rep| {
+            for ([_]I8Route{ .lt, .hand }) |r| {
+                try self.ctx.timerBegin(timer);
+                switch (r) {
+                    .hand => try self.launchFused(.s8, y, w_db, ws_db, 1.0, rows, bias_ptr),
+                    .lt => try self.opI8GemmLt(y, w_db, ws_db, rows, bias_ptr),
+                }
+                const ms = try self.ctx.timerEndMs(timer);
+                // the first rep builds cuBLASLt's plan and loads the module
+                if (rep > 0) best[@intFromEnum(r)] = @min(best[@intFromEnum(r)], ms);
+            }
+        }
+        const pick: I8Route = if (best[@intFromEnum(I8Route.hand)] < best[@intFromEnum(I8Route.lt)]) .hand else .lt;
+        self.i8_routes.put(self.gpa, key, pick) catch return error.OutOfMemory;
+        if (pick == .lt) try self.opI8GemmLt(y, w_db, ws_db, rows, bias_ptr);
+        return pick;
+    }
+
+    /// cuBLASLt into the s32 scratch, then `irescale` to `y`; with `use_fused_i8`, the
+    /// cuDNN GEMM+dequant graph instead.
+    fn opI8GemmLt(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, bias_ptr: u64) Error!void {
         const m = self.i8_mpad;
         const k = self.i8_cols;
         // The cuDNN graph has no bias node, so a biased linear takes cuBLASLt + irescale.
@@ -5181,16 +5257,31 @@ pub const Backend = struct {
     /// device-vs-CPU check cannot see it (int8 over 50 layers has a ~1e-4 floor).
     pub var force_global_prep: bool = false;
 
+    /// Loads a prep's activation one element a thread, the A/B for `vecPrep`.
+    pub var force_scalar_prep: bool = false;
+
+    /// Whether a prep may load `x` 16 bytes a thread.
+    fn vecPrep(x: DeviceBuffer) bool {
+        return !force_scalar_prep and x.ptr() % 16 == 0;
+    }
+
     /// Reads `x` at its own dtype.
     pub fn opI8PrepR(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, rotate: bool) Error!void {
-        return self.prepRows(x, m, cols, .s8, rotate);
+        return self.prepRows(x, null, m, cols, .s8, rotate);
+    }
+
+    /// `opI8PrepR` of `silu(gate) * up` without storing the product: the bytes the
+    /// prep would read after `siluMul`, both at one dtype.
+    pub fn opI8PrepSiluMul(self: *Backend, gate: DeviceBuffer, up: DeviceBuffer, m: usize, cols: usize, rotate: bool) Error!void {
+        std.debug.assert(gate.dt == up.dt);
+        return self.prepRows(gate, up, m, cols, .s8, rotate);
     }
 
     /// `opI8Prep` to e4m3 at one scale per row, unrotated, for `opF8Gemm`. Needs
     /// `hasFp8Mma`.
     pub fn opF8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
         std.debug.assert(self.hasFp8Mma());
-        return self.prepRows(x, m, cols, .e4m3, false);
+        return self.prepRows(x, null, m, cols, .e4m3, false);
     }
 
     /// Whether this device has the fp8 tensor cores (`kernels.fp8_need`).
@@ -5198,7 +5289,7 @@ pub const Backend = struct {
         return @as(u32, @intCast(self.ctx.cc_major * 10 + self.ctx.cc_minor)) >= kernels.fp8_need.sm;
     }
 
-    fn prepRows(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, q: kernels.PrepOut, rotate: bool) Error!void {
+    fn prepRows(self: *Backend, x: DeviceBuffer, up: ?DeviceBuffer, m: usize, cols: usize, q: kernels.PrepOut, rotate: bool) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
         const mpad = std.mem.alignForward(usize, m, 128);
@@ -5221,15 +5312,24 @@ pub const Backend = struct {
         const stage_global = force_global_prep or
             kernels.prepNeedsGlobalStage(cols, @intCast(@max(self.ctx.shared_optin_max, 0)));
         if (stage_global) try self.ensureDeviceBuffer(&self.i8_rot, mpad * cols * 4);
-        const f = try self.prepFn(cols, x.dt, q, rotate, stage_global);
+        const load: kernels.PrepLoad = .{ .vec = vecPrep(x) and (up == null or vecPrep(up.?)), .silu_mul = up != null };
+        const f = try self.prepFn(cols, x.dt, q, rotate, stage_global, load);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
         var prot = if (stage_global) self.i8_rot.ptr() else 0;
-        var pp3 = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
-        var pp4 = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas), @ptrCast(&prot) };
-        const pp: []?*anyopaque = if (stage_global) pp4[0..] else pp3[0..];
-        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols, stage_global)), pp) catch return error.CudaError;
+        var pup = if (up) |u| u.ptr() else 0;
+        var pp: [5]?*anyopaque = .{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas), undefined, undefined };
+        var np: usize = 3;
+        if (stage_global) {
+            pp[np] = @ptrCast(&prot);
+            np += 1;
+        }
+        if (up != null) {
+            pp[np] = @ptrCast(&pup);
+            np += 1;
+        }
+        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols, stage_global)), pp[0..np]) catch return error.CudaError;
         self.i8_m = m;
         self.i8_mpad = mpad;
         self.i8_cols = cols;
@@ -5257,7 +5357,7 @@ pub const Backend = struct {
     fn bqPrepFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_prep_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, 0, rotate, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, 0, rotate, false, .{}) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("block-quant prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -5290,7 +5390,7 @@ pub const Backend = struct {
     fn bqDecFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_dec_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, if (bits == 4) .s4 else .s8, .f32, block, bqChunk(cols), rotate, false, .{}) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const nm = if (bits == 4)
@@ -5393,6 +5493,50 @@ pub const Backend = struct {
     pub fn opI8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, bias: ?[]const f32) Error!void {
         const w_db = try self.cachedWeight(w_bytes);
         return self.opI8GemmDev(y, w_db, weight_scale, rows, bias);
+    }
+
+    /// Whether `opI8GemmPlanes` takes planes `split` outputs wide over `cols` inputs: a
+    /// plane is whole 128-column tiles of the hand kernel.
+    pub fn i8PlanesSupported(split: usize, cols: usize, count: usize) bool {
+        return split % 128 == 0 and cols % 64 == 0 and count >= 1 and count <= 3;
+    }
+
+    /// The int8 GEMM against the last `opI8Prep` over planes `first .. first +
+    /// ys.len` of a weight fused from `split`-row parts (a qkv, a gate/up): plane
+    /// `first + i` lands in `ys[i]`, `split` wide. The fused weight is uploaded once
+    /// whichever planes a call takes, where a row view per plane would be a second
+    /// copy. Runs on the hand fused kernel on both arms, which on every fused shape
+    /// measured is ahead of cuBLASLt plus `irescale`. `bias` covers the planes taken.
+    pub fn opI8GemmPlanes(self: *Backend, ys: []const DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, split: usize, first: usize, bias: ?[]const f32) Error!void {
+        const k = self.i8_cols;
+        if (!i8PlanesSupported(split, k, ys.len)) return error.UnsupportedKernelArm;
+        for (ys[1..]) |y| std.debug.assert(y.dt == ys[0].dt);
+        const rows = split * ys.len;
+        const w_db = try self.cachedWeight(w_bytes);
+        self.hold(w_db);
+        defer self.unhold();
+        const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
+        self.hold(ws_db);
+        defer self.unhold();
+        const bias_ptr = try self.epilogueBias(bias, rows);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const f = try self.fusedFn(.s8, ys[0].dt);
+        var pa = self.i8_x.ptr();
+        var pb = w_db.viewBytes(first * split * k).ptr();
+        var pc = ys[0].ptr();
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(k);
+        var pas = self.i8_scale.ptr();
+        var pws = ws_db.viewBytes(first * split * 4).ptr();
+        var pbias = bias_ptr;
+        var pm: u32 = @intCast(self.i8_m);
+        var pwsc: f32 = 1.0;
+        var pc1 = ys[@min(1, ys.len - 1)].ptr();
+        var pc2 = ys[ys.len - 1].ptr();
+        var psplit: u32 = @intCast(split);
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&pbias), @ptrCast(&pm), @ptrCast(&pwsc), @ptrCast(&pc1), @ptrCast(&pc2), @ptrCast(&psplit) };
+        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
     /// Decode a packed ComfyUI `asym_w4a8_int8` weight into a reusable device scratch
@@ -5569,13 +5713,14 @@ pub const Backend = struct {
 
     // ---- int4 (W4A4) GEMM pair ----------------------------------------------
 
-    fn i4prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
-        if (self.i4_prep_mods.get(cols)) |f| return f;
+    fn i4prepFn(self: *Backend, cols: usize, vec: bool) Error!cu.CUfunction {
+        const key = cols | (if (vec) @as(usize, 1) << 50 else 0);
+        if (self.i4_prep_mods.get(key)) |f| return f;
         // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, .s4, .f32, .none, 0, true, false) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, .s4, .f32, .none, 0, true, false, .{ .vec = vec }) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -5587,7 +5732,7 @@ pub const Backend = struct {
         const f = mod.getFunction(self.ctx, "i4prep") catch return error.CudaError;
         self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols, false)) catch return error.CudaError;
         self.i4_prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
-        self.i4_prep_mods.put(self.gpa, cols, f) catch return error.OutOfMemory;
+        self.i4_prep_mods.put(self.gpa, key, f) catch return error.OutOfMemory;
         return f;
     }
 
@@ -5608,7 +5753,7 @@ pub const Backend = struct {
             self.ctx.memsetD8Async(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * qbytes)), .bytes = @intCast(pad * qbytes) }, 0, pad * qbytes) catch return error.CudaError;
             self.ctx.memsetD32Async(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
         }
-        const f = try self.i4prepFn(cols);
+        const f = try self.i4prepFn(cols, vecPrep(x));
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
@@ -5691,9 +5836,11 @@ pub const Backend = struct {
     /// stream into an executable graph.
     pub fn graphCaptureBegin(self: *Backend) Error!void {
         self.ctx.check(self.ctx.api.cuStreamBeginCapture(self.ctx.stream, 0), "cuStreamBeginCapture") catch return error.CudaError;
+        self.capturing = true;
     }
 
     pub fn graphCaptureEnd(self: *Backend) Error!cu.CUgraphExec {
+        self.capturing = false;
         var graph: cu.CUgraph = null;
         self.ctx.check(self.ctx.api.cuStreamEndCapture(self.ctx.stream, &graph), "cuStreamEndCapture") catch return error.CudaError;
         defer _ = self.ctx.api.cuGraphDestroy(graph);
@@ -6086,6 +6233,28 @@ pub const Backend = struct {
     }
 
     /// per-head RMS norm * weight, one thread per row (rows = seq*n_heads).
+    /// MiniMax H3's modulation table (`dual/elt.zig` `adalnTable`) into `out`, one
+    /// element a thread: `blocks` blocks of `labels` labels, `k`-wide time embeddings.
+    pub fn opAdalnTable(self: *Backend, out: DeviceBuffer, w: DeviceBuffer, aux: DeviceBuffer, t_emb: DeviceBuffer, blocks: usize, labels: usize, h: usize, k: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const total = blocks * labels * 18 * h;
+        try self.dualElemsAt("adaln_table", w.dt, out, w, aux, t_emb, .{ @intCast(total), @intCast(h), @intCast(labels), @intCast(k), 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Per-head RMSNorm then RoPE from `x` into `out` (the same buffer for in place),
+    /// one pass; an f32 `x` may land in a 16-bit `out`.
+    pub fn normRope(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: DeviceBuffer, freqs: DeviceBuffer, a: dual_table.NormRope) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(x.dt == out.dt or x.dt == .f32);
+        switch (x.dt) {
+            inline else => |i| switch (out.dt) {
+                inline else => |o| if (i != o and i != .f32) unreachable else try self.dualRows(comptime dual_table.normRopeName(i, o), x, w, freqs, out, a.u(), a.f(), a.rows),
+            },
+        }
+    }
+
     pub fn qkNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, hd: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -6570,6 +6739,101 @@ pub const Backend = struct {
         try self.opHeadPad(self.xattn_vp, v, seq_kv, heads, hp, hd, stride, 0);
         try self.opAttnTCRect(self.xattn_qp, self.xattn_kp, self.xattn_vp, self.xattn_op, seq_q, seq_kv, heads, heads, hp, scale);
         try self.opHeadUnpad(self.xattn_op, out, seq_q, heads, hd, hp);
+    }
+
+    /// ComfyUI's int8 attention, the kernels of `sage.zig`: Q [lq][heads*128] and K,
+    /// V [lk][heads*128] (each f32, f16 or bf16, by their `dt`) into `out` [lq][heads*128]
+    /// (f32, or the 16-bit type it is rounded to), every value rounded as comfy-kitchen
+    /// stores it: f16 for f16 operands, bf16 otherwise. Only shapes
+    /// `ops.sage_attn.supported` takes.
+    pub fn opSageAttn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, lq: usize, lk: usize, heads: usize, scale: f32) Error!void {
+        if (lk <= 1024) return error.UnsupportedKernelArm;
+        self.ptic();
+        defer self.ptoc(.attn);
+        const qrows = sage.qRows(lq);
+        const krows = sage.kRows(lk);
+        try self.ensureDeviceBuffer(&self.sage_q8, heads * qrows * sage.hd);
+        try self.ensureDeviceBuffer(&self.sage_k8, heads * krows * sage.hd);
+        try self.ensureDeviceBuffer(&self.sage_v8, heads * sage.hd * krows);
+        try self.ensureDeviceBuffer(&self.sage_qs, heads * sage.qScales(lq) * 4);
+        try self.ensureDeviceBuffer(&self.sage_ks, heads * sage.kScales(lk) * 4);
+        try self.ensureDeviceBuffer(&self.sage_vs, heads * sage.hd * 4);
+        try self.ensureDeviceBuffer(&self.sage_vmax, heads * sage.hd * 4);
+        try self.ensureDeviceBuffer(&self.sage_anchor, heads * 4);
+
+        var pk = k.ptr();
+        var pq = q.ptr();
+        var pv = v.ptr();
+        var lq32: u32 = @intCast(lq);
+        var lk32: u32 = @intCast(lk);
+        var heads32: u32 = @intCast(heads);
+        var stride: u32 = @intCast(heads * sage.hd);
+        var pan = self.sage_anchor.ptr();
+        var pq8 = self.sage_q8.ptr();
+        var pqs = self.sage_qs.ptr();
+        var pk8 = self.sage_k8.ptr();
+        var pks = self.sage_ks.ptr();
+        var pv8 = self.sage_v8.ptr();
+        var pvs = self.sage_vs.ptr();
+        var pvm = self.sage_vmax.ptr();
+        const ntiles: u32 = @intCast(krows / sage.key_tile);
+
+        const f_an = try self.sageFn(.anchor, k.dt, .f32);
+        var pa = [_]?*anyopaque{ @ptrCast(&pk), @ptrCast(&lk32), @ptrCast(&stride), @ptrCast(&pan) };
+        self.ctx.launch(f_an, .{ @intCast(heads), 1, 1 }, .{ 128, 1, 1 }, 0, &pa) catch return error.CudaError;
+
+        // Q and K share a kernel and a dtype; a mixed pair goes through K's.
+        if (q.dt != k.dt) return error.UnsupportedKernelArm;
+        const f_qk = try self.sageFn(.quant_qk, k.dt, .f32);
+        var pqk = [_]?*anyopaque{ @ptrCast(&pq), @ptrCast(&pk), @ptrCast(&lq32), @ptrCast(&lk32), @ptrCast(&heads32), @ptrCast(&stride), @ptrCast(&pan), @ptrCast(&pq8), @ptrCast(&pqs), @ptrCast(&pk8), @ptrCast(&pks) };
+        const warps = heads * (sage.qScales(lq) + sage.kScales(lk));
+        self.ctx.launch(f_qk, .{ @intCast((warps + 3) / 4), 1, 1 }, .{ 128, 1, 1 }, 0, &pqk) catch return error.CudaError;
+
+        self.ctx.memsetD32Async(.{ .ptr = pvm, .bytes = heads * sage.hd * 4 }, 0, heads * sage.hd) catch return error.CudaError;
+        const f_vm = try self.sageFn(.vmax, v.dt, .f32);
+        var pvmx = [_]?*anyopaque{ @ptrCast(&pv), @ptrCast(&lk32), @ptrCast(&stride), @ptrCast(&pvm) };
+        self.ctx.launch(f_vm, .{ @intCast(heads), ntiles, 1 }, .{ 128, 1, 1 }, 0, &pvmx) catch return error.CudaError;
+        const f_qv = try self.sageFn(.quant_v, v.dt, .f32);
+        var pqv = [_]?*anyopaque{ @ptrCast(&pv), @ptrCast(&lk32), @ptrCast(&stride), @ptrCast(&pvm), @ptrCast(&pv8), @ptrCast(&pvs) };
+        self.ctx.launch(f_qv, .{ @intCast(heads), ntiles, 1 }, .{ 128, 1, 1 }, 0, &pqv) catch return error.CudaError;
+
+        const f_at = try self.sageFn(.attn, q.dt, out.dt);
+        var po = out.ptr();
+        var qrows32: u32 = @intCast(qrows);
+        var krows32: u32 = @intCast(krows);
+        var sm2: f32 = scale * @as(f32, 1.44269504088896340736);
+        var pat = [_]?*anyopaque{ @ptrCast(&pq8), @ptrCast(&pk8), @ptrCast(&pv8), @ptrCast(&pqs), @ptrCast(&pks), @ptrCast(&pvs), @ptrCast(&po), @ptrCast(&lq32), @ptrCast(&lk32), @ptrCast(&qrows32), @ptrCast(&krows32), @ptrCast(&stride), @ptrCast(&sm2) };
+        self.ctx.launch(f_at, .{ @intCast((lq + sage.q_tile - 1) / sage.q_tile), @intCast(heads), 1 }, .{ 128, 1, 1 }, 0, &pat) catch return error.CudaError;
+    }
+
+    const SageKernel = enum(u8) { anchor, quant_qk, vmax, quant_v, attn };
+
+    fn sageFn(self: *Backend, kind: SageKernel, in_dt: Dt, out_dt: Dt) Error!cu.CUfunction {
+        if (in_dt != .f32 and in_dt != .bf16 and in_dt != .f16) return error.UnsupportedKernelArm;
+        if (kind == .attn and out_dt != .f32 and out_dt != (if (in_dt == .f16) Dt.f16 else Dt.bf16)) return error.UnsupportedKernelArm;
+        const key: u32 = @as(u32, @intFromEnum(kind)) | @as(u32, @backingInt(in_dt)) << 8 | @as(u32, @backingInt(out_dt)) << 16;
+        if (self.sage_fns.get(key)) |f| return f;
+        const src = switch (kind) {
+            .anchor => sage.buildAnchor(self.gpa, in_dt),
+            .quant_qk => sage.buildQuantQK(self.gpa, in_dt),
+            .vmax => sage.buildVMax(self.gpa, in_dt),
+            .quant_v => sage.buildQuantV(self.gpa, in_dt),
+            .attn => sage.buildAttn(self.gpa, in_dt, out_dt),
+        } catch return error.OutOfMemory;
+        defer self.gpa.free(src);
+        var mod = self.ctx.loadModule(src) catch return error.CudaError;
+        const name = switch (kind) {
+            .anchor => "sage_anchor",
+            .quant_qk => "sage_quant_qk",
+            .vmax => "sage_vmax",
+            .quant_v => "sage_quant_v",
+            .attn => "sage_attn",
+        };
+        const f = mod.getFunction(self.ctx, name) catch return error.CudaError;
+        self.elt_mods.append(self.gpa, mod) catch return error.OutOfMemory;
+        self.sage_fns.put(self.gpa, key, f) catch return error.OutOfMemory;
+        if (kind == .attn) self.logOccupancy(name, f, 128);
+        return f;
     }
 
     /// im2col for an SD 3x3 convolution band. `mode` is the source sampling:

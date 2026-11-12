@@ -97,6 +97,7 @@ pub const CU_JIT_GENERATE_LINE_INFO: c_int = 13;
 // ---- CUfunction_attribute ----------------------------------------------------
 pub const CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 0;
 pub const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
+pub const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
 pub const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
 pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 pub const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: c_int = 9;

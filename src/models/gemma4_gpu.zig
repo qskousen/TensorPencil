@@ -1016,8 +1016,9 @@ pub const VulkanLM = struct {
         const sin_off = if (global) self.sin_off_global else self.sin_off_local;
         const hd = cfg.headDim(l);
         if (seq == 1) ctx.independent(2);
-        try ctx.opQkNormRope(self.bufs.q, try nbuf(ctx, layer.q_norm), freqs, seq * cfg.n_heads, hd, cfg.n_heads, self.len, sin_off, cfg.rms_eps);
-        try ctx.opQkNormRope((try self.kvOut(l, seq))[0], try nbuf(ctx, layer.k_norm), freqs, seq * cfg.nKv(l), hd, cfg.nKv(l), self.len, sin_off, cfg.rms_eps);
+        try ctx.opNormRope(self.bufs.q, self.bufs.q, try nbuf(ctx, layer.q_norm), freqs, .{ .rows = seq * cfg.n_heads, .dim = hd, .heads = cfg.n_heads, .pairs = hd / 2, .sin_off = sin_off, .eps = cfg.rms_eps, .pos0 = self.len });
+        const k_out = (try self.kvOut(l, seq))[0];
+        try ctx.opNormRope(k_out, k_out, try nbuf(ctx, layer.k_norm), freqs, .{ .rows = seq * cfg.nKv(l), .dim = hd, .heads = cfg.nKv(l), .pairs = hd / 2, .sin_off = sin_off, .eps = cfg.rms_eps, .pos0 = self.len });
     }
 
     /// RMS over each head with no learned weight. V is not rotated.

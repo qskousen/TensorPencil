@@ -183,15 +183,15 @@ def main():
     # 1. ZERO spatial padding instead of reflect.
     orig_fwd = mvae.CausalConv3d.forward
 
-    def zero_pad_fwd(self, x):
-        if sum(self.causal_padding) == 0:
-            return super(mvae.CausalConv3d, self).forward(x)
-        x = F.pad(x, (self.causal_padding[2], self.causal_padding[2],
-                      self.causal_padding[1], self.causal_padding[1], 0, 0), mode="constant")
-        if x.shape[2] == 1:
-            return super(mvae.CausalConv3d, self).forward(x, autopad="causal_zero")
-        x = F.pad(x, (0, 0, 0, 0, self.causal_padding[0] * 2, 0), mode="constant")
-        return super(mvae.CausalConv3d, self).forward(x)
+    # The conv folds its pre-norm and spatial pad in; do both here instead, with
+    # a zero pad, and hand the real forward nothing left to pad spatially.
+    def zero_pad_fwd(self, x, pre_norm=None, spatial_pad=None, residual=None):
+        if pre_norm is not None:
+            x = F.silu(pre_norm(x))
+        if spatial_pad is None:
+            spatial_pad = (self.causal_padding[2],) * 2 + (self.causal_padding[1],) * 2
+        x = F.pad(x, (*spatial_pad, 0, 0), mode="constant")
+        return orig_fwd(self, x, spatial_pad=(0, 0, 0, 0), residual=residual)
 
     mvae.CausalConv3d.forward = zero_pad_fwd
     try:
@@ -241,6 +241,16 @@ def main():
     assert d_tile > 1e-3, "the 288-wide case does not actually tile (%.2e)" % d_tile
     d_small = rel(untiled_small, ref)
     assert d_small < 1e-6, "the 64px case should be ONE tile, but tiling changed it (%.2e)" % d_small
+
+    # The image VAEs encode a posterior SAMPLE (seeded 42), not the mean. Run
+    # ComfyUI's own `H3ImageVAE.encode` on this toy VAE; it reads only the encoder
+    # half and the latent statistics, both of which this one has.
+    with torch.inference_mode():
+        sampled = mvae.H3ImageVAE.encode(vae, small)
+    d_sample = rel(sampled, ref)
+    assert d_sample > 1e-2, "the posterior sample is indistinguishable from the mean (%.2e)" % d_sample
+    tensors["out.sample_one_frame_small"] = sampled
+    print("  posterior sample vs mean: rel %.4f" % d_sample)
 
     meta = {
         "config": json.dumps(dict(ch=CH, ch_mult=list(CH_MULT), space_down=list(SPACE_DOWN),

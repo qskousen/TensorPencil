@@ -52,6 +52,7 @@ const noise_curve = @import("tp_core").noise_curve;
 const philox_rng = @import("tp_core").philox_rng;
 const safetensors = @import("tp_core").safetensors;
 const audio_file = @import("tp_core").audio;
+const resample = @import("tp_core").resample;
 const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
 const sampler = @import("tp_core").sampler;
@@ -298,6 +299,10 @@ pub const Options = struct {
     /// request order. Empty is text-to-image. Ignored by every other family.
     /// See `EncodeOptions.mf_ref_images`.
     mf_ref_images: []const Session.RefImage = &.{},
+    /// MiniMax-H3-Image edit pictures, planar `[3][h][w]` in [0, 1], in request
+    /// order (`Picture 1` first). Empty is text-to-image. Ignored by every other
+    /// family. See `EncodeOptions.h3_ref_images`.
+    h3_ref_images: []const Session.RefImage = &.{},
     /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax`,
     /// the two are not interchangeable spellings of the same thing.
     prompt_syntax: PromptSyntax = .comfy,
@@ -490,6 +495,7 @@ pub const Options = struct {
             .cancel = self.cancel,
             .sn_ref_images = self.sn_ref_images,
             .mf_ref_images = self.mf_ref_images,
+            .h3_ref_images = self.h3_ref_images,
             .prompt_type = pt,
             .cond_noise = self.cond_noise,
             .render_seed = self.seed,
@@ -909,7 +915,9 @@ pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
         // SenseNova joins them by table rather than by template: its schedule is
         // the same `discrete_flow` shift, and ComfyUI's own workflow leaves the
         // KSampler on `normal`, which over a flow table IS `simple`.
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .fibo2 => .simple,
+        // MiniMax-H3-Image's table is its PDD grid, and `simple` at the bank's step
+        // count is its reference workflow.
+        .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .sensenova, .mageflow, .moss_image, .fibo2 => .simple,
         // diffusers' schedule, which ComfyUI does not reproduce (see `DiffusersFlow`).
         .qwen_image21, .fibo => .reference,
         .sd15, .sdxl => .normal,
@@ -1514,9 +1522,6 @@ pub const Clip = struct {
     }
 };
 
-/// Stripped conditioning: [seq][12][2560] plus its length. Produced by
-/// `Session.encode`, consumed by `Session.denoiser` / `Session.predict`; the
-/// caller owns `data`.
 /// A MiniMax H3 prompt's reference payload: the layout shapes, the DiT's
 /// condition rows and the text region's VIDEO-tagged spans, all derived from the
 /// same pass over the pictures.
@@ -1527,7 +1532,8 @@ pub const H3Refs = struct {
     /// Per-reference layout shapes, in request order.
     refs: []minimax_h3.Ref,
     /// Patchified condition rows for every reference, concatenated in layout
-    /// order. `[total_video_cond_rows][videoPatchDim]`.
+    /// order and already noised (`minimax_h3.packCondRows`).
+    /// `[total_video_cond_rows][videoPatchDim]`.
     cond_video: []f32,
     /// The same for the AUDIO condition rows, concatenated in the same layout
     /// order. `[total_audio_cond_rows][audio_latent_channels]`, and empty when no
@@ -1546,6 +1552,106 @@ pub const H3Refs = struct {
     }
 };
 
+/// MiniMax-H3-Image's per-render denoiser state: the packed layout, the trunk's
+/// workspace on whichever backend runs it, and the refined text rows of each
+/// branch. Both branches share one layout, since the zeroed negative keeps the
+/// positive's length, tags and references.
+pub const H3Image = struct {
+    layout: minimax_h3.PackedLayout,
+    ws: ?minimax_h3.Workspace = null,
+    cu: ?minimax_h3_cuda.Session = null,
+    cu_ws: ?minimax_h3_cuda.Workspace = null,
+    vk: ?minimax_h3_gpu.Session = null,
+    vk_ws: ?minimax_h3_gpu.Workspace = null,
+    /// `[text_len][hidden]`, through `condition_proj` and the token refiner.
+    text_pos: []f32 = &.{},
+    /// The same for zeros, empty without CFG.
+    text_neg: []f32 = &.{},
+    /// The references' rows, borrowed from the positive conditioning.
+    cond_video: []const f32 = &.{},
+
+    fn init(sess: *Session, gpa: std.mem.Allocator, cond: Cond, lat_h: usize, lat_w: usize, use_cfg: bool) !H3Image {
+        const m = &sess.models.minimax_h3_image;
+        const refs = cond.h3;
+        // `Family.latentMustBeEven` keeps the 2x2 patch whole.
+        if (lat_h % 2 != 0 or lat_w % 2 != 0) return error.LatentMustBeEven;
+        var st: H3Image = .{ .layout = try minimax_h3.PackedLayout.build(gpa, .{
+            .text_len = cond.seq,
+            .latent_t = 1,
+            .latent_h = lat_h,
+            .latent_w = lat_w,
+            .audio_t = 0,
+        }, &.{}, if (refs) |r| r.refs else &.{}, if (refs) |r| r.tag_spans else &.{}) };
+        errdefer st.deinit(sess, gpa);
+        st.cond_video = if (refs) |r| r.cond_video else &.{};
+
+        if (sess.cu_be) |b| {
+            if (minimax_h3_cuda.supported(&m.dit)) {
+                sess.setMemTag(.dit);
+                st.cu = try minimax_h3_cuda.Session.init(b, gpa, &m.dit, &st.layout);
+                st.cu_ws = try minimax_h3_cuda.Workspace.init(b, &m.dit, st.layout.seq_len, sess.actFor(.denoiser));
+            } else std.log.warn("MiniMax H3 Image: this checkpoint's trunk weights have no CUDA path; the trunk runs on the CPU.", .{});
+        } else if (sess.gpu_ctx) |gc| {
+            if (minimax_h3_gpu.supported(gc, &m.dit)) {
+                sess.setMemTag(.dit);
+                st.vk = try minimax_h3_gpu.Session.init(gc, gpa, &m.dit, &st.layout);
+                st.vk_ws = try minimax_h3_gpu.Workspace.init(gc, &m.dit, st.layout.seq_len, sess.actFor(.denoiser));
+            } else std.log.warn("MiniMax H3 Image: this checkpoint's trunk weights have no Vulkan path; the trunk runs on the CPU.", .{});
+        }
+        if (st.cu == null and st.vk == null) st.ws = try minimax_h3.Workspace.init(gpa, m.dit.cfg, &st.layout);
+
+        const hidden = m.dit.cfg.hidden;
+        st.text_pos = try gpa.alloc(f32, cond.seq * hidden);
+        try minimax_h3.refineText(&m.dit, sess.io, gpa, st.text_pos, cond.data, cond.seq);
+        if (use_cfg) {
+            const zeros = try gpa.alloc(f32, cond.data.len);
+            defer gpa.free(zeros);
+            @memset(zeros, 0);
+            st.text_neg = try gpa.alloc(f32, cond.seq * hidden);
+            try minimax_h3.refineText(&m.dit, sess.io, gpa, st.text_neg, zeros, cond.seq);
+        }
+        return st;
+    }
+
+    fn deinit(self: *H3Image, sess: *Session, gpa: std.mem.Allocator) void {
+        if (sess.cu_be) |b| {
+            if (self.cu_ws) |*w| w.deinit(b);
+            if (self.cu) |*c| c.deinit(b);
+        }
+        if (sess.gpu_ctx) |gc| {
+            if (self.vk_ws) |*w| w.deinit(gc);
+            if (self.vk) |*c| c.deinit(gc);
+        }
+        if (self.ws) |*w| w.deinit(gpa);
+        if (self.text_pos.len > 0) gpa.free(self.text_pos);
+        if (self.text_neg.len > 0) gpa.free(self.text_neg);
+        self.layout.deinit();
+        self.* = undefined;
+    }
+
+    fn forward(self: *H3Image, sess: *Session, gpa: std.mem.Allocator, v_out: []f32, latent: []const f32, sigma: f32, sigmas: []const f32, text: []const f32, cancel: ?*std.atomic.Value(bool)) !void {
+        const dit = &sess.models.minimax_h3_image.dit;
+        const in: minimax_h3.Inputs = .{
+            .video = latent,
+            .audio = &.{},
+            .text = text,
+            .sigma = sigma,
+            .sample_sigmas = sigmas,
+            .cond_video = self.cond_video,
+        };
+        if (self.cu) |*cu| {
+            try minimax_h3_cuda.forward(dit, sess.cu_be.?, cu, &self.cu_ws.?, sess.io, gpa, &self.layout, v_out, &.{}, in, cancel);
+        } else if (self.vk) |*vk| {
+            try minimax_h3_gpu.forward(dit, sess.gpu_ctx.?, vk, &self.vk_ws.?, sess.io, gpa, &self.layout, v_out, &.{}, in, cancel);
+        } else {
+            try minimax_h3.forward(dit, sess.io, gpa, &self.ws.?, &self.layout, v_out, &.{}, in);
+        }
+    }
+};
+
+/// Stripped conditioning: [seq][12][2560] plus its length. Produced by
+/// `Session.encode`, consumed by `Session.denoiser` / `Session.predict`; the
+/// caller owns `data`.
 pub const Cond = struct {
     data: []f32,
     seq: usize,
@@ -1720,7 +1826,7 @@ pub const CondNoise = struct {
     /// cache with its own rope index, not a token sequence to append to.
     pub fn concatSupported(f: Family) bool {
         return switch (f) {
-            .krea2, .sd15, .sdxl, .mageflow, .moss_image, .minimax_h3, .qwen_image21 => true,
+            .krea2, .sd15, .sdxl, .mageflow, .moss_image, .minimax_h3, .minimax_h3_image, .qwen_image21 => true,
             .zimage, .anima, .sensenova, .fibo2, .fibo => false,
         };
     }
@@ -1791,8 +1897,9 @@ pub const EncodeOptions = struct {
     /// caller that is not rendering a schedule wants.
     steps: usize = 0,
     cancel: ?*std.atomic.Value(bool) = null,
-    /// MiniMax H3 reference pictures, in REQUEST order. Empty is t2va, which is
-    /// exactly the tokenized prompt. Ignored by every other family.
+    /// MiniMax H3 reference pictures, in REQUEST order. Empty is t2va (or t2i),
+    /// which is exactly the tokenized prompt. Ignored by every other family; the
+    /// image release reads them as edit pictures.
     ///
     /// Pixels rather than shapes: `encode` runs both towers itself, because the
     /// LLM's features and the DiT's condition rows have to describe the same
@@ -1841,8 +1948,8 @@ pub const EncodeOptions = struct {
     prompt_type: PromptType = .positive,
     /// Perturb the conditioning this encode produces. See `CondNoise`.
     cond_noise: CondNoise = .{},
-    /// The render's seed, which `cond_noise` derives its field from when it carries
-    /// no seed of its own. Read for nothing else.
+    /// The render's seed: `cond_noise` derives its field from it when it carries no
+    /// seed of its own, and MiniMax-H3 seeds its reference rows' noise with it.
     render_seed: u64 = 0,
 };
 
@@ -2447,6 +2554,8 @@ pub const Denoiser = struct {
     fb15_vk_ws: ?fibo_gpu.Workspace = null,
     fb_pre: ?fibo2.Prefix = null,
     fb_pre_neg: ?fibo2.Prefix = null,
+    /// MiniMax-H3-Image's per-render state.
+    h3i: ?H3Image = null,
     /// Fibo 2.0's device sessions, which hold the same prefix on the device.
     fb_cu: ?fibo2_cuda.Session = null,
     fb_cu_neg: ?fibo2_cuda.Session = null,
@@ -2514,6 +2623,7 @@ pub const Denoiser = struct {
 
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.sess.denoiserLora()) |st| st.level = null;
+        if (self.h3i) |*x| x.deinit(self.sess, gpa);
         gpa.free(self.sigmas);
         if (self.v_neg) |b| gpa.free(b);
         if (self.sd_ws) |*w| w.deinit();
@@ -2679,6 +2789,7 @@ pub const Denoiser = struct {
             .qwen_image21 => return self.predictQwenImage21(gpa, v_out, latent, sigma, cancel),
             .fibo2 => return self.predictFibo2(gpa, v_out, latent, sigma, cancel),
             .fibo => return self.predictFibo(gpa, v_out, latent, sigma, cancel),
+            .minimax_h3_image => return self.predictH3Image(gpa, v_out, latent, sigma, cancel),
             .minimax_h3 => unreachable, // `denoiser` refuses H3; a clip runs `ClipDenoiser`.
             .krea2 => {},
         }
@@ -2874,6 +2985,19 @@ pub const Denoiser = struct {
         const v_neg = self.v_neg.?;
         const n = self.fb15_neg.?;
         try dit.forward(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, n.ehs, n.layers, self.fb15_text[1], cancel);
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    /// MiniMax-H3-Image: the H3 trunk over `[text | refs | image]`, its PDD head
+    /// picked from this step's place in the schedule. The negative branch is the
+    /// positive conditioning ZEROED, references and tags kept, which is what the
+    /// release workflow's `ConditioningZeroOut` hands the sampler.
+    fn predictH3Image(self: *Denoiser, gpa: std.mem.Allocator, v_out: []f32, latent: []const f32, sigma: f32, cancel: ?*std.atomic.Value(bool)) !void {
+        const st = &self.h3i.?;
+        try st.forward(self.sess, gpa, v_out, latent, sigma, self.sigmas, st.text_pos, cancel);
+        if (self.cfg == 1.0) return;
+        const v_neg = self.v_neg.?;
+        try st.forward(self.sess, gpa, v_neg, latent, sigma, self.sigmas, st.text_neg, cancel);
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
@@ -3340,6 +3464,7 @@ pub const anima_probe = "llm_adapter.blocks.0.cross_attn.q_proj.weight";
 /// OR'd (any hit resolves the component), so the AND lives in `detectFamily`.
 pub const minimax_h3_video_probe = "video_patch_proj.weight";
 pub const minimax_h3_audio_probe = "audio_patch_proj.weight";
+pub const minimax_h3_condition_probe = "condition_proj.weight";
 
 /// The tensor PAIR that says "this is a SenseNova U1.5 checkpoint", ComfyUI's own
 /// test in `model_detection.py`. The first says the generation vision tower is
@@ -3486,6 +3611,23 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
                 .probes = &.{"decoder.conv_pre.weight"},
             },
             .conditioner2 => error.NoSuchComponent,
+        },
+        // The image release: the same encoder, and a VAE whose decoder is
+        // single-frame (`model_spec.storeFits` tells it from the video one).
+        .minimax_h3_image => switch (comp) {
+            .denoiser => .{
+                .prefixes = &.{ "model.diffusion_model.", "" },
+                .probes = &.{minimax_h3_video_probe},
+            },
+            .conditioner => .{
+                .prefixes = &.{ "text_encoders.", "" },
+                .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" },
+            },
+            .decoder => .{
+                .prefixes = &.{ "first_stage_model.", "vae.", "" },
+                .probes = &.{"decoder.transformer_blocks.0.attn.to_qkv.weight"},
+            },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
         },
         // SDXL bundles its two towers under `conditioner.embedders.{0,1}`, and the two
         // are spelled differently *within one file*: embedder 0 is a `transformers`
@@ -3664,7 +3806,7 @@ fn encoderConfigFor(fam: Family) ?qwen3.Config {
         .qwen_image21 => qwen3.Config.vl_8b,
         .zimage => qwen3.Config.qwen3_4b,
         .anima => qwen3.Config.qwen3_0_6b,
-        .sd15, .sdxl, .sensenova, .minimax_h3, .moss_image => null,
+        .sd15, .sdxl, .sensenova, .minimax_h3, .minimax_h3_image, .moss_image => null,
     };
 }
 
@@ -3704,6 +3846,12 @@ pub const Family = enum {
     /// (a ViT3D video VAE and a BigVGAN audio VAE) rather than one. See
     /// `models/minimax_h3.zig`.
     minimax_h3,
+    /// MiniMax-H3-Image: the H3 trunk with the audio stream removed, denoising one
+    /// latent frame packed as `[text | reference images | image]`, with a PDD bank of
+    /// output heads distilled on a sigma grid the checkpoint declares (which is also
+    /// its sigma table). Same text encoder; its own VAE pairs H3's encoder with a
+    /// single-frame ViT decoder. Shares `MiniMaxH3Models` with `minimax_h3`.
+    minimax_h3_image,
     /// SenseNova U1.5, the first family with neither a VAE nor a separate text
     /// encoder. One Qwen3-shaped 8B trunk carries two weight copies per layer:
     /// the prompt runs the base copy and leaves a KV cache, and the canvas, in
@@ -3757,7 +3905,7 @@ pub const Family = enum {
     /// before drawing the control.
     pub fn supportsLora(self: Family) bool {
         return switch (self) {
-            .minimax_h3, .sensenova, .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo, .sd15, .sdxl => true,
+            .minimax_h3, .minimax_h3_image, .sensenova, .krea2, .zimage, .anima, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo, .sd15, .sdxl => true,
         };
     }
 
@@ -3766,7 +3914,7 @@ pub const Family = enum {
     pub fn latentMustBeEven(self: Family) bool {
         return switch (self) {
             // Qwen-Image 2.1 is patch 1, but diffusers rounds the image to 32 px.
-            .krea2, .zimage, .anima, .minimax_h3, .qwen_image21 => true,
+            .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .qwen_image21 => true,
             // SenseNova's canvas is pixels, and it is padded to 32 px per axis by
             // the model itself, so "even" is not the constraint here; `latentShape`
             // rounds to `tokenPx` instead. Mage-Flow is patch 1: a token IS a
@@ -3781,7 +3929,7 @@ pub const Family = enum {
     pub fn conditionsFromDenoiser(self: Family) bool {
         return switch (self) {
             .sensenova => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow, .minimax_h3, .moss_image, .qwen_image21, .fibo2, .fibo => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .mageflow, .minimax_h3, .minimax_h3_image, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 
@@ -3790,7 +3938,7 @@ pub const Family = enum {
     pub fn isVideo(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .minimax_h3_image, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 
@@ -3799,7 +3947,7 @@ pub const Family = enum {
     pub fn hasAudio(self: Family) bool {
         return switch (self) {
             .minimax_h3 => true,
-            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => false,
+            .krea2, .zimage, .anima, .sd15, .sdxl, .sensenova, .mageflow, .minimax_h3_image, .moss_image, .qwen_image21, .fibo2, .fibo => false,
         };
     }
 };
@@ -4098,7 +4246,8 @@ pub const MiniMaxH3Models = struct {
     vae_st: ?Container,
     vae: minimax_h3_vae.VideoDecoder,
     audio_st: ?Container,
-    audio: minimax_h3_audio.AudioDecoder,
+    /// Null for MiniMax-H3-Image, which has no audio stream.
+    audio: ?minimax_h3_audio.AudioDecoder,
     /// The BigVGAN's permuted device weights, built on first device decode. 135 MB
     /// of host memory, so a render that never reaches the audio stage skips it.
     audio_cu: ?minimax_h3_audio_cuda.Session = null,
@@ -4141,6 +4290,7 @@ pub const Models = union(Family) {
     zimage: ZImageModels,
     anima: AnimaModels,
     minimax_h3: MiniMaxH3Models,
+    minimax_h3_image: MiniMaxH3Models,
     sensenova: SenseNovaModels,
     mageflow: MageFlowModels,
     moss_image: MossImageModels,
@@ -4204,12 +4354,19 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     // either name alone is a weaker claim than the pair. `componentSpec`'s probe
     // list cannot express the AND (its probes are OR'd), which is why the pair
     // lives here and the prefix list is still shared with it.
+    // MiniMax H3, by ComfyUI's own test: the video patch embedding and the
+    // conditioning projection, with the audio stream telling the video release
+    // from the image one.
     for ((componentSpec(.minimax_h3, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
+        var b3: [96]u8 = undefined;
         const vid = std.mem.print(&b1, "{s}" ++ minimax_h3_video_probe, .{pfx}) catch continue;
-        const aud = std.mem.print(&b2, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
-        if (store.get(vid) != null and store.get(aud) != null) return .minimax_h3;
+        const cnd = std.mem.print(&b2, "{s}" ++ minimax_h3_condition_probe, .{pfx}) catch continue;
+        const aud = std.mem.print(&b3, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
+        if (store.get(vid) != null and store.get(cnd) != null) {
+            return if (store.get(aud) != null) .minimax_h3 else .minimax_h3_image;
+        }
     }
     // SenseNova U1.5, and this is ComfyUI's own test: the generation vision
     // tower's patch embedding AND the generation stream's query projection. Both,
@@ -4283,7 +4440,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
     };
 }
 
@@ -4406,6 +4563,9 @@ pub fn familySigmaTable(fam: Family, ladder: []const f32, shift: f32) sampler.Si
         // carries the audio latent scaled onto this schedule and the model
         // converts, so there is one table for the pack.
         .minimax_h3 => .{ .discrete_flow = shift },
+        // `MiniMaxH3ImageModelSampling`: the checkpoint's own PDD grid, passed
+        // as the ladder; the release's before one is open. No shift.
+        .minimax_h3_image => .{ .pdd_grid = if (ladder.len > 0) ladder else &minimax_h3.release_pdd_grid },
         // `ModelSamplingDiscreteFlow` at multiplier 1.0, like Z-Image's; only
         // the shift differs, and it is large (6.0).
         .mageflow => .{ .discrete_flow = shift },
@@ -4469,7 +4629,7 @@ pub fn stepLevels(gpa: std.mem.Allocator, fam: Family, width: usize, height: usi
         .krea2, .anima => wan_vae.spatial_scale,
         .zimage => zimage.spatial_scale,
         .sd15, .sdxl => sd_vae.spatial_scale,
-        .minimax_h3 => minimax_h3.spatial_downscale,
+        .minimax_h3, .minimax_h3_image => minimax_h3.spatial_downscale,
         .sensenova => sensenova.spatial_scale,
         .mageflow, .moss_image, .qwen_image21, .fibo2 => mage_vae.spatial_scale,
         .fibo => fibo.spatial_scale,
@@ -4496,6 +4656,8 @@ pub fn defaultShift(fam: Family) f32 {
         // schedule; the audio stream's is derived from it in closed form inside
         // the model (`minimax_h3.timeShiftSigma`), so it is not a schedule knob.
         .minimax_h3 => minimax_h3.shift_video,
+        // Unused: the PDD grid table takes no shift.
+        .minimax_h3_image => 1.0,
         .sensenova => sensenova.default_shift,
         // ComfyUI's `MageFlow.sampling_settings`, and far higher than any other
         // family's here.
@@ -4529,7 +4691,7 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // hidden state, so there is no fixed token window to interpolate a weight
         // in. Its presentation is not even chat-templated, it is raw prompt text
         // with vision blocks spliced in, so there is nothing to anchor against.
-        .krea2, .zimage, .minimax_h3, .mageflow, .qwen_image21, .fibo2, .fibo => qwen3.TextEncoder.supports_prompt_weights,
+        .krea2, .zimage, .minimax_h3, .minimax_h3_image, .mageflow, .qwen_image21, .fibo2, .fibo => qwen3.TextEncoder.supports_prompt_weights,
         // True, where the other Qwen3-conditioned families are false, and the
         // difference is structural rather than a judgement call. krea2 and Z-Image
         // weight the *encoder's* tap states, which have no fixed token window to
@@ -4754,7 +4916,6 @@ pub const Session = struct {
     /// "Most of them", not "all": quantization here is per WEIGHT, so one checkpoint
     /// can mix formats block by block. A reader wants one tag, and the
     /// majority is a truer summary than whichever weight happened to be first.
-    /// Empty for the families with no device linear list (H3).
     pub fn weightDtype(self: *const Session) []const u8 {
         const lins: []const ops.matmul.Weight = switch (self.models) {
             .krea2 => |*m| m.dit.device_lins,
@@ -4767,7 +4928,7 @@ pub const Session = struct {
             .fibo => |*m| m.dit.device_lins,
             .sensenova => |*m| m.dit.device_lins,
             .sd15, .sdxl => |*m| m.unet.device_lins,
-            .minimax_h3 => &.{},
+            .minimax_h3, .minimax_h3_image => |*m| m.dit.device_lins,
         };
         if (lins.len == 0) return "";
         var best = lins[0].dtype;
@@ -4841,13 +5002,13 @@ pub const Session = struct {
         if (self.cu_be == null and self.gpu_ctx == null) return null;
         return switch (comp) {
             .encoder => switch (self.models) {
-                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| m.enc.integerKind(),
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .minimax_h3_image, .qwen_image21, .fibo2, .fibo => |*m| m.enc.integerKind(),
                 .moss_image => |*m| m.enc.integerKind(),
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.clip.device_lins) orelse if (m.clip_g) |*g| models_lin.integerKind(g.device_lins) else null,
                 .sensenova => |*m| models_lin.integerKind(m.dit.prefix_lins),
             },
             .denoiser => switch (self.models) {
-                inline .krea2, .zimage, .anima, .mageflow, .moss_image, .sensenova, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| models_lin.integerKind(m.dit.device_lins),
+                inline .krea2, .zimage, .anima, .mageflow, .moss_image, .sensenova, .minimax_h3, .minimax_h3_image, .qwen_image21, .fibo2, .fibo => |*m| models_lin.integerKind(m.dit.device_lins),
                 .sd15, .sdxl => |*m| models_lin.integerKind(m.unet.device_lins),
             },
             .vae => null,
@@ -4897,7 +5058,7 @@ pub const Session = struct {
                     if (self.cu_be != null and anima_cuda.supported(&m.dit)) return anima_dev.streamDtFor(want);
                     if (self.gpu_ctx) |gc| if (anima_gpu.supported(gc, &m.dit)) return anima_dev.streamDtFor(want);
                 },
-                .minimax_h3 => |*m| {
+                .minimax_h3, .minimax_h3_image => |*m| {
                     if (self.cu_be != null and minimax_h3_cuda.supported(&m.dit)) return minimax_h3_dev.streamDtFor(want);
                     if (self.gpu_ctx) |gc| if (minimax_h3_gpu.supported(gc, &m.dit)) return minimax_h3_dev.streamDtFor(want);
                 },
@@ -4924,7 +5085,7 @@ pub const Session = struct {
             },
             .vae => switch (self.models) {
                 .sd15, .sdxl, .zimage, .krea2, .anima => if (self.cu_be != null or self.gpu_ctx != null) return want,
-                .minimax_h3 => |*m| {
+                .minimax_h3, .minimax_h3_image => |*m| {
                     if (self.cu_be != null and minimax_h3_vae_cuda.supported(&m.vae)) return want;
                     if (self.gpu_ctx != null and minimax_h3_vae_gpu.supported(&m.vae)) return want;
                 },
@@ -4941,7 +5102,7 @@ pub const Session = struct {
             .encoder => switch (self.models) {
                 // The Qwen3 walk stores its residual, norms and FFN planes at any width
                 // on both backends; the CPU encode is f32.
-                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .qwen_image21, .fibo2, .fibo => |*m| {
+                inline .krea2, .zimage, .anima, .mageflow, .minimax_h3, .minimax_h3_image, .qwen_image21, .fibo2, .fibo => |*m| {
                     if (self.cu_be != null) {
                         if (qwen3_cuda.supportsWeights(&m.enc)) return want;
                     } else if (self.gpu_ctx) |gc| if (qwen3_gpu.supportsWeights(gc, &m.enc)) return want;
@@ -5066,7 +5227,7 @@ pub const Session = struct {
 
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => null,
+            .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -5080,7 +5241,7 @@ pub const Session = struct {
             .krea2 => |*m| m.dit_st.store(),
             .zimage => |*m| m.dit_st.store(),
             .anima => |*m| m.dit_st.store(),
-            .minimax_h3 => |*m| m.dit_st.store(),
+            .minimax_h3, .minimax_h3_image => |*m| m.dit_st.store(),
             .sensenova => |*m| m.dit_st.store(),
             .mageflow => |*m| m.dit_st.store(),
             .moss_image => |*m| m.dit_st.store(),
@@ -5173,7 +5334,7 @@ pub const Session = struct {
     fn detachLoras(self: *Session) void {
         self.sd_vk_lora_ok = null;
         switch (self.models) {
-            .minimax_h3 => |*m| m.dit.detachLora(),
+            .minimax_h3, .minimax_h3_image => |*m| m.dit.detachLora(),
             .sensenova => |*m| m.dit.lora = null,
             .krea2 => |*m| m.dit.lora = null,
             .zimage => |*m| m.dit.lora = null,
@@ -5334,7 +5495,7 @@ pub const Session = struct {
         const stack = &self.lora.?;
         switch (self.models) {
             // H3 resolves a hit list onto each `Lin` during its own walk.
-            .minimax_h3 => |*m| return m.dit.attachLora(self.gpa, stack),
+            .minimax_h3, .minimax_h3_image => |*m| return m.dit.attachLora(self.gpa, stack),
             .sensenova => |*m| {
                 m.dit.lora = stack;
                 // Both copies: the turbo LoRAs patch only `_mot_gen`, but a file
@@ -5946,12 +6107,11 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .anima = m };
             },
-            // Four components, not three: the trunk plus a text encoder, a ViT3D
-            // video decoder and a BigVGAN audio decoder, resolved independently.
-            // `generate` is not the entry point here, `generateClip` is (a still
-            // image is not a thing this family produces), so `Session.generate`
-            // reports `error.FamilyNotImplemented`.
-            .minimax_h3 => {
+            // H3 is four components: the trunk plus a text encoder, a ViT3D video
+            // decoder and a BigVGAN audio decoder, resolved independently, rendered
+            // through `generateClip`. The image release is the first three, the
+            // decoder single-frame, rendered through `generate`.
+            .minimax_h3, .minimax_h3_image => {
                 var m: MiniMaxH3Models = .{
                     .tok = undefined,
                     .enc_st = null,
@@ -5961,7 +6121,7 @@ pub const Session = struct {
                     .vae_st = null,
                     .vae = undefined,
                     .audio_st = null,
-                    .audio = undefined,
+                    .audio = null,
                     .enc_view = null,
                     .vae_view = null,
                     .audio_view = null,
@@ -5969,6 +6129,12 @@ pub const Session = struct {
                 const den = try self.resolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
                 m.dit = try minimax_h3.DiT.load(gpa, den.store);
                 errdefer m.dit.deinit();
+                // The image checkpoints have no audio stream and sample on their PDD
+                // grid, which the reference requires them to declare.
+                if (m.dit.cfg.audio != (fam == .minimax_h3) or (fam == .minimax_h3_image and m.dit.cfg.pdd_steps == 1)) {
+                    std.log.err("minimax_h3: the denoiser has {s} audio stream and {d} output head(s), not a {t} checkpoint", .{ if (m.dit.cfg.audio) "an" else "no", m.dit.cfg.pdd_steps, fam });
+                    return error.UnsupportedCheckpoint;
+                }
                 if (den.view) |v| {
                     v.deinit(gpa);
                     gpa.destroy(v);
@@ -5994,16 +6160,22 @@ pub const Session = struct {
                 m.vae_view = vae_r.view;
                 m.vae = try minimax_h3_vae.VideoDecoder.load(gpa, vae_r.store);
                 errdefer m.vae.deinit();
+                if ((m.vae.cfg.patch_t == 1) != (fam == .minimax_h3_image)) {
+                    std.log.err("minimax_h3: the VAE decodes {d} frame(s) per latent, which is the other release's", .{m.vae.cfg.patch_t});
+                    return error.UnsupportedCheckpoint;
+                }
 
-                m.audio_st = try openIfGiven(gpa, io, opts.vae_2_path, opts.explicit_vae_2);
                 errdefer if (m.audio_st) |*st| st.deinit();
-                const aud_r = try self.resolve(gpa, fam, .decoder2, m.dit_st.store(), storeOf(&m.audio_st), opts.explicit_vae_2, opts.vae_2_path);
-                m.audio_view = aud_r.view;
-                m.audio = try minimax_h3_audio.AudioDecoder.load(gpa, aud_r.store);
-                errdefer m.audio.deinit();
+                errdefer if (m.audio) |*a| a.deinit();
+                if (fam == .minimax_h3) {
+                    m.audio_st = try openIfGiven(gpa, io, opts.vae_2_path, opts.explicit_vae_2);
+                    const aud_r = try self.resolve(gpa, fam, .decoder2, m.dit_st.store(), storeOf(&m.audio_st), opts.explicit_vae_2, opts.vae_2_path);
+                    m.audio_view = aud_r.view;
+                    m.audio = try minimax_h3_audio.AudioDecoder.load(gpa, aud_r.store);
+                }
 
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
-                self.models = .{ .minimax_h3 = m };
+                self.models = if (fam == .minimax_h3) .{ .minimax_h3 = m } else .{ .minimax_h3_image = m };
             },
             .sd15, .sdxl => {
                 const cfgs = sdConfigs(fam);
@@ -6075,7 +6247,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => unreachable,
                 };
             },
             // One file, one model: the prompt is encoded by the trunk's own
@@ -6206,7 +6378,7 @@ pub const Session = struct {
             .krea2 => |*m| swapDit(&m.dit, try dit_mod.DiT.load(self.gpa, store)),
             .zimage => |*m| swapDit(&m.dit, try zimage.DiT.load(self.gpa, store, zimage.z_image)),
             .anima => |*m| swapDit(&m.dit, try anima.DiT.load(self.gpa, store, try anima.detectConfig(store))),
-            .minimax_h3 => |*m| swapDit(&m.dit, try minimax_h3.DiT.load(self.gpa, store)),
+            .minimax_h3, .minimax_h3_image => |*m| swapDit(&m.dit, try minimax_h3.DiT.load(self.gpa, store)),
             .sensenova => |*m| swapDit(&m.dit, try sensenova.Model.load(self.gpa, store, sensenova.u15_8b)),
             .mageflow => |*m| swapDit(&m.dit, try mageflow.DiT.load(self.gpa, store)),
             .moss_image => |*m| swapDit(&m.dit, try moss_image.DiT.load(self.gpa, store)),
@@ -6482,8 +6654,8 @@ pub const Session = struct {
                 m.t5.deinit();
                 m.tok.deinit();
             },
-            .minimax_h3 => |*m| {
-                m.audio.deinit();
+            .minimax_h3, .minimax_h3_image => |*m| {
+                if (m.audio) |*a| a.deinit();
                 m.vae.deinit();
                 // The DiT points into the sidecar, which points into its
                 // container, so they unwind in that order.
@@ -6543,10 +6715,12 @@ pub const Session = struct {
         return familySigmaTable(self.family(), self.sigmaLadder(), shift);
     }
 
-    /// SD's sigma ladder; empty for the flow families, which have none.
+    /// SD's sigma ladder, or MiniMax-H3-Image's PDD grid; empty for the other flow
+    /// families, which have none.
     fn sigmaLadder(self: *const Session) []const f32 {
         return switch (self.models) {
             .sd15, .sdxl => |*m| m.sigma_ladder,
+            .minimax_h3_image => |*m| m.dit.pdd_grid,
             else => &.{},
         };
     }
@@ -6621,7 +6795,7 @@ pub const Session = struct {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
-            .krea2, .zimage, .anima, .minimax_h3, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => sampler.scaleInitialNoise(x, sigma0),
+            .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => sampler.scaleInitialNoise(x, sigma0),
             // The one family whose initial noise is not unit variance. Leaving the
             // scale out does not soften the image, it renders noise.
             .sensenova => {
@@ -6646,7 +6820,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima, .minimax_h3, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => .flow,
+            .krea2, .zimage, .anima, .minimax_h3, .minimax_h3_image, .sensenova, .mageflow, .moss_image, .qwen_image21, .fibo2, .fibo => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -6682,7 +6856,7 @@ pub const Session = struct {
             .anima => anima.latent_channels,
             // The VISUAL stream's channels. H3's audio stream has its own count
             // (32) and is not part of this answer; `LatentShape` carries both.
-            .minimax_h3 => minimax_h3.latent_channels,
+            .minimax_h3, .minimax_h3_image => minimax_h3.latent_channels,
             // Not a latent: SenseNova's canvas is the RGB image itself.
             .sensenova => sensenova.latent_channels,
             .mageflow => mageflow.channels,
@@ -7114,8 +7288,8 @@ pub const Session = struct {
         for (buf) |*v| v.* *= renorm;
     }
 
-    /// `c`'s layout, or null for a conditioning with no walkable body (H3's
-    /// reference payload rides beside `data`, not in it).
+    /// `c`'s layout, or null when it has none to walk. H3's reference payload
+    /// rides beside `data`, not in it.
     pub fn condLayout(self: *const Session, c: *const Cond) ?CondLayout {
         return switch (self.models) {
             // Widths off the loaded encoder, never the module constants: the same
@@ -7129,7 +7303,7 @@ pub const Session = struct {
             .fibo2 => |*m| .{ .rows = c.seq, .segs = fibo2_text.bundle_index.len, .w = m.enc.cfg.hidden },
             .fibo => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             .zimage => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
-            .minimax_h3 => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
+            .minimax_h3, .minimax_h3_image => |*m| .{ .rows = c.seq, .segs = m.enc.taps.len, .w = m.enc.cfg.hidden },
             // The adapter's rows, pad rows included: they are attended to, so they
             // are conditioning like any other row.
             .anima => .{ .rows = c.seq, .segs = 1, .w = anima.anima_2b.context_dim },
@@ -7168,7 +7342,7 @@ pub const Session = struct {
             .krea2, .anima => wan_vae.spatial_scale,
             .zimage => zimage.spatial_scale,
             .sd15, .sdxl => sd_vae.spatial_scale,
-            .minimax_h3 => minimax_h3.spatial_downscale,
+            .minimax_h3, .minimax_h3_image => minimax_h3.spatial_downscale,
             // 1: there is no VAE, so the sampler's canvas is the image. The model
             // pads it to 32 px per axis itself and crops the velocity back, so any
             // extent renders.
@@ -7243,7 +7417,7 @@ pub const Session = struct {
             .anima => wan_vae.latentPreviewInto(rgb_out, z, h, w),
             // The only arm that reads `shape.t`, and the only one for which
             // `frame` is not ignored.
-            .minimax_h3 => minimax_h3.latentPreviewInto(rgb_out, z, shape.t, h, w, frame),
+            .minimax_h3, .minimax_h3_image => minimax_h3.latentPreviewInto(rgb_out, z, shape.t, h, w, frame),
             // Not an approximation: the canvas IS the image, so the preview is the
             // decode.
             .sensenova => sensenova.canvasToRgb(rgb_out, z, h * w),
@@ -7438,78 +7612,7 @@ pub const Session = struct {
                 var p = try minimax_h3_present.build(gpa, &m.tok, text, items);
                 defer p.deinit();
 
-                var vision: qwen3.TextEncoder.Vision = .{};
-                var pos: []f32 = &.{};
-                defer if (pos.len > 0) gpa.free(pos);
-                var blocks: []qwen3.TextEncoder.Vision.Block = &.{};
-                defer if (blocks.len > 0) gpa.free(blocks);
-                var ds: [][]f32 = &.{};
-                defer if (ds.len > 0) gpa.free(ds);
-
-                if (p.blocks.len > 0) {
-                    std.debug.assert(p.blocks.len == n_blocks);
-                    vision.inject = try p.injectSpans(gpa, qwen3.TextEncoder.Vision.Span);
-
-                    // Presentation order: every picture's single block, then each
-                    // video's blocks in temporal order. `flatMerged` walks the two
-                    // sources as one list so the tower rows, the deepstack
-                    // concatenation and the injection spans cannot disagree.
-                    blocks = try gpa.alloc(qwen3.TextEncoder.Vision.Block, n_blocks);
-                    {
-                        var bi: usize = 0;
-                        for (refs) |r| {
-                            blocks[bi] = .{ .at = p.blocks[bi].index, .rows = r.merged };
-                            bi += 1;
-                        }
-                        for (vids) |v| {
-                            for (v.merged) |mg| {
-                                blocks[bi] = .{ .at = p.blocks[bi].index, .rows = mg };
-                                bi += 1;
-                            }
-                        }
-                        std.debug.assert(bi == n_blocks);
-                    }
-                    vision.blocks = blocks;
-
-                    // DeepStack features are CONCATENATED across blocks per layer,
-                    // in the same order, and the injection spans select them in
-                    // sequence order. The two agree because both walk pictures then
-                    // videos.
-                    const n_ds = if (refs.len > 0) refs[0].deepstack.len else vids[0].deepstack[0].len;
-                    ds = try gpa.alloc([]f32, n_ds);
-                    var built: usize = 0;
-                    errdefer for (ds[0..built]) |d| gpa.free(d);
-                    const eh = m.enc.cfg.hidden;
-                    const total = vision.injectRows(); // sum, not a range
-                    for (ds, 0..) |*d, li| {
-                        d.* = try gpa.alloc(f32, total * eh);
-                        built += 1;
-                        var row: usize = 0;
-                        for (refs) |r| {
-                            const src = r.deepstack[li];
-                            @memcpy(d.*[row * eh ..][0..src.len], src);
-                            row += src.len / eh;
-                        }
-                        for (vids) |v| {
-                            for (v.deepstack) |per_block| {
-                                const src = per_block[li];
-                                @memcpy(d.*[row * eh ..][0..src.len], src);
-                                row += src.len / eh;
-                            }
-                        }
-                    }
-                    vision.deepstack = ds;
-
-                    // Multimodal rope, which only exists once there is an image.
-                    const spans = try p.imageSpans(gpa);
-                    defer gpa.free(spans);
-                    pos = try gpa.alloc(f32, 3 * p.ids.len);
-                    try minimax_h3_vit.mropePositions(pos, p.ids.len, spans);
-                    vision.positions = pos;
-                    vision.rope_dims = m.enc.cfg.rope_dims;
-                }
-
-                const data = try self.runQwen3Vision(gpa, &m.enc, p.ids, vision, o);
+                const data = try self.h3EncodeVision(gpa, m, &p, refs, vids, n_blocks, o);
                 errdefer gpa.free(data);
 
                 // What the DiT needs, assembled once.
@@ -7548,15 +7651,11 @@ pub const Session = struct {
                     }
                     const cond = try gpa.alloc(f32, cond_len);
                     errdefer gpa.free(cond);
-                    var at: usize = 0;
-                    for (refs) |r| {
-                        @memcpy(cond[at..][0..r.cond_rows.len], r.cond_rows);
-                        at += r.cond_rows.len;
-                    }
-                    for (vids) |v| {
-                        @memcpy(cond[at..][0..v.cond_rows.len], v.cond_rows);
-                        at += v.cond_rows.len;
-                    }
+                    const pieces = try gpa.alloc([]const f32, refs.len + vids.len);
+                    defer gpa.free(pieces);
+                    for (refs, pieces[0..refs.len]) |r, *pc| pc.* = r.cond_rows;
+                    for (vids, pieces[refs.len..]) |v, *pc| pc.* = v.cond_rows;
+                    try minimax_h3.packCondRows(gpa, cond, pieces, o.render_seed);
 
                     // Audio rows in the SAME layout order: each reference video's
                     // soundtrack where the video sits, then the standalone ones.
@@ -7587,6 +7686,7 @@ pub const Session = struct {
                 }
                 return .{ .data = data, .seq = p.ids.len, .h3 = h3 };
             },
+            .minimax_h3_image => |*m| return self.encodeH3Image(gpa, m, text, o),
             .krea2 => |*m| {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(gpa);
@@ -8092,7 +8192,7 @@ pub const Session = struct {
         lin_cuda.dual_lin.trunk_int8 = self.intGemmFor(.denoiser);
         lin_cuda.dual_lin.trunk_fp8 = self.fp8_gemm;
         const use_cfg = cfg != 1.0;
-        if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
+        if (use_cfg and cond_neg == null and self.family() != .minimax_h3_image) return error.CfgNeedsNegativeCond;
         // Not built yet: H3's sampler steps a TWO-STREAM latent
         // (video and audio together, on schedules related by the audio carry),
         // and nothing allocates or steps one. Refuse by name here, because the
@@ -8333,6 +8433,12 @@ pub const Session = struct {
                     d.fb15_vk_ws = try fibo_gpu.Workspace.init(gc, &m.dit, lat_h * lat_w, text_cap, act);
                 } else std.log.warn("Fibo 1.5: this checkpoint's weight dtype has no Vulkan path (or the device has no tensor cores); the trunk runs on the CPU.", .{});
             }
+            return d;
+        }
+
+        if (self.family() == .minimax_h3_image) {
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, minimax_h3.latent_channels * lat_h * lat_w);
+            d.h3i = try H3Image.init(self, gpa, cond_pos, lat_h, lat_w, use_cfg);
             return d;
         }
 
@@ -10263,6 +10369,192 @@ pub const Session = struct {
         _ = self;
     }
 
+    /// The H3 presentation through the encoder: vision blocks, their DeepStack
+    /// features and the multimodal rope, then the walk. `refs` are the pictures and
+    /// `vids` the reference videos, in presentation order; `n_blocks` counts both.
+    fn h3EncodeVision(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        p: *const minimax_h3_present.Presentation,
+        refs: []const EncodedRef,
+        vids: []const EncodedVideo,
+        n_blocks: usize,
+        o: EncodeOptions,
+    ) ![]f32 {
+        var vision: qwen3.TextEncoder.Vision = .{};
+        var pos: []f32 = &.{};
+        defer if (pos.len > 0) gpa.free(pos);
+        var blocks: []qwen3.TextEncoder.Vision.Block = &.{};
+        defer if (blocks.len > 0) gpa.free(blocks);
+        var ds: [][]f32 = &.{};
+        defer if (ds.len > 0) gpa.free(ds);
+
+        if (p.blocks.len > 0) {
+            std.debug.assert(p.blocks.len == n_blocks);
+            vision.inject = try p.injectSpans(gpa, qwen3.TextEncoder.Vision.Span);
+
+            // Presentation order: every picture's single block, then each
+            // video's blocks in temporal order. `flatMerged` walks the two
+            // sources as one list so the tower rows, the deepstack
+            // concatenation and the injection spans cannot disagree.
+            blocks = try gpa.alloc(qwen3.TextEncoder.Vision.Block, n_blocks);
+            {
+                var bi: usize = 0;
+                for (refs) |r| {
+                    blocks[bi] = .{ .at = p.blocks[bi].index, .rows = r.merged };
+                    bi += 1;
+                }
+                for (vids) |v| {
+                    for (v.merged) |mg| {
+                        blocks[bi] = .{ .at = p.blocks[bi].index, .rows = mg };
+                        bi += 1;
+                    }
+                }
+                std.debug.assert(bi == n_blocks);
+            }
+            vision.blocks = blocks;
+
+            // DeepStack features are CONCATENATED across blocks per layer,
+            // in the same order, and the injection spans select them in
+            // sequence order. The two agree because both walk pictures then
+            // videos.
+            const n_ds = if (refs.len > 0) refs[0].deepstack.len else vids[0].deepstack[0].len;
+            ds = try gpa.alloc([]f32, n_ds);
+            var built: usize = 0;
+            errdefer for (ds[0..built]) |d| gpa.free(d);
+            const eh = m.enc.cfg.hidden;
+            const total = vision.injectRows(); // sum, not a range
+            for (ds, 0..) |*d, li| {
+                d.* = try gpa.alloc(f32, total * eh);
+                built += 1;
+                var row: usize = 0;
+                for (refs) |r| {
+                    const src = r.deepstack[li];
+                    @memcpy(d.*[row * eh ..][0..src.len], src);
+                    row += src.len / eh;
+                }
+                for (vids) |v| {
+                    for (v.deepstack) |per_block| {
+                        const src = per_block[li];
+                        @memcpy(d.*[row * eh ..][0..src.len], src);
+                        row += src.len / eh;
+                    }
+                }
+            }
+            vision.deepstack = ds;
+
+            // Multimodal rope, which only exists once there is an image.
+            const spans = try p.imageSpans(gpa);
+            defer gpa.free(spans);
+            pos = try gpa.alloc(f32, 3 * p.ids.len);
+            try minimax_h3_vit.mropePositions(pos, p.ids.len, spans);
+            vision.positions = pos;
+            vision.rope_dims = m.enc.cfg.rope_dims;
+        }
+
+        return self.runQwen3Vision(gpa, &m.enc, p.ids, vision, o);
+    }
+
+    /// MiniMax-H3-Image: the H3 presentation with `Picture i: ` labels and edit
+    /// pictures only (no keyframes, videos or audio).
+    fn encodeH3Image(self: *Session, gpa: std.mem.Allocator, m: *MiniMaxH3Models, text: []const u8, o: EncodeOptions) !Cond {
+        const refs = try gpa.alloc(EncodedRef, o.h3_ref_images.len);
+        var n_done: usize = 0;
+        defer {
+            for (refs[0..n_done]) |*r| r.deinit(gpa);
+            gpa.free(refs);
+        }
+        for (o.h3_ref_images, refs) |img, *out| {
+            out.* = try self.h3ImageEncodeRef(gpa, m, img);
+            n_done += 1;
+        }
+
+        const items = try gpa.alloc(minimax_h3_present.Item, refs.len);
+        defer gpa.free(items);
+        for (refs, items) |r, *it| it.* = .{ .image = .{ .h = r.grid_h, .w = r.grid_w } };
+        var p = try minimax_h3_present.buildWith(gpa, &m.tok, text, items, .plain);
+        defer p.deinit();
+
+        const data = try self.h3EncodeVision(gpa, m, &p, refs, &.{}, refs.len, o);
+        errdefer gpa.free(data);
+        if (refs.len == 0) return .{ .data = data, .seq = p.ids.len };
+
+        const layout_refs = try gpa.alloc(minimax_h3.Ref, refs.len);
+        errdefer gpa.free(layout_refs);
+        var cond_len: usize = 0;
+        for (refs, layout_refs) |r, *lr| {
+            lr.* = .{ .kind = .image, .latent_t = 1, .latent_h = r.lat_h, .latent_w = r.lat_w };
+            cond_len += r.cond_rows.len;
+        }
+        const cond = try gpa.alloc(f32, cond_len);
+        errdefer gpa.free(cond);
+        const pieces = try gpa.alloc([]const f32, refs.len);
+        defer gpa.free(pieces);
+        for (refs, pieces) |r, *pc| pc.* = r.cond_rows;
+        try minimax_h3.packCondRows(gpa, cond, pieces, o.render_seed);
+        const kfs = try gpa.alloc(minimax_h3.Keyframe, 0);
+        errdefer gpa.free(kfs);
+        const cond_au = try gpa.alloc(f32, 0);
+        errdefer gpa.free(cond_au);
+        return .{ .data = data, .seq = p.ids.len, .h3 = .{
+            .keyframes = kfs,
+            .refs = layout_refs,
+            .cond_video = cond,
+            .cond_audio = cond_au,
+            .tag_spans = try p.tagSpans(gpa),
+        } };
+    }
+
+    /// One MiniMax-H3-Image edit picture through both towers, as
+    /// `MiniMaxH3ImageConditioning` prepares it: a Lanczos copy at a 1024 px short
+    /// edge for the vision tower and another at a short edge clamped to
+    /// [1024, 2048] for the VAE, which encodes a posterior SAMPLE rather than the
+    /// mean.
+    fn h3ImageEncodeRef(self: *Session, gpa: std.mem.Allocator, m: *MiniMaxH3Models, img: RefImage) !EncodedRef {
+        try self.h3EnsureRefModels(gpa, m);
+        const vit = &m.vit.?;
+        const venc = &m.venc.?;
+
+        const vs = minimax_h3.imageRefSize(img.width, img.height, minimax_h3.image_ref_short_edge, minimax_h3.image_ref_short_edge);
+        const vis = try gpa.alloc(f32, 3 * vs.h * vs.w);
+        defer gpa.free(vis);
+        // the node's `_resize_to` leaves a picture already at its size untouched
+        if (vs.h == img.height and vs.w == img.width) {
+            @memcpy(vis, img.rgb);
+        } else {
+            try resample.lanczosPlanar(gpa, vis, img.rgb, img.height, img.width, vs.h, vs.w);
+        }
+        // Qwen's own resize then sees an in-range, 32-aligned picture and keeps it.
+        var prep = try minimax_h3_vit.preprocessStill(gpa, vit.cfg, vis, vs.h, vs.w, 3136, 12845056);
+        defer prep.deinit(gpa);
+        var enc = try self.h3Vit(gpa, vit, prep.patches, prep.grid_h, prep.grid_w);
+        errdefer enc.deinit(gpa);
+
+        const ps = minimax_h3.imageRefSize(img.width, img.height, minimax_h3.image_ref_short_edge, minimax_h3.image_ref_vae_max_short_edge);
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = minimax_h3.spatial_downscale };
+        var vdev = try self.h3VencDevice(gpa, m);
+        defer if (vdev) |*d| d.deinit();
+        const dev_moments = if (vdev) |*d| d.moments() else null;
+        const lat = try minimax_h3_vae_encode.encodeImageRef(venc, self.io, gpa, img.rgb, img.height, img.width, ps.h, ps.w, sp, dev_moments, minimax_h3.image_encode_seed);
+        defer gpa.free(lat.d);
+
+        const frame_rows = (lat.h / minimax_h3.patch_h) * (lat.w / minimax_h3.patch_w);
+        const cond_rows = try gpa.alloc(f32, frame_rows * m.dit.cfg.videoPatchDim());
+        errdefer gpa.free(cond_rows);
+        minimax_h3.patchifyVideo(cond_rows, lat.d, lat.t, lat.h, lat.w);
+
+        return .{
+            .merged = enc.merged,
+            .deepstack = enc.deepstack,
+            .grid_h = prep.grid_h,
+            .grid_w = prep.grid_w,
+            .cond_rows = cond_rows,
+            .lat_h = lat.h,
+            .lat_w = lat.w,
+        };
+    }
+
     /// One reference picture through both towers.
     ///
     /// `area_cap` is the pixel budget the ViT resize clamps to, which is the
@@ -10352,17 +10644,17 @@ pub const Session = struct {
         t: usize,
     ) !bool {
         if (std.c.getenv("TP_AUDIO_CPU") != null) return false;
-        if (!minimax_h3_audio_cuda.supported(&m.audio)) return false;
+        if (!minimax_h3_audio_cuda.supported(&m.audio.?)) return false;
         const be = self.cu_be orelse return self.decodeAudioVk(m, gpa, out, z, t);
         if (m.audio_cu == null) {
-            m.audio_cu = minimax_h3_audio_cuda.Session.init(gpa, &m.audio) catch |err| {
+            m.audio_cu = minimax_h3_audio_cuda.Session.init(gpa, &m.audio.?) catch |err| {
                 std.log.warn("minimax_h3_audio_cuda: session build failed ({t}), decoding on the CPU", .{err});
                 return false;
             };
         }
-        var ws = minimax_h3_audio_cuda.Workspace.init(be, &m.audio, t) catch |err| {
+        var ws = minimax_h3_audio_cuda.Workspace.init(be, &m.audio.?, t) catch |err| {
             std.log.warn("minimax_h3_audio_cuda: workspace ({d} MB) failed ({t}), decoding on the CPU", .{
-                minimax_h3_audio_cuda.Workspace.bytesFor(&m.audio, t) >> 20, err,
+                minimax_h3_audio_cuda.Workspace.bytesFor(&m.audio.?, t) >> 20, err,
             });
             return false;
         };
@@ -10370,7 +10662,7 @@ pub const Session = struct {
         // No cancel handle: `decodeClip` is a stage API and takes none, so the
         // video decode beside this one is uncancellable too. The audio decode is
         // now ~75 ms, so it is the video side that would be worth wiring.
-        minimax_h3_audio_cuda.decode(&m.audio, &m.audio_cu.?, be, &ws, gpa, out, z, t, null) catch |err| {
+        minimax_h3_audio_cuda.decode(&m.audio.?, &m.audio_cu.?, be, &ws, gpa, out, z, t, null) catch |err| {
             if (err == error.Canceled) return err;
             std.log.warn("minimax_h3_audio_cuda: decode failed ({t}), decoding on the CPU", .{err});
             return false;
@@ -10390,17 +10682,17 @@ pub const Session = struct {
     ) !bool {
         const gc = self.gpu_ctx orelse return false;
         if (m.audio_cu == null) {
-            m.audio_cu = minimax_h3_audio_gpu.Session.init(gpa, &m.audio) catch |err| {
+            m.audio_cu = minimax_h3_audio_gpu.Session.init(gpa, &m.audio.?) catch |err| {
                 std.log.warn("minimax_h3_audio_gpu: session build failed ({t}), decoding on the CPU", .{err});
                 return false;
             };
         }
-        var ws = minimax_h3_audio_gpu.Workspace.init(gc, gpa, &m.audio, t) catch |err| {
+        var ws = minimax_h3_audio_gpu.Workspace.init(gc, gpa, &m.audio.?, t) catch |err| {
             std.log.warn("minimax_h3_audio_gpu: workspace failed ({t}), decoding on the CPU", .{err});
             return false;
         };
         defer ws.deinit(gc);
-        minimax_h3_audio_gpu.decode(&m.audio, &m.audio_cu.?, gc, &ws, gpa, out, z, t, null) catch |err| {
+        minimax_h3_audio_gpu.decode(&m.audio.?, &m.audio_cu.?, gc, &ws, gpa, out, z, t, null) catch |err| {
             if (err == error.Canceled) return err;
             std.log.warn("minimax_h3_audio_gpu: decode failed ({t}), decoding on the CPU", .{err});
             return false;
@@ -10454,6 +10746,45 @@ pub const Session = struct {
                 continue;
             };
         }
+    }
+
+    /// MiniMax-H3-Image's decode: the reference's still path, one frame through
+    /// the single-frame ViT in spatial tiles, then the ImageNet finalize. The
+    /// latent statistics are the VAE's own (`VideoDecoder.latents_mean`).
+    fn decodeH3Image(self: *Session, latent: []const f32, lat_h: usize, lat_w: usize, progress: ?*std.Io.Writer, act: Act) !Image {
+        const gpa = self.gpa;
+        const io = self.io;
+        const m = &self.models.minimax_h3_image;
+        const vcfg = m.vae.cfg;
+        if (latent.len != vcfg.in_channels * lat_h * lat_w) return error.LatentSizeMismatch;
+        self.setMemTag(.vae);
+        try note(progress, "decoding latent...\n", .{});
+        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+
+        // Sized for one tile, which is all the volume decode ever sees.
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = vcfg.patch };
+        const cells = sp.tile / sp.ratio;
+        var dev: ?DeviceVolume = null;
+        defer if (dev) |*d| d.deinit();
+        var vdev: ?VkVolume = null;
+        defer if (vdev) |*d| d.deinit();
+        if (self.cu_be) |b| {
+            if (minimax_h3_vae_cuda.supported(&m.vae)) dev = try DeviceVolume.init(b, gpa, &m.vae, 1, @min(lat_h, cells), @min(lat_w, cells), act);
+        } else if (self.gpu_ctx) |gc| {
+            if (minimax_h3_vae_gpu.supported(&m.vae)) vdev = try VkVolume.init(gc, gpa, &m.vae, 1, @min(lat_h, cells), @min(lat_w, cells), act);
+        }
+
+        const s = minimax_h3_vae.outputShape(vcfg, 1, lat_h, lat_w);
+        const planar = try gpa.alloc(f32, vcfg.out_channels * s.height * s.width);
+        defer gpa.free(planar);
+        try minimax_h3_vae.decodeTiled(&m.vae, io, gpa, sp, planar, latent, 1, lat_h, lat_w, if (dev) |*d| d.volume() else if (vdev) |*d| d.volume() else null);
+        minimax_h3_vae.finalizePixels(planar, vcfg.out_channels, s.height * s.width);
+        try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e9});
+        return .{
+            .rgb = try image.planarUnitToRgb8(gpa, planar, s.width, s.height),
+            .width = s.width,
+            .height = s.height,
+        };
     }
 
     fn decodeClipAt(
@@ -10548,7 +10879,7 @@ pub const Session = struct {
         try note(progress, "video decoded in {d:.1}s, decoding audio...\n", .{
             @as(f64, @floatFromInt(t_vid - t0)) / 1e9,
         });
-        const samples = audio_shape.t * m.audio.upsampleFactor();
+        const samples = audio_shape.t * m.audio.?.upsampleFactor();
         const audio = try gpa.alloc(f32, samples * minimax_h3_audio.stereo);
         errdefer gpa.free(audio);
         const zaudio = latent[shape.audioOffset()..];
@@ -10568,7 +10899,7 @@ pub const Session = struct {
             });
         }
         if (!try self.decodeAudioOnDevice(gpa, m, audio, zaudio, audio_shape.t)) {
-            try minimax_h3_audio.decode(&m.audio, io, gpa, audio, zaudio, audio_shape.t);
+            try minimax_h3_audio.decode(&m.audio.?, io, gpa, audio, zaudio, audio_shape.t);
         }
 
         try note(progress, "decoded in {d:.1}s\n", .{
@@ -10607,6 +10938,18 @@ pub const Session = struct {
         // `Image`. Neither is loaded, so refuse by name rather than fall through
         // to a decoder that would read this latent as a still.
         if (self.family() == .minimax_h3) return error.FamilyNotImplemented;
+        if (self.family() == .minimax_h3_image) {
+            while (true) {
+                const act = self.actFor(.vae);
+                return self.decodeH3Image(latent, lat_h, lat_w, progress, act) catch |err| {
+                    if (err != error.GpuDecodeNonFinite) return err;
+                    self.last_failure = .{ .component = .vae, .act = act };
+                    const wider = self.widen(.vae, act) orelse return error.NonFiniteActivation;
+                    try note(progress, "{f}; rerunning the decode at {t}\n", .{ self.last_failure.?, wider });
+                    continue;
+                };
+            }
+        }
 
         // The SD family differs from krea2 only in its normalization, its
         // AutoencoderKL takes `z / scaling_factor`, where Wan's is per-channel
@@ -11179,7 +11522,8 @@ pub const Session = struct {
         defer cond_pos.deinit(gpa);
         // The negative branch says so, because SenseNova's negative under editing
         // is the reference pictures with no prompt rather than an empty prompt.
-        var cond_neg: ?Cond = if (use_cfg)
+        // MiniMax-H3-Image's negative is the positive zeroed, built by its denoiser.
+        var cond_neg: ?Cond = if (use_cfg and self.family() != .minimax_h3_image)
             try self.encode(gpa, opts.negative, opts.encodeOptions(.negative, nsteps))
         else
             null;
@@ -11643,7 +11987,7 @@ test "the live preview follows the family's own latent format" {
             .krea2 => wan_vae.latent_channels,
             .zimage => zimage.latent_channels,
             .anima => anima.latent_channels,
-            .minimax_h3 => minimax_h3.latent_channels,
+            .minimax_h3, .minimax_h3_image => minimax_h3.latent_channels,
             .sensenova => sensenova.latent_channels,
             .mageflow, .moss_image, .fibo2 => mageflow.channels,
             .fibo => fibo.channels,
@@ -12071,8 +12415,11 @@ test "family detection reads the denoiser's own tensor names" {
         // MiniMax H3 needs BOTH patch projections, ComfyUI's own test: one
         // projection per stream is what makes it a joint audio-video model. The
         // negative case below pins that the video one alone is not enough.
-        .{ .names = &.{ "model.diffusion_model.video_patch_proj.weight", "model.diffusion_model.audio_patch_proj.weight" }, .want = .minimax_h3 },
-        .{ .names = &.{ "video_patch_proj.weight", "audio_patch_proj.weight" }, .want = .minimax_h3 },
+        .{ .names = &.{ "model.diffusion_model.video_patch_proj.weight", "model.diffusion_model.audio_patch_proj.weight", "model.diffusion_model.condition_proj.weight" }, .want = .minimax_h3 },
+        .{ .names = &.{ "video_patch_proj.weight", "audio_patch_proj.weight", "condition_proj.weight" }, .want = .minimax_h3 },
+        // The image release is the same trunk with no audio stream.
+        .{ .names = &.{ "model.diffusion_model.video_patch_proj.weight", "model.diffusion_model.condition_proj.weight" }, .want = .minimax_h3_image },
+        .{ .names = &.{ "video_patch_proj.weight", "condition_proj.weight" }, .want = .minimax_h3_image },
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;

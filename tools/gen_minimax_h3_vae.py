@@ -140,17 +140,20 @@ def main():
 
     # Teeth: swapping the swiglu halves must move the output a lot. The DiT's
     # first fixture could not see this at all.
-    orig_ff_forward = h3vae.FeedForward.forward
+    # The feed-forward fuses its gated SiLU into the GEMM's input activation, so
+    # swap the halves where ComfyUI defines that activation.
+    import comfy.ops as _ops
+    orig = _ops.INPUT_ACT_EAGER["swiglu"]
 
-    def swapped(self, x):
-        gate, up = self.w1(x).chunk(2, dim=-1)
-        return self.w2(torch.nn.functional.silu(up).mul_(gate))
+    def swapped(x):
+        gate, up = x.chunk(2, dim=-1)
+        return torch.nn.functional.silu(up).mul_(gate)
 
-    h3vae.FeedForward.forward = swapped
+    _ops.INPUT_ACT_EAGER["swiglu"] = swapped
     try:
         alt, _ = run(dec)
     finally:
-        h3vae.FeedForward.forward = orig_ff_forward
+        _ops.INPUT_ACT_EAGER["swiglu"] = orig
     rel = (alt - out).norm() / out.norm()
     assert rel > 1e-2, "swiglu half order is indistinguishable (rel %.2e)" % rel
 
@@ -162,6 +165,9 @@ def main():
     torch.nn.Module.__init__(vae)
     vae.vae_ratio = PATCH
     vae.vae_ratio_t = PATCH_T
+    # the stock causal decoder, decoding a still as the first latent of a clip
+    vae.noncausal = False
+    vae.still_frame = None
     vae.clip_length = 17
     vae.token_drop = 3
     vae.frame_pre_padding = (-vae.clip_length) % vae.vae_ratio_t

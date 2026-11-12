@@ -347,8 +347,7 @@ const Dev = struct {
     pub fn headNorm(d: Dev, buf: Buf, w: []const f32, n: usize) !void {
         const cfg = d.model.cfg;
         const wb: Buf = .{ .buf = try d.ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
-        if (d.ctx.hasSubgroupNorm()) return d.ctx.opRmsNormSg(buf, buf, wb, n * cfg.heads, cfg.head_dim, cfg.eps);
-        try d.ctx.opElt(gpu.eltAt("rmsnorm", buf.dt), buf, buf, wb, null, .{ .u0 = @intCast(n * cfg.heads), .u1 = @intCast(cfg.head_dim), .f0 = cfg.eps }, n * cfg.heads, 1, 1);
+        try d.ctx.opRmsNorm(buf, buf, wb, n * cfg.heads, cfg.head_dim, cfg.eps);
     }
 
     pub fn rope(d: Dev, buf: Buf, n: usize) !void {

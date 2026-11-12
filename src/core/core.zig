@@ -52,6 +52,7 @@ pub const unicode_tables = @import("unicode_tables.zig");
 /// Unicode NFC, which transformers applies to a prompt before a Qwen tokenizer splits it.
 pub const nfc = @import("nfc.zig");
 pub const image = @import("image.zig");
+pub const resample = @import("resample.zig");
 /// Waveform container I/O (WAV) and torchaudio-compatible rate conversion.
 pub const audio = @import("audio.zig");
 pub const kv_cache = @import("kv_cache.zig");
@@ -94,6 +95,7 @@ test {
     _ = jinja;
     _ = unicode_tables;
     _ = image;
+    _ = resample;
     _ = audio;
     _ = kv_cache;
     _ = sample;

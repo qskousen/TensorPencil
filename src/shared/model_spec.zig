@@ -140,7 +140,7 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             .fibo => dims.len == 2 and dims[1] == models.qwen3.Config.smollm3_3b.hidden and dims[0] == models.qwen3.Config.smollm3_3b.kvDim(),
             .zimage => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_4b.hidden,
             .anima => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3_0_6b.hidden,
-            .minimax_h3 => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
+            .minimax_h3, .minimax_h3_image => dims.len == 2 and dims[1] == models.qwen3.Config.qwen3vl_32b_h3.hidden,
             // Not a side file: SenseNova's "conditioner" is the trunk's own
             // understanding half, in the checkpoint the denoiser came from.
             .sensenova => dims.len == 2 and dims[1] == models.sensenova.u15_8b.dim,
@@ -169,7 +169,11 @@ pub fn componentFits(view: tp.weights.TensorView, fam: Family, comp: Component) 
             // `decoder.conv1.weight` is [inner][z][t][3][3]; the Qwen-Image 2.1 and
             // Wan 2.2 VAEs carry it too, at 64 and 48 channels.
             .krea2, .anima => dims.len == 5 and dims[1] == models.wan_vae.latent_channels,
-            .minimax_h3, .sensenova => true,
+            // The probe is a decoder block's `to_qkv`, `[3 * dim][dim]`: the image
+            // release's single-frame decoder is the 1024-wide one.
+            .minimax_h3 => dims.len == 2 and dims[1] != models.minimax_h3_vae.Config.image_decoder_dim,
+            .minimax_h3_image => dims.len == 2 and dims[1] == models.minimax_h3_vae.Config.image_decoder_dim,
+            .sensenova => true,
         },
         .decoder2, .denoiser => true,
     };
@@ -273,7 +277,7 @@ fn encoderConfig(fam: Family) ?tp.models.qwen3.Config {
         .fibo => C.smollm3_3b,
         .zimage => C.qwen3_4b,
         .anima => C.qwen3_0_6b,
-        .minimax_h3 => C.qwen3vl_32b_h3,
+        .minimax_h3, .minimax_h3_image => C.qwen3vl_32b_h3,
         // Not a Qwen3 encoder file: the depth check below is about a SIDE
         // encoder's layer count, and SenseNova has no side encoder to check.
         .sd15, .sdxl, .sensenova, .moss_image => null,
@@ -494,7 +498,7 @@ fn loraSpec(fam: Family) ?LoraSpec {
         },
         .fibo2 => .{ .probe = "layers.0.attention.to_q", .in_dim = m.fibo2.release.dim, .out_dim = m.fibo2.release.dim, .layers = m.fibo2.release.n_layers },
         .fibo => .{ .probe = "transformer_blocks.0.attn.to_q", .in_dim = m.fibo.release.dim, .out_dim = m.fibo.release.dim, .layers = m.fibo.release.n_double },
-        .sd15, .sdxl, .minimax_h3 => null,
+        .sd15, .sdxl, .minimax_h3, .minimax_h3_image => null,
     };
 }
 
@@ -634,6 +638,19 @@ pub fn traits(fam: Family) Traits {
             .height = 768,
             .frames = 124,
             .steps = 30,
+            .cfg = 1.0,
+        },
+        // ComfyUI's `image_minimax_h3_image_edit` template: 6 steps (one per PDD
+        // head), cfg 1 against a zeroed negative, euler + `simple`. 2048x2048 is
+        // the conditioning node's own default; the template says the model is
+        // best at 4 to 20 MP.
+        .minimax_h3_image => .{
+            .label = "MiniMax H3 Image (DiT, distilled heads)",
+            .short = "MiniMax H3 Image",
+            .backends = &all_backends,
+            .width = 2048,
+            .height = 2048,
+            .steps = 6,
             .cfg = 1.0,
         },
         // The workflow the ComfyUI PR ships with: 1024x1024, 50 steps, cfg 4,

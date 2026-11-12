@@ -1,3 +1,32 @@
+- MiniMax H3 / H3-Image, what is left:
+  - The H3-Image trunk at 1024² int8 is 0.27 s/step against ComfyUI's 0.28. The GPU is
+    busy 99% of a forward; what is left:
+    - The modulation table is built on the device (`AdalnDevice`, `adaln_table`) except
+      under a LoRA on an adaLN, which still takes ~23 ms a step on the host
+      (`buildModTable` and its 58 MB upload). A device-side LoRA delta on the adaLN
+      would close that.
+    - `gated_add` (~9.5 ms, at bandwidth) only goes by folding `x += gate * y` into the
+      out/fc2 GEMM epilogue, which needs the LoRA sidecar to add its delta gated too.
+    - `rms_mod` (~12 ms) writes `t1` in f32 for the prep to re-read; folding the norm
+      into the int8 prep (as `PrepLoad.silu_mul` folds the MLP product) removes a pass.
+  - `lin_cuda.gemmPlanes` runs a fused weight as one GEMM; H3 uses it for qkv and fc1.
+    MOSS-Image (qkv, up/gate), Qwen-Image 2.1 and Fibo 2 (qkv) still run row views one
+    by one. Z-Image's qkv planes are unequal (GQA), which the kernel's one `p_split`
+    does not take.
+  - `--first-frame` does not anchor an H3 clip: frame 0 ignores the keyframe, with or
+    without its condition noise, on the Ref2VA checkpoint, the only video one here.
+    Unknown whether that checkpoint ignores keyframes or our keyframe path is wrong;
+    ComfyUI with the same keyframe tells.
+  - The GUI still lists H3 (video) as CPU-only behind a comment saying no trunk exists,
+    and `model_spec.loraSpec` offers no LoRA for either H3 family.
+  - A PDD video checkpoint (a head bank on the runtime shift's grid) is refused by name.
+  - The 40 GB bf16 H3-Image release has not been rendered.
+- ComfyUI's int8 attention (`ops/sage_attn.zig`, `gpu/cuda/sage.zig`) covers head dim 128
+  with more than 1024 keys only. comfy-kitchen takes 64-key tiles at 1024 keys or fewer (and
+  at 512 or fewer unfused probabilities), an H4 rotation at 256 or fewer and an H64 one at
+  head dim 64; those shapes run ordinary attention here, which is H3-Image below about
+  1024², and Vulkan runs ordinary attention everywhere. Each new path needs its own case in
+  `tools/gen_sage_attn_fixture.py` and a byte-exact check in `sage-attn-cuda-test`.
 - Zig 0.17 port, what is left:
   - Three SPIR-V backend bugs to report upstream (Codeberg), each with a minimal repro: an
     access chain into an array at a comptime-known index is typed as a pointer to the
@@ -110,10 +139,12 @@
   an isolation: the separate `opAddBiasRows` pass after every block GEMM, which
   ComfyUI folds into cuBLASLt's epilogue (an `opGemmBf16` that takes a real bias
   would remove ~10 GB/step of traffic, ESTIMATED not measured), and the per-block
-  text q/k/v copies. Our VAE is 1.69x FASTER than ComfyUI's on CUDA and another
-  3.7x faster again on Vulkan (0.3 s against 1.1 s at 1024x1024, unexplained and
-  worth a look from the other direction: what the CUDA VAE is doing that the
-  Vulkan one is not), so the codec is not where to look
+  text q/k/v copies. The codec is not where to look: its warm decode ties ComfyUI's
+  (49 ms at 1024x1024)
+- VAE decode on Vulkan trails CUDA on every family (warm, 1024x1024, `generate
+  --decode-bench`): H3-Image 1306 vs 286 ms, Z-Image 557 vs 272, SDXL 656 vs 434,
+  Mage-VAE 104 vs 49, Qwen-Image 2.1 830 vs 645, krea2 268 vs 145. H3's 4.6x is the
+  one to profile first; where its time goes is not measured
 - mageflow: the edit path has never run against Mage-Flow-EDIT (`mage_flow_edit_bf16` /
   `mage_flow_edit_int8_convrot`), which is not on this box
 - mageflow: the VAE ENCODE side is still host-only (`mage_vae.encode`), which costs
@@ -150,9 +181,19 @@
   encoders and LLMs keep fp8 weight-only, unmeasured there. Measured on a PRO 6000, Krea2 Turbo 1024²: zig-cuda 816 -> 352 ms a forward, the cuDNN arm 585 -> 357;
   velocity vs the bf16 source 0.118 weight-only, 0.108 W8A8 (noise floor 5.7e-2 against
   weight-only's 1.5e-3); render vs bf16 30.8 dB weight-only, 29.5 dB W8A8. The int8 convrot
-  file of the same model measures 0.027 and 34.4 dB at the same speed. Next on Blackwell:
-  NVFP4 native (block-scaled `mma` on sm_120a, or cuBLAS on the cuDNN arm), and W4A8 with
-  fp4 weights against fp8 activations
+  file of the same model measures 0.027 and 34.4 dB at the same speed
+- int4 convrot W4A4 is ~8x slower in the GEMM on sm_120 than int8 (the s4 `mma` is emulated
+  there, `cuda-i4-test` rates). Route int4 to the W4A8 decode (`i4_i8`, what Vulkan runs) on
+  any device whose s4 rate is not above its s8 rate: a `lin_cuda.Caps` bit from the compute
+  capability (native s4 on sm_80-89 only), then render A/B on gen
+- fp4 on Blackwell's fp4 tensor cores: NVFP4 (and SVDQuant fp4) weights read at 4 bits
+  instead of decoding to bf16 every GEMM. Routes, each its own `dual_lin` route gated by a
+  `lin_cuda.Caps` bit and opt-in until measured like fp8 W8A8: W4A4 (activation quantized to
+  E2M1 with per-16 fp8 scales, block-scaled `mma` on sm_120a, `ptx.Builder.requires` with
+  `arch_specific`) and W4A8 (fp4 weight against an e4m3 activation, reusing `f8prep`). The
+  cuDNN arm can take cuBLASLt's block-scaled fp4 GEMM instead. Measure on gen with Krea2
+  Turbo's NVFP4 file (Comfy-Org/Krea-2): speed against the bf16 decode, velocity and render
+  against the bf16 file, and the perturb floor. MXFP4/MXFP8 files are unread
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - preview: the TAESD ladder only has the Wan decoder (`taehv`), so the settings
   "Preview decoder" row appears for Krea2 and Anima alone. Opening it to SD1.5 / SDXL

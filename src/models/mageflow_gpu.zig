@@ -518,13 +518,10 @@ const Dev = struct {
         const n = d.sess.n_tok;
         try rmsNorm(ctx, ws.qt_d, ws.qt_d, blk.attn.txt_qnorm, seq_txt * heads, hd, eps);
         try rmsNorm(ctx, ws.kt_d, ws.kt_d, blk.attn.txt_knorm, seq_txt * heads, hd, eps);
-        try rmsNorm(ctx, ws.qi_d, ws.qi_d, blk.attn.qnorm, n * heads, hd, eps);
-        try rmsNorm(ctx, ws.ki_d, ws.ki_d, blk.attn.knorm, n * heads, hd, eps);
+        const nr: gpu.NormRope = .{ .rows = n * heads, .dim = hd, .heads = heads, .pairs = half, .sin_off = n * half, .eps = eps, .interleaved = true };
+        try ctx.opNormRope(ws.qi_d, ws.qi_d, try normBuf(ctx, blk.attn.qnorm), d.sess.img_freqs_d, nr);
+        try ctx.opNormRope(ws.ki_d, ws.ki_d, try normBuf(ctx, blk.attn.knorm), d.sess.img_freqs_d, nr);
         lap(d.io, &prof.norm_ns);
-        const rope: gpu.EltPush = .{ .u0 = @intCast(n * heads * half), .u1 = half, .u2 = @intCast(n * half), .u3 = heads };
-        try ctx.opElt(.rope_inter, ws.qi_d, null, d.sess.img_freqs_d, null, rope, n * heads * half, 1, 1);
-        try ctx.opElt(.rope_inter, ws.ki_d, null, d.sess.img_freqs_d, null, rope, n * heads * half, 1, 1);
-        lap(d.io, &prof.elt_ns);
         const img_off = seq_txt * F;
         try copyInto(ctx, ws.qt_d, 0, ws.q_d, 0, seq_txt * F);
         try copyInto(ctx, ws.kt_d, 0, ws.k_d, 0, seq_txt * F);
@@ -628,12 +625,7 @@ fn linear(sess: *const Session, y: Buf, x: Buf, m: usize, lw: anytype) !void {
 /// kernel wherever it exists, for `zimage_gpu`'s measured reason.
 fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, e: f32) !void {
     const w = try normBuf(ctx, weights);
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, out, w, rows, dim, e);
-    try ctx.opElt(.rmsnorm, x, out, w, null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = e,
-    }, rows, 1, 1);
+    try ctx.opRmsNorm(x, out, w, rows, dim, e);
 }
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !Buf {

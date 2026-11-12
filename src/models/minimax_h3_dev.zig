@@ -2,7 +2,7 @@
 //! adapter (`minimax_h3_cuda.Dev`, `minimax_h3_gpu.Dev`). `body` runs between the
 //! adapter's upload of a `minimax_h3.DeviceStep` (packed sequence into `ws.x_d`, the
 //! two modulation tables, the label tables) and its download of the heads' rows,
-//! video from `ws.q_d` and audio from `ws.k_d`.
+//! video from `ws.q_d` and audio, when the layout has any, from `ws.k_d`.
 //!
 //! Attention runs in bands of query rows. Pass one writes K and V for the whole
 //! sequence a band at a time (they must see the block's input, which no residual add
@@ -10,13 +10,16 @@
 //! a time and folds each into the residual. Only Q, the attention output and the
 //! projection are band-sized, which is what takes them off the sequence length. The
 //! MLP is banded the same way. A band can straddle segments and each segment
-//! modulates with its own row, so a band applies the INTERSECTION of itself with each.
+//! modulates with its own row, which `modRows` gives per sequence row, so a band is
+//! one launch whatever segments it crosses.
 //!
 //! Adapter: `ws` (`x_d`, `t1_d`, `q_d`, `attn_d`, `ao_d`, `gate_d`, `up_d`, `mod_d`,
-//! `fmod_d`), `labelIdx` (a target segment's per-row label buffer, or null), the
-//! band ops `rmsMod` / `gatedAdd` (row offsets as arguments), the linears, `qkNorm`,
-//! `rope` (positions from `pos0`), `kvAt` / `kvStore` (where a K or V band lands, and
-//! storing it there in the attention's own width) and `kvReady` once both are whole.
+//! `fmod_d`), `modRows` (`DeviceStep.mod_rows` on the device), `labelIdx` (a target
+//! segment's per-row label buffer, or null, for the heads), the band ops `rmsMod` /
+//! `gatedAdd` (row offsets as arguments), the linears, `normRope` (Q to where the
+//! attention reads it, K into the cache, positions from `pos0`), `kvAt` (where a K or
+//! V band lands from the GEMM), `vStore` (V into the cache in the attention's own
+//! width) and `kvReady` once both are whole.
 //!
 //! The residual `x_d` and the norm output `t1_d` are stored at the denoiser's activation
 //! dtype; both deltas (`ao_d`, which also takes fc2's output) and the MLP planes stay
@@ -77,14 +80,22 @@ pub fn padRows(rows: usize) usize {
 /// gate_mlp)`. PREMUL, not scale: the norm weight and the `1 +` are folded in on the
 /// host (`buildModTable`), because the kernel applies neither.
 pub fn modOff(cfg: minimax_h3.Config, n_labels: usize, block: usize, t_row: usize, tag: minimax_h3.Tag, slot: usize) usize {
-    std.debug.assert(t_row < n_labels and slot < 6);
-    return (((block * n_labels + t_row) * 3 + @backingInt(tag)) * 6 + slot) * cfg.hidden;
+    std.debug.assert(t_row < n_labels);
+    return slotBase(cfg, n_labels, block, slot) + minimax_h3.DeviceStep.modRow(t_row, tag) * modRowStride(cfg);
+}
+
+/// `modOff` of label zero, tag zero: a row adds `mod_rows[row] * modRowStride`.
+pub fn slotBase(cfg: minimax_h3.Config, n_labels: usize, block: usize, slot: usize) usize {
+    std.debug.assert(slot < 6);
+    return (block * n_labels * 3 * 6 + slot) * cfg.hidden;
+}
+
+pub fn modRowStride(cfg: minimax_h3.Config) usize {
+    return 6 * cfg.hidden;
 }
 
 const Ctx = struct {
     dit: *const DiT,
-    layout: *const minimax_h3.PackedLayout,
-    ts: *const minimax_h3.Timesteps,
     n_labels: usize,
     block: usize,
     /// `streamDiv` of the residual.
@@ -100,25 +111,33 @@ pub fn body(d: anytype, dit: *const DiT, layout: *const minimax_h3.PackedLayout,
 
     for (dit.blocks, 0..) |*b, bi| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        const cx: Ctx = .{ .dit = dit, .layout = layout, .ts = &step.ts, .n_labels = step.ts.labels().len, .block = bi, .div = div };
+        const cx: Ctx = .{ .dit = dit, .n_labels = step.ts.labels().len, .block = bi, .div = div };
 
-        // Pass one: K and V over the whole sequence. The fused qkv is split by rows
-        // (`DiT.device_lins`), so these are two GEMMs into separate planes.
+        // Every qkv GEMM goes through `gemmPlanes` on the fused weight, so it is
+        // uploaded once whichever planes a pass takes.
+        const qkv = b.attn.qkv.w;
+        const wq = dit.deviceLin(bi, .q);
+        const wk = dit.deviceLin(bi, .k);
+        const wv = dit.deviceLin(bi, .v);
+        // With one band the two passes read the same normalized rows, so Q is
+        // computed here with K and V, in one GEMM.
+        const one_band = seq <= attn_band;
+
+        // Pass one: K and V over the whole sequence.
         var k0: usize = 0;
         while (k0 < seq) : (k0 += attn_band) {
             const n = @min(attn_band, seq - k0);
             try modBand(d, cx, k0, n, 0, 1);
-            const wk = dit.deviceLin(bi, .k);
-            const wv = dit.deviceLin(bi, .v);
-            const g = try d.prep(ws.t1_d, n, h, &.{ wk, wv });
+            const g = try d.prep(ws.t1_d, n, h, &.{ qkv, wq, wk, wv });
             const k_at = try d.kvAt(.k, k0);
-            try d.gemm(g, k_at, wk);
-            try d.qkNorm(k_at, b.attn.k_norm, n);
-            try d.rope(k_at, n, k0);
-            try d.kvStore(.k, k_at, k0, n);
             const v_at = try d.kvAt(.v, k0);
-            try d.gemm(g, v_at, wv);
-            try d.kvStore(.v, v_at, k0, n);
+            if (one_band) {
+                try d.gemmPlanes(g, &.{ ws.q_d, k_at, v_at }, qkv, 0, &.{ wq, wk, wv });
+            } else {
+                try d.gemmPlanes(g, &.{ k_at, v_at }, qkv, 1, &.{ wk, wv });
+            }
+            try d.normRope(.k, k_at, b.attn.k_norm, n, k0);
+            try d.vStore(v_at, k0, n);
         }
         try d.kvReady(seq);
 
@@ -129,11 +148,13 @@ pub fn body(d: anytype, dit: *const DiT, layout: *const minimax_h3.PackedLayout,
         var a0: usize = 0;
         while (a0 < seq) : (a0 += attn_band) {
             const n = @min(attn_band, seq - a0);
-            try modBand(d, cx, a0, n, 0, 1);
-            try d.linear(ws.q_d, ws.t1_d, n, dit.deviceLin(bi, .q));
-            try d.qkNorm(ws.q_d, b.attn.q_norm, n);
-            try d.rope(ws.q_d, n, a0);
-            try d.attention(n, seq);
+            if (!one_band) {
+                try modBand(d, cx, a0, n, 0, 1);
+                const g = try d.prep(ws.t1_d, n, h, &.{ qkv, wq });
+                try d.gemmPlanes(g, &.{ws.q_d}, qkv, 0, &.{wq});
+            }
+            try d.normRope(.q, ws.q_d, b.attn.q_norm, n, a0);
+            try d.attention(n, seq, b.attn.int8);
             try d.linear(ws.ao_d, ws.attn_d, n, dit.deviceLin(bi, .out));
             try gatedBand(d, cx, ws.ao_d, a0, n, 2);
         }
@@ -143,61 +164,44 @@ pub fn body(d: anytype, dit: *const DiT, layout: *const minimax_h3.PackedLayout,
             const n = @min(mlp_tile, seq - c0);
             try modBand(d, cx, c0, n, 3, 4);
             // fc1 is the fused swiglu gate+value; rows [0, ffn) are the GATE.
+            const fc1 = b.mlp.fc1.w;
             const wg = dit.deviceLin(bi, .gate);
             const wu = dit.deviceLin(bi, .up);
-            const g = try d.prep(ws.t1_d, n, h, &.{ wg, wu });
-            try d.gemm(g, ws.gate_d, wg);
-            try d.gemm(g, ws.up_d, wu);
-            try d.siluMul(ws.gate_d, ws.up_d, n * cfg.ffn);
+            // The group names the views too: a fallback GEMM runs on them.
+            const g = try d.prep(ws.t1_d, n, h, &.{ fc1, wg, wu });
+            try d.gemmPlanes(g, &.{ ws.gate_d, ws.up_d }, fc1, 0, &.{ wg, wu });
             // Into `ao_d`, idle here and at least a tile wide: the output is f32.
-            try d.linear(ws.ao_d, ws.gate_d, n, dit.deviceLin(bi, .fc2));
+            try d.siluMulLinear(ws.ao_d, ws.gate_d, ws.up_d, n, dit.deviceLin(bi, .fc2));
             try gatedBand(d, cx, ws.ao_d, c0, n, 5);
         }
     }
 
     // The heads stay on the device although they are 96 and 32 rows: reaching them
     // from the host means downloading the whole trunk, 925 MB at 15 seconds of
-    // 512x768 every step, against 16 MB of results. Their weights are f32, which
-    // takes the f32 GEMM and its lack of a 128-row floor.
-    std.debug.assert(dit.final.video_out.dtype == .f32 and dit.final.audio_out.dtype == .f32);
+    // 512x768 every step, against 16 MB of results. Their weights are f32 (the
+    // loader refuses otherwise), which takes the f32 GEMM and its lack of a
+    // 128-row floor.
     const final_eps = cfg.final_norm_eps / (div * div);
-    try finalHead(d, ws.q_d, layout.segmentOf(.video).?, step.ts.rowFor(.video), d.labelIdx(.video), h, dit.final.video_out, dit.final.video_bias, final_eps);
-    try finalHead(d, ws.k_d, layout.segmentOf(.audio).?, step.ts.rowFor(.audio), d.labelIdx(.audio), h, dit.final.audio_out, dit.final.audio_bias, final_eps);
+    try finalHead(d, ws.q_d, layout.segmentOf(.video).?, step.ts.rowFor(.video), d.labelIdx(.video), h, step.video_head.w, step.video_head.bias, final_eps);
+    if (layout.segmentOf(.audio)) |sg| {
+        const head = dit.final.audio_out orelse return error.NoAudioStream;
+        try finalHead(d, ws.k_d, sg, step.ts.rowFor(.audio), d.labelIdx(.audio), h, head.w, head.bias, final_eps);
+    }
 }
 
 /// Normalize and modulate rows `[b0, b0 + n)` of `x_d` into row 0 of `t1_d`, each
-/// segment's part with its own modulation row.
+/// row with its own modulation row.
 fn modBand(d: anytype, cx: Ctx, b0: usize, n: usize, premul_slot: usize, shift_slot: usize) !void {
     const ws = d.ws;
     const cfg = cx.dit.cfg;
-    const stride = minimax_h3.modality_count * 6 * cfg.hidden;
-    for (cx.layout.segments) |sg| {
-        const lo = @max(sg.start, b0);
-        const hi = @min(sg.stop, b0 + n);
-        if (lo >= hi) continue;
-        const tag = sg.kind.tag();
-        // With an index buffer the scalar offsets are the LABEL-ZERO ones and the
-        // kernel adds `idx[row] * stride`; a band starts mid-segment, so does its index.
-        const idx = d.labelIdx(sg.kind);
-        const base = if (idx == null) cx.ts.rowFor(sg.kind) else 0;
-        try d.rmsMod(ws.x_d, lo, ws.t1_d, lo - b0, ws.mod_d, hi - lo, modOff(cfg, cx.n_labels, cx.block, base, tag, premul_slot), modOff(cfg, cx.n_labels, cx.block, base, tag, shift_slot), cfg.norm_eps / (cx.div * cx.div), idx, lo - sg.start, stride);
-    }
+    try d.rmsMod(ws.x_d, b0, ws.t1_d, 0, ws.mod_d, n, slotBase(cfg, cx.n_labels, cx.block, premul_slot), slotBase(cfg, cx.n_labels, cx.block, shift_slot), cfg.norm_eps / (cx.div * cx.div), d.modRows(), b0, modRowStride(cfg));
 }
 
-/// `x_d[b0 + r] += gate * src[r]` over `n` rows, each segment's part with its own gate.
+/// `x_d[b0 + r] += gate * src[r]` over `n` rows, each row with its own gate.
 fn gatedBand(d: anytype, cx: Ctx, src: anytype, b0: usize, n: usize, slot: usize) !void {
     const ws = d.ws;
     const cfg = cx.dit.cfg;
-    const h = cfg.hidden;
-    const stride = minimax_h3.modality_count * 6 * h;
-    for (cx.layout.segments) |sg| {
-        const lo = @max(sg.start, b0);
-        const hi = @min(sg.stop, b0 + n);
-        if (lo >= hi) continue;
-        const idx = d.labelIdx(sg.kind);
-        const base = if (idx == null) cx.ts.rowFor(sg.kind) else 0;
-        try d.gatedAdd(ws.x_d, lo, src, lo - b0, ws.mod_d, (hi - lo) * h, modOff(cfg, cx.n_labels, cx.block, base, sg.kind.tag(), slot), idx, lo - sg.start, stride, 1 / cx.div);
-    }
+    try d.gatedAdd(ws.x_d, b0, src, 0, ws.mod_d, n * cfg.hidden, slotBase(cfg, cx.n_labels, cx.block, slot), d.modRows(), b0, modRowStride(cfg), 1 / cx.div);
 }
 
 /// One output head: weightless norm and modulate from the folded final table, then

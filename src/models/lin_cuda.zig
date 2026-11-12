@@ -318,6 +318,34 @@ pub fn gemm(be: *Backend, p: Plan, g: Group, y: Buf, w: Weight, bias: ?[]const f
     if (ys.buf != y.buf) try be.opCast(ys, y, g.m * w.rows, 0);
 }
 
+/// `gemm` over planes of a weight fused from equal parts (a qkv, a gate/up): `planes`
+/// are its row views (`lin.rowSlice`), `first` the index of `planes[0]` among them, and
+/// plane `i` lands in `ys[i]`. On the int8 route this is one GEMM over the fused weight,
+/// uploaded once whichever planes a call takes; elsewhere, and under a DoRA, which
+/// re-runs the base product, it is one `gemm` per plane. `g` is prepped for `fused`.
+pub fn gemmPlanes(be: *Backend, p: Plan, g: Group, ys: []const Buf, fused: Weight, first: usize, planes: []const Weight) !void {
+    std.debug.assert(ys.len == planes.len);
+    const split = planes[0].rows;
+    const r = routeOn(be, p, fused, g.m) orelse return error.UnsupportedDType;
+    const fast = r == .i8 and Backend.i8PlanesSupported(split, fused.cols, ys.len) and for (ys[1..]) |y| {
+        if (y.dt != ys[0].dt) break false;
+    } else !doraOn(p, planes);
+    if (!fast) {
+        for (ys, planes) |y, w| try gemm(be, p, g, y, w, null);
+        return;
+    }
+    std.debug.assert(g.prep == r.prep() and g.serial == serial_int and fused.cols == g.cols);
+    // The whole fused weight every time: the device cache keys on its host address.
+    try be.opI8GemmPlanes(ys, fused.bytes, fused.row_scale.?, split, first, null);
+    if (p.lora) |stack| for (ys, planes) |y, w| try sidecar(be, p, r, stack, y, g.x, g.m, w, null, true);
+}
+
+fn doraOn(p: Plan, ws: []const Weight) bool {
+    const stack = p.lora orelse return false;
+    for (ws) |w| for (stack.forWeight(w)) |h| if (h.target.dora != null) return true;
+    return false;
+}
+
 /// One linear of a one-shot tower under `Plan.tower`, which a ViT, an embedder or a
 /// text fusion calls per weight (its prep is the weight's own, so the rotation is too),
 /// with `stack`'s LoRA hits on it.
@@ -336,6 +364,26 @@ pub fn towerLinear(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]c
 pub fn linear(be: *Backend, p: Plan, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
     const g = try prep(be, p, x, m, w.cols, &.{w});
     try gemm(be, p, g, y, w, bias);
+}
+
+/// Stores `silu(gate) * up` before `linearSiluMul`'s prep on every route, the A/B.
+pub var unfused_silu: bool = false;
+
+/// `linear` of `silu(gate) * up`. On the int8 route with nothing past the prep reading
+/// the product (no LoRA or SVDQuant on `w`), the prep makes it as it loads and it is
+/// never stored; otherwise it lands in `gate` first.
+pub fn linearSiluMul(be: *Backend, p: Plan, y: Buf, gate: Buf, up: Buf, m: usize, w: Weight) !void {
+    const r = routeOn(be, p, w, m) orelse return error.UnsupportedDType;
+    const lora = if (p.lora) |stack| stack.forWeight(w).len > 0 else false;
+    if (unfused_silu or r != .i8 or lora or w.svdq != null or gate.dt != up.dt) {
+        try be.siluMul(gate, up, m * w.cols);
+        return linear(be, p, y, gate, m, w, null);
+    }
+    try be.opI8PrepSiluMul(gate, up, m, w.cols, p.rot);
+    serial_int +%= 1;
+    // `x` is the gate, not the product: only the routes excluded above read it.
+    const g = Group{ .x = gate, .m = m, .cols = w.cols, .prep = .i8, .layout_rows = m, .serial = serial_int };
+    try gemm(be, p, g, y, w, null);
 }
 
 /// The CUDA backend's capabilities, as `dual_lin.routeOf` asks for them.

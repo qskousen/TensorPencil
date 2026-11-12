@@ -44,9 +44,11 @@ fn block(d: anytype, cfg: moss_image.Config, blk: *const moss_image.Block, i: us
     const att = blk.dev[0..3];
     try d.gemms(try d.prep(ws.nrm_d, seq, dim, att), &.{ ws.q_d, ws.k_d, ws.v_d }, att);
     try d.qkNormRope(blk.q_norm, blk.k_norm, seq);
-    try d.scale(ws.v_d, seq * dim, v_div);
-    try d.attention(seq);
-    try d.scale(ws.attn_d, seq * dim, 1.0 / v_div);
+    // ComfyUI's int8 attention sees V unscaled, and its per-channel V scale needs no headroom
+    const int8 = d.int8Attention(blk.int8_attn);
+    if (!int8) try d.scale(ws.v_d, seq * dim, v_div);
+    try d.attention(seq, int8);
+    if (!int8) try d.scale(ws.attn_d, seq * dim, 1.0 / v_div);
     try d.linear(ws.dlt_d, ws.attn_d, seq, blk.dev[3]);
     try d.gatedAdd(ws.x_d, ws.dlt_d, seq, T.gate_a);
 

@@ -294,8 +294,9 @@ const Dev = struct {
         try rmsNormAt(d.ctx, x, y, try normBuf(d.ctx, w), rows, dim, d.cfg.eps);
     }
 
-    pub fn unitNorm(d: Dev, x: Buf, seq: usize) !void {
-        try rmsNormAt(d.ctx, x, x, d.sess.ones_d, seq * d.cfg.heads, d.cfg.head_dim, d.cfg.eps);
+    /// The weightless per-head norm (fed ones) and the partial rope, in one pass.
+    pub fn unitNormRope(d: Dev, x: Buf, seq: usize) !void {
+        try d.ctx.opNormRope(x, x, d.sess.ones_d, d.sess.freqs_d, .{ .rows = seq * d.cfg.heads, .dim = d.cfg.head_dim, .heads = d.cfg.heads, .pairs = d.sess.pairs, .sin_off = d.sess.sinOff(), .eps = d.cfg.eps });
     }
 
     pub fn gemm(d: Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
@@ -308,18 +309,6 @@ const Dev = struct {
             .u0 = @intCast(n),
             .u1 = @intCast(d.cfg.head_dim),
         }, n, 1, 1);
-    }
-
-    pub fn rope(d: Dev, x: Buf, seq: usize) !void {
-        const total = seq * d.cfg.heads * d.sess.pairs;
-        try d.ctx.opElt(.rope_half_part, x, null, d.sess.freqs_d, null, .{
-            .u0 = @intCast(total),
-            .u1 = @intCast(d.sess.pairs),
-            .u2 = @intCast(d.sess.sinOff()),
-            .u3 = @intCast(d.cfg.heads),
-            .u4 = 0,
-            .u5 = @intCast(d.cfg.head_dim),
-        }, total, 1, 1);
     }
 
     pub fn attention(d: Dev, seq: usize) !void {

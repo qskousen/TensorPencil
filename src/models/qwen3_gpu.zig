@@ -1045,8 +1045,9 @@ pub const VulkanLM = struct {
         const ctx = self.be;
         const b = &self.bufs;
         if (seq == 1) ctx.independent(2);
-        try ctx.opQkNormRope(b.q, try nbuf(ctx, layer.q_norm), self.freqs_d, seq * c.n_heads, hd, c.n_heads, self.len, self.sin_off, c.rms_eps);
-        try ctx.opQkNormRope((try self.kvOut(l, seq))[0], try nbuf(ctx, layer.k_norm), self.freqs_d, seq * c.n_kv_heads, hd, c.n_kv_heads, self.len, self.sin_off, c.rms_eps);
+        try ctx.opNormRope(b.q, b.q, try nbuf(ctx, layer.q_norm), self.freqs_d, .{ .rows = seq * c.n_heads, .dim = hd, .heads = c.n_heads, .pairs = hd / 2, .sin_off = self.sin_off, .eps = c.rms_eps, .pos0 = self.len });
+        const k_out = (try self.kvOut(l, seq))[0];
+        try ctx.opNormRope(k_out, k_out, try nbuf(ctx, layer.k_norm), self.freqs_d, .{ .rows = seq * c.n_kv_heads, .dim = hd, .heads = c.n_kv_heads, .pairs = hd / 2, .sin_off = self.sin_off, .eps = c.rms_eps, .pos0 = self.len });
     }
 
     pub fn applyRope(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {

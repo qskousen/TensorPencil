@@ -357,12 +357,10 @@ const Dev = struct {
         const cfg = d.model.cfg;
         const hd = cfg.headDim();
         const half = hd / 2;
-        try d.be.qkNorm(d.ws.q_d, d.ws.q_d, try normBuf(d.be, qnorm), n * cfg.heads, hd, eps);
-        try d.be.qkNorm(k, k, try normBuf(d.be, knorm), n * cfg.heads, hd, eps);
         const row0 = if (pass == .prefix) 0 else d.sess.pre;
-        const f = d.sess.freqs_d.slice(row0 * half * 4, d.sess.freqs_d.size - row0 * half * 4);
-        try d.be.rope(d.ws.q_d, f, n, cfg.heads, half, d.sess.seq * half);
-        try d.be.rope(k, f, n, cfg.heads, half, d.sess.seq * half);
+        inline for (.{ .{ d.ws.q_d, qnorm }, .{ k, knorm } }) |t| {
+            try d.be.normRope(t[0], t[0], try normBuf(d.be, t[1]), d.sess.freqs_d, .{ .rows = n * cfg.heads, .dim = hd, .heads = cfg.heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = eps, .pos0 = row0, .interleaved = true });
+        }
     }
 
     pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {

@@ -20,13 +20,13 @@
 //!    `rmsnorm(x) * premul + shift`. So the host folds `norm.weight * (1 + scale)`
 //!    into `premul`. Uploading a bare `scale` there drops the norm weight AND the
 //!    identity term, which is finite and wrong.
-//! 3. **The fused weights are SPLIT BY ROWS on the host.** `qkv_proj` is one
-//!    `[3 * inner, hidden]` tensor and `fc1` one `[2 * ffn, hidden]`, but the
-//!    device wants separate q/k/v and gate/up buffers. A row range of a row-major
-//!    weight is a contiguous byte range and its per-row scales slice with it, so
-//!    the split is three (or two) `Weight` views over the same mapping, with no
-//!    copy and no de-interleave kernel. The views are `DiT.device_lins`, built at
-//!    load, and every one goes through `lin_cuda` like any family's linear.
+//! 3. **The fused weights run whole, written in planes.** `qkv_proj` is one
+//!    `[3 * inner, hidden]` tensor and `fc1` one `[2 * ffn, hidden]`, and the
+//!    device wants separate q/k/v and gate/up buffers. `lin_cuda.gemmPlanes` runs
+//!    the fused weight as one GEMM whose planes land in their own buffers; a route
+//!    without that kernel runs the row views (`DiT.device_lins`, three or two
+//!    `Weight`s over the same mapping) one at a time. Never both: the device cache
+//!    keys on the host address, so a view is a second upload of the same bytes.
 //!
 //! Numerics match `minimax_h3.forward` up to int8 quantization and the softmax
 //! approximation, the same regime `dit_cuda` runs in. `minimax-h3-cuda-test`
@@ -40,6 +40,7 @@ const lin_mod = @import("lin.zig");
 const lora_mod = @import("lora.zig");
 const cuda = @import("tp_gpu").cuda;
 const ops = @import("tp_ops");
+const sage_attn = ops.sage_attn;
 
 const DiT = minimax_h3.DiT;
 const Backend = cuda.Backend;
@@ -71,12 +72,33 @@ pub const Session = struct {
     /// `[seq * pairs]` cos then `[seq * pairs]` sin, f32. `sin_off` is the split.
     freqs_d: Buf = .{},
     pairs: usize,
+    /// `minimax_h3.AdalnDevice` on the device, so a step builds its modulation table
+    /// there; unset when the host has to.
+    adaln_w_d: Buf = .{},
+    adaln_aux_d: Buf = .{},
+    /// A step's time embeddings, `[max_labels][time_embed_dim]`.
+    t_emb_d: Buf = .{},
 
     pub fn init(be: *Backend, gpa: std.mem.Allocator, dit: *const DiT, layout: *const minimax_h3.PackedLayout) !Session {
         const cfg = dit.cfg;
         const pairs = cfg.ropePairs();
         var s: Session = .{ .seq = layout.seq_len, .pairs = pairs };
         errdefer s.deinit(be);
+
+        if (try minimax_h3.AdalnDevice.init(gpa, dit)) |a_| {
+            var a = a_;
+            defer a.deinit(gpa);
+            s.adaln_w_d = try be.tensorCreate(a.w.len);
+            try be.tensorUpload(s.adaln_w_d, a.w);
+            s.adaln_w_d = s.adaln_w_d.as(switch (a.dtype) {
+                .f16 => .f16,
+                .bf16 => .bf16,
+                else => .f32,
+            });
+            s.adaln_aux_d = try be.tensorCreate(a.aux.len * 4);
+            try be.tensorUpload(s.adaln_aux_d, std.mem.sliceAsBytes(a.aux));
+            s.t_emb_d = try be.tensorCreate(minimax_h3.Timesteps.max_labels * cfg.time_embed_dim * 4);
+        }
 
         // The same table the CPU path builds, uploaded once: it depends only on
         // the packed layout's position grid, which is fixed for a render.
@@ -95,8 +117,13 @@ pub const Session = struct {
         return self.seq * self.pairs;
     }
 
+    /// Whether this step's modulation table can be built on the device.
+    pub fn deviceMod(self: Session, dit: *const DiT) bool {
+        return self.adaln_w_d.size > 0 and !minimax_h3.hostModOnly(dit);
+    }
+
     pub fn deinit(self: *Session, be: *Backend) void {
-        be.tensorDestroy(&self.freqs_d);
+        inline for (.{ &self.freqs_d, &self.adaln_w_d, &self.adaln_aux_d, &self.t_emb_d }) |b| be.tensorDestroy(b);
     }
 };
 
@@ -117,6 +144,9 @@ pub const Workspace = struct {
     /// Only allocated when `kv_bf16`.
     qb_d: Buf = .{},
     ob_d: Buf = .{},
+    /// V's f32 band before `kvStore` narrows it, apart from K's (`attn_d`) so one
+    /// qkv GEMM writes both. Only allocated when `kv_bf16`.
+    v32_d: Buf = .{},
     /// K and V are stored as bf16 and handed to the attention AS its operands, so the
     /// conversion staging that an f32 stream needs does not exist: that staging
     /// is another full copy of both, 2.62 GB at 15 s of 768x1152 on top of the
@@ -135,6 +165,8 @@ pub const Workspace = struct {
     /// the workspace depended on something the layout does not carry.
     vmask_d: Buf = .{},
     amask_d: Buf = .{},
+    /// `DeviceStep.mod_rows`, u32 per sequence row.
+    modrow_d: Buf = .{},
     /// What `lin_cuda.plan` decided for this checkpoint, the LoRA stack on it.
     plan: lin_cuda.Plan = undefined,
 
@@ -174,6 +206,7 @@ pub const Workspace = struct {
         if (ws.kv_bf16) {
             ws.qb_d = try be.tensorCreate(aband * inner * 2);
             ws.ob_d = try be.tensorCreate(aband * inner * 2);
+            ws.v32_d = try be.tensorCreate(aband * inner * 4);
         }
         const tile = padRows(@min(mlp_tile, seq));
         ws.gate_d = try be.tensorCreate(tile * cfg.ffn * 4);
@@ -183,6 +216,7 @@ pub const Workspace = struct {
         ws.fmod_d = try be.tensorCreate(minimax_h3.Timesteps.max_labels * 2 * cfg.hidden * 4);
         ws.vmask_d = try be.tensorCreate(seq * 4);
         ws.amask_d = try be.tensorCreate(seq * 4);
+        ws.modrow_d = try be.tensorCreate(seq * 4);
         ws.plan = try lin_cuda.plan(dit.device_lins, lin_use, "minimax_h3 cuda");
         if (force_weight_only) ws.plan = lin_cuda.withInt8(ws.plan, be, .weight_only);
         try lin_cuda.presize(be, ws.plan, dit.device_lins);
@@ -211,7 +245,7 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, be: *Backend) void {
-        inline for (.{ &self.x_d, &self.t1_d, &self.q_d, &self.k_d, &self.v_d, &self.attn_d, &self.ao_d, &self.qb_d, &self.ob_d, &self.gate_d, &self.up_d, &self.mod_d, &self.fmod_d, &self.vmask_d, &self.amask_d }) |b| {
+        inline for (.{ &self.x_d, &self.t1_d, &self.q_d, &self.k_d, &self.v_d, &self.attn_d, &self.ao_d, &self.qb_d, &self.ob_d, &self.v32_d, &self.gate_d, &self.up_d, &self.mod_d, &self.fmod_d, &self.vmask_d, &self.amask_d, &self.modrow_d }) |b| {
             be.tensorDestroy(b);
         }
         self.* = undefined;
@@ -237,7 +271,8 @@ pub fn forward(
 ) !void {
     const cfg = dit.cfg;
     std.debug.assert(sess.seq == layout.seq_len);
-    var step = try minimax_h3.DeviceStep.init(dit, io, gpa, layout, in);
+    const device_mod = sess.deviceMod(dit);
+    var step = try minimax_h3.DeviceStep.init(dit, io, gpa, layout, in, !device_mod);
     defer step.deinit(gpa);
 
     try be.beginBatch();
@@ -249,12 +284,13 @@ pub fn forward(
         defer gpa.free(bytes);
         try be.tensorUpload(ws.x_d, bytes);
     }
-    try be.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(step.mod));
+    if (device_mod) {
+        try be.tensorUpload(sess.t_emb_d, std.mem.sliceAsBytes(step.t_emb));
+        try be.opAdalnTable(ws.mod_d, sess.adaln_w_d, sess.adaln_aux_d, sess.t_emb_d, dit.blocks.len, step.ts.labels().len, cfg.hidden, cfg.time_embed_dim);
+    } else try be.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(step.mod));
     try be.tensorUpload(ws.fmod_d, std.mem.sliceAsBytes(step.fmod));
-    // A denoise mask relabels rows inside a target segment, so those two segments
-    // pick their modulation row PER ROW: the kernels take a u32 index buffer and a
-    // stride, where one launch per run of equal labels would be thousands of launches
-    // for a spatial mask.
+    try be.tensorUpload(ws.modrow_d, std.mem.sliceAsBytes(step.mod_rows));
+    // The heads pick their modulation row per row only under a denoise mask.
     var vmask: ?Buf = null;
     var amask: ?Buf = null;
     if (step.video_idx.len > 0) {
@@ -272,10 +308,11 @@ pub fn forward(
 
     const v_rows = try gpa.alloc(f32, layout.segmentOf(.video).?.len() * cfg.videoPatchDim());
     defer gpa.free(v_rows);
-    const a_rows = try gpa.alloc(f32, layout.segmentOf(.audio).?.len() * minimax_h3.audio_latent_channels);
+    const a_len = if (layout.segmentOf(.audio)) |sg| sg.len() else 0;
+    const a_rows = try gpa.alloc(f32, a_len * minimax_h3.audio_latent_channels);
     defer gpa.free(a_rows);
     try be.tensorDownload(ws.q_d, std.mem.sliceAsBytes(v_rows));
-    try be.tensorDownload(ws.k_d, std.mem.sliceAsBytes(a_rows));
+    if (a_len > 0) try be.tensorDownload(ws.k_d, std.mem.sliceAsBytes(a_rows));
     minimax_h3.DeviceStep.finish(layout, out_video, out_audio, v_rows, a_rows);
 }
 
@@ -313,6 +350,10 @@ const Dev = struct {
         try lin_cuda.gemm(d.be, d.ws.plan, g, y, w, null);
     }
 
+    pub fn gemmPlanes(d: Dev, g: lin_cuda.Group, ys: []const Buf, fused: Weight, first: usize, planes: []const Weight) !void {
+        try lin_cuda.gemmPlanes(d.be, d.ws.plan, g, ys, fused, first, planes);
+    }
+
     pub fn linear(d: Dev, y: Buf, x: Buf, rows: usize, w: Weight) !void {
         try lin_cuda.linear(d.be, d.ws.plan, y, x, rows, w, null);
     }
@@ -323,42 +364,65 @@ const Dev = struct {
         try lin_cuda.linear(d.be, d.ws.plan, y.viewBytes(y_off * 4), x, rows, w, bias);
     }
 
-    pub fn qkNorm(d: Dev, x: Buf, w: []const f32, rows: usize) !void {
-        try d.be.qkNorm(x, x, try normBuf(d.be, w), rows * d.cfg.n_heads, d.cfg.head_dim, d.cfg.qk_norm_eps);
+    pub fn modRows(d: Dev) Buf {
+        return d.ws.modrow_d;
     }
 
-    pub fn rope(d: Dev, x: Buf, rows: usize, pos0: usize) !void {
-        try d.be.opRopeHalfPart(x, d.sess.freqs_d, rows, d.cfg.n_heads, d.sess.pairs, d.sess.sinOff(), pos0, d.cfg.head_dim);
+    /// Q into where `attention` reads it, K into its cache rows from `pos0`, narrowing
+    /// to bf16 in the same pass when the attention reads that; the norm and the rope
+    /// run on the f32 GEMM output either way.
+    pub fn normRope(d: Dev, which: enum { q, k }, src: Buf, w: []const f32, rows: usize, pos0: usize) !void {
+        const cfg = d.cfg;
+        const ws = d.ws;
+        const inner = cfg.n_heads * cfg.head_dim;
+        const dst = switch (which) {
+            .q => if (ws.kv_bf16) ws.qb_d.as(.bf16) else src,
+            .k => if (ws.kv_bf16) ws.k_d.viewBytes(pos0 * inner * 2).as(.bf16) else src,
+        };
+        try d.be.normRope(src.as(.f32), dst, try normBuf(d.be, w), d.sess.freqs_d, .{
+            .rows = rows * cfg.n_heads,
+            .dim = cfg.head_dim,
+            .heads = cfg.n_heads,
+            .pairs = d.sess.pairs,
+            .sin_off = d.sess.sinOff(),
+            .eps = cfg.qk_norm_eps,
+            .pos0 = pos0,
+        });
     }
 
-    /// With bf16 storage a band lands in the f32 band scratch (`attn_d`, idle until
-    /// pass two) and `kvStore` narrows it into place; the norm and the rope run on
-    /// the f32 form either way.
+    /// With bf16 storage a band lands in an f32 band scratch (`attn_d` for K, idle
+    /// until pass two, `v32_d` for V) and `normRope` / `vStore` narrow it into place.
     pub fn kvAt(d: Dev, which: enum { k, v }, k0: usize) !Buf {
-        if (d.ws.kv_bf16) return d.ws.attn_d;
+        if (d.ws.kv_bf16) return if (which == .k) d.ws.attn_d else d.ws.v32_d;
         const inner = d.cfg.n_heads * d.cfg.head_dim;
         return (if (which == .k) d.ws.k_d else d.ws.v_d).viewBytes(k0 * inner * 4);
     }
 
-    pub fn kvStore(d: Dev, which: enum { k, v }, at: Buf, k0: usize, rows: usize) !void {
+    pub fn vStore(d: Dev, at: Buf, k0: usize, rows: usize) !void {
         if (!d.ws.kv_bf16) return;
         const inner = d.cfg.n_heads * d.cfg.head_dim;
-        try d.be.cvtF32ToBf16(at, (if (which == .k) d.ws.k_d else d.ws.v_d).viewBytes(k0 * inner * 2), rows * inner);
+        try d.be.cvtF32ToBf16(at, d.ws.v_d.viewBytes(k0 * inner * 2), rows * inner);
     }
 
     pub fn kvReady(_: Dev, _: usize) !void {}
 
     /// MHA (kv_heads == n_heads), unmasked, so a band of queries over the whole key
     /// sequence is the same arithmetic as the square launch.
-    pub fn attention(d: Dev, rows: usize, seq: usize) !void {
+    pub fn attention(d: Dev, rows: usize, seq: usize, int8: bool) !void {
         const cfg = d.cfg;
         const ws = d.ws;
         const inner = cfg.n_heads * cfg.head_dim;
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        if (!force_naive_attn and sage_attn.use(int8, cfg.head_dim, seq)) {
+            // the int8 kernels take one dtype for Q and K, and store f32 directly
+            if (ws.kv_bf16) {
+                return d.be.opSageAttn(ws.qb_d.as(.bf16), ws.k_d.as(.bf16), ws.v_d.as(.bf16), ws.attn_d.as(.f32), rows, seq, cfg.n_heads, scale);
+            }
+            return d.be.opSageAttn(ws.q_d.as(.f32), ws.k_d.as(.f32), ws.v_d.as(.f32), ws.attn_d.as(.f32), rows, seq, cfg.n_heads, scale);
+        }
         if (force_naive_attn) {
             try d.be.attn(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, rows, seq, cfg.n_heads, cfg.n_heads, cfg.head_dim, scale, false);
         } else if (ws.kv_bf16) {
-            try d.be.cvtF32ToBf16(ws.q_d, ws.qb_d, rows * inner);
             // K and V are bf16 here only; the heads reuse `k_d` as f32 scratch.
             try d.be.opAttnCross(ws.qb_d.as(.bf16), ws.k_d.as(.bf16), ws.v_d.as(.bf16), ws.ob_d.as(.bf16), rows, seq, cfg.n_heads, cfg.head_dim, scale);
             try d.be.cvtBf16ToF32(ws.ob_d, ws.attn_d, rows * inner);
@@ -367,8 +431,10 @@ const Dev = struct {
         }
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
-        try d.be.siluMul(g, u, n);
+    /// `linear` of `silu(g) * u`, the product made inside the activation prep where
+    /// nothing else reads it (`lin_cuda.linearSiluMul`).
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, rows: usize, w: Weight) !void {
+        try lin_cuda.linearSiluMul(d.be, d.ws.plan, y, g, u, rows, w);
     }
 
 };

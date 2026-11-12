@@ -613,8 +613,10 @@ const Dev = struct {
         try d.be.opAdd(x, y, n);
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
-        try d.be.siluMul(g, u, n);
+    /// `linear` of `silu(g) * u`, the product made inside the activation prep where
+    /// nothing else reads it (`lin_cuda.linearSiluMul`).
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, rows: usize, w: Weight) !void {
+        try lin_cuda.linearSiluMul(d.be, d.plan, y, g, u, rows, w);
     }
 
     pub fn addScaled(d: Dev, x: Buf, y: Buf, n: usize, s: f32) !void {

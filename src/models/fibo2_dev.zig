@@ -56,8 +56,7 @@ pub fn prefix(d: anytype, model: *const fibo2.DiT, p: anytype, cancel: ?*std.ato
         try d.norm(p.g, p.nrm, pl.ffn_norm, ng);
         const fw = [_]fibo2.Weight{ pl.ffn.w1, pl.ffn.w3 };
         try d.gemms(try d.prep(p.nrm, ng, cfg.dim, &fw), &.{ p.mg, p.mu }, &fw);
-        try d.siluMul(p.mg, p.mu, ng * cfg.ffn_dim);
-        try d.linear(p.dlt, p.mg, ng, pl.ffn.w2);
+        try d.siluMulLinear(p.dlt, p.mg, p.mu, ng, pl.ffn.w2);
         try d.add(p.g, p.dlt, ng * cfg.dim);
     }
     try d.norm(p.g, p.g, model.perceiver_norm, ng);
@@ -133,10 +132,8 @@ fn block(d: anytype, cfg: fibo2.Config, blk: *const fibo2.Block, x: anytype, row
     try modNorm(d, x, ws.nrm_d, rows, split, step_off, zero_off, 0, blk.attn_norm1);
     const att = [_]fibo2.Weight{ blk.attn.q, blk.attn.k, blk.attn.v };
     try d.gemms(try d.prep(ws.nrm_d, rows, dim, &att), &.{ ws.q_d, ws.k_d, ws.v_d }, &att);
-    try d.headNorm(ws.q_d, blk.attn.qnorm, rows);
-    try d.headNorm(ws.k_d, blk.attn.knorm, rows);
-    try d.rope(ws.q_d, rows, rope_row0);
-    try d.rope(ws.k_d, rows, rope_row0);
+    try d.headNormRope(ws.q_d, blk.attn.qnorm, rows, rope_row0);
+    try d.headNormRope(ws.k_d, blk.attn.knorm, rows, rope_row0);
     try d.scale(ws.v_d, rows * dim, v_div);
     try d.attention(ws.q_d, ws.k_d, ws.v_d, ws.attn_d, rows, rows);
     try d.scale(ws.attn_d, rows * dim, 1.0 / v_div);
@@ -163,8 +160,7 @@ fn block(d: anytype, cfg: fibo2.Config, blk: *const fibo2.Block, x: anytype, row
     try modNorm(d, x, ws.nrm_d, rows, split, step_off, zero_off, 2, blk.ffn_norm1);
     const ffn = [_]fibo2.Weight{ blk.ffn.w1, blk.ffn.w3 };
     try d.gemms(try d.prep(ws.nrm_d, rows, dim, &ffn), &.{ ws.mg_d, ws.mu_d }, &ffn);
-    try d.siluMul(ws.mg_d, ws.mu_d, rows * cfg.ffn_dim);
-    try d.linear(ws.dlt_d, ws.mg_d, rows, blk.ffn.w2);
+    try d.siluMulLinear(ws.dlt_d, ws.mg_d, ws.mu_d, rows, blk.ffn.w2);
     try d.norm(ws.dlt_d, ws.dlt_d, blk.ffn_norm2, rows);
     try gatedAdd(d, x, rows, split, step_off, zero_off, 3);
 }

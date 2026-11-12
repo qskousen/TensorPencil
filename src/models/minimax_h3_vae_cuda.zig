@@ -246,9 +246,9 @@ const Dev = struct {
         try d.be.qkNorm(x, y, try normBuf(d.be, w), rows, dim, d.cfg.eps);
     }
 
-    /// `qkNorm` always multiplies a weight, so the weightless norm is fed ones.
-    pub fn unitNorm(d: Dev, x: Buf, seq: usize) !void {
-        try d.be.qkNorm(x, x, d.sess.ones_d, seq * d.cfg.heads, d.cfg.head_dim, d.cfg.eps);
+    /// The weightless per-head norm (fed ones) and the partial rope, in one pass.
+    pub fn unitNormRope(d: Dev, x: Buf, seq: usize) !void {
+        try d.be.normRope(x, x, d.sess.ones_d, d.sess.freqs_d, .{ .rows = seq * d.cfg.heads, .dim = d.cfg.head_dim, .heads = d.cfg.heads, .pairs = d.sess.pairs, .sin_off = d.sess.sinOff(), .eps = d.cfg.eps });
     }
 
     pub fn gemm(d: Dev, y: Buf, x: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
@@ -257,10 +257,6 @@ const Dev = struct {
 
     pub fn deinterleave3(d: Dev, seq: usize) !void {
         try d.be.opDeinterleave3(d.ws.qkv_d, d.ws.q_d, d.ws.k_d, d.ws.v_d, seq * d.cfg.dim, d.cfg.head_dim);
-    }
-
-    pub fn rope(d: Dev, x: Buf, seq: usize) !void {
-        try d.be.opRopeHalfPart(x, d.sess.freqs_d, seq, d.cfg.heads, d.sess.pairs, d.sess.sinOff(), 0, d.cfg.head_dim);
     }
 
     pub fn attention(d: Dev, seq: usize) !void {

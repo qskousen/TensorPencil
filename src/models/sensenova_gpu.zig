@@ -755,7 +755,12 @@ const Dev = struct {
         try d.ctx.opElt(gpu.eltAt("add", x.dt), x, y, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, rows: usize, w: Weight) !void {
+        try d.siluMul(g, u, rows * w.cols);
+        try d.linear(y, g, rows, w);
+    }
+
+    fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
         std.debug.assert(g.dt == u.dt);
         try d.ctx.opElt(gpu.eltAt("silu_mul", g.dt), g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
     }

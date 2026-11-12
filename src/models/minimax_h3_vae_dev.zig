@@ -10,7 +10,7 @@
 //! `to_qkv` is fused PER HEAD (`[h0 q|h0 k|h0 v|h1 q|...]` per token), so the three
 //! planes are not row ranges of the weight and are split by `deinterleave3`; `ff.w1`
 //! IS `[gate; value]` by rows, so that one splits as two GEMMs. The q/k norms are
-//! WEIGHTLESS (`unitNorm`).
+//! WEIGHTLESS (`unitNormRope`).
 
 const std = @import("std");
 const vae = @import("minimax_h3_vae.zig");
@@ -24,10 +24,8 @@ pub fn body(d: anytype, dec: *const vae.VideoDecoder, seq: usize, grid: usize) !
         try d.rmsNorm(ws.x_d, ws.hn_d, b.norm1, seq, dim);
         try d.gemm(ws.qkv_d, ws.hn_d, seq, b.qkv, b.qkv_bias);
         try d.deinterleave3(seq);
-        try d.unitNorm(ws.q_d, seq);
-        try d.unitNorm(ws.k_d, seq);
-        try d.rope(ws.q_d, seq);
-        try d.rope(ws.k_d, seq);
+        try d.unitNormRope(ws.q_d, seq);
+        try d.unitNormRope(ws.k_d, seq);
         try d.attention(seq);
         try d.gemm(ws.proj_d, ws.ao_d, seq, b.out, b.out_bias);
         // LayerScale: the gated add with the learned scale where a DiT has a gate.

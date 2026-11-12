@@ -336,19 +336,11 @@ const Dev = struct {
         const ctx = d.ctx;
         const hd = cfg.headDim();
         const half = hd / 2;
-        ctx.independent(2);
-        try rmsNorm(ctx, d.ws.q_d, qnorm, n * cfg.heads, hd);
-        try rmsNorm(ctx, k, knorm, n * cfg.heads, hd);
         const row0 = if (pass == .prefix) 0 else d.sess.pre;
-        const f = try ctx.view(d.sess.freqs_d, row0 * half * 4, d.sess.freqs_d.size - row0 * half * 4);
         ctx.independent(2);
-        inline for (.{ d.ws.q_d, k }) |buf| {
-            try ctx.opElt(gpu.eltAt("rope_inter", buf.dt), buf, null, f, null, .{
-                .u0 = @intCast(n * cfg.heads * half),
-                .u1 = @intCast(half),
-                .u2 = @intCast(d.sess.seq * half),
-                .u3 = @intCast(cfg.heads),
-            }, n * cfg.heads * half, 1, 1);
+        inline for (.{ .{ d.ws.q_d, qnorm }, .{ k, knorm } }) |t| {
+            const w: Buf = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(t[1])), .mem = .null_handle, .size = 0 };
+            try ctx.opNormRope(t[0], t[0], w, d.sess.freqs_d, .{ .rows = n * cfg.heads, .dim = hd, .heads = cfg.heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = eps, .pos0 = row0, .interleaved = true });
         }
     }
 
@@ -440,9 +432,3 @@ fn rect(d: Dev, q: Buf, out: Buf, q_rows: usize, kv_rows: usize) !void {
     }, null);
 }
 
-/// Weighted per-row RMSNorm in place, the subgroup kernel where it exists.
-fn rmsNorm(ctx: *gpu.Context, x: Buf, weights: []const f32, rows: usize, dim: usize) !void {
-    const w: Buf = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, dim, eps);
-    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, x, w, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
-}

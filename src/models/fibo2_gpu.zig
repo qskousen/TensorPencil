@@ -426,16 +426,12 @@ const Dev = struct {
         try rmsNorm(d.ctx, buf, buf, w, n * cfg.n_heads, cfg.head_dim, cfg.norm_eps);
     }
 
-    pub fn rope(d: Dev, buf: Buf, n: usize, row0: usize) !void {
+    /// `headNorm` then rope from joint row `row0`, in one pass.
+    pub fn headNormRope(d: Dev, buf: Buf, w: []const f32, n: usize, row0: usize) !void {
         const cfg = d.model.cfg;
         const half = cfg.head_dim / 2;
-        const f = try d.ctx.view(d.sess.freqs_d, row0 * half * 4, d.sess.freqs_d.size - row0 * half * 4);
-        try d.ctx.opElt(.rope_inter, buf, null, f, null, .{
-            .u0 = @intCast(n * cfg.n_heads * half),
-            .u1 = @intCast(half),
-            .u2 = @intCast(d.sess.seq * half),
-            .u3 = @intCast(cfg.n_heads),
-        }, n * cfg.n_heads * half, 1, 1);
+        const wb: Buf = .{ .buf = try d.ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
+        try d.ctx.opNormRope(buf, buf, wb, d.sess.freqs_d, .{ .rows = n * cfg.n_heads, .dim = cfg.head_dim, .heads = cfg.n_heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = cfg.norm_eps, .pos0 = row0, .interleaved = true });
     }
 
     pub fn prep(d: Dev, x: Buf, m: usize, cols: usize, group: []const Weight) !lin_gpu.Group {
@@ -482,7 +478,12 @@ const Dev = struct {
         try d.ctx.opElt(gpu.eltAt("add_scaled", x.dt), x, t, null, null, .{ .u0 = @intCast(n), .f0 = s }, n, 1, 1);
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, m: usize, w: Weight) !void {
+        try d.siluMul(g, u, m * w.cols);
+        try d.linear(y, g, m, w);
+    }
+
+    fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
         std.debug.assert(g.dt == u.dt);
         try d.ctx.opElt(gpu.eltAt("silu_mul", g.dt), g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
     }
@@ -492,6 +493,5 @@ const Dev = struct {
 /// where it exists.
 fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, eps: f32) !void {
     const w: Buf = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, out, w, rows, dim, eps);
-    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, out, w, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
+    try ctx.opRmsNorm(x, out, w, rows, dim, eps);
 }

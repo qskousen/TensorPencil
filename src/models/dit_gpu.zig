@@ -664,38 +664,27 @@ const Dev = struct {
         const freqs_d = d.sess.freqs_d;
         const seq_pad = pad(seq);
         const half = hd / 2;
-        const sin_off: u32 = @intCast(seq * half);
+        const sin_off = seq * half;
         const tc_attn = d.tc_attn;
         const flash = d.flash;
         const md_off = seq_pad * F;
         const s_rows = d.s_rows;
         const heads_per_batch = d.heads_per_batch;
         const attn_f16 = ap.q.dt == .f16;
-        const is_i8 = allI8(d.sess, &.{ blk.attn.wq, blk.attn.wk, blk.attn.wv, blk.attn.gate }, seq);
+            // Per-head norm and rope in one pass, in place. On the f16 path Q's
+            // attention scale rides along, so Q is the scores operand as it stands; K
+            // then gathers f16 -> f16 into the scores layout, and V needs nothing (its
+            // GEMM already wrote the P@V operand).
+            const nr: gpu.NormRope = .{ .rows = seq * heads, .dim = hd, .heads = heads, .pairs = half, .sin_off = sin_off, .eps = 1e-5, .interleaved = true, .scale = if (attn_f16) attn_scale else 1 };
+            var nk = nr;
+            nk.rows = seq * kv_heads;
+            nk.heads = kv_heads;
+            nk.scale = 1;
+            ctx.independent(2);
+            try ctx.opNormRope(q_d, q_d, try normBuf(ctx, blk.attn.qnorm), freqs_d, nr);
+            try ctx.opNormRope(k_d, k_d, try normBuf(ctx, blk.attn.knorm), freqs_d, nk);
+            mark(io, &t_mark, &prof.elt_ns);
             if (attn_f16) {
-                // Fused per-head norm + rope + scale, in place on the f16 GEMM
-                // outputs (value-identical to the chain below, see the kernel);
-                // K then gathers f16 -> f16 into the scores layout. V needs
-                // nothing: its GEMM already wrote the P@V operand.
-                ctx.independent(2);
-                try ctx.opElt(.qknorm_rope_f16, q_d, try normBuf(ctx, blk.attn.qnorm), freqs_d, null, .{
-                    .u0 = @intCast(seq * heads),
-                    .u1 = half,
-                    .u2 = sin_off,
-                    .u3 = heads,
-                    .f0 = attn_scale,
-                    .f1 = 1e-5,
-                }, seq * heads, 1, 1);
-                mark(io, &t_mark, &prof.elt_ns);
-                try ctx.opElt(.qknorm_rope_f16, k_d, try normBuf(ctx, blk.attn.knorm), freqs_d, null, .{
-                    .u0 = @intCast(seq * kv_heads),
-                    .u1 = half,
-                    .u2 = sin_off,
-                    .u3 = kv_heads,
-                    .f0 = 1.0,
-                    .f1 = 1e-5,
-                }, seq * kv_heads, 1, 1);
-                mark(io, &t_mark, &prof.elt_ns);
                 try ctx.opElt(.gather_kmajor16, k_d, null, null, kt_d, .{
                     .u0 = @intCast(kv_heads * hd * seq_pad / 2),
                     .u1 = hd,
@@ -704,67 +693,9 @@ const Dev = struct {
                     .u4 = kv_heads,
                 }, kv_heads * hd * seq_pad / 2, 1, 1);
                 mark(io, &t_mark, &prof.elt_ns);
-            } else if (is_i8 and tc_attn) {
-                // int8 f32 GEMM outputs, tensor-core attention: fuse rmsnorm+rope
-                // into ONE f32 in-place pass for q and k (2 passes each -> 1), then
-                // the existing converts (which zero the seq_pad tail correctly).
-                // 7 f32 passes -> 5. q's attn_scale is applied at the f32_to_h16.
-                ctx.independent(2);
-                try ctx.opElt(.qknorm_rope, q_d, try normBuf(ctx, blk.attn.qnorm), freqs_d, null, .{
-                    .u0 = @intCast(seq * heads),
-                    .u1 = half,
-                    .u2 = sin_off,
-                    .u3 = heads,
-                    .f0 = 1.0,
-                    .f1 = 1e-5,
-                }, seq * heads, 1, 1);
-                try ctx.opElt(.qknorm_rope, k_d, try normBuf(ctx, blk.attn.knorm), freqs_d, null, .{
-                    .u0 = @intCast(seq * kv_heads),
-                    .u1 = half,
-                    .u2 = sin_off,
-                    .u3 = kv_heads,
-                    .f0 = 1.0,
-                    .f1 = 1e-5,
-                }, seq * kv_heads, 1, 1);
-                mark(io, &t_mark, &prof.elt_ns);
+            } else if (tc_attn) {
                 try attn_gpu.stage(ctx, q_d, k_d, v_d, qt_d, kt_d, v16_d, seq, heads, kv_heads, hd, attn_scale);
                 mark(io, &t_mark, &prof.elt_ns);
-            } else {
-            // The q and k chains (norm -> rope -> convert/gather) touch disjoint
-            // buffers stage by stage; each stage pair/triple runs barrier-free.
-            // The SUBGROUP norm, because `Elt.rmsnorm` gives each THREAD a whole 128-wide
-            // head, a warp's 32 loads land 512 B apart and each is its own sector. Measured
-            // at krea2's geometry at 1120x1680 (`vk-norm-bench`, 352800 x 128): 35 GB/s
-            // against 558, 16x, worth ~600 ms/step across the two calls x 28 blocks.
-            //
-            // This `else` arm is reached by every group neither fused path above takes
-            // (dense bf16, fp8 off the shared path, NVFP4, a block quant); an int8 one takes
-            // `qknorm_rope` and never gets here.
-            //
-            // Not bit-identical: the row sum becomes a subgroup tree where it was serial (the
-            // more accurate of the two). `independent(2)` still applies, one dispatch either way.
-            ctx.independent(2);
-            try rmsNormQk(ctx, q_d, blk.attn.qnorm, seq * heads, hd);
-            mark(io, &t_mark, &prof.elt_ns);
-            try rmsNormQk(ctx, k_d, blk.attn.knorm, seq * kv_heads, hd);
-            mark(io, &t_mark, &prof.elt_ns);
-            ctx.independent(2);
-            try ctx.opElt(.rope_inter, q_d, null, freqs_d, null, .{
-                .u0 = @intCast(seq * heads * half),
-                .u1 = half,
-                .u2 = sin_off,
-                .u3 = heads,
-            }, seq * heads * half, 1, 1);
-            mark(io, &t_mark, &prof.elt_ns);
-            try ctx.opElt(.rope_inter, k_d, null, freqs_d, null, .{
-                .u0 = @intCast(seq * kv_heads * half),
-                .u1 = half,
-                .u2 = sin_off,
-                .u3 = kv_heads,
-            }, seq * kv_heads * half, 1, 1);
-            mark(io, &t_mark, &prof.elt_ns);
-            if (tc_attn) {
-                try attn_gpu.stage(ctx, q_d, k_d, v_d, qt_d, kt_d, v16_d, seq, heads, kv_heads, hd, attn_scale);
             } else {
                 ctx.independent(2);
                 try ctx.opElt(.gather_kmajor, q_d, null, null, qt_d, .{
@@ -779,7 +710,6 @@ const Dev = struct {
                     .u2 = hd,
                     .u3 = @intCast(seq),
                 }, seq * kv_heads * hd, 1, 1);
-            }
             }
             // On the f16-C path Q was normed/roped/scaled in place: it IS the
             // scores operand.
@@ -881,7 +811,12 @@ const Dev = struct {
         d.lap(&d.prof.elt_ns);
     }
 
-    pub fn siluMul(d: Dev, mg: Buf, mu: Buf, tile: usize) !void {
+    pub fn siluMulLinear(d: Dev, y: Buf, mg: Buf, mu: Buf, tile: usize, w: Weight) !void {
+        try d.siluMul(mg, mu, tile);
+        try d.linear(y, mg, tile, w);
+    }
+
+    fn siluMul(d: Dev, mg: Buf, mu: Buf, tile: usize) !void {
         std.debug.assert(mg.dt == mu.dt);
         try d.ctx.opElt(gpu.eltAt("silu_mul", mg.dt), mg, mu, null, null, .{ .u0 = @intCast(tile * dit.mlp_dim) }, tile * dit.mlp_dim, 1, 1);
         d.lap(&d.prof.elt_ns);
@@ -930,18 +865,6 @@ fn probeInputAt(ctx: *gpu.Context, x: gpu.DeviceBuffer, off_bytes: u64, m: usize
     defer ctx.gpa.free(host);
     try ctx.tensorDownloadAt(x, off_bytes, std.mem.sliceAsBytes(host));
     p.input(p.ctx, w, host, m);
-}
-
-/// Per-head weighted RMSNorm in place over `[rows][hd]`, preferring the subgroup kernel.
-/// See the call site for the measurement and for which checkpoints reach it.
-fn rmsNormQk(ctx: *gpu.Context, x: gpu.DeviceBuffer, weights: []const f32, rows: usize, width: usize) !void {
-    const w = try normBuf(ctx, weights);
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, width, 1e-5);
-    try ctx.opElt(.rmsnorm, x, x, w, null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(width),
-        .f0 = 1e-5,
-    }, rows, 1, 1);
 }
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !gpu.DeviceBuffer {

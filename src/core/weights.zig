@@ -63,6 +63,24 @@ pub const WeightStore = union(enum) {
         };
     }
 
+    /// A string from the container's own metadata: the safetensors header's
+    /// `__metadata__` map, or a GGUF string kv. A wrapper reads its base's (a
+    /// `Mix` reads `a`'s), since a bundled file has one metadata block for every
+    /// component in it.
+    pub fn metaString(self: WeightStore, key: []const u8) ?[]const u8 {
+        return switch (self) {
+            .safetensors => |st| blk: {
+                const m = st.metadata orelse break :blk null;
+                const v = m.get(key) orelse break :blk null;
+                break :blk if (v == .string) v.string else null;
+            },
+            .gguf => |g| g.getStr(key),
+            .overlay => |o| o.base.metaString(key),
+            .prefixed => |pfx| pfx.base.metaString(key),
+            .mix => |m| m.a.metaString(key),
+        };
+    }
+
     /// The whole-file mmap backing the tensor bytes (for page-locked direct
     /// GPU streaming); null on the buffered-read path.
     pub fn mapping(self: WeightStore) ?[]align(std.heap.page_size_min) const u8 {

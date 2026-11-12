@@ -109,29 +109,38 @@ pub inline fn rmsnorm(e: Env, comptime dt: Dt) void {
     }
 }
 
-/// `rmsnorm` then `ropeHalf` on each head row in place, the normed values kept in
-/// registers, so a row is bit-identical to the two kernels in turn.
-/// a = x [rows][dim], b = norm weight [dim], c = freqs (cos, then sin at u2).
-/// u0 = rows (positions * heads), u1 = dim, u2 = sin_off, u3 = heads, u4 = position of
-/// row 0. f0 = eps.
-pub inline fn qkNormRope(e: Env) void {
+/// Per-head `rmsnorm` then RoPE, the normed values kept in registers, so a row is
+/// bit-identical to the two kernels in turn followed by a cast to `out`.
+/// a = x [rows][dim] in `in`, b = norm weight [dim], c = freqs (cos at
+/// `pos * u5 + p`, sin u2 past it), d = out [rows][dim] in `out`, which may be a.
+/// The first u5 pairs rotate, rotate-half (p with p + u5) or interleaved (2p with
+/// 2p + 1) when u6 is set; the rest of the row is only normed.
+/// u0 = rows (positions * heads), u1 = dim, u3 = heads, u4 = position of row 0.
+/// f0 = eps, f1 = output scale.
+pub inline fn normRope(e: Env, comptime in: Dt, comptime out: Dt) void {
     const r = Rows(e);
     const dim = e.u(1);
-    const half = dim / 2;
+    const pairs = e.u(5);
+    const inter = e.u(6) != 0;
+    const scale = e.f(1);
     var row = r.row;
     while (row < e.u(0)) : (row += r.step) {
         const base = row * dim;
-        const inv = rmsInv(e, r, base, dim, .f32);
+        const inv = rmsInv(e, r, base, dim, in);
         const pos = row / e.u(3) + e.u(4);
         var p = r.lane;
-        while (p < half) : (p += r.lanes) {
-            const lo = e.ld(.a, base + p) * inv * e.ld(.b, p);
-            const hi = e.ld(.a, base + p + half) * inv * e.ld(.b, p + half);
-            const cos_v = e.ld(.c, pos * half + p);
-            const sin_v = e.ld(.c, e.u(2) + pos * half + p);
-            e.st(.a, base + p, lo * cos_v - hi * sin_v);
-            e.st(.a, base + p + half, hi * cos_v + lo * sin_v);
+        while (p < pairs) : (p += r.lanes) {
+            const at_lo = if (inter) 2 * p else p;
+            const at_hi = if (inter) 2 * p + 1 else p + pairs;
+            const lo = e.ldT(.a, in, base + at_lo) * inv * e.ld(.b, at_lo);
+            const hi = e.ldT(.a, in, base + at_hi) * inv * e.ld(.b, at_hi);
+            const cos_v = e.ld(.c, pos * pairs + p);
+            const sin_v = e.ld(.c, e.u(2) + pos * pairs + p);
+            e.stT(.d, out, base + at_lo, (lo * cos_v - hi * sin_v) * scale);
+            e.stT(.d, out, base + at_hi, (hi * cos_v + lo * sin_v) * scale);
         }
+        var i = 2 * pairs + r.lane;
+        while (i < dim) : (i += r.lanes) e.stT(.d, out, base + i, e.ldT(.a, in, base + i) * inv * e.ld(.b, i) * scale);
     }
 }
 

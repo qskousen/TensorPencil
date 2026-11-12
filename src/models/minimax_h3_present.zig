@@ -12,6 +12,8 @@
 //!              video -> "<Video k>: " then per 2-frame temporal block
 //!                       "<T.T seconds>" <block>
 //!            then <prompt>
+//!     image  "Picture 1: " <block> ["Picture 2: " <block> ...] <prompt>
+//!            (MiniMax-H3-Image edits: no angle brackets, `PictureLabel.plain`)
 //!
 //! ⚠️ **The ordinals count per TYPE, not globally**, so an image followed by an
 //! audio followed by an image is `<Picture 1>`, `<Audio 1>`, `<Picture 2>`. A
@@ -126,6 +128,10 @@ pub const Presentation = struct {
     }
 };
 
+/// How a picture reference is labelled: H3's `<Picture i>: ` or the image
+/// release's `Picture i: `.
+pub const PictureLabel = enum { bracketed, plain };
+
 /// Build the presentation: labels, vision blocks, then the prompt.
 ///
 /// `items` is in REQUEST order and the ordinals are counted per type as it walks.
@@ -134,6 +140,16 @@ pub fn build(
     tok: *const Tokenizer,
     text: []const u8,
     items: []const Item,
+) !Presentation {
+    return buildWith(gpa, tok, text, items, .bracketed);
+}
+
+pub fn buildWith(
+    gpa: std.mem.Allocator,
+    tok: *const Tokenizer,
+    text: []const u8,
+    items: []const Item,
+    picture_label: PictureLabel,
 ) !Presentation {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -159,7 +175,11 @@ pub fn build(
         switch (item) {
             .image => |g| {
                 n_image += 1;
-                try addText(alloc, tok, &ids, try std.mem.print(&buf, "<Picture {d}>: ", .{n_image}));
+                const label = switch (picture_label) {
+                    .bracketed => try std.mem.print(&buf, "<Picture {d}>: ", .{n_image}),
+                    .plain => try std.mem.print(&buf, "Picture {d}: ", .{n_image}),
+                };
+                try addText(alloc, tok, &ids, label);
                 try addBlock(alloc, &ids, &blocks, &grids, g);
             },
             .audio => {

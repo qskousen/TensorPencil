@@ -518,9 +518,15 @@ const Dev = struct {
         return x.viewBytes(r0 * width * x.dt.bytes());
     }
 
-    pub fn siluMul(d: Dev, mg: DeviceBuffer, mu: DeviceBuffer, tile: usize) !void {
+    /// `linear` of `silu(mg) * mu`, the product made inside the activation prep where
+    /// nothing else reads it (`lin_cuda.linearSiluMul`).
+    pub fn siluMulLinear(d: Dev, y: DeviceBuffer, mg: DeviceBuffer, mu: DeviceBuffer, tile: usize, w: Weight) !void {
         // The f32 stream's f16 chain keeps its paired kernel.
-        if (mg.dt == .f16 and d.ws.act == .f32) try d.be.siluMul16(mg, mu, tile * mlp_dim) else try d.be.siluMul(mg, mu, tile * mlp_dim);
+        if (mg.dt == .f16 and d.ws.act == .f32) {
+            try d.be.siluMul16(mg, mu, tile * mlp_dim);
+            return d.linear(y, mg, tile, w);
+        }
+        try lin_cuda.linearSiluMul(d.be, d.sess.plan, y, mg, mu, tile, w);
     }
 
     /// Reads the residual back and reuses the CPU accumulator rather than growing a

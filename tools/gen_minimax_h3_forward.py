@@ -82,13 +82,8 @@ AUDIO_T = 3
 SIGMA = 0.7
 
 
-def main():
-    torch.manual_seed(20260824)
-    ops = comfy.ops.disable_weight_init
-
-    model = MiniMaxH3Model(operations=ops, dtype=torch.float32, **CFG)
-    model.eval()
-
+def init_weights(model):
+    """Fill `model` with seeded weights shaped like trained ones; returns the state dict."""
     # Seeded weights, initialized the way REAL ones are distributed rather than
     # uniformly small. This is what gives the fixture teeth.
     #
@@ -134,6 +129,16 @@ def main():
     # no_grad nor inference_mode changes the flag on a parameter.
     for prm in model.parameters():
         prm.requires_grad_(False)
+    return sd
+
+
+def main():
+    torch.manual_seed(20260824)
+    ops = comfy.ops.disable_weight_init
+
+    model = MiniMaxH3Model(operations=ops, dtype=torch.float32, **CFG)
+    model.eval()
+    sd = init_weights(model)
 
     # Inputs. Batch 1 is the only supported batch.
     video = torch.randn(1, CFG["latents_dim"], LATENT_T, LATENT_H, LATENT_W, dtype=torch.float32)

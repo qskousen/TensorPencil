@@ -420,23 +420,11 @@ const Dev = struct {
         const ws = d.ws;
         const half = cfg.head_dim / 2;
         const freqs = if (stage == .image) d.sess.img_freqs_d else d.sess.freqs_d;
-        const sin_off: u32 = @intCast((if (stage == .image) d.sess.img_padded else d.sess.seq) * half);
+        const sin_off = (if (stage == .image) d.sess.img_padded else d.sess.seq) * half;
         ctx.independent(2);
-        try rmsNorm(ctx, ws.q_d, ws.q_d, qnorm, rows * cfg.n_heads, cfg.head_dim, cfg.qk_eps);
-        try rmsNorm(ctx, ws.k_d, ws.k_d, knorm, rows * cfg.n_kv_heads, cfg.head_dim, cfg.qk_eps);
-        ctx.independent(2);
-        try ctx.opElt(.rope_inter, ws.q_d, null, freqs, null, .{
-            .u0 = @intCast(rows * cfg.n_heads * half),
-            .u1 = @intCast(half),
-            .u2 = sin_off,
-            .u3 = @intCast(cfg.n_heads),
-        }, rows * cfg.n_heads * half, 1, 1);
-        try ctx.opElt(.rope_inter, ws.k_d, null, freqs, null, .{
-            .u0 = @intCast(rows * cfg.n_kv_heads * half),
-            .u1 = @intCast(half),
-            .u2 = sin_off,
-            .u3 = @intCast(cfg.n_kv_heads),
-        }, rows * cfg.n_kv_heads * half, 1, 1);
+        inline for (.{ .{ ws.q_d, qnorm, cfg.n_heads }, .{ ws.k_d, knorm, cfg.n_kv_heads } }) |t| {
+            try ctx.opNormRope(t[0], t[0], try normBuf(ctx, t[1]), freqs, .{ .rows = rows * t[2], .dim = cfg.head_dim, .heads = t[2], .pairs = half, .sin_off = sin_off, .eps = cfg.qk_eps, .interleaved = true });
+        }
     }
 
     pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {
@@ -493,12 +481,7 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
 /// does move the parity figures, so the gated forward test's bound is the thing to watch.
 fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, eps: f32) !void {
     const w = try normBuf(ctx, weights);
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, out, w, rows, dim, eps);
-    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, out, w, null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = eps,
-    }, rows, 1, 1);
+    try ctx.opRmsNorm(x, out, w, rows, dim, eps);
 }
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !Buf {

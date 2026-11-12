@@ -23,15 +23,16 @@
 //! Loads from any `WeightStore`. Block q/k/v are fused (`proj.qkv`, repacked
 //! files) or split (`proj.q`, `.k`, `.v`); both run the same forward.
 //!
-//! ComfyUI renders this checkpoint with int8 attention, which alone moves the image
-//! far more than we differ from it: compare renders against
-//! `tools/gen_moss_image_render.py --no-int8-attention`.
+//! The int8 file asks for ComfyUI's int8 attention in every layer, which alone moves
+//! the image far more than anything else here does; Vulkan runs ordinary attention, so
+//! compare a Vulkan render against `tools/gen_moss_image_render.py --no-int8-attention`.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
+const dtypes = @import("tp_core").dtype;
 const quant_weight = @import("quant_weight.zig");
 const lin = @import("lin.zig");
 const lora_mod = @import("lora.zig");
@@ -130,6 +131,8 @@ pub const Block = struct {
     /// What the device runs, in forward order: q, k, v, o, hidden, gate, down. The
     /// fused tensors appear as row views (`lin.rowSlice`).
     dev: [7]Weight,
+    /// The checkpoint asks for ComfyUI's int8 attention here (`ops.sage_attn`).
+    int8_attn: bool = false,
 };
 
 /// An unmodulated pre-norm block over the text alone, with biases.
@@ -464,7 +467,7 @@ fn blockForward(
         try linear(io, gpa, stack, k, y, seq, blk.k.?);
         try linear(io, gpa, stack, v, y, seq, blk.v.?);
     }
-    const att = try attend(io, gpa, cfg, q, k, v, blk.q_norm, blk.k_norm, seq, freqs);
+    const att = try attend(io, gpa, cfg, q, k, v, blk.q_norm, blk.k_norm, seq, freqs, blk.int8_attn);
     defer gpa.free(att);
     try linear(io, gpa, stack, y, att, seq, blk.o);
     gatedAdd(x, y, mod.chunk(2));
@@ -507,7 +510,7 @@ fn textBlockForward(
     const k = qkv[seq * d ..][0 .. seq * d];
     const v = qkv[2 * seq * d ..];
     splitRows(fused, &.{ q, k, v }, seq, d);
-    const att = try attend(io, gpa, cfg, q, k, v, blk.q_norm, blk.k_norm, seq, freqs);
+    const att = try attend(io, gpa, cfg, q, k, v, blk.q_norm, blk.k_norm, seq, freqs, false);
     defer gpa.free(att);
     try linear(io, gpa, stack, y, att, seq, blk.proj);
     for (x, y) |*a, b| a.* += b;
@@ -536,6 +539,7 @@ fn attend(
     k_norm: []const f32,
     seq: usize,
     freqs: ops.rope.Freqs,
+    int8: bool,
 ) ![]f32 {
     const hd = cfg.headDim();
     ops.norm.rmsNorm(q, q, q_norm, eps);
@@ -544,6 +548,17 @@ fn attend(
     ops.rope.applyRotateHalf(k, freqs, seq, cfg.heads, hd);
     const out = try gpa.alloc(f32, seq * cfg.dim);
     errdefer gpa.free(out);
+    if (ops.sage_attn.use(int8, hd, seq)) {
+        // ComfyUI quantizes the bf16 activations it holds
+        const vb = try gpa.alloc(f32, v.len);
+        defer gpa.free(vb);
+        for ([_][]f32{ q, k }) |t| for (t) |*e| {
+            e.* = dtypes.bf16ToF32(dtypes.f32ToBf16(e.*));
+        };
+        for (vb, v) |*o, e| o.* = dtypes.bf16ToF32(dtypes.f32ToBf16(e));
+        try ops.sage_attn.attention(io, gpa, out, q, k, vb, seq, seq, cfg.heads, 1 / @sqrt(@as(f32, @floatFromInt(hd))));
+        return out;
+    }
     try ops.attention.attention(io, gpa, out, q, k, v, .{
         .seq_q = seq,
         .seq_kv = seq,
@@ -672,6 +687,7 @@ const Loader = struct {
     }
 
     fn blockWeights(l: Loader, i: usize) !Block {
+        var buf: [160]u8 = undefined;
         const d = l.cfg.dim;
         const hd = l.cfg.headDim();
         const fused = l.cfg.fused_qkv;
@@ -688,6 +704,7 @@ const Loader = struct {
             .up_gate = try l.linear("layers.{d}.proj.ffn_up_gate", .{i}, 2 * l.cfg.ffn, d, false),
             .down = try l.linear("layers.{d}.proj.ffn_down", .{i}, d, l.cfg.ffn, false),
             .dev = undefined,
+            .int8_attn = ops.sage_attn.requested(l.store, try l.name(&buf, "layers.{d}", .{i})),
         };
     }
 

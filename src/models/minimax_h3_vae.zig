@@ -39,6 +39,24 @@ const ops = @import("tp_ops");
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 
+/// The reference's `LATENTS_MEAN` / `LATENTS_STD`, used when a file carries none.
+pub const default_latents_mean = [24]f32{
+    0.858090341091156,   -0.9606591463088989, 1.0661640167236328,  -0.5090325474739075,
+    -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
+    -0.5376840829849243, -0.0464097298681736, 0.6657370328903198,  0.19690127670764923,
+    -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543,
+    -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279,
+    -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264,
+};
+pub const default_latents_std = [24]f32{
+    1.2223774194717407, 1.2767263650894165,  1.68317747116088865, 1.7549455165863037,
+    1.5636216402053833, 2.194143533706665,   0.96531379222869875, 1.05698859691619875,
+    0.841948926448822,  0.7729952931404114,  1.8955937623977661,  0.946841835975647,
+    0.7996809482574463, 0.44988900423049925, 0.7197399735450745,  0.69362932443618775,
+    2.961095094680786,  2.7694199085235595,  3.0496184825897215,  2.1088054180145265,
+    3.276226282119751,  3.1627357006073,     2.28168129920959475, 2.6127843856811525,
+};
+
 /// ImageNet statistics the decoder's output is denormalized by.
 pub const pixel_mean = [3]f32{ 0.485, 0.456, 0.406 };
 pub const pixel_std = [3]f32{ 0.229, 0.224, 0.225 };
@@ -61,18 +79,20 @@ pub const Config = struct {
     rope_theta: f32 = 100.0,
     /// Fraction of the head that rotates. 0.75 of 64 is 48 dims, i.e. 24 pairs.
     rope_dim_ratio: f32 = 0.75,
+    /// Position axes the rope covers: the trailing `rope_dims` of `(t, h, w)`.
+    /// The image decoder's is `(h, w)`.
+    rope_dims: usize = 3,
     eps: f32 = 1e-5,
 
-    /// Rotation pairs per token. `int(head_dim * ratio)` is the reference's
-    /// rope width, and `n_dim = 3` axes share it: the frequency count per axis is
-    /// `rope_width / (2 * 3)`, so the pair count is three times that.
+    /// Frequencies per axis. `int(head_dim * ratio)` is the reference's rope
+    /// width, shared by `rope_dims` axes of `width / (2 * rope_dims)` each.
     pub fn ropeFreqCount(self: Config) usize {
         const width: usize = @intFromFloat(@as(f32, @floatFromInt(self.head_dim)) * self.rope_dim_ratio);
-        return width / 6;
+        return width / (2 * self.rope_dims);
     }
 
     pub fn ropePairs(self: Config) usize {
-        return self.ropeFreqCount() * 3;
+        return self.ropeFreqCount() * self.rope_dims;
     }
 
     /// Head dims the rotation covers; the rest pass through.
@@ -86,6 +106,14 @@ pub const Config = struct {
     }
 
     pub fn detect(store: WeightStore) !Config {
+        return detectWith(store, image_decoder_dim);
+    }
+
+    /// The width that marks a single-frame decoder as MiniMax-H3-Image's: the
+    /// reference's own discriminator. A parameter so a toy fixture can stand in.
+    pub const image_decoder_dim = 1024;
+
+    pub fn detectWith(store: WeightStore, image_dim: usize) !Config {
         const emb = try dims2(store, "decoder.x_embedder.weight");
         const dim = emb[0];
         const in_channels = emb[1];
@@ -131,10 +159,19 @@ pub const Config = struct {
             .out_channels = 3,
             .n_register = n_register,
         };
-        // `proj_out` states the patch volume; with out_channels and patch_t fixed
-        // by the architecture, that pins the spatial patch.
-        const per_frame = proj[0] / (cfg.out_channels * cfg.patch_t);
-        cfg.patch = std.math.sqrt(per_frame);
+        // A 768-row `proj_out` is one 16x16 RGB frame per token: an image
+        // decoder, as in the reference's `sd.py`. MiniMax-H3-Image's is the 1024
+        // wide one with a 2D rope over half the head; p-h3-image's is 2048 wide
+        // with a 3D rope at a fixed time coordinate, which nothing here builds.
+        if (proj[0] == cfg.out_channels * cfg.patch * cfg.patch) {
+            if (dim != image_dim) {
+                std.log.err("minimax_h3_vae: a {d}-wide single-frame decoder (p-h3-image) is not supported", .{dim});
+                return error.UnsupportedCheckpoint;
+            }
+            cfg.patch_t = 1;
+            cfg.rope_dims = 2;
+            cfg.rope_dim_ratio = 0.5;
+        }
         if (cfg.patchDim() != proj[0]) return error.ShapeMismatch;
         return cfg;
     }
@@ -188,10 +225,13 @@ pub const VideoDecoder = struct {
     }
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore) !VideoDecoder {
+        return loadAs(gpa, store, try Config.detect(store));
+    }
+
+    pub fn loadAs(gpa: std.mem.Allocator, store: WeightStore, cfg: Config) !VideoDecoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
-        const cfg = try Config.detect(store);
         const l: L = .{ .alloc = alloc, .store = store };
 
         const blocks = try alloc.alloc(Block, cfg.n_layers);
@@ -223,8 +263,10 @@ pub const VideoDecoder = struct {
         const norm_out_b = try l.vec("decoder.norm_out.bias", .{}, cfg.dim);
         const proj_out = try l.mat("decoder.proj_out.weight", .{}, cfg.patchDim(), cfg.dim);
         const proj_out_bias = try l.vec("decoder.proj_out.bias", .{}, cfg.patchDim());
-        const latents_mean = try l.vec("latents_mean", .{}, cfg.in_channels);
-        const latents_std = try l.vec("latents_std", .{}, cfg.in_channels);
+        // The image release ships no statistics; the reference then takes its
+        // own constants, at full precision rather than the f16 a file stores.
+        const latents_mean = if (store.get("latents_mean") != null) try l.vec("latents_mean", .{}, cfg.in_channels) else try alloc.dupe(f32, &default_latents_mean);
+        const latents_std = if (store.get("latents_std") != null) try l.vec("latents_std", .{}, cfg.in_channels) else try alloc.dupe(f32, &default_latents_std);
 
         return .{
             .arena = arena,
@@ -296,7 +338,8 @@ pub fn tokenAxis(alloc: std.mem.Allocator, n: usize) ![]f32 {
 }
 
 /// Rope tables for `t * h * w` grid tokens followed by `n_suffix` tokens pinned
-/// at position zero (the register tokens and the trailing zero token).
+/// at position zero (the register tokens and the trailing zero token). A 2D
+/// rope reads `(h, w)` only, so every frame of a `t > 1` grid shares positions.
 pub fn ropeFreqs(
     gpa: std.mem.Allocator,
     cfg: Config,
@@ -329,8 +372,8 @@ pub fn ropeFreqs(
     for (0..t) |ti| {
         for (0..h) |hi| {
             for (0..w) |wi| {
-                const axes = [3]f32{ ta[ti], ha[hi], wa[wi] };
-                for (axes, 0..) |p, ax| {
+                const all = [3]f32{ ta[ti], ha[hi], wa[wi] };
+                for (all[3 - cfg.rope_dims ..], 0..) |p, ax| {
                     for (0..n_freq) |i| {
                         const inv = std.math.pow(f32, cfg.rope_theta, -@as(f32, @floatFromInt(i)) * step);
                         const ang = angle_scale * p * inv;
@@ -771,6 +814,75 @@ test "the real video VAE loads and its config matches the checkpoint" {
     for (dec.latents_std) |s| try std.testing.expect(s > 0);
 }
 
+const real_image_vae = build_options.model_root ++ "/vae/minimax_h3_image_vae_fp16.safetensors";
+
+test "the real image VAE is the single-frame 2D-rope decoder" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try test_gate.requireModelFile(io, real_image_vae);
+
+    var st = try tp_core.safetensors.SafeTensors.open(gpa, io, real_image_vae);
+    defer st.deinit();
+    var dec = try VideoDecoder.load(gpa, .{ .safetensors = &st });
+    defer dec.deinit();
+    const cfg = dec.cfg;
+    try std.testing.expectEqual(@as(usize, 1024), cfg.dim);
+    try std.testing.expectEqual(@as(usize, 16), cfg.heads);
+    try std.testing.expectEqual(@as(usize, 24), cfg.n_layers);
+    try std.testing.expectEqual(@as(usize, 1), cfg.patch_t);
+    try std.testing.expectEqual(@as(usize, 16), cfg.patch);
+    try std.testing.expectEqual(@as(usize, 2), cfg.rope_dims);
+    try std.testing.expectEqual(@as(usize, 32), cfg.ropeRotDim());
+    // the release carries no statistics, so these are the reference's constants
+    try std.testing.expectEqualSlices(f32, &default_latents_mean, dec.latents_mean);
+}
+
+const image_vae_fixture = @embedFile("assets/minimax_h3_image_vae.safetensors");
+
+test "the image decoder matches the reference's tiled still decode" {
+    // ComfyUI's own `MiniMaxH3ImageVAE.decode` with its head count shrunk to 2
+    // (tools/gen_minimax_h3_image_vae.py): one frame per token, a 2D rope over half
+    // the head, a 2D post-quant conv, the reference's default latent statistics
+    // (the file carries none, like the release), and a latent wide enough to tile.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, image_vae_fixture);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+
+    const cfg = try Config.detectWith(store, 128);
+    try std.testing.expectEqual(@as(usize, 1), cfg.patch_t);
+    try std.testing.expectEqual(@as(usize, 2), cfg.rope_dims);
+    try std.testing.expectEqual(@as(usize, 2), cfg.heads);
+    // a 64-wide head at ratio 0.5: 8 frequencies per axis, 16 pairs, 32 dims rotate
+    try std.testing.expectEqual(@as(usize, 32), cfg.ropeRotDim());
+
+    var dec = try VideoDecoder.loadAs(gpa, store, cfg);
+    defer dec.deinit();
+    try std.testing.expectEqualSlices(f32, &default_latents_mean, dec.latents_mean);
+
+    const lh: usize = 3;
+    const lw: usize = 18;
+    const z = try (try st.require("in.z")).toF32Alloc(gpa);
+    defer gpa.free(z);
+    const want = try (try st.require("out.rgb")).toF32Alloc(gpa);
+    defer gpa.free(want);
+    const got = try gpa.alloc(f32, want.len);
+    defer gpa.free(got);
+    try decodeTiled(&dec, io, gpa, .{}, got, z, 1, lh, lw, null);
+    finalizePixels(got, 3, lh * 16 * lw * 16);
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    for (want, got) |e, a| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+    }
+    const rel = @sqrt(l2_err / l2_ref);
+    errdefer std.debug.print("image decode rel L2 {e}\n", .{rel});
+    try std.testing.expect(rel < 1e-5);
+}
+
 // --- spatial tiling -------------------------------------------------------
 
 /// How a frame is decoded: in overlapping PIXEL tiles, blended.
@@ -886,6 +998,13 @@ pub fn blendAxis(
 ///
 /// `out` is the whole window at `[out_channels][frames][h*patch][w*patch]`;
 /// `vol` decodes ONE tile.
+///
+/// ⚠️ **A tile blends against its neighbours AS ALREADY BLENDED**: vertically
+/// against the previous tile row's composited bottom strip (full width, so the
+/// slice over this tile's columns already carries that row's horizontal seams),
+/// then horizontally against the previous tile's right edge taken after its own
+/// blends. Blending against the raw neighbours instead is finite and wrong only
+/// where two overlaps cross.
 pub fn decodeTiled(
     dec: *const VideoDecoder,
     io: std.Io,
@@ -903,6 +1022,7 @@ pub fn decodeTiled(
     const width = w * cfg.patch;
     const frames = t * cfg.patch_t;
     const chans = cfg.out_channels;
+    const planes = chans * frames;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -914,24 +1034,24 @@ pub fn decodeTiled(
         return callVolume(dec, vol, io, gpa, out, z, t, h, w);
     }
 
-    // The previous tile ROW's bottom overlap, per column, and the previous tile's
-    // right overlap in this row.
-    const row_tails = try a.alloc([]f32, xs.starts.len);
-    @memset(row_tails, &.{});
-    var left_tail: []f32 = &.{};
-    var left_w: usize = 0;
-
+    // The previous tile row's composited bottom overlap, `[planes][ov][width]`.
+    var strip: []f32 = &.{};
+    var strip_h: usize = 0;
     var out_y: usize = 0;
     for (ys.starts, ys.lens, 0..) |ipos, ilen, i| {
         const zi = ipos / cfg.patch;
         const zl = ilen / cfg.patch;
-        const new_tails = try a.alloc([]f32, xs.starts.len);
-        @memset(new_tails, &.{});
+        const last_row = i + 1 == ys.starts.len;
+        const new_h: usize = if (last_row) 0 else ys.overlaps[i];
+        const new_strip = try a.alloc(f32, planes * new_h * width);
+        var left_tail: []f32 = &.{};
+        var left_w: usize = 0;
         var out_x: usize = 0;
         var last_h: usize = 0;
         for (xs.starts, xs.lens, 0..) |jpos, jlen, j| {
             const zj = jpos / cfg.patch;
             const zw = jlen / cfg.patch;
+            const last_col = j + 1 == xs.starts.len;
 
             // The tile's latent slice, planar [c][t][zl][zw].
             const sub = try a.alloc(f32, cfg.in_channels * t * zl * zw);
@@ -944,67 +1064,49 @@ pub fn decodeTiled(
                     }
                 }
             }
-            var th = zl * cfg.patch;
-            var tw = zw * cfg.patch;
-            const tile = try a.alloc(f32, chans * frames * th * tw);
+            const th = zl * cfg.patch;
+            const tw = zw * cfg.patch;
+            const tile = try a.alloc(f32, planes * th * tw);
             try callVolume(dec, vol, io, gpa, tile, sub, t, zl, zw);
 
-            // Keep this tile's trailing edges BEFORE blending: they are the
-            // reference for the next tile, and blending overwrites them.
-            if (i + 1 < ys.starts.len) {
-                const ov = ys.overlaps[i];
-                const keep = try a.alloc(f32, chans * frames * ov * tw);
-                for (0..chans * frames) |p| {
-                    @memcpy(keep[p * ov * tw ..][0 .. ov * tw], tile[p * th * tw + (th - ov) * tw ..][0 .. ov * tw]);
-                }
-                new_tails[j] = keep;
-            }
-            var next_left: []f32 = &.{};
-            var next_left_w: usize = 0;
-            if (j + 1 < xs.starts.len) {
-                const ov = xs.overlaps[j];
-                const keep = try a.alloc(f32, chans * frames * th * ov);
-                for (0..chans * frames) |p| {
-                    for (0..th) |r| {
-                        @memcpy(keep[(p * th + r) * ov ..][0..ov], tile[p * th * tw + r * tw + (tw - ov) ..][0..ov]);
-                    }
-                }
-                next_left = keep;
-                next_left_w = ov;
-            }
-
             if (i > 0) {
-                const ov = ys.overlaps[i - 1];
-                blendAxis(tile, row_tails[j], ov, chans, frames, true, ov, tw, th, tw);
+                // the composited strip over this tile's columns
+                const above = try a.alloc(f32, planes * strip_h * tw);
+                for (0..planes) |p| for (0..strip_h) |r| {
+                    @memcpy(above[(p * strip_h + r) * tw ..][0..tw], strip[(p * strip_h + r) * width + jpos ..][0..tw]);
+                };
+                blendAxis(tile, above, ys.overlaps[i - 1], chans, frames, true, strip_h, tw, th, tw);
             }
-            if (j > 0) {
-                const ov = xs.overlaps[j - 1];
-                blendAxis(tile, left_tail, ov, chans, frames, false, th, left_w, th, tw);
+            if (j > 0) blendAxis(tile, left_tail, xs.overlaps[j - 1], chans, frames, false, th, left_w, th, tw);
+
+            // This tile as blended is the next one's left neighbour.
+            if (!last_col) {
+                const ov = xs.overlaps[j];
+                left_tail = try a.alloc(f32, planes * th * ov);
+                for (0..planes) |p| for (0..th) |r| {
+                    @memcpy(left_tail[(p * th + r) * ov ..][0..ov], tile[(p * th + r) * tw + (tw - ov) ..][0..ov]);
+                };
+                left_w = ov;
             }
-            left_tail = next_left;
-            left_w = next_left_w;
 
-            // Crop the trailing overlap: the next tile owns those pixels.
-            var vh = th;
-            var vw = tw;
-            if (i + 1 < ys.starts.len) vh -= ys.overlaps[i];
-            if (j + 1 < xs.starts.len) vw -= xs.overlaps[j];
-
-            for (0..chans) |c| {
-                for (0..frames) |f| {
-                    for (0..vh) |r| {
-                        const src = ((c * frames + f) * th + r) * tw;
-                        const dst = ((c * frames + f) * height + (out_y + r)) * width + out_x;
-                        @memcpy(out[dst..][0..vw], tile[src..][0..vw]);
-                    }
+            // Crop the trailing overlaps: the next tile owns those pixels, and the
+            // bottom one goes to the next row's strip.
+            const vw = if (last_col) tw else tw - xs.overlaps[j];
+            const vh = th - new_h;
+            for (0..planes) |p| {
+                for (0..vh) |r| {
+                    @memcpy(out[(p * height + out_y + r) * width + out_x ..][0..vw], tile[(p * th + r) * tw ..][0..vw]);
+                }
+                for (0..new_h) |r| {
+                    @memcpy(new_strip[(p * new_h + r) * width + out_x ..][0..vw], tile[(p * th + vh + r) * tw ..][0..vw]);
                 }
             }
             out_x += vw;
             last_h = vh;
-            th = th;
-            tw = tw;
         }
-        @memcpy(row_tails, new_tails);
+        std.debug.assert(out_x == width);
+        strip = new_strip;
+        strip_h = new_h;
         out_y += last_h;
     }
     std.debug.assert(out_y == height);

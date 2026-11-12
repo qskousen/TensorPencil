@@ -30,6 +30,15 @@
 //! - Audio rows are channel-major, with `w` pinned to the extremes of the video
 //!   frame's `w` grid and `h` fixed at 0. See `audioGrid`.
 //!
+//! The IMAGE release (`Config.audio == false`) is the same trunk with no audio
+//! stream, packed `[text | reference images | image]` at one latent frame, and
+//! its `video_out` is a PDD bank: `pdd_steps` heads, row block 0 a full head and
+//! the rest offsets, distilled on a sigma grid the checkpoint's `config` metadata
+//! declares. A step projects through the dt-weighted mix of the grid intervals it
+//! spans (`HeadSpan.select`), which depends on where the SAMPLER goes next, so the
+//! forward needs the schedule (`Inputs.sample_sigmas`). The mixes are built once
+//! at load (`FinalLayer.video_heads`).
+//!
 //! Reference is ComfyUI: comfy/ldm/minimax/model.py plus the layout half of
 //! comfy_extras/nodes_minimax_h3.py. The VAEs are minimax_h3_vae.zig (video) and
 //! minimax_h3_audio.zig (audio); the GPU twins are minimax_h3_cuda.zig and
@@ -237,6 +246,55 @@ pub fn adaptCanvas(width: usize, height: usize) struct { w: usize, h: usize } {
     return .{ .w = cw, .h = ch };
 }
 
+/// MiniMax-H3-Image's reference sizing (`_size_short_edge`): scale so the short
+/// edge lands in `[low, high]`, aspect kept, each side rounded (half to even) to
+/// the 32 px canvas grid. The vision tower's copy is `(1024, 1024)`, the VAE's
+/// `(1024, 2048)`. Returns `(w, h)`, the reference's own order.
+pub fn imageRefSize(width: usize, height: usize, low: usize, high: usize) struct { w: usize, h: usize } {
+    const short: f64 = @floatFromInt(@min(width, height));
+    const target = @min(@max(short, @as(f64, @floatFromInt(low))), @as(f64, @floatFromInt(high)));
+    const scale = target / short;
+    const canvas = 32;
+    return .{
+        .w = @max(canvas, roundTo(@as(f64, @floatFromInt(width)) * scale, canvas)),
+        .h = @max(canvas, roundTo(@as(f64, @floatFromInt(height)) * scale, canvas)),
+    };
+}
+
+pub const image_ref_short_edge = 1024;
+pub const image_ref_vae_max_short_edge = 2048;
+/// The seed the image VAEs draw their posterior sample with.
+pub const image_encode_seed = 42;
+
+/// The reference's condition noise augmentation (`_cond_video_rows`), in place
+/// over ONE condition's patchified rows: `aug * r + (1 - aug) * noise`, the noise
+/// torch's CPU `randn` at `seed` over the rows' shape. Every condition restarts the
+/// same stream, so call this once per condition with the same seed. A no-op at
+/// `aug >= 1`. The same noise is drawn every step, so applying it once is exact.
+pub fn augmentCondRows(gpa: std.mem.Allocator, rows: []f32, seed: u64, aug: f32) !void {
+    if (aug >= 1.0) return;
+    const noise = try gpa.alloc(f32, rows.len);
+    defer gpa.free(noise);
+    tp_core.noise.randn(noise, seed, .torch_cpu);
+    // `1.0 - aug` is a Python float (f64) rounded to f32 by the tensor op
+    const rest: f32 = @floatCast(1.0 - @as(f64, aug));
+    for (rows, noise) |*r, n| r.* = aug * r.* + rest * n;
+}
+
+/// Packs each condition's rows into `out` in layout order, each taking the
+/// reference's visual condition noise with the stream restarted at `seed`.
+pub fn packCondRows(gpa: std.mem.Allocator, out: []f32, conds: []const []const f32, seed: u64) !void {
+    var at: usize = 0;
+    for (conds) |c| {
+        if (at + c.len > out.len) return error.CondLengthMismatch;
+        const dst = out[at..][0..c.len];
+        @memcpy(dst, c);
+        try augmentCondRows(gpa, dst, seed, visual_cond_timestep);
+        at += c.len;
+    }
+    if (at != out.len) return error.CondLengthMismatch;
+}
+
 /// Python's `round` (half to EVEN) times `m`, matching the reference's
 /// `round(v / m) * m`. Half-up differs at exactly half a multiple.
 fn roundTo(v: f64, m: usize) usize {
@@ -333,6 +391,15 @@ pub const Config = struct {
     /// Per-axis rope frequency count. The packed rope width is `6 * this`: three
     /// axes, halves duplicated.
     rope_inv_freq_len: usize,
+    /// False on the image checkpoints, which drop the audio stream entirely: no
+    /// `audio_patch_proj`, no `audio_out`, no audio rows in the sequence.
+    audio: bool = true,
+    /// Output heads stacked in `video_out` (a PDD bank), 1 for a plain head. Not
+    /// readable off the shapes: the checkpoint's `config` metadata declares it.
+    pdd_steps: usize = 1,
+    /// The bank's decreasing sigma grid, `pdd_steps + 1` points from 1 to 0, read
+    /// from the same metadata; see `pddSigmas`.
+    pdd_sigma_buf: [max_pdd_steps + 1]f64 = @splat(0),
 
     norm_eps: f32 = 1e-5,
     qk_norm_eps: f32 = 1e-5,
@@ -365,21 +432,38 @@ pub const Config = struct {
         return self.adaln_curve_grid != null;
     }
 
-    /// Read the config off the checkpoint's own tensor shapes, the way
-    /// `comfy/model_detection.py` does. Nothing here is guessed from a name.
+    /// The PDD bank's sigma grid, empty for a plain head.
+    pub fn pddSigmas(self: *const Config) []const f64 {
+        return if (self.pdd_steps > 1) self.pdd_sigma_buf[0 .. self.pdd_steps + 1] else &.{};
+    }
+
+    /// Read the config off the checkpoint's own tensor shapes and its `config`
+    /// metadata, the way `comfy/model_detection.py` does. Nothing here is guessed
+    /// from a name.
     pub fn detect(store: WeightStore) !Config {
         const video_proj = try dimsOf(store, "video_patch_proj.weight");
         try video_proj.rank(2);
         const hidden = video_proj.d[0];
 
+        var cfg_out: Config = undefined;
+        try readTransformerMeta(store, &cfg_out);
+        const pdd_steps = cfg_out.pdd_steps;
+
         const video_out = try dimsOf(store, "final_layer.video_out.weight");
         try video_out.rank(2);
-        // patch 1x2x2, so the head emits four spatial sub-positions per channel
-        if (video_out.d[0] != latent_channels * patch_t * patch_h * patch_w) return error.ShapeMismatch;
+        // patch 1x2x2, so a head emits four spatial sub-positions per channel
+        if (video_out.d[0] != latent_channels * patch_t * patch_h * patch_w * pdd_steps) return error.ShapeMismatch;
 
-        const audio_out = try dimsOf(store, "final_layer.audio_out.weight");
-        try audio_out.rank(2);
-        if (audio_out.d[0] != audio_latent_channels) return error.ShapeMismatch;
+        const audio = store.get("audio_patch_proj.weight") != null;
+        if (audio) {
+            if (pdd_steps > 1) {
+                std.log.err("minimax_h3: PDD heads on an audio-video checkpoint are not supported", .{});
+                return error.UnsupportedCheckpoint;
+            }
+            const audio_out = try dimsOf(store, "final_layer.audio_out.weight");
+            try audio_out.rank(2);
+            if (audio_out.d[0] != audio_latent_channels * pdd_steps) return error.ShapeMismatch;
+        }
 
         const q_norm = try dimsOf(store, "blocks.0.attn.q_norm.weight");
         try q_norm.rank(1);
@@ -426,9 +510,55 @@ pub const Config = struct {
             .time_embed_dim = time_embed_dim,
             .adaln_curve_grid = curve_grid,
             .rope_inv_freq_len = inv_freq.d[0],
+            .audio = audio,
+            .pdd_steps = pdd_steps,
+            .pdd_sigma_buf = cfg_out.pdd_sigma_buf,
         };
     }
 };
+
+pub const max_pdd_steps = 16;
+
+/// The MiniMax-H3-Image release's grid, ASCENDING in f32 as the reference's sigma
+/// table holds it, for a schedule wanted before a checkpoint is open. A loaded
+/// checkpoint's own is `DiT.pdd_grid`.
+pub const release_pdd_grid = [_]f32{ 0.0, 0.23200887441635132, 0.5327739119529724, 0.75, 0.8875485062599182, 0.9675236940383911, 1.0 };
+
+/// `pdd_steps` and `pdd_sigmas` from the checkpoint's `config` metadata
+/// (`{"transformer": {...}}`), into `out`'s PDD fields. Absent metadata is a plain
+/// head. A bank without its grid is refused: the video models derive theirs from
+/// the runtime flow shift (`pdd_grid` in the reference), which a head mixed once
+/// at load cannot follow.
+fn readTransformerMeta(store: WeightStore, out: *Config) !void {
+    out.pdd_steps = 1;
+    out.pdd_sigma_buf = @splat(0);
+    const text = store.metaString("config") orelse return;
+
+    var buf: [16 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const Meta = struct {
+        transformer: struct {
+            pdd_steps: usize = 1,
+            pdd_sigmas: []const f64 = &.{},
+        } = .{},
+    };
+    const parsed = std.json.parseFromSliceLeaky(Meta, fba.allocator(), text, .{ .ignore_unknown_fields = true }) catch |e| {
+        std.log.err("minimax_h3: unreadable `config` metadata ({t})", .{e});
+        return error.UnsupportedCheckpoint;
+    };
+    const t = parsed.transformer;
+    if (t.pdd_steps == 0 or t.pdd_steps > max_pdd_steps) return error.UnsupportedCheckpoint;
+    out.pdd_steps = t.pdd_steps;
+    if (t.pdd_steps == 1) return;
+    if (t.pdd_sigmas.len != t.pdd_steps + 1) {
+        std.log.err("minimax_h3: a {d}-head PDD bank without a {d}-point `pdd_sigmas` grid is not supported", .{ t.pdd_steps, t.pdd_steps + 1 });
+        return error.UnsupportedCheckpoint;
+    }
+    for (t.pdd_sigmas[1..], t.pdd_sigmas[0..t.pdd_steps]) |next, prev| {
+        if (!(next < prev)) return error.UnsupportedCheckpoint;
+    }
+    @memcpy(out.pdd_sigma_buf[0..t.pdd_sigmas.len], t.pdd_sigmas);
+}
 
 /// A tensor's dims, COPIED out of the view.
 ///
@@ -832,11 +962,14 @@ pub const PackedLayout = struct {
             ref_cursor += r.timeSpan();
         }
 
-        // target audio, then target video: always the last two segments
-        const n_audio = s.audio_t * audio_channels;
-        try segments.append(alloc, .{ .start = row, .stop = row + n_audio, .kind = .audio });
-        try appendAudioGrid(alloc, &pos, target_cursor, s.audio_t, audio_w_low, audio_w_high);
-        row += n_audio;
+        // target audio, then target video, always last; an image has no audio
+        // segment at all rather than an empty one
+        if (s.audio_t > 0) {
+            const n_audio = s.audio_t * audio_channels;
+            try segments.append(alloc, .{ .start = row, .stop = row + n_audio, .kind = .audio });
+            try appendAudioGrid(alloc, &pos, target_cursor, s.audio_t, audio_w_low, audio_w_high);
+            row += n_audio;
+        }
 
         const n_video = s.latent_t * frame_rows;
         try segments.append(alloc, .{ .start = row, .stop = row + n_video, .kind = .video });
@@ -959,6 +1092,8 @@ pub const Attn = struct {
     q_norm: []f32,
     k_norm: []f32,
     out: Lin,
+    /// The checkpoint asks for ComfyUI's int8 attention here (`ops.sage_attn`).
+    int8: bool = false,
 };
 
 /// SwiGLU MLP. `fc1` emits `2 * ffn` and the halves are `[gate; value]` in that
@@ -999,11 +1134,93 @@ pub const FinalLayer = struct {
     norm: []f32,
     adaln: Weight,
     adaln_bias: []f32,
-    video_out: Weight,
-    video_bias: []f32,
-    audio_out: Weight,
-    audio_bias: []f32,
+    /// One video head per PDD interval, in `HeadSpan.index` order; a plain
+    /// checkpoint has exactly one. Each is mixed once at load and never written
+    /// again, because both device weight caches key on the host pointer.
+    video_heads: []Head,
+    /// Null on the image checkpoints.
+    audio_out: ?Head,
 };
+
+/// An f32 output projection and its bias. A mixed PDD head keeps the bank's tag,
+/// so a single-head LoRA (which ComfyUI applies to head 0, the base of every
+/// interval's mix) lands on it unchanged.
+pub const Head = struct {
+    w: Weight,
+    bias: []f32,
+};
+
+/// The PDD heads a step consumes: grid intervals `[start, stop)`.
+pub const HeadSpan = struct {
+    start: usize,
+    stop: usize,
+
+    /// Position of `[start, stop)` among every interval of an `n`-head bank,
+    /// ordered by start then stop.
+    pub fn index(self: HeadSpan, n: usize) usize {
+        std.debug.assert(self.start < self.stop and self.stop <= n);
+        // intervals starting before `start`: n + (n - 1) + ... + (n - start + 1)
+        return self.start * (2 * n - self.start + 1) / 2 + (self.stop - self.start - 1);
+    }
+
+    pub fn count(n: usize) usize {
+        return n * (n + 1) / 2;
+    }
+
+    /// The reference's choice for a step from `sigma`: its successor in the
+    /// sampler's own schedule, then the grid points nearest each end. The step
+    /// always spans at least one interval. `sample_sigmas` is the schedule the
+    /// sampler is walking; its nearest entry stands in for `sigma`.
+    pub fn select(grid: []const f64, sigma: f32, sample_sigmas: []const f32) !HeadSpan {
+        if (sample_sigmas.len == 0) return error.PddNeedsSchedule;
+        const n = grid.len - 1;
+        var i: usize = 0;
+        for (sample_sigmas, 0..) |s, k| {
+            if (@abs(s - sigma) < @abs(sample_sigmas[i] - sigma)) i = k;
+        }
+        const next = sample_sigmas[@min(i + 1, sample_sigmas.len - 1)];
+        const start = @min(nearest(grid, sigma), n - 1);
+        const stop = @max(nearest(grid, next), start + 1);
+        return .{ .start = start, .stop = stop };
+    }
+
+    fn nearest(grid: []const f64, s: f32) usize {
+        const v: f64 = s;
+        var best: usize = 0;
+        for (grid, 0..) |g, k| {
+            if (@abs(g - v) < @abs(grid[best] - v)) best = k;
+        }
+        return best;
+    }
+};
+
+/// Every interval's mixed head from a stacked bank: `rows[0] + sum_k w_k rows[k]`
+/// over `k` in `[max(start, 1), stop)`, with `w_k` interval k's share of the
+/// step's sigma drop. Row block 0 is a full head and the rest are offsets from it,
+/// so block 0 never takes a weight of its own.
+fn mixPddHeads(alloc: std.mem.Allocator, bank: []align(1) const f32, bank_bias: []const f32, grid: []const f64, rows: usize, cols: usize, tag: ?[]const u8) ![]Head {
+    const n = grid.len - 1;
+    std.debug.assert(bank.len == n * rows * cols and bank_bias.len == n * rows);
+    const heads = try alloc.alloc(Head, HeadSpan.count(n));
+    for (0..n) |start| for (start + 1..n + 1) |stop| {
+        var total: f64 = 0;
+        for (start..stop) |k| total += grid[k] - grid[k + 1];
+        const w = try alloc.alloc(f32, rows * cols);
+        const b = try alloc.alloc(f32, rows);
+        @memcpy(w, bank[0 .. rows * cols]);
+        @memcpy(b, bank_bias[0..rows]);
+        for (@max(start, 1)..stop) |k| {
+            // the reference rounds each share to the activation dtype before use
+            const share: f32 = @floatCast((grid[k] - grid[k + 1]) / total);
+            for (w, bank[k * rows * cols ..][0 .. rows * cols]) |*o, v| o.* += share * v;
+            for (b, bank_bias[k * rows ..][0..rows]) |*o, v| o.* += share * v;
+        }
+        var hw = Weight.fromF32(w, rows, cols);
+        hw.tag = tag;
+        heads[(HeadSpan{ .start = start, .stop = stop }).index(n)] = .{ .w = hw, .bias = b };
+    };
+    return heads;
+}
 
 pub const DiT = struct {
     arena: std.heap.ArenaAllocator,
@@ -1011,8 +1228,8 @@ pub const DiT = struct {
 
     video_patch: Weight,
     video_patch_bias: []f32,
-    audio_patch: Weight,
-    audio_patch_bias: []f32,
+    /// Null on the image checkpoints, as is `final.audio_out`.
+    audio_patch: ?Head,
     condition_proj: Weight,
     condition_bias: []f32,
 
@@ -1021,6 +1238,9 @@ pub const DiT = struct {
     adaln_t_table: []f32,
     /// `[rope_inv_freq_len]` f32, shared by all three position axes.
     rope_inv_freq: []f32,
+    /// The PDD grid ASCENDING in f32, the image family's sigma table
+    /// (`schedule.SigmaTable.pdd_grid`). Empty for a plain head.
+    pdd_grid: []f32,
 
     refiner: []RefinerBlock,
     refiner_final_norm: []f32,
@@ -1038,6 +1258,14 @@ pub const DiT = struct {
 
     pub const lins_per_block = @typeInfo(DeviceLin).@"enum".field_names.len;
     pub const DeviceLin = enum { q, k, v, out, gate, up, fc2 };
+
+    /// The video head a step from `sigma` projects through: the only one, or
+    /// the PDD mix of the grid intervals the step spans.
+    pub fn videoHead(self: *const DiT, sigma: f32, sample_sigmas: []const f32) !Head {
+        if (self.cfg.pdd_steps == 1) return self.final.video_heads[0];
+        const span = try HeadSpan.select(self.cfg.pddSigmas(), sigma, sample_sigmas);
+        return self.final.video_heads[span.index(self.cfg.pdd_steps)];
+    }
 
     /// Keep blocks `[lo, hi)` only, for a test that runs part of the trunk. The device
     /// linears are indexed by block, so they are cut with them.
@@ -1072,7 +1300,18 @@ pub const DiT = struct {
         }
         for (self.refiner) |*b| try attachBlockLora(&b.attn, &b.mlp, stack);
         // The plain weights `matW` and the device heads apply hits to by tag.
-        inline for (.{ self.video_patch, self.audio_patch, self.condition_proj, self.final.adaln, self.final.video_out, self.final.audio_out }) |w| _ = try stack.resolve(w);
+        inline for (.{ self.video_patch, self.condition_proj, self.final.adaln }) |w| _ = try stack.resolve(w);
+        if (self.audio_patch) |hd| _ = try stack.resolve(hd.w);
+        if (self.final.audio_out) |hd| _ = try stack.resolve(hd.w);
+        // Every mixed head shares the bank's tag, so one resolve sees them all. A
+        // hit as tall as the whole bank patches every interval's rows, which a head
+        // mixed at load cannot take.
+        for (try stack.resolve(self.final.video_heads[0].w)) |h| {
+            if (h.target.out_dim != self.cfg.videoPatchDim()) {
+                std.log.err("minimax_h3: a LoRA on the {d}-head PDD bank is not supported", .{self.cfg.pdd_steps});
+                return error.UnsupportedLora;
+            }
+        }
         return stack.finishAttach(gpa);
     }
 
@@ -1135,21 +1374,26 @@ pub const DiT = struct {
         // chunks allocated afterwards would be missed by deinit.
         const video_patch = try l.mat("video_patch_proj.weight", .{}, hidden, cfg.videoPatchDim());
         const video_patch_bias = try l.vec("video_patch_proj.bias", .{}, hidden);
-        const audio_patch = try l.mat("audio_patch_proj.weight", .{}, hidden, audio_latent_channels);
-        const audio_patch_bias = try l.vec("audio_patch_proj.bias", .{}, hidden);
+        const audio_patch: ?Head = if (cfg.audio) .{
+            .w = try l.mat("audio_patch_proj.weight", .{}, hidden, audio_latent_channels),
+            .bias = try l.vec("audio_patch_proj.bias", .{}, hidden),
+        } else null;
         const condition_proj = try l.mat("condition_proj.weight", .{}, hidden, cfg.text_dim);
         const condition_bias = try l.vec("condition_proj.bias", .{}, hidden);
         const adaln_t_table = try l.vec("adaln_t_table", .{}, cfg.adaln_curve_grid.? * t_dim);
         const rope_inv_freq = try l.vec("rope.inv_freq", .{}, cfg.rope_inv_freq_len);
+        const pdd_grid = try alloc.alloc(f32, cfg.pddSigmas().len);
+        for (pdd_grid, 0..) |*g, i| g.* = @floatCast(cfg.pddSigmas()[cfg.pddSigmas().len - 1 - i]);
         const refiner_final_norm = try l.vec("token_refiner.final_norm.weight", .{}, hidden);
         const final: FinalLayer = .{
             .norm = try l.vec("final_layer.norm.weight", .{}, hidden),
             .adaln = try l.mat("final_layer.adaln_proj.linear.weight", .{}, 2 * hidden, t_dim),
             .adaln_bias = try l.vec("final_layer.adaln_proj.linear.bias", .{}, 2 * hidden),
-            .video_out = try l.mat("final_layer.video_out.weight", .{}, cfg.videoPatchDim(), hidden),
-            .video_bias = try l.vec("final_layer.video_out.bias", .{}, cfg.videoPatchDim()),
-            .audio_out = try l.mat("final_layer.audio_out.weight", .{}, audio_latent_channels, hidden),
-            .audio_bias = try l.vec("final_layer.audio_out.bias", .{}, audio_latent_channels),
+            .video_heads = try l.videoHeads(),
+            .audio_out = if (cfg.audio) .{
+                .w = try l.mat("final_layer.audio_out.weight", .{}, audio_latent_channels, hidden),
+                .bias = try l.vec("final_layer.audio_out.bias", .{}, audio_latent_channels),
+            } else null,
         };
         const device_lins = try alloc.alloc(Weight, blocks.len * DiT.lins_per_block);
         for (blocks, 0..) |b, bi| {
@@ -1170,11 +1414,11 @@ pub const DiT = struct {
             .video_patch = video_patch,
             .video_patch_bias = video_patch_bias,
             .audio_patch = audio_patch,
-            .audio_patch_bias = audio_patch_bias,
             .condition_proj = condition_proj,
             .condition_bias = condition_bias,
             .adaln_t_table = adaln_t_table,
             .rope_inv_freq = rope_inv_freq,
+            .pdd_grid = pdd_grid,
             .refiner = refiner,
             .refiner_final_norm = refiner_final_norm,
             .blocks = blocks,
@@ -1222,6 +1466,27 @@ const Loader = struct {
         return view.toF32Alloc(l.alloc);
     }
 
+    /// `final_layer.video_out` as a single head, or every interval's mix of its
+    /// PDD bank. The heads are an f32 island in every checkpoint, which the
+    /// device arms rely on.
+    fn videoHeads(l: Loader) ![]Head {
+        const rows = l.cfg.videoPatchDim();
+        const cols = l.cfg.hidden;
+        const n = l.cfg.pdd_steps;
+        const w = try l.mat("final_layer.video_out.weight", .{}, rows * n, cols);
+        if (w.dtype != .f32) {
+            std.log.err("minimax_h3: final_layer.video_out is {t}, expected f32", .{w.dtype});
+            return error.UnsupportedCheckpoint;
+        }
+        const bias = try l.vec("final_layer.video_out.bias", .{}, rows * n);
+        if (n == 1) {
+            const one = try l.alloc.alloc(Head, 1);
+            one[0] = .{ .w = w, .bias = bias };
+            return one;
+        }
+        return mixPddHeads(l.alloc, std.mem.bytesAsSlice(f32, w.bytes), bias, l.cfg.pddSigmas(), rows, cols, w.tag);
+    }
+
     fn lin(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Lin {
         return .{ .w = try l.mat(fmt, args, rows, cols) };
     }
@@ -1229,11 +1494,13 @@ const Loader = struct {
     fn attn(l: Loader, comptime fmt: []const u8, args: anytype) !Attn {
         const cfg = l.cfg;
         const inner = cfg.n_heads * cfg.head_dim;
+        var buf: [128]u8 = undefined;
         return .{
             .qkv = try l.lin(fmt ++ ".qkv_proj.weight", args, 3 * inner, cfg.hidden),
             .q_norm = try l.vec(fmt ++ ".q_norm.weight", args, cfg.head_dim),
             .k_norm = try l.vec(fmt ++ ".k_norm.weight", args, cfg.head_dim),
             .out = try l.lin(fmt ++ ".out_proj.weight", args, cfg.hidden, inner),
+            .int8 = ops.sage_attn.requested(l.store, try l.name(&buf, fmt, args, "")),
         };
     }
 
@@ -1760,6 +2027,9 @@ pub const Inputs = struct {
     text: []const f32,
     /// The VIDEO sigma. The audio stream's is derived from it and `shifts`.
     sigma: f32,
+    /// The schedule the sampler is walking. A PDD checkpoint picks its head from
+    /// where this step goes next (`HeadSpan.select`); a plain one ignores it.
+    sample_sigmas: []const f32 = &.{},
     /// Per-row denoise mask for the VIDEO target segment (1 = generate), one value
     /// per 2x2 patch row, `latent_t * frame_rows` long. Empty generates everything.
     /// Reduced ONCE PER RENDER by `maskRowValues`, not per step: it depends on the
@@ -1864,6 +2134,14 @@ fn runAttn(
 
     const att = try gpa.alloc(f32, seq * inner);
     defer gpa.free(att);
+    if (ops.sage_attn.use(a.int8, cfg.head_dim, seq)) {
+        // ComfyUI quantizes the bf16 activations it holds
+        for ([_][]f32{ q, k, v }) |t| for (t) |*e| {
+            e.* = tp_core.dtype.bf16ToF32(tp_core.dtype.f32ToBf16(e.*));
+        };
+        try ops.sage_attn.attention(io, gpa, att, q, k, v, seq, seq, cfg.n_heads, 1 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim))));
+        return matLin(io, gpa, out[0 .. seq * cfg.hidden], cfg.hidden, att, seq, a.out, null, dit.lora);
+    }
     try ops.attention.attention(io, gpa, att, q, k, v, .{
         .seq_q = seq,
         .seq_kv = seq,
@@ -1975,7 +2253,8 @@ pub fn embedPacked(
             v_off += n;
         } else {
             const src = audio_rows[a_off * audio_latent_channels ..][0 .. n * audio_latent_channels];
-            try matW(io, gpa, dit.lora, dst, src, n, dit.audio_patch, dit.audio_patch_bias);
+            const ap = dit.audio_patch orelse return error.NoAudioStream;
+            try matW(io, gpa, dit.lora, dst, src, n, ap.w, ap.bias);
             a_off += n;
         }
     }
@@ -1985,12 +2264,13 @@ pub fn embedPacked(
     if (in.audio_mask.len > 0) std.debug.assert(in.audio_mask.len == at * audio_channels);
     // The result OWNS its per-row index tables when a mask is in play, so the
     // caller deinits it. `gpa` rather than the arena above, which is about to go.
+    // An image has no audio schedule: shift parity puts its label on the video one.
     return Timesteps.initMasked(
         gpa,
         in.sigma,
         in.visual_cond_aug,
         in.audio_cond_aug,
-        in.shifts,
+        if (at == 0) .{ .video = 1, .audio = 1 } else in.shifts,
         in.video_mask,
         in.audio_mask,
     );
@@ -2040,7 +2320,8 @@ pub const DeviceStep = struct {
     packed_h: []f32,
     ts: Timesteps,
     t_emb: []f32,
-    /// `[block][label][tag][slot][hidden]`, premul folded; see `buildModTable`.
+    /// `[block][label][tag][slot][hidden]`, premul folded; see `buildModTable`. Empty
+    /// when the device builds it (`init`'s `host_mod`).
     mod: []f32,
     /// `[label][2][hidden]`, norm folded; see `buildFinalModTable`.
     fmod: []f32,
@@ -2048,8 +2329,15 @@ pub const DeviceStep = struct {
     /// empty unless a denoise mask relabels rows inside them.
     video_idx: []u32,
     audio_idx: []u32,
+    /// `modRow` of every sequence row, masked or not: what lets a band modulate in one
+    /// launch whichever segments it crosses.
+    mod_rows: []u32,
+    /// The video head this step projects through (`DiT.videoHead`).
+    video_head: Head,
 
-    pub fn init(dit: *const DiT, io: std.Io, gpa: std.mem.Allocator, layout: *const PackedLayout, in: Inputs) !DeviceStep {
+    /// `host_mod` false leaves `mod` empty for a device that builds the table itself
+    /// (`AdalnDevice`) from `t_emb`.
+    pub fn init(dit: *const DiT, io: std.Io, gpa: std.mem.Allocator, layout: *const PackedLayout, in: Inputs, host_mod: bool) !DeviceStep {
         const cfg = dit.cfg;
         const h = cfg.hidden;
         const packed_h = try gpa.alloc(f32, layout.seq_len * h);
@@ -2061,9 +2349,9 @@ pub const DeviceStep = struct {
         const t_emb = try gpa.alloc(f32, n_labels * cfg.time_embed_dim);
         errdefer gpa.free(t_emb);
         timeEmbed(t_emb, dit.adaln_t_table, cfg.adaln_curve_grid.?, cfg.time_embed_dim, ts.labels());
-        const mod = try gpa.alloc(f32, dit.blocks.len * n_labels * 3 * 6 * h);
+        const mod = try gpa.alloc(f32, if (host_mod) dit.blocks.len * n_labels * 3 * 6 * h else 0);
         errdefer gpa.free(mod);
-        try buildModTable(dit, io, gpa, mod, t_emb, n_labels);
+        if (host_mod) try buildModTable(dit, io, gpa, mod, t_emb, n_labels);
         const fmod = try gpa.alloc(f32, n_labels * 2 * h);
         errdefer gpa.free(fmod);
         try buildFinalModTable(dit, io, gpa, fmod, t_emb, n_labels);
@@ -2071,7 +2359,31 @@ pub const DeviceStep = struct {
         const video_idx = try widen(gpa, ts.rowsFor(.video));
         errdefer gpa.free(video_idx);
         const audio_idx = try widen(gpa, ts.rowsFor(.audio));
-        return .{ .packed_h = packed_h, .ts = ts, .t_emb = t_emb, .mod = mod, .fmod = fmod, .video_idx = video_idx, .audio_idx = audio_idx };
+        errdefer gpa.free(audio_idx);
+        const mod_rows = try modRows(gpa, layout, &ts);
+        errdefer gpa.free(mod_rows);
+        const video_head = try dit.videoHead(in.sigma, in.sample_sigmas);
+        return .{ .packed_h = packed_h, .ts = ts, .t_emb = t_emb, .mod = mod, .fmod = fmod, .video_idx = video_idx, .audio_idx = audio_idx, .mod_rows = mod_rows, .video_head = video_head };
+    }
+
+    /// A modulation row of `[label][tag]`, the order `buildModTable` lays them out in.
+    pub fn modRow(label: usize, tag: Tag) usize {
+        return label * 3 + @backingInt(tag);
+    }
+
+    fn modRows(gpa: std.mem.Allocator, layout: *const PackedLayout, ts: *const Timesteps) ![]u32 {
+        const out = try gpa.alloc(u32, layout.seq_len);
+        var covered: usize = 0;
+        for (layout.segments) |sg| covered += sg.len();
+        std.debug.assert(covered == layout.seq_len);
+        for (layout.segments) |sg| {
+            const per_row = ts.rowsFor(sg.kind);
+            for (out[sg.start..sg.stop], 0..) |*o, r| {
+                const label = if (per_row.len > 0) per_row[r] else ts.rowFor(sg.kind);
+                o.* = @intCast(modRow(label, sg.kind.tag()));
+            }
+        }
+        return out;
     }
 
     fn widen(gpa: std.mem.Allocator, src: []const u8) ![]u32 {
@@ -2088,11 +2400,13 @@ pub const DeviceStep = struct {
         gpa.free(self.fmod);
         gpa.free(self.video_idx);
         gpa.free(self.audio_idx);
+        gpa.free(self.mod_rows);
         self.* = undefined;
     }
 
-    /// The two heads' rows to the sampler's planar velocities: unpack, then NEGATE,
-    /// the reference's last act and invisible in every norm.
+    /// The heads' rows to the sampler's planar velocities: unpack, then NEGATE,
+    /// the reference's last act and invisible in every norm. `out_audio` and
+    /// `a_rows` are empty on an image.
     pub fn finish(layout: *const PackedLayout, out_video: []f32, out_audio: []f32, v_rows: []const f32, a_rows: []const f32) void {
         unpatchifyVideo(out_video, v_rows, layout.latent_t, layout.latent_h, layout.latent_w);
         for (out_video) |*x| x.* = -x.*;
@@ -2115,6 +2429,7 @@ pub fn finalHeads(
     ts: *const Timesteps,
     t_emb: []const f32,
     trunk: []const f32,
+    video_head: Head,
     out_video: []f32,
     out_audio: []f32,
 ) !void {
@@ -2132,19 +2447,17 @@ pub fn finalHeads(
     try matW(io, gpa, dit.lora, fmod, t_emb, labels.len, dit.final.adaln, dit.final.adaln_bias);
 
     const video_seg = layout.segmentOf(.video).?;
-    const audio_seg = layout.segmentOf(.audio).?;
-    const scratch = try a.alloc(f32, @max(video_seg.len(), audio_seg.len()) * hidden);
+    const audio_seg = layout.segmentOf(.audio);
+    const audio_len = if (audio_seg) |sg| sg.len() else 0;
+    const scratch = try a.alloc(f32, @max(video_seg.len(), audio_len) * hidden);
     const v_rows = try a.alloc(f32, video_seg.len() * cfg.videoPatchDim());
-    const a_rows = try a.alloc(f32, audio_seg.len() * audio_latent_channels);
-    try finalHead(dit, io, gpa, v_rows, trunk, scratch, fmod, video_seg, ts.rowFor(.video), ts.rowsFor(.video), dit.final.video_out, dit.final.video_bias);
-    try finalHead(dit, io, gpa, a_rows, trunk, scratch, fmod, audio_seg, ts.rowFor(.audio), ts.rowsFor(.audio), dit.final.audio_out, dit.final.audio_bias);
-
-    // Unpack, then NEGATE. Both streams: the reference's last act is
-    // `[-video_out, -audio_out]`, and it is invisible in every norm.
-    unpatchifyVideo(out_video, v_rows, layout.latent_t, layout.latent_h, layout.latent_w);
-    for (out_video) |*x| x.* = -x.*;
-    unpackAudio(out_audio, a_rows, layout.audio_t);
-    for (out_audio) |*x| x.* = -x.*;
+    const a_rows = try a.alloc(f32, audio_len * audio_latent_channels);
+    try finalHead(dit, io, gpa, v_rows, trunk, scratch, fmod, video_seg, ts.rowFor(.video), ts.rowsFor(.video), video_head.w, video_head.bias);
+    if (audio_seg) |sg| {
+        const head = dit.final.audio_out orelse return error.NoAudioStream;
+        try finalHead(dit, io, gpa, a_rows, trunk, scratch, fmod, sg, ts.rowFor(.audio), ts.rowsFor(.audio), head.w, head.bias);
+    }
+    DeviceStep.finish(layout, out_video, out_audio, v_rows, a_rows);
 }
 
 /// One denoiser step: the packed forward over both streams.
@@ -2193,7 +2506,7 @@ pub fn forward(
         modGate(ws.h, ws.blk, ws.mod, layout, &ts, hidden, 5);
     }
 
-    try finalHeads(dit, io, gpa, layout, &ts, t_emb, ws.h, out_video, out_audio);
+    try finalHeads(dit, io, gpa, layout, &ts, t_emb, ws.h, try dit.videoHead(in.sigma, in.sample_sigmas), out_video, out_audio);
 }
 
 
@@ -3254,6 +3567,125 @@ test "a uniform denoise mask gives the same forward either way it is expressed" 
     try std.testing.expect(relL2(um_a, cs_a) > 1e-3);
 }
 
+const image_forward_fixture = @embedFile("assets/minimax_h3_image_forward.safetensors");
+
+test "the image forward matches the reference at a toy width, every head interval" {
+    // ComfyUI's `MiniMaxH3ImageModel` at the video fixture's toy width with a
+    // 3-head PDD bank and one reference image (tools/gen_minimax_h3_image_forward.py):
+    // no audio stream, [text | ref | image], and each step's head mixed over the
+    // checkpoint's own grid. The three steps pick intervals [0,1), [0,2) and [1,3).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var st = try tp_core.safetensors.SafeTensors.initFromSlice(gpa, image_forward_fixture);
+    defer st.deinit();
+    var dit = try DiT.load(gpa, .{ .safetensors = &st });
+    defer dit.deinit();
+    const cfg = dit.cfg;
+    try std.testing.expect(!cfg.audio);
+    try std.testing.expect(dit.audio_patch == null and dit.final.audio_out == null);
+    try std.testing.expectEqual(@as(usize, 3), cfg.pdd_steps);
+    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.8, 0.45, 0.0 }, cfg.pddSigmas());
+    try std.testing.expectEqual(HeadSpan.count(3), dit.final.video_heads.len);
+
+    const text_len: usize = 4;
+    const lh: usize = 4;
+    const lw: usize = 6;
+    const rh: usize = 6;
+    const rw: usize = 4;
+
+    const text = try (try st.require("in.text")).toF32Alloc(gpa);
+    defer gpa.free(text);
+    const image = try (try st.require("in.image")).toF32Alloc(gpa);
+    defer gpa.free(image);
+    const ref = try (try st.require("in.ref")).toF32Alloc(gpa);
+    defer gpa.free(ref);
+
+    const refined = try gpa.alloc(f32, text_len * cfg.hidden);
+    defer gpa.free(refined);
+    try refineText(&dit, io, gpa, refined, text, text_len);
+
+    var layout = try PackedLayout.build(gpa, .{ .text_len = text_len, .latent_t = 1, .latent_h = lh, .latent_w = lw, .audio_t = 0 }, &.{}, &.{.{ .kind = .image, .latent_t = 1, .latent_h = rh, .latent_w = rw }}, &.{});
+    defer layout.deinit();
+    try std.testing.expectEqual(@as(usize, 3), layout.segments.len);
+    try std.testing.expect(layout.segmentOf(.audio) == null);
+
+    const cond = try gpa.alloc(f32, layout.video_cond_rows * cfg.videoPatchDim());
+    defer gpa.free(cond);
+    patchifyVideo(cond, ref, 1, rh, rw);
+
+    var ws = try Workspace.init(gpa, cfg, &layout);
+    defer ws.deinit(gpa);
+    const got = try gpa.alloc(f32, image.len);
+    defer gpa.free(got);
+
+    const Step = struct { sigma: f32, schedule: []const f32, span: HeadSpan };
+    const steps = [_]Step{
+        .{ .sigma = 1.0, .schedule = &.{ 1.0, 0.8, 0.45, 0.0 }, .span = .{ .start = 0, .stop = 1 } },
+        .{ .sigma = 1.0, .schedule = &.{ 1.0, 0.45, 0.0 }, .span = .{ .start = 0, .stop = 2 } },
+        .{ .sigma = 0.8, .schedule = &.{ 1.0, 0.8, 0.0 }, .span = .{ .start = 1, .stop = 3 } },
+    };
+    for (steps, 0..) |s, i| {
+        try std.testing.expectEqual(s.span, try HeadSpan.select(cfg.pddSigmas(), s.sigma, s.schedule));
+        try forward(&dit, io, gpa, &ws, &layout, got, &.{}, .{
+            .video = image,
+            .audio = &.{},
+            .text = refined,
+            .sigma = s.sigma,
+            .sample_sigmas = s.schedule,
+            .cond_video = cond,
+        });
+        var name_buf: [16]u8 = undefined;
+        const want = try (try st.require(try std.mem.print(&name_buf, "out.{d}", .{i}))).toF32Alloc(gpa);
+        defer gpa.free(want);
+        const err = relL2(want, got);
+        errdefer std.debug.print("step {d} rel L2 {e}\n", .{ i, err });
+        try std.testing.expect(err < 1e-5);
+    }
+
+    // Step 0 again with the reference's condition noise at its default, seed 7.
+    try augmentCondRows(gpa, cond, 7, visual_cond_timestep);
+    try forward(&dit, io, gpa, &ws, &layout, got, &.{}, .{
+        .video = image,
+        .audio = &.{},
+        .text = refined,
+        .sigma = steps[0].sigma,
+        .sample_sigmas = steps[0].schedule,
+        .cond_video = cond,
+    });
+    const want = try (try st.require("out.aug")).toF32Alloc(gpa);
+    defer gpa.free(want);
+    const err = relL2(want, got);
+    errdefer std.debug.print("augmented rel L2 {e}\n", .{err});
+    try std.testing.expect(err < 1e-5);
+}
+
+test "every condition restarts the noise stream" {
+    const gpa = std.testing.allocator;
+    const a = [_]f32{ 0.5, -1.0, 2.0, 0.25 };
+    const b = [_]f32{ 3.0, 1.0 };
+    var out: [a.len + b.len]f32 = undefined;
+    try packCondRows(gpa, &out, &.{ &a, &b }, 11);
+    var want_a = a;
+    var want_b = b;
+    try augmentCondRows(gpa, &want_a, 11, visual_cond_timestep);
+    try augmentCondRows(gpa, &want_b, 11, visual_cond_timestep);
+    try std.testing.expectEqualSlices(f32, &want_a, out[0..a.len]);
+    try std.testing.expectEqualSlices(f32, &want_b, out[a.len..]);
+    try std.testing.expectError(error.CondLengthMismatch, packCondRows(gpa, out[1..], &.{ &a, &b }, 11));
+}
+
+test "PDD head intervals index every span once" {
+    for (1..max_pdd_steps + 1) |n| {
+        var seen: [HeadSpan.count(max_pdd_steps)]bool = @splat(false);
+        for (0..n) |a| for (a + 1..n + 1) |b| {
+            const i = (HeadSpan{ .start = a, .stop = b }).index(n);
+            try std.testing.expect(i < HeadSpan.count(n) and !seen[i]);
+            seen[i] = true;
+        };
+    }
+}
+
 test "the forward matches the reference at a toy width" {
     // The real checkpoint is 21 GB of int8 and cannot be a unit fixture. What is
     // pinned here is the ARCHITECTURE: ComfyUI's own `MiniMaxH3Model` built at a
@@ -3403,6 +3835,25 @@ test "config is read off the checkpoint's own shapes" {
     try std.testing.expectEqual(cfg.ropeRotDim(), cfg.ropeAngleWidth());
     try std.testing.expectEqual(@as(usize, 32), cfg.head_dim - cfg.ropeRotDim());
     try std.testing.expectEqual(@as(usize, 96), cfg.videoPatchDim());
+}
+
+const h3_image_dit = build_options.model_root ++ "/diffusion_models/h3-image/minimax_h3_image_ggufy_int8_convrot.safetensors";
+
+test "the image release's config: no audio, a 6-head PDD bank on its own grid" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try test_gate.requireModelFile(io, h3_image_dit);
+
+    var st = try SafeTensors.open(gpa, io, h3_image_dit);
+    defer st.deinit();
+    const cfg = try Config.detect(.{ .safetensors = &st });
+    try std.testing.expect(!cfg.audio);
+    try std.testing.expectEqual(@as(usize, 5376), cfg.hidden);
+    try std.testing.expectEqual(@as(usize, 50), cfg.n_layers);
+    try std.testing.expectEqual(@as(usize, 6), cfg.pdd_steps);
+    const grid = cfg.pddSigmas();
+    try std.testing.expectEqual(@as(usize, 7), grid.len);
+    for (grid, 0..) |g, i| try std.testing.expectEqual(@as(f32, @floatCast(g)), release_pdd_grid[grid.len - 1 - i]);
 }
 
 // --- layout parity against the reference -----------------------------------
@@ -3822,6 +4273,61 @@ test "workspace memory is reported before it is allocated" {
 /// Cheap: the adaLN projection is `[6 * hidden * 3, time_embed_dim]` against at
 /// most a handful of timestep rows, so this is a few million MACs against the
 /// trunk's trillions.
+/// Every block's adaLN weights packed for a device to build `buildModTable`'s table each
+/// step (the `adaln_table` kernel): `w` is `[block][18 * hidden][time_embed_dim]` at the
+/// checkpoint's dtype, `aux` per block `[bias 18h | norm1 h | norm2 h]`.
+pub const AdalnDevice = struct {
+    w: []u8,
+    dtype: DType,
+    aux: []f32,
+
+    /// Null when a block's adaLN is in a dtype the kernel does not read or carries a
+    /// scale; the host builds the table then.
+    pub fn init(gpa: std.mem.Allocator, dit: *const DiT) !?AdalnDevice {
+        const h = dit.cfg.hidden;
+        const first = dit.blocks[0].adaln;
+        for (dit.blocks) |*b| {
+            const w = b.adaln;
+            if (w.dtype != first.dtype or w.scale != 1 or w.row_scale != null) return null;
+            switch (w.dtype) {
+                .f32, .f16, .bf16 => {},
+                else => return null,
+            }
+            std.debug.assert(w.rows == 18 * h and w.cols == dit.cfg.time_embed_dim and b.adaln_bias.len == 18 * h);
+        }
+        const per = first.bytes.len;
+        const w = try gpa.alloc(u8, per * dit.blocks.len);
+        errdefer gpa.free(w);
+        const aux = try gpa.alloc(f32, 20 * h * dit.blocks.len);
+        for (dit.blocks, 0..) |*b, bi| {
+            @memcpy(w[bi * per ..][0..per], b.adaln.bytes);
+            const a = aux[bi * 20 * h ..][0 .. 20 * h];
+            @memcpy(a[0 .. 18 * h], b.adaln_bias);
+            @memcpy(a[18 * h .. 19 * h], b.norm1);
+            @memcpy(a[19 * h ..], b.norm2);
+        }
+        return .{ .w = w, .dtype = first.dtype, .aux = aux };
+    }
+
+    pub fn deinit(self: *AdalnDevice, gpa: std.mem.Allocator) void {
+        gpa.free(self.w);
+        gpa.free(self.aux);
+        self.* = undefined;
+    }
+};
+
+/// Builds every step's modulation table on the host, the A/B for `AdalnDevice`.
+pub var force_host_mod: bool = false;
+
+/// Whether this step's modulation table must come from the host: a LoRA reaching an
+/// adaLN, which only `buildModTable` applies, or `force_host_mod`.
+pub fn hostModOnly(dit: *const DiT) bool {
+    if (force_host_mod) return true;
+    const stack = dit.lora orelse return false;
+    for (dit.blocks) |*b| if (stack.forWeight(b.adaln).len > 0) return true;
+    return false;
+}
+
 pub fn buildModTable(
     dit: *const DiT,
     io: std.Io,
@@ -3873,4 +4379,24 @@ test "modality tags are the adaLN row indices, not names" {
     try std.testing.expectEqual(Tag.video, Kind.ref_img.tag());
     try std.testing.expectEqual(Tag.audio, Kind.cond_audio.tag());
     try std.testing.expectEqual(Tag.audio, Kind.ref_audio.tag());
+}
+
+test "image reference sizes match the node's short-edge rule" {
+    // `_size_short_edge` from comfy_extras/nodes_minimax_h3.py, evaluated there.
+    const Case = struct { w: usize, h: usize, lo: usize, hi: usize, ow: usize, oh: usize };
+    const cases = [_]Case{
+        .{ .w = 1000, .h = 750, .lo = 1024, .hi = 2048, .ow = 1376, .oh = 1024 },
+        .{ .w = 4000, .h = 3000, .lo = 1024, .hi = 2048, .ow = 2720, .oh = 2048 },
+        .{ .w = 1024, .h = 1536, .lo = 1024, .hi = 1024, .ow = 1024, .oh = 1536 },
+        .{ .w = 3000, .h = 2000, .lo = 1024, .hi = 1024, .ow = 1536, .oh = 1024 },
+        // 1200 / 32 = 37.5 rounds to the EVEN 38
+        .{ .w = 1200, .h = 1200, .lo = 1024, .hi = 2048, .ow = 1216, .oh = 1216 },
+        .{ .w = 1680, .h = 1050, .lo = 1024, .hi = 1024, .ow = 1632, .oh = 1024 },
+    };
+    for (cases) |c| {
+        const got = imageRefSize(c.w, c.h, c.lo, c.hi);
+        errdefer std.debug.print("{d}x{d} [{d},{d}] -> {d}x{d}\n", .{ c.w, c.h, c.lo, c.hi, got.w, got.h });
+        try std.testing.expectEqual(c.ow, got.w);
+        try std.testing.expectEqual(c.oh, got.h);
+    }
 }

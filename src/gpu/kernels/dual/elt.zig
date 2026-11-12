@@ -62,6 +62,41 @@ pub inline fn silu(e: Env, comptime dt: Dt) void {
     e.stT(.a, dt, i, k.silu(e.ldT(.a, dt, i)));
 }
 
+/// MiniMax H3's per-step modulation table, the layout and values of
+/// `minimax_h3.buildModTable`: a = out `[block][label][tag][slot][h]`, slots
+/// (premul, shift, gate) twice, premul = norm * (1 + scale). b = the adaLN weights
+/// `[block][tag][raw slot][h][k]` in `dt`, raw slots (shift, scale, gate) twice; c = per
+/// block `[bias 18h | norm1 h | norm2 h]`; d = time embeddings `[label][k]`.
+/// u0 = elements, u1 = h, u2 = labels, u3 = k.
+pub inline fn adalnTable(e: Env, comptime dt: Dt) void {
+    const i = k.elem(e) orelse return;
+    const h = e.u(1);
+    const kk = e.u(3);
+    const col = i % h;
+    var r = i / h;
+    const slot = r % 6;
+    r /= 6;
+    const tag = r % 3;
+    r /= 3;
+    const label = r % e.u(2);
+    const block = r / e.u(2);
+    // A premul reads its scale, the shift its shift: the table swaps those two.
+    const raw = switch (slot % 3) {
+        0 => slot + 1,
+        1 => slot - 1,
+        else => slot,
+    };
+    const o = (tag * 6 + raw) * h + col;
+    const wb = (block * 18 * h + o) * kk;
+    var acc: f32 = 0;
+    var j: u32 = 0;
+    while (j < kk) : (j += 1) acc += e.ld(.d, label * kk + j) * e.ldT(.b, dt, wb + j);
+    const aux = block * 20 * h;
+    var v = acc + e.ld(.c, aux + o);
+    if (slot % 3 == 0) v = e.ld(.c, aux + 18 * h + (slot / 3) * h + col) * (1.0 + v);
+    e.st(.a, i, v);
+}
+
 /// a = silu(a) * b, both `dt`. u0 = n.
 pub inline fn siluMul(e: Env, comptime dt: Dt) void {
     const i = k.elem(e) orelse return;
@@ -292,7 +327,7 @@ pub inline fn ropeInter(e: Env, comptime dt: Dt) void {
     const x0 = e.ldT(.a, dt, at);
     const x1 = e.ldT(.a, dt, at + 1);
     e.stT(.a, dt, at, x0 * cos_v - x1 * sin_v);
-    e.stT(.a, dt, at + 1, x0 * sin_v + x1 * cos_v);
+    e.stT(.a, dt, at + 1, x1 * cos_v + x0 * sin_v);
 }
 
 inline fn rotateHalf(e: Env, base: u32, half: u32, cos_v: f32, sin_v: f32) void {
@@ -1698,32 +1733,6 @@ pub inline fn gnCombine(e: Env) void {
     }
     e.st(.d, g, mean);
     e.st(.d, e.u(0) + g, 1.0 / @sqrt(m2 / count + e.f(0)));
-}
-
-/// Fused per-head rmsnorm + interleaved rope + output scale, in place, one thread per
-/// (pos, head) row. a = x [rows][2*half] (`dt`), b = norm weight, c = freqs.
-/// u0 = rows, u1 = half, u2 = sin_off, u3 = n_heads, f0 = scale, f1 = eps.
-pub inline fn qknormRope(e: Env, comptime dt: Dt) void {
-    const row = k.elem(e) orelse return;
-    const half = e.u(1);
-    const pos = row / e.u(3);
-    const base = row * half * 2;
-    var sum: f32 = 0;
-    var w: u32 = 0;
-    while (w < half * 2) : (w += 1) {
-        const v = e.ldT(.a, dt, base + w);
-        sum += v * v;
-    }
-    const inv = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(half * 2)) + e.f(1));
-    w = 0;
-    while (w < half) : (w += 1) {
-        const x0 = e.ldT(.a, dt, base + w * 2) * inv * e.ld(.b, w * 2);
-        const x1 = e.ldT(.a, dt, base + w * 2 + 1) * inv * e.ld(.b, w * 2 + 1);
-        const cos_v = e.ld(.c, pos * half + w);
-        const sin_v = e.ld(.c, e.u(2) + pos * half + w);
-        e.stT(.a, dt, base + w * 2, (x0 * cos_v - x1 * sin_v) * e.f(0));
-        e.stT(.a, dt, base + w * 2 + 1, (x0 * sin_v + x1 * cos_v) * e.f(0));
-    }
 }
 
 // ---- Mage-VAE ----------------------------------------------------------------

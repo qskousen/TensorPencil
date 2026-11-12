@@ -174,12 +174,17 @@ pub const SigmaTable = union(enum) {
     /// Flow matching like `.flux`, but a 1000-rung table under a differently-rounded
     /// form of the same formula, see `discreteFlowSigma`.
     discrete_flow: f32,
+    /// MiniMax-H3-Image (`MiniMaxH3ImageModelSampling`): a checkpoint's PDD sigma
+    /// grid, ASCENDING and in f32, borrowed, lerped over a 1000-rung table with
+    /// multiplier 1000. The stock schedulers at the bank's step count then land
+    /// beside the grid points its heads were distilled for. No shift.
+    pdd_grid: []const f32,
 
     pub fn len(self: SigmaTable) usize {
         return switch (self) {
             .flux => flux_table_len,
             .discrete => |l| l.len,
-            .discrete_flow => discrete_flow_table_len,
+            .discrete_flow, .pdd_grid => discrete_flow_table_len,
         };
     }
 
@@ -189,6 +194,8 @@ pub const SigmaTable = union(enum) {
             .flux => |shift| fluxTableAt(shift, i),
             .discrete => |l| l[i],
             .discrete_flow => |shift| discreteFlowTableAt(shift, i),
+            // `arange(1, 1001) / 1000 * 1000`, each op in f32
+            .pdd_grid => |g| gridSigma(g, @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(discrete_flow_table_len)) * pdd_multiplier),
         };
     }
 
@@ -213,6 +220,7 @@ pub const SigmaTable = union(enum) {
             // is `sigma * multiplier` with Z-Image's multiplier of 1.0, an identity
             // only because of that value, not a property of the class.
             .flux, .discrete_flow => sigma,
+            .pdd_grid => sigma * pdd_multiplier,
             .discrete => |l| blk: {
                 const log_sigma: f32 = @log(sigma);
                 var best: usize = 0;
@@ -235,9 +243,28 @@ pub const SigmaTable = union(enum) {
             .flux => |shift| fluxSigma(shift, t),
             .discrete => |l| interpLadder(l, t),
             .discrete_flow => |shift| discreteFlowSigma(shift, t),
+            .pdd_grid => |g| gridSigma(g, t),
         };
     }
 };
+
+/// `MiniMaxH3ImageModelSampling`'s multiplier, inherited from `ModelSamplingDiscreteFlow`.
+pub const pdd_multiplier: f32 = 1000;
+
+/// `MiniMaxH3ImageModelSampling.sigma(timestep)`: the ascending grid lerped at
+/// fractional index `clamp(t / 1000, 0, 1) * n`, every op in f32.
+pub fn gridSigma(grid: []const f32, timestep: f32) f32 {
+    const n = grid.len - 1;
+    const pos = std.math.clamp(timestep / pdd_multiplier, 0, 1) * @as(f32, @floatFromInt(n));
+    const i: usize = @min(@as(usize, @intFromFloat(@floor(pos))), n - 1);
+    return torchLerp(grid[i], grid[i + 1], pos - @as(f32, @floatFromInt(i)));
+}
+
+/// `torch.lerp` on f32: two formulas split at weight 0.5, so each end is exact.
+fn torchLerp(a: f32, b: f32, w: f32) f32 {
+    if (@abs(w) < 0.5) return a + w * (b - a);
+    return b - (b - a) * (1 - w);
+}
 
 // --- the schedulers ---------------------------------------------------------
 
@@ -291,7 +318,7 @@ pub const Scheduler = enum {
         return switch (table) {
             // `simple` for both flow-matching tables: it is what ComfyUI's own
             // Z-Image Turbo template selects, alongside 8 steps and cfg 1.
-            .flux, .discrete_flow => .simple,
+            .flux, .discrete_flow, .pdd_grid => .simple,
             .discrete => .normal,
         };
     }
@@ -1057,5 +1084,34 @@ test "the diffusers flow schedule matches diffusers bit for bit, base and turbo"
             defer gpa.free(via);
             for (c.bits, via) |b, g| try std.testing.expectEqual(b, @as(u32, @bitCast(g)));
         }
+    }
+}
+
+test "the PDD grid table reproduces ComfyUI's schedules bit for bit" {
+    // `calculate_sigmas` over `MiniMaxH3ImageModelSampling` on the MiniMax-H3-Image
+    // release grid, f32 bits as the reference returns them.
+    const grid_desc = [_]f64{ 1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0 };
+    var grid: [grid_desc.len]f32 = undefined;
+    for (&grid, 0..) |*g, i| g.* = @floatCast(grid_desc[grid_desc.len - 1 - i]);
+    const table: SigmaTable = .{ .pdd_grid = &grid };
+
+    const Case = struct { sched: Scheduler, bits: []const u32 };
+    const cases = [_]Case{
+        .{ .sched = .simple, .bits = &.{ 0x3f800000, 0x3f77b825, 0x3f6340dc, 0x3f400000, 0x3f089cd1, 0x3e6e316b, 0 } },
+        .{ .sched = .simple, .bits = &.{ 0x3f800000, 0x3f79c3ba, 0x3f6d7302, 0x3f5a68c9, 0x3f400000, 0x3f164ae7, 0x3ec3c8ce, 0x3e322ecd, 0 } },
+        .{ .sched = .normal, .bits = &.{ 0x3f800000, 0x3f73a023, 0x3f553ebf, 0x3f1ee9aa, 0x3e969da7, 0x3afdfe2f, 0 } },
+        .{ .sched = .normal, .bits = &.{ 0x3f800000, 0x3f78e239, 0x3f691c63, 0x3f4f3792, 0x3f286ec0, 0x3ee5b38b, 0x3e4d569f, 0x3afdfe2f, 0 } },
+        .{ .sched = .beta, .bits = &.{ 0x3f800000, 0x3f7b75e9, 0x3f6a60d2, 0x3f403616, 0x3edbce9d, 0x3e03247e, 0 } },
+        .{ .sched = .beta, .bits = &.{ 0x3f800000, 0x3f7d2819, 0x3f768a20, 0x3f63bea7, 0x3f403616, 0x3f06d9a7, 0x3e805606, 0x3da55a89, 0 } },
+        .{ .sched = .sgm_uniform, .bits = &.{ 0x3f800000, 0x3f77b298, 0x3f6344f8, 0x3f4025a6, 0x3f08b324, 0x3e6fb885, 0 } },
+        .{ .sched = .sgm_uniform, .bits = &.{ 0x3f800000, 0x3f79c5f2, 0x3f6d7df3, 0x3f5a8505, 0x3f4025a6, 0x3f169539, 0x3ec4bfc3, 0x3e33eb4a, 0 } },
+    };
+    const gpa = std.testing.allocator;
+    for (cases) |c| {
+        const sig = try build(gpa, table, c.sched, c.bits.len - 1);
+        defer gpa.free(sig);
+        errdefer std.debug.print("{t} at {d} steps: {any}\n", .{ c.sched, c.bits.len - 1, sig });
+        try std.testing.expectEqual(c.bits.len, sig.len);
+        for (sig, c.bits) |s, b| try std.testing.expectEqual(b, @as(u32, @bitCast(s)));
     }
 }

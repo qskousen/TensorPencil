@@ -154,7 +154,8 @@ const Int8Conf = struct {
     };
 };
 
-/// Formats with a reader of their own, all of which run BEFORE this one. Seeing one on a
+/// Formats with a reader of their own, all of which run BEFORE this one, and `mxfp8`, which
+/// has none and must be refused rather than read. Seeing one on a
 /// weight that reached the int8 arm means the sidecars and the metadata disagree, and
 /// reading those bytes as int8 gives finite, plausible, wrong numbers.
 const foreign_formats = [_][]const u8{

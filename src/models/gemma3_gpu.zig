@@ -801,8 +801,9 @@ pub const VulkanLM = struct {
         const ctx = self.be;
         const freqs = if (cfg.isGlobal(l)) self.freqs_global else self.freqs_local;
         if (seq == 1) ctx.independent(2);
-        try ctx.opQkNormRope(self.bufs.q, try nbuf(ctx, layer.q_norm), freqs, seq * cfg.n_heads, cfg.head_dim, cfg.n_heads, self.len, self.sin_off, cfg.rms_eps);
-        try ctx.opQkNormRope((try self.kvOut(l, seq))[0], try nbuf(ctx, layer.k_norm), freqs, seq * cfg.n_kv_heads, cfg.head_dim, cfg.n_kv_heads, self.len, self.sin_off, cfg.rms_eps);
+        try ctx.opNormRope(self.bufs.q, self.bufs.q, try nbuf(ctx, layer.q_norm), freqs, .{ .rows = seq * cfg.n_heads, .dim = cfg.head_dim, .heads = cfg.n_heads, .pairs = cfg.head_dim / 2, .sin_off = self.sin_off, .eps = cfg.rms_eps, .pos0 = self.len });
+        const k_out = (try self.kvOut(l, seq))[0];
+        try ctx.opNormRope(k_out, k_out, try nbuf(ctx, layer.k_norm), freqs, .{ .rows = seq * cfg.n_kv_heads, .dim = cfg.head_dim, .heads = cfg.n_kv_heads, .pairs = cfg.head_dim / 2, .sin_off = self.sin_off, .eps = cfg.rms_eps, .pos0 = self.len });
     }
     pub fn applyRope(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
         _ = l;

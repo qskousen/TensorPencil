@@ -323,6 +323,30 @@ pub fn interpolatePos(out: []f32, pos: []const f32, pos_grid: usize, dim: usize,
     }
 }
 
+/// The rope's cos and sin tables, `[rows][freqsPerAxis]` each, one row per patch
+/// position along the LONGER axis.
+///
+/// ⚠️ Sized by the grid, not by the learned position table: a picture past
+/// `pos_grid` patches on a side (768 px here) is every MiniMax-H3-Image edit, and
+/// a table cut at `pos_grid` reads its last rows out of bounds.
+pub fn ropeTable(alloc: std.mem.Allocator, cfg: Config, gh: usize, gw: usize) !struct { cos: []f32, sin: []f32, rows: usize } {
+    const half = cfg.freqsPerAxis();
+    const rows = @max(gh, gw);
+    const cos = try alloc.alloc(f32, rows * half);
+    errdefer alloc.free(cos);
+    const sin = try alloc.alloc(f32, rows * half);
+    for (0..rows) |p| {
+        for (0..half) |k| {
+            const exp = @as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(2 * half));
+            const inv = std.math.pow(f64, cfg.rope_theta, -exp);
+            const ang = @as(f64, @floatFromInt(p)) * inv;
+            cos[p * half + k] = @floatCast(@cos(ang));
+            sin[p * half + k] = @floatCast(@sin(ang));
+        }
+    }
+    return .{ .cos = cos, .sin = sin, .rows = rows };
+}
+
 /// Row-major patch order -> the 2x2-merged block order every other stage speaks:
 /// `(block_row, block_col, intra_row, intra_col)`.
 pub fn mergeOrder(out: []f32, x: []const f32, dim: usize, gh: usize, gw: usize, merge: usize) void {
@@ -702,8 +726,8 @@ pub const Encoded = struct {
 };
 
 /// `patches` is `[gh * gw][patchDim]`, already normalized and flattened in
-/// `(channel, temporal, ky, kx)` order, in ROW-MAJOR patch order as
-/// `process_qwen2vl_images` emits it.
+/// `(channel, temporal, ky, kx)` order, in the 2x2-merged block order
+/// `process_qwen2vl_images` emits (`preprocessStill`).
 pub fn encode(
     v: *const Vit,
     io: std.Io,
@@ -742,23 +766,10 @@ pub fn encode(
     mergeOrder(pos, pos_row, dim, gh, gw, cfg.merge);
     for (x, pos) |*d, p| d.* += p;
 
-    // Rope tables over the two axes, `freqsPerAxis` frequencies each.
     const half = cfg.freqsPerAxis();
-    const cos = try a.alloc(f32, cfg.pos_grid * half);
-    const sin = try a.alloc(f32, cfg.pos_grid * half);
-    {
-        const max_hw = @max(gh, gw);
-        std.debug.assert(max_hw <= cfg.pos_grid);
-        for (0..cfg.pos_grid) |p| {
-            for (0..half) |k| {
-                const exp = @as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(2 * half));
-                const inv = std.math.pow(f64, cfg.rope_theta, -exp);
-                const ang = @as(f64, @floatFromInt(p)) * inv;
-                cos[p * half + k] = @floatCast(@cos(ang));
-                sin[p * half + k] = @floatCast(@sin(ang));
-            }
-        }
-    }
+    const rope = try ropeTable(a, cfg, gh, gw);
+    const cos = rope.cos;
+    const sin = rope.sin;
     const py = try a.alloc(u32, np);
     const px = try a.alloc(u32, np);
     patchCoords(py, px, gh, gw, cfg.merge);
@@ -1151,6 +1162,18 @@ test "image preprocessing reproduces the reference's patch matrix" {
     const rel_m = relL2(merged, got.merged);
     errdefer std.debug.print("merged-from-our-pixels rel L2 {e}\n", .{rel_m});
     try testing.expect(rel_m < 1e-4);
+
+    // A grid past the 48-row position table on one axis: the rope table follows
+    // the grid.
+    const wp = try (try st.require("in.patches_wide")).toF32Alloc(gpa);
+    defer gpa.free(wp);
+    var wide = try encode(&v, testing.io, gpa, wp, 4, 52);
+    defer wide.deinit(gpa);
+    const want_wide = try (try st.require("out.merged_wide")).toF32Alloc(gpa);
+    defer gpa.free(want_wide);
+    const rel_w = relL2(want_wide, wide.merged);
+    errdefer std.debug.print("wide grid rel L2 {e}\n", .{rel_w});
+    try testing.expect(rel_w < 1e-4);
 }
 
 test "the resize is nearest-to-grid with banker's rounding, not floor" {

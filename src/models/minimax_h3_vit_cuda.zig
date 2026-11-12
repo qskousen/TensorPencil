@@ -130,19 +130,9 @@ pub fn encode(
     defer gpa.free(pos);
     h3vit.mergeOrder(pos, pos_row, dim, gh, gw, cfg.merge);
 
-    const cos = try gpa.alloc(f32, cfg.pos_grid * half);
-    defer gpa.free(cos);
-    const sin = try gpa.alloc(f32, cfg.pos_grid * half);
-    defer gpa.free(sin);
-    for (0..cfg.pos_grid) |p| {
-        for (0..half) |kk| {
-            const exp = @as(f64, @floatFromInt(2 * kk)) / @as(f64, @floatFromInt(2 * half));
-            const inv = std.math.pow(f64, cfg.rope_theta, -exp);
-            const ang = @as(f64, @floatFromInt(p)) * inv;
-            cos[p * half + kk] = @floatCast(@cos(ang));
-            sin[p * half + kk] = @floatCast(@sin(ang));
-        }
-    }
+    const rope = try h3vit.ropeTable(gpa, cfg, gh, gw);
+    defer gpa.free(rope.cos);
+    defer gpa.free(rope.sin);
     const py = try gpa.alloc(u32, np);
     defer gpa.free(py);
     const px = try gpa.alloc(u32, np);
@@ -155,11 +145,11 @@ pub fn encode(
         pos2[t * 2 + 1] = px[t];
     }
 
-    const sin_off = cfg.pos_grid * half;
+    const sin_off = rope.rows * half;
     var freqs_d = try be.tensorCreate(2 * sin_off * 4);
     defer be.tensorDestroy(&freqs_d);
-    try be.tensorUpload(sized(freqs_d, 0, sin_off * 4), std.mem.sliceAsBytes(cos));
-    try be.tensorUpload(sized(freqs_d, sin_off * 4, sin_off * 4), std.mem.sliceAsBytes(sin));
+    try be.tensorUpload(sized(freqs_d, 0, sin_off * 4), std.mem.sliceAsBytes(rope.cos));
+    try be.tensorUpload(sized(freqs_d, sin_off * 4, sin_off * 4), std.mem.sliceAsBytes(rope.sin));
     var pos2_d = try be.tensorCreate(np * 2 * 4);
     defer be.tensorDestroy(&pos2_d);
     try be.tensorUpload(pos2_d, std.mem.sliceAsBytes(pos2));

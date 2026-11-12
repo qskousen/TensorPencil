@@ -296,20 +296,24 @@ const Dev = struct {
         const cfg = d.model.cfg;
         const hd = cfg.headDim();
         const half = hd / 2;
-        try d.be.qkNorm(d.ws.q_d, d.ws.q_d, try normBuf(d.be, qnorm), rows * cfg.heads, hd, eps);
-        try d.be.qkNorm(d.ws.k_d, d.ws.k_d, try normBuf(d.be, knorm), rows * cfg.heads, hd, eps);
-        try d.be.ropeHalf(d.ws.q_d, d.sess.freqs_d, rows, cfg.heads, half, d.sess.seq * half, 0);
-        try d.be.ropeHalf(d.ws.k_d, d.sess.freqs_d, rows, cfg.heads, half, d.sess.seq * half, 0);
+        inline for (.{ .{ d.ws.q_d, qnorm }, .{ d.ws.k_d, knorm } }) |t| {
+            try d.be.normRope(t[0], t[0], try normBuf(d.be, t[1]), d.sess.freqs_d, .{ .rows = rows * cfg.heads, .dim = hd, .heads = cfg.heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = eps });
+        }
     }
 
     pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {
         try d.be.opScale(buf, f, n);
     }
 
-    pub fn attention(d: Dev, rows: usize) !void {
+    pub fn int8Attention(d: Dev, requested: bool) bool {
+        return ops.sage_attn.use(requested, d.model.cfg.headDim(), d.seq);
+    }
+
+    pub fn attention(d: Dev, rows: usize, int8: bool) !void {
         const cfg = d.model.cfg;
         const hd = cfg.headDim();
         const sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        if (int8) return d.be.opSageAttn(d.ws.q_d, d.ws.k_d, d.ws.v_d, d.ws.attn_d, rows, rows, cfg.heads, sc);
         try d.be.opAttnTC(d.ws.q_d, d.ws.k_d, d.ws.v_d, d.ws.attn_d, rows, cfg.heads, cfg.heads, hd, sc);
     }
 

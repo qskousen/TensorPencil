@@ -37,7 +37,10 @@ Vulkan push layouts and the CUDA wrappers remap. It holds:
   the H3 audio kernels;
 - every block-quant dequantizer (f16, bf16 and f32 output, raw row-major input);
 - the row reductions (rmsnorm, grouped rmsnorm, layernorm, the two fused norm+AdaLN kernels,
-  l2norm, GroupNorm statistics, int8 row max), one subgroup per row.
+  the per-head norm+RoPE, l2norm, GroupNorm statistics, int8 row max), one subgroup per row.
+
+Gate for the per-head norm+RoPE: `norm-rope-test` (both backends, byte-identical to rmsnorm then
+each rope layout then the cast).
 
 Per backend: the tensor-core GEMMs and MMQ pipes (`cuda/kernels.zig`, `coopmat.zig`), the dp4a
 GEMVs, the attention decompositions, the graph-capture kernels that read `g_state`, and anything
@@ -240,6 +243,9 @@ Cosmos-Predict2 trunk conditioned through a T5-indexed LLM adapter over Qwen3-0.
 - ⚠️ **Vulkan int4 is W4A8-shaped, not W4A4** (no `sint4` coopmat): the weight decodes to int8 per
   GEMM (`i4_decode_t`). The same file scores differently per backend. Both 4-bit formats decode
   per GEMM, never at load.
+- The CUDA activation prep (`kernels.buildPrep`) loads 16 bytes a thread when the row is aligned
+  (`PrepLoad.vec`, `diffusion-profile --ab scalarprep`) and can make `silu(gate) * up` as it loads
+  (`PrepLoad.silu_mul`, `--ab silu`); both give the bytes of the plain path (`prep-vec-test`).
 - The Vulkan int8 activation prep is one fused f32 kernel (`coopmat.buildFusedPrepI8`, built per
   width by `Context.i8PrepPipe`, plan from `coopmat.fusedPrepPlan`) at any width that is a multiple
   of 256 up to 32768; past that it takes the 3-pass chain. It matches `ops.matmul.emulateActQuant`.
@@ -271,6 +277,12 @@ VIDEO_PLAN.md is the roadmap; the conventions live in the `minimax_h3*` module h
   the dial's width, deltas and MLP planes f32. An f16 residual is stored divided by 256 with every
   RMSNorm reading it at `eps / 65536`. The clip path takes the dials (`ClipOptions`,
   `generate-clip --dit-act`) and reruns one dtype wider on a non-finite step.
+- The int8 checkpoints ask for ComfyUI's int8 attention in every block; CUDA and the CPU run it
+  where a band attends to more than 1024 keys, Vulkan runs ordinary attention.
+- Each step's modulation table (50 blocks x labels x 18 x hidden) is built on the device from the
+  resident adaLN weights (`minimax_h3.AdalnDevice`, the `adaln_table` dual kernel), byte-identical to
+  the host's `buildModTable` (`minimax-h3-cuda-test`, `minimax-h3-vk-test`; Vulkan under `NoContraction`); a LoRA on an adaLN takes the host table
+  (`diffusion-profile --ab hostmod`).
 - Trunk K/V are stored bf16 and read in place wherever the attention takes 16-bit operands
   (`Backend.attnReads16`: cuDNN, and `flash_attn` on zig-cuda), 2 bytes per element against an
   f32 copy plus its f16 staging. Q and the output narrow per band.
@@ -283,6 +295,23 @@ VIDEO_PLAN.md is the roadmap; the conventions live in the `minimax_h3*` module h
   read that figure as "no defect", not a precision bound.
 
 Gates: `minimax-h3-cuda-test` / `minimax-h3-vk-test` (`TP_H3_MASK=binary|graded|spatial`, `TP_H3_BLOCKS` depth, `TP_H3_ACT` residual dtype, `TP_H3_WEIGHT_ONLY`); `minimax-h3-vae-cuda-test` / `minimax-h3-vae-vk-test` (`TP_VAE_MAG`); `minimax-h3-audio-cuda-test` / `minimax-h3-audio-vk-test`; `minimax-h3-vae-encode-cuda-test`, `minimax-h3-audio-encode-cuda-test`; `te-test <file> --minimax-h3`, and `TP_TE_VISION=1 te-test` for the vision path.
+
+### 2E'. MiniMax-H3-Image (`minimax_h3_image`)
+
+The H3 trunk without audio, one latent frame, a PDD bank of output heads mixed per step
+(`minimax_h3.HeadSpan`), sampled on the checkpoint's own grid (`SigmaTable.pdd_grid`). Its VAE
+is H3's encoder with a single-frame 2D-rope ViT decoder.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **DiT trunk + mixed PDD head** | ✅ | ✅ | ✅ | ✅ | the H3 rows above; the mixed heads are f32, built at load. int8, w4a8 and q4_k rendered on cuda |
+| **Image VAE decode** (16 heads, 24 blocks, 2D rope) | ✅ | ✅ | ✅ | ✅ | `minimax_h3_vae{,_gpu,_cuda}.zig` (`rope_dims = 2`, `patch_t = 1`), the still path's spatial tiles |
+| **Edit pictures** (vision blocks + reference rows) | ✅ | ✅ (tower and VAE encode on host) | ✅ | ✅ | `Session.encodeH3Image`; references are a posterior sample (`encodeSample`) |
+
+Gates: `minimax-h3-cuda-test <image ckpt>` / `minimax-h3-vk-test <image ckpt>` (one frame, a
+reference, a step spanning three PDD intervals); `TP_VAE_IMAGE=1 minimax-h3-vae-cuda-test` /
+`-vk-test`; `minimax-h3-vit-check <te> <png> <out>` for the vision tower against a dump;
+`tools/render_h3_image_ref.py` for the whole render against ComfyUI.
 
 ### 2F. Diffusion speed snapshot
 
@@ -312,6 +341,7 @@ ComfyUI on the same card.
 | RTX 3090 | Anima | — | 1056x1584 | 30, 5 | — | 3.11 | 2.32 | 1.62 | 1.31 (bf16) |
 | RTX 3090 | SenseNova | — | 1024² | 8, 1 | 30.30 | — | — | 0.48 | — |
 | RTX 3090 | MiniMax H3 | int8 | 256², 5 frames | 8, — | — | 0.88 | — | 0.14 | — |
+| RTX 3090 | MiniMax H3 Image | int8 | 1024² | 6, 1 | — | — | — | 0.27 | 0.28 |
 | RTX 3090 | Mage-Flow | — | 1024² | 30, 5 | — | — | — | 0.755 | 0.621 |
 | RTX 3090 | MOSS-Image | int8 | 1024² | 25, 2.5 | — | 2.29 | 1.70 | 1.17 | 0.694 (int8 attention) |
 
@@ -408,8 +438,9 @@ split-half 4-axis RoPE. Silent conventions: `moss_image.zig`'s and
   a GGUF's tiled (h % k). Every GDN kernel takes the group (`Config.v_group`); permuting
   the heads instead would break an int8 convrot `out_proj`.
 - The `1 + w` norms and `A = -exp(A_log)` are applied at load, in f32.
-- ComfyUI runs this checkpoint with int8 attention, which nothing here runs; compare
-  against `tools/gen_moss_image_render.py --no-int8-attention`.
+- The int8 file asks for ComfyUI's int8 attention in every layer, and CUDA and the CPU run it
+  (`--int8-attention off` is the control). Vulkan runs ordinary attention, so a Vulkan render
+  differs from ComfyUI's by that much.
 - At full depth near sigma 1 the W8A8 noise ratio is reported, not gated.
 
 Gates: `moss-image-cuda-test` / `moss-image-vk-test` (`--layers`, `--lat`, `--cap`,
@@ -737,11 +768,13 @@ Gates: `zig build test` (SenseNova's layout offsets pinned against
 | **Conv2d** (patch gather + GEMM, fused 2× upsample) | ✅ f32 | ✅ f16-TC (co≥96) / f32 | ✅ | ✅ (cuDNN NHWC conv for stride-1 3×3; gather for stride-2 and upsample) | f32 weights; f16 TC wide-co; f16 or bf16 activation storage either side |
 | **Attention** (DiT GQA 48/12, hd128) | f32 | f16 two-pass TC (+flash), `models/attn_gpu.zig` | `opAttnTC`: fused `flash_attn` (`kernels.buildFlashAttn`) at hd 64/128, f32 scores in registers | cuDNN SDPA | f16/bf16 operands |
 | **VAE mid-block attn** | f32 | f32 scores plane, query-banded | TC flash, f32 scores band | cuDNN SDPA | see below |
+| **ComfyUI int8 attention** (a checkpoint's `comfy_attention.config`; hd 128, more than 1024 keys) | `ops/sage_attn.zig` | ✗ (ordinary attention) | `opSageAttn` (`gpu/cuda/sage.zig`): byte-identical to comfy-kitchen's kernels | ↤ | Q/K/V f32, f16 or bf16 |
 | RMSNorm + AdaLN modulate | ✅ | `rms_apply_mod`/`modulate` or `rms_mod` (dual) | `rms_mod` (dual) | ↤ | f32 (+h16) |
-| Weighted RMSNorm (Q/K, sandwich) | ✅ | `rmsnorm` (dual, subgroup per row) | `rmsnorm` (dual); hand `qk_rmsnorm_par` for <64 rows at ≥1024 wide | ↤ | f32/f16 |
+| Weighted RMSNorm (sandwich, hidden) | ✅ | `rmsnorm` via `opRmsNorm` (dual, subgroup per row) | `rmsnorm` (dual); hand `qk_rmsnorm_par` for <64 rows at ≥1024 wide | ↤ | f32/f16 |
+| Per-head Q/K norm + RoPE, one pass | ✅ | `norm_rope` via `opNormRope` (dual) | `normRope` (same kernel) | ↤ | f32/f16/bf16 in place, or f32 into f16/bf16; rotate-half or interleaved, partial rotation, output scale |
 | Weightless LayerNorm + modulate | ✅ | `ln_mod` (dual) | ↤ | ↤ | f32 |
 | RoPE (3-axis interleaved) | ✅ | `rope_inter` (dual) | ↤ | ↤ | f32 |
-| SwiGLU / silu-mul | ✅ | `silu_mul{,16,_h16}` (dual) | ↤ | ↤ | f32/f16 |
+| SwiGLU / silu-mul | ✅ | `silu_mul{,16,_h16}` (dual) | ↤, and inside the int8 activation prep (`lin_cuda.linearSiluMul`) when nothing else reads the product | ↤ | f32/f16/bf16 |
 | sigmoid-gated add | ✅ | `sigmoid_mul` (dual) | ↤ | ↤ | f32 |
 | gated residual add | ✅ | `gated_add{,16}` (dual) | ↤ | ↤ | f32/f16 |
 | relu / add_relu | ✅ | `relu` / `add_relu` | `relu` / `add`+`relu` | ↤ | f32 |
@@ -1163,6 +1196,9 @@ path; GGUF `q*` are the **LLM** path.
   raised by its instructions (`ptx.Builder.requires`; fp8 MMA and e4m3 conversion need sm_89 /
   ISA 8.4), and routing asks the device (`lin_cuda.Caps.of`) before choosing a route whose
   kernels need more. Everything else stays at the baseline and runs on newer cards by JIT.
+- ⚠️ **sm_120 has no native int4 tensor cores**: the s4 `mma` is correct there but runs at
+  0.13x the s8 rate (RTX PRO 6000, fused GEMM 7680x6144x6144: s8 658 TOPS, s4 83, e4m3 642;
+  the 3090 runs s4 at 2.3x s8). `cuda-i4-test` prints these rates for the card it runs on.
 - **fp8 W8A8 quantizes the activation to e4m3 at one scale per row** (absmax / 448, round to
   nearest even, no rotation). Denoiser trunks only (`dual_lin.trunk_fp8`); `Use.encoder` and
   `Use.llm` pin fp8 to weight-only. Checked against the CPU fed the same e4m3 activation (`lin-cuda-test`,
@@ -1207,7 +1243,7 @@ One source, SPIR-V and PTX; the full list is `dual_table.entries`. By area:
 - GroupNorm / VAE: `gn_combine` · `gn_apply{,_h16}` · `vae_norm` · `dup_up_add` · `bias_compact{,_h16}` · `bias_add_{f16,h16}` · `add_bias_rows{,_h16}` · `im2col` · `im2col_sd{,_h16}` · `im2col1d`
 - Mage-VAE: `dw_conv3` · `col_mean` · `mul_cols_sigmoid` · `nerf_feat` · `modulate_pr` · `gated_add_pr` · `layernorm_f32_{f16,bf16}` · `patch_scatter` · `win_gather` · `win_scatter`
 - softmax: `softmax_partial` · `softmax_combine`
-- fused: `qknorm_rope16` · `qknorm_rope_f32`
+- fused: `norm_rope{,_f16,_bf16,_f32_f16,_f32_bf16}` (per-head norm and RoPE, every layout)
 - sampling: `argmax_reduce` · `argmax_final` · `topk_reduce` · `penalize`
 - GDN: `gdn_gates{,_batch}` · `gdn_conv_{step,batch,state}` · `gdn_delta_chunk_d{64,128}`
 - attention: `attn_rows_{f32,f16,q8}` · `attn_rows_g{2,4,8}_{f32,f16,q8}` (grouped KV heads) · `attn_merge`
@@ -1318,6 +1354,14 @@ Still hand PTX in `elt.zig`: `qk_rmsnorm_par` · `attn_cross` · `attn_batched` 
 **cuBLASLt** (`src/gpu/cuda/cublaslt.zig`): int8 `R_8I`/`COMPUTE_32I`, f16 `R_16F`, bf16 `R_16BF`,
 batched/prefill GEMM only. **cuDNN** (`src/gpu/cuda/cudnn.zig`): fused SDPA-forward attention,
 legacy conv-forward (VAE). Everything else is hand-PTX.
+
+A W8A8 GEMM in this mode runs on cuBLASLt plus the `irescale` pass or on zig-cuda's hand
+`igemm_pipe_fused`, whichever the first GEMM of that (padded rows, n, k) shape timed faster
+(`Backend.i8Route`); the two store identical bytes. On a 3090 the hand kernel wins at 256 to
+16k rows on every H3 shape, and matches ComfyUI's CUTLASS int8 GEMM on them. `i8-shape-bench
+[--m N]` times both at the sustained clock and compares their bytes. A weight fused from equal parts (a qkv, a gate/up) runs as one GEMM whose
+column planes land in separate buffers (`lin_cuda.gemmPlanes`, `Backend.opI8GemmPlanes`), on the
+hand kernel, int8 route only; every other route and Vulkan run the parts one by one.
 
 ### cpu — `src/ops/*.zig` + ggml (fetched dep, `-Dggml`, default on)
 

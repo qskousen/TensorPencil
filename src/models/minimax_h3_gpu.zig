@@ -44,12 +44,33 @@ pub const Session = struct {
     /// `[seq * pairs]` cos then `[seq * pairs]` sin, f32. `sinOff` is the split.
     freqs_d: Buf = nullBuf,
     pairs: usize,
+    /// `minimax_h3.AdalnDevice` on the device, so a step builds its modulation table
+    /// there; unset when the host has to.
+    adaln_w_d: Buf = nullBuf,
+    adaln_aux_d: Buf = nullBuf,
+    /// A step's time embeddings, `[max_labels][time_embed_dim]`.
+    t_emb_d: Buf = nullBuf,
 
     pub fn init(ctx: *Context, gpa: std.mem.Allocator, dit: *const DiT, layout: *const minimax_h3.PackedLayout) !Session {
         const cfg = dit.cfg;
         const pairs = cfg.ropePairs();
         var s: Session = .{ .seq = layout.seq_len, .pairs = pairs };
         errdefer s.deinit(ctx);
+
+        if (try minimax_h3.AdalnDevice.init(gpa, dit)) |a_| {
+            var a = a_;
+            defer a.deinit(gpa);
+            s.adaln_w_d = try ctx.tensorCreate(a.w.len);
+            try ctx.tensorUpload(s.adaln_w_d, a.w);
+            s.adaln_w_d = s.adaln_w_d.as(switch (a.dtype) {
+                .f16 => .f16,
+                .bf16 => .bf16,
+                else => .f32,
+            });
+            s.adaln_aux_d = try ctx.tensorCreate(a.aux.len * 4);
+            try ctx.tensorUpload(s.adaln_aux_d, std.mem.sliceAsBytes(a.aux));
+            s.t_emb_d = try ctx.tensorCreate(minimax_h3.Timesteps.max_labels * cfg.time_embed_dim * 4);
+        }
 
         var freqs = try minimax_h3.ropeFreqs(gpa, layout.pos, dit.rope_inv_freq);
         defer freqs.deinit(gpa);
@@ -66,8 +87,13 @@ pub const Session = struct {
         return self.seq * self.pairs;
     }
 
+    /// Whether this step's modulation table can be built on the device.
+    pub fn deviceMod(self: Session, dit: *const DiT) bool {
+        return self.adaln_w_d.size > 0 and !minimax_h3.hostModOnly(dit);
+    }
+
     pub fn deinit(self: *Session, ctx: *Context) void {
-        ctx.tensorDestroy(&self.freqs_d);
+        inline for (.{ &self.freqs_d, &self.adaln_w_d, &self.adaln_aux_d, &self.t_emb_d }) |b| ctx.tensorDestroy(b);
     }
 };
 
@@ -89,6 +115,8 @@ pub const Workspace = struct {
     fmod_d: Buf = nullBuf,
     vmask_d: Buf = nullBuf,
     amask_d: Buf = nullBuf,
+    /// `DeviceStep.mod_rows`, u32 per sequence row.
+    modrow_d: Buf = nullBuf,
     /// Every block linear's dispatch, and what it decided for this checkpoint.
     lin: ?lin_gpu.Lin = null,
     lin_plan: lin_gpu.Plan = undefined,
@@ -137,6 +165,7 @@ pub const Workspace = struct {
         ws.fmod_d = try ctx.tensorCreate(minimax_h3.Timesteps.max_labels * 2 * cfg.hidden * 4);
         ws.vmask_d = try ctx.tensorCreate(seq * 4);
         ws.amask_d = try ctx.tensorCreate(seq * 4);
+        ws.modrow_d = try ctx.tensorCreate(seq * 4);
 
         // Padded on BOTH axes: the scores kernel tiles 128x128 and reads whole tiles.
         ws.qh_d = try ctx.tensorCreate(aband * inner * 2);
@@ -171,7 +200,8 @@ pub fn forward(
 ) !void {
     const cfg = dit.cfg;
     std.debug.assert(sess.seq == layout.seq_len);
-    var step = try minimax_h3.DeviceStep.init(dit, io, gpa, layout, in);
+    const device_mod = sess.deviceMod(dit);
+    var step = try minimax_h3.DeviceStep.init(dit, io, gpa, layout, in, !device_mod);
     defer step.deinit(gpa);
 
     try ctx.beginBatch();
@@ -183,8 +213,19 @@ pub fn forward(
         defer gpa.free(bytes);
         try ctx.tensorUpload(ws.x_d, bytes);
     }
-    try ctx.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(step.mod));
+    if (device_mod) {
+        const labels = step.ts.labels().len;
+        const total = dit.blocks.len * labels * 18 * cfg.hidden;
+        try ctx.tensorUpload(sess.t_emb_d, std.mem.sliceAsBytes(step.t_emb));
+        try ctx.opElt(gpu.eltAt("adaln_table", sess.adaln_w_d.dt), ws.mod_d, sess.adaln_w_d, sess.adaln_aux_d, sess.t_emb_d, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(cfg.hidden),
+            .u2 = @intCast(labels),
+            .u3 = @intCast(cfg.time_embed_dim),
+        }, total, 1, 1);
+    } else try ctx.tensorUpload(ws.mod_d, std.mem.sliceAsBytes(step.mod));
     try ctx.tensorUpload(ws.fmod_d, std.mem.sliceAsBytes(step.fmod));
+    try ctx.tensorUpload(ws.modrow_d, std.mem.sliceAsBytes(step.mod_rows));
     var vmask: ?Buf = null;
     var amask: ?Buf = null;
     if (step.video_idx.len > 0) {
@@ -202,10 +243,11 @@ pub fn forward(
 
     const v_rows = try gpa.alloc(f32, layout.segmentOf(.video).?.len() * cfg.videoPatchDim());
     defer gpa.free(v_rows);
-    const a_rows = try gpa.alloc(f32, layout.segmentOf(.audio).?.len() * minimax_h3.audio_latent_channels);
+    const a_len = if (layout.segmentOf(.audio)) |sg| sg.len() else 0;
+    const a_rows = try gpa.alloc(f32, a_len * minimax_h3.audio_latent_channels);
     defer gpa.free(a_rows);
     try ctx.tensorDownload(ws.q_d, std.mem.sliceAsBytes(v_rows));
-    try ctx.tensorDownload(ws.k_d, std.mem.sliceAsBytes(a_rows));
+    if (a_len > 0) try ctx.tensorDownload(ws.k_d, std.mem.sliceAsBytes(a_rows));
     minimax_h3.DeviceStep.finish(layout, out_video, out_audio, v_rows, a_rows);
 }
 
@@ -272,6 +314,11 @@ const Dev = struct {
         try d.l().gemm(d.ws.lin_plan, g, y, w, .{});
     }
 
+    /// One GEMM per plane: the Vulkan dispatcher has no fused-plane kernel.
+    pub fn gemmPlanes(d: Dev, g: lin_gpu.Group, ys: []const Buf, _: Weight, _: usize, planes: []const Weight) !void {
+        for (ys, planes) |y, w| try d.gemm(g, y, w);
+    }
+
     pub fn linear(d: Dev, y: Buf, x: Buf, rows: usize, w: Weight) !void {
         try d.l().linear(d.ws.lin_plan, y, 0, x, rows, w);
     }
@@ -280,27 +327,23 @@ const Dev = struct {
         try d.l().linearAt(d.ws.lin_plan, y, y_off, x, 0, rows, w, bias);
     }
 
-    pub fn qkNorm(d: Dev, x: Buf, w: []const f32, rows: usize) !void {
-        const n = rows * d.cfg.n_heads;
-        try d.ctx.opElt(.rmsnorm, x, x, try normBuf(d.ctx, w), null, .{
-            .u0 = @intCast(n),
-            .u1 = @intCast(d.cfg.head_dim),
-            .f0 = d.cfg.qk_norm_eps,
-        }, n, 1, 1);
+    pub fn modRows(d: Dev) Buf {
+        return d.ws.modrow_d;
     }
 
-    /// PARTIAL split-half rope: `pairs` pairs of a `head_dim`-wide head, so the tail
-    /// passes through untouched.
-    pub fn rope(d: Dev, x: Buf, rows: usize, pos0: usize) !void {
-        const total = rows * d.cfg.n_heads * d.sess.pairs;
-        try d.ctx.opElt(.rope_half_part, x, null, d.sess.freqs_d, null, .{
-            .u0 = @intCast(total),
-            .u1 = @intCast(d.sess.pairs),
-            .u2 = @intCast(d.sess.sinOff()),
-            .u3 = @intCast(d.cfg.n_heads),
-            .u4 = @intCast(pos0),
-            .u5 = @intCast(d.cfg.head_dim),
-        }, total, 1, 1);
+    /// In place: K's band already sits in the cache and Q where the attention reads
+    /// it. PARTIAL split-half rope: `pairs` pairs of a `head_dim`-wide head.
+    pub fn normRope(d: Dev, which: enum { q, k }, x: Buf, w: []const f32, rows: usize, pos0: usize) !void {
+        _ = which;
+        try d.ctx.opNormRope(x, x, try normBuf(d.ctx, w), d.sess.freqs_d, .{
+            .rows = rows * d.cfg.n_heads,
+            .dim = d.cfg.head_dim,
+            .heads = d.cfg.n_heads,
+            .pairs = d.sess.pairs,
+            .sin_off = d.sess.sinOff(),
+            .eps = d.cfg.qk_norm_eps,
+            .pos0 = pos0,
+        });
     }
 
     pub fn kvAt(d: Dev, which: enum { k, v }, k0: usize) !Buf {
@@ -309,7 +352,7 @@ const Dev = struct {
         return d.ctx.view(b, off, b.size - off);
     }
 
-    pub fn kvStore(_: Dev, _: enum { k, v }, _: Buf, _: usize, _: usize) !void {}
+    pub fn vStore(_: Dev, _: Buf, _: usize, _: usize) !void {}
 
     /// The half K (per-head k-major) and V the tensor-core attention reads, once per
     /// block rather than once per query band.
@@ -338,7 +381,9 @@ const Dev = struct {
     /// tile, a two-pass softmax and the PV GEMM. `attn_cross` is the reference arm, and
     /// it is one thread per (query, head) looping every key, which at production sizes
     /// trips the GPU watchdog and surfaces as a device loss.
-    pub fn attention(d: Dev, rows: usize, seq: usize) !void {
+    /// Vulkan has no int8 attention yet; a checkpoint asking for it runs the ordinary one.
+    pub fn attention(d: Dev, rows: usize, seq: usize, int8: bool) !void {
+        _ = int8;
         const ctx = d.ctx;
         const ws = d.ws;
         const heads = d.cfg.n_heads;
@@ -373,8 +418,10 @@ const Dev = struct {
         }, null);
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, rows: usize, w: Weight) !void {
+        const n = rows * w.cols;
         try d.ctx.opElt(.silu_mul, g, u, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+        try d.linear(y, g, rows, w);
     }
 };
 

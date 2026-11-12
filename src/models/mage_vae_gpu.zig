@@ -533,12 +533,7 @@ const Dev = struct {
 
     pub fn rmsNorm(d: Dev, x: Buf, weights: []const f32, rows: usize, dim: usize) !void {
         const w = try vecBuf(d.ctx, weights);
-        if (d.ctx.hasSubgroupNorm()) return d.ctx.opRmsNormSg(x, x, w, rows, dim, eps);
-        try d.ctx.opElt(.rmsnorm, x, x, w, null, .{
-            .u0 = @intCast(rows),
-            .u1 = @intCast(dim),
-            .f0 = eps,
-        }, rows, 1, 1);
+        try d.ctx.opRmsNorm(x, x, w, rows, dim, eps);
     }
 
     pub fn patchScatter(d: Dev, rgb: Buf, pix: Buf, nb: usize, lat_w: usize, l0: usize) !void {

@@ -421,10 +421,9 @@ const Dev = struct {
         const half = cfg.head_dim / 2;
         const freqs = if (stage == .image) d.sess.img_freqs_d else d.sess.freqs_d;
         const sin_off = (if (stage == .image) d.sess.img_padded else d.sess.seq) * half;
-        try be.qkNorm(d.ws.q_d, d.ws.q_d, try normBuf(be, qnorm), rows * cfg.n_heads, cfg.head_dim, cfg.qk_eps);
-        try be.qkNorm(d.ws.k_d, d.ws.k_d, try normBuf(be, knorm), rows * cfg.n_kv_heads, cfg.head_dim, cfg.qk_eps);
-        try be.rope(d.ws.q_d, freqs, rows, cfg.n_heads, half, sin_off);
-        try be.rope(d.ws.k_d, freqs, rows, cfg.n_kv_heads, half, sin_off);
+        inline for (.{ .{ d.ws.q_d, qnorm, cfg.n_heads }, .{ d.ws.k_d, knorm, cfg.n_kv_heads } }) |t| {
+            try be.normRope(t[0], t[0], try normBuf(be, t[1]), freqs, .{ .rows = rows * t[2], .dim = cfg.head_dim, .heads = t[2], .pairs = half, .sin_off = sin_off, .eps = cfg.qk_eps, .interleaved = true });
+        }
     }
 
     pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {

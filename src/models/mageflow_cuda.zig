@@ -451,10 +451,9 @@ const Dev = struct {
         const ki = d.rows(ws.k_d, n);
         try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.attn.txt_qnorm), seq_txt * heads, hd, eps);
         try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, blk.attn.txt_knorm), seq_txt * heads, hd, eps);
-        try be.qkNorm(qi, qi, try normBuf(be, blk.attn.qnorm), n * heads, hd, eps);
-        try be.qkNorm(ki, ki, try normBuf(be, blk.attn.knorm), n * heads, hd, eps);
-        try be.rope(ws.q_d, d.sess.freqs_d, seq, heads, half, seq * half);
-        try be.rope(ws.k_d, d.sess.freqs_d, seq, heads, half, seq * half);
+        const nr: @import("tp_gpu").dual_table.NormRope = .{ .rows = n * heads, .dim = hd, .heads = heads, .pairs = half, .sin_off = seq * half, .eps = eps, .pos0 = seq_txt, .interleaved = true };
+        try be.normRope(qi, qi, try normBuf(be, blk.attn.qnorm), d.sess.freqs_d, nr);
+        try be.normRope(ki, ki, try normBuf(be, blk.attn.knorm), d.sess.freqs_d, nr);
     }
 
     pub fn scale(d: Dev, buf: Buf, n: usize, f: f32) !void {

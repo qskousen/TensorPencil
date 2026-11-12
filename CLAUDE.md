@@ -258,6 +258,7 @@ tensor names (`detectFamily`), never from a flag.
 | `qwen_image21` | `models/qwen_image21.zig` | Qwen3-VL 8B | Wan 2.2 layout, RGBA |
 | `fibo2` | `models/fibo2.zig` | Qwen3-VL 4B, 15 taps | Flux 2's (either codec) |
 | `fibo` (1.5) | `models/fibo.zig` | SmolLM3 3B, every state | Wan 2.2 TI2V |
+| `minimax_h3_image` | `models/minimax_h3.zig`, no audio, PDD heads | H3's Qwen3-VL 32B | H3's encoder + single-frame ViT |
 
 Weight formats (`models/quant_weight.zig` reads them all; BACKEND.md §7 has the matrix):
 

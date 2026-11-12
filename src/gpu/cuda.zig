@@ -16,6 +16,7 @@ const std = @import("std");
 pub const cu = @import("cuda/cu.zig");
 pub const ptx = @import("cuda/ptx.zig");
 pub const kernels = @import("cuda/kernels.zig");
+pub const sage = @import("cuda/sage.zig");
 pub const elt = @import("cuda/elt.zig");
 pub const wnoise = @import("cuda/wnoise.zig");
 pub const context = @import("cuda/context.zig");

@@ -632,6 +632,26 @@ test "interleavedF32ToRgb8 maps [-1, 1] onto the byte range" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 0, 191, 255 }, px);
 }
 
+/// `planarF32ToRgb8` for a decoder that finalizes to [0, 1] itself (MiniMax H3's
+/// ViT decoders undo an ImageNet normalization and clamp): no `x / 2 + 0.5`.
+pub fn planarUnitToRgb8(gpa: std.mem.Allocator, planar: []const f32, width: usize, height: usize) ![]u8 {
+    std.debug.assert(planar.len == 3 * width * height);
+    const px = try gpa.alloc(u8, width * height * 3);
+    const plane = width * height;
+    for (0..plane) |i| for (0..3) |c| {
+        px[i * 3 + c] = @intFromFloat(@round(std.math.clamp(planar[c * plane + i], 0.0, 1.0) * 255.0));
+    };
+    return px;
+}
+
+test "planarUnitToRgb8 maps [0, 1] onto the byte range, planar to interleaved" {
+    const gpa = std.testing.allocator;
+    // two pixels: R plane, G plane, B plane
+    const px = try planarUnitToRgb8(gpa, &.{ 0, 1, 0.5, -1, 2, 0.25 }, 2, 1);
+    defer gpa.free(px);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 255, 0, 64 }, px);
+}
+
 /// Convert decoder output in [-1, 1] (planar [3][h][w], torch layout) to
 /// interleaved [h][w][3] u8, matching ComfyUI's (x/2 + 0.5).clamp(0,1) * 255.
 pub fn planarF32ToRgb8(gpa: std.mem.Allocator, planar: []const f32, width: usize, height: usize) ![]u8 {

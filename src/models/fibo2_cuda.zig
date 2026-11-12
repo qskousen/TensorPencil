@@ -440,11 +440,11 @@ const Dev = struct {
         try d.be.qkNorm(buf, buf, try normBuf(d.be, w), n * cfg.n_heads, cfg.head_dim, cfg.norm_eps);
     }
 
-    pub fn rope(d: Dev, buf: Buf, n: usize, row0: usize) !void {
+    /// `headNorm` then rope from joint row `row0`, in one pass.
+    pub fn headNormRope(d: Dev, buf: Buf, w: []const f32, n: usize, row0: usize) !void {
         const cfg = d.model.cfg;
         const half = cfg.head_dim / 2;
-        const f = d.sess.freqs_d.slice(row0 * half * 4, d.sess.freqs_d.size - row0 * half * 4);
-        try d.be.rope(buf, f, n, cfg.n_heads, half, d.sess.seq * half);
+        try d.be.normRope(buf, buf, try normBuf(d.be, w), d.sess.freqs_d, .{ .rows = n * cfg.n_heads, .dim = cfg.head_dim, .heads = cfg.n_heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = cfg.norm_eps, .pos0 = row0, .interleaved = true });
     }
 
     pub fn prep(d: Dev, x: Buf, m: usize, cols: usize, group: []const Weight) !lin_cuda.Group {
@@ -480,8 +480,10 @@ const Dev = struct {
         try d.be.opAddScaled(x, t, n, s);
     }
 
-    pub fn siluMul(d: Dev, g: Buf, u: Buf, n: usize) !void {
-        try d.be.siluMul(g, u, n);
+    /// `linear` of `silu(g) * u`, the product made inside the activation prep where
+    /// nothing else reads it (`lin_cuda.linearSiluMul`).
+    pub fn siluMulLinear(d: Dev, y: Buf, g: Buf, u: Buf, m: usize, w: Weight) !void {
+        try lin_cuda.linearSiluMul(d.be, d.sess.plan, y, g, u, m, w);
     }
 };
 

@@ -471,11 +471,9 @@ const Dev = struct {
         const ws = d.ws;
         const hd = cfg.headDim();
         ctx.independent(2);
-        try qkNorm(ctx, ws.q_d, qnorm, seq * cfg.n_heads, hd, cfg.qk_eps);
-        try qkNorm(ctx, ws.k_d, knorm, seq * cfg.n_heads, hd, cfg.qk_eps);
-        ctx.independent(2);
-        try ropeHalf(ctx, ws.q_d, d.sess.freqs_d, seq, cfg.n_heads, hd / 2);
-        try ropeHalf(ctx, ws.k_d, d.sess.freqs_d, seq, cfg.n_heads, hd / 2);
+        inline for (.{ .{ ws.q_d, qnorm }, .{ ws.k_d, knorm } }) |t| {
+            try ctx.opNormRope(t[0], t[0], try normBuf(ctx, t[1]), d.sess.freqs_d, .{ .rows = seq * cfg.n_heads, .dim = hd, .heads = cfg.n_heads, .pairs = hd / 2, .sin_off = seq * (hd / 2), .eps = cfg.qk_eps });
+        }
     }
 
     pub fn qNorm(d: Dev, qnorm: []const f32, seq: usize) !void {
@@ -606,22 +604,7 @@ fn lnMod(ctx: *gpu.Context, ws: *Workspace, rows: usize, dim: usize, premul_off:
 /// 17x, and the subgroup kernel had been sitting here unused. Three calls per block.
 fn qkNorm(ctx: *gpu.Context, x: Buf, weights: []const f32, rows: usize, hd: usize, eps: f32) !void {
     const w = try normBuf(ctx, weights);
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, hd, eps);
-    try ctx.opElt(.rmsnorm, x, x, w, null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(hd),
-        .f0 = eps,
-    }, rows, 1, 1);
-}
-
-fn ropeHalf(ctx: *gpu.Context, x: Buf, freqs: Buf, rows: usize, heads: usize, half: usize) !void {
-    const total = rows * heads * half;
-    try ctx.opElt(.rope_half, x, null, freqs, null, .{
-        .u0 = @intCast(total),
-        .u1 = @intCast(half),
-        .u2 = @intCast(rows * half), // sin_off
-        .u3 = @intCast(heads),
-    }, total, 1, 1);
+    try ctx.opRmsNorm(x, x, w, rows, hd, eps);
 }
 
 /// Wrap a CPU norm-weight slice as a (pointer-cached) small device buffer.

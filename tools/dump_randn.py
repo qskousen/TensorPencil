@@ -26,3 +26,17 @@ g = torch.manual_seed(80085)
 t = torch.randn((1, 16, 210, 140), generator=g, device="cpu", dtype=torch.float32)
 t.flatten()[:1024].numpy().tofile("testdata/randn_80085_head1024.bin")
 print(f"testdata/randn_80085_head1024.bin: first={t.flatten()[0].item():.9g}")
+
+# Below 16 elements torch takes its element-wise path (normal_distribution<double>
+# with the generator's cached second Box-Muller sample); embedded because it is small.
+# Fresh draws of every size 1..15 at seed 3, then one held generator at seed 5
+# drawing the sizes in HELD, which pins how the cache carries across draws.
+HELD = (1, 2, 3, 16, 5, 15, 7, 1)
+out = []
+for n in range(1, 16):
+    out.append(torch.randn(n, generator=torch.manual_seed(3), dtype=torch.float32))
+g = torch.Generator("cpu").manual_seed(5)
+for n in HELD:
+    out.append(torch.randn(n, generator=g, dtype=torch.float32))
+torch.cat(out).numpy().tofile("src/core/assets/randn_small.bin")
+print("src/core/assets/randn_small.bin:", sum(t.numel() for t in out), "values")

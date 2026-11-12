@@ -18,6 +18,7 @@
 //! dequantized inside the GEMM; the safetensors mapping must outlive this.
 
 const std = @import("std");
+const quant_weight = @import("quant_weight.zig");
 const build_options = @import("build_options");
 const safetensors = @import("tp_core").safetensors;
 const test_gate = @import("../test_gate.zig");
@@ -1137,51 +1138,15 @@ fn loadNormNamed(alloc: std.mem.Allocator, store: WeightStore, name: []const u8,
     return view.toF32Alloc(alloc);
 }
 
-fn loadWeight(store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
-    var buf: [96]u8 = undefined;
-    const name = try std.mem.print(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
-    return loadWeightNamed(null, store, name, rows, cols);
-}
-
 fn loadLayerWeight(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
     const name = try std.mem.print(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     return loadWeightNamed(alloc, store, name, rows, cols);
 }
 
-/// A 2-D weight by exact name, with whatever scale sidecar its dtype needs.
-///
-/// The sidecar is named `<name>_scale` either way, but it means two different
-/// things: for fp8 it is ONE number for the whole tensor, and for int8/int4
-/// convrot it is one per output ROW plus a rotation group size. Reading the
-/// second as the first leaves `row_scale` null, and `ops.matmul.matmul` asserts
-/// on that for an integer weight, so the failure is a panic several frames deep
-/// rather than a wrong answer. `alloc` is required for the int8 arm (the row
-/// scales are dequantized into owned memory) and may be null when the caller
-/// knows the weight is not integer.
-fn loadWeightNamed(alloc: ?std.mem.Allocator, store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
-    const view = store.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
-
-    var scale_buf: [112]u8 = undefined;
-    if (scale_buf.len < name.len + 6) return error.NameTooLong;
-    const scale_name = try std.mem.print(&scale_buf, "{s}_scale", .{name});
-
-    if (view.info.dtype == .i8 or view.info.dtype == .i4) {
-        const a = alloc orelse return error.UnsupportedDType;
-        const sv = store.get(scale_name) orelse return error.MissingTensor;
-        if (sv.info.elemCount() != rows) return error.ShapeMismatch;
-        if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
-        w.row_scale = try sv.toF32Alloc(a);
-        w.convrot = ops.convrot.group_size;
-        return w;
-    }
-    if (store.get(scale_name)) |scale_view| {
-        w.scale = try scale_view.asScalarF32();
-    }
-    return w;
+/// A 2-D weight by exact name, in any format `quant_weight` reads.
+fn loadWeightNamed(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
+    return quant_weight.load(alloc, store, name, rows, cols, .{ .who = "qwen3" });
 }
 
 // --- tests -----------------------------------------------------------------

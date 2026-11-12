@@ -351,10 +351,9 @@ const Dev = struct {
         const ws = d.ws;
         const hd = cfg.headDim();
         const half = hd / 2;
-        try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, qnorm), seq * cfg.n_heads, hd, cfg.qk_eps);
-        try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, knorm), seq * cfg.n_heads, hd, cfg.qk_eps);
-        try be.ropeHalf(ws.q_d, d.sess.freqs_d, seq, cfg.n_heads, half, seq * half, 0);
-        try be.ropeHalf(ws.k_d, d.sess.freqs_d, seq, cfg.n_heads, half, seq * half, 0);
+        inline for (.{ .{ ws.q_d, qnorm }, .{ ws.k_d, knorm } }) |t| {
+            try be.normRope(t[0], t[0], try normBuf(be, t[1]), d.sess.freqs_d, .{ .rows = seq * cfg.n_heads, .dim = hd, .heads = cfg.n_heads, .pairs = half, .sin_off = seq * half, .eps = cfg.qk_eps });
+        }
     }
 
     pub fn qNorm(d: Dev, qnorm: []const f32, seq: usize) !void {

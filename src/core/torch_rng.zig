@@ -17,6 +17,9 @@
 //! reference venv (tools/dump_randn.py), including a full 470400-element
 //! latent.
 //!
+//! Below 16 elements torch instead runs `normal_distribution<double>` per element
+//! (`Generator.normalSerial`).
+//!
 //! Portability note: torch dispatches an MKL VSL path on Intel CPUs with
 //! different output; this matches the AVX2 normal_fill path torch uses on
 //! this AMD box.
@@ -173,16 +176,20 @@ fn fill16(data: *[16]f32) void {
 /// this: the second draw continues the MT stream rather than restarting it.
 pub const Generator = struct {
     mt: Mt19937,
+    /// The second Box-Muller sample of the element-wise path, which torch keeps on
+    /// the generator for its next small draw.
+    next_normal: ?f64 = null,
 
     pub fn init(seed: u64) Generator {
         return .{ .mt = .init(seed) };
     }
 
-    /// Fill `out` with standard-normal samples and advance the engine. Requires
-    /// out.len >= 16 (below that torch switches to a cached element-wise
-    /// Box-Muller this doesn't implement; latents are always >= 16).
+    /// Fill `out` with standard-normal samples and advance the engine.
     pub fn randn(self: *Generator, out: []f32) void {
-        std.debug.assert(out.len >= 16);
+        if (out.len < 16) {
+            for (out) |*v| v.* = @floatCast(self.normalSerial());
+            return;
+        }
         for (out) |*v| v.* = uniform(&self.mt);
         var i: usize = 0;
         while (i + 16 <= out.len) : (i += 16) {
@@ -196,6 +203,30 @@ pub const Generator = struct {
             fill16(tail);
         }
     }
+
+    /// torch's `normal_distribution<double>`, what `normal_kernel` runs per element
+    /// below 16 elements.
+    fn normalSerial(self: *Generator) f64 {
+        if (self.next_normal) |v| {
+            self.next_normal = null;
+            return v;
+        }
+        const u1_ = self.uniform53();
+        const u2_ = self.uniform53();
+        const r = @sqrt(-2.0 * std.math.log1p(-u2_));
+        const theta = 2.0 * std.math.pi * u1_;
+        self.next_normal = r * @sin(theta);
+        return r * @cos(theta);
+    }
+
+    /// `uniform_real_distribution<double>(0, 1)`: 53 bits of `random64`, whose
+    /// first engine draw is the high word.
+    fn uniform53(self: *Generator) f64 {
+        const hi: u64 = self.mt.random();
+        const lo: u64 = self.mt.random();
+        const bits = ((hi << 32) | lo) & ((@as(u64, 1) << 53) - 1);
+        return @as(f64, @floatFromInt(bits)) * 0x1p-53;
+    }
 };
 
 /// One draw from a fresh generator: `torch.manual_seed(seed)` + `torch.randn(out.len)`
@@ -203,6 +234,28 @@ pub const Generator = struct {
 pub fn randn(out: []f32, seed: u64) void {
     var g: Generator = .init(seed);
     g.randn(out);
+}
+
+test "randn below 16 elements matches torch bit-for-bit" {
+    // tools/dump_randn.py: fresh draws of 1..15 at seed 3, then one generator at
+    // seed 5 drawing `held` in order.
+    const raw = @embedFile("assets/randn_small.bin");
+    const held = [_]usize{ 1, 2, 3, 16, 5, 15, 7, 1 };
+    var want: [170]f32 = undefined;
+    @memcpy(std.mem.sliceAsBytes(&want), raw);
+    var got: [170]f32 = undefined;
+    var at: usize = 0;
+    for (1..16) |n| {
+        randn(got[at..][0..n], 3);
+        at += n;
+    }
+    var g: Generator = .init(5);
+    for (held) |n| {
+        g.randn(got[at..][0..n]);
+        at += n;
+    }
+    try std.testing.expectEqual(want.len, at);
+    try std.testing.expectEqualSlices(u32, @ptrCast(&want), @ptrCast(&got));
 }
 
 test "randn matches torch fixtures bit-for-bit" {

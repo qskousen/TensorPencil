@@ -280,16 +280,9 @@ const Dev = struct {
         const hd = cfg.headDim();
         const half = hd / 2;
         ctx.independent(2);
-        try rmsNorm(ctx, d.ws.q_d, qnorm, rows * cfg.heads, hd);
-        try rmsNorm(ctx, d.ws.k_d, knorm, rows * cfg.heads, hd);
-        ctx.independent(2);
-        inline for (.{ d.ws.q_d, d.ws.k_d }) |buf| {
-            try ctx.opElt(.rope_half, buf, null, d.sess.freqs_d, null, .{
-                .u0 = @intCast(rows * cfg.heads * half),
-                .u1 = @intCast(half),
-                .u2 = @intCast(d.sess.seq * half),
-                .u3 = @intCast(cfg.heads),
-            }, rows * cfg.heads * half, 1, 1);
+        inline for (.{ .{ d.ws.q_d, qnorm }, .{ d.ws.k_d, knorm } }) |t| {
+            const w: Buf = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(t[1])), .mem = .null_handle, .size = 0 };
+            try ctx.opNormRope(t[0], t[0], w, d.sess.freqs_d, .{ .rows = rows * cfg.heads, .dim = hd, .heads = cfg.heads, .pairs = half, .sin_off = d.sess.seq * half, .eps = eps });
         }
     }
 
@@ -297,7 +290,14 @@ const Dev = struct {
         try d.ctx.opElt(.scale_f32, buf, buf, null, null, .{ .u0 = @intCast(n), .f0 = f }, n, 1, 1);
     }
 
-    pub fn attention(d: Dev, rows: usize) !void {
+    /// Vulkan has no int8 attention yet; a checkpoint asking for it runs the ordinary one.
+    pub fn int8Attention(d: Dev, requested: bool) bool {
+        _ = .{ d, requested };
+        return false;
+    }
+
+    pub fn attention(d: Dev, rows: usize, int8: bool) !void {
+        std.debug.assert(!int8);
         const cfg = d.model.cfg;
         const hd = cfg.headDim();
         try attn_gpu.run(d.ctx, &d.ws.attn, d.ws.q_d, d.ws.k_d, d.ws.v_d, d.ws.attn_d, .{
@@ -330,9 +330,3 @@ const Dev = struct {
     }
 };
 
-/// Weighted per-row RMSNorm in place, the subgroup kernel where it exists.
-fn rmsNorm(ctx: *gpu.Context, x: Buf, weights: []const f32, rows: usize, dim: usize) !void {
-    const w: Buf = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
-    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, dim, eps);
-    try ctx.opElt(gpu.eltAt("rmsnorm", x.dt), x, x, w, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
-}

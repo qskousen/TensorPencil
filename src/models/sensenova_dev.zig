@@ -75,8 +75,7 @@ pub fn layer(d: anytype, cfg: Config, s: *const Stream, rows: usize, seq_kv: usi
 
     try d.rmsNorm(b.x, b.nrm, s.post_norm, rows, eps);
     try d.gemms(b.nrm, rows, dim, &.{ s.gate, s.up }, &.{ b.mg, b.mu });
-    try d.siluMul(b.mg, b.mu, rows * cfg.inter);
-    try d.linear(b.dlt, b.mg, rows, s.down);
+    try d.siluMulLinear(b.dlt, b.mg, b.mu, rows, s.down);
     try addDelta(d, b.x, b.dlt, rows * dim, div);
 }
 
