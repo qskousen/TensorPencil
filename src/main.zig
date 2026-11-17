@@ -998,14 +998,17 @@ fn runCommand(arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, gpa:
             \\                         euler | euler_ancestral | heun | dpm_2
             \\                         | dpm_2_ancestral | dpmpp_2s_ancestral
             \\                         | dpmpp_sde | dpmpp_2m | dpmpp_2m_sde
-            \\                         | dpmpp_2m_sde_heun | dpmpp_3m_sde.
+            \\                         | dpmpp_2m_sde_heun | dpmpp_3m_sde | ddim | lms
+            \\                         | ipndm | ipndm_v | deis | heunpp2
+            \\                         | res_multistep | res_multistep_ancestral
+            \\                         | er_sde | uni_pc | uni_pc_bh2.
             \\                         The ancestral ones step short of the next sigma
             \\                         and add the gap back as noise; the SDE ones
             \\                         take their noise from a seed-determined
             \\                         Brownian tree instead. heun, dpm_2 and the two
             \\                         2S/2-ancestral ones plus dpmpp_sde run the
-            \\                         model TWICE per step, so the same --steps is
-            \\                         twice the time
+            \\                         model TWICE per step, heunpp2 three times, so
+            \\                         the same --steps costs that multiple
             \\      --eta 1.0          noise level for a stochastic sampler
             \\                         (0 = deterministic DPM++(2M), or plain euler)
             \\      --s-noise 1.0      multiplier on that noise

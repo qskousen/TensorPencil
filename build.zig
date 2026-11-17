@@ -571,6 +571,26 @@ pub fn build(b: *std.Build) !void {
     run_ui_probe.addPassthruArgs();
     ui_probe_step.dependOn(&run_ui_probe.step);
 
+    // ui-check: every chip input on the screens that draw them must take focus
+    // on a click, an empty one included. Part of `gui-test`.
+    const ui_check_step = b.step("ui-check", "Click every chip input on ui-probe's screens; fail if one does not take focus");
+    for ([_][]const []const u8{
+        &.{"--check-chips"},
+        &.{ "--studio", "--check-chips=empty" },
+        &.{ "--studio", "--lora", "--check-chips=empty" },
+        &.{ "--studio", "--expand", "--check-chips=empty" },
+    }) |args| {
+        const run = b.addRunArtifact(ui_probe_exe);
+        _ = run.addOutputFileArg("ui_check.png");
+        run.addArgs(&.{ "1200", "2400" });
+        run.addArgs(args);
+        // Matching stderr consumes it, so a pass prints nothing.
+        run.addCheck(.{ .expect_stderr_match = "chips took focus" });
+        run.expectExitCode(0);
+        ui_check_step.dependOn(&run.step);
+    }
+    gui_test_step.dependOn(ui_check_step);
+
     // The three layers, one test binary each: settings, catalog, model
     // spec, tool-call parsing, turn stats and meter math (shared); the
     // chat and diffusion engines' pure helpers, the scanner and the

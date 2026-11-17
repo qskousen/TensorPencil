@@ -165,11 +165,6 @@
   splitting a wide row across subgroups needs a cross-subgroup reduce. MEASURED, so
   don't retry it as-is at one row: a subgroup-per-row `normWide` is 32 lanes on one
   multiprocessor and costs 6% of decode (30.9 -> 29.0 tok/s, 8B q8_0)
-- cuda: a module's PTX target is the baseline (`-Dcuda-sm` / `-Dptx-isa`, default 86 / 8.0)
-  raised by what its instructions need (`ptx.Builder.requires`), and the backend builds
-  one only where `lin_cuda.Caps.of` says the device runs it (fp8 MMA: sm_89+). Anything
-  below sm_80 still cannot run the hand kernels at all (cp.async, mma.m16n8k32); a startup
-  check against `cc_major` that says so, rather than a JIT log, is missing
 - fp8 W8A8 for text encoders, to make it their default too: `Use.encoder` pins fp8 to
   weight-only because W8A8 is unmeasured on a conditioning pass. Measure on an sm_89+ card
   (gen) with an fp8 encoder (Krea2's Qwen3-VL 4B fp8, CLIP, the SenseNova prefix): the
@@ -236,12 +231,6 @@
   cosine between directions for UNRELATED concepts against a random-direction control:
   near the 1/sqrt(features) floor means the derive is separating concepts, high means it
   has collapsed onto one axis again
-- gui: `ui-probe --click=X,Y` injects a press/release and prints what took keyboard
-  focus, but nothing runs it as a check. An `--expect-focus` arm plus a build step would
-  make it a regression guard; the probe already falls back to SDL's dummy driver
-- cond steer: a direction is re-derived on every encode, so a batch of N images pays N
-  text encodes per term. A cache on the Session keyed by (text, model) is the fix; the SD
-  arm's `empty_ref` is the precedent
 - cond noise: the krea2 tap sweep says the DiT leans on the DEEP encoder taps (2.6x the
   effect of the shallow ones at a mirrored budget, BACKEND.md 2K). Turn that into a TE
   quantization budget: quantize taps 0-3 harder than 8-11 and check the render against
@@ -434,12 +423,6 @@
   fixture in `tools/gen_sampler_fixtures.py`; the trap is that ComfyUI ships a SEPARATE
   `_RF` body for several of them and dispatches on `CONST`, which a port that reads
   only the eps form gets plausibly wrong on krea2 and Z-Image
-- tp-gui fonts: bold CJK runs render regular (no Bold face embedded).
-  FreeType's synthetic bold (`FT_GlyphSlot_Embolden`, em/24) is a fair stand-in at
-  UI sizes, measured in-app, but it is a dvui change: `Font.Cache.getOrCreate`
-  knows when bold was asked and only a regular source matched, and the two
-  `FT_Load_Char` sites embolden the slot. ~20 lines, prototyped; needs a dvui fork
-  or an upstream PR, then fonts.zig routes tier-2 bold as `.bold` again
 - tp-gui fonts: the faces embed uncompressed, 21.5 MB. Measured on the 10 MB CJK
   face in ReleaseFast: std zstd inflates at 22 MB/s (0.77 ratio, ~1 s for the set,
   8 s in Debug), std xz at 27 MB/s (0.70), std flate at 190 MB/s but only 0.86, so

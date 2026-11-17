@@ -472,6 +472,27 @@ pub const InputResult = struct {
     editing: bool = false,
 };
 
+/// Set by ui-probe's `--check-chips`: every `chipInput` drawn records its text
+/// entry here, so the probe can click each one by its own rect.
+pub var chip_probe: ?*ChipProbe = null;
+
+pub const ChipProbe = struct {
+    pub const Chip = struct { id: dvui.Id, rect: dvui.Rect.Physical, empty: bool };
+    chips: [64]Chip = undefined,
+    n: usize = 0,
+    /// Chips drawn past the array's end. The probe fails rather than check a subset.
+    dropped: usize = 0,
+
+    fn record(p: *ChipProbe, c: Chip) void {
+        if (p.n == p.chips.len) {
+            p.dropped += 1;
+            return;
+        }
+        p.chips[p.n] = c;
+        p.n += 1;
+    }
+};
+
 /// A chip-shaped text field with a dimmed, non-editable suffix ("1.8 MP").
 /// Same skin as `chip`, so a typed value and a picked one read as the same
 /// kind of control.
@@ -514,6 +535,11 @@ pub fn chipInput(src: std.lang.SourceLocation, buf: []u8, suffix: []const u8, wi
         .theme = noFocusTheme(),
     });
     const id = te.data().id;
+    if (chip_probe) |p| p.record(.{
+        .id = id,
+        .rect = te.data().borderRectScale().r,
+        .empty = std.mem.sliceTo(buf, 0).len == 0,
+    });
     const focused = dvui.focusedWidgetId() == id;
     res.editing = focused;
     dvui.dataSet(null, box.data().id, "_focus_ring", focused);
@@ -639,6 +665,8 @@ pub const CollapsibleOpts = struct {
     /// folded section that says nothing about its contents is one nobody opens,
     /// so every caller should pass something ("2 active", "euler · 20 · 4.0").
     summary: []const u8 = "",
+    /// Draws the summary in amber: something inside needs a look.
+    warn: bool = false,
     /// A count the user set, drawn as a blue pill after the summary while collapsed.
     pill: []const u8 = "",
 };
@@ -689,7 +717,7 @@ pub fn collapsibleBegin(src: std.lang.SourceLocation, title: []const u8, flag: *
         });
         if (!flag.* and o.summary.len > 0) dvui.labelNoFmt(@src(), o.summary, .{}, .{
             .font = F.mono,
-            .color_text = .{ .color = C.text_faint },
+            .color_text = .{ .color = if (o.warn) C.amber else C.text_faint },
             .padding = .{},
             .gravity_x = 1.0,
             .gravity_y = 0.5,

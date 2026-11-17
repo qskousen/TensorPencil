@@ -1,12 +1,12 @@
 //! CUDA Driver-API context: device/context/stream setup, PTX JIT, device
-//! buffers, kernel launch, and event-based timing. Thin, explicit, and
-//! diagnostic-friendly (the Phase-1 experiment lives on top of this).
+//! buffers, kernel launch, and event-based timing.
 
 const std = @import("std");
 const repeat = @import("tp_core").strings.repeat;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const cu = @import("cu.zig");
+const ptx = @import("ptx.zig");
 const mem_tag = @import("../mem_tag.zig");
 pub const MemTag = mem_tag.MemTag;
 
@@ -176,6 +176,19 @@ pub const Context = struct {
         _ = self.api.cuDeviceGetAttribute(&self.shared_per_sm, cu.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.regs_per_sm, cu.CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.clock_khz, cu.CU_DEVICE_ATTRIBUTE_CLOCK_RATE, self.dev);
+
+        const sm: u32 = @intCast(self.cc_major * 10 + self.cc_minor);
+        switch (ptx.fitsDevice(sm)) {
+            .ok => {},
+            .below_kernels => {
+                std.debug.print("CUDA: {s} is sm_{d}; the CUDA backends need sm_80 (Ampere) or newer. Use --backend vulkan.\n", .{ self.deviceName(), sm });
+                return error.CudaError;
+            },
+            .below_build => {
+                std.debug.print("CUDA: {s} is sm_{d}, below this build's -Dcuda-sm={d}. Rebuild with -Dcuda-sm={d}.\n", .{ self.deviceName(), sm, build_options.cuda_sm, sm });
+                return error.CudaError;
+            },
+        }
 
         self.vmm_granularity = self.vmmQueryGranularity();
 

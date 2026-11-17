@@ -586,6 +586,14 @@ The print then lands inside the real failure report where it's useful.
 (`ZIG_BUILD_ERROR_STYLE=minimal` only hides the `failed command:` line,
 not the stderr dump — fix the test, not the env.)
 
+The same applies to an exe run as a check step (`ui-check`): `expectExitCode(0)` alone
+still dumps its stderr. Add `run.addCheck(.{ .expect_stderr_match = "<pass line>" })`,
+which consumes stderr and also proves the check ran.
+
+The `N/M tests passed` total in `--summary all` counts only the test binaries that ran
+this time; a `run test cached` binary adds nothing. A smaller total after an edit is
+not lost tests: compare against a run where every binary re-ran.
+
 ## `var x: T = undefined` bypasses EVERY field default
 
 A struct's `field: T = default` only runs for struct-literal initialization. A

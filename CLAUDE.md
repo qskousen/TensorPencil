@@ -83,7 +83,8 @@ from a checkpoint, match what ComfyUI does.
 Probes, for seeing what the code does without a debugger. Each prints its own usage.
 
 - `ui-probe` renders tp-gui screens to a PNG from canned data, no engine or GPU. The GUI's
-  failure modes are visual; this is how you see them.
+  failure modes are visual; this is how you see them. `zig build ui-check` (part of
+  `gui-test`) clicks every chip input on its screens and fails if one takes no focus.
 - `catalog-probe <folder>...` prints what a model scan took each file for ("why is my
   model not in the menu").
 - `driver-probe`, `serve-probe`, `hosts-probe` drive the engine host in-process, through a

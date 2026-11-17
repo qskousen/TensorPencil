@@ -3,12 +3,15 @@
 //! `zig build ui-probe -- out.png [width height] [mode] [--click=X,Y]`, mode one of
 //! `--states` (the status bar under three loads), `--settings`, `--studio` (with
 //! `--lora`, over a selection that has LoRAs, `--folded`, which leaves its
-//! sections closed to show their folded summaries, and `--expand`, the composer
-//! in Expand mode with text in it), `--hosts` (one status bar
+//! sections closed to show their folded summaries, `--expand`, the composer
+//! in Expand mode with text in it, and `--off-grid`, H3-Image on a scheduler that
+//! misses its distilled sigmas), `--hosts` (one status bar
 //! per host, through the real `status_bar.render`, so two bars sharing a history
 //! ring, widget id or handle shows), `--library` or `--reopened` (a run whose
 //! files have gone: ghost slots, no toast, no retry). `--click` is in the PNG's
-//! physical pixels.
+//! physical pixels. `--check-chips[=empty]` clicks every chip input on the screen
+//! and exits 1 if one does not take focus (or, with `=empty`, if none of them is
+//! empty); `zig build ui-check` runs it per screen.
 //!
 //! Exists because every failure mode of this screen is visual — a face that
 //! resolved to the wrong weight, a band that stole a rail's width, a hairline
@@ -1182,6 +1185,78 @@ fn settingsFrame() void {
 
 // --------------------------------------------------------------------- main
 
+const Screen = enum { chat, states, settings, studio, hosts };
+
+fn drawScreen(screen: Screen) void {
+    switch (screen) {
+        .chat => frame(),
+        .states => statesFrame(),
+        .settings => settingsFrame(),
+        .studio => studioFrame(),
+        .hosts => hostsFrame(),
+    }
+}
+
+/// `--check-chips`: click the middle of every `style.chipInput` on the screen and
+/// require that field to take focus. `need_empty` also requires an empty one, the
+/// case where a text entry once had no rect and so took no click.
+fn checkChips(win: *dvui.Window, screen: Screen, need_empty: bool) !void {
+    var rec: style.ChipProbe = .{};
+    try win.begin(win.frame_time_ns + 16 * std.time.ns_per_ms);
+    style.chip_probe = &rec;
+    style.install();
+    drawScreen(screen);
+    style.chip_probe = null;
+    _ = try win.end(.{});
+
+    const view = win.rect_pixels;
+    var failed: usize = 0;
+    var checked: usize = 0;
+    var empty_checked: usize = 0;
+    var off_screen: usize = 0;
+    for (rec.chips[0..rec.n]) |c| {
+        const pt: dvui.Point.Physical = .{ .x = c.rect.x + c.rect.w / 2, .y = c.rect.y + c.rect.h / 2 };
+        if (c.rect.w <= 0 or c.rect.h <= 0 or !view.contains(pt)) {
+            // A zero rect is the defect itself; off the canvas is the probe's size.
+            if (c.rect.w <= 0 or c.rect.h <= 0) {
+                std.debug.print("ui-probe: chip {x} has no rect (empty={any})\n", .{ c.id.asU64(), c.empty });
+                failed += 1;
+            } else off_screen += 1;
+            continue;
+        }
+        var focused = false;
+        for (0..4) |i| {
+            try win.begin(win.frame_time_ns + 16 * std.time.ns_per_ms);
+            _ = try win.addEventMouseMotion(.{ .pt = pt });
+            if (i == 1) _ = try win.addEventMouseButton(.left, .press);
+            if (i == 2) _ = try win.addEventMouseButton(.left, .release);
+            style.install();
+            drawScreen(screen);
+            if (i == 3) focused = dvui.focusedWidgetId() == c.id;
+            _ = try win.end(.{});
+        }
+        checked += 1;
+        if (c.empty) empty_checked += 1;
+        if (!focused) {
+            std.debug.print("ui-probe: click at ({d},{d}) did not focus chip {x} (empty={any})\n", .{ pt.x, pt.y, c.id.asU64(), c.empty });
+            failed += 1;
+        }
+    }
+    if (rec.dropped > 0) {
+        std.debug.print("ui-probe: {d} chips past the probe's table; raise ChipProbe.chips\n", .{rec.dropped});
+        failed += 1;
+    }
+    if (checked == 0 or (need_empty and empty_checked == 0)) {
+        std.debug.print("ui-probe: {d} chips clicked, {d} of them empty; the check needs an empty one on screen\n", .{ checked, empty_checked });
+        failed += 1;
+    }
+    if (failed > 0) {
+        std.debug.print("ui-probe: chip check FAILED ({d} problems, {d} chips off the canvas)\n", .{ failed, off_screen });
+        std.process.exit(1);
+    }
+    std.debug.print("ui-probe: {d} chips took focus ({d} empty, {d} off the canvas)\n", .{ checked, empty_checked, off_screen });
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const arena = init.arena.allocator();
@@ -1195,8 +1270,10 @@ pub fn main(init: std.process.Init) !void {
     var settings_mode = false;
     var studio_mode = false;
     var click_pt: ?dvui.Point.Physical = null;
+    var check_chips: enum { off, any, empty } = .off;
     var lora_mode = false;
     var folded = false;
+    var off_grid = false;
     var hosts_mode = false;
     var no_chat = false;
     var dims: [2]?u32 = .{ null, null };
@@ -1223,6 +1300,10 @@ pub fn main(init: std.process.Init) !void {
                 .x = try std.fmt.parseFloat(f32, v[0..comma]),
                 .y = try std.fmt.parseFloat(f32, v[comma + 1 ..]),
             };
+        } else if (std.mem.eql(u8, arg, "--check-chips")) {
+            check_chips = .any;
+        } else if (std.mem.eql(u8, arg, "--check-chips=empty")) {
+            check_chips = .empty;
         } else if (std.mem.eql(u8, arg, "--studio")) {
             studio_mode = true;
             setCannedCatalog(try cannedCatalog(std.heap.smp_allocator));
@@ -1235,6 +1316,8 @@ pub fn main(init: std.process.Init) !void {
             lora_mode = true;
         } else if (std.mem.eql(u8, arg, "--folded")) {
             folded = true;
+        } else if (std.mem.eql(u8, arg, "--off-grid")) {
+            off_grid = true;
         } else if (std.mem.eql(u8, arg, "--library")) {
             g_rail_tab = .library;
             try cannedLibrary(std.heap.smp_allocator);
@@ -1254,6 +1337,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    const screen: Screen = if (states_mode) .states else if (settings_mode) .settings else if (studio_mode) .studio else if (hosts_mode) .hosts else .chat;
     // The mockups' own canvases, so a screenshot can be held next to them.
     const w: u32 = dims[0] orelse 1200;
     // The state sheet's height follows the number of states (head + bar each).
@@ -1294,7 +1378,13 @@ pub fn main(init: std.process.Init) !void {
             probe_cfg.act_curve.set("max(0, (t-0.6)/0.2)");
             probe_cfg.cond_steers.items[0] = .{ .text = .lit("tentacles, suckers"), .scale = 1.2 };
             probe_cfg.cond_steers.items[1] = .{ .text = .lit("anime, cel shading"), .scale = -0.8 };
-            probe_cfg.cond_steers.count = 2;
+            // An empty term, as "+ term" makes one.
+            probe_cfg.cond_steers.items[2] = .{ .scale = 1.0, .mode = .concat };
+            probe_cfg.cond_steers.count = 3;
+        }
+        if (off_grid) {
+            image_view.forced_family = .minimax_h3_image;
+            probe_cfg.scheduler = .normal;
         }
         if (folded) {
             probe_cfg.studio_open_size = false;
@@ -1359,7 +1449,7 @@ pub fn main(init: std.process.Init) !void {
         try win.begin(win.frame_time_ns + @as(i128, @intCast(i + 1)) * 16 * std.time.ns_per_ms);
         _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
         style.install();
-        if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
+        drawScreen(screen);
         _ = try win.end(.{});
     }
 
@@ -1373,7 +1463,7 @@ pub fn main(init: std.process.Init) !void {
             if (i == 1) _ = try win.addEventMouseButton(.left, .press);
             if (i == 2) _ = try win.addEventMouseButton(.left, .release);
             style.install();
-            if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
+            drawScreen(screen);
             const foc = dvui.focusedWidgetId();
             _ = try win.end(.{});
             std.debug.print("ui-probe: after frame {d} at ({d},{d}) focus={?} steer_editing={any}\n", .{
@@ -1382,11 +1472,13 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (check_chips != .off) try checkChips(&win, screen, check_chips == .empty);
+
     try win.begin(win.frame_time_ns + 12 * 16 * std.time.ns_per_ms);
     _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
     style.install();
     var pic = dvui.Picture.start(dvui.windowRectPixels()) orelse return error.CaptureUnsupported;
-    if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else if (studio_mode) studioFrame() else if (hosts_mode) hostsFrame() else frame();
+    drawScreen(screen);
     _ = dvui.currentWindow().endRendering(.{});
     pic.stop();
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 1 << 20);

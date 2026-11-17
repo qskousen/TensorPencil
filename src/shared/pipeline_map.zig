@@ -96,19 +96,10 @@ pub fn toPipelineEmphasis(e: config.Emphasis) pipeline.Emphasis {
     };
 }
 
+/// The two enums share their names; a member missing from either fails here.
 pub fn toPipelineSampler(s: config.Sampler) tp.sampler.Kind {
     return switch (s) {
-        .euler => .euler,
-        .euler_ancestral => .euler_ancestral,
-        .heun => .heun,
-        .dpm_2 => .dpm_2,
-        .dpm_2_ancestral => .dpm_2_ancestral,
-        .dpmpp_2s_ancestral => .dpmpp_2s_ancestral,
-        .dpmpp_sde => .dpmpp_sde,
-        .dpmpp_2m => .dpmpp_2m,
-        .dpmpp_2m_sde => .dpmpp_2m_sde,
-        .dpmpp_2m_sde_heun => .dpmpp_2m_sde_heun,
-        .dpmpp_3m_sde => .dpmpp_3m_sde,
+        inline else => |t| @field(tp.sampler.Kind, @tagName(t)),
     };
 }
 
@@ -134,17 +125,7 @@ pub fn toPipelineScheduler(s: config.Scheduler) ?tp.sampler.Scheduler {
 /// The inverses, for a form seeded from a render that already happened.
 pub fn fromPipelineSampler(k: tp.sampler.Kind) config.Sampler {
     return switch (k) {
-        .euler => .euler,
-        .euler_ancestral => .euler_ancestral,
-        .heun => .heun,
-        .dpm_2 => .dpm_2,
-        .dpm_2_ancestral => .dpm_2_ancestral,
-        .dpmpp_2s_ancestral => .dpmpp_2s_ancestral,
-        .dpmpp_sde => .dpmpp_sde,
-        .dpmpp_2m => .dpmpp_2m,
-        .dpmpp_2m_sde => .dpmpp_2m_sde,
-        .dpmpp_2m_sde_heun => .dpmpp_2m_sde_heun,
-        .dpmpp_3m_sde => .dpmpp_3m_sde,
+        inline else => |t| @field(config.Sampler, @tagName(t)),
     };
 }
 

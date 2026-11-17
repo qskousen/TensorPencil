@@ -56,6 +56,7 @@ const resample = @import("tp_core").resample;
 const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
 const sampler = @import("tp_core").sampler;
+const encode_cache = @import("encode_cache.zig");
 const image = @import("tp_core").image;
 const qwen3 = @import("tp_models").models.qwen3;
 const qwen3_gpu = @import("tp_models").models.qwen3_gpu;
@@ -258,22 +259,19 @@ pub const Snapshot = struct {
     /// history but does have a position in its noise sequence, which `step` above
     /// is enough to rebuild (`Stepper.resumeFrom`).
     ///
-    /// A latent alone is not enough to resume a DPM++(2M) run bit-identically:
-    /// the step after the resume applies a second-order correction built from the
-    /// PREVIOUS step's denoised prediction. Dropping it is not a crash, the
-    /// resumed step silently degrades to first order and the image differs from an
-    /// uninterrupted render, which is exactly the promise `resume_from` makes.
-    /// DPM++(3M) SDE reaches one step further back, hence the second slot.
-    hist_denoised: ?[]f32 = null,
-    hist_denoised2: ?[]f32 = null,
-    /// The `h` of the two steps before the resume point, the other half of that state.
+    /// A latent alone is not enough to resume a multistep sampler bit-identically:
+    /// the step after the resume reads earlier steps' estimates. Dropping them is not
+    /// a crash, the resumed step silently degrades to lower order and the image
+    /// differs from an uninterrupted render, which is exactly the promise
+    /// `resume_from` makes. `Stepper.history` says what goes in each slot.
+    hist: [sampler.Stepper.max_history]?[]f32 = @splat(null),
+    /// The SDE stepper's step sizes, the other half of its state.
     hist_h: f64 = 0,
     hist_h2: f64 = 0,
 
     pub fn deinit(self: *Snapshot, gpa: std.mem.Allocator) void {
         gpa.free(self.latent);
-        if (self.hist_denoised) |o| gpa.free(o);
-        if (self.hist_denoised2) |o| gpa.free(o);
+        for (self.hist) |b| if (b) |o| gpa.free(o);
         self.* = undefined;
     }
 };
@@ -1961,6 +1959,111 @@ pub const EncodeOptions = struct {
     /// seed of its own, and MiniMax-H3 seeds its reference rows' noise with it.
     render_seed: u64 = 0,
 };
+
+/// Identifies what `encodeTextRaw(text, o)` puts in `Cond.data`, for
+/// `Session.side_encodes`. The encoder's own state is not in it: the session
+/// empties that cache when it changes.
+fn encodeKey(text: []const u8, o: EncodeOptions) u64 {
+    // Each field is hashed below or listed here with why it cannot change `data`.
+    // A new field fails this until it is sorted into one or the other.
+    const not_hashed = .{
+        "cancel",
+        // `encodeText`'s perturbation; `encodeTextRaw` never reads it.
+        "cond_noise",
+        // Seeds H3's reference rows, which land in `Cond.h3`, not `data`.
+        "render_seed",
+    };
+    const hashed = .{
+        "prompt_syntax", "emphasis",        "steps",         "prompt_type",
+        "h3_ref_images", "h3_ref_area",     "h3_ref_videos", "h3_ref_audios",
+        "h3_target_frames", "h3_keyframes", "h3_canvas_h",   "h3_canvas_w",
+        "sn_ref_images", "mf_ref_images",
+    };
+    comptime {
+        for (@typeInfo(EncodeOptions).@"struct".field_names) |name| {
+            var n = 0;
+            for (not_hashed) |x| n += @intFromBool(std.mem.eql(u8, x, name));
+            for (hashed) |x| n += @intFromBool(std.mem.eql(u8, x, name));
+            if (n != 1) @compileError("encodeKey: sort EncodeOptions." ++ name ++ " into hashed or not_hashed");
+        }
+    }
+
+    var h = std.hash.Wyhash.init(0);
+    const H = struct {
+        fn int(hh: *std.hash.Wyhash, v: u64) void {
+            hh.update(std.mem.asBytes(&v));
+        }
+        fn floats(hh: *std.hash.Wyhash, v: []const f32) void {
+            int(hh, v.len);
+            hh.update(std.mem.sliceAsBytes(v));
+        }
+        fn img(hh: *std.hash.Wyhash, r: Session.RefImage) void {
+            int(hh, r.width);
+            int(hh, r.height);
+            floats(hh, r.rgb);
+        }
+        fn audio(hh: *std.hash.Wyhash, a: Session.RefAudio) void {
+            int(hh, a.channels);
+            int(hh, a.sample_rate);
+            floats(hh, a.samples);
+        }
+    };
+    H.int(&h, text.len);
+    h.update(text);
+    H.int(&h, @intFromEnum(o.prompt_syntax));
+    H.int(&h, @intFromEnum(o.emphasis));
+    H.int(&h, o.steps);
+    H.int(&h, @intFromEnum(o.prompt_type));
+    H.int(&h, o.h3_ref_images.len);
+    for (o.h3_ref_images) |r| H.img(&h, r);
+    H.int(&h, o.h3_ref_area);
+    H.int(&h, o.h3_ref_videos.len);
+    for (o.h3_ref_videos) |v| {
+        H.int(&h, v.frames.len);
+        for (v.frames) |f| H.img(&h, f);
+        H.int(&h, @intFromBool(v.soundtrack != null));
+        if (v.soundtrack) |a| H.audio(&h, a);
+    }
+    H.int(&h, o.h3_ref_audios.len);
+    for (o.h3_ref_audios) |a| H.audio(&h, a);
+    H.int(&h, o.h3_target_frames);
+    H.int(&h, o.h3_keyframes.len);
+    for (o.h3_keyframes) |k| {
+        H.img(&h, k.img);
+        H.int(&h, k.frame_index);
+        H.int(&h, @intFromBool(k.cover_crop));
+    }
+    H.int(&h, o.h3_canvas_h);
+    H.int(&h, o.h3_canvas_w);
+    H.int(&h, o.sn_ref_images.len);
+    for (o.sn_ref_images) |r| {
+        H.int(&h, r.h);
+        H.int(&h, r.w);
+        H.floats(&h, r.rgb);
+    }
+    H.int(&h, o.mf_ref_images.len);
+    for (o.mf_ref_images) |r| H.img(&h, r);
+    return h.final();
+}
+
+test {
+    _ = encode_cache;
+}
+
+test "encodeKey separates every option that reaches the rows, and ignores the seed" {
+    const base: EncodeOptions = .{};
+    const k = encodeKey("moon", base);
+    try std.testing.expectEqual(k, encodeKey("moon", .{ .render_seed = 7 }));
+    try std.testing.expect(k != encodeKey("mood", base));
+    try std.testing.expect(k != encodeKey("moon", .{ .prompt_syntax = .a1111 }));
+    try std.testing.expect(k != encodeKey("moon", .{ .prompt_type = .negative }));
+    const px_a = [_]f32{ 0.1, 0.2, 0.3 };
+    const px_b = [_]f32{ 0.1, 0.2, 0.4 };
+    const ka = encodeKey("moon", .{ .mf_ref_images = &.{.{ .rgb = &px_a, .width = 1, .height = 1 }} });
+    const kb = encodeKey("moon", .{ .mf_ref_images = &.{.{ .rgb = &px_b, .width = 1, .height = 1 }} });
+    try std.testing.expect(ka != k);
+    try std.testing.expect(ka != kb);
+}
 
 pub const PromptType = enum { positive, negative };
 
@@ -4652,6 +4755,33 @@ pub fn stepLevels(gpa: std.mem.Allocator, fam: Family, width: usize, height: usi
     return out;
 }
 
+/// Whether `sched`, run at the step count the family's heads were distilled for,
+/// puts a step between the sigmas they were distilled at. Only H3-Image has such a
+/// grid; every other family answers false. Reads the release grid, which every
+/// known checkpoint ships, since a UI asks before anything loads.
+pub fn missesDistilledGrid(gpa: std.mem.Allocator, fam: Family, sched: ?sampler.Scheduler) !bool {
+    const grid: []const f32 = switch (fam) {
+        .minimax_h3_image => &minimax_h3.release_pdd_grid,
+        else => return false,
+    };
+    const sigmas = familySchedule(gpa, fam, &.{}, grid.len - 1, defaultShift(fam), sched, 0, 0) catch |e| switch (e) {
+        error.SchedulerUnsupported => return true,
+        else => return e,
+    };
+    defer gpa.free(sigmas);
+    return sampler.schedule_mod.offGrid(grid, sigmas);
+}
+
+test "missesDistilledGrid: H3-Image wants a scheduler that lands on its PDD grid" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect(!try missesDistilledGrid(gpa, .minimax_h3_image, null));
+    try std.testing.expect(!try missesDistilledGrid(gpa, .minimax_h3_image, .simple));
+    try std.testing.expect(try missesDistilledGrid(gpa, .minimax_h3_image, .normal));
+    try std.testing.expect(try missesDistilledGrid(gpa, .minimax_h3_image, .karras));
+    try std.testing.expect(!try missesDistilledGrid(gpa, .minimax_h3_image, .sgm_uniform));
+    try std.testing.expect(!try missesDistilledGrid(gpa, .krea2, .normal));
+}
+
 pub fn defaultShift(fam: Family) f32 {
     return switch (fam) {
         .krea2 => sampler.default_shift,
@@ -4909,6 +5039,9 @@ pub const Session = struct {
     /// SD through `SdModels.lora`. Factors may be views into these mappings, and a
     /// stack must outlive whatever attached to it.
     lora_sts: []Container = &.{},
+    /// Steering terms' and the empty prompt's encodes, reused across a batch.
+    /// `encoderChanged` empties it.
+    side_encodes: encode_cache.RowCache = .{},
     /// Whether the installed stack runs on the Vulkan UNet; asked once per stack,
     /// cleared by `detachLoras`.
     sd_vk_lora_ok: ?bool = null,
@@ -5145,15 +5278,32 @@ pub const Session = struct {
 
     /// Take a render's dials; one that changed drops what `auto` learned for it.
     pub fn setDials(self: *Session, te: ?Act, dit: ?Act, vae: ?Act) void {
+        const before = self.acts();
         self.dials.getPtr(.encoder).setDial(te);
         self.dials.getPtr(.denoiser).setDial(dit);
         self.dials.getPtr(.vae).setDial(vae);
+        const after = self.acts();
+        if (before.encoder != after.encoder or !std.meta.eql(before.encoder_int, after.encoder_int)) self.encoderChanged();
+    }
+
+    /// Drop everything computed through the text encoder. Call on any change to
+    /// what it produces: its LoRAs, their dials, its precision.
+    fn encoderChanged(self: *Session) void {
+        self.side_encodes.clear(self.gpa);
+        if (self.sd()) |m| {
+            if (m.empty_ref) |e| self.gpa.free(e);
+            if (m.empty_ref_g) |e| self.gpa.free(e);
+            m.empty_ref = null;
+            m.empty_ref_g = null;
+        }
     }
 
     /// After a non-finite output from `comp` at `ran`: the next wider dtype it runs as
     /// itself, now remembered, or null (explicit dial, or nothing wider).
     pub fn widen(self: *Session, comp: precision.Component, ran: Act) ?Act {
-        return self.dials.getPtr(comp).widen(ran, RunsCtx{ .s = self, .comp = comp }, RunsCtx.runs);
+        const wider = self.dials.getPtr(comp).widen(ran, RunsCtx{ .s = self, .comp = comp }, RunsCtx.runs);
+        if (wider != null and comp == .encoder) self.encoderChanged();
+        return wider;
     }
 
     const RunsCtx = struct {
@@ -5408,6 +5558,7 @@ pub const Session = struct {
     pub fn setLoras(self: *Session, io: std.Io, specs: []const LoraSpec) !void {
         if (specs.len > lora_mod.max_files) return error.TooManyLoras;
         self.dropLoras();
+        self.encoderChanged();
         try self.installLoras(io, specs, null);
     }
 
@@ -5545,18 +5696,25 @@ pub const Session = struct {
     pub fn setLoraStrength(self: *Session, file: usize, strength: f32) void {
         if (self.sd()) |m| {
             const sl = m.lora orelse return;
+            var moved = false;
             for (&sl.stacks) |*st| if (file < st.files.items.len) {
+                moved = moved or st.files.items[file].dial != strength;
                 st.files.items[file].dial = strength;
             };
+            if (moved) self.encoderChanged();
             return;
         }
         if (self.lora == null) return;
         const stack = &self.lora.?;
-        if (file < stack.files.items.len) stack.files.items[file].dial = strength;
+        if (file < stack.files.items.len and stack.files.items[file].dial != strength) {
+            stack.files.items[file].dial = strength;
+            self.encoderChanged();
+        }
     }
 
     /// `setLoraStrength` for the schedule. The next denoiser forward picks it up.
     pub fn setLoraSchedule(self: *Session, file: usize, sched: lora_mod.Schedule) void {
+        self.encoderChanged();
         if (self.sd()) |m| {
             const sl = m.lora orelse return;
             for (&sl.stacks) |*st| if (file < st.files.items.len) {
@@ -6545,6 +6703,7 @@ pub const Session = struct {
         // LoRA containers' mappings, and the device weight cache is keyed on
         // those host pointers.
         self.dropLoras();
+        self.side_encodes.clear(gpa);
         // Tear the compute backend down FIRST, before unmapping the checkpoint
         // safetensors below. The CUDA backend's prefetch thread streams weights
         // straight from those mmaps and DRAINS its queued requests as it joins
@@ -7054,6 +7213,17 @@ pub const Session = struct {
         return out;
     }
 
+    /// `encodeTextRaw`'s rows for a steering term or the empty prompt, from the
+    /// session's cache when this text was encoded under the same options. The rows
+    /// stay valid until the next side encode.
+    fn sideEncode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !encode_cache.Rows {
+        const key = encodeKey(text, o);
+        if (self.side_encodes.get(key, text)) |hit| return hit;
+        var c = try self.encodeTextRaw(gpa, text, o);
+        defer c.deinit(gpa);
+        return self.side_encodes.put(self.gpa, key, text, c.data, c.seq);
+    }
+
     fn steerDirection(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -7069,8 +7239,8 @@ pub const Session = struct {
         plain.cond_noise = .{};
         plain.steps = 0;
 
-        var want = try self.encodeTextRaw(gpa, text, plain);
-        defer want.deinit(gpa);
+        const rows = try self.sideEncode(gpa, text, plain);
+        const want: Cond = .{ .data = rows.data, .seq = rows.seq };
 
         const want_lay = self.condLayout(&want) orelse return error.FamilyNotImplemented;
         // Token counts differ (they are different prompts); the SHAPE of a row must
@@ -7158,8 +7328,8 @@ pub const Session = struct {
     /// multiplies the appended rows: 1 is the phrase as encoded, smaller is a quieter
     /// mention. It reallocates `c.data`, which is why `concatSupported` exists.
     fn concatCond(self: *Session, gpa: std.mem.Allocator, c: *Cond, term: CondNoise.Steer, plain: EncodeOptions) !void {
-        var add = try self.encodeTextRaw(gpa, term.text, plain);
-        defer add.deinit(gpa);
+        const rows = try self.sideEncode(gpa, term.text, plain);
+        const add: Cond = .{ .data = rows.data, .seq = rows.seq };
 
         const lay = self.condLayout(c) orelse return error.FamilyNotImplemented;
         const add_lay = self.condLayout(&add) orelse return error.FamilyNotImplemented;
@@ -7197,8 +7367,8 @@ pub const Session = struct {
             defer if (from_empty) |e| gpa.free(e);
             for (o.cond_noise.steers) |t| {
                 if (t.on() and t.mode == .empty and from_empty == null) {
-                    var base = try self.encodeTextRaw(gpa, "", plain);
-                    defer base.deinit(gpa);
+                    const rows = try self.sideEncode(gpa, "", plain);
+                    const base: Cond = .{ .data = rows.data, .seq = rows.seq };
                     const base_lay = self.condLayout(&base) orelse return error.FamilyNotImplemented;
                     if (base_lay.segs != lay.segs or base_lay.rowWidth() != lay.rowWidth()) return error.CondLengthMismatch;
                     from_empty = try condMeans(gpa, &base, base_lay, lay.w);
@@ -11521,13 +11691,21 @@ pub const Session = struct {
         // number than requested. Hoisting is safe, `scheduleAt` is pure and touches no
         // RNG, so the noise draw below is unchanged and the render stays bit-identical.
         const shift = self.resolvedShift(opts);
-        const sigmas = try self.scheduleAt(gpa, opts.steps, shift, opts.scheduler, lat_h, lat_w);
+        const sigmas = if (opts.sampler.discardsPenultimateSigma()) blk: {
+            const full = try self.scheduleAt(gpa, opts.steps + 1, shift, opts.scheduler, lat_h, lat_w);
+            defer gpa.free(full);
+            break :blk try sampler.dropPenultimate(gpa, full);
+        } else try self.scheduleAt(gpa, opts.steps, shift, opts.scheduler, lat_h, lat_w);
         defer gpa.free(sigmas);
         const nsteps = sigmas.len - 1;
         if (nsteps != opts.steps) {
             try note(progress, "scheduler {t} produced {d} steps for a request of {d}\n", .{
                 opts.scheduler orelse sampler.Scheduler.defaultFor(self.sigmaTable(shift)), nsteps, opts.steps,
             });
+        }
+        if (try missesDistilledGrid(gpa, self.family(), opts.scheduler)) {
+            try note(progress, "warning: scheduler {t} misses the sigmas this model was distilled at; " ++
+                "expect broken anatomy. simple or sgm_uniform land on them\n", .{opts.scheduler orelse sampler.Scheduler.defaultFor(self.sigmaTable(shift))});
         }
 
         // Stage 1: text encoding (reusing the resident encoder).
@@ -11617,21 +11795,21 @@ pub const Session = struct {
                     // render wrong, with nothing failing.
                     .latent_noise_src = self.compat.noise_src,
                 },
-                shift,
+                self.sigmaTable(shift),
             );
             defer stepper.deinit();
             // Rebuild what a resume needs: the multistep history for an SDE stepper,
             // the position in the noise sequence for the ancestral one. Both are
             // silent when missed, see `Stepper.resumeFrom`.
             if (opts.resume_from) |r| stepper.resumeFrom(@min(r.step, nsteps), blk: {
-                const prev = r.hist_denoised orelse break :blk null;
-                if (prev.len != lat_len) break :blk null;
-                break :blk .{
-                    .prev = prev,
-                    .prev2 = if (r.hist_denoised2) |p2| (if (p2.len == lat_len) p2 else null) else null,
-                    .h = r.hist_h,
-                    .h2 = r.hist_h2,
-                };
+                var h: sampler.Stepper.History = .{ .h = r.hist_h, .h2 = r.hist_h2 };
+                for (r.hist) |b| {
+                    const buf = b orelse break;
+                    if (buf.len != lat_len) break :blk null;
+                    h.bufs[h.n] = buf;
+                    h.n += 1;
+                }
+                break :blk if (h.n == 0) null else h;
             });
 
             // The per-image denoiser: text fusion, rope table, timestep vectors and
@@ -11754,18 +11932,14 @@ pub const Session = struct {
                             // A multistep sampler's history is part of the state a
                             // bit-identical resume needs; null for the others, whose
                             // state `resumeFrom` rebuilds from the step index alone.
-                            const hist = stepper.history();
-                            so.* = .{
-                                .latent = try gpa.dupe(f32, x),
-                                .step = i,
-                                .hist_denoised = if (hist) |h| try gpa.dupe(f32, h.prev) else null,
-                                .hist_denoised2 = if (hist) |h|
-                                    (if (h.prev2) |p2| try gpa.dupe(f32, p2) else null)
-                                else
-                                    null,
-                                .hist_h = if (hist) |h| h.h else 0,
-                                .hist_h2 = if (hist) |h| h.h2 else 0,
-                            };
+                            var snap: Snapshot = .{ .latent = try gpa.dupe(f32, x), .step = i };
+                            errdefer snap.deinit(gpa);
+                            if (stepper.history()) |h| {
+                                for (h.slice(), snap.hist[0..h.n]) |b, *slot| slot.* = try gpa.dupe(f32, b);
+                                snap.hist_h = h.h;
+                                snap.hist_h2 = h.h2;
+                            }
+                            so.* = snap;
                             return error.Paused;
                         }
                         return error.Canceled;
@@ -12197,6 +12371,50 @@ const test_paths = struct {
     const te = build_options.model_root ++ "/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     const vae = build_options.model_root ++ "/vae/krea2RealVae_v10.safetensors";
 };
+
+test "a cached steering encode conditions exactly as a fresh one" {
+    // One term per mode, so each `sideEncode` call site is exercised: the
+    // direction's text, the empty prompt's, and concat's appended rows.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const ckpt = build_options.model_root ++ "/checkpoints/dreamshaper_8.safetensors";
+    try test_gate.requireModelFile(io, ckpt);
+
+    var sess = try Session.init(io, gpa, .{ .prompt = "", .backend = .cpu, .dit_path = ckpt }, null);
+    defer sess.deinit();
+
+    const steers = [_]CondNoise.Steer{
+        .{ .text = "moon", .scale = 0.5, .mode = .prompt },
+        .{ .text = "fog", .scale = -0.3, .mode = .empty },
+        .{ .text = "a red kite", .scale = 1, .mode = .concat },
+    };
+    const o: EncodeOptions = .{ .cond_noise = .{ .steers = &steers } };
+    const prompt = "a lighthouse on a cliff";
+
+    var first = try sess.encode(gpa, prompt, o);
+    defer first.deinit(gpa);
+    var filled: usize = 0;
+    for (sess.side_encodes.entries) |e| filled += @intFromBool(e != null);
+    // "moon", "fog", "" (fog's contrast) and "a red kite".
+    try std.testing.expectEqual(@as(usize, 4), filled);
+
+    var hit = try sess.encode(gpa, prompt, o);
+    defer hit.deinit(gpa);
+    sess.encoderChanged();
+    var fresh = try sess.encode(gpa, prompt, o);
+    defer fresh.deinit(gpa);
+    for ([_]*const Cond{ &hit, &fresh }) |c| {
+        try std.testing.expectEqual(first.seq, c.seq);
+        try std.testing.expectEqualSlices(f32, first.data, c.data);
+    }
+
+    // A different term must not be served the first one's rows.
+    var other_steers = steers;
+    other_steers[0].text = "sun";
+    var other = try sess.encode(gpa, prompt, .{ .cond_noise = .{ .steers = &other_steers } });
+    defer other.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(f32, first.data, other.data));
+}
 
 test "generate composed from the public stages is bit-identical to Session.generate" {
     // The acceptance test for the stage split: `encode` / `schedule` / `denoiser`

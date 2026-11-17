@@ -62,6 +62,8 @@ import torch  # noqa: E402
 import comfy.model_sampling as ms  # noqa: E402
 import comfy.samplers  # noqa: E402
 from comfy.k_diffusion import sampling as kds  # noqa: E402
+from comfy.extra_samplers import uni_pc  # noqa: E402
+from comfy.k_diffusion import deis  # noqa: E402
 
 
 def f32_list(t):
@@ -155,7 +157,8 @@ def plain_trajectory(name, fn, model_sampling, sigmas, **kw):
     c = torch.randn(1, 4, 4, 4, dtype=torch.float32)
     x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32)
     sig = torch.tensor(sigmas, dtype=torch.float32)
-    out = fn(ToyDenoiser(c, model_sampling), x0.clone(), sig,
+    # A clone: UniPC overwrites the last sigma through a view.
+    out = fn(ToyDenoiser(c, model_sampling), x0.clone(), sig.clone(),
              extra_args={"seed": SEED}, disable=True, **kw)
     return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
                 eta=0.0, s_noise=1.0, seed=SEED, n=N,
@@ -214,6 +217,21 @@ def ancestral2_trajectory(name, fn, model_sampling, sigmas, eta, s_noise):
              disable=True, eta=eta, s_noise=s_noise)
     return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
                 eta=eta, s_noise=s_noise, seed=SEED, n=N,
+                sigmas=[float(v) for v in sig.cpu()], c=f32_list(c.cpu()), x0=f32_list(x0.cpu()),
+                x_out=f32_list(out.cpu()))
+
+
+def noisy_trajectory(name, fn, model_sampling, sigmas, **kw):
+    """A sampler drawing from `default_noise_sampler` (`res_multistep_ancestral`,
+    `er_sde`): on CUDA, for the same reason as the ancestral ones."""
+    torch.manual_seed(0)
+    c = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    x0 = torch.randn(1, 4, 4, 4, dtype=torch.float32).cuda()
+    sig = torch.tensor(sigmas, dtype=torch.float32).cuda()
+    out = fn(ToyDenoiser(c, model_sampling), x0.clone(), sig, extra_args={"seed": SEED},
+             disable=True, **kw)
+    return dict(name=name, family=("const" if isinstance(model_sampling, ms.CONST) else "eps"),
+                eta=kw.get("eta", 0.0), s_noise=kw.get("s_noise", 1.0), seed=SEED, n=N,
                 sigmas=[float(v) for v in sig.cpu()], c=f32_list(c.cpu()), x0=f32_list(x0.cpu()),
                 x_out=f32_list(out.cpu()))
 
@@ -437,6 +455,64 @@ def main():
         ancestral_trajectory("sd_ancestral_10_eta0", eps_ms, sd_sigmas(10), 0.0, 1.0),
     ]
 
+    # Every further sampler on ComfyUI's list, one entry per (sampler, family) and a
+    # short schedule where a sampler has a branch for the last steps. Keyed by the
+    # ComfyUI sampler name, which is what the Zig side looks the Kind up by.
+    extra = []
+    for sname, fn in (
+        ("lms", kds.sample_lms),
+        ("ipndm", kds.sample_ipndm),
+        ("ipndm_v", kds.sample_ipndm_v),
+        ("deis", kds.sample_deis),
+        ("heunpp2", kds.sample_heunpp2),
+        ("res_multistep", kds.sample_res_multistep),
+        ("uni_pc", uni_pc.sample_unipc),
+        ("uni_pc_bh2", uni_pc.sample_unipc_bh2),
+    ):
+        for t in (
+            plain_trajectory(f"krea2_{sname}_8", fn, const_ms, simple_schedule(8)),
+            plain_trajectory(f"sd_{sname}_10", fn, eps_ms, sd_sigmas(10)),
+            plain_trajectory(f"sd_{sname}_4", fn, eps_ms, sd_sigmas(4)),
+            plain_trajectory(f"sd_{sname}_2", fn, eps_ms, sd_sigmas(2)),
+        ):
+            t["sampler"] = sname
+            extra.append(t)
+    for t in (
+        noisy_trajectory("krea2_resa_8", kds.sample_res_multistep_ancestral, const_ms, simple_schedule(8), eta=1.0, s_noise=1.0),
+        noisy_trajectory("sd_resa_10", kds.sample_res_multistep_ancestral, eps_ms, sd_sigmas(10), eta=1.0, s_noise=1.0),
+        noisy_trajectory("sd_resa_10_eta05", kds.sample_res_multistep_ancestral, eps_ms, sd_sigmas(10), eta=0.5, s_noise=0.9),
+    ):
+        t["sampler"] = "res_multistep_ancestral"
+        extra.append(t)
+    for t in (
+        noisy_trajectory("krea2_ersde_8", kds.sample_er_sde, const_ms, simple_schedule(8), s_noise=1.0),
+        noisy_trajectory("sd_ersde_10", kds.sample_er_sde, eps_ms, sd_sigmas(10), s_noise=1.0),
+        noisy_trajectory("sd_ersde_10_s09", kds.sample_er_sde, eps_ms, sd_sigmas(10), s_noise=0.9),
+        # No noise at all: isolates the three-stage solver from the draws.
+        noisy_trajectory("sd_ersde_10_s0", kds.sample_er_sde, eps_ms, sd_sigmas(10), s_noise=0.0),
+        noisy_trajectory("zimage_ersde_8", kds.sample_er_sde, zimg_ms, comfy.samplers.calculate_sigmas(zimg_ms, "simple", 8).tolist(), s_noise=1.0),
+    ):
+        t["sampler"] = "er_sde"
+        extra.append(t)
+
+    # DEIS's weights on their own: a real model is sensitive to them far below what a
+    # trajectory bound can see (an f64 port moves ComfyUI's render 30 dB).
+    deis_coeffs = []
+    for name, sig in (
+        ("sd_normal_10", comfy.samplers.calculate_sigmas(eps_ms, "normal", 10)),
+        ("sd_normal_20", comfy.samplers.calculate_sigmas(eps_ms, "normal", 20)),
+        ("sd_normal_30", comfy.samplers.calculate_sigmas(eps_ms, "normal", 30)),
+        ("sd_karras_20", comfy.samplers.calculate_sigmas(eps_ms, "karras", 20)),
+        ("krea2_simple_8", torch.tensor(simple_schedule(8), dtype=torch.float32)),
+    ):
+        sig = sig.to(torch.float32)
+        C = deis.get_deis_coeff_list(sig, 3)
+        deis_coeffs.append(dict(name=name, sigmas=f32_list(sig),
+                                # The step onto sigma 0 integrates to infinity and is
+                                # never used (DEIS takes Euler there): null.
+                                coeffs=[[float(v) for v in row] if all(torch.isfinite(torch.as_tensor(v)) for v in row) else None
+                                        for row in C]))
+
     doc = dict(
         _comment="Generated by tools/gen_sampler_fixtures.py against ComfyUI's own "
                  "k_diffusion.sampling and torchsde. Do not hand-edit.",
@@ -451,12 +527,14 @@ def main():
         ancestral=ancestral,
         ancestral2=ancestral2,
         sde_2s=sde_2s,
+        extra=extra,
+        deis_coeffs=deis_coeffs,
     )
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w") as f:
         json.dump(doc, f, indent=1)
     print(f"wrote {OUT} ({os.path.getsize(OUT)} bytes)")
-    for t in trajectories + plain + ancestral + ancestral2 + sde_2s:
+    for t in trajectories + plain + ancestral + ancestral2 + sde_2s + extra:
         print(f"  {t['name']:22s} family={t['family']:5s} eta={t['eta']} "
               f"|x_out| max={max(abs(v) for v in t['x_out']):.4f}")
     for fam in ("flux", "sd", "zimage"):

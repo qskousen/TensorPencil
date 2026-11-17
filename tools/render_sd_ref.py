@@ -96,7 +96,7 @@ samples = comfy.sample.sample(
 print("final latent: max|x| %.3f" % float(samples.abs().max()))
 
 img = vae.decode(samples.to(comfy.model_management.get_torch_device()))
-arr = (img[0].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+arr = (img[0].detach().clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
 os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
 Image.fromarray(arr).save(a.out)
 print(f"wrote {a.out} ({arr.shape[1]}x{arr.shape[0]})")

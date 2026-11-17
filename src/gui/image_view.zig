@@ -576,7 +576,7 @@ fn renderWide(cfg: *config.Config, u: *const models.Union, fam: ?model_spec.Fami
 
 fn renderForm(cfg: *config.Config, u: *const models.Union, fam: ?model_spec.Family, cb: Callbacks) void {
     renderSizeSection(cfg);
-    renderSamplingSection(cfg);
+    renderSamplingSection(cfg, fam);
     renderLoraSection(cfg, &u.cat, fam);
     renderAdvancedSection(cfg, cb);
 }
@@ -1179,7 +1179,11 @@ fn renderSizeSection(cfg: *config.Config) void {
     }
 }
 
-fn renderSamplingSection(cfg: *config.Config) void {
+fn renderSamplingSection(cfg: *config.Config, fam: ?model_spec.Family) void {
+    const off_grid = if (fam) |f|
+        tp.pipeline.missesDistilledGrid(dvui.currentWindow().arena(), f, pipeline_map.toPipelineScheduler(f_scheduler)) catch false
+    else
+        false;
     var sum_buf: [96]u8 = undefined;
     var sec = style.collapsibleBegin(@src(), "SAMPLING", &cfg.studio_open_sampling, .{
         .summary = std.mem.print(&sum_buf, "{s} · {s} · {s} steps · cfg {s}", .{
@@ -1188,6 +1192,7 @@ fn renderSamplingSection(cfg: *config.Config) void {
             std.mem.sliceTo(&steps_buf, 0),
             std.mem.sliceTo(&cfg_buf, 0),
         }) catch "",
+        .warn = off_grid,
     });
     defer style.collapsibleEnd(&sec);
     if (!sec.open()) return;
@@ -1202,6 +1207,8 @@ fn renderSamplingSection(cfg: *config.Config) void {
         defer row.deinit();
         _ = enumChip(@src(), config.Scheduler, &f_scheduler, 0);
     }
+    if (off_grid) note(1, C.amber, "This scheduler skips the noise levels the model was distilled " ++
+        "at, which shows as twisted bodies and smeared detail. Default, simple and sgm_uniform land on them.");
     {
         var row = rowBegin(@src(), 2, "Steps");
         defer row.deinit();
@@ -1733,6 +1740,10 @@ fn renderActModal() void {
 /// the moment the text wraps. Anything that can reach a second line needs a role
 /// with real leading.
 fn help(id: usize, text: []const u8) void {
+    note(id, C.text_ghost, text);
+}
+
+fn note(id: usize, color: style.Color, text: []const u8) void {
     var tl = dvui.textLayout(@src(), .{}, .{
         .id_extra = id,
         .expand = .horizontal,
@@ -1741,7 +1752,7 @@ fn help(id: usize, text: []const u8) void {
         .padding = .{ .y = 2, .h = 8 },
     });
     defer tl.deinit();
-    fonts.addStyled(tl, text, .{}, .{ .font = F.row, .color_text = .{ .color = C.text_ghost } });
+    fonts.addStyled(tl, text, .{}, .{ .font = F.row, .color_text = .{ .color = color } });
 }
 
 // ----------------------------------------------------------------- composer

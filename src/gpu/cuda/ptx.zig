@@ -233,6 +233,32 @@ pub const Need = struct {
 
 const baseline: Need = .{ .sm = build_options.cuda_sm, .isa = parseIsa(build_options.ptx_isa) };
 
+/// The hand kernels' own floor (cp.async, mma.m16n8k32, ldmatrix).
+const kernel_sm = 80;
+
+pub const DeviceFit = enum { ok, below_kernels, below_build };
+
+/// Whether a device of capability `sm` (`major * 10 + minor`) can JIT this build's
+/// modules. `below_build` is fixable by rebuilding with a lower `-Dcuda-sm`.
+pub fn deviceFit(sm: u32, build_sm: u32) DeviceFit {
+    if (sm < kernel_sm) return .below_kernels;
+    if (sm < build_sm) return .below_build;
+    return .ok;
+}
+
+pub fn fitsDevice(sm: u32) DeviceFit {
+    return deviceFit(sm, baseline.sm);
+}
+
+test "deviceFit refuses below the kernels' floor and below the build target" {
+    try std.testing.expectEqual(DeviceFit.below_kernels, deviceFit(75, 86));
+    try std.testing.expectEqual(DeviceFit.below_kernels, deviceFit(75, 75));
+    try std.testing.expectEqual(DeviceFit.below_build, deviceFit(80, 86));
+    try std.testing.expectEqual(DeviceFit.ok, deviceFit(80, 80));
+    try std.testing.expectEqual(DeviceFit.ok, deviceFit(86, 86));
+    try std.testing.expectEqual(DeviceFit.ok, deviceFit(120, 86));
+}
+
 fn parseIsa(comptime s: []const u8) u32 {
     const dot = std.mem.findScalar(u8, s, '.').?;
     return (std.fmt.parseInt(u32, s[0..dot], 10) catch unreachable) * 10 + (std.fmt.parseInt(u32, s[dot + 1 ..], 10) catch unreachable);

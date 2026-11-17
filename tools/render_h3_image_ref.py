@@ -22,14 +22,20 @@ samples and decodes. Run each under a memory cap:
 `--no-int8-attention` swaps the file's int8 attention for ComfyUI's ordinary one,
 the control row: how far ComfyUI moves from itself. `--ref-image` (repeatable)
 makes it an edit; the VAE is then needed in the encode phase too.
+
+`--matrix runs.json` renders many settings with one load: a list of objects with
+any of `name`, `width`, `height`, `steps`, `sampler`, `scheduler`, `seed`, `cfg`
+(missing keys take the flags' values). The encode phase writes one conditioning per
+size in it, `<out>_<w>x<h>.cond.pt`, and the sample phase writes `<out>_<name>.png`.
 """
 
 import argparse
+import json
 import os
 import sys
 
-COMFY = "/home/qt/genai/comfyui"
-ROOT = "/mnt/watch/models/diffusion"
+COMFY = os.environ.get("COMFY", "/home/qt/genai/comfyui")
+ROOT = os.environ.get("MODEL_ROOT", "/mnt/watch/models/diffusion")
 DEFAULT_DIT = os.path.join(ROOT, "diffusion_models/h3-image/minimax_h3_image_ggufy_int8_convrot.safetensors")
 DEFAULT_TE = os.path.join(ROOT, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors")
 DEFAULT_VAE = os.path.join(ROOT, "vae/minimax_h3_image_vae_fp16.safetensors")
@@ -55,6 +61,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
+import comfy.model_management  # noqa: E402
 import comfy.sd  # noqa: E402
 import comfy_kitchen  # noqa: E402
 
@@ -72,37 +79,73 @@ def load_image(path):
     return torch.from_numpy(arr)[None]
 
 
+def runs(args):
+    """The renders to make: the matrix file's entries over the flags' values, or the flags alone."""
+    base = {"name": None, "width": args.width, "height": args.height, "steps": args.steps,
+            "sampler": args.sampler, "scheduler": args.scheduler, "seed": args.seed, "cfg": args.cfg}
+    if not args.matrix:
+        return [base]
+    with open(args.matrix) as f:
+        entries = json.load(f)
+    out = []
+    for e in entries:
+        unknown = set(e) - set(base)
+        assert not unknown, "unknown matrix keys %s" % unknown
+        r = dict(base, **e)
+        r["name"] = r["name"] or "%dx%d_%s_%s_%d_s%d" % (r["width"], r["height"], r["sampler"],
+                                                         r["scheduler"], r["steps"], r["seed"])
+        out.append(r)
+    return out
+
+
+def cond_path(args, r):
+    return args.out + (".cond.pt" if not args.matrix else "_%dx%d.cond.pt" % (r["width"], r["height"]))
+
+
 def encode(args):
     clip = comfy.sd.load_clip(ckpt_paths=[args.text_encoder], embedding_directory=None,
                               clip_type=comfy.sd.CLIPType.MINIMAX)
     vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(args.vae)) if args.ref_image else None
     images = {"image_%d" % (i + 1): load_image(p) for i, p in enumerate(args.ref_image)}
-    out = MiniMaxH3ImageConditioning.execute(clip, args.prompt, args.width, args.height, vae=vae,
-                                             images=images or None)
-    positive, latent = out.result if hasattr(out, "result") else out
-    torch.save({"positive": positive, "latent": latent}, args.out + ".cond.pt")
-    print("wrote %s.cond.pt  tokens %d  latent %s" % (args.out, positive[0][0].shape[1],
-                                                       tuple(latent["samples"].shape)))
+    done = set()
+    for r in runs(args):
+        path = cond_path(args, r)
+        if path in done:
+            continue
+        done.add(path)
+        out = MiniMaxH3ImageConditioning.execute(clip, args.prompt, r["width"], r["height"], vae=vae,
+                                                 images=images or None)
+        positive, latent = out.result if hasattr(out, "result") else out
+        torch.save({"positive": positive, "latent": latent}, path)
+        print("wrote %s  tokens %d  latent %s" % (path, positive[0][0].shape[1], tuple(latent["samples"].shape)))
 
 
 def sample(args):
-    saved = torch.load(args.out + ".cond.pt", weights_only=False)
-    positive, latent = saved["positive"], saved["latent"]
-    (negative,) = nodes.ConditioningZeroOut().zero_out(positive)
+    import time
     model = comfy.sd.load_diffusion_model(args.dit)
     vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(args.vae))
-    import time
-    t0 = time.perf_counter()
-    (out,) = nodes.common_ksampler(model, args.seed, args.steps, args.cfg, "euler", "simple",
-                                   positive, negative, latent, denoise=1.0)
-    t1 = time.perf_counter()
-    image = vae.decode(out["samples"])
-    print("sampling %.1fs (%.2fs/step), decode %.1fs" % (t1 - t0, (t1 - t0) / args.steps,
-                                                         time.perf_counter() - t1))
-    arr = (image.reshape(-1, *image.shape[-3:])[0].detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
-    Image.fromarray(arr).save(args.out + ".png")
-    comfy.utils.save_torch_file({"latent": out["samples"][0].contiguous().float().cpu()}, args.out + ".safetensors")
-    print("wrote %s.png and %s.safetensors" % (args.out, args.out))
+    for r in runs(args):
+        saved = torch.load(cond_path(args, r), weights_only=False)
+        positive, latent = saved["positive"], saved["latent"]
+        (negative,) = nodes.ConditioningZeroOut().zero_out(positive)
+        t0 = time.perf_counter()
+        (out,) = nodes.common_ksampler(model, r["seed"], r["steps"], r["cfg"], r["sampler"], r["scheduler"],
+                                       positive, negative, latent, denoise=1.0)
+        t1 = time.perf_counter()
+        stem = args.out if not args.matrix else "%s_%s" % (args.out, r["name"])
+        comfy.utils.save_torch_file({"latent": out["samples"][0].contiguous().float().cpu()}, stem + ".safetensors")
+        # The latent is saved first because on a 24 GB card ComfyUI's decode runs out of
+        # memory at 1536x1536 and up even with the DiT unloaded; decode it with
+        # `minimax-h3-image-decode` instead.
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        t2 = time.perf_counter()
+        image = vae.decode(out["samples"])
+        print("%s: sampling %.1fs (%.2fs/step), decode %.1fs" % (
+            r["name"] or stem, t1 - t0, (t1 - t0) / r["steps"], time.perf_counter() - t2))
+        arr = (image.reshape(-1, *image.shape[-3:])[0].detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+        Image.fromarray(arr).save(stem + ".png")
+        print("wrote %s.png and %s.safetensors" % (stem, stem))
 
 
 def main():
@@ -118,10 +161,15 @@ def main():
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--cfg", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--sampler", default="euler")
+    ap.add_argument("--scheduler", default="simple")
+    ap.add_argument("--matrix", default="")
     ap.add_argument("--out", default="scratch_out/h3i_comfy")
     args = ap.parse_args(OUR_ARGV)
     args.out = os.path.join(CALLER_CWD, args.out)
     args.ref_image = [os.path.join(CALLER_CWD, p) for p in args.ref_image]
+    if args.matrix:
+        args.matrix = os.path.join(CALLER_CWD, args.matrix)
     encode(args) if args.phase == "encode" else sample(args)
 
 

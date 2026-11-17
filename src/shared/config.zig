@@ -216,8 +216,8 @@ pub const Compat = enum(u8) {
 ///
 ///  - the ancestral and SDE ones draw noise as they go, so `eta` / `s_noise` mean
 ///    something (left at ComfyUI's 1.0; the CLI's `--eta` / `--s-noise` can override);
-///  - the ones marked 2 evals/step run the model TWICE per step, so the same step
-///    count is twice the render time.
+///  - the ones marked 2 or 3 evals/step run the model that many times per step, so
+///    the same step count is that multiple of the render time.
 pub const Sampler = enum(u8) {
     euler,
     euler_ancestral,
@@ -230,6 +230,17 @@ pub const Sampler = enum(u8) {
     dpmpp_2m_sde,
     dpmpp_2m_sde_heun,
     dpmpp_3m_sde,
+    ddim,
+    lms,
+    ipndm,
+    ipndm_v,
+    deis,
+    heunpp2,
+    res_multistep,
+    res_multistep_ancestral,
+    er_sde,
+    uni_pc,
+    uni_pc_bh2,
 
     pub fn label(self: Sampler) []const u8 {
         return switch (self) {
@@ -244,6 +255,17 @@ pub const Sampler = enum(u8) {
             .dpmpp_2m_sde => "DPM++ 2M SDE",
             .dpmpp_2m_sde_heun => "DPM++ 2M SDE Heun",
             .dpmpp_3m_sde => "DPM++ 3M SDE",
+            .ddim => "DDIM (same as Euler)",
+            .lms => "LMS",
+            .ipndm => "iPNDM",
+            .ipndm_v => "iPNDM-v",
+            .deis => "DEIS",
+            .heunpp2 => "Heun++ (3 evals/step)",
+            .res_multistep => "RES multistep",
+            .res_multistep_ancestral => "RES multistep ancestral",
+            .er_sde => "ER-SDE",
+            .uni_pc => "UniPC",
+            .uni_pc_bh2 => "UniPC bh2",
         };
     }
 

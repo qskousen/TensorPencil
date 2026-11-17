@@ -199,6 +199,19 @@ pub const SigmaTable = union(enum) {
         };
     }
 
+    /// `model_sampling.percent_to_sigma(percent)`, which ComfyUI offsets a flow
+    /// schedule's first sigma with. Null for SD's, which is never offset.
+    pub fn percentToSigma(self: SigmaTable, percent: f64) ?f64 {
+        const t = 1.0 - percent;
+        return switch (self) {
+            .flux => |mu| sigmaAt(mu, t),
+            // `time_snr_shift` on Python floats, not the table's f32 `discreteFlowSigma`.
+            .discrete_flow => |shift| if (shift == 1.0) t else @as(f64, shift) * t / (1 + (@as(f64, shift) - 1) * t),
+            .pdd_grid => |g| gridSigma(g, @floatCast(t * pdd_multiplier)),
+            .discrete => null,
+        };
+    }
+
     pub fn sigmaMin(self: SigmaTable) f32 {
         return self.at(0);
     }
@@ -258,6 +271,35 @@ pub fn gridSigma(grid: []const f32, timestep: f32) f32 {
     const pos = std.math.clamp(timestep / pdd_multiplier, 0, 1) * @as(f32, @floatFromInt(n));
     const i: usize = @min(@as(usize, @intFromFloat(@floor(pos))), n - 1);
     return torchLerp(grid[i], grid[i + 1], pos - @as(f32, @floatFromInt(i)));
+}
+
+/// Whether any of `sigmas` falls between two points of the ascending `grid` rather
+/// than on one. The tolerance is 2% of a grid interval: `simple` reads a 1000-rung
+/// table and lands within 0.6% of a point, `normal` misses by about 20%.
+pub fn offGrid(grid: []const f32, sigmas: []const f32) bool {
+    const tol = 0.02;
+    for (sigmas) |s| {
+        var i: usize = 0;
+        while (i + 2 < grid.len and s > grid[i + 1]) i += 1;
+        const pos = (s - grid[i]) / (grid[i + 1] - grid[i]);
+        if (@min(@abs(pos), @abs(1 - pos)) > tol) return true;
+    }
+    return false;
+}
+
+test "offGrid: simple lands on the H3 release grid at its own step count, normal does not" {
+    const grid = [_]f32{ 0.0, 0.23200887441635132, 0.5327739119529724, 0.75, 0.8875485062599182, 0.9675236940383911, 1.0 };
+    const gpa = std.testing.allocator;
+    const on = try build(gpa, .{ .pdd_grid = &grid }, .simple, grid.len - 1);
+    defer gpa.free(on);
+    errdefer std.debug.print("simple {any}\n", .{on});
+    try std.testing.expect(!offGrid(&grid, on));
+    const off = try build(gpa, .{ .pdd_grid = &grid }, .normal, grid.len - 1);
+    defer gpa.free(off);
+    errdefer std.debug.print("normal {any}\n", .{off});
+    try std.testing.expect(offGrid(&grid, off));
+    try std.testing.expect(!offGrid(&grid, &grid));
+    try std.testing.expect(offGrid(&grid, &.{0.6}));
 }
 
 /// `torch.lerp` on f32: two formulas split at weight 0.5, so each end is exact.

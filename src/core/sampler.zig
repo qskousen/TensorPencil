@@ -34,6 +34,9 @@ const std = @import("std");
 const noise = @import("noise.zig");
 const brownian = @import("brownian.zig");
 const schedule = @import("schedule.zig");
+const linear = @import("sampler_linear.zig");
+const exp_samplers = @import("sampler_exp.zig");
+const unipc = @import("sampler_unipc.zig");
 
 // Re-exported from `schedule.zig`, which now owns them. Kept here because
 // `pipeline`, `main` and ggufy's measurement ladder reach for `sampler.<name>`.
@@ -93,6 +96,19 @@ pub const Kind = enum {
     dpmpp_2m_sde,
     dpmpp_2m_sde_heun,
     dpmpp_3m_sde,
+    /// ComfyUI's `ddim` is Euler with inpainting's random-noise option, which
+    /// changes nothing outside a mask.
+    ddim,
+    lms,
+    ipndm,
+    ipndm_v,
+    deis,
+    heunpp2,
+    res_multistep,
+    res_multistep_ancestral,
+    er_sde,
+    uni_pc,
+    uni_pc_bh2,
 
     /// The `--sampler` spelling, and the GUI config value.
     pub fn parse(s: []const u8) ?Kind {
@@ -100,19 +116,7 @@ pub const Kind = enum {
     }
 
     pub fn label(self: Kind) []const u8 {
-        return switch (self) {
-            .euler => "euler",
-            .euler_ancestral => "euler_ancestral",
-            .heun => "heun",
-            .dpm_2 => "dpm_2",
-            .dpm_2_ancestral => "dpm_2_ancestral",
-            .dpmpp_2s_ancestral => "dpmpp_2s_ancestral",
-            .dpmpp_sde => "dpmpp_sde",
-            .dpmpp_2m => "dpmpp_2m",
-            .dpmpp_2m_sde => "dpmpp_2m_sde",
-            .dpmpp_2m_sde_heun => "dpmpp_2m_sde_heun",
-            .dpmpp_3m_sde => "dpmpp_3m_sde",
-        };
+        return @tagName(self);
     }
 
     /// The AUTOMATIC1111 `parameters` spelling, for PNG metadata. Different from
@@ -131,6 +135,13 @@ pub const Kind = enum {
             .dpmpp_2m_sde => "DPM++ 2M SDE",
             .dpmpp_2m_sde_heun => "DPM++ 2M SDE Heun",
             .dpmpp_3m_sde => "DPM++ 3M SDE",
+            .ddim => "DDIM",
+            .lms => "LMS",
+            .uni_pc => "UniPC",
+            // No A1111 name. ComfyUI's own, as SaveImageWithMetaDataUniversal writes
+            // an unmapped one. Its "Heun" / "UniPC" aliases for heunpp2 and
+            // uni_pc_bh2 would re-render as a different sampler.
+            .ipndm, .ipndm_v, .deis, .heunpp2, .res_multistep, .res_multistep_ancestral, .er_sde, .uni_pc_bh2 => @tagName(self),
         };
     }
 
@@ -139,7 +150,7 @@ pub const Kind = enum {
     /// latent alone.
     pub fn isStochastic(self: Kind) bool {
         return switch (self) {
-            .euler, .heun, .dpm_2, .dpmpp_2m => false,
+            .euler, .heun, .dpm_2, .dpmpp_2m, .ddim, .lms, .ipndm, .ipndm_v, .deis, .heunpp2, .res_multistep, .uni_pc, .uni_pc_bh2 => false,
             .euler_ancestral,
             .dpm_2_ancestral,
             .dpmpp_2s_ancestral,
@@ -147,6 +158,8 @@ pub const Kind = enum {
             .dpmpp_2m_sde,
             .dpmpp_2m_sde_heun,
             .dpmpp_3m_sde,
+            .res_multistep_ancestral,
+            .er_sde,
             => true,
         };
     }
@@ -157,10 +170,38 @@ pub const Kind = enum {
     pub fn evalsPerStep(self: Kind) u8 {
         return switch (self) {
             .euler, .euler_ancestral, .dpmpp_2m, .dpmpp_2m_sde, .dpmpp_2m_sde_heun, .dpmpp_3m_sde => 1,
+            .ddim, .lms, .ipndm, .ipndm_v, .deis, .res_multistep, .res_multistep_ancestral, .er_sde, .uni_pc, .uni_pc_bh2 => 1,
             .heun, .dpm_2, .dpm_2_ancestral, .dpmpp_2s_ancestral, .dpmpp_sde => 2,
+            // Two probes on every step but the last two.
+            .heunpp2 => 3,
+        };
+    }
+
+    /// ComfyUI's `KSampler.DISCARD_PENULTIMATE_SIGMA_SAMPLERS`: these build their
+    /// schedule for one step more and drop the second-to-last sigma
+    /// (`dropPenultimate`).
+    pub fn discardsPenultimateSigma(self: Kind) bool {
+        return switch (self) {
+            .dpm_2, .dpm_2_ancestral, .uni_pc, .uni_pc_bh2 => true,
+            else => false,
         };
     }
 };
+
+/// `torch.cat([sigmas[:-2], sigmas[-1:]])`, into a new slice the caller frees.
+pub fn dropPenultimate(gpa: std.mem.Allocator, sigmas: []const f32) ![]f32 {
+    std.debug.assert(sigmas.len >= 2);
+    const out = try gpa.alloc(f32, sigmas.len - 1);
+    @memcpy(out[0 .. out.len - 1], sigmas[0 .. sigmas.len - 2]);
+    out[out.len - 1] = sigmas[sigmas.len - 1];
+    return out;
+}
+
+test "dropPenultimate keeps the ends and loses the second-to-last" {
+    const out = try dropPenultimate(std.testing.allocator, &.{ 14.6, 7.0, 3.0, 0.5, 0 });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(f32, &.{ 14.6, 7.0, 3.0, 0 }, out);
+}
 
 /// Which generator a sampler's own per-step noise comes from, given the one the
 /// INITIAL LATENT was drawn from.
@@ -179,7 +220,7 @@ pub const Kind = enum {
 /// fresh one, which is not reproduced here.
 pub fn stepNoiseSource(kind: Kind, latent_src: noise.Source) noise.Source {
     return switch (kind) {
-        .euler_ancestral, .dpm_2_ancestral, .dpmpp_2s_ancestral => .nv_philox,
+        .euler_ancestral, .dpm_2_ancestral, .dpmpp_2s_ancestral, .res_multistep_ancestral, .er_sde => .nv_philox,
         else => latent_src,
     };
 }
@@ -201,7 +242,7 @@ pub const Parameterization = enum {
     /// `EPS` (SD1.5 / SDXL): `alpha = 1` and `lambda = -log(sigma)`.
     eps,
 
-    fn halfLogSnr(self: Parameterization, sigma: f64) f64 {
+    pub fn halfLogSnr(self: Parameterization, sigma: f64) f64 {
         return switch (self) {
             // `1 - sigma` is exact in f32/f64 for sigma in [0.5, 1) by Sterbenz, so
             // this has no cancellation problem despite looking like it should.
@@ -262,6 +303,10 @@ pub const Stepper = union(enum) {
     multistep: MultistepStepper,
     sde: SdeStepper,
     sde_2s: SdeSingleStepper,
+    linear: linear.LinearStepper,
+    res: exp_samplers.ResStepper,
+    er_sde: exp_samplers.ErSdeStepper,
+    unipc: unipc.UniPcStepper,
 
     pub const Options = struct {
         /// Noise level. 0 makes a stochastic sampler deterministic; ComfyUI's default
@@ -288,12 +333,31 @@ pub const Stepper = union(enum) {
         n: usize,
         param: Parameterization,
         opts: Options,
-        shift: f32,
+        table: SigmaTable,
     ) !Stepper {
         const src = stepNoiseSource(kind, opts.latent_noise_src);
         return switch (kind) {
-            .euler => .euler,
-            .heun, .dpm_2 => .{ .two_stage = try .init(gpa, kind, sigmas, n) },
+            .euler, .ddim => .euler,
+            .heun, .dpm_2, .heunpp2 => .{ .two_stage = try .init(gpa, kind, sigmas, n) },
+            .lms, .ipndm, .ipndm_v, .deis => .{ .linear = try .init(gpa, switch (kind) {
+                .lms => .lms,
+                .ipndm => .ipndm,
+                .ipndm_v => .ipndm_v,
+                else => .deis,
+            }, sigmas, n) },
+            .res_multistep, .res_multistep_ancestral => .{ .res = try .init(gpa, sigmas, n, .{
+                // ComfyUI fixes eta per name: 0 for the plain one, the option for the other.
+                .eta = if (kind == .res_multistep) 0 else opts.eta,
+                .s_noise = opts.s_noise,
+                .seed = opts.seed,
+                .noise_src = src,
+            }) },
+            .er_sde => .{ .er_sde = try .init(gpa, sigmas, n, param, .{
+                .s_noise = opts.s_noise,
+                .seed = opts.seed,
+                .noise_src = src,
+            }, table) },
+            .uni_pc, .uni_pc_bh2 => .{ .unipc = try .init(gpa, if (kind == .uni_pc) .bh1 else .bh2, sigmas, n) },
             .euler_ancestral, .dpm_2_ancestral, .dpmpp_2s_ancestral => .{ .ancestral = try .init(gpa, kind, sigmas, n, param, .{
                 .eta = opts.eta,
                 .s_noise = opts.s_noise,
@@ -305,7 +369,7 @@ pub const Stepper = union(enum) {
                 .s_noise = opts.s_noise,
                 .seed = opts.seed,
                 .noise_src = src,
-            }, shift) },
+            }, table) },
             .dpmpp_2m => .{ .multistep = try .init(gpa, sigmas, n) },
             .dpmpp_2m_sde, .dpmpp_2m_sde_heun, .dpmpp_3m_sde => .{ .sde = try .init(gpa, sigmas, n, param, .{
                 .eta = opts.eta,
@@ -321,7 +385,7 @@ pub const Stepper = union(enum) {
                 .third_order = kind == .dpmpp_3m_sde,
                 .seed = opts.seed,
                 .noise_src = src,
-            }, shift) },
+            }, table) },
         };
     }
 
@@ -342,6 +406,7 @@ pub const Stepper = union(enum) {
             .multistep => |*s| s.step(x, v, i),
             .sde => |*s| try s.step(x, v, i),
             .sde_2s => |*s| try s.step(x, v, i, model),
+            inline .linear, .res, .er_sde, .unipc => |*s| s.step(x, v, i),
         }
     }
 
@@ -356,29 +421,56 @@ pub const Stepper = union(enum) {
         };
     }
 
-    /// What a multistep sampler has to be handed back to resume bit-identically.
-    /// `prev2` is null for every sampler but DPM++(3M) SDE, which reaches two steps
-    /// back.
+    /// The most latent-sized buffers a sampler carries across a step: UniPC's
+    /// point, its pending update's start and three model values.
+    pub const max_history = 5;
+
+    /// What a multistep sampler has to be handed back to resume bit-identically: its
+    /// buffers, in the order its `history` arm lists them, and the SDE stepper's
+    /// step sizes.
     pub const History = struct {
-        prev: []const f32,
-        prev2: ?[]const f32 = null,
+        bufs: [max_history][]const f32 = undefined,
+        n: usize = 0,
         h: f64 = 0,
         h2: f64 = 0,
+
+        pub fn slice(self: *const History) []const []const f32 {
+            return self.bufs[0..self.n];
+        }
+
+        fn push(self: *History, b: []const f32) void {
+            self.bufs[self.n] = b;
+            self.n += 1;
+        }
     };
 
     /// The multistep history a bit-identical resume needs, or null when there is none
     /// yet (the first step of a run, and every step of a single-step sampler).
     pub fn history(self: *const Stepper) ?History {
-        return switch (self.*) {
-            .sde => |*s| if (s.n_old == 0) null else .{
-                .prev = s.old_denoised,
-                .prev2 = if (s.n_old > 1) s.old_denoised2 else null,
-                .h = s.h_last,
-                .h2 = s.h_last2,
+        var h: History = .{};
+        switch (self.*) {
+            .sde => |*s| {
+                if (s.n_old == 0) return null;
+                h.push(s.old_denoised);
+                if (s.n_old > 1) h.push(s.old_denoised2);
+                h.h = s.h_last;
+                h.h2 = s.h_last2;
             },
-            .multistep => |*s| if (s.have_old) .{ .prev = s.old_denoised } else null,
-            else => null,
-        };
+            .multistep => |*s| if (s.have_old) h.push(s.old_denoised),
+            .linear => |*s| for (s.past[0..s.n_past]) |p| h.push(p),
+            .res => |*s| if (s.have_old) h.push(s.old_denoised),
+            .er_sde => |*s| {
+                if (s.n_old >= 1) h.push(s.old_denoised);
+                if (s.n_old >= 2) h.push(s.old_d);
+            },
+            .unipc => |*s| if (s.n_models > 0) {
+                h.push(s.x_vp);
+                h.push(s.x_prev);
+                for (s.models[0..s.n_models]) |m| h.push(m);
+            },
+            .euler, .two_stage, .ancestral, .sde_2s => {},
+        }
+        return if (h.n == 0) null else h;
     }
 
     /// Rebuild the state a render resumed at `start_step` needs.
@@ -393,14 +485,31 @@ pub const Stepper = union(enum) {
         switch (self.*) {
             .euler, .two_stage => {},
             .ancestral => |*s| s.fastForward(start_step),
-            .multistep => |*s| if (hist) |h| s.restore(h.prev),
+            .multistep => |*s| if (hist) |h| s.restore(h.bufs[0]),
             .sde => |*s| if (hist) |h| s.restore(h),
             // The Brownian path is addressed by sigma, so a resumed render queries
             // the same intervals it would have; nothing to wind forward.
             .sde_2s => {},
+            .linear => |*s| if (hist) |h| s.restore(h.slice()),
+            .res => |*s| {
+                s.fastForward(start_step);
+                if (hist) |h| s.restore(start_step, h.bufs[0]);
+            },
+            .er_sde => |*s| {
+                s.fastForward(start_step);
+                if (hist) |h| s.restore(h.bufs[0], if (h.n > 1) h.bufs[1] else null);
+            },
+            // Without its state UniPC restarts at first order from the resumed point.
+            .unipc => |*s| if (hist) |h| if (h.n >= 2) s.restore(h.slice()),
         }
     }
 };
+
+test {
+    _ = linear;
+    _ = exp_samplers;
+    _ = unipc;
+}
 
 test "euler and cfg math" {
     var x = [_]f32{ 1.0, 2.0 };
@@ -770,9 +879,9 @@ test "the input scaling is what keeps SD's UNet in distribution" {
 /// Returns true if it changed anything. A no-op for `eps` (an SD ladder starts near
 /// 14.6, where the logarithm is unremarkable) and for any `flow` schedule already
 /// below 1.
-pub fn offsetFirstSigma(sigmas: []f32, param: Parameterization, shift: f32) bool {
+pub fn offsetFirstSigma(sigmas: []f32, param: Parameterization, table: SigmaTable) bool {
     if (param != .flow or sigmas.len <= 1 or sigmas[0] < 1.0) return false;
-    sigmas[0] = @floatCast(sigmaAt(shift, 1.0 - 1e-4));
+    sigmas[0] = @floatCast(table.percentToSigma(1e-4) orelse return false);
     return true;
 }
 
@@ -839,7 +948,7 @@ pub const SdeStepper = struct {
         n: usize,
         param: Parameterization,
         opts: Options,
-        shift: f32,
+        table: SigmaTable,
     ) !SdeStepper {
         std.debug.assert(sigmas.len >= 2);
         std.debug.assert(n > 0);
@@ -870,7 +979,7 @@ pub const SdeStepper = struct {
         const noise_buf = try gpa.alloc(f32, n);
         errdefer gpa.free(noise_buf);
 
-        _ = offsetFirstSigma(sigmas, param, shift);
+        _ = offsetFirstSigma(sigmas, param, table);
 
         return .{
             .gpa = gpa,
@@ -1003,13 +1112,12 @@ pub const SdeStepper = struct {
     /// step after a resume is the order every other step is rather than silently
     /// dropping one. The vectors must have the stepper's length.
     pub fn restore(self: *SdeStepper, hist: Stepper.History) void {
-        std.debug.assert(hist.prev.len == self.old_denoised.len);
-        @memcpy(self.old_denoised, hist.prev);
+        std.debug.assert(hist.n >= 1);
+        @memcpy(self.old_denoised, hist.bufs[0]);
         self.h_last = hist.h;
         self.n_old = 1;
-        if (hist.prev2) |p2| {
-            std.debug.assert(p2.len == self.old_denoised2.len);
-            @memcpy(self.old_denoised2, p2);
+        if (hist.n > 1) {
+            @memcpy(self.old_denoised2, hist.bufs[1]);
             self.h_last2 = hist.h2;
             self.n_old = 2;
         }
@@ -1069,18 +1177,25 @@ test "the first-sigma offset is required for flow matching and a no-op elsewhere
         // Unoffset, the very first coefficient is -inf and the whole render is NaN.
         try std.testing.expect(std.math.isNegativeInf(Parameterization.flow.halfLogSnr(1.0)));
 
-        try std.testing.expect(offsetFirstSigma(sigmas, .flow, default_shift));
+        try std.testing.expect(offsetFirstSigma(sigmas, .flow, .{ .flux = default_shift }));
         try std.testing.expectApproxEqAbs(@as(f32, 0.99996833), sigmas[0], 1e-7);
         try std.testing.expect(std.math.isFinite(Parameterization.flow.halfLogSnr(sigmas[0])));
         // Idempotent: sigmas[0] is now below 1.
-        try std.testing.expect(!offsetFirstSigma(sigmas, .flow, default_shift));
+        try std.testing.expect(!offsetFirstSigma(sigmas, .flow, .{ .flux = default_shift }));
+    }
+    {
+        // `ModelSamplingDiscreteFlow` offsets through its own formula, not Flux's.
+        // The value is ComfyUI's `percent_to_sigma(1e-4)` at Z-Image's shift 3.
+        var sigmas = [_]f32{ 1.0, 0.5, 0 };
+        try std.testing.expect(offsetFirstSigma(&sigmas, .flow, .{ .discrete_flow = 3.0 }));
+        try std.testing.expectEqual(@as(f32, 0.9999666810035706), sigmas[0]);
     }
     {
         // An SD ladder is untouched, `eps` has no singularity at the top.
         const sigmas = try sdSchedule(gpa, 8);
         defer gpa.free(sigmas);
         const before = sigmas[0];
-        try std.testing.expect(!offsetFirstSigma(sigmas, .eps, default_shift));
+        try std.testing.expect(!offsetFirstSigma(sigmas, .eps, .{ .flux = default_shift }));
         try std.testing.expectEqual(before, sigmas[0]);
     }
 }
@@ -1094,7 +1209,7 @@ test "eta = 0 reduces the SDE stepper to deterministic DPM++(2M)" {
     for (&out, [_]u64{ 1, 999 }) |*dst, seed| {
         const sigmas = try sdSchedule(gpa, 6);
         defer gpa.free(sigmas);
-        var st = try SdeStepper.init(gpa, sigmas, n, .eps, .{ .eta = 0, .seed = seed }, default_shift);
+        var st = try SdeStepper.init(gpa, sigmas, n, .eps, .{ .eta = 0, .seed = seed }, .{ .flux = default_shift });
         defer st.deinit();
 
         var x: [n]f32 = undefined;
@@ -1118,7 +1233,7 @@ test "the SDE stepper's last step lands exactly on the denoised estimate" {
     const n = 16;
     const sigmas = try sdSchedule(gpa, 3);
     defer gpa.free(sigmas);
-    var st = try SdeStepper.init(gpa, sigmas, n, .eps, .{}, default_shift);
+    var st = try SdeStepper.init(gpa, sigmas, n, .eps, .{}, .{ .flux = default_shift });
     defer st.deinit();
 
     var x: [n]f32 = undefined;
@@ -1142,7 +1257,7 @@ test "restore reinstates the multistep history bit-identically" {
         fn straight(a: std.mem.Allocator, x: *[n]f32) !void {
             const sigmas = try sdSchedule(a, 5);
             defer a.free(sigmas);
-            var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, default_shift);
+            var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, .{ .flux = default_shift });
             defer st.deinit();
             var v: [n]f32 = undefined;
             for (0..5) |i| {
@@ -1156,7 +1271,7 @@ test "restore reinstates the multistep history bit-identically" {
             {
                 const sigmas = try sdSchedule(a, 5);
                 defer a.free(sigmas);
-                var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, default_shift);
+                var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, .{ .flux = default_shift });
                 defer st.deinit();
                 var v: [n]f32 = undefined;
                 for (0..3) |i| {
@@ -1168,9 +1283,11 @@ test "restore reinstates the multistep history bit-identically" {
             }
             const sigmas = try sdSchedule(a, 5);
             defer a.free(sigmas);
-            var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, default_shift);
+            var st = try SdeStepper.init(a, sigmas, n, .eps, .{ .seed = 5 }, .{ .flux = default_shift });
             defer st.deinit();
-            st.restore(.{ .prev = &carry, .h = h_last });
+            var hist: Stepper.History = .{ .h = h_last };
+            hist.push(&carry);
+            st.restore(hist);
             var v: [n]f32 = undefined;
             for (3..5) |i| {
                 for (&v, x.*) |*vi, xi| vi.* = 0.07 * xi + 0.2;
@@ -1227,7 +1344,7 @@ fn checkTrajectory(gpa: std.mem.Allocator, obj: std.json.ObjectMap, kind: Kind, 
         // ancestral samplers and leaves it alone for the tree ones, which is exactly
         // the split the fixtures were generated under.
         .latent_noise_src = .torch_cpu,
-    }, default_shift);
+    }, if (std.mem.startsWith(u8, name, "zimage")) .{ .discrete_flow = 3.0 } else .{ .flux = default_shift });
     defer st.deinit();
 
     var toy: ToyModel = .{ .c = c };
@@ -1376,6 +1493,43 @@ test "the deterministic samplers match ComfyUI, including the two-evaluation one
 }
 
 
+test "the remaining ComfyUI samplers match ComfyUI on both families" {
+    // lms, ipndm(_v), deis, heunpp2, res_multistep(_ancestral), er_sde and UniPC,
+    // each over krea2 and SD schedules and short ones that reach their last-step
+    // branches. `sampler` is ComfyUI's name, which is also `Kind`'s.
+    const gpa = std.testing.allocator;
+    const parsed = try openFixtures(gpa);
+    defer parsed.deinit();
+    var seen: std.EnumSet(Kind) = .{};
+    for (parsed.value.object.get("extra").?.array.items) |t| {
+        const kind = Kind.parse(t.object.get("sampler").?.string) orelse return error.BadFixture;
+        seen.insert(kind);
+        try checkTrajectory(gpa, t.object, kind, traj_tol);
+    }
+    try std.testing.expectEqual(@as(usize, 10), seen.count());
+}
+
+test "ddim is euler" {
+    const gpa = std.testing.allocator;
+    const sigmas = try sdSchedule(gpa, 6);
+    defer gpa.free(sigmas);
+    var a = [_]f32{ 0.3, -1.2, 2.5, 0.01 };
+    var b = a;
+    var model: LinearModel = .{ .a = 0.1, .b = -0.2 };
+    var sa = try Stepper.init(gpa, .euler, sigmas, a.len, .eps, .{}, .{ .flux = default_shift });
+    defer sa.deinit();
+    var sb = try Stepper.init(gpa, .ddim, sigmas, b.len, .eps, .{}, .{ .flux = default_shift });
+    defer sb.deinit();
+    var v: [4]f32 = undefined;
+    for (0..sigmas.len - 1) |i| {
+        try model.model().predict(&v, &a, sigmas[i]);
+        try sa.step(&a, &v, sigmas, i, model.model());
+        try model.model().predict(&v, &b, sigmas[i]);
+        try sb.step(&b, &v, sigmas, i, model.model());
+    }
+    try std.testing.expectEqualSlices(f32, &a, &b);
+}
+
 // ---------------------------------------------------------------------------
 // Euler ancestral, the stochastic first-order sampler
 // ---------------------------------------------------------------------------
@@ -1420,7 +1574,7 @@ fn logMid(a: f32, b: f32) f32 {
 
 /// ComfyUI's `get_ancestral_step`: how far down to step, and how much noise to put
 /// back, splitting the next sigma's variance between the two.
-fn ancestralStep(sigma_from: f32, sigma_to: f32, eta: f64) struct { down: f64, up: f64 } {
+pub fn ancestralStep(sigma_from: f32, sigma_to: f32, eta: f64) struct { down: f64, up: f64 } {
     // The reference's own early out, and the reason eta = 0 is EXACTLY Euler rather
     // than Euler plus a rounding: it returns `sigma_to` itself, not `sqrt(sigma_to^2)`.
     if (eta == 0) return .{ .down = sigma_to, .up = 0 };
@@ -2080,6 +2234,8 @@ test "dpmpp_2m restores its history rather than dropping to first order" {
 // `sigmas[i]` exactly and the noise injection it guards never runs.
 
 /// A `heun` / `dpm_2` stepper: the probe latent and its derivative.
+/// heun, dpm_2 and heunpp2: probe evaluations off the schedule, no state. heunpp2
+/// takes a second probe on most steps, so three evaluations.
 pub const TwoStageStepper = struct {
     gpa: std.mem.Allocator,
     kind: Kind,
@@ -2089,6 +2245,9 @@ pub const TwoStageStepper = struct {
     denoised: []f32,
     x2: []f32,
     v2: []f32,
+    /// heunpp2's second probe; empty for the others.
+    x3: []f32,
+    v3: []f32,
 
     pub fn init(gpa: std.mem.Allocator, kind: Kind, sigmas: []const f32, n: usize) !TwoStageStepper {
         std.debug.assert(sigmas.len >= 2);
@@ -2099,14 +2258,52 @@ pub const TwoStageStepper = struct {
         errdefer gpa.free(x2);
         const v2 = try gpa.alloc(f32, n);
         errdefer gpa.free(v2);
-        return .{ .gpa = gpa, .kind = kind, .sigmas = sigmas, .denoised = denoised, .x2 = x2, .v2 = v2 };
+        const n3: usize = if (kind == .heunpp2) n else 0;
+        const x3 = try gpa.alloc(f32, n3);
+        errdefer gpa.free(x3);
+        const v3 = try gpa.alloc(f32, n3);
+        return .{ .gpa = gpa, .kind = kind, .sigmas = sigmas, .denoised = denoised, .x2 = x2, .v2 = v2, .x3 = x3, .v3 = v3 };
     }
 
     pub fn deinit(self: *TwoStageStepper) void {
         self.gpa.free(self.denoised);
         self.gpa.free(self.x2);
         self.gpa.free(self.v2);
+        self.gpa.free(self.x3);
+        self.gpa.free(self.v3);
         self.* = undefined;
+    }
+
+    /// `sample_heunpp2`: Euler onto the schedule's last sigma, Heun one step before
+    /// it, and otherwise a second probe at `sigmas[i + 2]`. The weights lean on the
+    /// FIRST sigma of the schedule, not the step's.
+    fn heunpp2(self: *TwoStageStepper, x: []f32, v: []const f32, i: usize, model: Model) !void {
+        const sg = self.sigmas;
+        const s_end = sg[sg.len - 1];
+        const sn = sg[i + 1];
+        const dt = sn - sg[i];
+        if (sn == s_end) {
+            for (x, v) |*xi, d| xi.* += d * dt;
+            return;
+        }
+        for (self.x2, x, v) |*x2, xi, d| x2.* = xi + d * dt;
+        try model.predict(self.v2, self.x2, sn);
+        if (sg[i + 2] == s_end) {
+            const w = 2 * sg[0];
+            const w2 = sn / w;
+            const w1 = 1 - w2;
+            for (x, v, self.v2) |*xi, d, d2| xi.* += (d * w1 + d2 * w2) * dt;
+            return;
+        }
+        const sn2 = sg[i + 2];
+        const dt2 = sn2 - sn;
+        for (self.x3, self.x2, self.v2) |*x3, x2, d2| x3.* = x2 + d2 * dt2;
+        try model.predict(self.v3, self.x3, sn2);
+        const w = 3 * sg[0];
+        const w2 = sn / w;
+        const w3 = sn2 / w;
+        const w1 = 1 - w2 - w3;
+        for (x, v, self.v2, self.v3) |*xi, d, d2, d3| xi.* += (w1 * d + w2 * d2 + w3 * d3) * dt;
     }
 
     pub fn step(self: *TwoStageStepper, x: []f32, v: []const f32, i: usize, model: Model) !void {
@@ -2121,6 +2318,7 @@ pub const TwoStageStepper = struct {
             for (self.denoised, x, v) |*d, xi, vi| d.* = xi - s * vi;
         }
 
+        if (self.kind == .heunpp2) return self.heunpp2(x, v, i, model);
         const dt = sigma_next - sigma;
         if (sigma_next == 0) {
             // Both reference bodies fall back to Euler for the last step: the probe
@@ -2198,7 +2396,7 @@ pub const SdeSingleStepper = struct {
         n: usize,
         param: Parameterization,
         opts: Options,
-        shift: f32,
+        table: SigmaTable,
     ) !SdeSingleStepper {
         std.debug.assert(sigmas.len >= 2);
         std.debug.assert(n > 0);
@@ -2224,7 +2422,7 @@ pub const SdeSingleStepper = struct {
         const noise_buf = try gpa.alloc(f32, n);
         errdefer gpa.free(noise_buf);
 
-        _ = offsetFirstSigma(sigmas, param, shift);
+        _ = offsetFirstSigma(sigmas, param, table);
 
         return .{
             .gpa = gpa,
@@ -2329,7 +2527,7 @@ test "the euler arm of Stepper is bit-identical to calling eulerStep" {
     for (&a, 0..) |*xi, j| xi.* = @as(f32, @floatFromInt(j)) * 0.37 - 8.0;
     var b = a;
 
-    var st = try Stepper.init(gpa, .euler, sigmas, n, .eps, .{}, default_shift);
+    var st = try Stepper.init(gpa, .euler, sigmas, n, .eps, .{}, .{ .flux = default_shift });
     defer st.deinit();
     var lin: LinearModel = .{ .a = 0.11, .b = -0.4 };
     var v: [n]f32 = undefined;
